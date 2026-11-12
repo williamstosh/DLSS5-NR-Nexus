@@ -5,11 +5,28 @@ $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile(
     (Join-Path $PSScriptRoot '../tools/run-fg-acceptance.ps1'), [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw $parseErrors[0] }
-foreach ($name in @('Set-FgPresentSection','Set-StreamlineFallback','Set-XeFgUiComposition','Get-ControlMaskSettings','Set-ModelDiagnosticSection','Set-OptiFgDisabled','Copy-ControlMaskGpuEvidence')) {
+foreach ($name in @('Set-FgPresentSection','Set-StreamlineFallback','Set-XeFgUiComposition','Get-ControlMaskSettings','Get-NrEditReuseSettings','Set-ModelDiagnosticSection','Set-OptiFgDisabled','Copy-ControlMaskGpuEvidence')) {
     $definition = $ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}, $true)
     if ($null -eq $definition) { throw "Missing production transform: $name" }
     . ([scriptblock]::Create($definition.Extent.Text))
 }
+$cacheBaseline = Get-NrEditReuseSettings 0
+$cacheCandidate = Get-NrEditReuseSettings 1
+if ($cacheBaseline.NREditReuse -ne 0 -or $cacheCandidate.NREditReuse -ne 1) { throw 'Cache A/B selection lost' }
+$cacheBaseline.Remove('NREditReuse')
+$cacheCandidate.Remove('NREditReuse')
+if (($cacheBaseline | ConvertTo-Json -Compress) -cne ($cacheCandidate | ConvertTo-Json -Compress)) {
+    throw 'Cache baseline and candidate must use identical remaining settings'
+}
+foreach ($invalidSession in @(@(), @('-RestoreInstallation','-InstallOnly'))) {
+    $rejection = & pwsh.exe -NoProfile -File (Join-Path $PSScriptRoot '../tools/run-fg-acceptance.ps1') `
+        -CandidateManifest 'unused-synthetic-candidate' -GameBinaryDirectory 'unused-synthetic-game' `
+        -NrEditReuse 1 @invalidSession 2>&1
+    if ($LASTEXITCODE -eq 0 -or ($rejection -join "`n") -notmatch 'NrEditReuse requires a restored HDR XeFG') {
+        throw 'Cache test must reject unsupported sessions before touching installation inputs'
+    }
+}
+$global:LASTEXITCODE = 0
 $diagnosticFixture = "[RenoDX.DLSS5]`nNRToggleKey=117`nNRScreenshotKey=116`nNRScreenshotSource=0`nNRDebugCapturePlanes=0`nNRIntensity=0.75`n"
 $diagnosticExpected = $diagnosticFixture.Replace('NRScreenshotKey=116','NRScreenshotKey=121').Replace('NRScreenshotSource=0','NRScreenshotSource=2').Replace('NRDebugCapturePlanes=0','NRDebugCapturePlanes=1')
 if ((Set-ModelDiagnosticSection $diagnosticFixture) -cne $diagnosticExpected) {

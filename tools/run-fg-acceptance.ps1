@@ -30,6 +30,7 @@ param(
     [ValidateRange(-1,3)][int]$NrPass2Stage = -1,
     [ValidateRange(-1,3)][int]$NrPass3Stage = -1,
     [ValidateRange(-1,3)][int]$NrPass4Stage = -1,
+    [ValidateRange(-1,1)][int]$NrEditReuse = -1,
     [ValidateSet('T0','T1','T2','T3','T4','T5','T6','GRect','BRect','DepthFar','DepthFarOff')][string]$ControlMaskCase,
     [switch]$ControlMaskUseCoreContext,
     [ValidateRange(-1,1)][int]$ControlMaskAutoMask = -1,
@@ -45,6 +46,11 @@ param(
     [switch]$AddonAbsentControl
 )
 $ErrorActionPreference = 'Stop'
+if ($NrEditReuse -ge 0 -and (-not $RestoreInstallation -or $InstallOnly -or $ControlMaskCase -or $SrOnly -or
+        $NrPreset -ne 2 -or $NrPasses -ne 1 -or $NrHookPoint -ne 2 -or
+        -not $BlockOptionalHudless -or $XeFGUiComposition -ne 0 -or $SdrGameOutput)) {
+    throw 'NrEditReuse requires a restored HDR XeFG single-Backbuffer Present test: model B, one pass, blocked optional HUDless and UIComposition 0.'
+}
 if ($ControlMaskUseCoreContext) {
     throw '-ControlMaskUseCoreContext is retired: production uses the owned backend. Use the offline tools/run-tests.ps1 -Suite fg-native entry for P0 Core diagnostics.'
 }
@@ -203,6 +209,14 @@ function Remove-FgAcceptanceBinaryBackups {
     }
     $result.status = if ($result.deleted_files -eq $binaries.Count) { 'cleaned' } else { 'incomplete' }
     return $result
+}
+function Get-NrEditReuseSettings([ValidateRange(0,1)][int]$Enabled) {
+    return @{
+        NREditReuse=$Enabled; NeuralUplift=1
+        NRFollowInputRes=0; NRResolutionScale=1; NRAdaptiveEnabled=0
+        NRLookMode=0; NRDetailStability=1; NRControlMaskEnabled=0; NRAutoMask=0
+        NRPresentPreFg=1; NRPresentGuides=1; NRPresentUICorrection=0
+    }
 }
 function Get-ControlMaskSettings(
     [ValidateSet('T0','T1','T2','T3','T4','T5','T6','GRect','BRect','DepthFar','DepthFarOff')][string]$Case,
@@ -438,6 +452,7 @@ $taskReceipt = [ordered]@{
     nr_model_test=@{runtime=$NrRuntimePath; main=$NrPreset; pass2=$NrPass2Preset; passes=$NrPasses}
     nr_runtime_test=$taskRuntimePlan
     nr_stage_test=@{hook=$NrHookPoint; pass2=$NrPass2Stage; pass3=$NrPass3Stage; pass4=$NrPass4Stage}
+    nr_edit_reuse_test=$(if ($NrEditReuse -ge 0) { Get-NrEditReuseSettings $NrEditReuse } else { $null })
     control_mask_case=$ControlMaskCase
     requested_control_mask_use_core_context=[bool]$ControlMaskUseCoreContext
     requested_control_mask_auto_mask=$ControlMaskAutoMask
@@ -545,6 +560,11 @@ try {
     if ($NrPass2Stage -ge 0) { $taskModelSettings.NRPass2Stage = $NrPass2Stage }
     if ($NrPass3Stage -ge 0) { $taskModelSettings.NRPass3Stage = $NrPass3Stage }
     if ($NrPass4Stage -ge 0) { $taskModelSettings.NRPass4Stage = $NrPass4Stage }
+    if ($NrEditReuse -ge 0) {
+        foreach ($taskSetting in (Get-NrEditReuseSettings $NrEditReuse).GetEnumerator()) {
+            $taskModelSettings[$taskSetting.Key] = $taskSetting.Value
+        }
+    }
     if ($ControlMaskCase) {
         foreach ($taskSetting in (Get-ControlMaskSettings $ControlMaskCase $NrHookPoint ([bool]$ControlMaskUseCoreContext)).GetEnumerator()) {
             $taskModelSettings[$taskSetting.Key] = $taskSetting.Value

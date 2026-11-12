@@ -48,6 +48,15 @@ Windows 入口会在替换安装文件前，通过合成文件的最终句柄路
 
 普通桌面上下文可通过 `normal_process.py --run <Python绝对路径> -B <probe_foreground.py绝对路径> --output-root <本仓库tmp绝对路径>` 运行同一探针。核对 result.json 的各场景和 cleanup，不能将请求激活当作实际成功。
 
+NR 编辑复用静态对照使用 PowerShell 入口的 `-NrEditReuse 0|1`（逐帧基线／x2候选）。
+它要求 `-RestoreInstallation -NrPreset 2 -NrPasses 1 -NrHookPoint 2 -BlockOptionalHudless -XeFGUiComposition 0`，
+要求实际输出为 FP16 scRGB HDR；不能与 ControlMask case、SR-only 或 InstallOnly 混用。
+两组都临时关闭自适应、Look、Detail stability、ControlMask 和 UI 校正，固定100%尺寸并要求真实 guides；
+除缓存开关外设置相同，实际设置写入 receipt，沿原备份和完整恢复流程。
+可用受保护 `-CaptureScript` 采集静态日志／画面；实际 SDK 状态、NR Evaluate 频率和动态画质分别判断。
+先从运行日志核对实际颜色格式与 `hdr` 契约；系统 HDR 开启不等于 scRGB。10位 PQ 输出会回到逐帧 NR，
+此时只能记录格式回退，不能把配置开关或 runner 的启动／退出通过当作缓存生效。
+
 ## 后续获授权的实机入口
 
 下列步骤会写本地输出；完整入口还会临时替换游戏文件并启动游戏。执行前核对进程、候选 manifest、目标安装和存档，并取得本轮实机授权。
