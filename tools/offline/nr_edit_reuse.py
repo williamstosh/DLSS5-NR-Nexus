@@ -117,6 +117,8 @@ def analyze(root: Path) -> dict:
             raise ContractError(f"Wrong condition or schema: {name}")
         if report["dimensions"] != reference["dimensions"] or len(report["frames"]) != len(frames):
             raise ContractError(f"Incompatible sequence: {name}")
+        if report["detail_stability"] != 1:
+            raise ContractError(f"History experiment requires Detail stability Off (1): {name}")
         for key in ("runtime", "nr_sha256", "driver_x100", "requested_model", "internal_model",
                     "detail_stability", "feed_mode", "norm_governor", "prefix_host_sr_evaluates", "prefix_nr_evaluates"):
             if report[key] != reference[key]:

@@ -18,6 +18,7 @@ param(
     [string]$NativeNgxProjectIdPath,
     [string]$NativeNgxSdkLibraryDirectory,
     [string]$NativeNgxRuntimePath = $(if ($env:NR_NEXUS_NGX_RUNTIME_DIR) { Join-Path $env:NR_NEXUS_NGX_RUNTIME_DIR 'nvngx_dlssnr.dll' }),
+    [string]$NativeNgxSrRuntimePath,
     [ValidateSet('dlaa','sr','stage-resolution','same-stage-resolution','render-stage-resolution','present-stage-resolution')][string[]]$BridgeCase = @(),
     [switch]$BuildOnly,
     [ValidateSet('Standard','Full','Acceptance')][string]$RetentionMode = $(if ($env:NR_NEXUS_TEST_RETENTION) { $env:NR_NEXUS_TEST_RETENTION } else { 'Standard' }),
@@ -83,6 +84,9 @@ if ($usesNativeNgx) {
     }
     $NativeNgxProjectIdPath = (Resolve-Path -LiteralPath $NativeNgxProjectIdPath).Path
     $NativeNgxRuntimePath = (Resolve-Path -LiteralPath $NativeNgxRuntimePath).Path
+    if ($NativeNgxSrRuntimePath) {
+        $NativeNgxSrRuntimePath = (Resolve-Path -LiteralPath $NativeNgxSrRuntimePath).Path
+    }
 }
 if ($BridgeCase -and $Suite -notcontains 'bridge-motion') { throw '-BridgeCase requires -Suite bridge-motion (or all).' }
 if ($Suite -contains 'vulkan-control-mask') {
@@ -189,9 +193,17 @@ foreach ($item in $Suite) {
             foreach ($case in $NativeCase) {
                 if ($case -in @('control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','control-mask-native-ngx-fg')) {
                     $runtimeLink = Join-Path $directory 'nvngx_dlssnr.dll'
+                    $srRuntimeLink = if ($NativeNgxSrRuntimePath) { Join-Path $directory 'nvngx_dlss.dll' } else { $null }
                     if (Test-Path -LiteralPath $runtimeLink) { throw "Runtime link target already exists: $runtimeLink" }
+                    if ($srRuntimeLink -and (Test-Path -LiteralPath $srRuntimeLink)) { throw "Runtime link target already exists: $srRuntimeLink" }
                     New-Item -ItemType HardLink -Path $runtimeLink -Target $NativeNgxRuntimePath | Out-Null
                     try {
+                        if ($srRuntimeLink) {
+                            New-Item -ItemType HardLink -Path $srRuntimeLink -Target $NativeNgxSrRuntimePath | Out-Null
+                        }
+                        @($NativeNgxRuntimePath, $NativeNgxSrRuntimePath) | Where-Object { $_ } | ForEach-Object {
+                            @{ path=$_; sha256=(Get-FileHash -LiteralPath $_).Hash }
+                        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $directory 'native-ngx-runtime-inputs.json') -Encoding utf8
                         $nativeArgument = "--$case"
                         if ($case -eq 'nr-edit-reuse-history') {
                             $previousCondition = $env:NR_NEXUS_TEST_NR_HISTORY_CONDITION
@@ -228,6 +240,7 @@ foreach ($item in $Suite) {
                         throw
                     } finally {
                         if (Test-Path -LiteralPath $runtimeLink) { Remove-Item -LiteralPath $runtimeLink -Force }
+                        if ($srRuntimeLink -and (Test-Path -LiteralPath $srRuntimeLink)) { Remove-Item -LiteralPath $srRuntimeLink -Force }
                     }
                 } else {
                     Invoke-TestProcess $exe $directory $case @("--$case")

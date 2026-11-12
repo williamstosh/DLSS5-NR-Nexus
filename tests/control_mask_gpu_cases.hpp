@@ -2503,6 +2503,7 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeRuntimeEvaluate(
   }
   native_resize_evaluate_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
   if (NVSDK_NGX_SUCCEED(result) && native_motion_neural_readback != nullptr) {
+    // Capture inside Evaluate's observer, before returning to RunLookStage.
     auto* neural = addon::GetD3D12Resource(parameters, "DLSSNR.Output");
     native_motion_gpu->Transition(neural, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     native_motion_gpu->RecordTextureReadback(neural, *native_motion_neural_readback);
@@ -2709,7 +2710,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       // the preceding sequence's cut-aware normalization/Look history.
       addon::feed_mode = 1u;
       addon::norm_governor = 0u;
-      addon::detail_stability = 0u;
+      addon::detail_stability = (history_test ? 1u : 0u);  // 0 Auto, 1 Off.
       addon::control_mask_mode = addon::kControlMaskRgb;
       addon::control_mask_motion_enabled = false;
       addon::control_mask_motion_start = 2.f;
@@ -2885,6 +2886,10 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     nlohmann::json resize_report;
     nlohmann::json history_report;
     if (history_test) {
+      const auto history_look = addon::LookSettingsSnapshot(true);
+      Check(addon::detail_stability.load() == 1u && history_look.stabilize == 0u
+                && !history_look.stabilize_detail && history_look.stabilize_alpha == 0.f,
+            "history fixture disables temporal Look in the effective after-path snapshot");
       const char* requested_condition = std::getenv("NR_NEXUS_TEST_NR_HISTORY_CONDITION");
       const std::string condition = (requested_condition != nullptr ? requested_condition : "baseline");
       Check(condition == "baseline" || condition == "baseline-repeat"
@@ -2922,6 +2927,8 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           {"validity", "bit0: single-step same surface/in bounds; bit1: both steps valid"},
           {"feed_mode", addon::feed_mode.load()}, {"norm_governor", addon::norm_governor.load()},
           {"detail_stability", addon::detail_stability.load()}, {"timestamp_frequency_hz", queries.frequency_hz},
+          {"look_snapshot", {{"stabilize", history_look.stabilize}, {"stabilize_detail", history_look.stabilize_detail},
+              {"stabilize_alpha", history_look.stabilize_alpha}}},
           {"timing_scope", "individual real SR and NR Evaluate GPU intervals, excluding readback copies; diagnostic only"},
           {"raw_policy", "condition directory registered disposable by test entry; only KEEP_RAW=1 preserves complete dataset"},
           {"frames", nlohmann::json::array()}};
@@ -3063,6 +3070,9 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         }
         gpu.Submit();
         addon::DrainRetiredResources(true);
+        const auto& look_history = addon::features.at(owner).slots[0].look_history;
+        Check(look_history.buffers[0] == nullptr && look_history.buffers[1] == nullptr,
+              "history fixture never allocates temporal Look history");
         Check(gpu.fence->GetCompletedValue() >= gpu.serial && SUCCEEDED(gpu.device->GetDeviceRemovedReason()),
               "history frame completed on a healthy GPU");
         const std::string stem = "frame-" + std::to_string(1000 + frame).substr(1);

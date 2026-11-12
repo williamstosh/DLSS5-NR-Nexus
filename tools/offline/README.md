@@ -231,7 +231,7 @@ pwsh -File tools/run-tests.ps1 -Suite vulkan-control-mask -VulkanNativeNgx `
 
 同一组真实 SR／NR Feature 执行关闭／开启运动衰减的两段 8 帧合成序列，
 各段相同 Reset 前缀，输入平移与低分辨率运动矢量一致，MV scale 为 (-2,1)。
-固定帧测光、关闭亮度 governor 和细节稳定，以隔离墙钟及前段历史对配对的影响。
+固定帧测光、关闭亮度 governor；Detail stability 保持 Auto，最终结果包含该过滤。
 在实际消费边界复制 SR 输出、NR proxy 和 raw neural，Fence 完成后检查两组 SR／proxy
 逐字节相同、实际遮罩及 G/B/A、停止后的 R 恢复，以及 neural／最终输出响应；
 完全运动衰减时另核对 neural RGB 等于实际 proxy。完成后核对 NR 关闭后的 SR 续跑、
@@ -255,11 +255,15 @@ Fence、provider 边界与实际 NGX 模块身份；原始读回仅在内存配�
 ~~~powershell
 pwsh -File tools/run-tests.ps1 -Suite fg-native -NativeCase nr-edit-reuse-history `
     -NativeNgxProjectIdPath $projectIdPath -NativeNgxSdkLibraryDirectory $sdkLibraryDirectory `
-    -NativeNgxRuntimePath $runtimePath -PythonExecutable $pythonWithNumpyAndPillow `
+    -NativeNgxRuntimePath $runtimePath -NativeNgxSrRuntimePath $srRuntimePath `
+    -PythonExecutable $pythonWithNumpyAndPillow `
     -UiPreview None -OutputDirectory tmp/offline/nr-history
 ~~~
 
 四组使用相同创建前缀及24帧输入，依次包含静止、变速平移、独立运动前景的遮挡显露、光照变化。
+`$srRuntimePath` 指向已有的 `nvngx_dlss.dll`；D3D12 原生 NGX 入口可用该选项显式提供 SR 库。
+Runner 仅在测试输出目录建立临时链接，记录输入 SHA-256，并在结束时移除链接。
+若省略，SR 依赖本机 NGX 搜索路径；SR Feature 1 返回 `0xBAD0000B` 时先核对 SR 库是否可用。
 当前夹具为零 jitter、未含 jitter 的渲染像素运动和单位 scale；不覆盖非零 jitter 或 Subrect。
 组合运动从上一基础帧的对应位置取样，不是当前运动乘二。刷新沿生产 wrapper 调用真实 NR，
 仅在测试观察器边界替换 NR 运动资源或 Reset；SR 参数和生产实现不改动。

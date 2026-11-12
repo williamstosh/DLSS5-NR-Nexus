@@ -72,7 +72,7 @@ class HistoryAnalysisTests(unittest.TestCase):
                 report = {"schema": "nr-nexus-nr-edit-reuse-history-v1", "condition": condition,
                           "process_id": condition_index + 1, "runtime": "synthetic", "nr_sha256": "synthetic",
                           "driver_x100": 0, "requested_model": "B", "internal_model": "unknown",
-                          "detail_stability": 0, "feed_mode": 1, "norm_governor": 0,
+                          "detail_stability": 1, "feed_mode": 1, "norm_governor": 0,
                           "prefix_host_sr_evaluates": 2, "prefix_nr_evaluates": 1,
                           "dimensions": {"render": [4, 4], "output": [4, 4]}, "frames": []}
                 for index in range(4):
@@ -114,6 +114,11 @@ class HistoryAnalysisTests(unittest.TestCase):
             self.assertGreater(result["comparisons"]["x2-compose"][1]["temporal_error_stops"]["mae"], 1)
             report_path = root / "x2-reset" / "nr-edit-reuse-history.json"
             report = json.loads(report_path.read_text(encoding="utf-8"))
+            report["detail_stability"] = 0
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+            with self.assertRaisesRegex(history.ContractError, "Detail stability Off"):
+                history.analyze(root)
+            report["detail_stability"] = 1
             descriptor = report["frames"][0]["planes"]["sr"]
             raw = np.ones((4, 4, 4), dtype="<f2").tobytes()
             (root / "x2-reset" / descriptor["file"]).write_bytes(raw)
