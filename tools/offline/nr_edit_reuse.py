@@ -30,11 +30,34 @@ def read_plane(directory: Path, descriptor: dict) -> tuple[np.ndarray, str]:
     raw = path.read_bytes()
     if len(raw) != descriptor["bytes"] or zlib.crc32(raw) != descriptor["crc32"]:
         raise ContractError(f"Readback identity mismatch: {path}")
-    dtype, channels = FORMATS[descriptor["format"]]
-    values = np.frombuffer(raw, dtype=dtype).reshape(descriptor["height"], descriptor["width"], channels)
+    if descriptor["format"] == "R10G10B10A2_UNORM":
+        packed = np.frombuffer(raw, dtype="<u4").reshape(descriptor["height"], descriptor["width"])
+        values = np.stack([(packed >> shift) & mask for shift, mask in
+                           ((0, 1023), (10, 1023), (20, 1023), (30, 3))], axis=-1)
+        values = values.astype(np.float32) / np.array([1023, 1023, 1023, 3], dtype=np.float32)
+    else:
+        dtype, channels = FORMATS[descriptor["format"]]
+        values = np.frombuffer(raw, dtype=dtype).reshape(descriptor["height"], descriptor["width"], channels)
     if not np.isfinite(values).all():
         raise ContractError(f"Non-finite readback: {path}")
     return values.astype(np.float32), hashlib.sha256(raw).hexdigest()
+
+
+def linearize_plane(values: np.ndarray, descriptor: dict) -> np.ndarray:
+    """Decode PQ to BT.709 scRGB (1 = 80 nits); retain other source units and alpha."""
+    if descriptor["format"] != "R10G10B10A2_UNORM":
+        return values
+    if descriptor["encoding"] != "pq_bt2020_10000nits":
+        raise ContractError("Packed 10-bit color requires an explicit PQ BT.2020 contract")
+    encoded = np.clip(values[..., :3].astype(np.float64), 0, 1)
+    power = encoded ** (1 / 78.84375)
+    linear = (np.maximum(power - .8359375, 0) /
+              np.maximum(18.8515625 - 18.6875 * power, 1e-12)) ** (1 / .1593017578125)
+    result = values.astype(np.float64).copy()
+    result[..., :3] = linear @ np.array([[1.6604910, -.1245505, -.0181508],
+                                       [-.5876411, 1.1328999, -.1005789],
+                                       [-.0728499, -.0083494, 1.1187297]]) * 125
+    return result
 
 
 def srgb_decode(values: np.ndarray) -> np.ndarray:

@@ -16,7 +16,7 @@ import numpy as np
 from PIL import Image
 
 from contracts import ContractError, artifact_path, digest, read_json, sample_statistics
-from nr_edit_reuse import read_plane, save_preview, statistics
+from nr_edit_reuse import linearize_plane, read_plane, save_preview, statistics
 
 CONDITIONS = ("cache-baseline", "cache")
 
@@ -44,11 +44,16 @@ def analyze(root: Path) -> dict:
               "evidence": ["NATIVE_GPU", "NATIVE_NGX"], "visual_acceptance": "not_performed",
               "conditions": {}, "comparisons": [], "dimensions": reference["dimensions"],
               "route": reference.get("route", "inline"), "xefg_scope": reference.get("xefg_scope"),
+              "source_format": reference.get("source_format", "RGBA16F"),
+              "source_encoding": reference.get("source_encoding", "linear HDR"),
+              "metric_rgb_encoding": ("linear BT709 scRGB; 1=80 nits"
+                                      if reference.get("source_format") == "R10G10B10A2_UNORM"
+                                      else "linear RGB in source units"),
               "measurement_notes": [
-                  "Independent Features use identical SR input and byte-identical SR output.",
-                  "Whole-chain intervals include cache storage/reprojection, codec and output copies, excluding test readbacks.",
+                  "Independent Features use identical SR input, byte-identical SR output and byte-identical actual NR sources.",
+                  "Whole-chain intervals include cache storage/reprojection, codec and output copies, excluding test readbacks and fixture PQ construction.",
                   "Model intervals include only real NR Evaluate; reuse has no model sample.",
-                  "Invalid reuse pixels must equal current SR bit-for-bit, including alpha.",
+                  "Invalid reuse pixels must equal the current NR source bit-for-bit, including alpha.",
                   "Refresh/reuse costs are separate; no FPS or dynamic visual acceptance is inferred."]}
     for name, report in reports.items():
         if report["schema"] != "nr-nexus-nr-edit-reuse-cache-v1" or len(report["frames"]) != len(frames):
@@ -61,8 +66,13 @@ def analyze(root: Path) -> dict:
             raise ContractError(f"Cache experiment requires Detail stability Off (1): {name}")
         if any(report.get(key) != reference.get(key) for key in ("scene_id", "raster_sign")):
             raise ContractError(f"Mismatched jitter scene: {name}")
-        if any(report.get(key) != reference.get(key) for key in ("route", "present_white_nits", "xefg_scope")):
+        if any(report.get(key) != reference.get(key) for key in
+               ("route", "present_white_nits", "xefg_scope", "source_format", "source_encoding", "sr_format")):
             raise ContractError(f"Mismatched recording route: {name}")
+        if report.get("source_format") == "R10G10B10A2_UNORM" and (
+                report.get("route") != "xefg-record" or report.get("source_encoding") != "pq_bt2020_10000nits"
+                or report.get("sr_format") != "RGBA16F"):
+            raise ContractError(f"Invalid PQ source/report contract: {name}")
         times, kinds, model_times = [], {}, []
         previous_fence, previous_reuse = 0, False
         for index, frame in enumerate(report["frames"]):
@@ -103,6 +113,13 @@ def analyze(root: Path) -> dict:
         loaded = {}
         for name, report in reports.items():
             frame = report["frames"][index]
+            if report.get("source_format") == "R10G10B10A2_UNORM":
+                if (frame["planes"].get("source") is None
+                        or frame["planes"]["sr"]["format"] != "RGBA16F"
+                        or any(frame["planes"][plane]["format"] != report["source_format"]
+                               or frame["planes"][plane]["encoding"] != report["source_encoding"]
+                               for plane in ("source", "final"))):
+                    raise ContractError(f"Invalid PQ source/plane contract: {name} frame {index}")
             loaded[name] = {"inputs": {}, "planes": {}}
             for group in ("inputs", "planes"):
                 for plane, descriptor in frame[group].items():
@@ -113,28 +130,46 @@ def analyze(root: Path) -> dict:
                     result["conditions"][name]["raw_sha256"][descriptor["file"]] = sha
             if name == "cache-baseline":
                 continue
-            for group, planes in (("inputs", baseline_frame["inputs"]), ("planes", {"sr": baseline_frame["planes"]["sr"]})):
+            identity_planes = {key: baseline_frame["planes"][key] for key in ("sr", "source")
+                               if baseline_frame["planes"].get(key) is not None}
+            for group, planes in (("inputs", baseline_frame["inputs"]), ("planes", identity_planes)):
                 for plane, first in planes.items():
                     second = frame[group][plane]
-                    if (result["conditions"]["cache-baseline"]["raw_sha256"][first["file"]]
+                    if (any(first[key] != second[key] for key in ("format", "encoding", "width", "height", "bytes"))
+                            or result["conditions"]["cache-baseline"]["raw_sha256"][first["file"]]
                             != result["conditions"][name]["raw_sha256"][second["file"]]):
                         preserve(root, [("cache-baseline", first), (name, second)])
                         raise ContractError(f"{plane} mismatch: {name} frame {index}")
         baseline = loaded["cache-baseline"]["planes"]
         cached = loaded["cache"]["planes"]
         frame = reports["cache"]["frames"][index]
-        final_bits = cached["final"].astype("<f2").view("<u2")
-        source_bits = cached["sr"].astype("<f2").view("<u2")
+        source_name = "source" if "source" in cached else "sr"
+        source_descriptor = frame["planes"][source_name]
+        final_descriptor = frame["planes"]["final"]
+        if (final_descriptor["format"] != source_descriptor["format"]
+                or (source_descriptor["format"] == "R10G10B10A2_UNORM"
+                    and final_descriptor["encoding"] != source_descriptor["encoding"])):
+            raise ContractError(f"Final/source color contract mismatch: frame {index}")
+        if source_descriptor["format"] == "R10G10B10A2_UNORM":
+            quantization = np.array([1023, 1023, 1023, 3], dtype=np.float32)
+            final_bits = np.rint(cached["final"] * quantization).astype("<u2")
+            source_bits = np.rint(cached[source_name] * quantization).astype("<u2")
+        else:
+            final_bits = cached["final"].astype("<f2").view("<u2")
+            source_bits = cached[source_name].astype("<f2").view("<u2")
         if not np.array_equal(final_bits[..., 3], source_bits[..., 3]):
             raise ContractError(f"Cache changed source alpha: frame {index}")
+        for name, planes in (("cache-baseline", baseline), ("cache", cached)):
+            for plane in (source_name, "final"):
+                planes[plane] = linearize_plane(planes[plane], reports[name]["frames"][index]["planes"][plane])
         row = {"frame": index, "scene": frame["scene"], "frame_kind": frame["frame_kind"],
                "final_rgb": statistics(cached["final"][..., :3] - baseline["final"][..., :3]),
                "alpha_identical": True, "invalid_pixels": None, "invalid_pixels_identical": None}
         if frame["frame_kind"] == "reuse":
             invalid = cached["validity"][..., 0] == 0
             if not np.array_equal(final_bits[invalid], source_bits[invalid]):
-                preserve(root, [("cache", frame["planes"]["sr"]), ("cache", frame["planes"]["final"])])
-                raise ContractError(f"Invalid cache pixels differ from current SR: frame {index}")
+                preserve(root, [("cache", source_descriptor), ("cache", final_descriptor)])
+                raise ContractError(f"Invalid cache pixels differ from current NR source: frame {index}")
             row.update(invalid_pixels=int(invalid.sum()), invalid_pixels_identical=True,
                        valid_pixels=int((~invalid).sum()))
         # The six lighting frames stop the background camera. This fixed left
@@ -142,10 +177,10 @@ def analyze(root: Path) -> dict:
         # Compare changes in NR's edit to the per-frame baseline, separating
         # source illumination from the edit disappearing/reappearing.
         if frame["scene"] == "lighting":
-            height, width = cached["sr"].shape[:2]
+            height, width = cached[source_name].shape[:2]
             roi = (slice(height // 4, height * 3 // 4), slice(width // 16, width // 4))
-            base_edit = luma_edit(baseline["final"], baseline["sr"])[roi]
-            cache_edit = luma_edit(cached["final"], cached["sr"])[roi]
+            base_edit = luma_edit(baseline["final"], baseline[source_name])[roi]
+            cache_edit = luma_edit(cached["final"], cached[source_name])[roi]
             row["lighting_roi"] = {"xywh": [width // 16, height // 4, width // 4 - width // 16, height * 3 // 4 - height // 4],
                                    "baseline_edit_stops": statistics(base_edit), "cache_edit_stops": statistics(cache_edit),
                                    "edit_error_stops": statistics(cache_edit - base_edit), "temporal_error_stops": None}
@@ -157,7 +192,7 @@ def analyze(root: Path) -> dict:
             previous_lighting = (base_edit, cache_edit)
         result["comparisons"].append(row)
         save_preview(root / f"cache-frame-{index:03d}.png", index, frame["scene"],
-                     [("SR", cached["sr"]), ("baseline", baseline["final"]),
+                     [("NR source", cached[source_name]), ("baseline", baseline["final"]),
                       (frame["frame_kind"], cached["final"])])
         if frame["scene"] == "lighting":
             with Image.open(root / f"cache-frame-{index:03d}.png") as preview:
@@ -178,7 +213,7 @@ def analyze(root: Path) -> dict:
         strip.save(root / "cache-lighting-strip.png")
         result["lighting_observation"] = {"preview": "cache-lighting-preview.png", "strip": "cache-lighting-strip.png",
                                           "preview_frame_ms": 250,
-                                          "notes": "Slow diagnostic loop, not game pacing. ROI uses final/SR log2 luma gain; temporal error subtracts the baseline edit change."}
+                                          "notes": "Slow diagnostic loop, not game pacing. ROI uses linear BT709 final/source log2 luma gain; temporal error subtracts the baseline edit change."}
     return result
 
 

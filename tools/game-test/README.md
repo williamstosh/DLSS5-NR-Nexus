@@ -50,12 +50,13 @@ Windows 入口会在替换安装文件前，通过合成文件的最终句柄路
 
 NR 编辑复用静态对照使用 PowerShell 入口的 `-NrEditReuse 0|1`（逐帧基线／x2候选）。
 它要求 `-RestoreInstallation -NrPreset 2 -NrPasses 1 -NrHookPoint 2 -BlockOptionalHudless -XeFGUiComposition 0`，
-要求实际输出为 FP16 scRGB HDR；不能与 ControlMask case、SR-only 或 InstallOnly 混用。
+要求实际输出为 FP16 scRGB 或10位 HDR10/PQ；不能与 ControlMask case、SR-only 或 InstallOnly 混用。
 两组都临时关闭自适应、Look、Detail stability、ControlMask 和 UI 校正，固定100%尺寸并要求真实 guides；
 除缓存开关外设置相同，实际设置写入 receipt，沿原备份和完整恢复流程。
 可用受保护 `-CaptureScript` 采集静态日志／画面；实际 SDK 状态、NR Evaluate 频率和动态画质分别判断。
-先从运行日志核对实际颜色格式与 `hdr` 契约；系统 HDR 开启不等于 scRGB。10位 PQ 输出会回到逐帧 NR，
-此时只能记录格式回退，不能把配置开关或 runner 的启动／退出通过当作缓存生效。
+先从运行日志核对实际颜色格式与 `hdr` 契约；系统 HDR 开启不能替代实际格式核验。PQ 须为 format24／hdr2，
+且实际颜色合同为 PQ／BT.2020／10000 nit／Encoding4；合同不符回到逐帧 NR。以 `NR edit reuse` 和服务 Evaluate
+频率确认缓存生效，不能把配置开关或 runner 的启动／退出通过当作功能通过。
 
 ## 后续获授权的实机入口
 

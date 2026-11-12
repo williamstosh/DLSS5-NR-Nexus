@@ -11624,6 +11624,12 @@ inline bool RecordInline(
       && present->domain == present_restore_scope::Domain::PRE_FG_BACKBUFFER
       && present->stage_execution_plan == nullptr && !present->native_prefg_resolution_pair
       && present->source_color == nullptr;
+  // PQ stays in the existing Present codec: decode and convert to BT.709
+  // before the sRGB model proxy, then commit back to HDR10 after reuse.
+  const bool edit_reuse_hdr10 = edit_reuse_xefg_route && hdr_mode == 2
+      && output_desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM
+      && present->units.encoding == codec::Encoding::Pq && present->units.absolute
+      && present->units.unit_nits == 10000.f && present->units.bt2020 && present->hdr_encoding == 4u;
   const uint64_t edit_reuse_sequence = (present != nullptr ? present->xefg_edit_reuse_frame : feature.sr_sequence);
   const bool edit_reuse_route_eligible = edit_reuse_requested && (edit_reuse_inline_route || edit_reuse_xefg_route)
       && !plan.mixed && group.begin == 0 && requested_stack == 1 && !adaptive.enabled && !adaptive.preparing
@@ -11631,7 +11637,7 @@ inline bool RecordInline(
       && !control_mask_requested && !look_mode.load() && detail_stability.load() == 1u
       && preset.load() == 2u
       && !nr_follow_input_res.load() && nr_input_width == width && nr_input_height == height
-      && hdr_mode == 1 && output_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT
+      && ((hdr_mode == 1 && output_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) || edit_reuse_hdr10)
       && (output_desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0
       && output_rect.x == 0 && output_rect.y == 0 && width == output_desc.Width && height == output_desc.Height
       && current.motion_x == 0 && current.motion_y == 0 && current.depth_x == 0 && current.depth_y == 0
@@ -12459,7 +12465,7 @@ inline bool RecordInline(
   // chain's resets across two epochs.
   const uint64_t chain_reset_epoch =
       history_reset_epoch.load(std::memory_order_relaxed);
-  std::array<uint64_t, 35> edit_contract{};
+  std::array<uint64_t, 38> edit_contract{};
   if (edit_reuse_route_eligible) {
     edit_contract = {configuration_generation.load(), chain_reset_epoch, feature.source_generation,
         width, height, frame.motion_width, frame.motion_height, frame.create_flags, preset.load(), style.load(),
@@ -12474,7 +12480,8 @@ inline bool RecordInline(
         std::bit_cast<uint32_t>(proxy_anchor_nits.load()),
         (present != nullptr ? present->restore_config_epoch : 0u),
         (present != nullptr ? std::bit_cast<uint32_t>(frame_divisor) : 0u),
-        (present != nullptr ? static_cast<uint32_t>(frame.ui_correction) : 0u)};
+        (present != nullptr ? static_cast<uint32_t>(frame.ui_correction) : 0u),
+        static_cast<uint32_t>(output_desc.Format), hdr_mode, v6_encoding};
     if (auto& cache = feature.slots[0].edit_reuse; cache != nullptr) {
       if (cache->width != width || cache->height != height || cache->motion_width != frame.motion_width
           || cache->motion_height != frame.motion_height) {
@@ -13593,6 +13600,8 @@ inline bool RecordInline(
               << " reuse=" << count << " fallback=" << edit_reuse_fallbacks.load()
               << " anchor=" << feature.slots[0].edit_reuse->anchor_generation
               << " allocation_bytes=" << feature.slots[0].edit_reuse->allocated_bytes
+              << " source_format=" << static_cast<uint32_t>(output_desc.Format)
+              << " hdr=" << static_cast<uint32_t>(hdr_mode) << " encoding=" << v6_encoding
               << " model_evaluates=0 age=1";
       Log(reshade::log::level::info, message.str());
     }

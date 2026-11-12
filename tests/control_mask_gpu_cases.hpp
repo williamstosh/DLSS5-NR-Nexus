@@ -1,8 +1,10 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -11,6 +13,7 @@
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <set>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -2392,6 +2395,7 @@ inline d3d12_test::TimestampQueries* native_history_queries = nullptr;
 inline UINT native_history_interval = 0;
 inline nlohmann::json native_history_parameters;
 inline bool native_cache_observe = false;
+inline bool native_cache_pq = false;
 inline addon::DirectCreateFn native_resize_create = nullptr;
 inline addon::DirectReleaseFn native_resize_release = nullptr;
 inline double native_resize_create_ms = 0;
@@ -2440,7 +2444,7 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeHostEvaluate(
     native_motion_gpu->RecordTextureReadback(output, *native_motion_sr_readback);
     native_motion_gpu->Transition(output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   }
-  if (NVSDK_NGX_SUCCEED(result) && native_cache_observe && native_history_queries != nullptr) {
+  if (NVSDK_NGX_SUCCEED(result) && native_cache_observe && !native_cache_pq && native_history_queries != nullptr) {
     // Exclude real SR and its diagnostic snapshot from the full NR chain.
     native_history_queries->Begin(command_list, native_history_interval + 2);
   }
@@ -2542,6 +2546,12 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     const std::string cache_route = (cache_route_environment != nullptr ? cache_route_environment : "inline");
     Check(cache_route == "inline" || cache_route == "xefg-record", "known NR cache recording route");
     const bool xefg_cache_test = cache_test && cache_route == "xefg-record";
+    const char* cache_format_environment = (cache_test ? std::getenv("NR_NEXUS_TEST_NR_CACHE_FORMAT") : nullptr);
+    const std::string cache_format = (cache_format_environment != nullptr ? cache_format_environment : "scrgb");
+    Check(cache_format == "scrgb" || cache_format == "pq", "known NR cache source format");
+    const bool pq_cache_test = cache_test && cache_format == "pq";
+    Check(!pq_cache_test || xefg_cache_test, "PQ cache input requires the production XeFG Record route");
+    native_cache_pq = pq_cache_test;
     // Resize reuses public SDK initialization and the real SR owner, without
     // running the independent paired ControlMask motion experiment.
     motion_test = motion_test || resize_test || sequence_test || jitter_test;
@@ -2587,6 +2597,16 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     Check(SUCCEEDED(gpu.device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE,
         &output_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&output))),
         "native ControlMask output allocation");
+    ComPtr<ID3D12Resource> pq_source;
+    if (pq_cache_test) {
+      auto pq_desc = output_desc;
+      pq_desc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+      Check(SUCCEEDED(gpu.device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE,
+          &pq_desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&pq_source))),
+          "native cache actual PQ NR source allocation");
+    }
+    auto* cache_color = (pq_cache_test ? pq_source.Get() : output.Get());
+    std::vector<uint32_t> pq_source_codes;
 
     const size_t pixel_count = static_cast<size_t>(width) * height;
     const size_t render_pixel_count = static_cast<size_t>(render_width) * render_height;
@@ -2823,11 +2843,54 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     const auto* nr_workset_key = (xefg_cache_test
         ? reinterpret_cast<const ID3D12Resource*>(&cache_stream.roles[0]) : output.Get());
     const auto record_xefg = [&] {
-      // Exercise the production Record and writeback on the SR command list.
-      // This excludes SDK/Service admission (covered by WARP+MOCK), and keeps
-      // timestamps contiguous without CPU submission gaps between SR and NR.
+      // Exercise production Record and private-color writeback. SDK/Service
+      // admission is covered by WARP+MOCK. PQ input construction submits the
+      // real SR recording separately, before the contiguous NR GPU interval.
+      if (pq_cache_test) {
+        // Input construction only: retain real SR's FP16 snapshot, then convert
+        // BT.709 scRGB (80 nits/unit) to BT.2020/PQ (10000 nits/unit).
+        // The extra readback/CPU conversion/upload precedes the NR chain timer.
+        auto sr_transfer = gpu.CreateTextureTransfer(output.Get());
+        gpu.Transition(output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        gpu.RecordTextureReadback(output.Get(), sr_transfer);
+        gpu.Transition(output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        gpu.Submit();
+        const auto sr_bytes = gpu.ReadTexture(sr_transfer);
+        pq_source_codes.resize(static_cast<size_t>(width) * height);
+        const auto pack = [](double value, uint32_t maximum) {
+          return static_cast<uint32_t>(std::lround(std::clamp(value, 0.0, 1.0) * maximum));
+        };
+        for (size_t pixel = 0; pixel < pq_source_codes.size(); ++pixel) {
+          std::array<uint16_t, 4> half;
+          std::memcpy(half.data(), sr_bytes.data() + pixel * sizeof(half), sizeof(half));
+          std::array<double, 4> linear;
+          for (size_t channel = 0; channel < linear.size(); ++channel) {
+            linear[channel] = DirectX::PackedVector::XMConvertHalfToFloat(half[channel]);
+            Check(std::isfinite(linear[channel]), "real SR supplies finite PQ conversion input");
+          }
+          const std::array<double, 3> bt2020{
+              .6274040 * linear[0] + .3292820 * linear[1] + .0433136 * linear[2],
+              .0690970 * linear[0] + .9195400 * linear[1] + .0113612 * linear[2],
+              .0163916 * linear[0] + .0880132 * linear[1] + .8955950 * linear[2]};
+          uint32_t packed = pack(linear[3], 3) << 30;
+          for (size_t channel = 0; channel < bt2020.size(); ++channel) {
+            const double power = std::pow(std::clamp(bt2020[channel] * .008, 0.0, 1.0), .1593017578125);
+            const double pq = std::pow((.8359375 + 18.8515625 * power) / (1.0 + 18.6875 * power), 78.84375);
+            packed |= pack(pq, 1023) << (10 * channel);
+          }
+          pq_source_codes[pixel] = packed;
+        }
+        auto transfer = gpu.CreateTextureTransfer(pq_source.Get());
+        gpu.Transition(pq_source.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+        gpu.UploadTexture(pq_source.Get(), transfer, reinterpret_cast<const uint8_t*>(pq_source_codes.data()),
+            pq_source_codes.size() * sizeof(uint32_t), width * sizeof(uint32_t));
+        gpu.Transition(pq_source.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (native_cache_observe && native_history_queries != nullptr) {
+          native_history_queries->Begin(gpu.list.Get(), native_history_interval + 2);
+        }
+      }
       renodx::addons::dlss5::fg::FrameInput input{
-          .queue = gpu.queue.Get(), .backbuffer = output.Get(), .depth = depth.Get(), .motion = motion.Get(),
+          .queue = gpu.queue.Get(), .backbuffer = cache_color, .depth = depth.Get(), .motion = motion.Get(),
           .backbuffer_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
           .depth_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
           .motion_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -2839,7 +2902,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           .application_frame = ++cache_application_frame,
           .present_id = static_cast<uint32_t>(cache_application_frame),
           .init_flags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes,
-          .color_space = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709,
+          .color_space = (pq_cache_test ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 : DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709),
           .has_present_id = true, .has_constants = true,
           .reset = addon::GetInt(&parameters, NVSDK_NGX_Parameter_Reset) != 0, .fg_enabled = true};
       auto& slot = cache_stream.slots[0];
@@ -2847,27 +2910,28 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
             "XeFG Record fixture prepares existing private color surfaces");
       addon::PresentTarget target;
       addon::SnapshotPresentRestoreConfiguration(&target);
-      target.hdr_mode = 1;
-      target.units = {addon::codec::Encoding::Linear, true, 80.f, false};
+      target.hdr_mode = (pq_cache_test ? 2 : 1);
+      target.units = (pq_cache_test ? addon::codec::SourceUnits{addon::codec::Encoding::Pq, true, 10000.f, true}
+                                   : addon::codec::SourceUnits{addon::codec::Encoding::Linear, true, 80.f, false});
       target.hdr_encoding = addon::V6EncodingConstant(target.units);
       target.hdr_dark_gate = addon::V6DarkGate(target.units);
       target.hdr_pedestal_cap = addon::codec::BlackPedestalCap(target.units);
       target.hdr_white_nits = 200.f;
       target.hdr_white_source = "fixed_xefg_record_fixture";
       target.hdr_pedestal = renodx::addons::dlss5::present_hdr_pedestal::Decide(target.hdr_pedestal.configuration,
-          {.actual_present = true, .hdr_mode = 1, .v6_available = false,
-           .encoding_valid = true, .absolute_units = true, .unit_nits = 80.f,
+          {.actual_present = true, .hdr_mode = target.hdr_mode, .v6_available = false,
+           .encoding_valid = true, .absolute_units = true, .unit_nits = target.units.unit_nits,
            .display_codec = target.hdr_curve == 1u, .legacy_mode = target.hdr_pedestal.legacy_mode,
            .debug_bypass = target.diagnostic.bypass_hdr_pedestal});
       target.divisor = addon::codec::PresentDivisor(
           target.units, 200.f, addon::paper_white_scale.load(), addon::pq_calibration.load());
-      target.swapchain_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+      target.swapchain_format = cache_color->GetDesc().Format;
       const renodx::addons::dlss5::EvaluateChainScope chain;
       bool ready = false;
       std::array<addon::NrRecording, 2> recordings;
       addon::fg_service::Record(&cache_stream, &slot, gpu.list.Get(), input, target, &ready, &recordings);
       if (ready) {
-        addon::fg_service::CopyColor(gpu.list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        addon::fg_service::CopyColor(gpu.list.Get(), cache_color, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             slot.color[0], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, 0, 0, 0, 0, width, height);
       }
       return ready;
@@ -3177,6 +3241,17 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           {"frames", nlohmann::json::array()}};
       if (cache_test) {
         report["route"] = cache_route;
+        report["sr_format"] = "RGBA16F";
+        report["sr_encoding"] = "linear BT709 scRGB; 1=80 nits";
+        report["source_format"] = (pq_cache_test ? "R10G10B10A2_UNORM" : "RGBA16F");
+        report["source_dxgi_format"] = static_cast<uint32_t>(cache_color->GetDesc().Format);
+        report["source_encoding"] = (pq_cache_test ? "pq_bt2020_10000nits" : "linear BT709 scRGB; 1=80 nits");
+        report["source_construction"] = (pq_cache_test
+            ? "real per-frame SR FP16 readback -> CPU BT709 to BT2020, scale 80/10000, ST2084, round UNORM10 RGB/UNORM2 alpha -> upload; one extra completed SR submission per frame; conversion/readback/upload excluded from NR whole-chain GPU timestamps"
+            : "unmodified real per-frame SR FP16 output");
+        if (pq_cache_test) {
+          report["timing_scope"] = "real SR/model Evaluate separately; whole NR chain starts after fixture PQ upload through production Record, staging and private writeback; CPU conversion, readbacks and PQ upload excluded";
+        }
         report["xefg_scope"] = (xefg_cache_test
             ? "real SR and NR; production fg_service::Record plus private-color writeback; SDK/Service admission not exercised"
             : "not used");
@@ -3184,7 +3259,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         report["prefix_edit_reuse_enabled"] = true;
         report["prefix_force_reset"] = true;
         report["edit_reuse_enabled"] = condition == "cache";
-        report["validity"] = "output plane uint32: 0 exact current SR, 1 cached edit; fixture input valid remains two-step surface bits";
+        report["validity"] = "output plane uint32: 0 exact current NR source, 1 cached edit; fixture input valid remains two-step surface bits";
         if (jitter_scene) {
           report["raster_sampling"] = "color/depth/MV surface identity share pixelCenter+raster_sign*jitter; foreground edges (240.25,90.75) from frame0";
           report["input_validity_sampling"] = "render raster labels compared at integer physical displacement; output validity is the production uint32 plane";
@@ -3280,7 +3355,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         const auto& workset = addon::worksets.at({nr_owner, nr_workset_key, false});
         auto proxy_readback = gpu.CreateTextureTransfer(workset.proxy);
         auto neural_readback = gpu.CreateTextureTransfer(workset.nr_output);
-        auto final_readback = gpu.CreateTextureTransfer(output.Get());
+        auto final_readback = gpu.CreateTextureTransfer(cache_color);
         native_motion_sr_readback = &sr_readback;
         native_motion_proxy_readback = (refresh && !cache_test ? &proxy_readback : nullptr);
         native_motion_neural_readback = (refresh && !cache_test ? &neural_readback : nullptr);
@@ -3351,9 +3426,9 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           }
         }
         if (refresh || cache_test) {
-          gpu.Transition(output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-          gpu.RecordTextureReadback(output.Get(), final_readback);
-          gpu.Transition(output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+          gpu.Transition(cache_color, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+          gpu.RecordTextureReadback(cache_color, final_readback);
+          gpu.Transition(cache_color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
         gpu.Submit();
         addon::DrainRetiredResources(true);
@@ -3368,6 +3443,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           return save_packed_plane(raw_directory, stem + "-" + suffix, data, format, encoding, plane_width, plane_height);
         };
         const auto sr_bytes = gpu.ReadTexture(sr_readback);
+        const auto final_bytes = ((refresh || cache_test) ? gpu.ReadTexture(final_readback) : std::vector<uint8_t>{});
         nlohmann::json planes{{"sr", save("sr.rgba16f", sr_bytes, "RGBA16F", "linear HDR", width, height)},
             {"proxy", nullptr}, {"neural", nullptr}, {"final", nullptr}};
         if (refresh && !cache_test) {
@@ -3375,7 +3451,18 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           planes["neural"] = save("neural.rgba16f", gpu.ReadTexture(neural_readback), "RGBA16F", "v6 encoded sRGB float", width, height);
         }
         if (refresh || cache_test) {
-          planes["final"] = save("final.rgba16f", gpu.ReadTexture(final_readback), "RGBA16F", "linear HDR; production resolve", width, height);
+          planes["final"] = (pq_cache_test
+              ? save("final.r10g10b10a2", final_bytes, "R10G10B10A2_UNORM", "pq_bt2020_10000nits", width, height)
+              : save("final.rgba16f", final_bytes, "RGBA16F", "linear HDR; production resolve", width, height));
+        }
+        if (pq_cache_test) {
+          planes["source"] = save("source.r10g10b10a2", pq_source_codes, "R10G10B10A2_UNORM", "pq_bt2020_10000nits", width, height);
+          Check(final_bytes.size() == pq_source_codes.size() * sizeof(uint32_t), "PQ final matches actual packed source extent");
+          for (size_t pixel = 0; pixel < pq_source_codes.size(); ++pixel) {
+            uint32_t actual;
+            std::memcpy(&actual, final_bytes.data() + pixel * sizeof(uint32_t), sizeof(actual));
+            Check((actual >> 30) == (pq_source_codes[pixel] >> 30), "native PQ output preserves actual current-source alpha code");
+          }
         }
         if (cache_test) {
           planes["validity"] = nullptr;
@@ -3386,7 +3473,15 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
             std::vector<uint32_t> values(mapped, mapped + static_cast<size_t>(width) * height);
             const D3D12_RANGE no_writes{0, 0};
             validity_readback->Unmap(0, &no_writes);
-            planes["validity"] = save("validity.r32u", values, "R32_UINT", "0 selects exact current SR; 1 reuses anchor edit", width, height);
+            if (pq_cache_test) {
+              for (size_t pixel = 0; pixel < values.size(); ++pixel) {
+                if (values[pixel] != 0) continue;
+                uint32_t actual;
+                std::memcpy(&actual, final_bytes.data() + pixel * sizeof(uint32_t), sizeof(actual));
+                Check(actual == pq_source_codes[pixel], "native invalid PQ reuse returns exact current packed RGB and alpha");
+              }
+            }
+            planes["validity"] = save("validity.r32u", values, "R32_UINT", "0 selects exact current NR source; 1 reuses anchor edit", width, height);
           }
         }
         const auto sr_timing = queries.Read(frame * intervals_per_frame);

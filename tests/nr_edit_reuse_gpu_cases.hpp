@@ -216,6 +216,49 @@ int Run() {
     std::cout << "PASS edit reuse WARP shader: known edit, scaled reprojection, edge/depth/color rejection, neutral exact RGBA\n";
 
     {
+      constexpr uint32_t code_width = 1024, alpha_count = 4;
+      auto code_original = gpu.Texture(code_width, alpha_count, DXGI_FORMAT_R10G10B10A2_UNORM);
+      auto code_decoded = uav_texture(code_width, alpha_count, DXGI_FORMAT_R10G10B10A2_UNORM);
+      auto code_proxy = gpu.Texture(code_width, alpha_count, DXGI_FORMAT_R32G32B32A32_FLOAT);
+      auto code_neural = uav_texture(code_width, alpha_count, DXGI_FORMAT_R32G32B32A32_FLOAT);
+      auto code_motion = gpu.Texture(1, 1, DXGI_FORMAT_R32G32_FLOAT);
+      auto code_depth = gpu.Texture(1, 1, DXGI_FORMAT_R32_FLOAT);
+      std::vector<uint32_t> codes(code_width * alpha_count);
+      std::vector<float> neutral(code_width * alpha_count * 4, .375f);
+      for (uint32_t alpha = 0; alpha < alpha_count; ++alpha) {
+        for (uint32_t code = 0; code < code_width; ++code) {
+          codes[alpha * code_width + code] = code | ((1023u - code) << 10)
+              | (((code * 37u) & 1023u) << 20) | (alpha << 30);
+        }
+      }
+      upload(code_original.Get(), codes, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, code_width * 4);
+      upload(code_decoded.Get(), std::vector<uint32_t>(codes.size(), 0), D3D12_RESOURCE_STATE_COMMON,
+             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, code_width * 4);
+      upload(code_proxy.Get(), neutral, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, code_width * 16);
+      upload(code_neural.Get(), neutral, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, code_width * 16);
+      upload(code_motion.Get(), std::vector<float>(2, 0.f), D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, 8);
+      upload(code_depth.Get(), std::vector<float>(1, .5f), D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, 4);
+      reuse::State code_state;
+      const reuse::Inputs code_inputs{.width = code_width, .height = alpha_count, .motion_width = 1, .motion_height = 1,
+          .proxy = code_proxy.Get(), .neural = code_neural.Get(), .motion = code_motion.Get(), .depth = code_depth.Get(),
+          .original = code_original.Get(), .decoded = code_decoded.Get()};
+      Check(reuse::Record(gpu.device.Get(), gpu.list.Get(), &code_state, code_inputs, reuse::Phase::CAPTURE),
+            "capture neutral anchor for packed HDR10 selection");
+      gpu.Transition(code_neural.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      Check(reuse::Record(gpu.device.Get(), gpu.list.Get(), &code_state, code_inputs, reuse::Phase::APPLY),
+            "neutral HDR10 cache marks every pixel for original selection");
+      gpu.Transition(code_neural.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NATIVE_INPUT_STATE);
+      Check(reuse::Record(gpu.device.Get(), gpu.list.Get(), &code_state, code_inputs, reuse::Phase::SELECT_ORIGINAL),
+            "select packed HDR10 source through production typed SRV and UAV");
+      auto selected = stage_execution_cases::Capture(gpu, code_decoded.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      submit_commands("all HDR10 codes and alpha selection");
+      const auto selected_bytes = selected.Pixels();
+      Check(selected_bytes.size() == codes.size() * sizeof(uint32_t)
+                && std::memcmp(selected_bytes.data(), codes.data(), selected_bytes.size()) == 0,
+            "SELECT_ORIGINAL preserves all 1024 codes of each RGB channel and all four alpha codes bit exactly");
+    }
+
+    {
       // These are physical guide-raster offsets, independent of the SR API's
       // jitter sign. The 1.5 ratio places two output centers on opposite sides
       // of a guide texel boundary, distinguishing correct/omitted/reversed offsets.
