@@ -319,6 +319,8 @@ XeFG 的 SDK hooks、Service 准入与生命周期通过 `-NativeCase nr-edit-re
 刷新／复用／刷新、当前 RGBA、Reset、缺 guides、忙碌跳帧、模型失败恢复和缓存退休，
 并检查缓存不持有 DXGI Backbuffer。默认关闭的生产开关只在完整的单 Backbuffer 包上授权缓存，
 按基础帧推进复用年龄；HUDless、UI 合成及其他组合沿用原有路径。
+PQ 用例使用 `R32G8X24_TYPELESS` 深度资源，按第0平面的 float 深度上传和读取，并检查四字节 footprint；
+scRGB 用例保留 `R32_FLOAT`。原有颜色、alpha、深度拒绝与失败恢复断言覆盖两种路径。
 
 原生 `xefg-record` 对照仍使用真实 SR 和 NR，但不调用 XeFG SDK 或 Service 准入。
 默认 `NR_NEXUS_TEST_NR_CACHE_FORMAT=scrgb` 使用 RGBA16F scRGB：在同一 command list 上从 SR 读回之后计时，
