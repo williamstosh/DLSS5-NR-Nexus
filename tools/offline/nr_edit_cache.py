@@ -13,11 +13,17 @@ import shutil
 import sys
 
 import numpy as np
+from PIL import Image
 
 from contracts import ContractError, artifact_path, digest, read_json, sample_statistics
 from nr_edit_reuse import read_plane, save_preview, statistics
 
 CONDITIONS = ("cache-baseline", "cache")
+
+
+def luma_edit(final: np.ndarray, source: np.ndarray) -> np.ndarray:
+    weights = np.array([.2126, .7152, .0722])
+    return np.log2(np.maximum(final[..., :3] @ weights, 1 / 1024)) - np.log2(np.maximum(source[..., :3] @ weights, 1 / 1024))
 
 
 def preserve(root: Path, planes: list[tuple[str, dict]]) -> None:
@@ -52,6 +58,8 @@ def analyze(root: Path) -> dict:
                 raise ContractError(f"Mismatched {key}: {name}")
         if report["detail_stability"] != 1:
             raise ContractError(f"Cache experiment requires Detail stability Off (1): {name}")
+        if any(report.get(key) != reference.get(key) for key in ("scene_id", "raster_sign")):
+            raise ContractError(f"Mismatched jitter scene: {name}")
         times, kinds, model_times = [], {}, []
         previous_fence, previous_reuse = 0, False
         for index, frame in enumerate(report["frames"]):
@@ -61,6 +69,8 @@ def analyze(root: Path) -> dict:
                     or frame["completed_fence"] == 2 ** 64 - 1):
                 raise ContractError(f"Incomplete SR or GPU completion: {name} frame {index}")
             previous_fence = frame["fence"]
+            if frame["sr"].get("jitter") != frames[index]["sr"].get("jitter"):
+                raise ContractError(f"Mismatched SR jitter: {name} frame {index}")
             reuse = frame["frame_kind"] == "reuse"
             if frame["nr"]["calls"] != int(not reuse) or (reuse and previous_reuse):
                 raise ContractError(f"Unexpected x2 cadence: {name} frame {index}")
@@ -84,6 +94,8 @@ def analyze(root: Path) -> dict:
             "whole_chain_gpu_ms_by_kind": {kind: sample_statistics(values) for kind, values in kinds.items()},
             "model_gpu_ms_when_invoked": sample_statistics(model_times), "raw_sha256": {}}
 
+    previous_lighting = None
+    lighting_previews = []
     for index, baseline_frame in enumerate(frames):
         loaded = {}
         for name, report in reports.items():
@@ -122,10 +134,31 @@ def analyze(root: Path) -> dict:
                 raise ContractError(f"Invalid cache pixels differ from current SR: frame {index}")
             row.update(invalid_pixels=int(invalid.sum()), invalid_pixels_identical=True,
                        valid_pixels=int((~invalid).sum()))
+        # The six lighting frames stop the background camera. This fixed left
+        # ROI stays away from the independently moving foreground and borders.
+        # Compare changes in NR's edit to the per-frame baseline, separating
+        # source illumination from the edit disappearing/reappearing.
+        if frame["scene"] == "lighting":
+            height, width = cached["sr"].shape[:2]
+            roi = (slice(height // 4, height * 3 // 4), slice(width // 16, width // 4))
+            base_edit = luma_edit(baseline["final"], baseline["sr"])[roi]
+            cache_edit = luma_edit(cached["final"], cached["sr"])[roi]
+            row["lighting_roi"] = {"xywh": [width // 16, height // 4, width // 4 - width // 16, height * 3 // 4 - height // 4],
+                                   "baseline_edit_stops": statistics(base_edit), "cache_edit_stops": statistics(cache_edit),
+                                   "edit_error_stops": statistics(cache_edit - base_edit), "temporal_error_stops": None}
+            if previous_lighting is not None:
+                row["lighting_roi"]["baseline_delta_stops"] = statistics(base_edit - previous_lighting[0])
+                row["lighting_roi"]["cache_delta_stops"] = statistics(cache_edit - previous_lighting[1])
+                row["lighting_roi"]["temporal_error_stops"] = statistics(
+                    (cache_edit - previous_lighting[1]) - (base_edit - previous_lighting[0]))
+            previous_lighting = (base_edit, cache_edit)
         result["comparisons"].append(row)
         save_preview(root / f"cache-frame-{index:03d}.png", index, frame["scene"],
                      [("SR", cached["sr"]), ("baseline", baseline["final"]),
                       (frame["frame_kind"], cached["final"])])
+        if frame["scene"] == "lighting":
+            with Image.open(root / f"cache-frame-{index:03d}.png") as preview:
+                lighting_previews.append(preview.copy())
     if not any(row["frame_kind"] == "reuse" for row in result["comparisons"]):
         raise ContractError("Cache candidate never reused an edit")
     if not any(row.get("valid_pixels", 0) for row in result["comparisons"]):
@@ -133,6 +166,16 @@ def analyze(root: Path) -> dict:
     result["input_and_sr_identity"] = "passed"
     result["invalid_pixel_identity"] = "passed"
     result["quality_decision"] = "requires sequence review; no automatic quality pass"
+    if lighting_previews:
+        first = lighting_previews[0]
+        first.save(root / "cache-lighting-preview.png", save_all=True, append_images=lighting_previews[1:], duration=250, loop=0)
+        strip = Image.new("RGB", (first.width, first.height * len(lighting_previews)))
+        for index, preview in enumerate(lighting_previews):
+            strip.paste(preview, (0, index * first.height))
+        strip.save(root / "cache-lighting-strip.png")
+        result["lighting_observation"] = {"preview": "cache-lighting-preview.png", "strip": "cache-lighting-strip.png",
+                                          "preview_frame_ms": 250,
+                                          "notes": "Slow diagnostic loop, not game pacing. ROI uses final/SR log2 luma gain; temporal error subtracts the baseline edit change."}
     return result
 
 

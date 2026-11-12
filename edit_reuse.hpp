@@ -36,6 +36,12 @@ struct Inputs {
   uint32_t motion_height = 0;
   float motion_scale_x = 1.f;
   float motion_scale_y = 1.f;
+  // Guide content's raster displacement from the unjittered output grid,
+  // in render pixels. Motion values themselves exclude jitter.
+  float raster_offset_x = 0.f;
+  float raster_offset_y = 0.f;
+  float previous_motion_offset_x = 0.f;
+  float previous_motion_offset_y = 0.f;
   ID3D12Resource* proxy = nullptr;
   ID3D12Resource* neural = nullptr;
   ID3D12Resource* motion = nullptr;
@@ -68,6 +74,8 @@ struct State {
   uint64_t source_sequence = 0;
   uint64_t reuse_count = 0;
   uint64_t allocated_bytes = 0;
+  float motion_offset_x = 0.f;
+  float motion_offset_y = 0.f;
   bool valid = false;
   bool reused = false;
 };
@@ -100,7 +108,7 @@ inline bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list,
       parameters[3 + buffer].Descriptor.ShaderRegister = 1 + buffer;
     }
     parameters[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    parameters[6].Constants = {0, 0, 8};
+    parameters[6].Constants = {0, 0, 12};
     const D3D12_ROOT_SIGNATURE_DESC desc{.NumParameters = 7, .pParameters = parameters};
     Microsoft::WRL::ComPtr<ID3DBlob> serialized, errors;
     if (FAILED(renodx::utils::directx::pD3D12SerializeRootSignature(
@@ -226,10 +234,12 @@ inline bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list,
   list->SetComputeRootUnorderedAccessView(3, state->anchor->GetGPUVirtualAddress());
   list->SetComputeRootUnorderedAccessView(4, state->previous_motion->GetGPUVirtualAddress());
   list->SetComputeRootUnorderedAccessView(5, state->validity->GetGPUVirtualAddress());
-  const std::array<uint32_t, 8> constants{inputs.width, inputs.height, inputs.motion_width, inputs.motion_height,
+  const std::array<uint32_t, 12> constants{inputs.width, inputs.height, inputs.motion_width, inputs.motion_height,
       std::bit_cast<uint32_t>(inputs.motion_scale_x), std::bit_cast<uint32_t>(inputs.motion_scale_y),
-      static_cast<uint32_t>(phase), 0};
-  list->SetComputeRoot32BitConstants(6, 8, constants.data(), 0);
+      static_cast<uint32_t>(phase), 0,
+      std::bit_cast<uint32_t>(inputs.raster_offset_x), std::bit_cast<uint32_t>(inputs.raster_offset_y),
+      std::bit_cast<uint32_t>(inputs.previous_motion_offset_x), std::bit_cast<uint32_t>(inputs.previous_motion_offset_y)};
+  list->SetComputeRoot32BitConstants(6, 12, constants.data(), 0);
   const bool motion_phase = phase == Phase::MOTION || phase == Phase::SNAPSHOT_MOTION;
   list->Dispatch(((motion_phase ? inputs.motion_width : inputs.width) + 7) / 8,
                 ((motion_phase ? inputs.motion_height : inputs.height) + 7) / 8, 1);

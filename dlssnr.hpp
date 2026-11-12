@@ -11634,7 +11634,8 @@ inline bool RecordInline(
       && depth_desc.SampleDesc.Count == 1 && motion_desc.SampleDesc.Count == 1
       && (motion_desc.Format == DXGI_FORMAT_R16G16_FLOAT || motion_desc.Format == DXGI_FORMAT_R32G32_FLOAT)
       && (current.create_flags & NVSDK_NGX_DLSS_Feature_Flags_MVJittered) == 0
-      && current.has_jitter && current.jitter_x == 0.f && current.jitter_y == 0.f
+      && current.has_jitter && std::isfinite(current.jitter_x) && std::isfinite(current.jitter_y)
+      && std::abs(current.jitter_x) <= 0.5f && std::abs(current.jitter_y) <= 0.5f
       && std::isfinite(current.motion_scale_x) && std::isfinite(current.motion_scale_y)
       && current.motion_scale_x != 0.f && current.motion_scale_y != 0.f
       && motion_scale_x_multiplier.load() == 1.f && motion_scale_y_multiplier.load() == 1.f
@@ -12717,9 +12718,14 @@ inline bool RecordInline(
         cache = std::make_shared<edit_reuse::State>();
         cache->contract = edit_contract;
       }
+      // Real SR edge calibration maps pixelCenter - API jitter to the
+      // unjittered output: guide lookup therefore adds the API jitter.
+      // Motion values remain physical displacements, with no jitter term.
       edit_inputs = {.width = width, .height = height,
           .motion_width = frame.motion_width, .motion_height = frame.motion_height,
           .motion_scale_x = frame.motion_scale_x, .motion_scale_y = frame.motion_scale_y,
+          .raster_offset_x = frame.jitter_x, .raster_offset_y = frame.jitter_y,
+          .previous_motion_offset_x = cache->motion_offset_x, .previous_motion_offset_y = cache->motion_offset_y,
           .proxy = res.proxy, .neural = res.nr_output, .motion = frame.motion, .depth = frame.depth,
           .original = output, .decoded = res.decoded};
       if (edit_reuse::Record(device, command_list, cache.get(), edit_inputs, edit_reuse::Phase::PREPARE)) {
@@ -12731,6 +12737,8 @@ inline bool RecordInline(
           if (reuse_this_pass) {
             cache->reused = true;
             cache->source_sequence = feature.sr_sequence;
+            cache->motion_offset_x = edit_inputs.raster_offset_x;
+            cache->motion_offset_y = edit_inputs.raster_offset_y;
           }
         } else if (cache->valid && cache->reused) {
           composed_motion = edit_reuse::Record(device, command_list, edit_cache, edit_inputs, edit_reuse::Phase::MOTION);

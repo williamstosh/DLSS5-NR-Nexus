@@ -2535,13 +2535,13 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeRuntimeEvaluate(
 int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                  uint32_t mask_mode = addon::kControlMaskDepthFar, bool cost = false,
                  bool motion_test = false, bool resize_test = false, bool history_test = false,
-                 bool cache_test = false) {
+                 bool cache_test = false, bool jitter_test = false) {
   try {
     const bool sequence_test = history_test || cache_test;
     // Resize reuses public SDK initialization and the real SR owner, without
     // running the independent paired ControlMask motion experiment.
-    motion_test = motion_test || resize_test || sequence_test;
-    if (resize_test || sequence_test) {
+    motion_test = motion_test || resize_test || sequence_test || jitter_test;
+    if (resize_test || sequence_test || jitter_test) {
       // This headless fixture has no Present stream. Disable the production
       // game-exit heuristic so its normal submission-proven retirement runs.
       addon::shutdown_quiesce_enabled = false;
@@ -2699,7 +2699,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       native_runtime_evaluate = addon::core_evaluate_feature;
       addon::core_evaluate_feature = ObserveNativeRuntimeEvaluate;
     }
-    addon::enabled = true;
+    addon::enabled = !jitter_test;
     addon::hooks_enabled = true;
     addon::hook_point = (single_stage ? addon::kHookUpscaled : addon::kHookRender);
     addon::stack_passes = (single_stage ? 1 : 2);
@@ -2713,7 +2713,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     addon::intensity = 1.f;
     addon::preset = (single_stage ? 2u : 1u);
     addon::codec_mode = 0u;
-    const bool mask_enabled = !sequence_test && (cost ? cost_mode != "off"
+    const bool mask_enabled = !sequence_test && !jitter_test && (cost ? cost_mode != "off"
                                     : hot_toggle || std::getenv("NR_NEXUS_TEST_CONTROL_MASK_OFF") == nullptr);
     const char* mask_mode_name = (mask_mode == addon::kControlMaskRgb ? "rgb" : "depthfar");
     addon::control_mask_enabled = mask_enabled;
@@ -2733,7 +2733,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       // the preceding sequence's cut-aware normalization/Look history.
       addon::feed_mode = 1u;
       addon::norm_governor = 0u;
-      addon::detail_stability = (sequence_test ? 1u : 0u);  // 0 Auto, 1 Off.
+      addon::detail_stability = (sequence_test || jitter_test ? 1u : 0u);  // 0 Auto, 1 Off.
       addon::control_mask_mode = addon::kControlMaskRgb;
       addon::control_mask_motion_enabled = false;
       addon::control_mask_motion_start = 2.f;
@@ -2835,7 +2835,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     bool production_chain_completed = false;
     uint32_t prefix_host_evaluates = 0;
     size_t prefix_nr_evaluates = 0;
-    const uint32_t prefix_limit = (cost || sequence_test ? cost_prefix_frames : addon::kContractDebounceFrames + 32);
+    const uint32_t prefix_limit = (jitter_test ? 0 : (cost || sequence_test ? cost_prefix_frames : addon::kContractDebounceFrames + 32));
     for (uint32_t attempt = 0; attempt < prefix_limit; ++attempt) {
       native_runtime_masks.clear();
       native_runtime_results.clear();
@@ -2903,11 +2903,139 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       production_chain_completed = true;
       break;
     }
-    Check(production_chain_completed,
+    Check(jitter_test || production_chain_completed,
           "real Runtime completes the requested production stages within the debounce window");
+    constexpr std::array<std::array<float, 2>, 4> jitter_phases{{
+        {0.375f, 0.25f}, {-0.375f, 0.25f}, {0.375f, -0.25f}, {-0.375f, -0.25f}}};
+    const auto save_packed_plane = [&](const std::filesystem::path& directory, const std::string& filename,
+                                       const auto& data, const char* format, const char* encoding,
+                                       UINT plane_width, UINT plane_height) {
+      const auto byte_count = data.size() * sizeof(data[0]);
+      const auto* bytes = reinterpret_cast<const uint8_t*>(data.data());
+      std::ofstream file(directory / filename, std::ios::binary | std::ios::trunc);
+      file.write(reinterpret_cast<const char*>(bytes), static_cast<std::streamsize>(byte_count));
+      file.close();
+      Check(!file.fail(), "native sequence packed plane saved");
+      return nlohmann::json{{"file", filename}, {"format", format}, {"encoding", encoding},
+          {"width", plane_width}, {"height", plane_height}, {"bytes", byte_count},
+          {"crc32", renodx::utils::hash::ComputeCRC32(bytes, byte_count)}};
+    };
+    const auto runtime_identity = [&] {
+      ComPtr<IDXGIAdapter1> adapter;
+      Check(SUCCEEDED(gpu.factory->EnumAdapterByLuid(gpu.device->GetAdapterLuid(), IID_PPV_ARGS(&adapter))),
+            "native sequence actual device adapter");
+      DXGI_ADAPTER_DESC1 adapter_desc{};
+      Check(SUCCEEDED(adapter->GetDesc1(&adapter_desc)), "native sequence adapter identity");
+      LARGE_INTEGER driver_version{};
+      const auto driver_status = adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driver_version);
+      nlohmann::json identity{{"adapter", {{"vendor_id", adapter_desc.VendorId}, {"device_id", adapter_desc.DeviceId},
+          {"luid_low", adapter_desc.AdapterLuid.LowPart}, {"luid_high", adapter_desc.AdapterLuid.HighPart},
+          {"driver_version_raw", driver_version.QuadPart}, {"driver_status", driver_status}}},
+          {"loaded_ngx_modules", nlohmann::json::array()}};
+      std::array<HMODULE, 1024> modules{};
+      DWORD module_bytes = 0;
+      Check(EnumProcessModules(GetCurrentProcess(), modules.data(), sizeof(modules), &module_bytes)
+                && module_bytes <= sizeof(modules), "native sequence loaded module inventory");
+      for (size_t index = 0; index < module_bytes / sizeof(HMODULE); ++index) {
+        std::array<wchar_t, 32768> path{};
+        const auto length = GetModuleFileNameW(modules[index], path.data(), static_cast<DWORD>(path.size()));
+        Check(length != 0 && length < path.size(), "native sequence loaded module path");
+        const std::filesystem::path module_path(path.data());
+        if (module_path.filename().wstring().find(L"ngx") == std::wstring::npos) continue;
+        identity["loaded_ngx_modules"].push_back({{"path", module_path.string()},
+            {"sha256", addon::ComputeRuntimeSha256(module_path)},
+            {"version", addon::ReadNrRuntimeRequirements(module_path, gpu.device.Get()).file_version}});
+      }
+      return identity;
+    };
     nlohmann::json motion_report;
     nlohmann::json resize_report;
     nlohmann::json history_report;
+    nlohmann::json jitter_report;
+    if (jitter_test) {
+      const std::filesystem::path directory("jitter-calibration");
+      Check(std::filesystem::create_directory(directory), "jitter calibration uses a new isolated directory");
+      constexpr std::array<float, 2> edge{213.25f, 121.75f};
+      jitter_report = {{"schema", "nr-nexus-sr-jitter-calibration-v1"}, {"process_id", GetCurrentProcessId()},
+          {"host_sr_handle", reinterpret_cast<uintptr_t>(owner)}, {"evidence", "NATIVE_GPU+NATIVE_NGX"},
+          {"dimensions", {{"render", {render_width, render_height}}, {"output", {width, height}}}},
+          {"edge_render", edge}, {"runtime", addon::direct_runtime_requirements.file_version},
+          {"nr_sha256", addon::direct_runtime_sha256}, {"driver_x100", addon::direct_runtime_requirements.driver_x100},
+          {"provider_init", "public SDK ProjectID; real SR only; no NR Feature Evaluate"},
+          {"sampling", "unit box coverage of R vertical/G horizontal steps at pixelCenter+raster_sign*jitter"},
+          {"jitter_units", "render pixels"}, {"mv_jittered", false}, {"motion_scale", {1, 1}},
+          {"has_jitter", true}, {"create_flags", addon::features.at(owner).create_flags},
+          {"samples", nlohmann::json::array()}};
+      std::fill(depth_data.begin(), depth_data.end(), 0.5f);
+      std::fill(motion_data.begin(), motion_data.end(), uint16_t{0});
+      auto calibration_depth = gpu.CreateTextureTransfer(depth.Get());
+      gpu.Transition(depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+      gpu.UploadTexture(depth.Get(), calibration_depth, reinterpret_cast<const uint8_t*>(depth_data.data()),
+                        depth_data.size() * sizeof(float), render_width * sizeof(float));
+      gpu.Transition(depth.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      jitter_report["inputs"] = {
+          {"depth", save_packed_plane(directory, "depth.r32f", depth_data, "R32F", "constant normal depth", render_width, render_height)},
+          {"motion", save_packed_plane(directory, "motion.rg16f", motion_data, "RG16F", "zero physical motion; no jitter term", render_width, render_height)}};
+      for (uint32_t sample = 0; sample < 9; ++sample) {
+        const int raster_sign = (sample == 0 ? 0 : (sample <= 4 ? -1 : 1));
+        const std::array<float, 2> jitter = (sample == 0 ? std::array<float, 2>{0.f, 0.f} : jitter_phases[(sample - 1) % 4]);
+        for (UINT y = 0; y < render_height; ++y) {
+          for (UINT x = 0; x < render_width; ++x) {
+            const size_t pixel = static_cast<size_t>(y) * render_width + x;
+            const float sample_x = static_cast<float>(x) + 0.5f + raster_sign * jitter[0];
+            const float sample_y = static_cast<float>(y) + 0.5f + raster_sign * jitter[1];
+            const float red = 0.1f + 0.65f * std::clamp(sample_x + 0.5f - edge[0], 0.f, 1.f);
+            const float green = 0.15f + 0.6f * std::clamp(sample_y + 0.5f - edge[1], 0.f, 1.f);
+            color_data[pixel * 4] = DirectX::PackedVector::XMConvertFloatToHalf(red);
+            color_data[pixel * 4 + 1] = DirectX::PackedVector::XMConvertFloatToHalf(green);
+            color_data[pixel * 4 + 2] = DirectX::PackedVector::XMConvertFloatToHalf(0.25f);
+            color_data[pixel * 4 + 3] = DirectX::PackedVector::XMConvertFloatToHalf(1.f);
+          }
+        }
+        auto calibration_color = gpu.CreateTextureTransfer(color.Get());
+        gpu.Transition(color.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        gpu.UploadTexture(color.Get(), calibration_color, reinterpret_cast<const uint8_t*>(color_data.data()),
+                          color_data.size() * sizeof(uint16_t), render_width * 8);
+        gpu.Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        parameters.Set(NVSDK_NGX_Parameter_Reset, 1);
+        parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, jitter[0]);
+        parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, jitter[1]);
+        parameters.Set(NVSDK_NGX_Parameter_MV_Scale_X, 1.f);
+        parameters.Set(NVSDK_NGX_Parameter_MV_Scale_Y, 1.f);
+        Check(addon::GetFloat(&parameters, NVSDK_NGX_Parameter_Jitter_Offset_X, NAN) == jitter[0]
+                  && addon::GetFloat(&parameters, NVSDK_NGX_Parameter_Jitter_Offset_Y, NAN) == jitter[1],
+              "jitter calibration SDK parameters contain the exact two-axis offsets");
+        native_motion_sr_calls = 0;
+        native_runtime_results.clear();
+        auto sr_readback = gpu.CreateTextureTransfer(output.Get());
+        native_motion_sr_readback = &sr_readback;
+        addon::ngx_slot_real[0].evaluate = reinterpret_cast<void*>(ObserveNativeHostEvaluate);
+        const auto result = addon::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), owner, &parameters, nullptr);
+        addon::ngx_slot_real[0].evaluate = nullptr;
+        native_motion_sr_readback = nullptr;
+        Check(NVSDK_NGX_SUCCEED(result) && native_motion_sr_calls == 1 && native_runtime_results.empty(),
+              "each jitter calibration sample executes exactly one real SR and zero NR");
+        gpu.Submit();
+        Check(gpu.fence->GetCompletedValue() >= gpu.serial && SUCCEEDED(gpu.device->GetDeviceRemovedReason()),
+              "jitter calibration SR completes on a healthy GPU");
+        const std::string stem = "sample-" + std::to_string(sample);
+        jitter_report["samples"].push_back({{"index", sample}, {"raster_sign", raster_sign}, {"jitter", jitter},
+            {"sr", {{"calls", native_motion_sr_calls}, {"result", static_cast<uint32_t>(result)},
+                {"reset", addon::GetInt(&parameters, NVSDK_NGX_Parameter_Reset)}, {"nr_calls", 0}}},
+            {"fence", gpu.serial}, {"completed_fence", gpu.fence->GetCompletedValue()},
+            {"inputs", {{"color", save_packed_plane(directory, stem + "-input-color.rgba16f", color_data,
+                "RGBA16F", "linear HDR; analytic box-covered steps", render_width, render_height)}}},
+            {"planes", {{"sr", save_packed_plane(directory, stem + "-sr.rgba16f", gpu.ReadTexture(sr_readback),
+                "RGBA16F", "linear HDR", width, height)}}}});
+        std::ofstream file(directory / "sr-jitter-calibration.json", std::ios::binary | std::ios::trunc);
+        file << jitter_report.dump(2) << '\n';
+        file.close();
+        Check(!file.fail(), "jitter calibration partial evidence saved");
+      }
+      jitter_report.update(runtime_identity());
+      jitter_report["sequence_host_sr_evaluates"] = 9;
+      jitter_report["sequence_nr_evaluates"] = 0;
+    }
     if (sequence_test) {
       const auto history_look = addon::LookSettingsSnapshot(true);
       Check(addon::detail_stability.load() == 1u && history_look.stabilize == 0u
@@ -2920,6 +3048,18 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                        : condition == "baseline" || condition == "baseline-repeat"
                 || condition == "x2-compose" || condition == "x2-reset"), "known NR sequence condition");
       const bool sparse = condition == "x2-compose" || condition == "x2-reset";
+      const char* scene_environment = (cache_test ? std::getenv("NR_NEXUS_TEST_NR_CACHE_SCENE") : nullptr);
+      const std::string scene_id = (scene_environment != nullptr ? scene_environment : "default");
+      Check(scene_id == "default" || (cache_test && scene_id == "jitter-lighting"), "known NR cache scene");
+      const bool jitter_scene = scene_id == "jitter-lighting";
+      int raster_sign = 0;
+      if (jitter_scene) {
+        const char* sign_environment = std::getenv("NR_NEXUS_TEST_NR_RASTER_SIGN");
+        Check(sign_environment != nullptr && (std::strcmp(sign_environment, "-1") == 0
+                  || std::strcmp(sign_environment, "1") == 0 || std::strcmp(sign_environment, "+1") == 0),
+              "jitter scene requires the calibrated NR_NEXUS_TEST_NR_RASTER_SIGN=-1 or +1");
+        raster_sign = (std::strcmp(sign_environment, "-1") == 0 ? -1 : 1);
+      }
       const std::filesystem::path raw_directory(cache_test && condition == "baseline" ? "cache-baseline" : condition);
       Check(std::filesystem::create_directory(raw_directory), "history output is a new isolated condition directory");
       constexpr uint32_t frame_count = 24;
@@ -2928,6 +3068,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       constexpr std::array<int, frame_count> camera_delta{
           0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 2, 3, 4, 2, 3, 4, 0, 0, 0, 0, 0, 0};
       constexpr std::array<float, 6> light{1.f, 1.15f, 1.3f, 1.1f, 0.85f, 1.f};
+      constexpr std::array<float, 6> jitter_light{1.f, 1.15f, 1.15f, 1.15f, 0.85f, 0.85f};
       auto history_motion = gpu.Texture(render_width, render_height, DXGI_FORMAT_R16G16_FLOAT);
       gpu.Transition(history_motion.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
       const UINT intervals_per_frame = (cache_test ? 3u : 2u);
@@ -2938,6 +3079,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       std::vector<uint8_t> validity(render_pixel_count, 0), previous_validity(render_pixel_count, 0);
       auto& report = history_report;
       report = {{"schema", (cache_test ? "nr-nexus-nr-edit-reuse-cache-v1" : "nr-nexus-nr-edit-reuse-history-v1")}, {"condition", condition},
+          {"scene_id", scene_id}, {"raster_sign", raster_sign},
           {"process_id", GetCurrentProcessId()}, {"host_sr_handle", reinterpret_cast<uintptr_t>(owner)},
           {"evidence", "NATIVE_GPU+NATIVE_NGX"}, {"stage", "D3D12 Upscaled"}, {"passes", 1},
           {"dimensions", {{"render", {render_width, render_height}}, {"output", {width, height}}}},
@@ -2946,9 +3088,10 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           {"runtime", addon::direct_runtime_requirements.file_version}, {"nr_sha256", addon::direct_runtime_sha256},
           {"driver_x100", addon::direct_runtime_requirements.driver_x100},
           {"prefix", cost_prefix}, {"prefix_host_sr_evaluates", prefix_host_evaluates},
-          {"prefix_nr_evaluates", prefix_nr_evaluates}, {"jitter", {0, 0}}, {"has_jitter", true},
+          {"prefix_nr_evaluates", prefix_nr_evaluates}, {"jitter", (jitter_scene ? nlohmann::json("per-frame") : nlohmann::json({0, 0}))}, {"has_jitter", true},
           {"mv_jittered", false}, {"motion_scale", {1, 1}}, {"depth_convention", "normal; near 0 far 1"},
-          {"motion_convention", "current to previous render-grid pixels; integer sample positions; zero jitter"},
+          {"motion_convention", (jitter_scene ? "physical current-to-previous render pixels; no jitter in MV; guides raster sampled at pixelCenter+raster_sign*jitter"
+                                               : "current to previous render-grid pixels; integer sample positions; zero jitter")},
           {"composition", "d(t,t-2,x)=d(t,t-1,x)+d(t-1,t-2,x+d(t,t-1,x)); outside previous grid uses zero second step and valid bit1=0"},
           {"validity", "bit0: single-step same surface/in bounds; bit1: both steps valid"},
           {"feed_mode", addon::feed_mode.load()}, {"norm_governor", addon::norm_governor.load()},
@@ -2965,32 +3108,13 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         report["prefix_force_reset"] = true;
         report["edit_reuse_enabled"] = condition == "cache";
         report["validity"] = "output plane uint32: 0 exact current SR, 1 cached edit; fixture input valid remains two-step surface bits";
+        if (jitter_scene) {
+          report["raster_sampling"] = "color/depth/MV surface identity share pixelCenter+raster_sign*jitter; foreground edges (240.25,90.75) from frame0";
+          report["input_validity_sampling"] = "render raster labels compared at integer physical displacement; output validity is the production uint32 plane";
+          report["cache_motion_composition"] = "production raw guide q_prev=q+d1+jitter(t-1)-jitter(t); physical d(t,t-2)=d1+sample(previous motion,q_prev); input nr_motion plane remains the fixture single-step source";
+        }
       }
-      ComPtr<IDXGIAdapter1> adapter;
-      Check(SUCCEEDED(gpu.factory->EnumAdapterByLuid(gpu.device->GetAdapterLuid(), IID_PPV_ARGS(&adapter))),
-            "history actual device adapter");
-      DXGI_ADAPTER_DESC1 adapter_desc{};
-      Check(SUCCEEDED(adapter->GetDesc1(&adapter_desc)), "history adapter identity");
-      LARGE_INTEGER driver_version{};
-      const auto driver_status = adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driver_version);
-      report["adapter"] = {{"vendor_id", adapter_desc.VendorId}, {"device_id", adapter_desc.DeviceId},
-          {"luid_low", adapter_desc.AdapterLuid.LowPart}, {"luid_high", adapter_desc.AdapterLuid.HighPart},
-          {"driver_version_raw", driver_version.QuadPart}, {"driver_status", driver_status}};
-      report["loaded_ngx_modules"] = nlohmann::json::array();
-      std::array<HMODULE, 1024> modules{};
-      DWORD module_bytes = 0;
-      Check(EnumProcessModules(GetCurrentProcess(), modules.data(), sizeof(modules), &module_bytes)
-                && module_bytes <= sizeof(modules), "history loaded module inventory");
-      for (size_t index = 0; index < module_bytes / sizeof(HMODULE); ++index) {
-        std::array<wchar_t, 32768> path{};
-        const auto length = GetModuleFileNameW(modules[index], path.data(), static_cast<DWORD>(path.size()));
-        Check(length != 0 && length < path.size(), "history loaded module path");
-        const std::filesystem::path module_path(path.data());
-        if (module_path.filename().wstring().find(L"ngx") == std::wstring::npos) continue;
-        report["loaded_ngx_modules"].push_back({{"path", module_path.string()},
-            {"sha256", addon::ComputeRuntimeSha256(module_path)},
-            {"version", addon::ReadNrRuntimeRequirements(module_path, gpu.device.Get()).file_version}});
-      }
+      report.update(runtime_identity());
       int camera_shift = 0;
       uint32_t nr_calls = 0;
       bool previous_frame_reused = false;
@@ -3000,18 +3124,24 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         const uint64_t reuses_before = (cache_test ? addon::edit_reuse_reuses.load() : 0);
         const uint64_t fallbacks_before = (cache_test ? addon::edit_reuse_fallbacks.load() : 0);
         const bool refresh = !sparse || frame % 2 == 0;
-        const bool foreground = frame >= 12;
+        const std::array<float, 2> jitter = (jitter_scene ? jitter_phases[frame % jitter_phases.size()]
+                                                       : std::array<float, 2>{0.f, 0.f});
+        const bool foreground = jitter_scene || frame >= 12;
         const int foreground_left = 240 + (frame >= 12 ? 3 * static_cast<int>(frame - 12) : 0);
+        const float foreground_edge_x = foreground_left + (jitter_scene ? 0.25f : 0.f);
+        const float foreground_edge_y = (jitter_scene ? 90.75f : 90.f);
         const int foreground_delta = (frame > 12 ? 3 : 0);
         camera_shift += camera_delta[frame];
-        const float illumination = (frame >= 18 ? light[frame - 18] : 1.f);
+        const float illumination = (frame >= 18 ? (jitter_scene ? jitter_light[frame - 18] : light[frame - 18]) : 1.f);
         for (UINT y = 0; y < render_height; ++y) {
           for (UINT x = 0; x < render_width; ++x) {
             const size_t pixel = static_cast<size_t>(y) * render_width + x;
-            surface[pixel] = foreground && static_cast<int>(x) >= foreground_left
-                && static_cast<int>(x) < foreground_left + 96 && y >= 90 && y < 270;
-            const float u = static_cast<float>(static_cast<int>(x) - camera_shift) / render_width;
-            const float v = static_cast<float>(y) / render_height;
+            const float sample_x = (jitter_scene ? static_cast<float>(x) + 0.5f + raster_sign * jitter[0] : static_cast<float>(x));
+            const float sample_y = (jitter_scene ? static_cast<float>(y) + 0.5f + raster_sign * jitter[1] : static_cast<float>(y));
+            surface[pixel] = foreground && sample_x >= foreground_edge_x
+                && sample_x < foreground_edge_x + 96.f && sample_y >= foreground_edge_y && sample_y < foreground_edge_y + 180.f;
+            const float u = (sample_x - camera_shift) / render_width;
+            const float v = sample_y / render_height;
             const std::array<float, 3> rgb = (surface[pixel] != 0
                 ? std::array<float, 3>{0.65f, 0.18f + 0.1f * v, 0.12f}
                 : std::array<float, 3>{0.35f + 0.2f * std::sin(u * 40.f) + 0.1f * v,
@@ -3065,6 +3195,10 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         parameters.Set(NVSDK_NGX_Parameter_Reset, (frame == 0 ? 1 : 0));
         parameters.Set(NVSDK_NGX_Parameter_MV_Scale_X, 1.f);
         parameters.Set(NVSDK_NGX_Parameter_MV_Scale_Y, 1.f);
+        if (jitter_scene) {
+          parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, jitter[0]);
+          parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, jitter[1]);
+        }
         auto sr_readback = gpu.CreateTextureTransfer(output.Get());
         const auto& workset = addon::worksets.at({owner, output.Get(), false});
         auto proxy_readback = gpu.CreateTextureTransfer(workset.proxy);
@@ -3151,16 +3285,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         const std::string stem = "frame-" + std::to_string(1000 + frame).substr(1);
         const auto save = [&](const char* suffix, const auto& data, const char* format, const char* encoding,
                               UINT plane_width, UINT plane_height) {
-          const auto byte_count = data.size() * sizeof(data[0]);
-          const auto* bytes = reinterpret_cast<const uint8_t*>(data.data());
-          const std::string filename = stem + "-" + suffix;
-          std::ofstream file(raw_directory / filename, std::ios::binary | std::ios::trunc);
-          file.write(reinterpret_cast<const char*>(bytes), static_cast<std::streamsize>(byte_count));
-          file.close();
-          Check(!file.fail(), "history packed plane saved");
-          return nlohmann::json{{"file", filename}, {"format", format}, {"encoding", encoding},
-              {"width", plane_width}, {"height", plane_height}, {"bytes", byte_count},
-              {"crc32", renodx::utils::hash::ComputeCRC32(bytes, byte_count)}};
+          return save_packed_plane(raw_directory, stem + "-" + suffix, data, format, encoding, plane_width, plane_height);
         };
         const auto sr_bytes = gpu.ReadTexture(sr_readback);
         nlohmann::json planes{{"sr", save("sr.rgba16f", sr_bytes, "RGBA16F", "linear HDR", width, height)},
@@ -3201,6 +3326,8 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           nr["whole_chain_gpu_ticks"] = {timing.begin_tick, timing.end_tick};
         }
         report["frames"].push_back({{"frame", frame}, {"scene", (frame < 6 ? "stationary" : (frame < 12 ? "translation" : (frame < 18 ? "occlusion" : "lighting")))},
+            {"jitter", jitter}, {"raster_sign", raster_sign},
+            {"foreground_edge_render", {foreground_edge_x, foreground_edge_y}},
             {"refresh", refresh}, {"camera_shift", camera_shift}, {"camera_delta", camera_delta[frame]},
             {"foreground_left", foreground_left}, {"illumination", illumination},
             {"composition_differs_from_double_valid_pixels", composition_differs_from_double},
@@ -3212,7 +3339,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                 {"valid", save("valid.r8", validity, "R8_UINT", "bit0 one-step bit1 two-step", render_width, render_height)}}},
             {"planes", planes}, {"sr", {{"calls", native_motion_sr_calls}, {"result", static_cast<uint32_t>(result)},
                 {"reset", frame == 0 ? 1 : 0}, {"handle", reinterpret_cast<uintptr_t>(owner)},
-                {"create_flags", addon::features.at(owner).create_flags}, {"has_jitter", true}, {"jitter", {0, 0}},
+                {"create_flags", addon::features.at(owner).create_flags}, {"has_jitter", true}, {"jitter", jitter},
                 {"mv_jittered", false}, {"motion_scale", {1, 1}}, {"pre_exposure", 1.f}, {"exposure_scale", 1.f},
                 {"gpu_ms", sr_timing.gpu_ms}, {"gpu_ticks", {sr_timing.begin_tick, sr_timing.end_tick}}}},
             {"nr", nr}, {"fence", gpu.serial}, {"completed_fence", gpu.fence->GetCompletedValue()}});
@@ -3548,7 +3675,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       Check(!file.fail(), "resize evidence JSON saved");
       native_resize_ready = false;
     }
-    if (motion_test && !resize_test && !sequence_test) {
+    if (motion_test && !resize_test && !sequence_test && !jitter_test) {
       constexpr std::array<float, 8> speeds{0.f, 0.f, 2.f, 8.f, 16.f, 0.f, 0.f, 0.f};
       std::array<std::vector<uint8_t>, speeds.size()> reference;
       std::array<std::vector<uint8_t>, speeds.size()> reference_sr;
@@ -4071,7 +4198,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     output_readback->Unmap(0, nullptr);
     const bool keep_raw_output = std::getenv("NR_NEXUS_TEST_KEEP_RAW") != nullptr
         && std::strcmp(std::getenv("NR_NEXUS_TEST_KEEP_RAW"), "1") == 0;
-    if (keep_raw_output) {
+    if (keep_raw_output && !jitter_test) {
       std::ofstream output_file("controlmask-production-output.rgba16f",
                                 std::ios::binary | std::ios::trunc);
       Check(output_file.is_open(), "production output file opens");
@@ -4079,7 +4206,11 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                         static_cast<std::streamsize>(output_bytes.size()));
       Check(output_file.good(), "production output bytes are saved");
     }
-    std::cout << "PASS ControlMask production chain stages=" << (single_stage ? "Upscaled" : "Render+Upscaled")
+    if (jitter_test) {
+      std::cout << "PASS SR jitter calibration samples=9 real_sr_evaluates=9 nr_evaluates=0 size="
+                << width << 'x' << height << " raw=jitter-calibration; raster sign pending CPU analysis\n";
+    } else {
+      std::cout << "PASS ControlMask production chain stages=" << (single_stage ? "Upscaled" : "Render+Upscaled")
               << " evidence=NATIVE_GPU+NATIVE_NGX host_sr=" << (motion_test ? "NATIVE_NGX" : "MOCK") << " frames="
               << (sequence_test ? 24 : (resize_test ? 180 : (cost ? 80 : (motion_test ? 16 : (hot_toggle ? 52 : 1)))))
               << (cache_test ? " frame_scope=nr-cache" : (history_test ? " frame_scope=nr-history" : (resize_test ? " frame_scope=high-low-high" : (motion_test ? " frame_scope=paired_only" : ""))))
@@ -4087,17 +4218,20 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
               << (mask_enabled ? mask_mode_name : "off")
               << " output_readback=rgba16f raw="
               << (keep_raw_output ? "retained" : "discarded") << "\n";
+    }
 
     if (motion_test) {
       addon::enabled = false;
       native_runtime_results.clear();
       native_motion_sr_calls = 0;
-      addon::ngx_slot_real[0].evaluate = reinterpret_cast<void*>(ObserveNativeHostEvaluate);
-      const auto resumed = addon::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), owner, &parameters, nullptr);
-      addon::ngx_slot_real[0].evaluate = nullptr;
-      gpu.Submit();
-      Check(NVSDK_NGX_SUCCEED(resumed) && native_motion_sr_calls == 1 && native_runtime_results.empty(),
-            "real SR continues once with no NR Evaluate after the add-on is disabled");
+      if (!jitter_test) {
+        addon::ngx_slot_real[0].evaluate = reinterpret_cast<void*>(ObserveNativeHostEvaluate);
+        const auto resumed = addon::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), owner, &parameters, nullptr);
+        addon::ngx_slot_real[0].evaluate = nullptr;
+        gpu.Submit();
+        Check(NVSDK_NGX_SUCCEED(resumed) && native_motion_sr_calls == 1 && native_runtime_results.empty(),
+              "real SR continues once with no NR Evaluate after the add-on is disabled");
+      }
       addon::ngx_slot_real[0].release = reinterpret_cast<void*>(NVSDK_NGX_D3D12_ReleaseFeature);
       const auto released = addon::HookedReleaseFeatureSlot<0>(sr_handle);
       addon::ngx_slot_real[0].release = nullptr;
@@ -4125,7 +4259,17 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       Check(NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D12_DestroyParameters(sr_parameters)), "release real SR parameters");
       Check(NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D12_Shutdown1(gpu.device.Get())), "public SDK device shutdown");
       native_motion_gpu = nullptr;
-      if (sequence_test) {
+      if (jitter_test) {
+        jitter_report["teardown"] = {{"sr_release", true}, {"sdk_shutdown", true},
+            {"identity_bridge_installed", false}, {"nr_evaluates", 0}};
+        jitter_report["total_host_sr_evaluates"] = 9;
+        jitter_report["total_nr_evaluates"] = 0;
+        std::ofstream file(std::filesystem::path("jitter-calibration") / "sr-jitter-calibration.json",
+                           std::ios::binary | std::ios::trunc);
+        file << jitter_report.dump(2) << '\n';
+        file.close();
+        Check(!file.fail(), "jitter calibration completed teardown evidence saved");
+      } else if (sequence_test) {
         history_report["teardown"] = {{"sr_continues_without_nr", true}, {"sr_release", true},
             {"sdk_shutdown", true}, {"identity_bridge_installed", false},
             {"disabled_host_sr_evaluates", native_motion_sr_calls}};

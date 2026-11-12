@@ -215,6 +215,146 @@ int Run() {
           "RG32 composed motion retains finite 80000 raw units for an in-bounds 0.8-pixel displacement");
     std::cout << "PASS edit reuse WARP shader: known edit, scaled reprojection, edge/depth/color rejection, neutral exact RGBA\n";
 
+    {
+      // These are physical guide-raster offsets, independent of the SR API's
+      // jitter sign. The 1.5 ratio places two output centers on opposite sides
+      // of a guide texel boundary, distinguishing correct/omitted/reversed offsets.
+      constexpr uint32_t witness_size = 12, witness_grid = 8;
+      auto witness_proxy = gpu.Texture(witness_size, witness_size, DXGI_FORMAT_R32G32B32A32_FLOAT);
+      auto witness_neural = uav_texture(witness_size, witness_size, DXGI_FORMAT_R32G32B32A32_FLOAT);
+      auto witness_motion = gpu.Texture(witness_grid, witness_grid, DXGI_FORMAT_R32G32_FLOAT);
+      auto witness_depth = gpu.Texture(witness_grid, witness_grid, DXGI_FORMAT_R32_FLOAT);
+      auto witness_original = gpu.Texture(witness_size, witness_size, DXGI_FORMAT_R32G32B32A32_FLOAT);
+      auto witness_decoded = uav_texture(witness_size, witness_size, DXGI_FORMAT_R32G32B32A32_FLOAT);
+      std::vector<float> witness_proxy_values(witness_size * witness_size * 4);
+      std::vector<float> witness_neural_values(witness_size * witness_size * 4);
+      std::vector<float> witness_original_values(witness_size * witness_size * 4);
+      std::vector<float> witness_motion_values(witness_grid * witness_grid * 2, 0.f);
+      std::vector<float> witness_depth_values(witness_grid * witness_grid);
+      for (uint32_t y = 0; y < witness_size; ++y) {
+        for (uint32_t x = 0; x < witness_size; ++x) {
+          const size_t pixel = static_cast<size_t>(y) * witness_size + x;
+          const float edit = .2f + .02f * x + .03f * y;
+          for (uint32_t channel = 0; channel < 3; ++channel) {
+            witness_proxy_values[pixel * 4 + channel] = encode(.125f);
+            witness_neural_values[pixel * 4 + channel] = encode(.125f * std::exp2(edit));
+            witness_original_values[pixel * 4 + channel] = .03125f * (channel + 1) + static_cast<float>(pixel) / 1024.f;
+          }
+          witness_proxy_values[pixel * 4 + 3] = .375f;
+          witness_neural_values[pixel * 4 + 3] = .875f;
+          witness_original_values[pixel * 4 + 3] = .25f + .03125f * (pixel % 4);
+        }
+      }
+      for (uint32_t y = 0; y < witness_grid; ++y) {
+        for (uint32_t x = 0; x < witness_grid; ++x) {
+          witness_depth_values[y * witness_grid + x] = .25f + (x >= 4 ? .25f : 0.f) + (y >= 4 ? .125f : 0.f);
+        }
+      }
+      upload(witness_proxy.Get(), witness_proxy_values, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, witness_size * 16);
+      upload(witness_neural.Get(), witness_neural_values, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, witness_size * 16);
+      upload(witness_motion.Get(), witness_motion_values, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, witness_grid * 8);
+      upload(witness_depth.Get(), witness_depth_values, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, witness_grid * 4);
+      upload(witness_original.Get(), witness_original_values, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, witness_size * 16);
+      upload(witness_decoded.Get(), std::vector<float>(witness_size * witness_size * 4, -7.f),
+          D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, witness_size * 16);
+      reuse::Inputs witness_inputs{.width = witness_size, .height = witness_size,
+          .motion_width = witness_grid, .motion_height = witness_grid,
+          .proxy = witness_proxy.Get(), .neural = witness_neural.Get(), .motion = witness_motion.Get(),
+          .depth = witness_depth.Get(), .original = witness_original.Get(), .decoded = witness_decoded.Get()};
+      const std::array<std::array<float, 2>, 3> raster_offsets{{{.4f, -.4f}, {0.f, 0.f}, {-.4f, .4f}}};
+      const std::array<std::array<uint32_t, 2>, 4> witness_pixels{{{5, 1}, {6, 1}, {1, 5}, {1, 6}}};
+      const std::array<std::array<float, 4>, 3> expected_depth{{
+          {.5f, .5f, .25f, .25f}, {.25f, .5f, .25f, .375f}, {.25f, .25f, .375f, .375f}}};
+      std::array<reuse::State, 3> raster_states;
+      std::array<std::vector<uint8_t>, 3> captured_anchors;
+      for (size_t variant = 0; variant < raster_offsets.size(); ++variant) {
+        witness_inputs.raster_offset_x = raster_offsets[variant][0];
+        witness_inputs.raster_offset_y = raster_offsets[variant][1];
+        Check(reuse::Record(gpu.device.Get(), gpu.list.Get(), &raster_states[variant], witness_inputs, reuse::Phase::CAPTURE),
+              "capture GPU raster-offset depth witnesses");
+        captured_anchors[variant] = read_buffer(raster_states[variant].anchor.Get());
+        for (size_t point = 0; point < witness_pixels.size(); ++point) {
+          const size_t pixel = witness_pixels[point][1] * witness_size + witness_pixels[point][0];
+          std::array<float, 8> anchor;
+          std::memcpy(anchor.data(), captured_anchors[variant].data() + pixel * 32, 32);
+          Check(anchor[3] == 1.f && anchor[7] == expected_depth[variant][point],
+                "GPU guide lookup distinguishes both axes from missing or reversed raster offsets");
+        }
+      }
+      for (const size_t pixel : {size_t{2}, size_t{2 * witness_size + witness_size - 1}}) {
+        float anchor_valid = 1.f;
+        std::memcpy(&anchor_valid, captured_anchors[0].data() + pixel * 32 + 3 * sizeof(float), sizeof(float));
+        Check(anchor_valid == 0.f, "capture marks out-of-grid raster guides invalid rather than clamping an anchor");
+      }
+
+      // Current motion is zero. Only guide sampling changes: the edit itself
+      // must remain at the same output pixel, without a jitter-difference shift.
+      witness_inputs.raster_offset_x = 0.f;
+      witness_inputs.raster_offset_y = 0.f;
+      witness_inputs.previous_motion_offset_x = .4f;
+      witness_inputs.previous_motion_offset_y = -.4f;
+      gpu.Transition(witness_neural.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      Check(reuse::Record(gpu.device.Get(), gpu.list.Get(), &raster_states[0], witness_inputs, reuse::Phase::APPLY),
+            "reproject canonical edit with nonzero raster-offset difference");
+      gpu.Transition(witness_neural.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NATIVE_INPUT_STATE);
+      Check(reuse::Record(gpu.device.Get(), gpu.list.Get(), &raster_states[0], witness_inputs, reuse::Phase::SELECT_ORIGINAL),
+            "select exact source for invalid offset anchor");
+      auto witness_model = stage_execution_cases::Capture(gpu, witness_neural.Get(), NATIVE_INPUT_STATE);
+      auto witness_final = stage_execution_cases::Capture(gpu, witness_decoded.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      const auto witness_validity_bytes = read_buffer(raster_states[0].validity.Get());
+      const auto witness_model_bytes = witness_model.Pixels();
+      const auto witness_final_bytes = witness_final.Pixels();
+      uint32_t anchor_rejected = 1, interior_valid = 0;
+      std::memcpy(&anchor_rejected, witness_validity_bytes.data() + 2 * sizeof(uint32_t), sizeof(uint32_t));
+      constexpr size_t interior = 8 * witness_size + 8;
+      std::memcpy(&interior_valid, witness_validity_bytes.data() + interior * sizeof(uint32_t), sizeof(uint32_t));
+      Check(anchor_rejected == 0 && interior_valid == 1, "apply rejects invalid captured guides while retaining interior edit");
+      Check(std::memcmp(witness_final_bytes.data() + 2 * 16, witness_original_values.data() + 2 * 4, 16) == 0,
+            "invalid raster anchor returns exact current source color and alpha");
+      std::array<float, 4> unmoved_edit;
+      std::memcpy(unmoved_edit.data(), witness_model_bytes.data() + interior * 16, 16);
+      for (size_t channel = 0; channel < 3; ++channel) {
+        Check(std::fabs(unmoved_edit[channel] - encode(.125f * std::exp2(.6f))) < 3e-5f,
+              "raster jitter difference is not added to the final edit displacement");
+      }
+      Check(unmoved_edit[3] == .375f && read_buffer(raster_states[0].anchor.Get()) == captured_anchors[0],
+            "offset reuse preserves current proxy alpha and does not rewrite its anchor");
+
+      for (uint32_t y = 0; y < witness_grid; ++y) {
+        for (uint32_t x = 0; x < witness_grid; ++x) {
+          witness_motion_values[(y * witness_grid + x) * 2] = (x < 4 ? 0.f : 2.f);
+          witness_motion_values[(y * witness_grid + x) * 2 + 1] = (y < 4 ? 0.f : -2.f);
+        }
+      }
+      upload(witness_motion.Get(), witness_motion_values, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, witness_grid * 8);
+      Check(reuse::Record(gpu.device.Get(), gpu.list.Get(), &raster_states[0], witness_inputs, reuse::Phase::SNAPSHOT_MOTION),
+            "snapshot previous raw-grid motion step");
+      for (size_t pixel = 0; pixel < witness_motion_values.size() / 2; ++pixel) {
+        witness_motion_values[pixel * 2] = .25f;
+        witness_motion_values[pixel * 2 + 1] = -.25f;
+      }
+      upload(witness_motion.Get(), witness_motion_values, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, witness_grid * 8);
+      const std::array<std::array<float, 2>, 3> expected_composed{{{.25f, -2.25f}, {.75f, -1.75f}, {2.25f, -.25f}}};
+      for (size_t variant = 0; variant < raster_offsets.size(); ++variant) {
+        witness_inputs.raster_offset_x = raster_offsets[variant][0];
+        witness_inputs.raster_offset_y = raster_offsets[variant][1];
+        witness_inputs.previous_motion_offset_x = -raster_offsets[variant][0];
+        witness_inputs.previous_motion_offset_y = -raster_offsets[variant][1];
+        Check(reuse::Record(gpu.device.Get(), gpu.list.Get(), &raster_states[0], witness_inputs, reuse::Phase::MOTION),
+              "compose GPU motion with previous minus current raster offset");
+        auto witness_composed = stage_execution_cases::Capture(gpu, raster_states[0].composed_motion.Get(),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        submit_commands("raster-offset composed motion witness");
+        const auto bytes = witness_composed.Pixels();
+        std::array<float, 2> actual;
+        std::memcpy(actual.data(), bytes.data() + (4 * witness_grid + 3) * sizeof(float) * 2, sizeof(actual));
+        Check(std::fabs(actual[0] - expected_composed[variant][0]) < 2e-5f
+                  && std::fabs(actual[1] - expected_composed[variant][1]) < 2e-5f,
+              "two-step GPU motion distinguishes correct, omitted and reversed raster-offset differences");
+      }
+      std::cout << "PASS edit reuse WARP raster offsets: ratio=1.5 both axes, capture validity, exact RGBA, canonical edit, two-step motion\n";
+    }
+
     // Use the production SR wrapper with GPU-copy SR and NR substitutes. The
     // model call counter observes actual wrapper invocations, never cadence requests.
     native::enabled = true;
@@ -346,9 +486,20 @@ int Run() {
     Check(model_resets.back() == 1, "missing source sample resets the real NR history");
     parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, .25f);
     parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, -.375f);
+    const auto before_jitter_reuses = native::edit_reuse_reuses.load();
     const auto before_jitter_fallbacks = native::edit_reuse_fallbacks.load();
+    Check(frame(0) == 0 && native::edit_reuse_reuses.load() == before_jitter_reuses + 1,
+          "complete nonzero jitter retains x2 reuse cadence");
+    const auto& jitter_cache = native::features.at(owner).slots[0].edit_reuse;
+    Check(jitter_cache->motion_offset_x == .25f && jitter_cache->motion_offset_y == -.375f,
+          "skipped physical-frame motion retains its own two-axis raster offset");
+    parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, -.375f);
+    parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, .25f);
+    Check(frame(0) == 1 && native::edit_reuse_fallbacks.load() == before_jitter_fallbacks,
+          "next nonzero jitter phase refreshes NR with composed physical motion");
+    parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, .75f);
     Check(frame(0) == 1 && native::edit_reuse_fallbacks.load() > before_jitter_fallbacks,
-          "unvalidated nonzero jitter declines cache and retains per-frame NR");
+          "jitter outside the validated render-pixel range retains per-frame NR");
     parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, 0.f);
     parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, 0.f);
     Check(frame(1) == 1, "refresh recovers after unsupported jitter");
@@ -365,7 +516,7 @@ int Run() {
     const auto before_partial_jitter_fallbacks = native::edit_reuse_fallbacks.load();
     Check(frame(0) == 1 && native::edit_reuse_reuses.load() == before_partial_jitter_reuses
               && native::edit_reuse_fallbacks.load() > before_partial_jitter_fallbacks,
-          "a partial jitter pair cannot be mistaken for zero jitter");
+          "a partial jitter pair cannot establish a guide sampling contract");
     parameters = complete_parameters;
     Check(frame(1) == 1, "complete zero jitter contract restores refresh");
     native::edit_reuse_enabled = false;

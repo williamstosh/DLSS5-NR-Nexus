@@ -284,7 +284,8 @@ Standard 在分析后回收登记的原始平面，保留 JSON、日志、预览
 
 `nr-edit-reuse-contracts` 在 WARP＋MOCK 上检查生产 Shader 的已知编辑、运动缩放、边界／深度／颜色拒绝、
 中性及无效像素的精确原色／alpha；通过真实 wrapper 检查一次复用上限、Reset／设置变化／断档、
-非零 jitter 回退、关闭、失败和丢弃录制的资源生命周期。
+非零 jitter 的刷新／复用、超范围或缺轴回退、关闭、失败和丢弃录制的资源生命周期。
+1.5 倍采样比例的独立像素检查区分两轴 offset 正确、遗漏和反号，并核对两步 MV 的上一基础帧位置。
 
 ~~~powershell
 pwsh -File tools/run-tests.ps1 -Suite fg-native -NativeCase nr-edit-reuse-contracts `
@@ -294,7 +295,7 @@ pwsh -File tools/run-tests.ps1 -Suite fg-native -NativeCase nr-edit-reuse-contra
 `nr-edit-reuse-cache` 对相同的24帧短序列启动独立逐帧／缓存进程；SR 始终每帧运行，NR 的跳过、
 组合运动和最终原色回填由生产 wrapper 完成，测试观察器不替换模型输入。
 两组使用缓存开启且每次 Reset 的相同创建前缀，正式第0帧均 Reset；基线此时关闭缓存。
-当前条件为请求 B、原生 D3D12 Upscaled、100% RGBA16F HDR、零 jitter、单 Pass，关闭 Look、
+当前条件为请求 B、原生 D3D12 Upscaled、100% RGBA16F HDR、单 Pass，关闭 Look、
 Detail stability、ControlMask、自适应分辨率及 FG。
 
 ~~~powershell
@@ -311,6 +312,25 @@ pwsh -File tools/run-tests.ps1 -Suite fg-native -NativeCase nr-edit-reuse-cache 
 Resolve、Commit 和最终回填；测试平面读回与查询结果拷贝在计时外。分别报告刷新、复用、整体均值及分位数，
 不由调用减半推导 FPS。质量差异保留为测量，动态画质仍需人工验收。
 Standard 收尾与上一实验相同；分析器定向测试为 `test_nr_edit_cache_analysis.py`。
+
+默认序列保持零 jitter。验证非零 jitter 时，先用相同运行参数将 `-NativeCase` 改为
+`nr-edit-reuse-jitter`，输出到新的隔离目录。它只执行九次真实 SR、每次 Reset，不调用 NR：
+零 jitter 参考及两个光栅采样符号各四个双轴相位。`sr_jitter.py` 测量 R／G 边缘相对参考的位置，
+在 `sr-jitter-analysis.json` 保存误差、符号结论及原始 SHA；结果不明确则停止后续带 jitter 的对照。
+该校准建立夹具与实际 SR 参数的对应关系，不替代游戏 guides 契约检查。
+
+校准明确后，将 `NR_NEXUS_TEST_NR_CACHE_SCENE` 设为 `jitter-lighting`，
+`NR_NEXUS_TEST_NR_RASTER_SIGN` 设为报告中的 `raster_sampling_sign`，再运行一次 `nr-edit-reuse-cache`。
+颜色、深度及运动所属表面的采样共享同一光栅偏移，MV 本身不含 jitter。
+固定四个相位为 `(±0.375, ±0.25)` 渲染像素，前景边缘从第0帧存在；
+末六帧光照为 `1, 1.15, 1.15, 1.15, 0.85, 0.85`，用于观察突变与下一次刷新后的恢复。
+生产 guide 采样使用当前 jitter，组合 MV 使用上一基础帧与当前帧的 jitter 差；
+最终编辑位移不加 jitter 差，NR 仍收到当前 API jitter。
+
+分析器在静止背景区域比较 `log2(final luma / SR luma)`，分离光照本身与 NR 编辑消失／恢复；
+`lighting_roi` 保存相对逐帧基线的编辑差及额外时间变化。`cache-lighting-strip.png` 为六帧对照，
+`cache-lighting-preview.png` 是每帧250ms的慢速 APNG，仅用于定位变化，不模拟游戏播放节奏。
+校准分析器的合成回归入口为 `test_sr_jitter_analysis.py`。
 
 ## ControlMask 原生成本
 

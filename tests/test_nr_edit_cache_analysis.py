@@ -87,6 +87,30 @@ class CacheAnalysisTests(unittest.TestCase):
         with self.assertRaisesRegex(cache.ContractError, "invented a model sample"):
             cache.analyze(self.root)
 
+    def test_lighting_loss_and_recovery_are_separate_from_source_change(self):
+        for name in cache.CONDITIONS:
+            report_path = self.root / name / "nr-edit-reuse-cache.json"
+            report = json.loads(report_path.read_text())
+            for frame in report["frames"]:
+                index = frame["frame"]
+                frame["scene"] = "lighting"
+                source = np.frombuffer((self.root / name / frame["planes"]["sr"]["file"]).read_bytes(), dtype="<f2").reshape(2, 4, 4)
+                final = source.copy()
+                loses_edit = name == "cache" and index == 1
+                if not loses_edit:
+                    final[..., :3] *= 1.25
+                frame["planes"]["final"] = self.write_plane(self.root / name, index, "final", final, "RGBA16F")
+                if frame["frame_kind"] == "reuse":
+                    validity = np.full((2, 4, 1), int(not loses_edit), dtype="<u4")
+                    frame["planes"]["validity"] = self.write_plane(self.root / name, index, "validity", validity, "R32_UINT")
+            report_path.write_text(json.dumps(report))
+        result = cache.analyze(self.root)
+        loss = result["comparisons"][1]["lighting_roi"]["temporal_error_stops"]["signed_mean"]
+        recovery = result["comparisons"][2]["lighting_roi"]["temporal_error_stops"]["signed_mean"]
+        self.assertAlmostEqual(loss, -np.log2(1.25), places=3)
+        self.assertAlmostEqual(recovery, np.log2(1.25), places=3)
+        self.assertTrue((self.root / "cache-lighting-preview.png").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()
