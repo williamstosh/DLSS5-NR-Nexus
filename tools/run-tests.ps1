@@ -12,7 +12,7 @@ param(
     [string]$DetoursLibrary,
     [string]$PythonExecutable,
     [ValidateSet('Auto','Quick','Full','None')][string]$UiPreview = 'Auto',
-    [ValidateSet('control-mask','control-mask-safety','control-mask-safety-hardware','control-mask-capture','control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','control-mask-native-ngx-fg','gpu-pass-diagnostics','native-required-menu','native-owner-idle','native-options-resume','native-options-delayed','native-guide-contract','present-guide-models','adaptive-fg-service','adaptive-inline','vulkan-recorded-use-contract','native-present-decision','trace-metadata','stage-chain','stage-resolution','stage-resolution-hardware','same-stage-resolution','same-stage-resolution-hardware','render-stage-resolution','render-stage-resolution-hardware','present-stage-resolution','present-stage-resolution-hardware','native-prefg-resolution','native-prefg-resolution-hardware','native-frame-identity','same-stage-model-pair','same-stage-mixed-pair','source-lifecycle','feature-switch','feature-switch-hardware','f5-mixed','present-chain','present-chain-hardware','present-chain-scrgb','present-chain-hdr10','native-full','native-full-hardware')]
+    [ValidateSet('control-mask','control-mask-safety','control-mask-safety-hardware','control-mask-capture','control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','control-mask-native-ngx-fg','gpu-pass-diagnostics','native-required-menu','native-owner-idle','native-options-resume','native-options-delayed','native-guide-contract','present-guide-models','adaptive-fg-service','adaptive-inline','vulkan-recorded-use-contract','native-present-decision','trace-metadata','stage-chain','stage-resolution','stage-resolution-hardware','same-stage-resolution','same-stage-resolution-hardware','render-stage-resolution','render-stage-resolution-hardware','present-stage-resolution','present-stage-resolution-hardware','native-prefg-resolution','native-prefg-resolution-hardware','native-frame-identity','same-stage-model-pair','same-stage-mixed-pair','source-lifecycle','feature-switch','feature-switch-hardware','f5-mixed','present-chain','present-chain-hardware','present-chain-scrgb','present-chain-hdr10','native-full','native-full-hardware')]
     [string[]]$NativeCase = @(),
     [switch]$VulkanNativeNgx,
     [string]$NativeNgxProjectIdPath,
@@ -61,9 +61,12 @@ if ($BuildOnly -and @($Suite | Where-Object { $_ -in @('config','constants','lif
     throw '-BuildOnly requires explicitly selecting native/policy/scope/fg-xefg/fg-native/bridge-motion suites.'
 }
 if ($NativeCase.Count -and $Suite -notcontains 'fg-native') { throw '-NativeCase requires -Suite fg-native (or all).' }
+if ($NativeCase -contains 'nr-edit-reuse-history' -and -not $BuildOnly -and -not $PythonExecutable) {
+    throw 'nr-edit-reuse-history requires -PythonExecutable with NumPy and Pillow for paired analysis before raw cleanup.'
+}
 if ($VulkanNativeNgx -and $Suite -notcontains 'vulkan-control-mask') { throw '-VulkanNativeNgx requires -Suite vulkan-control-mask (or all).' }
 if ($VulkanNativeNgx -and $SoftwareOnly) { throw '-VulkanNativeNgx requires a native Vulkan GPU.' }
-$usesNativeNgx = $VulkanNativeNgx -or (@($NativeCase | Where-Object { $_ -in @('control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','control-mask-native-ngx-fg') }).Count -gt 0)
+$usesNativeNgx = $VulkanNativeNgx -or (@($NativeCase | Where-Object { $_ -in @('control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','control-mask-native-ngx-fg') }).Count -gt 0)
 if (@($Suite | Where-Object { $_ -in @('fg-native','vulkan-control-mask') }).Count -gt 0 -and ($usesNativeNgx -or $NativeNgxSdkLibraryDirectory)) {
     if (-not $NativeNgxSdkLibraryDirectory -or
         -not (Test-Path -LiteralPath (Join-Path $NativeNgxSdkLibraryDirectory 'nvsdk_ngx_s.lib') -PathType Leaf)) {
@@ -184,13 +187,45 @@ foreach ($item in $Suite) {
             }
         } elseif ($item -eq 'fg-native' -and $NativeCase.Count) {
             foreach ($case in $NativeCase) {
-                if ($case -in @('control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','control-mask-native-ngx-fg')) {
+                if ($case -in @('control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','control-mask-native-ngx-fg')) {
                     $runtimeLink = Join-Path $directory 'nvngx_dlssnr.dll'
                     if (Test-Path -LiteralPath $runtimeLink) { throw "Runtime link target already exists: $runtimeLink" }
                     New-Item -ItemType HardLink -Path $runtimeLink -Target $NativeNgxRuntimePath | Out-Null
                     try {
                         $nativeArgument = "--$case"
-                        Invoke-TestProcess $exe $directory $case @($nativeArgument, $NativeNgxProjectIdPath) -TimeoutMilliseconds 90000
+                        if ($case -eq 'nr-edit-reuse-history') {
+                            $previousCondition = $env:NR_NEXUS_TEST_NR_HISTORY_CONDITION
+                            try {
+                                foreach ($condition in @('baseline','baseline-repeat','x2-compose','x2-reset')) {
+                                    $env:NR_NEXUS_TEST_NR_HISTORY_CONDITION = $condition
+                                    try {
+                                        Invoke-TestProcess $exe $directory "$case-$condition" @($nativeArgument, $NativeNgxProjectIdPath) -TimeoutMilliseconds 90000 -DeferFailureCleanup
+                                    } finally {
+                                        $conditionDirectory = Join-Path $directory $condition
+                                        if ((Test-Path -LiteralPath $conditionDirectory -PathType Container) -and
+                                            $global:NexusTestOutputs[$directory].status -eq 'Running') {
+                                            Get-ChildItem -LiteralPath $conditionDirectory -File | Where-Object {
+                                                $_.Extension -in @('.rgba16f','.r32f','.rg16f','.r8')
+                                            } | ForEach-Object {
+                                                Register-TestDisposable -Directory $directory -Path $_.FullName -Kind 'nr-history-raw'
+                                            }
+                                        }
+                                    }
+                                }
+                                & $PythonExecutable (Join-Path $PSScriptRoot 'offline/nr_edit_reuse.py') --input $directory
+                                if ($LASTEXITCODE -ne 0) {
+                                    Complete-TestOutput $directory -Outcome Failed
+                                    throw 'NR history paired analysis failed; see nr-edit-reuse-analysis.json and failure-sample.'
+                                }
+                            } finally {
+                                $env:NR_NEXUS_TEST_NR_HISTORY_CONDITION = $previousCondition
+                            }
+                        } else {
+                            Invoke-TestProcess $exe $directory $case @($nativeArgument, $NativeNgxProjectIdPath) -TimeoutMilliseconds 90000
+                        }
+                    } catch {
+                        if ($case -eq 'nr-edit-reuse-history') { Complete-TestOutput $directory -Outcome Failed }
+                        throw
                     } finally {
                         if (Test-Path -LiteralPath $runtimeLink) { Remove-Item -LiteralPath $runtimeLink -Force }
                     }

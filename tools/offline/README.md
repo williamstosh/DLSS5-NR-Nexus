@@ -6,7 +6,7 @@
 ## 环境与构建
 
 沿用[项目构建前提](../../README.md#zh-build)中的固定宿主、MSVC 与 Windows SDK。
-Python 工具仅用标准库。`gpu` 后端复用既有生成 Shader 头和 embed_file 工具，并在
+除隔帧历史分析器使用 NumPy／Pillow 外，Python 工具仅用标准库。`gpu` 后端复用既有生成 Shader 头和 embed_file 工具，并在
 每个隔离构建目录重新用 FXC 编译当前 ControlMask Shader，通过预包含头绑定该字节码；
 不改共享生成目录。`replay` 仅复用通用 D3D12 测试助手，不生成或包含 ControlMask Shader。
 NGX 探针只用已有 SDK 头，不链接或打包第三方 Runtime。
@@ -241,6 +241,40 @@ pwsh -File tools/run-tests.ps1 -Suite vulkan-control-mask -VulkanNativeNgx `
 Fence、provider 边界与实际 NGX 模块身份；原始读回仅在内存配对。GPU timestamp
 包含 SR、NR 及消费边界读回，仅作诊断，不与旧 NR wrapper 计时比较，也不用于性能或游戏画质验收。
 内部实际模型身份保持未知；动态实机由人工验收。
+
+## NR 隔帧历史实验
+
+`nr-edit-reuse-history` 用例用于检查 NR 不连续调用时的历史行为。固定 D3D12 Upscaled、
+单 Pass、640×360 SR 输入及 960×540 NR，关闭 ControlMask 与 Detail stability。
+它扩展既有真实 SR→NR 入口，每个条件启动独立进程及独立 SR／NR Feature：
+
+- `baseline` 和 `baseline-repeat`：逐帧 SR 与 NR，重复运行估计基线差异。
+- `x2-compose`：SR 每帧执行，NR 仅在偶数帧执行，使用当前到上一次实际 NR 帧的组合运动。
+- `x2-reset`：相同 NR 刷新节奏，每次刷新将 NR Reset 设为 1。
+
+~~~powershell
+pwsh -File tools/run-tests.ps1 -Suite fg-native -NativeCase nr-edit-reuse-history `
+    -NativeNgxProjectIdPath $projectIdPath -NativeNgxSdkLibraryDirectory $sdkLibraryDirectory `
+    -NativeNgxRuntimePath $runtimePath -PythonExecutable $pythonWithNumpyAndPillow `
+    -UiPreview None -OutputDirectory tmp/offline/nr-history
+~~~
+
+四组使用相同创建前缀及24帧输入，依次包含静止、变速平移、独立运动前景的遮挡显露、光照变化。
+当前夹具为零 jitter、未含 jitter 的渲染像素运动和单位 scale；不覆盖非零 jitter 或 Subrect。
+组合运动从上一基础帧的对应位置取样，不是当前运动乘二。刷新沿生产 wrapper 调用真实 NR，
+仅在测试观察器边界替换 NR 运动资源或 Reset；SR 参数和生产实现不改动。
+
+每条件 JSON 保留实际 SR／NR 调用、参数、API 结果、GPU Fence、模块身份与独立 Evaluate 时间戳。
+SR 输出与最终结果为线性 HDR；v6 proxy 与 raw neural 虽用 RGBA16F 存储，仍为 sRGB 编码值。
+跳过帧只有 SR 读回，其他平面与 NR 时间明确为空，没有显示端缓存或复用输出。
+
+统一入口在收尾前调用 `tools/offline/nr_edit_reuse.py --input <fg-native输出目录>`，
+核对输入／SR／proxy 一致性，报告刷新帧差异、带运动补偿的编辑误差变化和重复基线；
+生成固定显示变换的对照预览。分析器需要已有 NumPy 和 Pillow，不自动安装依赖。
+可独立运行 `python -m unittest discover -s tests -p test_nr_edit_reuse_analysis.py` 检查比较数学与读回身份。
+数值报告不自动判定视觉通过；Evaluate 时间不包含完整编码／合成／复用成本，不能换算为游戏 FPS 收益。
+Standard 在分析后回收登记的原始平面，保留 JSON、日志、预览和配对失败样本；
+完整原始集只由显式 `NR_NEXUS_TEST_KEEP_RAW=1` 保留。使用 GPU 前应避开其他游戏或性能测试窗口。
 
 ## ControlMask 原生成本
 

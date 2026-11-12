@@ -33,6 +33,28 @@ Assert-ArtifactTest ($size.files -eq 1 -and $size.bytes -eq 5) 'Size scan count/
 $canonical = Initialize-TestOutput (Join-Path $OutputDirectory 'lowercase') -RetentionMode 'full'
 Assert-ArtifactTest ($global:NexusTestOutputs[$canonical].mode -ceq 'Full') 'Mode spelling not canonical'
 Complete-TestOutput $canonical
+foreach ($defer in @($false, $true)) {
+    $directory = Initialize-TestOutput (Join-Path $OutputDirectory "process-failure-$defer")
+    $raw = Join-Path $directory 'frame.rgba16f'
+    [IO.File]::WriteAllBytes($raw, [byte[]]@(0,0,0,0))
+    if (-not $defer) { Register-TestDisposable -Directory $directory -Path $raw -Kind 'raw-readback' }
+    $failed = $false
+    try {
+        Invoke-TestProcess $env:ComSpec $directory 'failure' @('/d','/c','exit','7') -DeferFailureCleanup:$defer
+    } catch {
+        if ($_.Exception.Message -notlike 'Test failed: failure exit=7') { throw }
+        $failed = $true
+    }
+    Assert-ArtifactTest $failed 'Nonzero test exit is reported'
+    if ($defer) {
+        Assert-ArtifactTest ($global:NexusTestOutputs[$directory].status -eq 'Running' -and
+            (Test-Path -LiteralPath $raw)) 'Deferred failure remains owned until raw registration'
+        Register-TestDisposable -Directory $directory -Path $raw -Kind 'raw-readback'
+        Complete-TestOutput $directory -Outcome Failed
+    }
+    Assert-ArtifactTest ($global:NexusTestOutputs[$directory].status -eq 'Failed' -and
+        -not (Test-Path -LiteralPath $raw)) 'Failed process raw cleanup completes'
+}
 foreach ($mode in @('Standard','Full','Acceptance')) {
     foreach ($outcome in @('Passed','Failed')) {
         $directory = Initialize-TestOutput (Join-Path $OutputDirectory "$mode-$outcome") -RetentionMode $mode

@@ -382,7 +382,8 @@ function Get-TestProjectInputs {
 
 function Invoke-TestProcess {
     param([string]$Executable, [string]$Directory, [string]$Name, [string[]]$Arguments = @(),
-        [ValidateRange(1,180000)][int]$TimeoutMilliseconds = 45000)
+        [ValidateRange(1,180000)][int]$TimeoutMilliseconds = 45000,
+        [switch]$DeferFailureCleanup)
     $start = @{ FilePath=$Executable; WorkingDirectory=$Directory; WindowStyle='Hidden'; PassThru=$true
         RedirectStandardOutput=(Join-Path $Directory "$Name.stdout.log"); RedirectStandardError=(Join-Path $Directory "$Name.stderr.log") }
     $owner = $null
@@ -397,14 +398,14 @@ function Invoke-TestProcess {
     $null = $process.Handle
     if (-not $process.WaitForExit($TimeoutMilliseconds)) {
         $process.Kill(); $process.WaitForExit()
-        if ($owner) { Complete-TestOutput $owner -Outcome Failed }
+        if ($owner -and -not $DeferFailureCleanup) { Complete-TestOutput $owner -Outcome Failed }
         throw "Test timeout: $Name"
     }
     $process.WaitForExit()
     Get-Content -LiteralPath $start.RedirectStandardOutput
     Get-Content -LiteralPath $start.RedirectStandardError
     if ($null -eq $process.ExitCode -or $process.ExitCode -ne 0) {
-        if ($owner) { Complete-TestOutput $owner -Outcome Failed }
+        if ($owner -and -not $DeferFailureCleanup) { Complete-TestOutput $owner -Outcome Failed }
         throw "Test failed: $Name exit=$($process.ExitCode)"
     }
 }

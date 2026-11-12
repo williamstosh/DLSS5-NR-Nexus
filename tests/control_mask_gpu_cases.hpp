@@ -2384,6 +2384,13 @@ inline const d3d12_test::TextureTransfer* native_motion_sr_readback = nullptr;
 inline const d3d12_test::TextureTransfer* native_motion_proxy_readback = nullptr;
 inline const d3d12_test::TextureTransfer* native_motion_neural_readback = nullptr;
 inline uint32_t native_motion_sr_calls = 0;
+// Only the history experiment overrides NR guides; SR always consumes its
+// original per-frame parameters and owns a separate SDK history.
+inline ID3D12Resource* native_history_motion = nullptr;
+inline int native_history_reset = -1;
+inline d3d12_test::TimestampQueries* native_history_queries = nullptr;
+inline UINT native_history_interval = 0;
+inline nlohmann::json native_history_parameters;
 inline addon::DirectCreateFn native_resize_create = nullptr;
 inline addon::DirectReleaseFn native_resize_release = nullptr;
 inline double native_resize_create_ms = 0;
@@ -2417,8 +2424,14 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeHostEvaluate(
     ID3D12GraphicsCommandList* command_list, const NVSDK_NGX_Handle* handle,
     const NVSDK_NGX_Parameter* parameters, PFN_NVSDK_NGX_ProgressCallback progress) {
   ++native_motion_sr_calls;
+  if (native_history_queries != nullptr) {
+    native_history_queries->Begin(command_list, native_history_interval);
+  }
   const auto start = std::chrono::steady_clock::now();
   const auto result = NVSDK_NGX_D3D12_EvaluateFeature(command_list, handle, parameters, progress);
+  if (native_history_queries != nullptr) {
+    native_history_queries->EndAndResolve(command_list, native_history_interval);
+  }
   native_resize_host_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
   if (NVSDK_NGX_SUCCEED(result) && native_motion_sr_readback != nullptr) {
     auto* output = addon::GetD3D12Resource(parameters, NVSDK_NGX_Parameter_Output);
@@ -2437,6 +2450,32 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeRuntimeEvaluate(
     const NVSDK_NGX_Handle* handle,
     const NVSDK_NGX_Parameter* parameters,
     PFN_NVSDK_NGX_ProgressCallback progress) {
+  if (native_history_motion != nullptr) {
+    const auto wrapper_reset = addon::GetInt(parameters, "DLSSNR.Reset", -1);
+    auto* experiment_parameters = const_cast<NVSDK_NGX_Parameter*>(parameters);
+    experiment_parameters->Set("DLSSNR.MVec", native_history_motion);
+    if (native_history_reset >= 0) {
+      experiment_parameters->Set("DLSSNR.Reset", native_history_reset);
+    }
+    native_history_parameters = {{"handle", reinterpret_cast<uintptr_t>(handle)},
+        {"wrapper_reset", wrapper_reset},
+        {"reset", addon::GetInt(parameters, "DLSSNR.Reset", -1)},
+        {"motion", reinterpret_cast<uintptr_t>(addon::GetD3D12Resource(parameters, "DLSSNR.MVec"))},
+        {"depth", reinterpret_cast<uintptr_t>(addon::GetD3D12Resource(parameters, "DLSSNR.Depth"))}};
+    const auto motion_desc = native_history_motion->GetDesc();
+    native_history_parameters["motion_resource"] = {{"width", motion_desc.Width}, {"height", motion_desc.Height},
+        {"format", static_cast<uint32_t>(motion_desc.Format)}, {"format_name", "R16G16_FLOAT"}};
+    for (const auto* key : {"DLSSNR.MVecScaleX", "DLSSNR.MVecScaleY", "DLSSNR.JitterOffsetX", "DLSSNR.JitterOffsetY"}) {
+      float value = 0.f;
+      const auto result = parameters->Get(key, &value);
+      native_history_parameters[key] = {{"present", NVSDK_NGX_SUCCEED(result)}, {"value", value}};
+    }
+    for (const auto* key : {"DLSSNR.InputWidth", "DLSSNR.InputHeight", "DLSSNR.OutputWidth", "DLSSNR.OutputHeight",
+             "DLSSNR.MVecSubrectBaseX", "DLSSNR.MVecSubrectBaseY", "DLSSNR.MVecSubrectWidth", "DLSSNR.MVecSubrectHeight",
+             "DLSSNR.DepthSubrectBaseX", "DLSSNR.DepthSubrectBaseY", "DLSSNR.DepthSubrectWidth", "DLSSNR.DepthSubrectHeight"}) {
+      native_history_parameters[key] = addon::GetUInt(parameters, key);
+    }
+  }
   native_runtime_masks.push_back(addon::GetD3D12Resource(parameters, "DLSSNR.ControlMask"));
   if (native_cost_observe) {
     native_runtime_resets.push_back(addon::GetInt(parameters, "DLSSNR.Reset", -1));
@@ -2454,8 +2493,14 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeRuntimeEvaluate(
   if (timed_evaluate) {
     native_cost_queries->Begin(command_list, evaluate_interval);
   }
+  if (native_history_queries != nullptr) {
+    native_history_queries->Begin(command_list, native_history_interval + 1);
+  }
   const auto start = std::chrono::steady_clock::now();
   const NVSDK_NGX_Result result = native_runtime_evaluate(command_list, handle, parameters, progress);
+  if (native_history_queries != nullptr) {
+    native_history_queries->EndAndResolve(command_list, native_history_interval + 1);
+  }
   native_resize_evaluate_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
   if (NVSDK_NGX_SUCCEED(result) && native_motion_neural_readback != nullptr) {
     auto* neural = addon::GetD3D12Resource(parameters, "DLSSNR.Output");
@@ -2474,12 +2519,12 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeRuntimeEvaluate(
 
 int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                  uint32_t mask_mode = addon::kControlMaskDepthFar, bool cost = false,
-                 bool motion_test = false, bool resize_test = false) {
+                 bool motion_test = false, bool resize_test = false, bool history_test = false) {
   try {
     // Resize reuses public SDK initialization and the real SR owner, without
     // running the independent paired ControlMask motion experiment.
-    motion_test = motion_test || resize_test;
-    if (resize_test) {
+    motion_test = motion_test || resize_test || history_test;
+    if (resize_test || history_test) {
       // This headless fixture has no Present stream. Disable the production
       // game-exit heuristic so its normal submission-proven retirement runs.
       addon::shutdown_quiesce_enabled = false;
@@ -2651,7 +2696,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     addon::intensity = 1.f;
     addon::preset = (single_stage ? 2u : 1u);
     addon::codec_mode = 0u;
-    const bool mask_enabled = (cost ? cost_mode != "off"
+    const bool mask_enabled = !history_test && (cost ? cost_mode != "off"
                                     : hot_toggle || std::getenv("NR_NEXUS_TEST_CONTROL_MASK_OFF") == nullptr);
     const char* mask_mode_name = (mask_mode == addon::kControlMaskRgb ? "rgb" : "depthfar");
     addon::control_mask_enabled = mask_enabled;
@@ -2766,14 +2811,16 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     bool production_chain_completed = false;
     uint32_t prefix_host_evaluates = 0;
     size_t prefix_nr_evaluates = 0;
-    const uint32_t prefix_limit = (cost ? cost_prefix_frames : addon::kContractDebounceFrames + 32);
+    const uint32_t prefix_limit = (cost || history_test ? cost_prefix_frames : addon::kContractDebounceFrames + 32);
     for (uint32_t attempt = 0; attempt < prefix_limit; ++attempt) {
       native_runtime_masks.clear();
       native_runtime_results.clear();
       native_runtime_resets.clear();
       gpu.list->ClearState(nullptr);
-      if (cost) {
-        restore_cost_inputs();
+      if (cost || history_test) {
+        if (cost) {
+          restore_cost_inputs();
+        }
         parameters.Set(NVSDK_NGX_Parameter_Reset, (attempt == 0 ? 1 : 0));
       }
       addon::ngx_slot_real[0].evaluate = (motion_test ? reinterpret_cast<void*>(ObserveNativeHostEvaluate)
@@ -2786,7 +2833,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       Check(NVSDK_NGX_SUCCEED(result), "host SR succeeds around production Render and Upscaled hooks");
       gpu.Submit();
       addon::DrainRetiredResources(true);
-      if (cost) {
+      if (cost || history_test) {
         cost_prefix.push_back({{"frame", attempt}, {"host_result", static_cast<uint32_t>(result)},
             {"evaluate_count", native_runtime_results.size()}, {"results", native_runtime_results},
             {"resets", native_runtime_resets}, {"fence", gpu.serial},
@@ -2804,7 +2851,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                   && native_runtime_masks[0] == addon::worksets.at({owner, output.Get(), false}).control_mask,
               "initial native frame binds and evaluates its production mask");
         production_chain_completed = true;
-        if (cost) continue;
+        if (cost || history_test) continue;
         break;
       }
       Check(feature.render_session != nullptr
@@ -2836,6 +2883,250 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           "real Runtime completes the requested production stages within the debounce window");
     nlohmann::json motion_report;
     nlohmann::json resize_report;
+    nlohmann::json history_report;
+    if (history_test) {
+      const char* requested_condition = std::getenv("NR_NEXUS_TEST_NR_HISTORY_CONDITION");
+      const std::string condition = (requested_condition != nullptr ? requested_condition : "baseline");
+      Check(condition == "baseline" || condition == "baseline-repeat"
+                || condition == "x2-compose" || condition == "x2-reset", "known NR history condition");
+      const bool sparse = condition == "x2-compose" || condition == "x2-reset";
+      const std::filesystem::path raw_directory(condition);
+      Check(std::filesystem::create_directory(raw_directory), "history output is a new isolated condition directory");
+      constexpr uint32_t frame_count = 24;
+      // Render-grid pixels. A nonconstant background velocity and separately
+      // moving foreground make composition observably different from 2*d1.
+      constexpr std::array<int, frame_count> camera_delta{
+          0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 2, 3, 4, 2, 3, 4, 0, 0, 0, 0, 0, 0};
+      constexpr std::array<float, 6> light{1.f, 1.15f, 1.3f, 1.1f, 0.85f, 1.f};
+      auto history_motion = gpu.Texture(render_width, render_height, DXGI_FORMAT_R16G16_FLOAT);
+      gpu.Transition(history_motion.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      auto queries = d3d12_test::CreateTimestampQueries(gpu, frame_count * 2);
+      std::vector<uint16_t> nr_motion_data(render_pixel_count * 2);
+      std::vector<uint16_t> previous_motion(render_pixel_count * 2, 0);
+      std::vector<uint8_t> surface(render_pixel_count, 0), previous_surface(render_pixel_count, 0);
+      std::vector<uint8_t> validity(render_pixel_count, 0), previous_validity(render_pixel_count, 0);
+      auto& report = history_report;
+      report = {{"schema", "nr-nexus-nr-edit-reuse-history-v1"}, {"condition", condition},
+          {"process_id", GetCurrentProcessId()}, {"host_sr_handle", reinterpret_cast<uintptr_t>(owner)},
+          {"evidence", "NATIVE_GPU+NATIVE_NGX"}, {"stage", "D3D12 Upscaled"}, {"passes", 1},
+          {"dimensions", {{"render", {render_width, render_height}}, {"output", {width, height}}}},
+          {"provider_init", "public SDK ProjectID; owned production NR; independent process/Features per condition"},
+          {"requested_model", "B"}, {"internal_model", "unknown"},
+          {"runtime", addon::direct_runtime_requirements.file_version}, {"nr_sha256", addon::direct_runtime_sha256},
+          {"driver_x100", addon::direct_runtime_requirements.driver_x100},
+          {"prefix", cost_prefix}, {"prefix_host_sr_evaluates", prefix_host_evaluates},
+          {"prefix_nr_evaluates", prefix_nr_evaluates}, {"jitter", {0, 0}}, {"has_jitter", true},
+          {"mv_jittered", false}, {"motion_scale", {1, 1}}, {"depth_convention", "normal; near 0 far 1"},
+          {"motion_convention", "current to previous render-grid pixels; integer sample positions; zero jitter"},
+          {"composition", "d(t,t-2,x)=d(t,t-1,x)+d(t-1,t-2,x+d(t,t-1,x)); outside previous grid uses zero second step and valid bit1=0"},
+          {"validity", "bit0: single-step same surface/in bounds; bit1: both steps valid"},
+          {"feed_mode", addon::feed_mode.load()}, {"norm_governor", addon::norm_governor.load()},
+          {"detail_stability", addon::detail_stability.load()}, {"timestamp_frequency_hz", queries.frequency_hz},
+          {"timing_scope", "individual real SR and NR Evaluate GPU intervals, excluding readback copies; diagnostic only"},
+          {"raw_policy", "condition directory registered disposable by test entry; only KEEP_RAW=1 preserves complete dataset"},
+          {"frames", nlohmann::json::array()}};
+      ComPtr<IDXGIAdapter1> adapter;
+      Check(SUCCEEDED(gpu.factory->EnumAdapterByLuid(gpu.device->GetAdapterLuid(), IID_PPV_ARGS(&adapter))),
+            "history actual device adapter");
+      DXGI_ADAPTER_DESC1 adapter_desc{};
+      Check(SUCCEEDED(adapter->GetDesc1(&adapter_desc)), "history adapter identity");
+      LARGE_INTEGER driver_version{};
+      const auto driver_status = adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driver_version);
+      report["adapter"] = {{"vendor_id", adapter_desc.VendorId}, {"device_id", adapter_desc.DeviceId},
+          {"luid_low", adapter_desc.AdapterLuid.LowPart}, {"luid_high", adapter_desc.AdapterLuid.HighPart},
+          {"driver_version_raw", driver_version.QuadPart}, {"driver_status", driver_status}};
+      report["loaded_ngx_modules"] = nlohmann::json::array();
+      std::array<HMODULE, 1024> modules{};
+      DWORD module_bytes = 0;
+      Check(EnumProcessModules(GetCurrentProcess(), modules.data(), sizeof(modules), &module_bytes)
+                && module_bytes <= sizeof(modules), "history loaded module inventory");
+      for (size_t index = 0; index < module_bytes / sizeof(HMODULE); ++index) {
+        std::array<wchar_t, 32768> path{};
+        const auto length = GetModuleFileNameW(modules[index], path.data(), static_cast<DWORD>(path.size()));
+        Check(length != 0 && length < path.size(), "history loaded module path");
+        const std::filesystem::path module_path(path.data());
+        if (module_path.filename().wstring().find(L"ngx") == std::wstring::npos) continue;
+        report["loaded_ngx_modules"].push_back({{"path", module_path.string()},
+            {"sha256", addon::ComputeRuntimeSha256(module_path)},
+            {"version", addon::ReadNrRuntimeRequirements(module_path, gpu.device.Get()).file_version}});
+      }
+      int camera_shift = 0;
+      uint32_t nr_calls = 0;
+      for (uint32_t frame = 0; frame < frame_count; ++frame) {
+        const bool refresh = !sparse || frame % 2 == 0;
+        const bool foreground = frame >= 12;
+        const int foreground_left = 240 + (frame >= 12 ? 3 * static_cast<int>(frame - 12) : 0);
+        const int foreground_delta = (frame > 12 ? 3 : 0);
+        camera_shift += camera_delta[frame];
+        const float illumination = (frame >= 18 ? light[frame - 18] : 1.f);
+        for (UINT y = 0; y < render_height; ++y) {
+          for (UINT x = 0; x < render_width; ++x) {
+            const size_t pixel = static_cast<size_t>(y) * render_width + x;
+            surface[pixel] = foreground && static_cast<int>(x) >= foreground_left
+                && static_cast<int>(x) < foreground_left + 96 && y >= 90 && y < 270;
+            const float u = static_cast<float>(static_cast<int>(x) - camera_shift) / render_width;
+            const float v = static_cast<float>(y) / render_height;
+            const std::array<float, 3> rgb = (surface[pixel] != 0
+                ? std::array<float, 3>{0.65f, 0.18f + 0.1f * v, 0.12f}
+                : std::array<float, 3>{0.35f + 0.2f * std::sin(u * 40.f) + 0.1f * v,
+                      0.1f + 0.65f * v, 0.4f + 0.2f * std::cos(u * 23.f + v * 11.f)});
+            for (size_t channel = 0; channel < 3; ++channel) {
+              color_data[pixel * 4 + channel] = DirectX::PackedVector::XMConvertFloatToHalf(rgb[channel] * illumination);
+            }
+            color_data[pixel * 4 + 3] = DirectX::PackedVector::XMConvertFloatToHalf(1.f);
+            depth_data[pixel] = (surface[pixel] != 0 ? 0.2f : 0.7f + 0.1f * v);
+            motion_data[pixel * 2] = DirectX::PackedVector::XMConvertFloatToHalf(
+                static_cast<float>(-(surface[pixel] != 0 ? foreground_delta : camera_delta[frame])));
+            motion_data[pixel * 2 + 1] = 0;
+          }
+        }
+        size_t composition_differs_from_double = 0;
+        for (UINT y = 0; y < render_height; ++y) {
+          for (UINT x = 0; x < render_width; ++x) {
+            const size_t pixel = static_cast<size_t>(y) * render_width + x;
+            const float d1 = DirectX::PackedVector::XMConvertHalfToFloat(motion_data[pixel * 2]);
+            const int previous_x = static_cast<int>(x) + static_cast<int>(d1);
+            const bool in_bounds = previous_x >= 0 && previous_x < static_cast<int>(render_width);
+            const size_t previous_pixel = (in_bounds ? static_cast<size_t>(y) * render_width + previous_x : 0);
+            const bool valid1 = frame > 0 && in_bounds && surface[pixel] == previous_surface[previous_pixel];
+            const bool valid2 = valid1 && (previous_validity[previous_pixel] & 1) != 0;
+            validity[pixel] = static_cast<uint8_t>((valid1 ? 1 : 0) | (valid2 ? 2 : 0));
+            const float d2 = (in_bounds ? DirectX::PackedVector::XMConvertHalfToFloat(previous_motion[previous_pixel * 2]) : 0.f);
+            const float composed = d1 + d2;
+            if (valid2 && composed != 2.f * d1) {
+              ++composition_differs_from_double;
+            }
+            nr_motion_data[pixel * 2] = DirectX::PackedVector::XMConvertFloatToHalf(
+                condition == "x2-compose" && frame > 0 ? composed : d1);
+            nr_motion_data[pixel * 2 + 1] = 0;
+          }
+        }
+        auto color_upload = gpu.CreateTextureTransfer(color.Get());
+        auto depth_upload = gpu.CreateTextureTransfer(depth.Get());
+        auto motion_upload = gpu.CreateTextureTransfer(motion.Get());
+        auto nr_motion_upload = gpu.CreateTextureTransfer(history_motion.Get());
+        const auto upload = [&](ID3D12Resource* resource, d3d12_test::TextureTransfer* transfer,
+                                const auto& data, UINT row_bytes) {
+          gpu.Transition(resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+          gpu.UploadTexture(resource, *transfer, reinterpret_cast<const uint8_t*>(data.data()),
+              data.size() * sizeof(data[0]), row_bytes);
+          gpu.Transition(resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        };
+        upload(color.Get(), &color_upload, color_data, render_width * 8);
+        upload(depth.Get(), &depth_upload, depth_data, render_width * 4);
+        upload(motion.Get(), &motion_upload, motion_data, render_width * 4);
+        upload(history_motion.Get(), &nr_motion_upload, nr_motion_data, render_width * 4);
+        parameters.Set(NVSDK_NGX_Parameter_Reset, (frame == 0 ? 1 : 0));
+        parameters.Set(NVSDK_NGX_Parameter_MV_Scale_X, 1.f);
+        parameters.Set(NVSDK_NGX_Parameter_MV_Scale_Y, 1.f);
+        auto sr_readback = gpu.CreateTextureTransfer(output.Get());
+        const auto& workset = addon::worksets.at({owner, output.Get(), false});
+        auto proxy_readback = gpu.CreateTextureTransfer(workset.proxy);
+        auto neural_readback = gpu.CreateTextureTransfer(workset.nr_output);
+        auto final_readback = gpu.CreateTextureTransfer(output.Get());
+        native_motion_sr_readback = &sr_readback;
+        native_motion_proxy_readback = (refresh ? &proxy_readback : nullptr);
+        native_motion_neural_readback = (refresh ? &neural_readback : nullptr);
+        native_motion_sr_calls = 0;
+        native_runtime_masks.clear();
+        native_runtime_results.clear();
+        native_runtime_resets.clear();
+        native_history_motion = (refresh ? history_motion.Get() : nullptr);
+        native_history_reset = (condition == "x2-reset" ? 1 : -1);
+        native_history_parameters = nullptr;
+        native_history_queries = &queries;
+        native_history_interval = frame * 2;
+        NVSDK_NGX_Result result;
+        if (refresh) {
+          addon::ngx_slot_real[0].evaluate = reinterpret_cast<void*>(ObserveNativeHostEvaluate);
+          result = addon::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), owner, &parameters, nullptr);
+          addon::ngx_slot_real[0].evaluate = nullptr;
+        } else {
+          // Bypass NR admission without toggling enabled or retiring its history.
+          result = ObserveNativeHostEvaluate(gpu.list.Get(), owner, &parameters, nullptr);
+        }
+        native_history_queries = nullptr;
+        native_history_motion = nullptr;
+        native_history_reset = -1;
+        native_motion_sr_readback = nullptr;
+        native_motion_proxy_readback = nullptr;
+        native_motion_neural_readback = nullptr;
+        Check(NVSDK_NGX_SUCCEED(result) && native_motion_sr_calls == 1
+                  && native_runtime_results.size() == (refresh ? 1u : 0u), "history actual per-frame SR/NR cadence");
+        if (refresh) {
+          Check(NVSDK_NGX_SUCCEED(native_runtime_results[0]) && native_runtime_resets.size() == 1,
+                "history real NR Evaluate returns success");
+          ++nr_calls;
+          gpu.Transition(output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+          gpu.RecordTextureReadback(output.Get(), final_readback);
+          gpu.Transition(output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        gpu.Submit();
+        addon::DrainRetiredResources(true);
+        Check(gpu.fence->GetCompletedValue() >= gpu.serial && SUCCEEDED(gpu.device->GetDeviceRemovedReason()),
+              "history frame completed on a healthy GPU");
+        const std::string stem = "frame-" + std::to_string(1000 + frame).substr(1);
+        const auto save = [&](const char* suffix, const auto& data, const char* format, const char* encoding,
+                              UINT plane_width, UINT plane_height) {
+          const auto byte_count = data.size() * sizeof(data[0]);
+          const auto* bytes = reinterpret_cast<const uint8_t*>(data.data());
+          const std::string filename = stem + "-" + suffix;
+          std::ofstream file(raw_directory / filename, std::ios::binary | std::ios::trunc);
+          file.write(reinterpret_cast<const char*>(bytes), static_cast<std::streamsize>(byte_count));
+          file.close();
+          Check(!file.fail(), "history packed plane saved");
+          return nlohmann::json{{"file", filename}, {"format", format}, {"encoding", encoding},
+              {"width", plane_width}, {"height", plane_height}, {"bytes", byte_count},
+              {"crc32", renodx::utils::hash::ComputeCRC32(bytes, byte_count)}};
+        };
+        const auto sr_bytes = gpu.ReadTexture(sr_readback);
+        nlohmann::json planes{{"sr", save("sr.rgba16f", sr_bytes, "RGBA16F", "linear HDR", width, height)},
+            {"proxy", nullptr}, {"neural", nullptr}, {"final", nullptr}};
+        if (refresh) {
+          planes["proxy"] = save("proxy.rgba16f", gpu.ReadTexture(proxy_readback), "RGBA16F", "v6 encoded sRGB float", width, height);
+          planes["neural"] = save("neural.rgba16f", gpu.ReadTexture(neural_readback), "RGBA16F", "v6 encoded sRGB float", width, height);
+          planes["final"] = save("final.rgba16f", gpu.ReadTexture(final_readback), "RGBA16F", "linear HDR; production resolve", width, height);
+        }
+        const auto sr_timing = queries.Read(frame * 2);
+        nlohmann::json nr{{"calls", native_runtime_results.size()}, {"executed", refresh},
+            {"result", nullptr}, {"reset", nullptr}, {"parameters", native_history_parameters},
+            {"gpu_ms", nullptr}, {"gpu_ticks", nullptr}};
+        if (refresh) {
+          const auto timing = queries.Read(frame * 2 + 1);
+          nr["result"] = static_cast<uint32_t>(native_runtime_results[0]);
+          nr["reset"] = native_runtime_resets[0];
+          nr["gpu_ms"] = timing.gpu_ms;
+          nr["gpu_ticks"] = {timing.begin_tick, timing.end_tick};
+        }
+        report["frames"].push_back({{"frame", frame}, {"scene", (frame < 6 ? "stationary" : (frame < 12 ? "translation" : (frame < 18 ? "occlusion" : "lighting")))},
+            {"refresh", refresh}, {"camera_shift", camera_shift}, {"camera_delta", camera_delta[frame]},
+            {"foreground_left", foreground_left}, {"illumination", illumination},
+            {"composition_differs_from_double_valid_pixels", composition_differs_from_double},
+            {"inputs", {{"color", save("input-color.rgba16f", color_data, "RGBA16F", "linear HDR", render_width, render_height)},
+                {"depth", save("depth.r32f", depth_data, "R32F", "normal depth", render_width, render_height)},
+                {"motion", save("motion.rg16f", motion_data, "RG16F", "render pixels current-to-previous", render_width, render_height)},
+                {"nr_motion", save("nr-motion.rg16f", nr_motion_data, "RG16F", "render pixels; NR only", render_width, render_height)},
+                {"surface", save("surface.r8", surface, "R8_UINT", "0 background 1 foreground", render_width, render_height)},
+                {"valid", save("valid.r8", validity, "R8_UINT", "bit0 one-step bit1 two-step", render_width, render_height)}}},
+            {"planes", planes}, {"sr", {{"calls", native_motion_sr_calls}, {"result", static_cast<uint32_t>(result)},
+                {"reset", frame == 0 ? 1 : 0}, {"handle", reinterpret_cast<uintptr_t>(owner)},
+                {"create_flags", addon::features.at(owner).create_flags}, {"has_jitter", true}, {"jitter", {0, 0}},
+                {"mv_jittered", false}, {"motion_scale", {1, 1}}, {"pre_exposure", 1.f}, {"exposure_scale", 1.f},
+                {"gpu_ms", sr_timing.gpu_ms}, {"gpu_ticks", {sr_timing.begin_tick, sr_timing.end_tick}}}},
+            {"nr", nr}, {"fence", gpu.serial}, {"completed_fence", gpu.fence->GetCompletedValue()}});
+        previous_motion = motion_data;
+        previous_surface = surface;
+        previous_validity = validity;
+        std::ofstream report_file(raw_directory / "nr-edit-reuse-history.json", std::ios::binary | std::ios::trunc);
+        report_file << report.dump(2) << '\n';
+        report_file.close();
+        Check(!report_file.fail(), "history partial evidence saved after each completed frame");
+      }
+      report["sequence_host_sr_evaluates"] = frame_count;
+      report["sequence_nr_evaluates"] = nr_calls;
+      std::cout << "PASS NR history condition=" << condition << " frames=" << frame_count << " SR=" << frame_count
+                << " NR=" << nr_calls << "; raw planes=" << raw_directory.string() << '\n';
+    }
     if (resize_test) {
       const auto* ready_environment = std::getenv("NR_NEXUS_TEST_RESIZE_READY");
       native_resize_ready = ready_environment == nullptr || std::strcmp(ready_environment, "0") != 0;
@@ -3144,7 +3435,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       Check(!file.fail(), "resize evidence JSON saved");
       native_resize_ready = false;
     }
-    if (motion_test && !resize_test) {
+    if (motion_test && !resize_test && !history_test) {
       constexpr std::array<float, 8> speeds{0.f, 0.f, 2.f, 8.f, 16.f, 0.f, 0.f, 0.f};
       std::array<std::vector<uint8_t>, speeds.size()> reference;
       std::array<std::vector<uint8_t>, speeds.size()> reference_sr;
@@ -3677,8 +3968,8 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     }
     std::cout << "PASS ControlMask production chain stages=" << (single_stage ? "Upscaled" : "Render+Upscaled")
               << " evidence=NATIVE_GPU+NATIVE_NGX host_sr=" << (motion_test ? "NATIVE_NGX" : "MOCK") << " frames="
-              << (resize_test ? 180 : (cost ? 80 : (motion_test ? 16 : (hot_toggle ? 52 : 1))))
-              << (resize_test ? " frame_scope=high-low-high" : (motion_test ? " frame_scope=paired_only" : ""))
+              << (history_test ? 24 : (resize_test ? 180 : (cost ? 80 : (motion_test ? 16 : (hot_toggle ? 52 : 1)))))
+              << (history_test ? " frame_scope=nr-history" : (resize_test ? " frame_scope=high-low-high" : (motion_test ? " frame_scope=paired_only" : "")))
               << " size=" << width << 'x' << height << " mask="
               << (mask_enabled ? mask_mode_name : "off")
               << " output_readback=rgba16f raw="
@@ -3721,7 +4012,19 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       Check(NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D12_DestroyParameters(sr_parameters)), "release real SR parameters");
       Check(NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D12_Shutdown1(gpu.device.Get())), "public SDK device shutdown");
       native_motion_gpu = nullptr;
-      if (resize_test) {
+      if (history_test) {
+        history_report["teardown"] = {{"sr_continues_without_nr", true}, {"sr_release", true},
+            {"sdk_shutdown", true}, {"identity_bridge_installed", false},
+            {"disabled_host_sr_evaluates", native_motion_sr_calls}};
+        history_report["total_host_sr_evaluates"] = prefix_host_evaluates + 24 + native_motion_sr_calls;
+        history_report["total_nr_evaluates"] = prefix_nr_evaluates
+            + history_report["sequence_nr_evaluates"].get<uint32_t>();
+        std::ofstream file(std::filesystem::path(history_report["condition"].get<std::string>())
+            / "nr-edit-reuse-history.json", std::ios::binary | std::ios::trunc);
+        file << history_report.dump(2) << '\n';
+        file.close();
+        Check(!file.fail(), "history completed teardown evidence saved");
+      } else if (resize_test) {
         Check(std::none_of(addon::worksets.begin(), addon::worksets.end(),
                   [owner](const auto& entry) { return entry.first.handle == owner; })
                   && addon::retired_nr_features.empty() && addon::retired_final_resources.empty(),
