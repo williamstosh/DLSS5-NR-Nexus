@@ -735,14 +735,20 @@ int RunNativeRequiredMenuTest() {
 #include "gpu_comparison_cases.hpp"
 #include "gpu_timer_cases.hpp"
 #include "control_mask_gpu_cases.hpp"
+#include "nr_edit_reuse_gpu_cases.hpp"
 #include "control_mask_capture_cases.hpp"
 #include "adaptive_fg_service_cases.hpp"
 #include "adaptive_inline_cases.hpp"
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-contracts") == 0) return nr_edit_reuse_gpu_cases::Run();
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-inline") == 0) return adaptive_inline_cases::Run();
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-fg-service") == 0) return adaptive_fg_service_cases::Run();
 #if defined(NR_NEXUS_TEST_NATIVE_NGX)
+  if (argc == 3 && std::strcmp(argv[1], "--nr-edit-reuse-cache") == 0) {
+    return control_mask_gpu_cases::RunNativeNgx(
+        argv[2], false, renodx::addons::dlss5::internal::kControlMaskRgb, false, false, false, false, true);
+  }
   if (argc == 3 && std::strcmp(argv[1], "--nr-edit-reuse-history") == 0) {
     return control_mask_gpu_cases::RunNativeNgx(
         argv[2], false, renodx::addons::dlss5::internal::kControlMaskRgb, false, false, false, true);
@@ -774,7 +780,8 @@ int main(int argc, char** argv) {
   }
 #else
   if (argc >= 2 && (std::strncmp(argv[1], "--control-mask-native-ngx", 25) == 0
-                    || std::strcmp(argv[1], "--nr-edit-reuse-history") == 0)) {
+                    || std::strcmp(argv[1], "--nr-edit-reuse-history") == 0
+                    || std::strcmp(argv[1], "--nr-edit-reuse-cache") == 0)) {
     std::cerr << "FAIL native NGX support was not compiled; rebuild with "
                  "tools/run-tests.ps1 -NativeNgxSdkLibraryDirectory containing nvsdk_ngx_s.lib\n";
     return 1;

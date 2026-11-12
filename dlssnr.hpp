@@ -112,6 +112,7 @@
 #include "ui/runtime_monitor.hpp"
 #include "ui/text_input.hpp"
 #include "submission_tracker.hpp"
+#include "edit_reuse.hpp"
 #include "control_mask_execution.hpp"
 #include "fg_xefg.hpp"
 #include "fg_native_options.hpp"
@@ -390,6 +391,7 @@ struct NrFeatureSlot {
   float logged_model[9] = {NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN};
   int64_t model_logged_ns = 0;
   LookHistory look_history;
+  std::shared_ptr<edit_reuse::State> edit_reuse;
 };
 
 // Where a relative-HDR frame's NR input scale comes from (NRFeedMode; the
@@ -452,6 +454,7 @@ struct FeatureState {
   std::shared_ptr<submission::RecordingStatus> control_mask_recording;
   std::shared_ptr<control_mask_execution::Stream> control_mask_stream;
   uint64_t source_generation = 0;
+  uint64_t sr_sequence = 0;
   bool mixed_recording_discarded = false;
   // Stage-local dimensions, normalization and slots must not alternate
   // between render and display contracts during one source evaluate.
@@ -683,6 +686,7 @@ struct RetiredNrFeature {
   // The slot's look history (LookHistory), retired with its handle, or on
   // its own (handle null) when Stabilize goes off.  Every use is tracked.
   ID3D12Resource* look_history[2] = {};
+  std::shared_ptr<edit_reuse::State> edit_reuse;
   // Late leases taken for an entry retired without a fence (DrainRetiredResources).
   uint8_t late_leases = 0;
 };
@@ -2520,6 +2524,10 @@ inline std::atomic_bool edit_trace_enabled = defaults::kEditTrace;
 // Latched when the look's programs or surfaces could not be created: the
 // look (and the trace) stay off for the session, NR runs on without them.
 inline std::atomic_bool look_unavailable = false;
+inline std::atomic_bool edit_reuse_enabled{false};
+inline std::atomic_uint64_t edit_reuse_refreshes{0};
+inline std::atomic_uint64_t edit_reuse_reuses{0};
+inline std::atomic_uint64_t edit_reuse_fallbacks{0};
 // Look stage counters (telemetry and the support report): shaped passes,
 // passes Detail stability filtered, transported passes, traced passes,
 // history restarts, motion ring entries recycled for a new motion-vector
@@ -5119,6 +5127,7 @@ inline RetiredNrFeature NrRetirement(const NrFeatureSlot& slot) {
                                            : AcquireGpuLease(0),
       .tracker_proof = tracked,
       .look_history = {slot.look_history.buffers[0], slot.look_history.buffers[1]},
+      .edit_reuse = slot.edit_reuse,
   };
 }
 
@@ -5128,7 +5137,7 @@ inline void ReleaseNrSlot(
     uint32_t slot_index,
     bool retire = false) {
   NrFeatureSlot& slot = state.slots[slot_index];
-  if (slot.handle == nullptr && slot.parameters == nullptr) {
+  if (slot.handle == nullptr && slot.parameters == nullptr && slot.edit_reuse == nullptr) {
     slot.control_mask_bound = false;
     slot.jitter_bound = false;
     return;
@@ -5168,6 +5177,7 @@ inline void ReleaseNrSlot(
   slot.tracked_since_create = false;
   slot.recording.reset();
   slot.look_history = {};
+  slot.edit_reuse.reset();
   RefreshActiveFeatureCount();
 }
 
@@ -5360,6 +5370,7 @@ inline void DrainRetiredResources(bool nr_release_allowed) {
     if (it->tracker_proof ? submission::ResourceReleasable(it->handle)
                                 && submission::ResourceReleasable(it->look_history[0])
                                 && submission::ResourceReleasable(it->look_history[1])
+                                && submission::ResourceReleasable(it->edit_reuse.get())
                                 && (it->lease.empty() || lease_released(it->lease))
                           : lease_proven(&it->lease, &it->late_leases)) {
       ReleaseRetiredNrFeature(*it);
@@ -11128,6 +11139,7 @@ __declspec(noinline) inline void SetPresentCaptureMeta(
 struct NrRecording {
   bool prepared = false;
   bool model_invoked = false;
+  bool edit_reused = false;
   bool model_recorded = false;
   bool output_ready = false;
   bool group_complete = false;
@@ -11598,9 +11610,51 @@ inline bool RecordInline(
   }
   stage_stats.width = width;
   stage_stats.height = height;
+  const bool edit_reuse_requested = edit_reuse_enabled.load(std::memory_order_relaxed);
+  const bool edit_reuse_route_eligible = edit_reuse_requested && present == nullptr && !plan.mixed
+      && group.begin == 0 && requested_stack == 1 && !adaptive.enabled && !adaptive.preparing
+      && hook_point.load() == kHookUpscaled && successful_sr_device == device
+      && !D3D11OnlySession() && !direct_api.borrowed_core_context
+      && native_fg_public_off.load() && native_fg_declaration.load() == NativeFgDeclaration::kOff
+      && !native_fg_owns.load() && !fg::xefg::Enabled() && !fg::xefg::OwnsStream()
+      && !auto_fg_fallback_active.load() && !mixed_present_fg_seen.load()
+      && !control_mask_requested && !look_mode.load() && detail_stability.load() == 1u
+      && preset.load() == 2u
+      && !nr_follow_input_res.load() && nr_input_width == width && nr_input_height == height
+      && hdr_mode == 1 && output_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT
+      && (output_desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0
+      && output_rect.x == 0 && output_rect.y == 0 && width == output_desc.Width && height == output_desc.Height
+      && current.motion_x == 0 && current.motion_y == 0 && current.depth_x == 0 && current.depth_y == 0
+      && motion_desc.Width == current.input_width && motion_desc.Height == current.input_height
+      && depth_desc.Width == current.input_width && depth_desc.Height == current.input_height
+      && depth_desc.Format == DXGI_FORMAT_R32_FLOAT
+      && depth_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+      && motion_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+      && depth_desc.DepthOrArraySize == 1 && motion_desc.DepthOrArraySize == 1
+      && depth_desc.SampleDesc.Count == 1 && motion_desc.SampleDesc.Count == 1
+      && (motion_desc.Format == DXGI_FORMAT_R16G16_FLOAT || motion_desc.Format == DXGI_FORMAT_R32G32_FLOAT)
+      && (current.create_flags & NVSDK_NGX_DLSS_Feature_Flags_MVJittered) == 0
+      && current.has_jitter && current.jitter_x == 0.f && current.jitter_y == 0.f
+      && std::isfinite(current.motion_scale_x) && std::isfinite(current.motion_scale_y)
+      && current.motion_scale_x != 0.f && current.motion_scale_y != 0.f
+      && motion_scale_x_multiplier.load() == 1.f && motion_scale_y_multiplier.load() == 1.f
+      && nr_model::SupportsControlMask(direct_runtime_requirements.file_version);
+  if (edit_reuse_requested && !edit_reuse_route_eligible) ++edit_reuse_fallbacks;
+  const auto retire_edit_reuse = [&] {
+    auto& slot = feature.slots[0];
+    if (slot.edit_reuse == nullptr) return;
+    if (slot.edit_reuse->reused || slot.edit_reuse->source_sequence + 1 != feature.sr_sequence) {
+      slot.pending_reset = true;
+      slot.pending_reset_reasons |= kResetRecovery;
+    }
+    retired_nr_features.push_back(RetiredNrFeature{
+        .generation = present_generation, .tracker_proof = true, .edit_reuse = std::move(slot.edit_reuse)});
+    nr_retirement_pending.store(true, std::memory_order_relaxed);
+  };
+  if (!edit_reuse_route_eligible) retire_edit_reuse();
   const uint32_t history_slot = (feature.adaptive_cache != nullptr
       ? static_cast<uint32_t>(feature.adaptive_cache->active) : 0u);
-  const bool track_control_mask_history = control_mask_eligible
+  const bool track_control_mask_history = control_mask_eligible || edit_reuse_route_eligible
       || feature.control_mask_recording != nullptr || feature.control_mask_stream != nullptr;
   if (track_control_mask_history) {
     const auto current_recording = submission::RecordingIdentity(command_list);
@@ -11619,7 +11673,7 @@ inline bool RecordInline(
         if (slot.handle == nullptr) continue;
         if (slot.recording != nullptr) {
           ready &= slot.tracked_since_create && reusable(
-              {slot.handle, slot.look_history.buffers[0], slot.look_history.buffers[1]}, slot.recording);
+              {slot.handle, slot.look_history.buffers[0], slot.look_history.buffers[1], slot.edit_reuse.get()}, slot.recording);
         } else {
           // Off -> on: old NR has no ControlMask provenance. Only reconstruct
           // after every exact tracked reference has ended; never reuse it.
@@ -11627,6 +11681,7 @@ inline bool RecordInline(
           for (const auto* history : slot.look_history.buffers) {
             ready &= submission::ResourceReleasable(history);
           }
+          ready &= submission::ResourceReleasable(slot.edit_reuse.get());
         }
       }
       if (feature.slots[0].recording != nullptr && feature.slots[0].recording->closed.load()
@@ -11678,7 +11733,7 @@ inline bool RecordInline(
       // is established on the actual submitting queues, without waiting for Reset.
       ready &= ordered_source
           && control_mask_execution::BeginRecording(feature.control_mask_stream, command_list);
-    } else if (ready && ordered_source && control_mask_eligible) {
+    } else if (ready && ordered_source && (control_mask_eligible || edit_reuse_route_eligible)) {
       // Adopt only after the old path's exact provenance has settled. This
       // also prevents enabling the mask from borrowing untracked old History.
       feature.control_mask_stream = control_mask_execution::CreateStream(device);
@@ -12393,6 +12448,35 @@ inline bool RecordInline(
   // chain's resets across two epochs.
   const uint64_t chain_reset_epoch =
       history_reset_epoch.load(std::memory_order_relaxed);
+  std::array<uint64_t, 32> edit_contract{};
+  if (edit_reuse_route_eligible) {
+    edit_contract = {configuration_generation.load(), chain_reset_epoch, feature.source_generation,
+        width, height, frame.motion_width, frame.motion_height, frame.create_flags, preset.load(), style.load(),
+        std::bit_cast<uint32_t>(intensity.load()), std::bit_cast<uint32_t>(local_tone_strength.load()),
+        std::bit_cast<uint32_t>(local_structure_strength.load()), std::bit_cast<uint32_t>(skin_structure_strength.load()),
+        skin_independent.load(), use_auto_mask.load(), ui_correction.load(), codec_mode.load(), source_encoding.load(),
+        FrameDisplayCodec(res), std::bit_cast<uint32_t>(color_strength.load()),
+        std::bit_cast<uint32_t>(transfer_strength.load()), std::bit_cast<uint32_t>(frame.motion_scale_x),
+        std::bit_cast<uint32_t>(frame.motion_scale_y), feed_mode.load(), norm_governor.load(), depth_mode.load(),
+        std::bit_cast<uint32_t>(norm_attack_stops.load()), std::bit_cast<uint32_t>(norm_release_stops.load()),
+        std::bit_cast<uint32_t>(norm_slew_stops.load()), norm_cut_aware.load(),
+        std::bit_cast<uint32_t>(proxy_anchor_nits.load())};
+    if (auto& cache = feature.slots[0].edit_reuse; cache != nullptr) {
+      if (cache->width != width || cache->height != height || cache->motion_width != frame.motion_width
+          || cache->motion_height != frame.motion_height) {
+        retire_edit_reuse();
+      } else if (cache->contract != edit_contract || cache->source_sequence + 1 != feature.sr_sequence
+                 || frame.frame_reset != 0 || feature.slots[0].pending_reset) {
+        if (cache->reused || cache->source_sequence + 1 != feature.sr_sequence) {
+          feature.slots[0].pending_reset = true;
+          feature.slots[0].pending_reset_reasons |= kResetRecovery;
+        }
+        cache->valid = false;
+        cache->reused = false;
+        cache->contract = edit_contract;
+      }
+    }
+  }
   int32_t executed = -1;
   int32_t last_model_pass = -1;
   bool last_model_used_control_mask = false;
@@ -12400,6 +12484,8 @@ inline bool RecordInline(
   // v6 audit issue 23: `executed` alone cannot distinguish a frame that ran
   // the model from a rule-3 bypass frame whose passes only copied through.
   bool model_evaluated = false;
+  bool edit_reused = false;
+  edit_reuse::Inputs edit_inputs;
   // Strengths of the last EXECUTED pass, consumed by the v6 pedestal and
   // commit dispatches after the loop.
   float final_pass_transfer = 0.f;
@@ -12622,196 +12708,271 @@ inline bool RecordInline(
     if (timers_active) {
       gpu_timers::Mark(command_list, gpu_timers::PassEvalStart(pass));
     }
-    const ControlMaskParameters mask_parameters =
-        ResolveControlMaskParameters(group.begin + pass);
-    const uint32_t mask_mode = mask_parameters.mode;
-    const uint32_t mask_blend = mask_parameters.blend_mode;
-    const std::array<float, 3>& mask_rgb = mask_parameters.rgb;
-    bool pass_control_mask_eligible = control_mask_eligible;
-    if (pass_control_mask_eligible) {
-      const uint32_t model_bucket = feature.slots[pass].nr_preset == 2u ? 1u : 0u;
-      if (!control_mask_active_logged[model_bucket].exchange(true, std::memory_order_relaxed)) {
-        const auto mask_desc = res.control_mask->GetDesc();
-        const auto allocation = device->GetResourceAllocationInfo(0, 1, &mask_desc);
-        std::ostringstream message;
-        message << "ControlMask active: runtime=" << direct_runtime_requirements.file_version
-                << " requested_model=" << (feature.slots[pass].nr_preset == 2u ? 'B' : 'A')
-                << " size=" << mask_desc.Width << 'x' << mask_desc.Height
-                << " allocation_bytes=" << allocation.SizeInBytes
-                << " generator_mode=" << mask_mode
-                << " blend_mode=" << mask_blend
-                << " rgb=" << mask_rgb[0] << ',' << mask_rgb[1] << ',' << mask_rgb[2]
-                << " auto_mask=" << PassModel(group.begin + pass, use_auto_mask, pass_auto_mask)
-                << " stage=DX12-Upscaled passes=" << requested_stack
-                << "; cost is included in the existing per-pass evaluate GPU timer";
-        if (mask_mode == kControlMaskDepthFar) {
-          message << " depth_range=" << mask_parameters.depth_near << ','
-                  << mask_parameters.depth_far;
-        }
-        if (mask_mode == kControlMaskGreenRect || mask_mode == kControlMaskBlueRect) {
-          message << " configured_rgb_ignored=1 base_rgba=1,1,1,1 local_zero_channel="
-                  << (mask_mode == kControlMaskGreenRect ? 'G' : 'B')
-                  << " rect=0,0," << nr_input_width / 2 << ',' << nr_input_height / 2;
-        }
-        Log(reshade::log::level::info, message.str());
+    bool reuse_this_pass = false;
+    bool composed_motion = false;
+    edit_reuse::State* edit_cache = nullptr;
+    if (edit_reuse_route_eligible) {
+      auto& cache = feature.slots[0].edit_reuse;
+      if (cache == nullptr) {
+        cache = std::make_shared<edit_reuse::State>();
+        cache->contract = edit_contract;
       }
-      pass_control_mask_eligible = DispatchControlMask(
-          device, command_list, res, frame.depth, depth_desc, frame,
-          nr_input_width, nr_input_height, mask_parameters,
-          control_mask_guides_have_provenance, control_mask_guides_have_provenance,
-          adaptive.enabled ? adaptive.upper[group.begin + pass].width : 0u,
-          adaptive.enabled ? adaptive.upper[group.begin + pass].height : 0u);
-    }
-    SetEvaluationParameters(
-        feature,
-        feature.slots[pass],
-        group.begin + pass,
-        chain_reset_epoch,
-        res,
-        frame,
-        nr_input_width,
-        nr_input_height,
-        feature_out_width,
-        feature_out_height,
-        pass_control_mask_eligible,
-        mask_blend);
-    ++stage_stats.evaluates;
-    stage_stats.resets += feature.slots[pass].model_reset;
-    stage_stats.resolved_requests[group.begin + pass] = feature.slots[pass].nr_preset;
-
-    // The NGX runtime records this handle's work into the game's list: a
-    // tracked use, so a later retirement waits for exactly this submission.
-    submission::TrackUse(command_list, feature.slots[pass].handle);
-    if (control_mask_enabled.load(std::memory_order_relaxed) || feature.control_mask_recording != nullptr) {
-      feature.slots[pass].recording = submission::ObserveRecording(command_list);
-    }
-    NVSDK_NGX_Result nr_result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
-    bool nr_returned = false;
-    if (recording != nullptr) {
-      recording->model_invoked = true;
-      recording->model_evaluate_mask |= 1u << pass;
-      if (feature.slots[pass].model_reset) {
-        recording->model_reset_mask |= 1u << pass;
-      }
-      recording->model_reset_reasons[pass] = feature.slots[pass].model_reset_reasons;
-    }
-    {
-      DirectCallScope ngx_direct_call;
-      try {
-        nr_result = feature.slots[pass].via_core
-            ? core_evaluate_feature(
-                  command_list,
-                  feature.slots[pass].handle,
-                  feature.slots[pass].parameters,
-                  nullptr)
-            : direct_api.evaluate(
-                  command_list,
-                  feature.slots[pass].handle,
-                  feature.slots[pass].parameters,
-                  nullptr);
-        nr_returned = true;
-      } catch (...) {
-        // The shared failure path below retains the game DLSS output,
-        // releases the handle, and arms the correct retry policy; the
-        // exception only substitutes the result code.
-        Log(reshade::log::level::error, "feature 18 evaluate raised an exception");
-        nr_result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
-      }
-    }
-    if (pass_control_mask_eligible) {
-      FinishControlMaskEvaluation(command_list, res, feature.slots[pass]);
-      const uint32_t model_bucket = feature.slots[pass].nr_preset == 2u ? 1u : 0u;
-      const bool accepted = nr_returned && NVSDK_NGX_SUCCEED(nr_result);
-      const bool log_result = (accepted
-          ? !control_mask_success_logged[model_bucket].exchange(true, std::memory_order_relaxed)
-          : !control_mask_evaluate_failure_logged.exchange(true, std::memory_order_relaxed));
-      if (log_result) {
-        std::ostringstream message;
-        message << "ControlMask evaluate: api_returned=" << nr_returned
-                << " ngx_accepted=" << accepted << " result=0x" << std::hex
-                << static_cast<uint32_t>(nr_result)
-                << " gpu_execution=unverified retry_same_frame=0";
-        Log(accepted ? reshade::log::level::info : reshade::log::level::error, message.str());
-      }
-    }
-    if (control_mask_capture_eligible) {
-      const auto& slot = feature.slots[pass];
-      control_mask_capture::Context context{
-          .requested_model = slot.nr_preset,
-          .stage = static_cast<uint32_t>(execution_stage),
-          .mask_enabled = control_mask_eligible, .mask_mode = mask_mode,
-          .mask_blend = static_cast<float>(mask_blend),
-          .mask_r = mask_rgb[0], .mask_g = mask_rgb[1], .mask_b = mask_rgb[2],
-          .auto_mask = slot.model_sent[4] != 0.f, .style = slot.model_sent[0],
-          .intensity = slot.model_intensity_sent, .local_tone = slot.model_sent[1],
-          .sent_structure = slot.model_sent[7], .sent_skin = slot.model_sent[8],
-          .width = nr_input_width, .height = nr_input_height,
-          .api_returned = nr_returned,
-          .ngx_accepted = nr_returned && NVSDK_NGX_SUCCEED(nr_result)};
-      std::snprintf(context.runtime_version, sizeof(context.runtime_version), "%s",
-                    direct_runtime_requirements.file_version.c_str());
-      if (timers_active && gpu_timers::internal::current.active) {
-        auto& timing = gpu_timers::internal::segments[gpu_timers::internal::current.idx];
-        // Same-stage passes share one timer segment and its first captured context.
-        if (timing.diagnostic_token == 0) {
-          timing.diagnostic_token = control_mask_capture::Reserve(context, timing.sequence, gpu_timers::NowNs());
+      edit_inputs = {.width = width, .height = height,
+          .motion_width = frame.motion_width, .motion_height = frame.motion_height,
+          .motion_scale_x = frame.motion_scale_x, .motion_scale_y = frame.motion_scale_y,
+          .proxy = res.proxy, .neural = res.nr_output, .motion = frame.motion, .depth = frame.depth,
+          .original = output, .decoded = res.decoded};
+      if (edit_reuse::Record(device, command_list, cache.get(), edit_inputs, edit_reuse::Phase::PREPARE)) {
+        edit_cache = cache.get();
+        reuse_this_pass = cache->valid && !cache->reused;
+        if (reuse_this_pass) {
+          reuse_this_pass = edit_reuse::Record(device, command_list, edit_cache, edit_inputs, edit_reuse::Phase::APPLY)
+              && edit_reuse::Record(device, command_list, edit_cache, edit_inputs, edit_reuse::Phase::SNAPSHOT_MOTION);
+          if (reuse_this_pass) {
+            cache->reused = true;
+            cache->source_sequence = feature.sr_sequence;
+          }
+        } else if (cache->valid && cache->reused) {
+          composed_motion = edit_reuse::Record(device, command_list, edit_cache, edit_inputs, edit_reuse::Phase::MOTION);
+          if (composed_motion) {
+            Transition(command_list, cache->composed_motion.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+          }
         }
       } else {
-        const uint64_t token = control_mask_capture::Reserve(context, 0, gpu_timers::NowNs());
-        control_mask_capture::Observe(gpu_timers::Stats{
-            .state = gpu_timers::SampleState::PROOF_UNAVAILABLE,
-            .measured_ns = gpu_timers::NowNs()}, token);
+        ++edit_reuse_fallbacks;
+        retire_edit_reuse();
+      }
+      if (edit_cache != nullptr && edit_cache->valid && edit_cache->reused
+          && !reuse_this_pass && !composed_motion) {
+        feature.slots[0].pending_reset = true;
+        feature.slots[0].pending_reset_reasons |= kResetRecovery;
+        edit_cache->valid = false;
+        ++edit_reuse_fallbacks;
       }
     }
-    ObserveNrEvaluation(execution_stage, handle, feature, feature.slots[pass], group.begin + pass, nr_result, plan, present, nr_returned);
-    last_result = static_cast<uint32_t>(nr_result);
-    if (NVSDK_NGX_FAILED(nr_result)) {
-      stack_failure = nr_result;
-      failed_pass = pass;
-      break;
-    }
-    last_model_pass = static_cast<int32_t>(pass);
-    last_model_used_control_mask = pass_control_mask_eligible;
-    last_model_control_mask_mode = mask_parameters.mode;
-    if (recording != nullptr) {
-      recording->model_recorded = true;
-      recording->model_pass_mask |= 1u << pass;
-    }
-    // Decode pass: blend the neural result over this pass's reference image
-    // and upscale from the NR working resolution to the output resolution.
-    // v6 HDR resolves in LINEAR source units onto the work ping-pong
-    // surface (no transfer function until the single commit below).
-    UavBarrier(command_list, res.nr_output);
-    if (timers_active) {
-      gpu_timers::Mark(command_list, gpu_timers::PassEvalEnd(pass));
-    }
-    if (capture_this_eval) {
-      // Diagnostics: the RAW neural output, before any transfer - evidence
-      // of what the model actually returns for the conditioned proxy.  With
-      // a multi-pass stack each pass records its own plane.
-      Transition(
-          command_list, res.nr_output,
-          D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-          D3D12_RESOURCE_STATE_COPY_SOURCE);
-      screenshot::RecordStackPlaneCopy(
-          device, command_list, res.nr_output,
-          res.input_width, res.input_height,
-          "neural", pass, requested_stack);
-      Transition(
-          command_list, res.nr_output,
-          D3D12_RESOURCE_STATE_COPY_SOURCE,
-          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (reuse_this_pass) {
+      UavBarrier(command_list, res.nr_output);
+      Transition(command_list, res.nr_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      res.nr_output_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+      edit_reused = true;
+      if (timers_active) {
+        gpu_timers::Mark(command_list, gpu_timers::PassEvalEnd(pass));
+      }
     } else {
-      Transition(
-          command_list, res.nr_output,
-          D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      const ControlMaskParameters mask_parameters =
+          ResolveControlMaskParameters(group.begin + pass);
+      const uint32_t mask_mode = mask_parameters.mode;
+      const uint32_t mask_blend = mask_parameters.blend_mode;
+      const std::array<float, 3>& mask_rgb = mask_parameters.rgb;
+      bool pass_control_mask_eligible = control_mask_eligible;
+      if (pass_control_mask_eligible) {
+        const uint32_t model_bucket = feature.slots[pass].nr_preset == 2u ? 1u : 0u;
+        if (!control_mask_active_logged[model_bucket].exchange(true, std::memory_order_relaxed)) {
+          const auto mask_desc = res.control_mask->GetDesc();
+          const auto allocation = device->GetResourceAllocationInfo(0, 1, &mask_desc);
+          std::ostringstream message;
+          message << "ControlMask active: runtime=" << direct_runtime_requirements.file_version
+                  << " requested_model=" << (feature.slots[pass].nr_preset == 2u ? 'B' : 'A')
+                  << " size=" << mask_desc.Width << 'x' << mask_desc.Height
+                  << " allocation_bytes=" << allocation.SizeInBytes
+                  << " generator_mode=" << mask_mode
+                  << " blend_mode=" << mask_blend
+                  << " rgb=" << mask_rgb[0] << ',' << mask_rgb[1] << ',' << mask_rgb[2]
+                  << " auto_mask=" << PassModel(group.begin + pass, use_auto_mask, pass_auto_mask)
+                  << " stage=DX12-Upscaled passes=" << requested_stack
+                  << "; cost is included in the existing per-pass evaluate GPU timer";
+          if (mask_mode == kControlMaskDepthFar) {
+            message << " depth_range=" << mask_parameters.depth_near << ','
+                    << mask_parameters.depth_far;
+          }
+          if (mask_mode == kControlMaskGreenRect || mask_mode == kControlMaskBlueRect) {
+            message << " configured_rgb_ignored=1 base_rgba=1,1,1,1 local_zero_channel="
+                    << (mask_mode == kControlMaskGreenRect ? 'G' : 'B')
+                    << " rect=0,0," << nr_input_width / 2 << ',' << nr_input_height / 2;
+          }
+          Log(reshade::log::level::info, message.str());
+        }
+        pass_control_mask_eligible = DispatchControlMask(
+            device, command_list, res, frame.depth, depth_desc, frame,
+            nr_input_width, nr_input_height, mask_parameters,
+            control_mask_guides_have_provenance, control_mask_guides_have_provenance,
+            adaptive.enabled ? adaptive.upper[group.begin + pass].width : 0u,
+            adaptive.enabled ? adaptive.upper[group.begin + pass].height : 0u);
+      }
+      EvaluationContract model_frame = frame;
+      if (composed_motion) model_frame.motion = edit_cache->composed_motion.Get();
+      SetEvaluationParameters(
+          feature,
+          feature.slots[pass],
+          group.begin + pass,
+          chain_reset_epoch,
+          res,
+          model_frame,
+          nr_input_width,
+          nr_input_height,
+          feature_out_width,
+          feature_out_height,
+          pass_control_mask_eligible,
+          mask_blend);
+      ++stage_stats.evaluates;
+      stage_stats.resets += feature.slots[pass].model_reset;
+      stage_stats.resolved_requests[group.begin + pass] = feature.slots[pass].nr_preset;
+
+      // The NGX runtime records this handle's work into the game's list: a
+      // tracked use, so a later retirement waits for exactly this submission.
+      submission::TrackUse(command_list, feature.slots[pass].handle);
+      if (control_mask_enabled.load(std::memory_order_relaxed) || feature.control_mask_recording != nullptr) {
+        feature.slots[pass].recording = submission::ObserveRecording(command_list);
+      }
+      NVSDK_NGX_Result nr_result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
+      bool nr_returned = false;
+      if (recording != nullptr) {
+        recording->model_invoked = true;
+        recording->model_evaluate_mask |= 1u << pass;
+        if (feature.slots[pass].model_reset) {
+          recording->model_reset_mask |= 1u << pass;
+        }
+        recording->model_reset_reasons[pass] = feature.slots[pass].model_reset_reasons;
+      }
+      {
+        DirectCallScope ngx_direct_call;
+        try {
+          nr_result = feature.slots[pass].via_core
+              ? core_evaluate_feature(
+                    command_list,
+                    feature.slots[pass].handle,
+                    feature.slots[pass].parameters,
+                    nullptr)
+              : direct_api.evaluate(
+                    command_list,
+                    feature.slots[pass].handle,
+                    feature.slots[pass].parameters,
+                    nullptr);
+          nr_returned = true;
+        } catch (...) {
+          // The shared failure path below retains the game DLSS output,
+          // releases the handle, and arms the correct retry policy; the
+          // exception only substitutes the result code.
+          Log(reshade::log::level::error, "feature 18 evaluate raised an exception");
+          nr_result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
+        }
+      }
+      if (composed_motion) {
+        Transition(command_list, edit_cache->composed_motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      }
+      if (pass_control_mask_eligible) {
+        FinishControlMaskEvaluation(command_list, res, feature.slots[pass]);
+        const uint32_t model_bucket = feature.slots[pass].nr_preset == 2u ? 1u : 0u;
+        const bool accepted = nr_returned && NVSDK_NGX_SUCCEED(nr_result);
+        const bool log_result = (accepted
+            ? !control_mask_success_logged[model_bucket].exchange(true, std::memory_order_relaxed)
+            : !control_mask_evaluate_failure_logged.exchange(true, std::memory_order_relaxed));
+        if (log_result) {
+          std::ostringstream message;
+          message << "ControlMask evaluate: api_returned=" << nr_returned
+                  << " ngx_accepted=" << accepted << " result=0x" << std::hex
+                  << static_cast<uint32_t>(nr_result)
+                  << " gpu_execution=unverified retry_same_frame=0";
+          Log(accepted ? reshade::log::level::info : reshade::log::level::error, message.str());
+        }
+      }
+      if (control_mask_capture_eligible) {
+        const auto& slot = feature.slots[pass];
+        control_mask_capture::Context context{
+            .requested_model = slot.nr_preset,
+            .stage = static_cast<uint32_t>(execution_stage),
+            .mask_enabled = control_mask_eligible, .mask_mode = mask_mode,
+            .mask_blend = static_cast<float>(mask_blend),
+            .mask_r = mask_rgb[0], .mask_g = mask_rgb[1], .mask_b = mask_rgb[2],
+            .auto_mask = slot.model_sent[4] != 0.f, .style = slot.model_sent[0],
+            .intensity = slot.model_intensity_sent, .local_tone = slot.model_sent[1],
+            .sent_structure = slot.model_sent[7], .sent_skin = slot.model_sent[8],
+            .width = nr_input_width, .height = nr_input_height,
+            .api_returned = nr_returned,
+            .ngx_accepted = nr_returned && NVSDK_NGX_SUCCEED(nr_result)};
+        std::snprintf(context.runtime_version, sizeof(context.runtime_version), "%s",
+                      direct_runtime_requirements.file_version.c_str());
+        if (timers_active && gpu_timers::internal::current.active) {
+          auto& timing = gpu_timers::internal::segments[gpu_timers::internal::current.idx];
+          // Same-stage passes share one timer segment and its first captured context.
+          if (timing.diagnostic_token == 0) {
+            timing.diagnostic_token = control_mask_capture::Reserve(context, timing.sequence, gpu_timers::NowNs());
+          }
+        } else {
+          const uint64_t token = control_mask_capture::Reserve(context, 0, gpu_timers::NowNs());
+          control_mask_capture::Observe(gpu_timers::Stats{
+              .state = gpu_timers::SampleState::PROOF_UNAVAILABLE,
+              .measured_ns = gpu_timers::NowNs()}, token);
+        }
+      }
+      ObserveNrEvaluation(execution_stage, handle, feature, feature.slots[pass], group.begin + pass, nr_result, plan, present, nr_returned);
+      last_result = static_cast<uint32_t>(nr_result);
+      if (NVSDK_NGX_FAILED(nr_result)) {
+        stack_failure = nr_result;
+        failed_pass = pass;
+        break;
+      }
+      last_model_pass = static_cast<int32_t>(pass);
+      last_model_used_control_mask = pass_control_mask_eligible;
+      last_model_control_mask_mode = mask_parameters.mode;
+      if (recording != nullptr) {
+        recording->model_recorded = true;
+        recording->model_pass_mask |= 1u << pass;
+      }
+      // Decode pass: blend the neural result over this pass's reference image
+      // and upscale from the NR working resolution to the output resolution.
+      // v6 HDR resolves in LINEAR source units onto the work ping-pong
+      // surface (no transfer function until the single commit below).
+      UavBarrier(command_list, res.nr_output);
+      if (timers_active) {
+        gpu_timers::Mark(command_list, gpu_timers::PassEvalEnd(pass));
+      }
+      if (capture_this_eval) {
+        // Diagnostics: the RAW neural output, before any transfer - evidence
+        // of what the model actually returns for the conditioned proxy.  With
+        // a multi-pass stack each pass records its own plane.
+        Transition(
+            command_list, res.nr_output,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
+        screenshot::RecordStackPlaneCopy(
+            device, command_list, res.nr_output,
+            res.input_width, res.input_height,
+            "neural", pass, requested_stack);
+        Transition(
+            command_list, res.nr_output,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      } else {
+        Transition(
+            command_list, res.nr_output,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      }
+      res.nr_output_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+      if (edit_cache != nullptr) {
+        edit_cache->valid = edit_reuse::Record(device, command_list, edit_cache, edit_inputs, edit_reuse::Phase::CAPTURE);
+        edit_cache->reused = false;
+        edit_cache->source_sequence = feature.sr_sequence;
+        if (edit_cache->valid) {
+          ++edit_cache->anchor_generation;
+        } else {
+          ++edit_reuse_fallbacks;
+        }
+      }
+      if (edit_reuse_route_eligible) {
+        ++edit_reuse_refreshes;
+      }
     }
-    res.nr_output_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     // The look stage reshapes the model's edit (or measures it) before the
     // resolve, which then reads the route it returns.
-    const LookRoute route =
-        RunLookStage(command_list, device, res, feature.slots[pass], pass, look_chain, frame, group.begin);
+    LookRoute route{srv_table_start, nr_input_width, nr_input_height, nr_input_width, nr_input_height};
+    if (!reuse_this_pass) {
+      route = RunLookStage(command_list, device, res, feature.slots[pass], pass, look_chain, frame, group.begin);
+    }
     ID3D12Resource* const looked_neural =
         (route.shaped ? (route.srv_set == kDescriptorTransportSet + srv_table_start
                             ? res.look_up_neural : res.look_output) : res.nr_output);
@@ -12897,7 +13058,7 @@ inline bool RecordInline(
     // Intermediate results stay in the ping-pong surfaces for the next pass
     // (resting in UAV, their tracked state); the write-back to the game
     // output happens once, after the loop, on the last executed pass.
-    model_evaluated = true;
+    model_evaluated |= !reuse_this_pass;
     executed = static_cast<int32_t>(pass);
     final_pass_transfer = pass_transfer;
     final_pass_color = pass_color;
@@ -13205,6 +13366,26 @@ inline bool RecordInline(
           0.f, present, hdr_capture.get());
       command_list->Dispatch((width + 15) / 16, (height + 15) / 16, 1);
       UavBarrier(command_list, res.decoded);
+      if (edit_reused) {
+        Transition(command_list, output, output_rest, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, 0u);
+        auto& cache = feature.slots[0].edit_reuse;
+        if (!edit_reuse::Record(device, command_list, cache.get(), edit_inputs, edit_reuse::Phase::SELECT_ORIGINAL)) {
+          // No model was invoked on this frame. Keep its original output and
+          // restart NR history on the next actual refresh.
+          Transition(command_list, output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                     D3D12_RESOURCE_STATE_COPY_SOURCE, 0u);
+          Transition(command_list, res.decoded, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+          CopyMip0(command_list, res.decoded, output);
+          Transition(command_list, res.decoded, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+          Transition(command_list, output, D3D12_RESOURCE_STATE_COPY_SOURCE, output_rest, 0u);
+          cache->valid = false;
+          feature.slots[0].pending_reset = true;
+          feature.slots[0].pending_reset_reasons |= kResetRecovery;
+          ++edit_reuse_fallbacks;
+        } else {
+          Transition(command_list, output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, output_rest, 0u);
+        }
+      }
       if (hdr_capture != nullptr) {
         constexpr const char* names[] = {
             "hdr_post_pedestal_linear", "hdr_post_gamut_linear", "hdr_encoded_float", "hdr_pedestal_field"};
@@ -13382,6 +13563,25 @@ inline bool RecordInline(
     return true;
   }
   ++captured_guides;
+  if (edit_reused) {
+    const uint64_t count = edit_reuse_reuses.fetch_add(1, std::memory_order_relaxed) + 1;
+    ++feature.slots[0].edit_reuse->reuse_count;
+    if (count == 1 || count == 60 || count == 600) {
+      std::ostringstream message;
+      message << "NR edit reuse: refresh=" << edit_reuse_refreshes.load()
+              << " reuse=" << count << " fallback=" << edit_reuse_fallbacks.load()
+              << " anchor=" << feature.slots[0].edit_reuse->anchor_generation
+              << " allocation_bytes=" << feature.slots[0].edit_reuse->allocated_bytes
+              << " model_evaluates=0 age=1";
+      Log(reshade::log::level::info, message.str());
+    }
+    if (recording != nullptr) {
+      recording->edit_reused = true;
+      recording->output_ready = true;
+      recording->group_complete = stage_scope.complete;
+    }
+    return true;
+  }
   if (!model_evaluated) {
     ++bypassed_evaluations;
     CountNrDecline(NrDeclineReason::kSlotWarmupMaturation);
@@ -13480,6 +13680,7 @@ inline uint64_t SourceSuccessfulEvaluations() {
       + successful_pre_sr_evaluations.load(std::memory_order_relaxed);
   const auto split_groups = mixed_stage_group_successes.load(std::memory_order_relaxed);
   return (groups > split_groups ? groups - split_groups : 0)
+      + edit_reuse_reuses.load(std::memory_order_relaxed)
       + mixed_stage_source_successes.load(std::memory_order_relaxed);
 }
 
@@ -18067,6 +18268,9 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
   bool frame_generation = false;
   if (!nested_in_c_wrapper && !InsideDirectCall()) {
     RuntimeLock lock(runtime_mutex);
+    if (source_scope.owner) {
+      if (auto source = features.find(handle); source != features.end()) ++source->second.sr_sequence;
+    }
     // NRPresentPreFg (present_path.hpp): a DLSS-G evaluate gets NR on its
     // input frame here, recorded into its list before DLSS-G reads it, and
     // a HUD-less stand-in in its block for the duration of real().
@@ -18316,6 +18520,9 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
   bool frame_generation = false;
   if (!InsideDirectCall()) {
     RuntimeLock lock(runtime_mutex);
+    if (source_scope.owner) {
+      if (auto source = features.find(handle); source != features.end()) ++source->second.sr_sequence;
+    }
     // NRPresentPreFg: NR on DLSS-G's input before DLSS-G reads it (see the
     // C++ wrapper).
     frame_generation =
@@ -29206,6 +29413,9 @@ inline void LoadConfiguration() {
   reshade::get_config_value(nullptr, kConfigSection, "NRLookUpsample", saved_look.upsample);
   reshade::get_config_value(
       nullptr, kConfigSection, "NRDetailStability", saved_detail_stability);
+  bool saved_edit_reuse = false;
+  reshade::get_config_value(nullptr, kConfigSection, "NREditReuse", saved_edit_reuse);
+  edit_reuse_enabled = saved_edit_reuse;
   // Diagnostics, read-only from the ini (never persisted): the telemetry line
   // interval (0 = off) and the per-frame normalization trace.
   uint32_t saved_telemetry_seconds = telemetry_seconds.load();

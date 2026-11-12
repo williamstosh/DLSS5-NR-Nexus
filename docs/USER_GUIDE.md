@@ -434,6 +434,12 @@ Present 显示以下选项。兼容的 Pre-FG 先增强游戏帧再交给 FG；�
 
 遇到具体问题时查本节。修改前记录旧值，一次对比一项；显示不适用时按原因处理。
 
+#### x2 编辑复用（开发实验）
+
+**仅开发分支提供，未包含于 v0.4.0 安装包，默认关闭。** 每两帧重新生成一次 NR 编辑，另一帧将编辑跟随运动应用到当前画面；遮挡、颜色变化或越界区域保留当前原色。它用于试验降低 NR 开销，动态画质尚待验收。
+
+关闭游戏后，在 ReShade 配置的 `[RenoDX.DLSS5]` 段加入 `NREditReuse=1`，重启后读取。首版只接受原生 DX12、Upscaled、模型 B、1 层、固定100% HDR 输出，关闭调整 NR 外观、细节稳定性、ControlMask、自适应尺寸和 FG；还要求游戏提供零 jitter 的匹配深度与运动。常见的非零 jitter 输入及其他组合会保持逐帧 NR。日志中的 `NR edit reuse` 表示实际发生复用；移除该键或设为 `0` 后重启即可关闭。此实验未加入菜单或方案分享。
+
 <a id="zh-paths"></a>
 #### 可用组合
 
@@ -976,6 +982,12 @@ Reset NR feature rebuilds runtime state; Restore defaults resets saved settings;
 ### Advanced diagnostics and special compatibility
 
 Use this for specific issues. Record old values and compare one change at a time; follow unavailable reasons.
+
+#### x2 edit reuse (development experiment)
+
+**Available only on the development branch, absent from the v0.4.0 package, and off by default.** NR generates a new edit every other frame. The intervening frame applies the motion-reprojected edit to the current image; rejected occlusion, color-change and boundary pixels retain their current color. This experiment targets lower NR cost; dynamic image quality awaits acceptance.
+
+With the game closed, add `NREditReuse=1` under `[RenoDX.DLSS5]` in the ReShade configuration, then restart. The initial candidate requires native DX12, Upscaled, model B, one pass and fixed 100% HDR output, with Adjust NR's look, Detail stability, ControlMask, adaptive sizing and FG off. It also requires matching depth and motion with zero jitter. Common nonzero jitter inputs and other combinations continue running NR every frame. An `NR edit reuse` log entry confirms actual reuse. Remove the key or set it to `0` and restart to disable it. There is no menu control or preset-sharing field for this experiment.
 
 <a id="en-paths"></a>
 #### Compatible combinations

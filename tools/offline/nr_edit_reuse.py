@@ -21,7 +21,7 @@ from contracts import ContractError, artifact_path, digest, read_json, sample_st
 
 CONDITIONS = ("baseline", "baseline-repeat", "x2-compose", "x2-reset")
 FORMATS = {"RGBA16F": ("<f2", 4), "RG16F": ("<f2", 2),
-           "R32F": ("<f4", 1), "R8_UINT": ("u1", 1)}
+           "R32F": ("<f4", 1), "R8_UINT": ("u1", 1), "R32_UINT": ("<u4", 1)}
 FLOOR = 1.0 / 1024.0
 
 

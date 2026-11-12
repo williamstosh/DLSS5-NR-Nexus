@@ -2391,6 +2391,7 @@ inline int native_history_reset = -1;
 inline d3d12_test::TimestampQueries* native_history_queries = nullptr;
 inline UINT native_history_interval = 0;
 inline nlohmann::json native_history_parameters;
+inline bool native_cache_observe = false;
 inline addon::DirectCreateFn native_resize_create = nullptr;
 inline addon::DirectReleaseFn native_resize_release = nullptr;
 inline double native_resize_create_ms = 0;
@@ -2439,6 +2440,10 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeHostEvaluate(
     native_motion_gpu->RecordTextureReadback(output, *native_motion_sr_readback);
     native_motion_gpu->Transition(output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   }
+  if (NVSDK_NGX_SUCCEED(result) && native_cache_observe && native_history_queries != nullptr) {
+    // Exclude real SR and its diagnostic snapshot from the full NR chain.
+    native_history_queries->Begin(command_list, native_history_interval + 2);
+  }
   return result;
 }
 
@@ -2450,10 +2455,12 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeRuntimeEvaluate(
     const NVSDK_NGX_Handle* handle,
     const NVSDK_NGX_Parameter* parameters,
     PFN_NVSDK_NGX_ProgressCallback progress) {
-  if (native_history_motion != nullptr) {
+  if (native_history_motion != nullptr || native_cache_observe) {
     const auto wrapper_reset = addon::GetInt(parameters, "DLSSNR.Reset", -1);
     auto* experiment_parameters = const_cast<NVSDK_NGX_Parameter*>(parameters);
-    experiment_parameters->Set("DLSSNR.MVec", native_history_motion);
+    if (native_history_motion != nullptr) {
+      experiment_parameters->Set("DLSSNR.MVec", native_history_motion);
+    }
     if (native_history_reset >= 0) {
       experiment_parameters->Set("DLSSNR.Reset", native_history_reset);
     }
@@ -2462,9 +2469,10 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeRuntimeEvaluate(
         {"reset", addon::GetInt(parameters, "DLSSNR.Reset", -1)},
         {"motion", reinterpret_cast<uintptr_t>(addon::GetD3D12Resource(parameters, "DLSSNR.MVec"))},
         {"depth", reinterpret_cast<uintptr_t>(addon::GetD3D12Resource(parameters, "DLSSNR.Depth"))}};
-    const auto motion_desc = native_history_motion->GetDesc();
+    const auto motion_desc = addon::GetD3D12Resource(parameters, "DLSSNR.MVec")->GetDesc();
     native_history_parameters["motion_resource"] = {{"width", motion_desc.Width}, {"height", motion_desc.Height},
-        {"format", static_cast<uint32_t>(motion_desc.Format)}, {"format_name", "R16G16_FLOAT"}};
+        {"format", static_cast<uint32_t>(motion_desc.Format)},
+        {"format_name", motion_desc.Format == DXGI_FORMAT_R32G32_FLOAT ? "R32G32_FLOAT" : "R16G16_FLOAT"}};
     for (const auto* key : {"DLSSNR.MVecScaleX", "DLSSNR.MVecScaleY", "DLSSNR.JitterOffsetX", "DLSSNR.JitterOffsetY"}) {
       float value = 0.f;
       const auto result = parameters->Get(key, &value);
@@ -2499,7 +2507,13 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeRuntimeEvaluate(
   const auto start = std::chrono::steady_clock::now();
   const NVSDK_NGX_Result result = native_runtime_evaluate(command_list, handle, parameters, progress);
   if (native_history_queries != nullptr) {
-    native_history_queries->EndAndResolve(command_list, native_history_interval + 1);
+    if (native_cache_observe) {
+      // Resolve the model timestamps after the whole-chain endpoint as well.
+      command_list->EndQuery(native_history_queries->heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                            2 * (native_history_interval + 1) + 1);
+    } else {
+      native_history_queries->EndAndResolve(command_list, native_history_interval + 1);
+    }
   }
   native_resize_evaluate_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
   if (NVSDK_NGX_SUCCEED(result) && native_motion_neural_readback != nullptr) {
@@ -2520,12 +2534,14 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeRuntimeEvaluate(
 
 int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                  uint32_t mask_mode = addon::kControlMaskDepthFar, bool cost = false,
-                 bool motion_test = false, bool resize_test = false, bool history_test = false) {
+                 bool motion_test = false, bool resize_test = false, bool history_test = false,
+                 bool cache_test = false) {
   try {
+    const bool sequence_test = history_test || cache_test;
     // Resize reuses public SDK initialization and the real SR owner, without
     // running the independent paired ControlMask motion experiment.
-    motion_test = motion_test || resize_test || history_test;
-    if (resize_test || history_test) {
+    motion_test = motion_test || resize_test || sequence_test;
+    if (resize_test || sequence_test) {
       // This headless fixture has no Present stream. Disable the production
       // game-exit heuristic so its normal submission-proven retirement runs.
       addon::shutdown_quiesce_enabled = false;
@@ -2697,7 +2713,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     addon::intensity = 1.f;
     addon::preset = (single_stage ? 2u : 1u);
     addon::codec_mode = 0u;
-    const bool mask_enabled = !history_test && (cost ? cost_mode != "off"
+    const bool mask_enabled = !sequence_test && (cost ? cost_mode != "off"
                                     : hot_toggle || std::getenv("NR_NEXUS_TEST_CONTROL_MASK_OFF") == nullptr);
     const char* mask_mode_name = (mask_mode == addon::kControlMaskRgb ? "rgb" : "depthfar");
     addon::control_mask_enabled = mask_enabled;
@@ -2705,12 +2721,19 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     addon::control_mask_depth_near = 0.7f;
     addon::control_mask_depth_far = 0.9f;
     addon::control_mask_blend_mode = 0u;
+    if (cache_test) {
+      addon::edit_reuse_enabled = true;
+      addon::native_fg_public_off = true;
+      addon::native_fg_declaration = addon::NativeFgDeclaration::kOff;
+      addon::cost_meter_enabled = false;
+      addon::gpu_timers_enabled = false;
+    }
     if (motion_test) {
       // Keep the paired proxy independent of wall-clock governor rates and
       // the preceding sequence's cut-aware normalization/Look history.
       addon::feed_mode = 1u;
       addon::norm_governor = 0u;
-      addon::detail_stability = (history_test ? 1u : 0u);  // 0 Auto, 1 Off.
+      addon::detail_stability = (sequence_test ? 1u : 0u);  // 0 Auto, 1 Off.
       addon::control_mask_mode = addon::kControlMaskRgb;
       addon::control_mask_motion_enabled = false;
       addon::control_mask_motion_start = 2.f;
@@ -2812,17 +2835,17 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     bool production_chain_completed = false;
     uint32_t prefix_host_evaluates = 0;
     size_t prefix_nr_evaluates = 0;
-    const uint32_t prefix_limit = (cost || history_test ? cost_prefix_frames : addon::kContractDebounceFrames + 32);
+    const uint32_t prefix_limit = (cost || sequence_test ? cost_prefix_frames : addon::kContractDebounceFrames + 32);
     for (uint32_t attempt = 0; attempt < prefix_limit; ++attempt) {
       native_runtime_masks.clear();
       native_runtime_results.clear();
       native_runtime_resets.clear();
       gpu.list->ClearState(nullptr);
-      if (cost || history_test) {
+      if (cost || sequence_test) {
         if (cost) {
           restore_cost_inputs();
         }
-        parameters.Set(NVSDK_NGX_Parameter_Reset, (attempt == 0 ? 1 : 0));
+        parameters.Set(NVSDK_NGX_Parameter_Reset, (cache_test || attempt == 0 ? 1 : 0));
       }
       addon::ngx_slot_real[0].evaluate = (motion_test ? reinterpret_cast<void*>(ObserveNativeHostEvaluate)
                                                    : reinterpret_cast<void*>(SuccessfulHostEvaluate));
@@ -2834,7 +2857,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       Check(NVSDK_NGX_SUCCEED(result), "host SR succeeds around production Render and Upscaled hooks");
       gpu.Submit();
       addon::DrainRetiredResources(true);
-      if (cost || history_test) {
+      if (cost || sequence_test) {
         cost_prefix.push_back({{"frame", attempt}, {"host_result", static_cast<uint32_t>(result)},
             {"evaluate_count", native_runtime_results.size()}, {"results", native_runtime_results},
             {"resets", native_runtime_resets}, {"fence", gpu.serial},
@@ -2852,7 +2875,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                   && native_runtime_masks[0] == addon::worksets.at({owner, output.Get(), false}).control_mask,
               "initial native frame binds and evaluates its production mask");
         production_chain_completed = true;
-        if (cost || history_test) continue;
+        if (cost || sequence_test) continue;
         break;
       }
       Check(feature.render_session != nullptr
@@ -2885,17 +2908,19 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     nlohmann::json motion_report;
     nlohmann::json resize_report;
     nlohmann::json history_report;
-    if (history_test) {
+    if (sequence_test) {
       const auto history_look = addon::LookSettingsSnapshot(true);
       Check(addon::detail_stability.load() == 1u && history_look.stabilize == 0u
                 && !history_look.stabilize_detail && history_look.stabilize_alpha == 0.f,
             "history fixture disables temporal Look in the effective after-path snapshot");
-      const char* requested_condition = std::getenv("NR_NEXUS_TEST_NR_HISTORY_CONDITION");
+      const char* requested_condition = std::getenv(cache_test
+          ? "NR_NEXUS_TEST_NR_CACHE_CONDITION" : "NR_NEXUS_TEST_NR_HISTORY_CONDITION");
       const std::string condition = (requested_condition != nullptr ? requested_condition : "baseline");
-      Check(condition == "baseline" || condition == "baseline-repeat"
-                || condition == "x2-compose" || condition == "x2-reset", "known NR history condition");
+      Check((cache_test ? condition == "baseline" || condition == "cache"
+                       : condition == "baseline" || condition == "baseline-repeat"
+                || condition == "x2-compose" || condition == "x2-reset"), "known NR sequence condition");
       const bool sparse = condition == "x2-compose" || condition == "x2-reset";
-      const std::filesystem::path raw_directory(condition);
+      const std::filesystem::path raw_directory(cache_test && condition == "baseline" ? "cache-baseline" : condition);
       Check(std::filesystem::create_directory(raw_directory), "history output is a new isolated condition directory");
       constexpr uint32_t frame_count = 24;
       // Render-grid pixels. A nonconstant background velocity and separately
@@ -2905,13 +2930,14 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       constexpr std::array<float, 6> light{1.f, 1.15f, 1.3f, 1.1f, 0.85f, 1.f};
       auto history_motion = gpu.Texture(render_width, render_height, DXGI_FORMAT_R16G16_FLOAT);
       gpu.Transition(history_motion.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-      auto queries = d3d12_test::CreateTimestampQueries(gpu, frame_count * 2);
+      const UINT intervals_per_frame = (cache_test ? 3u : 2u);
+      auto queries = d3d12_test::CreateTimestampQueries(gpu, frame_count * intervals_per_frame);
       std::vector<uint16_t> nr_motion_data(render_pixel_count * 2);
       std::vector<uint16_t> previous_motion(render_pixel_count * 2, 0);
       std::vector<uint8_t> surface(render_pixel_count, 0), previous_surface(render_pixel_count, 0);
       std::vector<uint8_t> validity(render_pixel_count, 0), previous_validity(render_pixel_count, 0);
       auto& report = history_report;
-      report = {{"schema", "nr-nexus-nr-edit-reuse-history-v1"}, {"condition", condition},
+      report = {{"schema", (cache_test ? "nr-nexus-nr-edit-reuse-cache-v1" : "nr-nexus-nr-edit-reuse-history-v1")}, {"condition", condition},
           {"process_id", GetCurrentProcessId()}, {"host_sr_handle", reinterpret_cast<uintptr_t>(owner)},
           {"evidence", "NATIVE_GPU+NATIVE_NGX"}, {"stage", "D3D12 Upscaled"}, {"passes", 1},
           {"dimensions", {{"render", {render_width, render_height}}, {"output", {width, height}}}},
@@ -2929,9 +2955,17 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           {"detail_stability", addon::detail_stability.load()}, {"timestamp_frequency_hz", queries.frequency_hz},
           {"look_snapshot", {{"stabilize", history_look.stabilize}, {"stabilize_detail", history_look.stabilize_detail},
               {"stabilize_alpha", history_look.stabilize_alpha}}},
-          {"timing_scope", "individual real SR and NR Evaluate GPU intervals, excluding readback copies; diagnostic only"},
+          {"timing_scope", (cache_test
+              ? "SR/model Evaluate and whole NR chain after real SR snapshot through wrapper return; final/validity readbacks excluded"
+              : "individual real SR and NR Evaluate GPU intervals, excluding readback copies; diagnostic only")},
           {"raw_policy", "condition directory registered disposable by test entry; only KEEP_RAW=1 preserves complete dataset"},
           {"frames", nlohmann::json::array()}};
+      if (cache_test) {
+        report["prefix_edit_reuse_enabled"] = true;
+        report["prefix_force_reset"] = true;
+        report["edit_reuse_enabled"] = condition == "cache";
+        report["validity"] = "output plane uint32: 0 exact current SR, 1 cached edit; fixture input valid remains two-step surface bits";
+      }
       ComPtr<IDXGIAdapter1> adapter;
       Check(SUCCEEDED(gpu.factory->EnumAdapterByLuid(gpu.device->GetAdapterLuid(), IID_PPV_ARGS(&adapter))),
             "history actual device adapter");
@@ -2959,7 +2993,12 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       }
       int camera_shift = 0;
       uint32_t nr_calls = 0;
+      bool previous_frame_reused = false;
+      if (cache_test) addon::edit_reuse_enabled = condition == "cache";
       for (uint32_t frame = 0; frame < frame_count; ++frame) {
+        const uint64_t refreshes_before = (cache_test ? addon::edit_reuse_refreshes.load() : 0);
+        const uint64_t reuses_before = (cache_test ? addon::edit_reuse_reuses.load() : 0);
+        const uint64_t fallbacks_before = (cache_test ? addon::edit_reuse_fallbacks.load() : 0);
         const bool refresh = !sparse || frame % 2 == 0;
         const bool foreground = frame >= 12;
         const int foreground_left = 240 + (frame >= 12 ? 3 * static_cast<int>(frame - 12) : 0);
@@ -3032,17 +3071,18 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         auto neural_readback = gpu.CreateTextureTransfer(workset.nr_output);
         auto final_readback = gpu.CreateTextureTransfer(output.Get());
         native_motion_sr_readback = &sr_readback;
-        native_motion_proxy_readback = (refresh ? &proxy_readback : nullptr);
-        native_motion_neural_readback = (refresh ? &neural_readback : nullptr);
+        native_motion_proxy_readback = (refresh && !cache_test ? &proxy_readback : nullptr);
+        native_motion_neural_readback = (refresh && !cache_test ? &neural_readback : nullptr);
         native_motion_sr_calls = 0;
         native_runtime_masks.clear();
         native_runtime_results.clear();
         native_runtime_resets.clear();
-        native_history_motion = (refresh ? history_motion.Get() : nullptr);
+        native_history_motion = (refresh && !cache_test ? history_motion.Get() : nullptr);
         native_history_reset = (condition == "x2-reset" ? 1 : -1);
         native_history_parameters = nullptr;
         native_history_queries = &queries;
-        native_history_interval = frame * 2;
+        native_history_interval = frame * intervals_per_frame;
+        native_cache_observe = cache_test;
         NVSDK_NGX_Result result;
         if (refresh) {
           addon::ngx_slot_real[0].evaluate = reinterpret_cast<void*>(ObserveNativeHostEvaluate);
@@ -3052,6 +3092,15 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           // Bypass NR admission without toggling enabled or retiring its history.
           result = ObserveNativeHostEvaluate(gpu.list.Get(), owner, &parameters, nullptr);
         }
+        if (cache_test) {
+          queries.EndAndResolve(gpu.list.Get(), native_history_interval + 2);
+          if (!native_runtime_results.empty()) {
+            const UINT query = 2 * (native_history_interval + 1);
+            gpu.list->ResolveQueryData(queries.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query, 2,
+                                      queries.readback.Get(), static_cast<uint64_t>(query) * sizeof(uint64_t));
+          }
+        }
+        native_cache_observe = false;
         native_history_queries = nullptr;
         native_history_motion = nullptr;
         native_history_reset = -1;
@@ -3059,11 +3108,35 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         native_motion_proxy_readback = nullptr;
         native_motion_neural_readback = nullptr;
         Check(NVSDK_NGX_SUCCEED(result) && native_motion_sr_calls == 1
-                  && native_runtime_results.size() == (refresh ? 1u : 0u), "history actual per-frame SR/NR cadence");
-        if (refresh) {
+                  && (cache_test ? native_runtime_results.size() <= 1 : native_runtime_results.size() == (refresh ? 1u : 0u)),
+              "sequence actual per-frame SR/NR cadence");
+        const bool model_executed = !native_runtime_results.empty();
+        if (model_executed) {
           Check(NVSDK_NGX_SUCCEED(native_runtime_results[0]) && native_runtime_resets.size() == 1,
                 "history real NR Evaluate returns success");
           ++nr_calls;
+        }
+        ComPtr<ID3D12Resource> validity_readback;
+        const auto cache_state = (cache_test ? addon::features.at(owner).slots[0].edit_reuse : nullptr);
+        const uint64_t reused = (cache_test ? addon::edit_reuse_reuses.load() - reuses_before : 0);
+        const uint64_t refreshed = (cache_test ? addon::edit_reuse_refreshes.load() - refreshes_before : 0);
+        const uint64_t fallback = (cache_test ? addon::edit_reuse_fallbacks.load() - fallbacks_before : 0);
+        if (cache_test) {
+          Check(reused <= 1 && (model_executed || reused == 1), "cache frame performs real NR or exactly one production reuse");
+          Check(reused == 0 || !previous_frame_reused, "cache never reuses on consecutive base frames");
+          Check(reused == 0 || (cache_state != nullptr && cache_state->reused && !model_executed),
+                "cache reuse skips actual NR and borrows the anchor at most once");
+          Check(condition != "baseline" || (model_executed && reused == 0), "baseline runs the real NR wrapper on every input");
+          previous_frame_reused = reused != 0;
+          if (cache_state != nullptr && cache_state->validity != nullptr && reused != 0) {
+            const uint64_t validity_bytes = static_cast<uint64_t>(width) * height * sizeof(uint32_t);
+            validity_readback = gpu.Buffer(validity_bytes, D3D12_HEAP_TYPE_READBACK);
+            gpu.Transition(cache_state->validity.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            gpu.list->CopyBufferRegion(validity_readback.Get(), 0, cache_state->validity.Get(), 0, validity_bytes);
+            gpu.Transition(cache_state->validity.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+          }
+        }
+        if (refresh || cache_test) {
           gpu.Transition(output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
           gpu.RecordTextureReadback(output.Get(), final_readback);
           gpu.Transition(output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -3092,21 +3165,40 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         const auto sr_bytes = gpu.ReadTexture(sr_readback);
         nlohmann::json planes{{"sr", save("sr.rgba16f", sr_bytes, "RGBA16F", "linear HDR", width, height)},
             {"proxy", nullptr}, {"neural", nullptr}, {"final", nullptr}};
-        if (refresh) {
+        if (refresh && !cache_test) {
           planes["proxy"] = save("proxy.rgba16f", gpu.ReadTexture(proxy_readback), "RGBA16F", "v6 encoded sRGB float", width, height);
           planes["neural"] = save("neural.rgba16f", gpu.ReadTexture(neural_readback), "RGBA16F", "v6 encoded sRGB float", width, height);
+        }
+        if (refresh || cache_test) {
           planes["final"] = save("final.rgba16f", gpu.ReadTexture(final_readback), "RGBA16F", "linear HDR; production resolve", width, height);
         }
-        const auto sr_timing = queries.Read(frame * 2);
-        nlohmann::json nr{{"calls", native_runtime_results.size()}, {"executed", refresh},
+        if (cache_test) {
+          planes["validity"] = nullptr;
+          if (validity_readback != nullptr) {
+            const D3D12_RANGE range{0, static_cast<SIZE_T>(width) * height * sizeof(uint32_t)};
+            uint32_t* mapped = nullptr;
+            Check(SUCCEEDED(validity_readback->Map(0, &range, reinterpret_cast<void**>(&mapped))), "cache validity readback map");
+            std::vector<uint32_t> values(mapped, mapped + static_cast<size_t>(width) * height);
+            const D3D12_RANGE no_writes{0, 0};
+            validity_readback->Unmap(0, &no_writes);
+            planes["validity"] = save("validity.r32u", values, "R32_UINT", "0 selects exact current SR; 1 reuses anchor edit", width, height);
+          }
+        }
+        const auto sr_timing = queries.Read(frame * intervals_per_frame);
+        nlohmann::json nr{{"calls", native_runtime_results.size()}, {"executed", model_executed},
             {"result", nullptr}, {"reset", nullptr}, {"parameters", native_history_parameters},
             {"gpu_ms", nullptr}, {"gpu_ticks", nullptr}};
-        if (refresh) {
-          const auto timing = queries.Read(frame * 2 + 1);
+        if (model_executed) {
+          const auto timing = queries.Read(frame * intervals_per_frame + 1);
           nr["result"] = static_cast<uint32_t>(native_runtime_results[0]);
           nr["reset"] = native_runtime_resets[0];
           nr["gpu_ms"] = timing.gpu_ms;
           nr["gpu_ticks"] = {timing.begin_tick, timing.end_tick};
+        }
+        if (cache_test) {
+          const auto timing = queries.Read(frame * intervals_per_frame + 2);
+          nr["whole_chain_gpu_ms"] = timing.gpu_ms;
+          nr["whole_chain_gpu_ticks"] = {timing.begin_tick, timing.end_tick};
         }
         report["frames"].push_back({{"frame", frame}, {"scene", (frame < 6 ? "stationary" : (frame < 12 ? "translation" : (frame < 18 ? "occlusion" : "lighting")))},
             {"refresh", refresh}, {"camera_shift", camera_shift}, {"camera_delta", camera_delta[frame]},
@@ -3124,17 +3216,28 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                 {"mv_jittered", false}, {"motion_scale", {1, 1}}, {"pre_exposure", 1.f}, {"exposure_scale", 1.f},
                 {"gpu_ms", sr_timing.gpu_ms}, {"gpu_ticks", {sr_timing.begin_tick, sr_timing.end_tick}}}},
             {"nr", nr}, {"fence", gpu.serial}, {"completed_fence", gpu.fence->GetCompletedValue()}});
+        if (cache_test) {
+          auto& current = report["frames"].back();
+          current["refresh"] = model_executed;
+          current["frame_kind"] = (reused != 0 ? "reuse" : (fallback != 0 ? "fallback" : "refresh"));
+          current["reuse"] = {{"refreshes", refreshed}, {"reuses", reused}, {"fallbacks", fallback},
+              {"anchor_generation", (cache_state != nullptr ? cache_state->anchor_generation : 0)},
+              {"reuse_count", (cache_state != nullptr ? cache_state->reuse_count : 0)},
+              {"anchor_valid", cache_state != nullptr && cache_state->valid},
+              {"allocated_bytes", (cache_state != nullptr ? cache_state->allocated_bytes : 0)}};
+          current["inputs"].erase("nr_motion");
+        }
         previous_motion = motion_data;
         previous_surface = surface;
         previous_validity = validity;
-        std::ofstream report_file(raw_directory / "nr-edit-reuse-history.json", std::ios::binary | std::ios::trunc);
+        std::ofstream report_file(raw_directory / (cache_test ? "nr-edit-reuse-cache.json" : "nr-edit-reuse-history.json"), std::ios::binary | std::ios::trunc);
         report_file << report.dump(2) << '\n';
         report_file.close();
         Check(!report_file.fail(), "history partial evidence saved after each completed frame");
       }
       report["sequence_host_sr_evaluates"] = frame_count;
       report["sequence_nr_evaluates"] = nr_calls;
-      std::cout << "PASS NR history condition=" << condition << " frames=" << frame_count << " SR=" << frame_count
+      std::cout << "PASS NR " << (cache_test ? "cache" : "history") << " condition=" << condition << " frames=" << frame_count << " SR=" << frame_count
                 << " NR=" << nr_calls << "; raw planes=" << raw_directory.string() << '\n';
     }
     if (resize_test) {
@@ -3445,7 +3548,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       Check(!file.fail(), "resize evidence JSON saved");
       native_resize_ready = false;
     }
-    if (motion_test && !resize_test && !history_test) {
+    if (motion_test && !resize_test && !sequence_test) {
       constexpr std::array<float, 8> speeds{0.f, 0.f, 2.f, 8.f, 16.f, 0.f, 0.f, 0.f};
       std::array<std::vector<uint8_t>, speeds.size()> reference;
       std::array<std::vector<uint8_t>, speeds.size()> reference_sr;
@@ -3978,8 +4081,8 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     }
     std::cout << "PASS ControlMask production chain stages=" << (single_stage ? "Upscaled" : "Render+Upscaled")
               << " evidence=NATIVE_GPU+NATIVE_NGX host_sr=" << (motion_test ? "NATIVE_NGX" : "MOCK") << " frames="
-              << (history_test ? 24 : (resize_test ? 180 : (cost ? 80 : (motion_test ? 16 : (hot_toggle ? 52 : 1)))))
-              << (history_test ? " frame_scope=nr-history" : (resize_test ? " frame_scope=high-low-high" : (motion_test ? " frame_scope=paired_only" : "")))
+              << (sequence_test ? 24 : (resize_test ? 180 : (cost ? 80 : (motion_test ? 16 : (hot_toggle ? 52 : 1)))))
+              << (cache_test ? " frame_scope=nr-cache" : (history_test ? " frame_scope=nr-history" : (resize_test ? " frame_scope=high-low-high" : (motion_test ? " frame_scope=paired_only" : ""))))
               << " size=" << width << 'x' << height << " mask="
               << (mask_enabled ? mask_mode_name : "off")
               << " output_readback=rgba16f raw="
@@ -4022,15 +4125,16 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       Check(NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D12_DestroyParameters(sr_parameters)), "release real SR parameters");
       Check(NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D12_Shutdown1(gpu.device.Get())), "public SDK device shutdown");
       native_motion_gpu = nullptr;
-      if (history_test) {
+      if (sequence_test) {
         history_report["teardown"] = {{"sr_continues_without_nr", true}, {"sr_release", true},
             {"sdk_shutdown", true}, {"identity_bridge_installed", false},
             {"disabled_host_sr_evaluates", native_motion_sr_calls}};
         history_report["total_host_sr_evaluates"] = prefix_host_evaluates + 24 + native_motion_sr_calls;
         history_report["total_nr_evaluates"] = prefix_nr_evaluates
             + history_report["sequence_nr_evaluates"].get<uint32_t>();
-        std::ofstream file(std::filesystem::path(history_report["condition"].get<std::string>())
-            / "nr-edit-reuse-history.json", std::ios::binary | std::ios::trunc);
+        const auto condition = history_report["condition"].get<std::string>();
+        std::ofstream file(std::filesystem::path(cache_test && condition == "baseline" ? "cache-baseline" : condition)
+            / (cache_test ? "nr-edit-reuse-cache.json" : "nr-edit-reuse-history.json"), std::ios::binary | std::ios::trunc);
         file << history_report.dump(2) << '\n';
         file.close();
         Check(!file.fail(), "history completed teardown evidence saved");

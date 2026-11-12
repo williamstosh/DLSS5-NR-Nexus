@@ -6,7 +6,7 @@
 ## 环境与构建
 
 沿用[项目构建前提](../../README.md#zh-build)中的固定宿主、MSVC 与 Windows SDK。
-除隔帧历史分析器使用 NumPy／Pillow 外，Python 工具仅用标准库。`gpu` 后端复用既有生成 Shader 头和 embed_file 工具，并在
+除隔帧历史／缓存分析器使用 NumPy／Pillow 外，Python 工具仅用标准库。`gpu` 后端复用既有生成 Shader 头和 embed_file 工具，并在
 每个隔离构建目录重新用 FXC 编译当前 ControlMask Shader，通过预包含头绑定该字节码；
 不改共享生成目录。`replay` 仅复用通用 D3D12 测试助手，不生成或包含 ControlMask Shader。
 NGX 探针只用已有 SDK 头，不链接或打包第三方 Runtime。
@@ -279,6 +279,38 @@ SR 输出与最终结果为线性 HDR；v6 proxy 与 raw neural 虽用 RGBA16F �
 数值报告不自动判定视觉通过；Evaluate 时间不包含完整编码／合成／复用成本，不能换算为游戏 FPS 收益。
 Standard 在分析后回收登记的原始平面，保留 JSON、日志、预览和配对失败样本；
 完整原始集只由显式 `NR_NEXUS_TEST_KEEP_RAW=1` 保留。使用 GPU 前应避开其他游戏或性能测试窗口。
+
+## NR x2 编辑缓存候选
+
+`nr-edit-reuse-contracts` 在 WARP＋MOCK 上检查生产 Shader 的已知编辑、运动缩放、边界／深度／颜色拒绝、
+中性及无效像素的精确原色／alpha；通过真实 wrapper 检查一次复用上限、Reset／设置变化／断档、
+非零 jitter 回退、关闭、失败和丢弃录制的资源生命周期。
+
+~~~powershell
+pwsh -File tools/run-tests.ps1 -Suite fg-native -NativeCase nr-edit-reuse-contracts `
+    -UiPreview None -OutputDirectory tmp/offline/nr-cache-contracts
+~~~
+
+`nr-edit-reuse-cache` 对相同的24帧短序列启动独立逐帧／缓存进程；SR 始终每帧运行，NR 的跳过、
+组合运动和最终原色回填由生产 wrapper 完成，测试观察器不替换模型输入。
+两组使用缓存开启且每次 Reset 的相同创建前缀，正式第0帧均 Reset；基线此时关闭缓存。
+当前条件为请求 B、原生 D3D12 Upscaled、100% RGBA16F HDR、零 jitter、单 Pass，关闭 Look、
+Detail stability、ControlMask、自适应分辨率及 FG。
+
+~~~powershell
+pwsh -File tools/run-tests.ps1 -Suite fg-native -NativeCase nr-edit-reuse-cache `
+    -NativeNgxProjectIdPath $projectIdPath -NativeNgxSdkLibraryDirectory $sdkLibraryDirectory `
+    -NativeNgxRuntimePath $runtimePath -NativeNgxSrRuntimePath $srRuntimePath `
+    -PythonExecutable $pythonWithNumpyAndPillow `
+    -UiPreview None -OutputDirectory tmp/offline/nr-cache
+~~~
+
+`cache-baseline/` 与 `cache/` 中的报告记录实际调用、锚点代次、复用／回退计数、显存分配及 GPU 完成。
+`nr_edit_cache.py` 核对输入和 SR 逐字节一致、所有帧 alpha、复用无效像素与当前 SR 完全相同，
+并生成 `nr-edit-cache-analysis.json` 和24张对照预览。整链时间覆盖 Encode、真实 NR 或缓存工作、
+Resolve、Commit 和最终回填；测试平面读回与查询结果拷贝在计时外。分别报告刷新、复用、整体均值及分位数，
+不由调用减半推导 FPS。质量差异保留为测量，动态画质仍需人工验收。
+Standard 收尾与上一实验相同；分析器定向测试为 `test_nr_edit_cache_analysis.py`。
 
 ## ControlMask 原生成本
 
