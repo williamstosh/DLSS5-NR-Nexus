@@ -31,6 +31,8 @@ param(
     [ValidateRange(-1,3)][int]$NrPass3Stage = -1,
     [ValidateRange(-1,3)][int]$NrPass4Stage = -1,
     [ValidateRange(-1,1)][int]$NrEditReuse = -1,
+    [switch]$UncapGameFps,
+    [switch]$XeFgGpuCapture,
     [ValidateSet('T0','T1','T2','T3','T4','T5','T6','GRect','BRect','DepthFar','DepthFarOff')][string]$ControlMaskCase,
     [switch]$ControlMaskUseCoreContext,
     [ValidateRange(-1,1)][int]$ControlMaskAutoMask = -1,
@@ -46,10 +48,17 @@ param(
     [switch]$AddonAbsentControl
 )
 $ErrorActionPreference = 'Stop'
+if ($UncapGameFps -and (-not $RestoreInstallation -or $InstallOnly)) {
+    throw 'UncapGameFps requires a restored test session, not InstallOnly.'
+}
 if ($NrEditReuse -ge 0 -and (-not $RestoreInstallation -or $InstallOnly -or $ControlMaskCase -or $SrOnly -or
         $NrPreset -ne 2 -or $NrPasses -ne 1 -or $NrHookPoint -ne 2 -or
         -not $BlockOptionalHudless -or $XeFGUiComposition -ne 0 -or $SdrGameOutput)) {
     throw 'NrEditReuse requires a restored HDR XeFG single-Backbuffer Present test: model B, one pass, blocked optional HUDless and UIComposition 0.'
+}
+if ($XeFgGpuCapture -and ($NrEditReuse -lt 0 -or -not $StartNrDisabled -or
+        $ControlMaskGpuSamples -le 0 -or -not $GpuTimers)) {
+    throw 'XeFgGpuCapture requires a restored NrEditReuse A/B, StartNrDisabled, GpuTimers and a positive sample target.'
 }
 if ($ControlMaskUseCoreContext) {
     throw '-ControlMaskUseCoreContext is retired: production uses the owned backend. Use the offline tools/run-tests.ps1 -Suite fg-native entry for P0 Core diagnostics.'
@@ -88,7 +97,7 @@ if ($taskHasMaskNear) {
         throw 'ControlMask depth thresholds must satisfy 0 <= Near < Far <= 1.'
     }
 }
-if ($ControlMaskGpuSamples -gt 0 -and (-not $ControlMaskCase -or -not $GpuTimers)) {
+if ($ControlMaskGpuSamples -gt 0 -and ((-not $ControlMaskCase -and -not $XeFgGpuCapture) -or -not $GpuTimers)) {
     throw 'ControlMask raw capture requires an explicit protected ControlMask case and existing -GpuTimers.'
 }
 if ($ControlMaskGpuSamples -gt 0 -and $ControlMaskGpuWarmupSeconds -ge $ControlMaskGpuSeconds) {
@@ -210,6 +219,12 @@ function Remove-FgAcceptanceBinaryBackups {
     $result.status = if ($result.deleted_files -eq $binaries.Count) { 'cleaned' } else { 'incomplete' }
     return $result
 }
+function Set-WitcherUnlimitedFps([string]$Text) {
+    if ([regex]::Matches($Text, '(?m)^LimitFPS=[0-9]+\r?$').Count -ne 1) {
+        throw 'Expected one explicit LimitFPS game setting'
+    }
+    return [regex]::Replace($Text, '(?m)^LimitFPS=[0-9]+(?=\r?$)', 'LimitFPS=0')
+}
 function Get-NrEditReuseSettings([ValidateRange(0,1)][int]$Enabled) {
     return @{
         NREditReuse=$Enabled; NeuralUplift=1
@@ -281,7 +296,7 @@ function Set-OptiFgDisabled([string]$Text) {
     $updated = [regex]::Replace($section.Value, '(?m)^Enabled\s*=[^\r\n]*', 'Enabled = false')
     return $Text.Substring(0,$section.Index) + $updated + $Text.Substring($section.Index+$section.Length)
 }
-function Copy-ControlMaskGpuEvidence([string]$Directory, [string]$OutputDirectory, [string[]]$BeforeNames, [int]$Target) {
+function Copy-ControlMaskGpuEvidence([string]$Directory, [string]$OutputDirectory, [string[]]$BeforeNames, [int]$Target, [switch]$XeFg) {
     $files = @(Get-ChildItem -LiteralPath $Directory -Filter 'control-mask-*.json' -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -notin $BeforeNames })
     if ($files.Count -gt 32) { throw 'Unexpected number of new ControlMask GPU evidence files' }
@@ -300,8 +315,18 @@ function Copy-ControlMaskGpuEvidence([string]$Directory, [string]$OutputDirector
             if ($json.status -eq 'terminal' -and $json.schema -eq 'control_mask_capture_v1') {
                 $record.summary = $json.summary
                 $validEvents = @($json.events | Where-Object { $_.status -eq 'valid' })
-                if ($validEvents.Count -ne $json.summary.actual_valid -or
-                    @($validEvents | Where-Object { $_.samples -ne 1 -or -not $_.context.ngx_accepted -or $null -eq $_.timing_us }).Count) {
+                $invalidEvents = @($validEvents | Where-Object { $_.samples -ne 1 -or $null -eq $_.timing_us })
+                if ($XeFg) {
+                    if ($json.scope -ne 'xefg_single_backbuffer_service') { throw 'Missing full XeFG service timing scope' }
+                    $invalidEvents += @($validEvents | Where-Object {
+                        -not $_.xefg.output_ready -or $null -eq $_.timing_us.service_total -or
+                        $null -eq $_.timing_us.staging -or $null -eq $_.timing_us.writeback -or
+                        ($_.xefg.model_evaluates -eq 0 -and -not $_.xefg.reuse)
+                    })
+                } else {
+                    $invalidEvents += @($validEvents | Where-Object { -not $_.context.ngx_accepted })
+                }
+                if ($validEvents.Count -ne $json.summary.actual_valid -or $invalidEvents.Count) {
                     throw 'GPU summary does not match the actual valid raw records'
                 }
                 if ($json.summary.reason -eq 'target_reached' -and $json.summary.actual_valid -ge $Target -and
@@ -313,7 +338,8 @@ function Copy-ControlMaskGpuEvidence([string]$Directory, [string]$OutputDirector
         $records += $record
     }
     return [ordered]@{target_valid_samples=$Target;target_reached=($complete.Count -eq 1);files=$records
-        measurement='Original per-pass GPU Evaluate interval includes mask generation; not independent mask cost.'}
+        measurement=$(if ($XeFg) { 'Full single-Backbuffer XeFG service GPU cost; CPU service entry intervals are not display intervals.' }
+            else { 'Original per-pass GPU Evaluate interval includes mask generation; not independent mask cost.' })}
 }
 function Set-FgPresentSection([string]$Text, [bool]$BlockHudless) {
     if ($Text -notmatch '(?m)^NRHookPoint=') { throw 'NRHookPoint is missing' }
@@ -397,13 +423,18 @@ if ($CleanEnvironment -or $XeFGUiComposition -ge 0 -or
 if ($CleanEnvironment) {
     $taskBackupFiles += Join-Path $taskGame 'ReShadePreset.ini'
 }
-if ($SdrGameOutput -or $ShowGameHud -or $SrOnly) {
+if ($SdrGameOutput -or $ShowGameHud -or $SrOnly -or $UncapGameFps) {
     if (-not (Test-Path -LiteralPath $taskGameConfig -PathType Leaf)) { throw 'Missing game HDR settings file' }
     $taskBackupFiles += $taskGameConfig
 }
 if ($SdrGameOutput) {
     $taskHdrMatches = [regex]::Matches([IO.File]::ReadAllText($taskGameConfig), '(?m)^HdrEnabled=(true|false)\r?$')
     if ($taskHdrMatches.Count -ne 1) { throw 'Expected one explicit HdrEnabled game setting' }
+}
+if ($UncapGameFps) {
+    $taskFpsText = [IO.File]::ReadAllText($taskGameConfig)
+    $null = Set-WitcherUnlimitedFps $taskFpsText
+    $taskOriginalFpsLimit = [int][regex]::Match($taskFpsText, '(?m)^LimitFPS=([0-9]+)\r?$').Groups[1].Value
 }
 if ($ShowGameHud) {
     $taskHudText = [IO.File]::ReadAllText($taskGameConfig)
@@ -460,7 +491,9 @@ $taskReceipt = [ordered]@{
     requested_control_mask_depth_near=$(if ($taskHasMaskNear) { $ControlMaskDepthNear } else { $null })
     requested_control_mask_depth_far=$(if ($taskHasMaskFar) { $ControlMaskDepthFar } else { $null })
     control_mask_gpu_capture=@{target_valid_samples=$ControlMaskGpuSamples; seconds=$ControlMaskGpuSeconds; warmup_seconds=$ControlMaskGpuWarmupSeconds}
+    xefg_gpu_capture=[bool]$XeFgGpuCapture
     temporary_game_sdr=[bool]$SdrGameOutput
+    game_fps_limit=$(if ($UncapGameFps) { @{original=$taskOriginalFpsLimit; requested=0; configured=$false} } else { $null })
     start_nr_disabled=[bool]$StartNrDisabled
     requested_sr_only=[bool]$SrOnly
     clean_environment=[bool]$CleanEnvironment
@@ -575,6 +608,9 @@ try {
             $taskModelSettings.NRControlMaskDepthNear = $ControlMaskDepthNear.ToString('R', [Globalization.CultureInfo]::InvariantCulture)
             $taskModelSettings.NRControlMaskDepthFar = $ControlMaskDepthFar.ToString('R', [Globalization.CultureInfo]::InvariantCulture)
         }
+    }
+    if ($ControlMaskCase -or $XeFgGpuCapture) {
+        $taskModelSettings.NRXeFgGpuCapture = [int][bool]$XeFgGpuCapture
         $taskModelSettings.NRControlMaskGpuCaptureSamples = $ControlMaskGpuSamples
         $taskModelSettings.NRControlMaskGpuCaptureSeconds = $ControlMaskGpuSeconds
         $taskModelSettings.NRControlMaskGpuCaptureWarmupSeconds = $ControlMaskGpuWarmupSeconds
@@ -621,6 +657,16 @@ try {
         $taskGameConfigText = [IO.File]::ReadAllText($taskGameConfig)
         $taskGameConfigText = [regex]::Replace($taskGameConfigText, '(?m)^HdrEnabled=(true|false)(?=\r?$)', 'HdrEnabled=false')
         [IO.File]::WriteAllText($taskGameConfig, $taskGameConfigText, [Text.UTF8Encoding]::new($false))
+        $taskReceipt.test_game_config_sha256 = (Get-FileHash -LiteralPath $taskGameConfig).Hash
+    }
+    if ($UncapGameFps) {
+        [IO.File]::WriteAllText($taskGameConfig,
+            (Set-WitcherUnlimitedFps ([IO.File]::ReadAllText($taskGameConfig))),
+            [Text.UTF8Encoding]::new($false))
+        if ([regex]::Matches([IO.File]::ReadAllText($taskGameConfig), '(?m)^LimitFPS=0\r?$').Count -ne 1) {
+            throw 'Unlimited game FPS setting was not written'
+        }
+        $taskReceipt.game_fps_limit.configured = $true
         $taskReceipt.test_game_config_sha256 = (Get-FileHash -LiteralPath $taskGameConfig).Hash
     }
     if ($ShowGameHud) {
@@ -706,7 +752,7 @@ try {
     }
     if ($ControlMaskGpuSamples -gt 0 -and $taskRunning.Count -eq 0) {
         try {
-            $taskReceipt.control_mask_gpu_result = Copy-ControlMaskGpuEvidence $taskGpuDirectory (Join-Path $taskRun 'raw-gpu') $taskGpuBefore $ControlMaskGpuSamples
+            $taskReceipt.control_mask_gpu_result = Copy-ControlMaskGpuEvidence $taskGpuDirectory (Join-Path $taskRun 'raw-gpu') $taskGpuBefore $ControlMaskGpuSamples -XeFg:$XeFgGpuCapture
             if (-not $taskReceipt.control_mask_gpu_result.target_reached) { $taskReceipt.test_exit_code = 1 }
         } catch {
             $taskReceipt.control_mask_gpu_result = @{target_reached=$false;error=$_.Exception.Message}

@@ -2528,6 +2528,7 @@ inline std::atomic_bool edit_trace_enabled = defaults::kEditTrace;
 // look (and the trace) stay off for the session, NR runs on without them.
 inline std::atomic_bool look_unavailable = false;
 inline std::atomic_bool edit_reuse_enabled{false};
+inline std::atomic_bool xefg_gpu_capture_enabled{false};
 inline std::atomic_uint64_t edit_reuse_refreshes{0};
 inline std::atomic_uint64_t edit_reuse_reuses{0};
 inline std::atomic_uint64_t edit_reuse_fallbacks{0};
@@ -11599,6 +11600,7 @@ inline bool RecordInline(
       && !plan.mixed && group.begin == 0
       && nr_model::SupportsControlMask(direct_runtime_requirements.file_version);
   const bool control_mask_capture_eligible = control_mask_capture::Enabled()
+      && !xefg_gpu_capture_enabled.load(std::memory_order_relaxed)
       && gpu_timers_enabled.load(std::memory_order_relaxed)
       && control_mask_capture_route_eligible;
   const bool control_mask_requested = control_mask_enabled.load(std::memory_order_relaxed);
@@ -29512,6 +29514,9 @@ inline void LoadConfiguration() {
         "ControlMask depth range is invalid or uses legacy defaults; using 0.999900 and 0.999950");
   }
   uint32_t capture_samples = 0, capture_seconds = 120, capture_warmup = 6;
+  bool capture_xefg = false;
+  reshade::get_config_value(nullptr, kConfigSection, "NRXeFgGpuCapture", capture_xefg);
+  xefg_gpu_capture_enabled = capture_xefg;
   reshade::get_config_value(nullptr, kConfigSection, "NRControlMaskGpuCaptureSamples", capture_samples);
   reshade::get_config_value(nullptr, kConfigSection, "NRControlMaskGpuCaptureSeconds", capture_seconds);
   reshade::get_config_value(nullptr, kConfigSection, "NRControlMaskGpuCaptureWarmupSeconds", capture_warmup);
@@ -29524,7 +29529,7 @@ inline void LoadConfiguration() {
   }
   control_mask_capture::wake_worker = &screenshot::WakeControlMaskCapture;
   gpu_timers::raw_observer = &control_mask_capture::Observe;
-  if (!control_mask_capture::Configure(capture_samples, capture_seconds, capture_warmup)) {
+  if (!control_mask_capture::Configure(capture_samples, capture_seconds, capture_warmup, 8192, capture_xefg)) {
     Log(reshade::log::level::warning, "ControlMask GPU capture configuration unavailable or busy; no capture was armed");
   }
   bool saved_norm_trace = false;

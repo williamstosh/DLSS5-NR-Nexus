@@ -171,6 +171,47 @@ inline int Run() {
           "Present terminal preserves actual stage, per-pass timings and requested window");
   }
 
+  auto xefg_context = present_context;
+  xefg_context.xefg_service = true;
+  xefg_context.application_frame = 120;
+  xefg_context.guide_serial = 121;
+  xefg_context.stream_epoch = 7;
+  xefg_context.service_entry_ns = 9'000'000'000;
+  xefg_context.service_interval_ms = 1000. / 30.;
+  xefg_context.service_interval_available = true;
+  xefg_context.api_returned = false;
+  xefg_context.ngx_accepted = false;
+  xefg_context.reuse = true;
+  Check(cap::Configure(1, 1, 0, 8192, true), "dedicated XeFG capture reuses the bounded worker");
+  Check(cap::Reserve(present_context, 1, 0) == 0 && !cap::CapturePending(),
+        "ordinary core evaluates cannot consume the dedicated Service capture window");
+  const auto failed_service_token = cap::Reserve(xefg_context, 1, 0);
+  cap::Observe(valid(1), failed_service_token);
+  Check(cap::GetSummary().rejected == 1 && cap::GetSummary().valid == 0,
+        "GPU completion without a complete Service output remains rejected");
+  xefg_context.output_ready = true;
+  const auto service_token = cap::Reserve(xefg_context, 2, 1);
+  auto service_stats = valid(2);
+  service_stats.service_total_us = 160;
+  service_stats.staging_us = 20;
+  service_stats.writeback_us = 30;
+  cap::Observe(service_stats, service_token);
+  expect_written();
+  const auto service_output = read_json(terminal_for(cap::GetSummary().capture_id));
+  const auto& service_event = service_output["events"][1];
+  Check(service_output["scope"] == "xefg_single_backbuffer_service"
+            && service_event["xefg"]["application_frame"] == 120
+            && service_event["xefg"]["guide_serial"] == 121
+            && service_event["xefg"]["service_entry_ns"] == 9'000'000'000
+            && service_event["xefg"]["service_interval_available"] == true
+            && !service_event["context"].contains("style") && !service_event["context"].contains("mask_rgb"),
+        "Service export retains its application identity and CPU entry interval scope");
+  Check(service_event["xefg"]["model_evaluates"] == 0 && service_event["xefg"]["reuse"] == true
+            && !service_event["context"].contains("ngx_accepted")
+            && service_event["timing_us"]["total"] == 110 && service_event["timing_us"]["service_total"] == 160
+            && service_event["timing_us"]["staging"] == 20 && service_event["timing_us"]["writeback"] == 30,
+        "completed reuse exports full Service cost without inventing an NR call or NGX acceptance");
+
   Check(cap::Configure(2, 1, 0), "capture can configure after successful export");
   auto token = cap::Reserve(changed, 10, 0);
   auto rejected = valid(10);

@@ -5,10 +5,27 @@ $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile(
     (Join-Path $PSScriptRoot '../tools/run-fg-acceptance.ps1'), [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw $parseErrors[0] }
-foreach ($name in @('Set-FgPresentSection','Set-StreamlineFallback','Set-XeFgUiComposition','Get-ControlMaskSettings','Get-NrEditReuseSettings','Set-ModelDiagnosticSection','Set-OptiFgDisabled','Copy-ControlMaskGpuEvidence')) {
+foreach ($name in @('Set-FgPresentSection','Set-StreamlineFallback','Set-XeFgUiComposition','Get-ControlMaskSettings','Get-NrEditReuseSettings','Set-WitcherUnlimitedFps','Set-ModelDiagnosticSection','Set-OptiFgDisabled','Copy-ControlMaskGpuEvidence')) {
     $definition = $ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}, $true)
     if ($null -eq $definition) { throw "Missing production transform: $name" }
     . ([scriptblock]::Create($definition.Extent.Text))
+}
+$fpsFixture = "[Rendering]`r`nVSync=false`r`nHdrEnabled=true`r`nDLSSGMode=1`r`n[Engine]`r`nLimitFPS=120`r`n[StartupFlow]`r`nLaunchCounter=8`r`n"
+if ((Set-WitcherUnlimitedFps $fpsFixture) -cne $fpsFixture.Replace('LimitFPS=120', 'LimitFPS=0')) {
+    throw 'Uncapping FPS changed unrelated game settings or line endings'
+}
+foreach ($invalidFps in @($fpsFixture.Replace('LimitFPS=120', ''), ($fpsFixture + "LimitFPS=60`r`n"))) {
+    $rejected = $false
+    try { Set-WitcherUnlimitedFps $invalidFps | Out-Null } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Uncapping accepted a missing or ambiguous limit' }
+}
+foreach ($invalidSession in @(@(), @('-RestoreInstallation','-InstallOnly'))) {
+    $rejection = & pwsh.exe -NoProfile -File (Join-Path $PSScriptRoot '../tools/run-fg-acceptance.ps1') `
+        -CandidateManifest 'unused-synthetic-candidate' -GameBinaryDirectory 'unused-synthetic-game' `
+        -UncapGameFps @invalidSession 2>&1
+    if ($LASTEXITCODE -eq 0 -or ($rejection -join "`n") -notmatch 'UncapGameFps requires a restored test session') {
+        throw 'FPS override must reject unprotected sessions before touching installation inputs'
+    }
 }
 $cacheBaseline = Get-NrEditReuseSettings 0
 $cacheCandidate = Get-NrEditReuseSettings 1
@@ -220,6 +237,19 @@ $terminal.events = @($terminal.events[0])
 $terminal | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $captureSource 'control-mask-new.json') -Encoding utf8
 $inconsistent = Copy-ControlMaskGpuEvidence $captureSource (Join-Path $captureFixture 'inconsistent') @('control-mask-old.json') 3
 if ($inconsistent.target_reached) { throw 'A summary with missing raw samples was accepted' }
+$terminal.scope = 'xefg_single_backbuffer_service'
+$terminal.events = @(
+    @{status='valid';samples=1;context=@{ngx_accepted=$true};xefg=@{output_ready=$true;model_evaluates=1;refresh=$true;reuse=$false};timing_us=@{eval=4000;service_total=4600;staging=100;writeback=100}},
+    @{status='valid';samples=1;context=@{ngx_accepted=$false};xefg=@{output_ready=$true;model_evaluates=0;refresh=$false;reuse=$true};timing_us=@{eval=200;service_total=800;staging=100;writeback=100}},
+    @{status='valid';samples=1;context=@{ngx_accepted=$true};xefg=@{output_ready=$true;model_evaluates=1;refresh=$true;reuse=$false};timing_us=@{eval=4000;service_total=4600;staging=100;writeback=100}}
+)
+$terminal | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $captureSource 'control-mask-new.json') -Encoding utf8
+$xefg = Copy-ControlMaskGpuEvidence $captureSource (Join-Path $captureFixture 'xefg') @('control-mask-old.json') 3 -XeFg
+if (-not $xefg.target_reached) { throw 'A completed XeFG reuse sample incorrectly required NR Evaluate' }
+$terminal.events[1].timing_us.Remove('service_total')
+$terminal | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $captureSource 'control-mask-new.json') -Encoding utf8
+$xefgMissing = Copy-ControlMaskGpuEvidence $captureSource (Join-Path $captureFixture 'xefg-missing') @('control-mask-old.json') 3 -XeFg
+if ($xefgMissing.target_reached) { throw 'A missing whole-service GPU timing was accepted' }
 $rejected = $false
 try { Copy-ControlMaskGpuEvidence $captureSource (Join-Path $captureFixture 'complete') @('control-mask-old.json') 3 | Out-Null } catch { $rejected = $true }
 if (-not $rejected) { throw 'Existing evidence was overwritten' }
