@@ -438,7 +438,7 @@ Present 显示以下选项。兼容的 Pre-FG 先增强游戏帧再交给 FG；�
 
 **仅开发分支提供，未包含于 v0.4.0 安装包，默认关闭。** 每两帧重新生成一次 NR 编辑，另一帧将编辑跟随运动应用到当前画面；遮挡、颜色变化或越界区域保留当前原色。它用于试验降低 NR 开销，动态画质尚待验收。
 
-关闭游戏后，在 ReShade 配置的 `[RenoDX.DLSS5]` 段加入 `NREditReuse=1`，重启后读取。首版只接受原生 DX12、Upscaled、模型 B、1 层、固定100% HDR 输出，关闭调整 NR 外观、细节稳定性、ControlMask、自适应尺寸和 FG。游戏须提供匹配的深度和运动数据，以及完整的 jitter 采样偏移（支持非零值，每轴不超过半个渲染像素）；运动数据须不含 jitter。其他组合保持逐帧 NR。光照突然变化时可能短暂回到原色，NR 色调变化也可能延后一帧，需在实际场景中判断是否可接受。日志中的 `NR edit reuse` 表示实际发生复用；移除该键或设为 `0` 后重启即可关闭。此实验未加入菜单或方案分享。
+关闭游戏后，在 ReShade 配置的 `[RenoDX.DLSS5]` 段加入 `NREditReuse=1`，重启后读取。开发版支持原生 DX12 的两条路径：关闭 FG 的 Upscaled，以及 XeFG 的 Present 单 Backbuffer（不含 HUDless/UI 合成）。均要求模型 B、1 层、固定100% HDR 输出，并关闭调整 NR 外观、细节稳定性、ControlMask 和自适应尺寸。游戏须提供匹配的深度和运动数据，以及完整的 jitter 采样偏移（支持非零值，每轴不超过半个渲染像素）；运动数据须不含 jitter。其他组合保持逐帧 NR。光照突然变化时可能短暂回到原色，NR 色调变化也可能延后一帧；XeFG 接入仍待游戏内动态画质验收，需在实际场景中判断是否可接受。日志中的 `NR edit reuse` 表示实际发生复用；移除该键或设为 `0` 后重启即可关闭。此实验未加入菜单或方案分享。
 
 <a id="zh-paths"></a>
 #### 可用组合
@@ -987,7 +987,7 @@ Use this for specific issues. Record old values and compare one change at a time
 
 **Available only on the development branch, absent from the v0.4.0 package, and off by default.** NR generates a new edit every other frame. The intervening frame applies the motion-reprojected edit to the current image; rejected occlusion, color-change and boundary pixels retain their current color. This experiment targets lower NR cost; dynamic image quality awaits acceptance.
 
-With the game closed, add `NREditReuse=1` under `[RenoDX.DLSS5]` in the ReShade configuration, then restart. The initial candidate requires native DX12, Upscaled, model B, one pass and fixed 100% HDR output, with Adjust NR's look, Detail stability, ControlMask, adaptive sizing and FG off. The game must provide matching depth and motion plus both jitter sampling offsets; nonzero values up to half a render pixel per axis are supported, with jitter excluded from motion. Other combinations continue running NR every frame. Sudden lighting changes may briefly restore the original color, and changes in NR's tone may lag by one frame; judge this in the intended scene. An `NR edit reuse` log entry confirms actual reuse. Remove the key or set it to `0` and restart to disable it. There is no menu control or preset-sharing field for this experiment.
+With the game closed, add `NREditReuse=1` under `[RenoDX.DLSS5]` in the ReShade configuration, then restart. The development build supports two native DX12 paths: Upscaled with FG off, and XeFG Present with a single Backbuffer and no HUDless/UI composition. Both require model B, one pass and fixed 100% HDR output, with Adjust NR's look, Detail stability, ControlMask and adaptive sizing off. The game must provide matching depth and motion plus both jitter sampling offsets; nonzero values up to half a render pixel per axis are supported, with jitter excluded from motion. Other combinations continue running NR every frame. Sudden lighting changes may briefly restore the original color, and changes in NR's tone may lag by one frame. The XeFG integration still awaits in-game dynamic visual acceptance; judge it in the intended scene. An `NR edit reuse` log entry confirms actual reuse. Remove the key or set it to `0` and restart to disable it. There is no menu control or preset-sharing field for this experiment.
 
 <a id="en-paths"></a>
 #### Compatible combinations

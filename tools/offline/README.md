@@ -295,8 +295,9 @@ pwsh -File tools/run-tests.ps1 -Suite fg-native -NativeCase nr-edit-reuse-contra
 `nr-edit-reuse-cache` 对相同的24帧短序列启动独立逐帧／缓存进程；SR 始终每帧运行，NR 的跳过、
 组合运动和最终原色回填由生产 wrapper 完成，测试观察器不替换模型输入。
 两组使用缓存开启且每次 Reset 的相同创建前缀，正式第0帧均 Reset；基线此时关闭缓存。
-当前条件为请求 B、原生 D3D12 Upscaled、100% RGBA16F HDR、单 Pass，关闭 Look、
-Detail stability、ControlMask、自适应分辨率及 FG。
+当前条件为请求 B、原生 D3D12、100% RGBA16F HDR、单 Pass，关闭 Look、
+Detail stability、ControlMask 和自适应分辨率。默认测试 Upscaled（FG 关闭）；
+`NR_NEXUS_TEST_NR_CACHE_ROUTE=xefg-record` 选择 XeFG 单 Backbuffer 的生产 `Record` 与私有颜色写回。
 
 ~~~powershell
 pwsh -File tools/run-tests.ps1 -Suite fg-native -NativeCase nr-edit-reuse-cache `
@@ -312,6 +313,18 @@ pwsh -File tools/run-tests.ps1 -Suite fg-native -NativeCase nr-edit-reuse-cache 
 Resolve、Commit 和最终回填；测试平面读回与查询结果拷贝在计时外。分别报告刷新、复用、整体均值及分位数，
 不由调用减半推导 FPS。质量差异保留为测量，动态画质仍需人工验收。
 Standard 收尾与上一实验相同；分析器定向测试为 `test_nr_edit_cache_analysis.py`。
+
+XeFG 的 SDK hooks、Service 准入与生命周期通过 `-NativeCase nr-edit-reuse-xefg-contracts`
+单独验证（WARP＋MOCK；SR、NR、XeFG 均为替身，不执行插帧）。它覆盖重复 present ID、
+刷新／复用／刷新、当前 RGBA、Reset、缺 guides、忙碌跳帧、模型失败恢复和缓存退休，
+并检查缓存不持有 DXGI Backbuffer。默认关闭的生产开关只在完整的单 Backbuffer 包上授权缓存，
+按基础帧推进复用年龄；HUDless、UI 合成及其他组合沿用原有路径。
+
+原生 `xefg-record` 对照仍使用真实 SR 和 NR，但不调用 XeFG SDK 或 Service 准入：
+在同一 command list 上从 SR 读回之后计时，覆盖 `Record`、原色暂存和私有输出写回，
+避免跨 CPU 提交空隙污染 GPU 区间。输入为 RGBA16F scRGB，固定白位200 nit；
+MV flags/scale 已按 Service 后的 NGX 契约提供。两条件使用独立 Feature 和相同前缀，
+报告记录 `route`、`xefg_scope` 及白位，分析器拒绝混用路径；不能由此推导实际插帧画质或游戏兼容性。
 
 默认序列保持零 jitter。验证非零 jitter 时，先用相同运行参数将 `-NativeCase` 改为
 `nr-edit-reuse-jitter`，输出到新的隔离目录。它只执行九次真实 SR、每次 Reset，不调用 NR：

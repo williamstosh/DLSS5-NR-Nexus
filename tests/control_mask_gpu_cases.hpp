@@ -2538,6 +2538,10 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                  bool cache_test = false, bool jitter_test = false) {
   try {
     const bool sequence_test = history_test || cache_test;
+    const char* cache_route_environment = (cache_test ? std::getenv("NR_NEXUS_TEST_NR_CACHE_ROUTE") : nullptr);
+    const std::string cache_route = (cache_route_environment != nullptr ? cache_route_environment : "inline");
+    Check(cache_route == "inline" || cache_route == "xefg-record", "known NR cache recording route");
+    const bool xefg_cache_test = cache_test && cache_route == "xefg-record";
     // Resize reuses public SDK initialization and the real SR owner, without
     // running the independent paired ControlMask motion experiment.
     motion_test = motion_test || resize_test || sequence_test || jitter_test;
@@ -2701,9 +2705,9 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     }
     addon::enabled = !jitter_test;
     addon::hooks_enabled = true;
-    addon::hook_point = (single_stage ? addon::kHookUpscaled : addon::kHookRender);
+    addon::hook_point = (xefg_cache_test ? addon::kHookPresent : (single_stage ? addon::kHookUpscaled : addon::kHookRender));
     addon::stack_passes = (single_stage ? 1 : 2);
-    addon::pass_stage[0] = 2u;
+    addon::pass_stage[0] = (xefg_cache_test ? 0u : 2u);
     addon::configuration_generation.fetch_add(1);
     addon::nr_follow_input_res = false;
     addon::nr_resolution_scale = 1.f;
@@ -2806,6 +2810,68 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     } else {
       addon::RegisterCreatedFeatureLocked(owner, addon::kFeatureDlss, &parameters);
     }
+    addon::fg_service::Stream cache_stream;
+    uint64_t cache_application_frame = 0;
+    if (xefg_cache_test) {
+      cache_stream.device = gpu.device.Get();
+      cache_stream.device->AddRef();
+      cache_stream.queue = gpu.queue.Get();
+      cache_stream.queue->AddRef();
+      cache_stream.epoch = 1;
+    }
+    const auto* nr_owner = (xefg_cache_test ? cache_stream.roles[0].Handle() : owner);
+    const auto* nr_workset_key = (xefg_cache_test
+        ? reinterpret_cast<const ID3D12Resource*>(&cache_stream.roles[0]) : output.Get());
+    const auto record_xefg = [&] {
+      // Exercise the production Record and writeback on the SR command list.
+      // This excludes SDK/Service admission (covered by WARP+MOCK), and keeps
+      // timestamps contiguous without CPU submission gaps between SR and NR.
+      renodx::addons::dlss5::fg::FrameInput input{
+          .queue = gpu.queue.Get(), .backbuffer = output.Get(), .depth = depth.Get(), .motion = motion.Get(),
+          .backbuffer_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+          .depth_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+          .motion_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+          .color_width = width, .color_height = height, .guide_width = render_width, .guide_height = render_height,
+          .motion_scale_x = 1.f, .motion_scale_y = 1.f,
+          .jitter_x = addon::GetFloat(&parameters, NVSDK_NGX_Parameter_Jitter_Offset_X),
+          .jitter_y = addon::GetFloat(&parameters, NVSDK_NGX_Parameter_Jitter_Offset_Y),
+          .context = reinterpret_cast<uintptr_t>(&cache_stream), .epoch = 1,
+          .application_frame = ++cache_application_frame,
+          .present_id = static_cast<uint32_t>(cache_application_frame),
+          .init_flags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes,
+          .color_space = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709,
+          .has_present_id = true, .has_constants = true,
+          .reset = addon::GetInt(&parameters, NVSDK_NGX_Parameter_Reset) != 0, .fg_enabled = true};
+      auto& slot = cache_stream.slots[0];
+      Check(addon::fg_service::PrepareSurfaces(&cache_stream, &slot, input, false, false),
+            "XeFG Record fixture prepares existing private color surfaces");
+      addon::PresentTarget target;
+      addon::SnapshotPresentRestoreConfiguration(&target);
+      target.hdr_mode = 1;
+      target.units = {addon::codec::Encoding::Linear, true, 80.f, false};
+      target.hdr_encoding = addon::V6EncodingConstant(target.units);
+      target.hdr_dark_gate = addon::V6DarkGate(target.units);
+      target.hdr_pedestal_cap = addon::codec::BlackPedestalCap(target.units);
+      target.hdr_white_nits = 200.f;
+      target.hdr_white_source = "fixed_xefg_record_fixture";
+      target.hdr_pedestal = renodx::addons::dlss5::present_hdr_pedestal::Decide(target.hdr_pedestal.configuration,
+          {.actual_present = true, .hdr_mode = 1, .v6_available = false,
+           .encoding_valid = true, .absolute_units = true, .unit_nits = 80.f,
+           .display_codec = target.hdr_curve == 1u, .legacy_mode = target.hdr_pedestal.legacy_mode,
+           .debug_bypass = target.diagnostic.bypass_hdr_pedestal});
+      target.divisor = addon::codec::PresentDivisor(
+          target.units, 200.f, addon::paper_white_scale.load(), addon::pq_calibration.load());
+      target.swapchain_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+      const renodx::addons::dlss5::EvaluateChainScope chain;
+      bool ready = false;
+      std::array<addon::NrRecording, 2> recordings;
+      addon::fg_service::Record(&cache_stream, &slot, gpu.list.Get(), input, target, &ready, &recordings);
+      if (ready) {
+        addon::fg_service::CopyColor(gpu.list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            slot.color[0], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, 0, 0, 0, 0, width, height);
+      }
+      return ready;
+    };
     const auto restore_cost_inputs = [&] {
       // The mock host does no GPU work. Restore both inputs explicitly because
       // Upscaled NR consumes and replaces Output; Color alone is not sufficient.
@@ -2849,9 +2915,13 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       }
       addon::ngx_slot_real[0].evaluate = (motion_test ? reinterpret_cast<void*>(ObserveNativeHostEvaluate)
                                                    : reinterpret_cast<void*>(SuccessfulHostEvaluate));
-      const NVSDK_NGX_Result result = addon::HookedEvaluateFeatureSlot<0>(
-          gpu.list.Get(), owner, &parameters, nullptr);
+      const NVSDK_NGX_Result result = (xefg_cache_test
+          ? ObserveNativeHostEvaluate(gpu.list.Get(), owner, &parameters, nullptr)
+          : addon::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), owner, &parameters, nullptr));
       addon::ngx_slot_real[0].evaluate = nullptr;
+      if (xefg_cache_test) {
+        record_xefg();
+      }
       ++prefix_host_evaluates;
       prefix_nr_evaluates += native_runtime_results.size();
       Check(NVSDK_NGX_SUCCEED(result), "host SR succeeds around production Render and Upscaled hooks");
@@ -2867,12 +2937,12 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       if (native_runtime_masks.size() != expected_evaluates
           || native_runtime_results.size() != expected_evaluates) continue;
 
-      auto& feature = addon::features.at(owner);
+      auto& feature = addon::features.at(nr_owner);
       if (single_stage) {
         Check(feature.slots[0].via_core && addon::direct_api.borrowed_core_context == !motion_test,
               "motion uses the production owned backend; legacy toggle/cost use borrowed Core");
         Check(native_runtime_results[0] == NVSDK_NGX_Result_Success
-                  && native_runtime_masks[0] == addon::worksets.at({owner, output.Get(), false}).control_mask,
+                  && native_runtime_masks[0] == addon::worksets.at({nr_owner, nr_workset_key, false}).control_mask,
               "initial native frame binds and evaluates its production mask");
         production_chain_completed = true;
         if (cost || sequence_test) continue;
@@ -3081,7 +3151,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       report = {{"schema", (cache_test ? "nr-nexus-nr-edit-reuse-cache-v1" : "nr-nexus-nr-edit-reuse-history-v1")}, {"condition", condition},
           {"scene_id", scene_id}, {"raster_sign", raster_sign},
           {"process_id", GetCurrentProcessId()}, {"host_sr_handle", reinterpret_cast<uintptr_t>(owner)},
-          {"evidence", "NATIVE_GPU+NATIVE_NGX"}, {"stage", "D3D12 Upscaled"}, {"passes", 1},
+          {"evidence", "NATIVE_GPU+NATIVE_NGX"}, {"stage", (xefg_cache_test ? "D3D12 XeFG Record" : "D3D12 Upscaled")}, {"passes", 1},
           {"dimensions", {{"render", {render_width, render_height}}, {"output", {width, height}}}},
           {"provider_init", "public SDK ProjectID; owned production NR; independent process/Features per condition"},
           {"requested_model", "B"}, {"internal_model", "unknown"},
@@ -3099,11 +3169,18 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           {"look_snapshot", {{"stabilize", history_look.stabilize}, {"stabilize_detail", history_look.stabilize_detail},
               {"stabilize_alpha", history_look.stabilize_alpha}}},
           {"timing_scope", (cache_test
-              ? "SR/model Evaluate and whole NR chain after real SR snapshot through wrapper return; final/validity readbacks excluded"
+              ? (xefg_cache_test
+                  ? "SR/model Evaluate and whole NR chain after real SR snapshot through Record, staging and private writeback; diagnostic readbacks excluded"
+                  : "SR/model Evaluate and whole NR chain after real SR snapshot through wrapper return; final/validity readbacks excluded")
               : "individual real SR and NR Evaluate GPU intervals, excluding readback copies; diagnostic only")},
           {"raw_policy", "condition directory registered disposable by test entry; only KEEP_RAW=1 preserves complete dataset"},
           {"frames", nlohmann::json::array()}};
       if (cache_test) {
+        report["route"] = cache_route;
+        report["xefg_scope"] = (xefg_cache_test
+            ? "real SR and NR; production fg_service::Record plus private-color writeback; SDK/Service admission not exercised"
+            : "not used");
+        report["present_white_nits"] = (xefg_cache_test ? nlohmann::json(200) : nlohmann::json(nullptr));
         report["prefix_edit_reuse_enabled"] = true;
         report["prefix_force_reset"] = true;
         report["edit_reuse_enabled"] = condition == "cache";
@@ -3200,7 +3277,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, jitter[1]);
         }
         auto sr_readback = gpu.CreateTextureTransfer(output.Get());
-        const auto& workset = addon::worksets.at({owner, output.Get(), false});
+        const auto& workset = addon::worksets.at({nr_owner, nr_workset_key, false});
         auto proxy_readback = gpu.CreateTextureTransfer(workset.proxy);
         auto neural_readback = gpu.CreateTextureTransfer(workset.nr_output);
         auto final_readback = gpu.CreateTextureTransfer(output.Get());
@@ -3218,7 +3295,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         native_history_interval = frame * intervals_per_frame;
         native_cache_observe = cache_test;
         NVSDK_NGX_Result result;
-        if (refresh) {
+        if (refresh && !xefg_cache_test) {
           addon::ngx_slot_real[0].evaluate = reinterpret_cast<void*>(ObserveNativeHostEvaluate);
           result = addon::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), owner, &parameters, nullptr);
           addon::ngx_slot_real[0].evaluate = nullptr;
@@ -3227,6 +3304,9 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           result = ObserveNativeHostEvaluate(gpu.list.Get(), owner, &parameters, nullptr);
         }
         if (cache_test) {
+          if (xefg_cache_test) {
+            Check(record_xefg(), "XeFG Record completes each measured base frame");
+          }
           queries.EndAndResolve(gpu.list.Get(), native_history_interval + 2);
           if (!native_runtime_results.empty()) {
             const UINT query = 2 * (native_history_interval + 1);
@@ -3251,7 +3331,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           ++nr_calls;
         }
         ComPtr<ID3D12Resource> validity_readback;
-        const auto cache_state = (cache_test ? addon::features.at(owner).slots[0].edit_reuse : nullptr);
+        const auto cache_state = (cache_test ? addon::features.at(nr_owner).slots[0].edit_reuse : nullptr);
         const uint64_t reused = (cache_test ? addon::edit_reuse_reuses.load() - reuses_before : 0);
         const uint64_t refreshed = (cache_test ? addon::edit_reuse_refreshes.load() - refreshes_before : 0);
         const uint64_t fallback = (cache_test ? addon::edit_reuse_fallbacks.load() - fallbacks_before : 0);
@@ -3277,7 +3357,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         }
         gpu.Submit();
         addon::DrainRetiredResources(true);
-        const auto& look_history = addon::features.at(owner).slots[0].look_history;
+        const auto& look_history = addon::features.at(nr_owner).slots[0].look_history;
         Check(look_history.buffers[0] == nullptr && look_history.buffers[1] == nullptr,
               "history fixture never allocates temporal Look history");
         Check(gpu.fence->GetCompletedValue() >= gpu.serial && SUCCEEDED(gpu.device->GetDeviceRemovedReason()),
@@ -4242,6 +4322,9 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     }
     {
       std::scoped_lock runtime_lock(addon::runtime_mutex);
+      if (xefg_cache_test) {
+        addon::fg_service::Release(&cache_stream);
+      }
       addon::ReleaseFeatureStates();
       addon::RetireAllWorksets();
       addon::FlushRetiredResources();

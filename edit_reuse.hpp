@@ -55,7 +55,7 @@ struct Binding {
   std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 6> resources;
 };
 
-// One immutable geometry and one x2 anchor per real SR Feature/Stage. The
+// One immutable geometry and one x2 anchor per source Feature/Stage. The
 // submission tracker guards the State marker until every recording is retired.
 struct State {
   Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
@@ -65,7 +65,7 @@ struct State {
   Microsoft::WRL::ComPtr<ID3D12Resource> validity;
   Microsoft::WRL::ComPtr<ID3D12Resource> composed_motion;
   std::vector<Binding> bindings;
-  std::array<uint64_t, 32> contract{};
+  std::array<uint64_t, 35> contract{};
   uint32_t width = 0;
   uint32_t height = 0;
   uint32_t motion_width = 0;

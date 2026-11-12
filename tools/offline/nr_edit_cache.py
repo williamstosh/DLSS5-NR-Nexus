@@ -43,6 +43,7 @@ def analyze(root: Path) -> dict:
     result = {"schema": "nr-nexus-nr-edit-cache-analysis/1", "status": "measured",
               "evidence": ["NATIVE_GPU", "NATIVE_NGX"], "visual_acceptance": "not_performed",
               "conditions": {}, "comparisons": [], "dimensions": reference["dimensions"],
+              "route": reference.get("route", "inline"), "xefg_scope": reference.get("xefg_scope"),
               "measurement_notes": [
                   "Independent Features use identical SR input and byte-identical SR output.",
                   "Whole-chain intervals include cache storage/reprojection, codec and output copies, excluding test readbacks.",
@@ -60,6 +61,8 @@ def analyze(root: Path) -> dict:
             raise ContractError(f"Cache experiment requires Detail stability Off (1): {name}")
         if any(report.get(key) != reference.get(key) for key in ("scene_id", "raster_sign")):
             raise ContractError(f"Mismatched jitter scene: {name}")
+        if any(report.get(key) != reference.get(key) for key in ("route", "present_white_nits", "xefg_scope")):
+            raise ContractError(f"Mismatched recording route: {name}")
         times, kinds, model_times = [], {}, []
         previous_fence, previous_reuse = 0, False
         for index, frame in enumerate(report["frames"]):

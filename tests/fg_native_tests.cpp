@@ -736,11 +736,13 @@ int RunNativeRequiredMenuTest() {
 #include "gpu_timer_cases.hpp"
 #include "control_mask_gpu_cases.hpp"
 #include "nr_edit_reuse_gpu_cases.hpp"
+#include "nr_edit_reuse_xefg_cases.hpp"
 #include "control_mask_capture_cases.hpp"
 #include "adaptive_fg_service_cases.hpp"
 #include "adaptive_inline_cases.hpp"
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-xefg-contracts") == 0) return nr_edit_reuse_xefg_cases::Run();
   if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-contracts") == 0) return nr_edit_reuse_gpu_cases::Run();
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-inline") == 0) return adaptive_inline_cases::Run();
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-fg-service") == 0) return adaptive_fg_service_cases::Run();

@@ -1068,6 +1068,9 @@ struct PresentTarget {
   uint32_t sdr_restore_effective_mode = 0;
   std::array<float, kMaxNrPasses> pass_color_strength{};
   uint64_t guide_serial = 0;
+  // Granted only by XeFG's tagged, single-backbuffer service. Its private
+  // Output contains this base frame's original color before NR runs.
+  uint64_t xefg_edit_reuse_frame = 0;
   uint64_t diagnostic_source_generation = 0;
   NVSDK_NGX_Feature diagnostic_source_feature = NVSDK_NGX_Feature_Reserved_Unknown;
   uint32_t guide_mode = 0;
@@ -11611,13 +11614,20 @@ inline bool RecordInline(
   stage_stats.width = width;
   stage_stats.height = height;
   const bool edit_reuse_requested = edit_reuse_enabled.load(std::memory_order_relaxed);
-  const bool edit_reuse_route_eligible = edit_reuse_requested && present == nullptr && !plan.mixed
-      && group.begin == 0 && requested_stack == 1 && !adaptive.enabled && !adaptive.preparing
+  const bool edit_reuse_inline_route = present == nullptr
       && hook_point.load() == kHookUpscaled && successful_sr_device == device
-      && !D3D11OnlySession() && !direct_api.borrowed_core_context
       && native_fg_public_off.load() && native_fg_declaration.load() == NativeFgDeclaration::kOff
       && !native_fg_owns.load() && !fg::xefg::Enabled() && !fg::xefg::OwnsStream()
-      && !auto_fg_fallback_active.load() && !mixed_present_fg_seen.load()
+      && !auto_fg_fallback_active.load() && !mixed_present_fg_seen.load();
+  const bool edit_reuse_xefg_route = present != nullptr && present->xefg_edit_reuse_frame != 0
+      && hook_point.load() == kHookPresent && !present->d3d11_bridge
+      && present->domain == present_restore_scope::Domain::PRE_FG_BACKBUFFER
+      && present->stage_execution_plan == nullptr && !present->native_prefg_resolution_pair
+      && present->source_color == nullptr;
+  const uint64_t edit_reuse_sequence = (present != nullptr ? present->xefg_edit_reuse_frame : feature.sr_sequence);
+  const bool edit_reuse_route_eligible = edit_reuse_requested && (edit_reuse_inline_route || edit_reuse_xefg_route)
+      && !plan.mixed && group.begin == 0 && requested_stack == 1 && !adaptive.enabled && !adaptive.preparing
+      && !D3D11OnlySession() && !direct_api.borrowed_core_context
       && !control_mask_requested && !look_mode.load() && detail_stability.load() == 1u
       && preset.load() == 2u
       && !nr_follow_input_res.load() && nr_input_width == width && nr_input_height == height
@@ -11644,7 +11654,7 @@ inline bool RecordInline(
   const auto retire_edit_reuse = [&] {
     auto& slot = feature.slots[0];
     if (slot.edit_reuse == nullptr) return;
-    if (slot.edit_reuse->reused || slot.edit_reuse->source_sequence + 1 != feature.sr_sequence) {
+    if (slot.edit_reuse->reused || slot.edit_reuse->source_sequence + 1 != edit_reuse_sequence) {
       slot.pending_reset = true;
       slot.pending_reset_reasons |= kResetRecovery;
     }
@@ -12449,7 +12459,7 @@ inline bool RecordInline(
   // chain's resets across two epochs.
   const uint64_t chain_reset_epoch =
       history_reset_epoch.load(std::memory_order_relaxed);
-  std::array<uint64_t, 32> edit_contract{};
+  std::array<uint64_t, 35> edit_contract{};
   if (edit_reuse_route_eligible) {
     edit_contract = {configuration_generation.load(), chain_reset_epoch, feature.source_generation,
         width, height, frame.motion_width, frame.motion_height, frame.create_flags, preset.load(), style.load(),
@@ -12461,14 +12471,17 @@ inline bool RecordInline(
         std::bit_cast<uint32_t>(frame.motion_scale_y), feed_mode.load(), norm_governor.load(), depth_mode.load(),
         std::bit_cast<uint32_t>(norm_attack_stops.load()), std::bit_cast<uint32_t>(norm_release_stops.load()),
         std::bit_cast<uint32_t>(norm_slew_stops.load()), norm_cut_aware.load(),
-        std::bit_cast<uint32_t>(proxy_anchor_nits.load())};
+        std::bit_cast<uint32_t>(proxy_anchor_nits.load()),
+        (present != nullptr ? present->restore_config_epoch : 0u),
+        (present != nullptr ? std::bit_cast<uint32_t>(frame_divisor) : 0u),
+        (present != nullptr ? static_cast<uint32_t>(frame.ui_correction) : 0u)};
     if (auto& cache = feature.slots[0].edit_reuse; cache != nullptr) {
       if (cache->width != width || cache->height != height || cache->motion_width != frame.motion_width
           || cache->motion_height != frame.motion_height) {
         retire_edit_reuse();
-      } else if (cache->contract != edit_contract || cache->source_sequence + 1 != feature.sr_sequence
+      } else if (cache->contract != edit_contract || cache->source_sequence + 1 != edit_reuse_sequence
                  || frame.frame_reset != 0 || feature.slots[0].pending_reset) {
-        if (cache->reused || cache->source_sequence + 1 != feature.sr_sequence) {
+        if (cache->reused || cache->source_sequence + 1 != edit_reuse_sequence) {
           feature.slots[0].pending_reset = true;
           feature.slots[0].pending_reset_reasons |= kResetRecovery;
         }
@@ -12736,7 +12749,7 @@ inline bool RecordInline(
               && edit_reuse::Record(device, command_list, edit_cache, edit_inputs, edit_reuse::Phase::SNAPSHOT_MOTION);
           if (reuse_this_pass) {
             cache->reused = true;
-            cache->source_sequence = feature.sr_sequence;
+            cache->source_sequence = edit_reuse_sequence;
             cache->motion_offset_x = edit_inputs.raster_offset_x;
             cache->motion_offset_y = edit_inputs.raster_offset_y;
           }
@@ -12964,7 +12977,7 @@ inline bool RecordInline(
       if (edit_cache != nullptr) {
         edit_cache->valid = edit_reuse::Record(device, command_list, edit_cache, edit_inputs, edit_reuse::Phase::CAPTURE);
         edit_cache->reused = false;
-        edit_cache->source_sequence = feature.sr_sequence;
+        edit_cache->source_sequence = edit_reuse_sequence;
         if (edit_cache->valid) {
           ++edit_cache->anchor_generation;
         } else {

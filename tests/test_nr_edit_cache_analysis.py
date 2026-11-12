@@ -64,6 +64,14 @@ class CacheAnalysisTests(unittest.TestCase):
         self.assertEqual(result["comparisons"][1]["valid_pixels"], 4)
         self.assertEqual(len(list(self.root.glob("cache-frame-*.png"))), 4)
 
+    def test_rejects_different_recording_routes(self):
+        report_path = self.root / "cache/nr-edit-reuse-cache.json"
+        report = json.loads(report_path.read_text())
+        report["route"] = "xefg-record"
+        report_path.write_text(json.dumps(report))
+        with self.assertRaisesRegex(cache.ContractError, "Mismatched recording route"):
+            cache.analyze(self.root)
+
     def test_rejects_wrong_invalid_pixel_and_preserves_sample(self):
         report_path = self.root / "cache/nr-edit-reuse-cache.json"
         report = json.loads(report_path.read_text())

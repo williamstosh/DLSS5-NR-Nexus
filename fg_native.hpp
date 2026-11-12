@@ -47,6 +47,7 @@ struct Stream {
   const NVSDK_NGX_Handle* native_handle = nullptr;
   bool continuing_submission = false;
   uint64_t last_model_frame[2] = {};
+  uint64_t last_output_frame[2] = {};
   int64_t diagnostic_logged_ns = 0;
   bool has_frame = false;
   fg::Result result = fg::Result::NOT_SERVED;
@@ -124,6 +125,7 @@ inline void Invalidate(Stream* stream) {
   stream->native_serial = 0;
   stream->continuing_submission = false;
   stream->last_model_frame[0] = stream->last_model_frame[1] = 0;
+  stream->last_output_frame[0] = stream->last_output_frame[1] = 0;
   stream->result = fg::Result::NOT_SERVED;
   for (auto& role : stream->roles) {
     if (const auto it = features.find(role.Handle()); it != features.end()) {
@@ -454,9 +456,17 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
   // XeFG full-frame inputs can feed the core's original copy directly while
   // output stays private. Composition needs the unmodified staged backbuffer.
   const auto backbuffer_desc = input.backbuffer->GetDesc();
+  const bool xefg_edit_reuse_frame = edit_reuse_enabled.load(std::memory_order_relaxed)
+      && !stream->native && native_parameters == nullptr && !has_hudless && !input.ui_composition
+      && input.fg_enabled && input.has_present_id && input.has_constants && input.application_frame != 0
+      && real_guides && input.color_x == 0 && input.color_y == 0
+      && backbuffer_desc.Width == input.color_width && backbuffer_desc.Height == input.color_height;
+  // Cache descriptors retain their sources. Stage the current original in
+  // the existing private slot instead of retaining a DXGI backbuffer across ResizeBuffers.
   const bool borrow_color_inputs = native_parameters == nullptr
       && input.color_x == 0 && input.color_y == 0
-      && backbuffer_desc.Width == input.color_width && backbuffer_desc.Height == input.color_height;
+      && backbuffer_desc.Width == input.color_width && backbuffer_desc.Height == input.color_height
+      && !xefg_edit_reuse_frame;
   if (!borrow_color_inputs) {
     CopyColor(list, slot->color[0], kRead, input.backbuffer, input.backbuffer_state,
               input.color_x, input.color_y);
@@ -489,9 +499,10 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     auto& role = stream->roles[i];
     // Public motion relates adjacent application frames, not the last frame
     // for which a busy service could obtain a recording slot or NGX turn.
+    // A cache output is a completed base frame without a new model call.
+    const uint64_t previous_frame = (xefg_edit_reuse_frame ? stream->last_output_frame[i] : stream->last_model_frame[i]);
     if (input.reset || role.real_guides != real_guides || stream->epoch != input.epoch
-        || (input.application_frame != 0 && stream->last_model_frame[i] != 0
-            && input.application_frame != stream->last_model_frame[i] + 1)) {
+        || (input.application_frame != 0 && previous_frame != 0 && input.application_frame != previous_frame + 1)) {
       ResetPresentStreamHistory(&role);
     }
     role.real_guides = real_guides;
@@ -511,6 +522,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     target.capture_display = false;
     target.ui_correction = i == 0 && base.ui_correction;
     target.guide_serial = (real_guides ? input.application_frame + 1 : 0u);
+    target.xefg_edit_reuse_frame = (xefg_edit_reuse_frame ? input.application_frame : 0u);
     target.domain = (i == 0 ? present_restore_scope::Domain::PRE_FG_BACKBUFFER
                             : present_restore_scope::Domain::PRE_FG_HUDLESS);
     target.original_identity = reinterpret_cast<uintptr_t>(i == 0 ? input.backbuffer : input.hudless);
@@ -527,6 +539,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
            << " application_frame=" << input.application_frame
            << " present_id=" << input.present_id << " tagged_id=" << input.has_present_id
            << " previous_model_frame=" << stream->last_model_frame[i]
+           << " previous_output_frame=" << stream->last_output_frame[i]
            << " guides=" << (real_guides ? "real" : "neutral")
            << " guide_frame_basis=" << (stream->native ? "native_fg_input" : "present_id")
            << " guide_serial=" << target.guide_serial << " constants=" << input.has_constants
@@ -699,6 +712,9 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     for (uint32_t i = 0; i < recordings->size(); ++i) {
       if ((*recordings)[i].model_recorded) {
         stream->last_model_frame[i] = input.application_frame;
+      }
+      if ((*recordings)[i].output_ready) {
+        stream->last_output_frame[i] = input.application_frame;
       }
     }
   }

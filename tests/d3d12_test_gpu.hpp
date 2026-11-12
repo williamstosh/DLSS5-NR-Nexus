@@ -86,11 +86,11 @@ struct Gpu {
       }
     }
   }
-  ComPtr<IDXGISwapChain3> Swapchain() {
+  ComPtr<IDXGISwapChain3> Swapchain(DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM) {
     DXGI_SWAP_CHAIN_DESC1 desc{};
     desc.Width = swapchain_width;
     desc.Height = swapchain_height;
-    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.Format = format;
     desc.SampleDesc.Count = 1;
     desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     desc.BufferCount = 2;
