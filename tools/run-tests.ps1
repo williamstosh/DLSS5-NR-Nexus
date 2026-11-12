@@ -235,7 +235,7 @@ foreach ($item in $Suite) {
                                         if ((Test-Path -LiteralPath $conditionDirectory -PathType Container) -and
                                             $global:NexusTestOutputs[$directory].status -eq 'Running') {
                                             Get-ChildItem -LiteralPath $conditionDirectory -File | Where-Object {
-                                                $_.Extension -in @('.rgba16f','.r32f','.rg16f','.r8','.r32u')
+                                                $_.Extension -in @('.rgba16f','.r10g10b10a2','.r32f','.rg16f','.r8','.r32u')
                                             } | ForEach-Object {
                                                 Register-TestDisposable -Directory $directory -Path $_.FullName -Kind 'nr-history-raw'
                                             }

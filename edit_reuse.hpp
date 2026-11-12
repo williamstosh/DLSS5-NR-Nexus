@@ -48,6 +48,7 @@ struct Inputs {
   ID3D12Resource* depth = nullptr;
   ID3D12Resource* original = nullptr;
   ID3D12Resource* decoded = nullptr;
+  DXGI_FORMAT depth_view_format = DXGI_FORMAT_R32_FLOAT;
 };
 
 struct Binding {
@@ -195,7 +196,8 @@ inline bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     for (uint32_t phase_index = 0; phase_index < active_srvs.size(); ++phase_index) {
       for (uint32_t index = 0; index < 5; ++index) {
         const auto resource_desc = resources[index]->GetDesc();
-        const D3D12_SHADER_RESOURCE_VIEW_DESC view{.Format = resource_desc.Format,
+        const D3D12_SHADER_RESOURCE_VIEW_DESC view{
+            .Format = (index == 3 ? inputs.depth_view_format : resource_desc.Format),
             .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D, .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             .Texture2D = {.MipLevels = 1}};
         device->CreateShaderResourceView((active_srvs[phase_index] & (1u << index)) != 0 ? resources[index] : nullptr,

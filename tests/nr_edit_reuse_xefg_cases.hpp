@@ -114,6 +114,13 @@ int Run() {
     const auto upload = [&](ID3D12Resource* resource, const auto& values,
                             D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after, UINT row_bytes) {
       auto transfer = gpu.CreateTextureTransfer(resource);
+      if (resource->GetDesc().Format == DXGI_FORMAT_R32G8X24_TYPELESS) {
+        // The shared transfer copies subresource 0: one float per depth pixel,
+        // without the separate stencil plane or the resource's packed size.
+        Check(transfer.footprint.Footprint.Depth == 1
+                  && transfer.row_bytes == resource->GetDesc().Width * sizeof(float),
+              "XeFG planar depth upload uses the four-byte plane-zero footprint");
+      }
       gpu.Transition(resource, before, D3D12_RESOURCE_STATE_COPY_DEST);
       gpu.UploadTexture(resource, transfer, reinterpret_cast<const uint8_t*>(values.data()),
                         values.size() * sizeof(values[0]), row_bytes);
@@ -137,7 +144,8 @@ int Run() {
       native::diffuse_white_nits = 200.f;
       const uint32_t guide_width = (pq ? width / 2 : width);
       const uint32_t guide_height = (pq ? height / 2 : height);
-      auto depth = gpu.Texture(guide_width, guide_height, DXGI_FORMAT_R32_FLOAT);
+      auto depth = gpu.Texture(guide_width, guide_height,
+          pq ? DXGI_FORMAT_R32G8X24_TYPELESS : DXGI_FORMAT_R32_FLOAT);
       auto motion = gpu.Texture(guide_width, guide_height, DXGI_FORMAT_R16G16_FLOAT);
       upload(depth.Get(), std::vector<float>(guide_width * guide_height, .5f), D3D12_RESOURCE_STATE_COMMON,
              NATIVE_INPUT_STATE, guide_width * sizeof(float));
@@ -453,6 +461,7 @@ int Run() {
     }
     std::cout << "PASS XeFG x2 single Backbuffer evidence=WARP+MOCK SR=MOCK NR=MOCK XeFG=MOCK"
                  " formats=scRGB/HDR10-PQ nonneutral_PQ=CPU_reference packed_RGBA=exact_on_rejection"
+                 " depth=scRGB:R32_FLOAT/PQ:R32G8X24_TYPELESS_plane0"
                  " source_updates=per_base_frame duplicate_present_id=stable refresh_reuse_refresh=1/0/1"
                  " reset/guides/gap/failure/retirement=checked interpolation=not_executed\n";
     return 0;

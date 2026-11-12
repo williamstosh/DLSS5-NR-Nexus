@@ -545,6 +545,18 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
            << " guide_serial=" << target.guide_serial << " constants=" << input.has_constants
            << " guide_size=" << contract.input_width << 'x' << contract.input_height
            << " color_size=" << input.color_width << 'x' << input.color_height
+           << " color_format=" << backbuffer_desc.Format
+           << " motion_format=" << motion->GetDesc().Format
+           << " motion_size=" << motion->GetDesc().Width << 'x' << motion->GetDesc().Height
+           << " motion_flags=" << motion->GetDesc().Flags
+           << " depth_format=" << depth->GetDesc().Format
+           << " depth_size=" << depth->GetDesc().Width << 'x' << depth->GetDesc().Height
+           << " depth_flags=" << depth->GetDesc().Flags
+           << " edit_requested=" << edit_reuse_enabled.load(std::memory_order_relaxed)
+           << " edit_frame=" << target.xefg_edit_reuse_frame
+           << " edit_refresh=" << edit_reuse_refreshes.load(std::memory_order_relaxed)
+           << " edit_reuse=" << edit_reuse_reuses.load(std::memory_order_relaxed)
+           << " edit_fallback=" << edit_reuse_fallbacks.load(std::memory_order_relaxed)
            << " motion_base=" << contract.motion_x << ',' << contract.motion_y
            << " depth_base=" << contract.depth_x << ',' << contract.depth_y
            << " motion_scale=" << contract.motion_scale_x << ',' << contract.motion_scale_y

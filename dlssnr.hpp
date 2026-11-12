@@ -11643,7 +11643,8 @@ inline bool RecordInline(
       && current.motion_x == 0 && current.motion_y == 0 && current.depth_x == 0 && current.depth_y == 0
       && motion_desc.Width == current.input_width && motion_desc.Height == current.input_height
       && depth_desc.Width == current.input_width && depth_desc.Height == current.input_height
-      && depth_desc.Format == DXGI_FORMAT_R32_FLOAT
+      && (depth_desc.Format == DXGI_FORMAT_R32_FLOAT || depth_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS)
+      && (depth_desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0
       && depth_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
       && motion_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
       && depth_desc.DepthOrArraySize == 1 && motion_desc.DepthOrArraySize == 1
@@ -12747,7 +12748,8 @@ inline bool RecordInline(
           .raster_offset_x = frame.jitter_x, .raster_offset_y = frame.jitter_y,
           .previous_motion_offset_x = cache->motion_offset_x, .previous_motion_offset_y = cache->motion_offset_y,
           .proxy = res.proxy, .neural = res.nr_output, .motion = frame.motion, .depth = frame.depth,
-          .original = output, .decoded = res.decoded};
+          .original = output, .decoded = res.decoded,
+          .depth_view_format = ControlMaskDepthViewFormat(depth_desc.Format)};
       if (edit_reuse::Record(device, command_list, cache.get(), edit_inputs, edit_reuse::Phase::PREPARE)) {
         edit_cache = cache.get();
         reuse_this_pass = cache->valid && !cache->reused;
