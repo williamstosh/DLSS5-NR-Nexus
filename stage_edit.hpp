@@ -89,6 +89,9 @@ inline void Draw() {
       }
     }
   }
+  // An absent modal clears p_open. Only a pending confirmation owns that
+  // cancellation path; direct-commit errors remain available to the panel.
+  if (!pending || !confirmation_required) return;
   const auto display = ImGui::GetIO().DisplaySize;
   ImGui::SetNextWindowPos(ImVec2(display.x * .5f, display.y * .5f), ImGuiCond_Appearing, ImVec2(.5f, .5f));
   const float column_width = (std::max)({ImGui::CalcTextSize("Upscaled").x, ImGui::CalcTextSize(ui::Tr("Before")).x,
