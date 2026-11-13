@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('all','report','branding','ui','presets','unicode-input','native','sdr-policy','hdr-policy','scope','config','constants','control-mask','control-mask-execution','vulkan-control-mask','fg-xefg','fg-native','lifecycle','bridge-motion','stage-plan','adaptive-resolution','copy-slots')]
+    [ValidateSet('all','report','branding','ui','presets','unicode-input','native','lastgasp','sdr-policy','hdr-policy','scope','config','constants','control-mask','control-mask-execution','vulkan-control-mask','fg-xefg','fg-native','lifecycle','bridge-motion','stage-plan','adaptive-resolution','copy-slots')]
     [string[]]$Suite = @('all'),
     [string]$SourceRoot = (Split-Path $PSScriptRoot -Parent),
     [string]$HostRoot = (Join-Path (Split-Path $PSScriptRoot -Parent) '.local/renodx'),
@@ -45,6 +45,7 @@ $sources = [ordered]@{
     'unicode-input'='unicode_input_tests'
     branding='branding_tests'
     native='native_contract_tests'; 'sdr-policy'='present_sdr_restore_policy_tests'
+    lastgasp='lastgasp_tests'
     'hdr-policy'='present_hdr_pedestal_policy_tests'; scope='present_restore_scope_tests'
     config='present_restore_configuration_tests'; constants='present_hdr_runtime_constants_tests'
     'control-mask'='control_mask_contract_tests'
