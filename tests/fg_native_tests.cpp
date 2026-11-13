@@ -747,6 +747,10 @@ int main(int argc, char** argv) {
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-inline") == 0) return adaptive_inline_cases::Run();
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-fg-service") == 0) return adaptive_fg_service_cases::Run();
 #if defined(NR_NEXUS_TEST_NATIVE_NGX)
+  if (argc == 3 && std::strcmp(argv[1], "--nr-edit-reuse-cost") == 0) {
+    return control_mask_gpu_cases::RunNativeNgx(
+        argv[2], false, renodx::addons::dlss5::internal::kControlMaskRgb, false, false, false, false, false, false, true);
+  }
   if (argc == 3 && std::strcmp(argv[1], "--nr-edit-reuse-jitter") == 0) {
     return control_mask_gpu_cases::RunNativeNgx(
         argv[2], false, renodx::addons::dlss5::internal::kControlMaskRgb, false, false, false, false, false, true);
@@ -788,7 +792,8 @@ int main(int argc, char** argv) {
   if (argc >= 2 && (std::strncmp(argv[1], "--control-mask-native-ngx", 25) == 0
                     || std::strcmp(argv[1], "--nr-edit-reuse-history") == 0
                     || std::strcmp(argv[1], "--nr-edit-reuse-jitter") == 0
-                    || std::strcmp(argv[1], "--nr-edit-reuse-cache") == 0)) {
+                    || std::strcmp(argv[1], "--nr-edit-reuse-cache") == 0
+                    || std::strcmp(argv[1], "--nr-edit-reuse-cost") == 0)) {
     std::cerr << "FAIL native NGX support was not compiled; rebuild with "
                  "tools/run-tests.ps1 -NativeNgxSdkLibraryDirectory containing nvsdk_ngx_s.lib\n";
     return 1;

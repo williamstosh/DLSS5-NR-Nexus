@@ -2395,6 +2395,7 @@ inline d3d12_test::TimestampQueries* native_history_queries = nullptr;
 inline UINT native_history_interval = 0;
 inline nlohmann::json native_history_parameters;
 inline bool native_cache_observe = false;
+inline bool native_cache_cost = false;
 inline bool native_cache_pq = false;
 inline addon::DirectCreateFn native_resize_create = nullptr;
 inline addon::DirectReleaseFn native_resize_release = nullptr;
@@ -2460,7 +2461,7 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeRuntimeEvaluate(
     const NVSDK_NGX_Handle* handle,
     const NVSDK_NGX_Parameter* parameters,
     PFN_NVSDK_NGX_ProgressCallback progress) {
-  if (native_history_motion != nullptr || native_cache_observe) {
+  if (native_history_motion != nullptr || (native_cache_observe && !native_cache_cost)) {
     const auto wrapper_reset = addon::GetInt(parameters, "DLSSNR.Reset", -1);
     auto* experiment_parameters = const_cast<NVSDK_NGX_Parameter*>(parameters);
     if (native_history_motion != nullptr) {
@@ -2543,15 +2544,51 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeRuntimeEvaluate(
 int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                  uint32_t mask_mode = addon::kControlMaskDepthFar, bool cost = false,
                  bool motion_test = false, bool resize_test = false, bool history_test = false,
-                 bool cache_test = false, bool jitter_test = false) {
+                 bool cache_test = false, bool jitter_test = false, bool cache_cost = false) {
+  nlohmann::json cache_cost_report;
+  std::filesystem::path cache_cost_directory;
+  const auto save_cache_cost_report = [&] {
+    std::ofstream file(cache_cost_directory / "nr-edit-reuse-cost.json", std::ios::binary | std::ios::trunc);
+    file << cache_cost_report.dump(2) << '\n';
+    file.close();
+    Check(!file.fail(), "NR cache cost evidence saved");
+  };
+  const auto save_cache_cost_failure = [&](const char* message) {
+    if (!cache_cost || cache_cost_directory.empty()) return;
+    native_history_queries = nullptr;
+    native_cache_observe = false;
+    native_cache_cost = false;
+    suppress_control_mask_cost_logs = false;
+    cache_cost_report["status"] = "failed";
+    cache_cost_report["errors"] = 1;
+    cache_cost_report["failure"] = message;
+    try {
+      save_cache_cost_report();
+    } catch (...) {
+      std::cerr << "FAIL saving NR cache cost failure JSON\n";
+    }
+  };
   try {
+    cache_test |= cache_cost;
+    if (cache_cost) {
+      const char* requested_condition = std::getenv("NR_NEXUS_TEST_NR_CACHE_CONDITION");
+      const std::string condition = (requested_condition != nullptr ? requested_condition : "baseline");
+      Check(condition == "baseline" || condition == "cache", "known NR cache cost condition");
+      const std::filesystem::path directory("cost-" + condition);
+      Check(std::filesystem::create_directory(directory), "cache cost uses a new isolated condition directory");
+      cache_cost_directory = directory;
+      cache_cost_report = {{"schema", "nr-nexus-nr-edit-reuse-cost-v1"}, {"condition", condition},
+          {"evidence", "NATIVE_GPU+NATIVE_NGX"}, {"status", "initializing"}};
+    }
     const bool sequence_test = history_test || cache_test;
     const char* cache_route_environment = (cache_test ? std::getenv("NR_NEXUS_TEST_NR_CACHE_ROUTE") : nullptr);
-    const std::string cache_route = (cache_route_environment != nullptr ? cache_route_environment : "inline");
+    const std::string cache_route = (cache_cost ? "xefg-record"
+        : (cache_route_environment != nullptr ? cache_route_environment : "inline"));
     Check(cache_route == "inline" || cache_route == "xefg-record", "known NR cache recording route");
     const bool xefg_cache_test = cache_test && cache_route == "xefg-record";
     const char* cache_format_environment = (cache_test ? std::getenv("NR_NEXUS_TEST_NR_CACHE_FORMAT") : nullptr);
-    const std::string cache_format = (cache_format_environment != nullptr ? cache_format_environment : "scrgb");
+    const std::string cache_format = (cache_cost ? "scrgb"
+        : (cache_format_environment != nullptr ? cache_format_environment : "scrgb"));
     Check(cache_format == "scrgb" || cache_format == "pq", "known NR cache source format");
     const bool pq_cache_test = cache_test && cache_format == "pq";
     Check(!pq_cache_test || xefg_cache_test, "PQ cache input requires the production XeFG Record route");
@@ -2581,10 +2618,10 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     reshade::internal::get_reshade_module_handle(GetModuleHandleW(nullptr));
     addon::addon_module = GetModuleHandleW(nullptr);
     Gpu gpu(true);
-    const UINT width = (cost ? 3840 : (resize_test ? 1920 : 960));
-    const UINT height = (cost ? 2160 : (resize_test ? 1080 : 540));
-    const UINT render_width = (motion_test ? (resize_test ? 1280 : 640) : width);
-    const UINT render_height = (motion_test ? (resize_test ? 720 : 360) : height);
+    const UINT width = (cost || cache_cost ? 3840 : (resize_test ? 1920 : 960));
+    const UINT height = (cost || cache_cost ? 2160 : (resize_test ? 1080 : 540));
+    const UINT render_width = (cache_cost ? 2560 : (motion_test ? (resize_test ? 1280 : 640) : width));
+    const UINT render_height = (cache_cost ? 1440 : (motion_test ? (resize_test ? 720 : 360) : height));
     Check(addon::InstallQueueCompletionHooks(gpu.queue.Get()), "native ControlMask queue completion hooks");
     Check(addon::InstallCommandListStateHooks(gpu.list.Get()), "native ControlMask command-list hooks");
     Check(addon::EnsureControlMaskPipeline(gpu.device.Get()), "native ControlMask production pipeline");
@@ -2735,6 +2772,9 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     addon::configuration_generation.fetch_add(1);
     addon::nr_follow_input_res = false;
     addon::nr_resolution_scale = 1.f;
+    if (cache_cost) {
+      addon::nr_adaptive_enabled = false;
+    }
     addon::look_mode = false;
     addon::transfer_strength = 1.f;
     addon::color_strength = 1.f;
@@ -3090,6 +3130,8 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     nlohmann::json resize_report;
     nlohmann::json history_report;
     nlohmann::json jitter_report;
+    constexpr uint32_t cache_cost_warmup_frames = 32;
+    constexpr uint32_t cache_cost_sample_frames = 128;
     if (jitter_test) {
       const std::filesystem::path directory("jitter-calibration");
       Check(std::filesystem::create_directory(directory), "jitter calibration uses a new isolated directory");
@@ -3174,7 +3216,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       jitter_report["sequence_host_sr_evaluates"] = 9;
       jitter_report["sequence_nr_evaluates"] = 0;
     }
-    if (sequence_test) {
+    if (sequence_test && !cache_cost) {
       const auto history_look = addon::LookSettingsSnapshot(true);
       Check(addon::detail_stability.load() == 1u && history_look.stabilize == 0u
                 && !history_look.stabilize_detail && history_look.stabilize_alpha == 0.f,
@@ -3545,6 +3587,197 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       report["sequence_nr_evaluates"] = nr_calls;
       std::cout << "PASS NR " << (cache_test ? "cache" : "history") << " condition=" << condition << " frames=" << frame_count << " SR=" << frame_count
                 << " NR=" << nr_calls << "; raw planes=" << raw_directory.string() << '\n';
+    }
+    if (cache_cost) {
+      const auto condition = cache_cost_report.at("condition").get<std::string>();
+      const auto look = addon::LookSettingsSnapshot(true);
+      Check(!addon::nr_adaptive_enabled.load() && !addon::look_mode.load() && !addon::control_mask_enabled.load()
+                && addon::detail_stability.load() == 1u && look.stabilize == 0u
+                && !look.stabilize_detail && look.stabilize_alpha == 0.f,
+            "cache cost disables adaptive resolution, ControlMask and temporal Look");
+      constexpr uint32_t total_frames = cache_cost_warmup_frames + cache_cost_sample_frames;
+      constexpr UINT intervals_per_frame = 3;
+      auto queries = d3d12_test::CreateTimestampQueries(gpu, total_frames * intervals_per_frame);
+      struct CacheCostFrame {
+        uint32_t sr_calls = 0, sr_result = 0, nr_calls = 0, nr_result = 0;
+        int reset = -1;
+        uint64_t refreshes = 0, reuses = 0, fallbacks = 0, source_successes = 0;
+        uint64_t fence = 0, completed_fence = 0, model = 0, workset = 0, cache_bytes = 0;
+        HRESULT device_status = E_FAIL;
+        double entry_ms = 0., interval_ms = 0., wrapper_ms = 0., record_ms = 0.;
+        double sr_api_ms = 0., nr_api_ms = 0., submit_complete_ms = 0., source_complete_ms = 0.;
+      };
+      std::array<CacheCostFrame, total_frames> frames{};
+      const NVSDK_NGX_Handle* stable_model = nullptr;
+      uint64_t stable_workset = 0;
+      auto previous_entry = std::chrono::steady_clock::time_point{};
+      const auto origin = std::chrono::steady_clock::now();
+      addon::edit_reuse_enabled = condition == "cache";
+      native_cache_cost = true;
+      suppressed_control_mask_cost_logs = 0;
+      suppress_control_mask_cost_logs = true;
+      const auto clear_observers = [&] {
+        native_history_queries = nullptr;
+        native_cache_observe = false;
+        native_cache_cost = false;
+        suppress_control_mask_cost_logs = false;
+      };
+      uint32_t attempted_frame = 0, completed_frames = 0;
+      try {
+        for (uint32_t frame = 0; frame < total_frames; ++frame) {
+          attempted_frame = frame;
+          native_motion_sr_calls = 0;
+          native_runtime_masks.clear();
+          native_runtime_results.clear();
+          native_runtime_resets.clear();
+          native_resize_host_ms = native_resize_evaluate_ms = 0.;
+          native_motion_sr_readback = nullptr;
+          native_motion_proxy_readback = nullptr;
+          native_motion_neural_readback = nullptr;
+          native_history_queries = &queries;
+          native_history_interval = frame * intervals_per_frame;
+          native_cache_observe = true;
+          const uint64_t refreshes_before = addon::edit_reuse_refreshes.load();
+          const uint64_t reuses_before = addon::edit_reuse_reuses.load();
+          const uint64_t fallbacks_before = addon::edit_reuse_fallbacks.load();
+          const auto successes_before = addon::SourceSuccessfulEvaluations();
+          parameters.Set(NVSDK_NGX_Parameter_Reset, frame == 0 ? 1 : 0);
+          gpu.list->ClearState(nullptr);
+          const auto entry = std::chrono::steady_clock::now();
+          const auto result = ObserveNativeHostEvaluate(gpu.list.Get(), owner, &parameters, nullptr);
+          const auto sr_recorded = std::chrono::steady_clock::now();
+          const bool ready = record_xefg();
+          const auto recorded = std::chrono::steady_clock::now();
+          queries.EndAndResolve(gpu.list.Get(), native_history_interval + 2);
+          if (!native_runtime_results.empty()) {
+            const UINT query = 2 * (native_history_interval + 1);
+            gpu.list->ResolveQueryData(queries.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query, 2,
+                queries.readback.Get(), static_cast<uint64_t>(query) * sizeof(uint64_t));
+          }
+          native_history_queries = nullptr;
+          native_cache_observe = false;
+          const auto submit_start = std::chrono::steady_clock::now();
+          gpu.Submit();
+          const auto completed = std::chrono::steady_clock::now();
+          addon::DrainRetiredResources(true);
+          const auto& model = addon::features.at(nr_owner).slots[0];
+          const auto& workset = addon::worksets.at({nr_owner, nr_workset_key, false});
+          auto& sample = frames[frame];
+          sample = {.sr_calls = native_motion_sr_calls, .sr_result = static_cast<uint32_t>(result),
+              .nr_calls = static_cast<uint32_t>(native_runtime_results.size()),
+              .nr_result = (native_runtime_results.empty() ? 0u : static_cast<uint32_t>(native_runtime_results[0])),
+              .reset = (native_runtime_resets.empty() ? -1 : native_runtime_resets[0]),
+              .refreshes = addon::edit_reuse_refreshes.load() - refreshes_before,
+              .reuses = addon::edit_reuse_reuses.load() - reuses_before,
+              .fallbacks = addon::edit_reuse_fallbacks.load() - fallbacks_before,
+              .source_successes = addon::SourceSuccessfulEvaluations() - successes_before,
+              .fence = gpu.serial, .completed_fence = gpu.fence->GetCompletedValue(),
+              .model = reinterpret_cast<uintptr_t>(model.handle), .workset = workset.id,
+              .cache_bytes = (model.edit_reuse != nullptr ? model.edit_reuse->allocated_bytes : 0),
+              .device_status = gpu.device->GetDeviceRemovedReason(),
+              .entry_ms = std::chrono::duration<double, std::milli>(entry - origin).count(),
+              .interval_ms = (frame == 0 ? 0. : std::chrono::duration<double, std::milli>(entry - previous_entry).count()),
+              .wrapper_ms = std::chrono::duration<double, std::milli>(recorded - entry).count(),
+              .record_ms = std::chrono::duration<double, std::milli>(recorded - sr_recorded).count(),
+              .sr_api_ms = native_resize_host_ms, .nr_api_ms = native_resize_evaluate_ms,
+              .submit_complete_ms = std::chrono::duration<double, std::milli>(completed - submit_start).count(),
+              .source_complete_ms = std::chrono::duration<double, std::milli>(completed - entry).count()};
+          ++completed_frames;
+          previous_entry = entry;
+          const bool refresh = condition == "baseline" || frame % 2 == 0;
+          Check(NVSDK_NGX_SUCCEED(result) && sample.sr_calls == 1 && ready && sample.source_successes == 1
+                    && sample.nr_calls == (refresh ? 1u : 0u) && native_runtime_resets.size() == sample.nr_calls
+                    && (sample.nr_calls == 0 || (NVSDK_NGX_SUCCEED(native_runtime_results[0]) && sample.reset == (frame == 0 ? 1 : 0)))
+                    && sample.reuses == (refresh ? 0u : 1u) && sample.fallbacks == 0
+                    && sample.refreshes == (condition == "cache" && refresh ? 1u : 0u),
+                "cache cost executes real SR each frame, exact NR 1/0 cadence and preserved refresh History");
+          Check(sample.completed_fence >= sample.fence && sample.completed_fence != UINT64_MAX
+                    && SUCCEEDED(sample.device_status) && model.handle != nullptr && model.via_core
+                    && !model.control_mask_bound && workset.control_mask == nullptr,
+                "cache cost completes every recording on a healthy GPU without mask bindings");
+          if (frame == cache_cost_warmup_frames - 1) {
+            stable_model = model.handle;
+            stable_workset = workset.id;
+          }
+          if (frame >= cache_cost_warmup_frames) {
+            Check(model.handle == stable_model && workset.id == stable_workset,
+                  "measured cache cost frames retain the warmed model and workset");
+          }
+        }
+      } catch (...) {
+        clear_observers();
+        const auto& sample = frames[attempted_frame];
+        cache_cost_report["failure_phase"] = "warmup_or_measurement";
+        cache_cost_report["attempted_frame"] = attempted_frame;
+        cache_cost_report["completed_frames"] = completed_frames;
+        cache_cost_report["last_attempt"] = {{"sr_calls", native_motion_sr_calls}, {"nr_results", native_runtime_results},
+            {"nr_resets", native_runtime_resets}, {"fence", sample.fence}, {"completed_fence", sample.completed_fence},
+            {"device_status", sample.device_status}};
+        throw;
+      }
+      clear_observers();
+      cache_cost_report = {{"schema", "nr-nexus-nr-edit-reuse-cost-v1"}, {"condition", condition},
+          {"evidence", "NATIVE_GPU+NATIVE_NGX"}, {"status", "measurement_completed"},
+          {"process_id", GetCurrentProcessId()}, {"host_sr_handle", reinterpret_cast<uintptr_t>(owner)},
+          {"route", "xefg-record"}, {"source_format", "RGBA16F"}, {"source_encoding", "linear BT709 scRGB; 1=80 nits"},
+          {"dimensions", {{"render", {render_width, render_height}}, {"output", {width, height}}}},
+          {"passes", 1}, {"adaptive_enabled", false}, {"control_mask_enabled", false}, {"jitter", {0, 0}},
+          {"requested_model", "B"}, {"internal_model", "unknown"}, {"present_white_nits", 200},
+          {"runtime", addon::direct_runtime_requirements.file_version}, {"nr_sha256", addon::direct_runtime_sha256},
+          {"driver_x100", addon::direct_runtime_requirements.driver_x100}, {"prefix", cost_prefix},
+          {"prefix_host_sr_evaluates", prefix_host_evaluates}, {"prefix_nr_evaluates", prefix_nr_evaluates},
+          {"prefix_edit_reuse_enabled", true}, {"prefix_force_reset", true},
+          {"warmup_frames", cache_cost_warmup_frames}, {"sample_frames", cache_cost_sample_frames},
+          {"sequence_host_sr_evaluates", total_frames}, {"sequence_nr_evaluates", condition == "baseline" ? total_frames : total_frames / 2},
+          {"measured_host_sr_evaluates", cache_cost_sample_frames},
+          {"measured_nr_evaluates", condition == "baseline" ? cache_cost_sample_frames : cache_cost_sample_frames / 2},
+          {"errors", 0}, {"timestamp_frequency_hz", queries.frequency_hz},
+          {"suppressed_log_calls", suppressed_control_mask_cost_logs},
+          {"input", {{"schedule", "single deterministic upload; static color/depth, zero motion and jitter"},
+              {"color_crc32", renodx::utils::hash::ComputeCRC32(reinterpret_cast<const uint8_t*>(color_data.data()), color_data.size() * sizeof(uint16_t))},
+              {"depth_crc32", renodx::utils::hash::ComputeCRC32(reinterpret_cast<const uint8_t*>(depth_data.data()), depth_data.size() * sizeof(float))}}},
+          {"reset_schedule", "identical Reset=1 prefix; warmup frame0 Reset=1, then host/NR refresh Reset=0"},
+          {"timing_scope", {{"sr", "real SR Evaluate only"}, {"model", "real NR Evaluate only; null on reuse"},
+              {"whole_nr_chain", "after SR timestamp resolve through production Record, original-color staging, cache/codec and final private-color writeback"},
+              {"cpu_wrapper", "SR observer plus production Record/private-color writeback recording"},
+              {"cpu_submit_complete", "test list Close/submission/Fence wait and allocator/list/tracker reset"},
+              {"source_interval", "adjacent test call entries including prior completion and test bookkeeping; no display pacing"}}},
+          {"synchronization", "one completed list submission per source frame; all GPU query reads after measurement"},
+          {"xefg_scope", "production Record only; no XeFG SDK/Service admission, generated frames or display FPS"},
+          {"visual_validation", "not performed; cost-only static input"},
+          {"frames", nlohmann::json::array()}};
+      cache_cost_report.update(runtime_identity());
+      const auto timestamp_json = [](const d3d12_test::TimestampSample& sample) {
+        return nlohmann::json{{"begin_tick", sample.begin_tick}, {"end_tick", sample.end_tick},
+            {"ticks", sample.ticks}, {"gpu_ms", sample.gpu_ms}};
+      };
+      for (uint32_t frame = 0; frame < total_frames; ++frame) {
+        const auto& sample = frames[frame];
+        const auto sr = queries.Read(frame * intervals_per_frame);
+        const auto chain = queries.Read(frame * intervals_per_frame + 2);
+        Check(sr.begin_tick < sr.end_tick && sr.end_tick <= chain.begin_tick && chain.begin_tick < chain.end_tick,
+              "cache cost SR and complete NR chain have ordered nonempty GPU intervals");
+        nlohmann::json model = nullptr;
+        if (sample.nr_calls != 0) {
+          const auto timing = queries.Read(frame * intervals_per_frame + 1);
+          Check(chain.begin_tick <= timing.begin_tick && timing.begin_tick < timing.end_tick && timing.end_tick <= chain.end_tick,
+                "cache cost actual NR Evaluate is nested in the complete NR chain");
+          model = timestamp_json(timing);
+        }
+        cache_cost_report["frames"].push_back({{"frame", frame}, {"warmup", frame < cache_cost_warmup_frames},
+            {"frame_kind", sample.reuses != 0 ? "reuse" : "refresh"},
+            {"sr", {{"calls", sample.sr_calls}, {"result", sample.sr_result}, {"gpu", timestamp_json(sr)}}},
+            {"nr", {{"calls", sample.nr_calls}, {"result", sample.nr_calls != 0 ? nlohmann::json(sample.nr_result) : nlohmann::json(nullptr)},
+                {"reset", sample.nr_calls != 0 ? nlohmann::json(sample.reset) : nlohmann::json(nullptr)}, {"gpu", model},
+                {"whole_chain_gpu", timestamp_json(chain)}, {"model", sample.model}, {"workset", sample.workset}, {"cache_bytes", sample.cache_bytes}}},
+            {"reuse", {{"refreshes", sample.refreshes}, {"reuses", sample.reuses}, {"fallbacks", sample.fallbacks}}},
+            {"source_successes", sample.source_successes},
+            {"cpu", {{"entry_ms", sample.entry_ms}, {"interval_ms", frame == 0 ? nlohmann::json(nullptr) : nlohmann::json(sample.interval_ms)},
+                {"wrapper_ms", sample.wrapper_ms}, {"record_ms", sample.record_ms}, {"sr_api_ms", sample.sr_api_ms},
+                {"nr_api_ms", sample.nr_api_ms}, {"submit_complete_ms", sample.submit_complete_ms}, {"source_complete_ms", sample.source_complete_ms}}},
+            {"fence", sample.fence}, {"completed_fence", sample.completed_fence}, {"device_status", sample.device_status}});
+      }
+      save_cache_cost_report();
     }
     if (resize_test) {
       const auto* ready_environment = std::getenv("NR_NEXUS_TEST_RESIZE_READY");
@@ -4387,6 +4620,17 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     gpu.list->CopyTextureRegion(&output_destination, 0, 0, 0, &output_source, nullptr);
     gpu.Transition(output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ComPtr<ID3D12Resource> cache_cost_validity_readback;
+    if (cache_cost && cache_cost_report.at("condition") == "cache") {
+      const auto state = addon::features.at(nr_owner).slots[0].edit_reuse;
+      Check(state != nullptr && state->reused && state->validity != nullptr,
+            "last cache cost frame owns a produced reuse validity plane");
+      const uint64_t bytes = static_cast<uint64_t>(width) * height * sizeof(uint32_t);
+      cache_cost_validity_readback = gpu.Buffer(bytes, D3D12_HEAP_TYPE_READBACK);
+      gpu.Transition(state->validity.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      gpu.list->CopyBufferRegion(cache_cost_validity_readback.Get(), 0, state->validity.Get(), 0, bytes);
+      gpu.Transition(state->validity.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
     gpu.Submit();
     uint8_t* output_mapped = nullptr;
     Check(SUCCEEDED(output_readback->Map(
@@ -4403,7 +4647,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     output_readback->Unmap(0, nullptr);
     const bool keep_raw_output = std::getenv("NR_NEXUS_TEST_KEEP_RAW") != nullptr
         && std::strcmp(std::getenv("NR_NEXUS_TEST_KEEP_RAW"), "1") == 0;
-    if (keep_raw_output && !jitter_test) {
+    if (keep_raw_output && !jitter_test && !cache_cost) {
       std::ofstream output_file("controlmask-production-output.rgba16f",
                                 std::ios::binary | std::ios::trunc);
       Check(output_file.is_open(), "production output file opens");
@@ -4411,7 +4655,53 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                         static_cast<std::streamsize>(output_bytes.size()));
       Check(output_file.good(), "production output bytes are saved");
     }
-    if (jitter_test) {
+    if (cache_cost) {
+      uint64_t nonfinite = 0;
+      float maximum_rgb = 0.f;
+      for (size_t pixel = 0; pixel < pixel_count; ++pixel) {
+        std::array<uint16_t, 4> rgba;
+        std::memcpy(rgba.data(), output_bytes.data() + pixel * sizeof(rgba), sizeof(rgba));
+        for (size_t channel = 0; channel < rgba.size(); ++channel) {
+          const float value = DirectX::PackedVector::XMConvertHalfToFloat(rgba[channel]);
+          nonfinite += !std::isfinite(value);
+          if (channel < 3) {
+            maximum_rgb = (std::max)(maximum_rgb, std::abs(value));
+          }
+        }
+      }
+      cache_cost_report["output_readback"] = {{"count", 1}, {"after_measurement", true},
+          {"bytes", output_bytes.size()}, {"raw_retained", false}, {"nonfinite_channels", nonfinite},
+          {"maximum_absolute_rgb", maximum_rgb}, {"fence", gpu.serial}, {"completed_fence", gpu.fence->GetCompletedValue()}};
+      Check(nonfinite == 0 && maximum_rgb > 0.f && gpu.fence->GetCompletedValue() >= gpu.serial
+                && gpu.fence->GetCompletedValue() != UINT64_MAX && SUCCEEDED(gpu.device->GetDeviceRemovedReason()),
+            "post-measurement cache cost output is finite, nonzero and GPU-completed");
+      cache_cost_report["validity_readback"] = nullptr;
+      if (cache_cost_validity_readback != nullptr) {
+        const D3D12_RANGE range{0, static_cast<SIZE_T>(pixel_count * sizeof(uint32_t))};
+        uint32_t* mapped = nullptr;
+        Check(SUCCEEDED(cache_cost_validity_readback->Map(0, &range, reinterpret_cast<void**>(&mapped))),
+              "final cost reuse validity readback map");
+        uint64_t invalid = 0, valid = 0, other = 0;
+        for (size_t pixel = 0; pixel < pixel_count; ++pixel) {
+          if (mapped[pixel] == 0) {
+            ++invalid;
+          } else if (mapped[pixel] == 1) {
+            ++valid;
+          } else {
+            ++other;
+          }
+        }
+        const D3D12_RANGE no_writes{0, 0};
+        cache_cost_validity_readback->Unmap(0, &no_writes);
+        cache_cost_report["validity_readback"] = {{"count", 1}, {"after_measurement", true}, {"raw_retained", false},
+            {"frame", cache_cost_warmup_frames + cache_cost_sample_frames - 1},
+            {"zero_pixels", invalid}, {"one_pixels", valid}, {"other_pixels", other}};
+        Check(other == 0 && valid > 0, "final cost reuse has valid cached pixels and only 0/1 validity values");
+      }
+      std::cout << "PASS NR edit reuse cost condition=" << cache_cost_report.at("condition").get<std::string>()
+                << " warmup=" << cache_cost_warmup_frames << " samples=" << cache_cost_sample_frames
+                << " size=" << width << 'x' << height << " real_SR=per_frame route=xefg-record; XeFG SDK/Service=not_run\n";
+    } else if (jitter_test) {
       std::cout << "PASS SR jitter calibration samples=9 real_sr_evaluates=9 nr_evaluates=0 size="
                 << width << 'x' << height << " raw=jitter-calibration; raster sign pending CPU analysis\n";
     } else {
@@ -4477,6 +4767,19 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         file << jitter_report.dump(2) << '\n';
         file.close();
         Check(!file.fail(), "jitter calibration completed teardown evidence saved");
+      } else if (cache_cost) {
+        Check(addon::retired_nr_features.empty() && addon::retired_final_resources.empty(),
+              "cache cost teardown drains completed model and workset retirement");
+        cache_cost_report["teardown"] = {{"sr_continues_without_nr", true}, {"sr_release", true}, {"sdk_shutdown", true},
+            {"identity_bridge_installed", false}, {"retirement_drained", true},
+            {"disabled_host_sr_evaluates", native_motion_sr_calls}, {"fence", gpu.serial},
+            {"completed_fence", gpu.fence->GetCompletedValue()}, {"device_status", gpu.device->GetDeviceRemovedReason()}};
+        cache_cost_report["total_host_sr_evaluates"] = prefix_host_evaluates + cache_cost_warmup_frames
+            + cache_cost_sample_frames + native_motion_sr_calls;
+        cache_cost_report["total_nr_evaluates"] = prefix_nr_evaluates
+            + cache_cost_report.at("sequence_nr_evaluates").get<uint32_t>();
+        cache_cost_report["status"] = "passed";
+        save_cache_cost_report();
       } else if (sequence_test) {
         history_report["teardown"] = {{"sr_continues_without_nr", true}, {"sr_release", true},
             {"sdk_shutdown", true}, {"identity_bridge_installed", false},
@@ -4528,7 +4831,12 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     }
     return 0;
   } catch (const std::exception& error) {
+    save_cache_cost_failure(error.what());
     std::cerr << "FAIL ControlMask production NATIVE_NGX: " << error.what() << '\n';
+    return 1;
+  } catch (...) {
+    save_cache_cost_failure("non-standard exception");
+    std::cerr << "FAIL ControlMask production NATIVE_NGX: non-standard exception\n";
     return 1;
   }
 }

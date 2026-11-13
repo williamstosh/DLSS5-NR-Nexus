@@ -355,6 +355,33 @@ MV flags/scale 已按 Service 后的 NGX 契约提供。两条件使用独立 Fe
 `cache-lighting-preview.png` 是每帧250ms的慢速 APNG，仅用于定位变化，不模拟游戏播放节奏。
 校准分析器的合成回归入口为 `test_sr_jitter_analysis.py`。
 
+### 隔帧编辑复用原生成本
+
+`nr-edit-reuse-cost` 固定真实 SR 输入 2560×1440、输出 3840×2160、RGBA16F scRGB、
+单 Pass／请求 B、零 jitter／运动，并关闭自适应分辨率、ControlMask 和时域 Look。
+它复用生产 `fg_service::Record` 的原色暂存、缓存／模型、codec 及私有颜色写回；
+不调用 XeFG SDK、Service 准入或插帧。该入口固定路线与格式，不读取其他缓存实验的路线／场景选项。
+
+~~~powershell
+pwsh -File tools/run-tests.ps1 -Suite fg-native -NativeCase nr-edit-reuse-cost `
+    -NativeNgxProjectIdPath $projectIdPath -NativeNgxSdkLibraryDirectory $sdkLibraryDirectory `
+    -NativeNgxRuntimePath $runtimePath -NativeNgxSrRuntimePath $srRuntimePath `
+    -UiPreview None -OutputDirectory tmp/offline/nr-cache-cost
+~~~
+
+统一入口分别启动独立进程／Feature 的 `baseline`、`cache` 条件，无需 Python 图像分析器。
+两组先使用缓存开启、逐帧 Reset 的相同创建前缀，再各执行 32 帧暖机及 128 帧计量。
+SR 每帧真实执行；基线 NR 每帧执行，缓存组按刷新／复用交替执行 1／0 次 NR，
+暖机首帧 Reset=1，后续刷新 Reset=0。计量期间抑制逐帧日志，不读取图像或 GPU query；
+全部完成后才读取已写入的计时槽，复用帧的模型时间为 null。
+
+`cost-baseline/nr-edit-reuse-cost.json` 与 `cost-cache/nr-edit-reuse-cost.json` 保留实际 GPU ticks／频率、
+SR／模型／完整 NR 链 GPU 时间、CPU 录制／提交完成／相邻调用间隔、真实调用与复用计数、
+Reset、Fence、稳定模型／工作集身份及完整收尾。测量结束只读回一次最终输出，检查有限且非零；
+缓存组再读取末帧 Validity，记录 0／1 像素数并要求存在有效复用像素，均不保存全图。
+失败保留状态及错误 JSON。相邻调用间隔包含夹具等待与管理开销，结果用于静态成本比较，
+不作为游戏／显示 FPS、动态画质或真实 XeFG 帧节奏验收。
+
 ## ControlMask 原生成本
 
 `fg-native` 的 `control-mask-native-ngx-cost` 用例在固定 4K 合成输入上计量
