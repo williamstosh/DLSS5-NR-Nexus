@@ -72,7 +72,6 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     const float3 edit = log2(max(neural, kEditFloor)) - log2(max(reference, kEditFloor));
     Anchor.Store4(index * 32u, asuint(float4(edit, guide_valid ? 1.0 : 0.0)));
     Anchor.Store4(index * 32u + 16u, asuint(float4(reference, depth)));
-    Validity.Store(index * 4u, 1u);
     return;
   }
   const float2 d = Motion.Load(int3(guide, 0)) * MotionScale * float2(Size) / float2(MotionSize);

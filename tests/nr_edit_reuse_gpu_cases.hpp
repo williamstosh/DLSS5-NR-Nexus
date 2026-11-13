@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -103,6 +104,20 @@ int Run() {
       readback->Unmap(0, &no_writes);
       return result;
     };
+    const auto fill_validity = [&](reuse::State* state) {
+      const auto bytes = static_cast<size_t>(state->validity->GetDesc().Width);
+      auto transfer = gpu.Buffer(bytes, D3D12_HEAP_TYPE_UPLOAD);
+      void* mapped = nullptr;
+      const D3D12_RANGE no_reads{0, 0};
+      Check(SUCCEEDED(transfer->Map(0, &no_reads, &mapped)), "validity sentinel upload map");
+      std::memset(mapped, 0xA5, bytes);
+      const D3D12_RANGE written{0, bytes};
+      transfer->Unmap(0, &written);
+      gpu.Transition(state->validity.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+      gpu.list->CopyBufferRegion(state->validity.Get(), 0, transfer.Get(), 0, bytes);
+      gpu.Transition(state->validity.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      gpu.uploads.push_back(transfer);
+    };
     const auto encode = [](float linear) {
       return (linear <= 0.0031308f ? linear * 12.92f : 1.055f * std::pow(linear, 1.f / 2.4f) - 0.055f);
     };
@@ -140,9 +155,14 @@ int Run() {
     const reuse::Inputs inputs{.width = width, .height = height, .motion_width = guide_width, .motion_height = guide_height,
         .proxy = proxy.Get(), .neural = neural.Get(), .motion = motion.Get(), .depth = depth.Get(),
         .original = original.Get(), .decoded = decoded.Get()};
+    Check(reuse::Record(gpu.device.Get(), gpu.list.Get(), &state, inputs, reuse::Phase::PREPARE), "prepare sentinel cache");
+    fill_validity(&state);
     Check(reuse::Record(gpu.device.Get(), gpu.list.Get(), &state, inputs, reuse::Phase::CAPTURE), "capture known spatial edit");
     submit_commands("initial anchor capture");
     const auto anchor_before = read_buffer(state.anchor.Get());
+    const auto validity_before = read_buffer(state.validity.Get());
+    Check(std::all_of(validity_before.begin(), validity_before.end(), [](uint8_t value) { return value == 0xA5; }),
+          "refresh leaves validity untouched until APPLY overwrites every pixel");
     for (size_t pixel = 0; pixel < motion_values.size() / 2; ++pixel) motion_values[pixel * 2] = -.5f;
     const auto apply = [&] {
       gpu.Transition(neural.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -213,7 +233,7 @@ int Run() {
     std::memcpy(&composed_x, composed_bytes.data() + 2 * sizeof(float) * 2, sizeof(float));
     Check(std::isfinite(composed_x) && std::fabs(composed_x - 80000.f) < .1f,
           "RG32 composed motion retains finite 80000 raw units for an in-bounds 0.8-pixel displacement");
-    std::cout << "PASS edit reuse WARP shader: known edit, scaled reprojection, edge/depth/color rejection, neutral exact RGBA\n";
+    std::cout << "PASS edit reuse WARP shader: untouched refresh validity, full sentinel overwrite, known edit, scaled reprojection, edge/depth/color rejection, neutral exact RGBA\n";
 
     {
       constexpr uint32_t code_width = 1024, alpha_count = 4;
@@ -242,6 +262,9 @@ int Run() {
       const reuse::Inputs code_inputs{.width = code_width, .height = alpha_count, .motion_width = 1, .motion_height = 1,
           .proxy = code_proxy.Get(), .neural = code_neural.Get(), .motion = code_motion.Get(), .depth = code_depth.Get(),
           .original = code_original.Get(), .decoded = code_decoded.Get()};
+      Check(reuse::Record(gpu.device.Get(), gpu.list.Get(), &code_state, code_inputs, reuse::Phase::PREPARE),
+            "prepare packed HDR10 sentinel cache");
+      fill_validity(&code_state);
       Check(reuse::Record(gpu.device.Get(), gpu.list.Get(), &code_state, code_inputs, reuse::Phase::CAPTURE),
             "capture neutral anchor for packed HDR10 selection");
       gpu.Transition(code_neural.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -256,6 +279,9 @@ int Run() {
       Check(selected_bytes.size() == codes.size() * sizeof(uint32_t)
                 && std::memcmp(selected_bytes.data(), codes.data(), selected_bytes.size()) == 0,
             "SELECT_ORIGINAL preserves all 1024 codes of each RGB channel and all four alpha codes bit exactly");
+      const auto code_validity = read_buffer(code_state.validity.Get());
+      Check(std::all_of(code_validity.begin(), code_validity.end(), [](uint8_t value) { return value == 0; }),
+            "neutral HDR10 APPLY overwrites every nonzero validity sentinel with invalid");
     }
 
     {
