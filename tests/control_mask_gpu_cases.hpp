@@ -2393,12 +2393,16 @@ inline double native_resize_evaluate_ms = 0;
 inline uint32_t native_resize_creates = 0;
 inline uint32_t native_resize_releases = 0;
 inline bool native_resize_ready = false;
+inline bool native_resize_create_runtime_locked = false;
+inline bool native_resize_create_ngx_call = false;
 inline std::vector<uintptr_t> native_resize_models;
 inline std::vector<bool> native_resize_preparing;
 
 NVSDK_NGX_Result NVSDK_CONV ObserveNativeResizeCreate(
     ID3D12GraphicsCommandList* list, NVSDK_NGX_Feature feature,
     const NVSDK_NGX_Parameter* parameters, NVSDK_NGX_Handle** handle) {
+  native_resize_create_runtime_locked = renodx::addons::dlss5::runtime_lock::State::HeldByThisThread();
+  native_resize_create_ngx_call = renodx::addons::dlss5::ngx_serial::depth != 0;
   const auto start = std::chrono::steady_clock::now();
   const auto result = native_resize_create(list, feature, parameters, handle);
   native_resize_create_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
@@ -2843,8 +2847,15 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     if (resize_test) {
       const auto* ready_environment = std::getenv("NR_NEXUS_TEST_RESIZE_READY");
       native_resize_ready = ready_environment == nullptr || std::strcmp(ready_environment, "0") != 0;
+      const auto* settings_environment = std::getenv("NR_NEXUS_TEST_RESIZE_SETTINGS");
+      const bool settings_reuse = native_resize_ready && settings_environment != nullptr
+          && std::strcmp(settings_environment, "1") == 0;
+      const auto* expect_reuse_environment = std::getenv("NR_NEXUS_TEST_RESIZE_EXPECT_REUSE");
+      const bool expect_reuse = settings_reuse && expect_reuse_environment != nullptr
+          && std::strcmp(expect_reuse_environment, "1") == 0;
+      const uint32_t frame_count = (settings_reuse ? 360u : 180u);
       const UINT intervals_per_frame = (native_resize_ready ? 3u : 2u);
-      auto queries = d3d12_test::CreateTimestampQueries(gpu, 180 * intervals_per_frame);
+      auto queries = d3d12_test::CreateTimestampQueries(gpu, frame_count * intervals_per_frame);
       ComPtr<IDXGIAdapter3> adapter;
       Check(SUCCEEDED(gpu.factory->EnumAdapterByLuid(gpu.device->GetAdapterLuid(), IID_PPV_ARGS(&adapter))),
             "resize memory adapter");
@@ -2872,6 +2883,8 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           {"input_depth_crc32", renodx::utils::hash::ComputeCRC32(reinterpret_cast<const uint8_t*>(depth_data.data()), depth_data.size() * sizeof(float))},
           {"input_motion_crc32", renodx::utils::hash::ComputeCRC32(reinterpret_cast<const uint8_t*>(motion_data.data()), motion_data.size() * sizeof(uint16_t))},
           {"mode", (native_resize_ready ? "ready-cache" : "cold")},
+          {"settings_reuse_sequence", settings_reuse},
+          {"expect_settings_reuse", expect_reuse},
           {"selection", "MOCK direct Session::Request; output FPS source unavailable, no FPS accuracy claim"},
           {"timing_scope", "CPU resource/wrapper residual includes resource preparation, binding, dispatch recording, logging and retirement outside SDK calls; GPU wrapper includes real SR and NR"},
           {"synchronization", "one submitted list, fence completed before reuse; 60Hz paced starts; raw actual start intervals"},
@@ -2902,9 +2915,45 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         addon::adaptive_configuration_settings = addon::comparison_ui::CaptureAdaptiveSettings;
         addon::kSetAdaptiveEnabled.Store(1.f);
       }
-      for (uint32_t frame = 0; frame < 180; ++frame) {
+      for (uint32_t frame = 0; frame < frame_count; ++frame) {
         const uint32_t phase = frame / 60;
         const bool changed = frame == 60 || frame == 120;
+        const char* setting_event = "none";
+        if (settings_reuse) {
+          switch (frame) {
+            case 180:
+              addon::kSetStyle.Store(1.f);
+              addon::ApplySettingEffect(addon::kSetStyle.effect);
+              setting_event = "style";
+              break;
+            case 210:
+              addon::kSetTransferStrength.Store(0.5f);
+              setting_event = "transfer-strength";
+              break;
+            case 240:
+              addon::kSetAdaptiveMinScale.Store(0.80f);
+              setting_event = "minimum-80";
+              break;
+            case 270:
+              addon::kSetAdaptiveMinScale.Store(0.50f);
+              setting_event = "minimum-50";
+              break;
+            case 285:
+              if (expect_reuse) {
+                Check(addon::features.at(owner).adaptive_session->RequestMinimum(addon::SteadyNowNs()),
+                      "native minimum request has an idle non-active slot");
+                setting_event = "request-minimum-50";
+              }
+              break;
+            case 300:
+              addon::kSetAdaptiveMinScale.Store(0.67f);
+              setting_event = "minimum-67";
+              break;
+            default:
+              break;
+          }
+          if (std::strcmp(setting_event, "none") != 0) recorded_ready = false;
+        }
         if (native_resize_ready && frame == 150) addon::kSetAdaptiveTargetFps.Store(120.f);
         if (changed) {
           if (native_resize_ready) {
@@ -2924,6 +2973,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         native_resize_preparing.clear();
         native_resize_create_ms = native_resize_release_ms = native_resize_host_ms = native_resize_evaluate_ms = 0;
         native_resize_creates = native_resize_releases = 0;
+        native_resize_create_runtime_locked = native_resize_create_ngx_call = false;
         gpu.list->ClearState(nullptr);
         parameters.Set(NVSDK_NGX_Parameter_Reset, 0);
         native_cost_interval = frame * intervals_per_frame;
@@ -2931,6 +2981,8 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         native_cost_queries = &queries;
         queries.Begin(gpu.list.Get(), native_cost_interval);
         const auto start = std::chrono::steady_clock::now();
+        const auto runtime_contentions_before = renodx::addons::dlss5::runtime_lock_contended.load();
+        const auto submit_contentions_before = renodx::addons::dlss5::submit_lock_blocked.load();
         addon::ngx_slot_real[0].evaluate = reinterpret_cast<void*>(ObserveNativeHostEvaluate);
         const auto source_successes_before = addon::SourceSuccessfulEvaluations();
         const auto result = addon::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), owner, &parameters, nullptr);
@@ -2955,8 +3007,9 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                 "every real resize Evaluate records its model and preparation context");
           const auto preparation_count = static_cast<size_t>(std::count(native_resize_preparing.begin(), native_resize_preparing.end(), true));
           const auto active_count = native_resize_preparing.size() - preparation_count;
-          Check(active_count == 1 && source_successes_after == source_successes_before + active_count,
-                "one real active NR output increments source successes once; preparation Evaluate adds none");
+          Check((active_count == 1 || (settings_reuse && frame >= 180 && active_count == 0 && native_resize_creates != 0))
+                    && source_successes_after == source_successes_before + active_count,
+                "real active outputs count once; setting cold-create and preparation-only frames add no source success");
           preparing_evaluates += preparation_count;
           const auto cache = addon::features.at(owner).adaptive_cache;
           Check(cache != nullptr && !cache->failed && !cache->budget_blocked, "real NR preparation cache remains healthy");
@@ -3026,8 +3079,28 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                 {"receipt_completed_healthy", tier.completion != nullptr && tier.completion->completed_healthy}});
           }
           if (all_ready) {
-            if (!recorded_ready) report["all_ready_frame"] = frame;
+            if (!recorded_ready) {
+              if (!report.contains("all_ready_frame")) report["all_ready_frame"] = frame;
+              report["ready_frames"].push_back(frame);
+            }
             recorded_ready = true;
+          }
+          if (expect_reuse && frame >= 180) {
+            Check(addon::features.at(owner).adaptive_session->IsLegal(
+                      addon::features.at(owner).adaptive_session->status.applied),
+                  "settings changes keep the actually applied dimensions within the current minimum");
+            if (frame < 285 || frame >= 300) {
+              Check(native_resize_creates == 0 && native_resize_releases == 0,
+                    "compatible settings and minimum edits preserve prepared allocations");
+            }
+            if (frame == 180) {
+              Check(!native_runtime_resets.empty() && native_runtime_resets[0] == 1,
+                    "compatible style edit resets real NR history while retaining the Feature");
+            }
+            if (frame == 299) {
+              Check(workset.input_width == width / 2 && workset.input_height == height / 2,
+                    "requested new minimum reaches a completed real 50 percent NR tier");
+            }
           }
           if (changed) {
             Check(cache->active == (phase == 1 ? cache->count - 1 : 0) && native_resize_creates == 0
@@ -3051,11 +3124,14 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         Check(gpu.fence->GetCompletedValue() >= gpu.serial && gpu.fence->GetCompletedValue() != UINT64_MAX
                   && SUCCEEDED(gpu.device->GetDeviceRemovedReason()), "resize GPU fence completes on healthy device");
         report["frames"].push_back({{"frame", frame}, {"phase", phase}, {"switch_id", (changed ? phase : 0)},
+            {"setting_event", setting_event},
             {"request_scale", (native_resize_ready
                 ? addon::features.at(owner).adaptive_session->ladder.coefficients[active] : (phase == 1 ? 2.f / 3.f : 1.f))},
             {"nr_width", workset.input_width}, {"nr_height", workset.input_height}, {"workset_id", workset.id},
             {"workset_bytes", workset.allocated_bytes}, {"cpu_create_count", native_resize_creates},
             {"cpu_create_ms", native_resize_create_ms}, {"cpu_release_count", native_resize_releases},
+            {"create_runtime_lock_held", native_resize_create_runtime_locked},
+            {"create_ngx_call_active", native_resize_create_ngx_call},
             {"cpu_release_ms", native_resize_release_ms}, {"cpu_host_sr_ms", native_resize_host_ms},
             {"cpu_nr_evaluate_ms", native_resize_evaluate_ms}, {"cpu_wrapper_ms", wrapper_ms},
             {"cpu_resource_wrapper_residual_ms", wrapper_ms - native_resize_create_ms - native_resize_host_ms - native_resize_evaluate_ms},
@@ -3066,6 +3142,10 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
             {"gpu_wrapper_begin_tick", wrapper_gpu.begin_tick}, {"gpu_wrapper_end_tick", wrapper_gpu.end_tick},
             {"gpu_nr_begin_tick", nr_gpu.begin_tick}, {"gpu_nr_end_tick", nr_gpu.end_tick},
             {"cpu_submit_wait_ms", std::chrono::duration<double, std::milli>(completed - submitted).count()},
+            {"runtime_lock_contentions", renodx::addons::dlss5::runtime_lock_contended.load() - runtime_contentions_before},
+            {"runtime_lock_wait_max_ns_cumulative", renodx::addons::dlss5::runtime_lock_wait_max_ns.load()},
+            {"submit_lock_contentions", renodx::addons::dlss5::submit_lock_blocked.load() - submit_contentions_before},
+            {"submit_lock_wait_max_ns_cumulative", renodx::addons::dlss5::submit_lock_wait_max_ns.load()},
             {"cpu_retirement_ms", std::chrono::duration<double, std::milli>(retired - completed).count()},
             {"completion_from_start_ms", std::chrono::duration<double, std::milli>(completed - start).count()},
             {"retired_nr_before_submit", retired_nr_before}, {"retired_worksets_before_submit", retired_worksets_before},
@@ -3087,6 +3167,10 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           report["frames"].back()["cache_layout_identity"] = cache->identity;
           report["frames"].back()["session_identity"] = addon::features.at(owner).adaptive_session->identity;
           report["frames"].back()["target_fps_setting"] = addon::nr_adaptive_target_fps.load();
+          report["frames"].back()["minimum_scale_setting"] = addon::nr_adaptive_min_scale.load();
+          report["frames"].back()["style_setting"] = addon::style.load();
+          report["frames"].back()["transfer_strength_setting"] = addon::transfer_strength.load();
+          report["frames"].back()["requested_slot"] = addon::features.at(owner).adaptive_session->level;
         }
         if (changed || native_resize_creates != 0) {
           std::cout << "RESIZE switch=" << phase << " create_ms=" << native_resize_create_ms
@@ -3103,7 +3187,17 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         Check(recorded_ready && addon::nr_resolution_scale.load() == 1.f,
               "real ready-cache roundtrip preserves the manual upper resolution");
         auto& before_off = addon::features.at(owner);
-        before_off.adaptive_session->Request(before_off.adaptive_cache->count - 1, addon::SteadyNowNs());
+        size_t low_slot = 0;
+        for (size_t slot = 1; slot < before_off.adaptive_cache->count; ++slot) {
+          const auto& cache = *before_off.adaptive_cache;
+          if (cache.tiers[slot].ready && before_off.adaptive_session->IsLegal(cache.ladder.sizes[slot])
+              && cache.ladder.sizes[slot] == before_off.adaptive_session->ladder.sizes[slot]
+              && cache.ladder.coefficients[slot] < cache.ladder.coefficients[low_slot]) {
+            low_slot = slot;
+          }
+        }
+        Check(low_slot != 0, "native Off test starts from a legal completed low tier");
+        before_off.adaptive_session->Request(low_slot, addon::SteadyNowNs());
         report["setting_transactions"] = nlohmann::json::array();
         const auto evaluate_transaction = [&](const char* name, bool disabled) {
           if (disabled) addon::kSetAdaptiveEnabled.Store(0.f);
@@ -3146,7 +3240,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                       && addon::retired_final_resources.empty(),
                   "turning adaptive Off restores the prepared manual upper tier and retires all standby tiers");
           } else {
-            Check(feature.adaptive_cache != nullptr && slot == feature.adaptive_cache->count - 1,
+            Check(feature.adaptive_cache != nullptr && slot == low_slot,
                   "Off restoration starts from a real ready low tier");
           }
           report["setting_transactions"].push_back({{"name", name}, {"disabled", disabled},
@@ -3707,8 +3801,10 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     }
     std::cout << "PASS ControlMask production chain stages=" << (single_stage ? "Upscaled" : "Render+Upscaled")
               << " evidence=NATIVE_GPU+NATIVE_NGX host_sr=" << (motion_test ? "NATIVE_NGX" : "MOCK") << " frames="
-              << (resize_test ? 180 : (cost ? 80 : (motion_test ? 16 : (hot_toggle ? 52 : 1))))
-              << (resize_test ? " frame_scope=high-low-high" : (motion_test ? " frame_scope=paired_only" : ""))
+              << (resize_test ? resize_report["frames"].size() : (cost ? 80 : (motion_test ? 16 : (hot_toggle ? 52 : 1))))
+              << (resize_test ? (resize_report.value("settings_reuse_sequence", false)
+                      ? " frame_scope=high-low-high-and-settings" : " frame_scope=high-low-high")
+                  : (motion_test ? " frame_scope=paired_only" : ""))
               << " size=" << width << 'x' << height << " mask="
               << (mask_enabled ? mask_mode_name : "off")
               << " output_readback=rgba16f raw="

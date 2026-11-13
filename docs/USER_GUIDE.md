@@ -307,7 +307,9 @@ Present 显示以下选项。兼容的 Pre-FG 先增强游戏帧再交给 FG；�
 
 自适应分辨率面向原生 DX12 的单个处理阶段，包括兼容的 XeFG／原生 FG 同尺寸链。跨阶段链、FG 异尺寸、DX11 Bridge 和 Vulkan 继续使用手动分辨率；缺少可靠帧率来源时暂停自动并保留合法尺寸。动态 FG 还需匹配的游戏帧计数；信息不足时暂停试探并等待采样，估算输出帧率仍可显示。更改设置或 GPU A/B 对比期间暂停自动。建议在游戏中比较转动视角时的细节和切档观感；使用限帧时，也可核对显示的帧率。
 
-自动调节在现有缓存预算内准备档位；默认单颜色、单输出最多 4 档，双颜色通常 2 档，轮换输出会占用相应容量。增加档位会增加首次准备及显存开销；首次开启或模型、游戏尺寸变化后需要重新准备，期间可能短暂停顿。临时容量占用解除后继续准备，显存不足时暂停自动；完成准备后再切入就绪档位。提高最低比例可缩小档位间的外观差异；比较流畅度时，将首次准备与后续切换分开观察。
+自动调节在现有缓存预算内准备档位；默认单颜色、单输出最多 4 档，双颜色通常 2 档，轮换输出会占用相应容量。首次开启或模型、游戏尺寸变化后需要准备，期间可能短暂停顿并增加显存使用。临时容量占用解除后继续准备，显存不足时暂停自动；完成准备后再切入就绪档位。
+
+**开发版的准备复用**：调整目标 FPS、风格或混合强度时保留兼容的预备档位。提高最低比例后，当前尺寸若已低于下限，会回到合法的就绪档；降低下限先保留已有档位，需要更低尺寸时才准备新的低档。新的尺寸仍可能产生准备停顿；比较流畅度时，将首次准备、新尺寸准备和就绪档切换分开观察。
 
 | 上采样选项 | NR 低于输出尺寸时的行为 |
 | --- | --- |
@@ -850,7 +852,9 @@ Automatic sizing keeps a lower level when reducing NR resolution helps approach 
 
 Adaptive sizing supports one processing stage on native DX12, including compatible same-size XeFG / native FG chains. Cross-stage chains, FG chains with different sizes, DX11 Bridge and Vulkan retain manual resolution. Automatic sizing pauses without a reliable output-rate source and keeps a legal size. Dynamic FG also needs matching game-frame counts; while those are unavailable, it pauses quality trials and collects samples, and estimated output FPS can still be shown. Editing settings and GPU A/B comparisons pause it. Compare detail and transitions while moving the camera, and check the displayed FPS when using frame caps.
 
-Automatic sizing prepares levels within the existing cache budget. The default allows up to four levels for one color and one output, usually two for two colors; rotating outputs consume corresponding capacity. More levels increase initial preparation and video-memory use. Initial activation and model or game-size changes require preparation, which can cause a brief pause. Preparation resumes after temporary capacity use clears; insufficient video memory pauses automatic sizing. Only ready levels are selected after preparation. Raising the minimum scale reduces appearance differences between levels; compare initial preparation and subsequent switches separately.
+Automatic sizing prepares levels within the existing cache budget. The default allows up to four levels for one color and one output, usually two for two colors; rotating outputs consume corresponding capacity. Initial activation and model or game-size changes require preparation, which can cause a brief pause and increase video-memory use. Preparation resumes after temporary capacity use clears; insufficient video memory pauses automatic sizing. Only ready levels are selected after preparation.
+
+**Preparation reuse in development builds**: Adjusting target FPS, style or blend strength keeps compatible prepared levels. Raising the minimum returns to a legal ready level if the current size is below the new limit. Lowering the minimum keeps existing levels and prepares a new lower size only when needed. Preparing a new size can still pause rendering; compare initial preparation, new-size preparation and ready-level switches separately.
 
 | Upsampling choice | Behaviour below output size |
 | --- | --- |

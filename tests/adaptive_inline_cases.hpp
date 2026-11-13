@@ -247,6 +247,123 @@ int Run() {
           "standby Evaluate calls execute and retain their preparation cost separately from source successes");
       Check(!parked_recording->closed.load() && !addon::submission::ResourceReleasable(parked_model),
           "standby preparation preserves the active tier's replayable recording protection");
+      {
+        const auto set = [](const native::Setting& setting, float value) {
+          setting.Store(value);
+          native::ApplySettingEffect(setting.effect);
+        };
+        const auto saved_style = native::kSetStyle.Get();
+        const auto upper_model = feature.slots[0].handle;
+        const auto lower_model = cache->tiers[1].state.slots[0].handle;
+        const auto allocations = native::worksets_created;
+        const auto models = native::nr_features_created;
+        addon::gpu_comparison::Identity before, resources_before, after, resources_after;
+        native::comparison_ui::CaptureSettings(&before);
+        native::comparison_ui::CaptureAdaptiveSettings(&resources_before);
+        set(native::kSetStyle, saved_style == 0.f ? 1.f : 0.f);
+        Check(record() && record(), "Evaluate-only steering keeps both active outputs running");
+        native::comparison_ui::CaptureSettings(&after);
+        native::comparison_ui::CaptureAdaptiveSettings(&resources_after);
+        const auto reset_epoch = native::history_reset_epoch.load();
+        Check(feature.adaptive_cache == cache && feature.slots[0].handle == upper_model
+            && cache->tiers[1].state.slots[0].handle == lower_model
+            && native::nr_features_created == models && native::worksets_created == allocations
+            && before.settings_hash != after.settings_hash && resources_before.settings_hash == resources_after.settings_hash
+            && feature.slots[0].acknowledged_reset_epoch == reset_epoch
+            && cache->tiers[1].state.slots[0].acknowledged_reset_epoch != reset_epoch,
+            "steering retains compatible allocations and measurement identity while each tier consumes its own History reset");
+        feature.adaptive_session->Request(1, native::SteadyNowNs());
+        Check(record() && record() && cache->active == 1 && feature.slots[0].handle == lower_model
+            && feature.slots[0].acknowledged_reset_epoch == reset_epoch && native::nr_features_created == models,
+            "the retained lower model applies the pending steering reset when it is activated");
+        feature.adaptive_session->Request(0, native::SteadyNowNs());
+        Check(record() && record(), "steering reuse returns to its original upper model");
+        set(native::kSetTransferStrength, .5f);
+        Check(record() && record() && feature.adaptive_cache == cache && feature.slots[0].handle == upper_model
+            && native::history_reset_epoch.load() == reset_epoch && native::nr_features_created == models
+            && native::worksets_created == allocations,
+            "resolve-only strength changes keep all allocations and do not request a model History reset");
+
+        auto running_list = gpu.list;
+        auto running_allocator = gpu.allocator;
+        ComPtr<ID3D12CommandAllocator> pending_allocator;
+        ComPtr<ID3D12GraphicsCommandList> pending_list;
+        Check(SUCCEEDED(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(&pending_allocator))), "minimum-change pending allocator");
+        Check(SUCCEEDED(gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            pending_allocator.Get(), nullptr, IID_PPV_ARGS(&pending_list))), "minimum-change pending list");
+        gpu.allocator = pending_allocator;
+        gpu.list = pending_list;
+        Check(native::InstallCommandListStateHooks(gpu.list.Get()), "minimum-change pending-list hooks");
+        feature.adaptive_session->Request(1, native::SteadyNowNs());
+        Check(evaluate(), "the old lower tier records on a deliberately unsubmitted list");
+        const auto pending = addon::submission::ObserveRecording(gpu.list.Get());
+        gpu.allocator = running_allocator;
+        gpu.list = running_list;
+        feature.adaptive_session->Request(0, native::SteadyNowNs());
+        Check(record() && record(), "the upper model continues while the lower recording is pending");
+        set(native::kSetAdaptiveMinScale, .8f);
+        Check(record() && record() && feature.adaptive_cache == cache && cache->active == 0
+            && feature.adaptive_session->status.ready_levels == 1
+            && feature.adaptive_session->status.prepared_levels == 1 && native::nr_features_created == models,
+            "raising the minimum retains the old allocation but counts only the legal ready upper tier");
+        set(native::kSetAdaptiveMinScale, .5f);
+        Check(record() && record() && native::nr_features_created == models,
+            "lowering the minimum does not eagerly create new coarse tiers");
+        Check(feature.adaptive_session->RequestMinimum(native::SteadyNowNs()), "the new 50-percent endpoint is requested");
+        const auto endpoint = feature.adaptive_session->level;
+        Check(!native::AdaptiveTierUsable(*cache, *feature.adaptive_session, endpoint)
+            && cache->tiers[endpoint].ready, "old GPU-ready evidence cannot qualify the replacement size");
+        Check(record() && record() && cache->active == 0 && native::nr_features_created == models
+            && !pending->closed.load() && !pending->submitted.load()
+            && !addon::submission::ResourceReleasable(lower_model) && !feature.adaptive_session->failed,
+            "an unsubmitted old lower recording prevents slot reuse without blocking the legal active output");
+        const auto cancelled_generation = feature.adaptive_session->status.generation;
+        set(native::kSetAdaptiveMinScale, .8f);
+        Check(record() && record() && cache->active == 0
+            && feature.adaptive_session->status.generation != cancelled_generation
+            && native::nr_features_created == models && !feature.adaptive_session->failed,
+            "a new minimum cancels the pending endpoint without accepting old completion or failing the source");
+        Check(SUCCEEDED(pending_list->Close()) && SUCCEEDED(pending_allocator->Reset())
+            && SUCCEEDED(pending_list->Reset(pending_allocator.Get(), nullptr)),
+            "the fixture explicitly discards its unsubmitted old lower recording");
+        set(native::kSetAdaptiveMinScale, .5f);
+        record();
+        Check(feature.adaptive_session->RequestMinimum(native::SteadyNowNs()), "the cancelled endpoint can be requested again");
+        for (uint32_t warmup = 0; warmup < 24; ++warmup) record();
+        native::PollAdaptiveCache(cache.get());
+        Check(feature.adaptive_cache == cache && cache->active == endpoint && feature.input_width == 8
+            && cache->ladder.sizes[endpoint] == feature.adaptive_session->minimum && cache->tiers[endpoint].ready
+            && native::nr_features_created == models + 1 && native::worksets_created == allocations + 2
+            && !feature.adaptive_session->failed && addon::submission::ResourceReleasable(lower_model),
+            "only the requested endpoint is rebuilt after exact retirement and completes both rotating outputs");
+        set(native::kSetAdaptiveMinScale, .8f);
+        Check(record() && record() && cache->active == 0 && feature.input_width == 16
+            && native::nr_features_created == models + 1,
+            "an active out-of-range endpoint immediately returns to the retained legal upper model");
+        set(native::kSetAdaptiveMinScale, .33f);
+        record();
+        Check(feature.adaptive_session->RequestMinimum(native::SteadyNowNs()), "the original exact lower endpoint is requested again");
+        for (uint32_t warmup = 0; warmup < 24; ++warmup) record();
+        feature.adaptive_session->Request(0, native::SteadyNowNs());
+        Check(record() && record() && cache->active == 0 && cache->ladder.sizes[1][0].width == 5,
+            "the fixed physical lower slot returns to its original coarse size without replacing the upper tier");
+        set(native::kSetStyle, saved_style);
+        set(native::kSetTransferStrength, 1.f);
+        Check(record() && record(), "reuse regression restores the original Evaluate and resolve controls");
+        const auto saved_preset = native::kSetPreset.Get();
+        native::comparison_ui::CaptureAdaptiveSettings(&resources_before);
+        native::kSetPreset.Store(saved_preset == 1.f ? 2.f : 1.f);
+        native::comparison_ui::CaptureAdaptiveSettings(&resources_after);
+        Check(resources_before.settings_hash != resources_after.settings_hash,
+            "model selection remains part of the allocation identity");
+        native::kSetPreset.Store(saved_preset);
+        const auto settled_models = native::nr_features_created;
+        Check(record() && record() && feature.adaptive_cache == cache && cache->active == 0
+            && cache->tiers[1].ready && cache->ladder.sizes[1][0].width == 5
+            && native::nr_features_created == settled_models,
+            "both outputs consume the restored measurement epoch with the original lower tier ready and no Create");
+      }
       if (hook == native::kHookRender) {
         auto running_list = gpu.list;
         auto running_allocator = gpu.allocator;
@@ -357,6 +474,29 @@ int Run() {
       Check(feature.adaptive_cache != nullptr && !feature.adaptive_session->failed
           && feature.adaptive_session->status.applied[0].width == 16,
           "adaptive On resumes the same inline source after Off without changing the saved upper limit");
+      native::kSetAdaptiveMinScale.Store(1.f);
+      native::RecreateFeatures();
+      for (uint32_t warmup = 0; warmup < 12; ++warmup) record();
+      const auto single_tier = feature.adaptive_cache;
+      Check(single_tier != nullptr && single_tier->count == 1 && single_tier->tiers[0].ready,
+          "a source first prepared at a 100-percent minimum owns only its upper physical tier");
+      const auto single_model = feature.slots[0].handle;
+      const auto single_models = native::nr_features_created;
+      const auto single_worksets = native::worksets_created;
+      native::kSetAdaptiveMinScale.Store(.5f);
+      Check(record() && record() && feature.adaptive_cache == single_tier && single_tier->count == 1
+          && feature.adaptive_session->ladder.count == 1 && native::nr_features_created == single_models,
+          "lowering a 100-percent minimum leaves the existing one-tier allocation untouched until requested");
+      Check(feature.adaptive_session->RequestMinimum(native::SteadyNowNs())
+          && feature.adaptive_session->ladder.count == 2 && single_tier->count == 1,
+          "requesting the lower endpoint adds only one logical physical slot within the original capacity");
+      for (uint32_t warmup = 0; warmup < 24; ++warmup) record();
+      Check(feature.adaptive_cache == single_tier && single_tier->count == 2 && single_tier->active == 1
+          && single_tier->tiers[1].ready && feature.adaptive_session->status.applied[0].width == 8
+          && single_tier->tiers[0].state.slots[0].handle == single_model
+          && native::nr_features_created == single_models + 1 && native::worksets_created == single_worksets + 2,
+          "the new physical slot completes both outputs without rebuilding or exceeding the retained upper allocation");
+      native::kSetAdaptiveMinScale.Store(.33f);
       std::cout << "ADAPTIVE_INLINE accounting hook=" << hook << " frames=" << frame
           << " source_successes=" << native::SourceSuccessfulEvaluations()
           << " model_calls=" << model_calls << " preparation_calls=" << preparation_calls

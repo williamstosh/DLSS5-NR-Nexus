@@ -115,14 +115,18 @@ struct Session {
   Settings settings;
   Ladder ladder;
   uint64_t identity = 0, output_source = 0, output_generation = 0, output_configuration = 0;
+  uint64_t resource_identity = 0;
   uint64_t configuration_epoch = 0;
+  Sizes minimum{};
   uint64_t last_output_serial = 0, last_sequence = 0, gpu_context = 0;
-  size_t level = 0, previous_level = 0;
+  size_t level = 0, previous_level = 0, active_level = 0;
   int64_t applied_ns = 0, stable_after_ns = 0, last_switch_ns = 0, at_target_since_ns = 0;
   int64_t next_measure_ns = 0;
   int64_t failed_raise_until_ns = 0;
   size_t failed_raise_level = MAX_LEVELS;
   bool trial = false, raising = false, extra_window = false, blocked = false, failed = false;
+  bool defer_preparation = false;
+  bool minimum_pending = false;
   double baseline_fps = 0., baseline_fps_mad = 0., baseline_gpu_us = 0., baseline_gpu_mad = 0.;
   double baseline_multiplier = 0.;
   double blocked_fps = 0., blocked_gpu_us = 0.;
@@ -142,7 +146,18 @@ struct Session {
     at_target_since_ns = 0;
   }
 
+  bool IsLegal(const Sizes& sizes) const {
+    for (size_t pass = 0; pass < MAX_PASSES; ++pass) {
+      if (sizes[pass].width < minimum[pass].width || sizes[pass].height < minimum[pass].height) return false;
+    }
+    return true;
+  }
+
   void Request(size_t candidate, int64_t now_ns) {
+    if (candidate >= ladder.count) return;
+    if (!IsLegal(ladder.sizes[candidate])) {
+      candidate = 0;
+    }
     level = candidate;
     ++status.generation;
     status.coefficient = ladder.coefficients[level];
@@ -153,9 +168,48 @@ struct Session {
     ResetMeasurements();
   }
 
+  bool RequestMinimum(int64_t now_ns) {
+    for (size_t slot = 0; slot < ladder.count; ++slot) {
+      if (ladder.sizes[slot] == minimum) {
+        minimum_pending = false;
+        Request(slot, now_ns);
+        return true;
+      }
+    }
+    size_t replacement = ladder.count;
+    for (size_t slot = 1; slot < ladder.count; ++slot) {
+      if (slot == level || slot == active_level || ladder.sizes[slot] == status.applied
+          || (trial && slot == previous_level)) continue;
+      if (replacement == ladder.count || !IsLegal(ladder.sizes[slot])
+          || ladder.coefficients[slot] > ladder.coefficients[replacement]) {
+        replacement = slot;
+        if (!IsLegal(ladder.sizes[slot])) break;
+      }
+    }
+    const size_t capacity = (settings.prepared_levels == 0
+        ? MAX_LEVELS : std::min<size_t>(settings.prepared_levels, MAX_PREPARED_LEVELS));
+    if (replacement == ladder.count && ladder.count < capacity) {
+      replacement = ladder.count++;
+    }
+    if (replacement == ladder.count) {
+      // Two resident tiers may need to return to the upper tier before the
+      // old lower allocation can retire. No GPU wait creates extra capacity.
+      minimum_pending = true;
+      Request(0, now_ns);
+      return false;
+    }
+    ladder.sizes[replacement] = minimum;
+    ladder.coefficients[replacement] = settings.minimum_scale;
+    defer_preparation = true;
+    minimum_pending = false;
+    Request(replacement, now_ns);
+    return true;
+  }
+
   void Applied(uint64_t generation, const Sizes& actual, int64_t now_ns) {
     if (generation != status.generation || actual != status.requested) return;
     status.applied = actual;
+    active_level = level;
     if (applied_ns != 0) return;
     applied_ns = now_ns;
     stable_after_ns = now_ns + WARMUP_NS;
@@ -220,19 +274,27 @@ struct Session {
   }
 
   void Prepare(const Settings& requested_settings, const Sizes& upper, const Sizes& floor,
-               uint64_t source_identity, const Output& output, int64_t now_ns, bool supported, bool frozen) {
+               uint64_t source_identity, const Output& output, int64_t now_ns, bool supported, bool frozen,
+               uint64_t allocation_identity = 0) {
     Settings next = requested_settings;
     next.target_fps = (std::isfinite(next.target_fps) ? std::clamp(next.target_fps, 30.f, 360.f) : 60.f);
     next.minimum_scale = (std::isfinite(next.minimum_scale) ? std::clamp(next.minimum_scale, 0.33f, 1.f) : 0.67f);
+    if (allocation_identity == 0) {
+      allocation_identity = source_identity;
+    }
     const bool changed = identity != source_identity || settings != next || status.upper != upper;
-    if (changed) {
+    const bool allocations_changed = resource_identity != allocation_identity || status.upper != upper
+        || settings.prepared_levels != next.prepared_levels;
+    if (allocations_changed) {
       const uint64_t generation = status.generation + 1;
       *this = Session{};
       status.generation = generation;
       settings = next;
       identity = source_identity;
+      resource_identity = allocation_identity;
       status.upper = upper;
       ladder = BuildLadder(upper, floor, next.minimum_scale);
+      minimum = ladder.sizes[ladder.count - 1];
       if (next.prepared_levels >= 2 && ladder.count > next.prepared_levels) {
         Ladder prepared;
         prepared.count = next.prepared_levels;
@@ -244,10 +306,30 @@ struct Session {
         ladder = prepared;
       }
       Request(0, now_ns);
+    } else if (changed) {
+      defer_preparation |= settings.minimum_scale != next.minimum_scale;
+      settings = next;
+      identity = source_identity;
+      const auto legal = BuildLadder(upper, floor, next.minimum_scale);
+      minimum = legal.sizes[legal.count - 1];
+      size_t candidate = (trial ? previous_level : active_level);
+      if (!next.enabled || candidate >= ladder.count || !IsLegal(ladder.sizes[candidate])) {
+        candidate = 0;
+      }
+      trial = false;
+      raising = false;
+      extra_window = false;
+      blocked = false;
+      minimum_pending = false;
+      failed_raise_level = MAX_LEVELS;
+      failed_raise_until_ns = 0;
+      previous_level = candidate;
+      Request(candidate, now_ns);
     }
     if (!settings.enabled || !supported) {
       if (level != 0) Request(0, now_ns);
       trial = false;
+      minimum_pending = false;
       status.reason = (settings.enabled ? Reason::UNSUPPORTED : Reason::DISABLED);
       return;
     }
@@ -267,6 +349,7 @@ struct Session {
       if (trial) Request(previous_level, now_ns);
       trial = false;
       blocked = false;
+      minimum_pending = false;
       ResetMeasurements();
       output_source = output.source;
       output_generation = output.generation;
@@ -342,18 +425,39 @@ struct Session {
       at_target_since_ns = 0;
     }
     size_t candidate = level;
+    const auto adjacent = [&](bool higher, size_t steps) {
+      size_t result = level;
+      for (size_t step = 0; step < steps; ++step) {
+        size_t nearest = result;
+        for (size_t slot = 0; slot < ladder.count; ++slot) {
+          if (!IsLegal(ladder.sizes[slot])) continue;
+          if (higher ? ladder.coefficients[slot] <= ladder.coefficients[result]
+                     : ladder.coefficients[slot] >= ladder.coefficients[result]) continue;
+          if (nearest == result || (higher ? ladder.coefficients[slot] < ladder.coefficients[nearest]
+                                          : ladder.coefficients[slot] > ladder.coefficients[nearest])) {
+            nearest = slot;
+          }
+        }
+        if (nearest == result) break;
+        result = nearest;
+      }
+      return result;
+    };
     if (output.fps < settings.target_fps * 0.95 && !blocked && now_ns - last_switch_ns >= 3'000'000'000) {
-      candidate = std::min(level + (settings.prepared_levels != 0 ? 1 : 2), ladder.count - 1);
+      candidate = (minimum_pending ? MAX_LEVELS : adjacent(false, settings.prepared_levels != 0 ? 1 : 2));
+      if (candidate == level && ladder.sizes[level] != minimum) {
+        candidate = MAX_LEVELS;
+      }
       raising = false;
     } else if (level != 0 && at_target_since_ns != 0 && now_ns - at_target_since_ns >= 6'000'000'000
         && now_ns - last_switch_ns >= 10'000'000'000
-        && (level - 1 != failed_raise_level || now_ns >= failed_raise_until_ns)) {
-      candidate = level - 1;
+        && (adjacent(true, 1) != failed_raise_level || now_ns >= failed_raise_until_ns)) {
+      candidate = adjacent(true, 1);
       raising = true;
     }
     if (candidate == level) {
       status.reason = (blocked ? Reason::NO_BENEFIT
-          : (level + 1 == ladder.count && output.fps < settings.target_fps * 0.95 ? Reason::AT_MINIMUM : Reason::OBSERVING));
+          : (ladder.sizes[level] == minimum && output.fps < settings.target_fps * 0.95 ? Reason::AT_MINIMUM : Reason::OBSERVING));
       return;
     }
     previous_level = level;
@@ -364,8 +468,14 @@ struct Session {
     baseline_multiplier = output.observed_multiplier;
     extra_window = false;
     trial = true;
-    Request(candidate, now_ns);
-    status.reason = (raising ? Reason::RAISING : Reason::LOWERING);
+    if (candidate == MAX_LEVELS) {
+      if (!RequestMinimum(now_ns)) {
+        trial = false;
+      }
+    } else {
+      Request(candidate, now_ns);
+    }
+    status.reason = (raising ? Reason::RAISING : (trial ? Reason::LOWERING : Reason::PREPARING));
   }
 };
 

@@ -385,6 +385,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
       reinterpret_cast<uintptr_t>(stream) ^ reinterpret_cast<uintptr_t>(stream->device)
           ^ reinterpret_cast<uintptr_t>(stream->queue) ^ input.epoch
           ^ stream->native_options_generation ^ static_cast<uint64_t>(base.hdr_mode)
+           ^ (static_cast<uint64_t>(input.backbuffer->GetDesc().Format) * 1099511628211ull) ^ contract.create_flags
           ^ (static_cast<uint64_t>(coupled_ui) << 40) ^ (static_cast<uint64_t>(may_compose) << 41),
       !base.d3d11_bridge && !base.native_prefg_resolution_pair,
       input.application_frame, (has_hudless && !coupled_ui ? 3u : 1u), true, 1, stream->adaptive_model_roles);
@@ -405,7 +406,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     const size_t requested_slot = stream->adaptive_session->level;
     bool group_ready = true;
     bool missing_role = false;
-    size_t current_slot = 0;
+    size_t current_slot = adaptive_resolution::MAX_LEVELS;
     for (uint32_t i = 0; i < 2; ++i) {
       if ((required_model_roles & (1u << i)) == 0) continue;
       const auto feature = features.find(stream->roles[i].Handle());
@@ -417,9 +418,14 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
       }
       auto& cache = *feature->second.adaptive_cache;
       PollAdaptiveCache(&cache);
-      current_slot = cache.active;
-      group_ready &= requested_slot < cache.count && !cache.failed && !cache.budget_blocked
-          && (requested_slot == cache.active || cache.tiers[requested_slot].ready);
+      const size_t active = (AdaptiveTierUsable(cache, *stream->adaptive_session, cache.active) ? cache.active : 0u);
+      if (current_slot == adaptive_resolution::MAX_LEVELS) {
+        current_slot = active;
+      } else if (current_slot != active) {
+        current_slot = 0;
+      }
+      group_ready &= !cache.failed && !cache.budget_blocked
+          && AdaptiveTierUsable(cache, *stream->adaptive_session, requested_slot);
     }
     const size_t slot = (group_ready ? requested_slot : (missing_role ? 0u : current_slot));
     stream->adaptive_frame.slot = static_cast<uint32_t>(slot);
@@ -638,7 +644,8 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
         const auto backbuffer = features.find(stream->roles[0].Handle());
         const auto cache = (backbuffer != features.end() ? backbuffer->second.adaptive_cache : nullptr);
         if (cache == nullptr || cache->identity != stream->adaptive_frame.layout_identity
-            || cache->failed || cache->budget_blocked || stream->adaptive_frame.slot >= cache->count
+            || cache->failed || cache->budget_blocked
+            || !AdaptiveTierUsable(*cache, *stream->adaptive_session, stream->adaptive_frame.slot)
             || !cache->tiers[stream->adaptive_frame.slot].ready) {
           // A new fallback role cannot publish half a lower-resolution frame.
           // Its upper tier matures on the next application frame as a complete pair.

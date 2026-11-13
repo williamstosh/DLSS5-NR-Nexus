@@ -7,7 +7,7 @@
 namespace comparison_ui {
 namespace comparison = gpu_comparison;
 
-inline void CaptureConfiguration(comparison::Identity* identity, bool include_adaptive) {
+inline void CaptureConfiguration(comparison::Identity* identity, bool include_adaptive, bool allocations_only = false) {
   std::shared_lock config_lock(present_restore_configuration.mutex);
   identity->configuration_generation = configuration_generation.load();
   identity->config_epoch = present_restore_configuration.epoch;
@@ -34,6 +34,19 @@ inline void CaptureConfiguration(comparison::Identity* identity, bool include_ad
       if (key.starts_with("NRScreenshot") || key == "NRToggleKey" || key == "NRGpuTimers"
           || key.starts_with("NROfficialCycle") || key.starts_with("NRCustomCycle")
           || key == "NRCostMeter" || key == "NREditTrace") continue;
+      const auto parameter = (key.starts_with("NRPass2") || key.starts_with("NRPass3") || key.starts_with("NRPass4")
+          ? key.substr(7) : key.substr(2));
+      // These parameters are consumed by Evaluate or the resolve without
+      // changing Create or resource layout. Measurement identities retain them.
+      if (allocations_only && (parameter == "Intensity" || parameter == "Style" || parameter == "LocalTone"
+          || parameter == "LocalStructure" || parameter == "Structure" || parameter == "SkinStructure"
+          || parameter == "Skin" || parameter == "SkinIndependent"
+          || parameter == "AutoMask" || parameter == "UICorrection" || parameter == "FollowPass1"
+          || parameter == "DepthMode" || parameter == "MVecScaleX" || parameter == "MVecScaleY"
+          || parameter == "ChainedHistory" || parameter == "TransferStrength" || parameter == "ColorStrength"
+          || parameter == "Transfer" || parameter == "Color" || parameter == "ChromaClamp"
+          || parameter == "TransferMode" || parameter == "StyleHighlightGuard" || parameter == "DisplayPedestal"
+          || parameter == "NeuralFloorGuard")) continue;
       const bool resolution = key == "NRFollowInputRes" || key == "NRResolutionScale"
           || key.ends_with("ResolutionMode") || key.ends_with("ResolutionScale");
       auto* hash = (resolution ? &identity->resolution_hash : &identity->settings_hash);
@@ -56,7 +69,7 @@ inline void CaptureSettings(comparison::Identity* identity) {
 }
 
 inline void CaptureAdaptiveSettings(comparison::Identity* identity) {
-  CaptureConfiguration(identity, false);
+  CaptureConfiguration(identity, false, true);
 }
 
 inline const char* ReasonText(comparison::Reason reason) {

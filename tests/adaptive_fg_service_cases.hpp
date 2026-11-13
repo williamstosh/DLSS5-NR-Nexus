@@ -5,6 +5,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <exception>
 #include <iostream>
@@ -82,6 +83,7 @@ int Run() {
     native::nr_adaptive_enabled.store(false);
     native::max_worksets.store(4);
     native::adaptive_configuration_settings = native::comparison_ui::CaptureAdaptiveSettings;
+    addon::gpu_timers::comparison_settings = native::comparison_ui::CaptureSettings;
     native::direct_api.module = GetModuleHandleW(nullptr);
     native::direct_api.create = CreateModel;
     native::direct_api.evaluate = EvaluateModel;
@@ -100,7 +102,10 @@ int Run() {
     uint32_t active_failures = 0;
     uint32_t preparation_calls = 0;
     uint32_t preparation_failures = 0;
-    model_parameter_observer = [&](const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter* parameters) {
+    uint64_t observing_context = 0;
+    std::array<uint32_t, 2> active_pass_masks{}, failed_pass_masks{};
+    uint32_t partial_role_recordings = 0;
+    model_parameter_observer = [&](const NVSDK_NGX_Handle* model, const NVSDK_NGX_Parameter* parameters) {
       Check(native::GetD3D12Resource(parameters, "DLSSNR.ControlMask") != nullptr,
           "every model call receives the production GPU ControlMask");
       ++masked_calls;
@@ -108,10 +113,31 @@ int Run() {
       if (native::preparing_adaptive_frame != nullptr) {
         ++preparation_calls;
         preparation_failures += failing;
-      } else if (failing) {
-        ++active_failures;
       } else {
-        ++active_successes;
+        const auto stream = native::fg_service::streams.find({false, observing_context});
+        Check(stream != native::fg_service::streams.end(), "active model Evaluate belongs to the observed Service context");
+        bool identified = false;
+        for (size_t role = 0; role < active_pass_masks.size(); ++role) {
+          const auto feature = native::features.find(stream->second.roles[role].Handle());
+          if (feature == native::features.end()) continue;
+          for (uint32_t pass = 0; pass < native::kMaxNrPasses; ++pass) {
+            if (feature->second.slots[pass].handle != model) continue;
+            Check(!identified && ((active_pass_masks[role] | failed_pass_masks[role]) & (1u << pass)) == 0,
+                "the actual model handle identifies one active role and one new Pass invocation");
+            identified = true;
+            if (failing) {
+              failed_pass_masks[role] |= 1u << pass;
+            } else {
+              active_pass_masks[role] |= 1u << pass;
+            }
+          }
+        }
+        Check(identified, "every non-preparation model Evaluate has an independently observed active role owner");
+        if (failing) {
+          ++active_failures;
+        } else {
+          ++active_successes;
+        }
       }
     };
     std::cout << "ADAPTIVE_SERVICE evidence=WARP+MOCK Runtime_contract=mock_310.9.16.0 native_NGX=not_run\n";
@@ -159,8 +185,9 @@ int Run() {
     const auto service = [&] {
       ++input.application_frame;
       const auto before_source = native::SourceSuccessfulEvaluations();
-      const auto before_active = active_successes;
-      const auto before_failed = active_failures;
+      observing_context = input.context;
+      active_pass_masks = {};
+      failed_pass_masks = {};
       const auto before_list_calls = list_calls.size();
       const auto result = native::fg_service::Service(input);
       for (size_t index = before_list_calls; index < list_calls.size(); ++index) {
@@ -184,15 +211,36 @@ int Run() {
           Check(false, "Service closes each recording once, after its successful Reset");
         }
       }
-      const uint64_t completed_active = (active_successes > before_active && active_failures == before_failed ? 1u : 0u);
-      Check(native::SourceSuccessfulEvaluations() == before_source + completed_active,
-          "Service source successes count only the active output, excluding every standby Evaluate");
+      uint64_t successful_active_roles = 0;
+      uint32_t partial_roles = 0;
+      for (size_t role = 0; role < active_pass_masks.size(); ++role) {
+        if (active_pass_masks[role] == 0 || failed_pass_masks[role] != 0) continue;
+        ++successful_active_roles;
+        if (active_pass_masks[role] != (1u << native::stack_passes.load()) - 1u) {
+          partial_roles |= 1u << role;
+          ++partial_role_recordings;
+        }
+      }
+      // SourceSuccessfulEvaluations counts active role invocations, including
+      // a partially matured stack. It is not a complete application-frame count.
+      if (native::SourceSuccessfulEvaluations() != before_source + successful_active_roles) {
+        std::cerr << "ADAPTIVE_SOURCE frame=" << input.application_frame << " result=" << static_cast<int>(result)
+            << " actual_delta=" << native::SourceSuccessfulEvaluations() - before_source
+            << " expected_active_roles=" << successful_active_roles
+            << " active_masks=" << active_pass_masks[0] << ',' << active_pass_masks[1]
+            << " failed_masks=" << failed_pass_masks[0] << ',' << failed_pass_masks[1] << '\n';
+      }
+      Check(native::SourceSuccessfulEvaluations() == before_source + successful_active_roles,
+          "source successes count independently observed successful active roles and exclude all preparation calls");
       gpu.Submit();
       native::DrainRetiredResources(true);
       auto& stream = native::fg_service::streams.at({false, input.context});
       std::cout << "ADAPTIVE_SERVICE frame=" << input.application_frame << " result=" << static_cast<int>(result)
           << " calls=" << model_calls << " failed=" << (stream.adaptive_session && stream.adaptive_session->failed)
           << " source_successes=" << native::SourceSuccessfulEvaluations() << " preparation_calls=" << preparation_calls
+          << " active_role_invocations=" << successful_active_roles
+          << " active_pass_masks=" << active_pass_masks[0] << ',' << active_pass_masks[1]
+          << " partial_roles=" << partial_roles
           << " reason=" << (stream.adaptive_session ? addon::adaptive_resolution::ReasonText(stream.adaptive_session->status.reason) : "Off")
           << '\n';
       return result;
@@ -299,6 +347,84 @@ int Run() {
         && std::all_of(recovered_cache->tiers.begin(), recovered_cache->tiers.begin() + recovered_cache->count,
             [](const auto& tier) { return tier.ready; }),
         "explicit clear-failure rebuilds real Features and successfully resumes the existing Service");
+    native::fg_service::Retire();
+    gpu.Submit();
+    native::DrainRetiredResources(true);
+    auto hudless = texture(DXGI_FORMAT_R8G8B8A8_UNORM);
+    gpu.Submit();
+    input.context = 0xADAF8;
+    input.application_frame = 0;
+    input.hudless = hudless.Get();
+    input.hudless_state = NATIVE_INPUT_STATE;
+    const auto before_partial_roles = partial_role_recordings;
+    for (uint32_t frame = 0; frame < 24; ++frame) service();
+    auto& dual = native::fg_service::streams.at({false, input.context});
+    auto primary = native::features.at(dual.roles[0].Handle()).adaptive_cache;
+    auto auxiliary = native::features.at(dual.roles[1].Handle()).adaptive_cache;
+    Check(primary != nullptr && auxiliary != nullptr && primary->count == 2 && auxiliary->count == 2
+        && primary->tiers[1].ready && auxiliary->tiers[1].ready,
+        "two real color roles retain two GPU-ready coarse tiers within the original four-workset budget");
+    Check(partial_role_recordings > before_partial_roles,
+        "dual-color cold maturation observes partial Pass masks without treating them as a complete color group");
+    const auto dual_models = native::nr_features_created;
+    const auto dual_worksets = native::worksets_created;
+    for (const auto* setting : {&native::kSetPassStructure[0], &native::kSetPassSkin[0], &native::kSetPassFollow[0]}) {
+      addon::gpu_comparison::Identity before, resources_before, after, resources_after;
+      native::comparison_ui::CaptureSettings(&before);
+      native::comparison_ui::CaptureAdaptiveSettings(&resources_before);
+      const auto saved = setting->Get();
+      setting->Store(saved == 0.f ? 1.f : 0.f);
+      native::comparison_ui::CaptureSettings(&after);
+      native::comparison_ui::CaptureAdaptiveSettings(&resources_after);
+      Check(before.settings_hash != after.settings_hash && resources_before.settings_hash == resources_after.settings_hash,
+          "per-Pass steering aliases and model-steering inheritance remain in measurements but preserve allocation identity");
+      setting->Store(saved);
+    }
+    ComPtr<ID3D12CommandAllocator> held_allocator;
+    ComPtr<ID3D12GraphicsCommandList> held_list;
+    Check(SUCCEEDED(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+        IID_PPV_ARGS(&held_allocator))), "dual-color held allocator");
+    Check(SUCCEEDED(gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+        held_allocator.Get(), nullptr, IID_PPV_ARGS(&held_list))), "dual-color held list");
+    Check(native::InstallCommandListStateHooks(held_list.Get()), "dual-color held-list hooks");
+    const auto held_model = auxiliary->tiers[1].state.slots[0].handle;
+    addon::submission::TrackUse(held_list.Get(), held_model);
+    native::kSetAdaptiveMinScale.Store(.8f);
+    service();
+    native::kSetAdaptiveMinScale.Store(.5f);
+    service();
+    Check(native::nr_features_created == dual_models && native::worksets_created == dual_worksets,
+        "minimum edits alone leave both color-role allocations unchanged");
+    Check(dual.adaptive_session->RequestMinimum(native::SteadyNowNs()), "dual-color new minimum is requested once");
+    for (uint32_t frame = 0; frame < 12; ++frame) service();
+    Check(primary->tiers[1].ready && primary->ladder.sizes[1] == dual.adaptive_session->minimum
+        && auxiliary->ladder.sizes[1] != dual.adaptive_session->minimum && primary->active == 0 && auxiliary->active == 0
+        && dual.adaptive_session->status.applied[0].width == 16 && !dual.adaptive_session->failed,
+        "one color can finish the new endpoint while the held old role keeps the complete group on its legal upper size");
+    Check(SUCCEEDED(held_list->Close()) && SUCCEEDED(held_allocator->Reset())
+        && SUCCEEDED(held_list->Reset(held_allocator.Get(), nullptr)),
+        "the fixture ends the old auxiliary role's unsubmitted tracked lifetime");
+    for (uint32_t frame = 0; frame < 16; ++frame) service();
+    Check(primary->active == 1 && auxiliary->active == 1
+        && primary->ladder.sizes[1] == dual.adaptive_session->minimum
+        && auxiliary->ladder.sizes[1] == dual.adaptive_session->minimum
+        && dual.adaptive_session->status.applied[0].width == 8 && dual.adaptive_session->status.applied[1].width == 8
+        && native::nr_features_created == dual_models + 4 && native::worksets_created == dual_worksets + 2,
+        "both colors and both Passes commit only after the requested replacement is GPU-ready as one group");
+    native::kSetAdaptiveMinScale.Store(.8f);
+    Check(service() == fg::Result::SUBMITTED && primary->active == 0 && auxiliary->active == 0
+        && dual.adaptive_session->status.applied[0].width == 16 && native::nr_features_created == dual_models + 4,
+        "raising the minimum returns both active colors to the retained legal upper tier without Create");
+    native::kSetPassPreset[0].Store(1.f);
+    native::ApplySettingEffect(native::kSetPassPreset[0].effect);
+    Check(native::features.at(dual.roles[0].Handle()).adaptive_cache == nullptr
+        && native::features.at(dual.roles[1].Handle()).adaptive_cache == nullptr,
+        "a changed Create model contract retires both color-role caches");
+    for (uint32_t frame = 0; frame < 20; ++frame) service();
+    Check(native::nr_features_created > dual_models + 4 && !dual.adaptive_session->failed
+        && native::features.at(dual.roles[0].Handle()).adaptive_cache != primary
+        && native::features.at(dual.roles[1].Handle()).adaptive_cache != auxiliary,
+        "both colors rebuild clean model contracts after the explicit model-selection change");
     model_parameter_observer = {};
     native::fg_service::Retire();
     gpu.Submit();
@@ -323,7 +449,7 @@ int Run() {
         Check(message->Severity > D3D12_MESSAGE_SEVERITY_ERROR, message->pDescription);
       }
     }
-    std::cout << "PASS adaptive single Backbuffer two-Pass Service evidence=WARP+MOCK frames=" << input.application_frame
+    std::cout << "PASS adaptive single/dual-color two-Pass Service evidence=WARP+MOCK frames=" << input.application_frame
         << " source_successes=" << native::SourceSuccessfulEvaluations() << " model_calls=" << model_calls
         << " preparation_calls=" << preparation_calls << " preparation_failures=" << preparation_failures << '\n';
     return 0;
