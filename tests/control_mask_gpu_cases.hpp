@@ -1,11 +1,13 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <DirectXPackedVector.h>
 #include <psapi.h>
 #include <fstream>
@@ -2397,6 +2399,12 @@ inline bool native_resize_create_runtime_locked = false;
 inline bool native_resize_create_ngx_call = false;
 inline std::vector<uintptr_t> native_resize_models;
 inline std::vector<bool> native_resize_preparing;
+inline const std::atomic_bool* native_cold_worker_sdk_active = nullptr;
+inline uint64_t native_cold_serial_timeouts_before = 0;
+inline bool native_cold_sdk_entry_refused = false;
+inline int64_t native_cold_sr_enter_ns = 0;
+inline bool native_cold_sr_runtime_locked = false;
+inline uint32_t native_cold_sr_ngx_depth = 0;
 
 NVSDK_NGX_Result NVSDK_CONV ObserveNativeResizeCreate(
     ID3D12GraphicsCommandList* list, NVSDK_NGX_Feature feature,
@@ -2421,10 +2429,29 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeResizeRelease(NVSDK_NGX_Handle* handle)
 NVSDK_NGX_Result NVSDK_CONV ObserveNativeHostEvaluate(
     ID3D12GraphicsCommandList* command_list, const NVSDK_NGX_Handle* handle,
     const NVSDK_NGX_Parameter* parameters, PFN_NVSDK_NGX_ProgressCallback progress) {
+  if (native_cold_worker_sdk_active != nullptr) {
+    // Call's bounded timeout normally forwards without serialization. This
+    // probe must refuse that fallback before entering the actual SDK.
+    if (native_cold_worker_sdk_active->load(std::memory_order_acquire)
+        || renodx::addons::dlss5::ngx_serial::serial_timeouts.load() != native_cold_serial_timeouts_before) {
+      native_cold_sdk_entry_refused = true;
+      return NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
+    }
+    native_cold_sr_enter_ns = addon::SteadyNowNs();
+    native_cold_sr_runtime_locked = renodx::addons::dlss5::HoldingRuntimeLock();
+    native_cold_sr_ngx_depth = renodx::addons::dlss5::ngx_serial::depth;
+    if (native_cost_queries != nullptr) {
+      native_cost_queries->Begin(command_list, native_cost_interval + 2);
+    }
+  }
   ++native_motion_sr_calls;
   const auto start = std::chrono::steady_clock::now();
   const auto result = NVSDK_NGX_D3D12_EvaluateFeature(command_list, handle, parameters, progress);
   native_resize_host_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  if (native_cold_worker_sdk_active != nullptr && native_cost_queries != nullptr) {
+    command_list->EndQuery(native_cost_queries->heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                          2 * (native_cost_interval + 2) + 1);
+  }
   if (NVSDK_NGX_SUCCEED(result) && native_motion_sr_readback != nullptr) {
     auto* output = addon::GetD3D12Resource(parameters, NVSDK_NGX_Parameter_Output);
     native_motion_gpu->Transition(output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -2483,6 +2510,10 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeRuntimeEvaluate(
 int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                  uint32_t mask_mode = addon::kControlMaskDepthFar, bool cost = false,
                  bool motion_test = false, bool resize_test = false) {
+  const auto* cold_prepare_environment = std::getenv("NR_NEXUS_TEST_RESIZE_COLD_PREPARE");
+  const bool cold_prepare = resize_test && cold_prepare_environment != nullptr
+      && std::strcmp(cold_prepare_environment, "1") == 0;
+  nlohmann::json resize_report;
   try {
     // Resize reuses public SDK initialization and the real SR owner, without
     // running the independent paired ControlMask motion experiment.
@@ -2843,8 +2874,504 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     Check(production_chain_completed,
           "real Runtime completes the requested production stages within the debounce window");
     nlohmann::json motion_report;
-    nlohmann::json resize_report;
-    if (resize_test) {
+    if (cold_prepare) {
+      namespace serial = renodx::addons::dlss5::ngx_serial;
+      constexpr UINT candidate_width = 960, candidate_height = 540;
+      const auto create = addon::core_create_feature;
+      const auto allocate = addon::core_allocate_parameters;
+      const auto destroy = addon::core_destroy_parameters;
+      const auto release = addon::core_release_feature;
+      const auto evaluate = native_runtime_evaluate;
+      const auto& original_feature = addon::features.at(owner);
+      const auto original_nr = original_feature.slots[0].handle;
+      const auto original_parameters = original_feature.slots[0].parameters;
+      const auto original_workset_id = addon::worksets.at({owner, output.Get(), false}).id;
+      const auto original_proxy = addon::worksets.at({owner, output.Get(), false}).proxy;
+      const uint32_t create_flags = original_feature.create_flags;
+      const uint32_t model_preset = original_feature.slots[0].nr_preset;
+      const uint8_t hdr_mode = original_feature.slots[0].nr_hdr_mode;
+      Check(create != nullptr && allocate != nullptr && destroy != nullptr && release != nullptr && evaluate != nullptr,
+            "cold prepare snapshots a complete initialized Core provider");
+      auto& report = resize_report;
+      report = {{"schema", "nr-nexus-native-cold-prepare-v1"}, {"evidence", "NATIVE_GPU+NATIVE_NGX"},
+          {"mode", "serialized-worker-probe"}, {"production_async_enabled", false}, {"p1_enabled", false},
+          {"purpose", "private worker Create without runtime_mutex; independent D3D progress and same-Core SR wait"},
+          {"host_sr", "NATIVE_NGX 1280x720 to 1920x1080"}, {"stage", "Upscaled"}, {"passes", 1}, {"colors", 1},
+          {"runtime", addon::direct_runtime_requirements.file_version}, {"nr_sha256", addon::direct_runtime_sha256},
+          {"requested_model", model_preset}, {"internal_model", "unknown"}, {"format", "RGBA16F"},
+          {"candidate_size", {candidate_width, candidate_height}}, {"source_size", {width, height}},
+          {"guide_size", {render_width, render_height}}, {"create_flags", create_flags}, {"hdr_mode", hdr_mode},
+          {"timing_clock", "SteadyNowNs; CPU nanoseconds with a common steady-clock epoch"},
+          {"timing_scope", "source starts are unpaced headless calls, not game/display FPS; explicit serialized SDK gate"},
+          {"main_thread_id", GetCurrentThreadId()}, {"teardown_status", "NotRun"},
+          {"frames", nlohmann::json::array()}};
+      ComPtr<IDXGIAdapter3> adapter;
+      Check(SUCCEEDED(gpu.factory->EnumAdapterByLuid(gpu.device->GetAdapterLuid(), IID_PPV_ARGS(&adapter))),
+            "cold prepare adapter");
+      DXGI_ADAPTER_DESC adapter_desc{};
+      Check(SUCCEEDED(adapter->GetDesc(&adapter_desc)), "cold prepare adapter identity");
+      report["adapter"] = std::filesystem::path(adapter_desc.Description).string();
+      LARGE_INTEGER driver_version{};
+      report["driver_status"] = adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driver_version);
+      report["driver_version_raw"] = driver_version.QuadPart;
+      report["input_crc32"] = {{"color", renodx::utils::hash::ComputeCRC32(
+          reinterpret_cast<const uint8_t*>(color_data.data()), color_data.size() * sizeof(uint16_t))},
+          {"depth", renodx::utils::hash::ComputeCRC32(reinterpret_cast<const uint8_t*>(depth_data.data()), depth_data.size() * sizeof(float))},
+          {"motion", renodx::utils::hash::ComputeCRC32(reinterpret_cast<const uint8_t*>(motion_data.data()), motion_data.size() * sizeof(uint16_t))}};
+      auto queries = d3d12_test::CreateTimestampQueries(gpu, 17);
+      ComPtr<ID3D12CommandAllocator> worker_allocator;
+      ComPtr<ID3D12GraphicsCommandList> worker_list;
+      ComPtr<ID3D12Fence> worker_fence;
+      ComPtr<ID3D12Resource> candidate_proxy, candidate_output;
+      ComPtr<ID3D12Resource> retained_depth = depth, retained_motion = motion;
+      addon::FeatureState candidate_state;
+      candidate_state.create_flags = create_flags;
+      auto& candidate_slot = candidate_state.slots[0];
+      std::shared_ptr<submission::RecordingStatus> create_receipt, evaluate_receipt;
+      std::atomic_bool worker_sdk_active{false}, worker_finished{false};
+      std::atomic_int64_t create_entered_ns{0};
+      std::exception_ptr worker_error;
+      nlohmann::json worker_report;
+      bool worker_submitted = false, worker_completed = false;
+      bool cleanup_attempted = false;
+      std::jthread worker;
+      native_cold_worker_sdk_active = &worker_sdk_active;
+      native_cold_serial_timeouts_before = serial::serial_timeouts.load();
+      native_cold_sdk_entry_refused = false;
+      const auto overlap_before = serial::overlap.load();
+      const auto runtime_contentions_before = renodx::addons::dlss5::runtime_lock_contended.load();
+      const auto submit_contentions_before = renodx::addons::dlss5::submit_lock_blocked.load();
+      const auto evaluate_source = [&](const char* phase) {
+        native_runtime_masks.clear();
+        native_runtime_results.clear();
+        native_runtime_resets.clear();
+        native_resize_host_ms = native_resize_evaluate_ms = 0.;
+        native_cold_sr_enter_ns = 0;
+        native_cold_sr_runtime_locked = false;
+        native_cold_sr_ngx_depth = 0;
+        gpu.list->ClearState(nullptr);
+        native_cost_interval = static_cast<UINT>(report["frames"].size()) * 3;
+        native_cost_queries = &queries;
+        native_cost_list = gpu.list.Get();
+        queries.Begin(gpu.list.Get(), native_cost_interval);
+        const auto source_start = addon::SteadyNowNs();
+        int64_t turn_acquired = 0, recorded = 0;
+        const auto sr_calls_before = native_motion_sr_calls;
+        const auto source_successes_before = addon::SourceSuccessfulEvaluations();
+        NVSDK_NGX_Result result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
+        {
+          // The gate wait is outside runtime_mutex and remains separately
+          // visible from CPU recording in the existing production wrapper.
+          const serial::Call turn;
+          turn_acquired = addon::SteadyNowNs();
+          if (worker_sdk_active.load(std::memory_order_acquire)
+              || serial::serial_timeouts.load() != native_cold_serial_timeouts_before) {
+            native_cold_sdk_entry_refused = true;
+          } else {
+            parameters.Set(NVSDK_NGX_Parameter_Reset, 0);
+            addon::ngx_slot_real[0].evaluate = reinterpret_cast<void*>(ObserveNativeHostEvaluate);
+            result = addon::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), owner, &parameters, nullptr);
+            addon::ngx_slot_real[0].evaluate = nullptr;
+          }
+          recorded = addon::SteadyNowNs();
+        }
+        native_cost_queries = nullptr;
+        gpu.list->EndQuery(queries.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2 * native_cost_interval + 1);
+        gpu.Retain(queries.readback.Get());
+        gpu.list->ResolveQueryData(queries.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+            2 * native_cost_interval, 2, queries.readback.Get(), 2ull * native_cost_interval * sizeof(uint64_t));
+        if (!native_runtime_results.empty()) {
+          gpu.list->ResolveQueryData(queries.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+              2 * (native_cost_interval + 1), 2, queries.readback.Get(), 2ull * (native_cost_interval + 1) * sizeof(uint64_t));
+        }
+        if (native_motion_sr_calls != sr_calls_before) {
+          gpu.list->ResolveQueryData(queries.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+              2 * (native_cost_interval + 2), 2, queries.readback.Get(), 2ull * (native_cost_interval + 2) * sizeof(uint64_t));
+        }
+        const auto submitted = addon::SteadyNowNs();
+        gpu.Submit();
+        const auto completed = addon::SteadyNowNs();
+        Check(gpu.fence->GetCompletedValue() >= gpu.serial && gpu.fence->GetCompletedValue() != UINT64_MAX
+                  && SUCCEEDED(gpu.device->GetDeviceRemovedReason()),
+              "cold source submission completes on a healthy device");
+        addon::DrainRetiredResources(true);
+        const auto& active_feature = addon::features.at(owner);
+        const auto& workset = addon::worksets.at({owner, output.Get(), false});
+        const bool identities_preserved = active_feature.slots[0].handle == original_nr
+            && active_feature.slots[0].parameters == original_parameters && workset.id == original_workset_id
+            && workset.proxy == original_proxy;
+        const auto previous_start = (report["frames"].empty() ? source_start
+            : report["frames"].back()["source_start_ns"].get<int64_t>());
+        report["frames"].push_back({{"phase", phase}, {"source_start_ns", source_start}, {"turn_acquired_ns", turn_acquired},
+            {"sr_enter_ns", native_cold_sr_enter_ns}, {"recorded_ns", recorded}, {"completed_ns", completed},
+            {"sr_runtime_mutex_held", native_cold_sr_runtime_locked}, {"sr_ngx_call_depth", native_cold_sr_ngx_depth},
+            {"source_start_interval_ms", (source_start - previous_start) / 1'000'000.},
+            {"cpu_turn_wait_ms", (turn_acquired - source_start) / 1'000'000.},
+            {"cpu_wrapper_after_turn_ms", (recorded - turn_acquired) / 1'000'000.},
+            {"cpu_wrapper_including_turn_ms", (recorded - source_start) / 1'000'000.},
+            {"cpu_host_sr_ms", native_resize_host_ms}, {"cpu_nr_evaluate_ms", native_resize_evaluate_ms},
+            {"cpu_submit_fence_ms", (completed - submitted) / 1'000'000.},
+            {"cpu_complete_from_start_ms", (completed - source_start) / 1'000'000.},
+            {"host_result", static_cast<uint32_t>(result)}, {"nr_results", native_runtime_results},
+            {"nr_reset_parameters", native_runtime_resets},
+            {"actual_sr_calls", native_motion_sr_calls - sr_calls_before}, {"actual_nr_calls", native_runtime_results.size()},
+            {"source_successes_delta", addon::SourceSuccessfulEvaluations() - source_successes_before},
+            {"old_chain_preserved", identities_preserved}, {"sr_handle", reinterpret_cast<uintptr_t>(owner)},
+            {"nr_handle", reinterpret_cast<uintptr_t>(original_nr)}, {"workset_id", workset.id},
+            {"nr_acknowledged_reset_epoch", active_feature.slots[0].acknowledged_reset_epoch},
+            {"global_reset_epoch", addon::history_reset_epoch.load()},
+            {"fence", gpu.serial}, {"completed_fence", gpu.fence->GetCompletedValue()},
+            {"sdk_entry_refused", native_cold_sdk_entry_refused}});
+        Check(!native_cold_sdk_entry_refused && NVSDK_NGX_SUCCEED(result) && native_motion_sr_calls == sr_calls_before + 1
+                  && native_runtime_results.size() == 1 && NVSDK_NGX_SUCCEED(native_runtime_results[0])
+                  && addon::SourceSuccessfulEvaluations() == source_successes_before + 1 && identities_preserved,
+              "cold prepare keeps one real SR and the original active NR successful without SDK overlap");
+        report["frames"].back()["gpu_wrapper_ms"] = queries.Read(native_cost_interval).gpu_ms;
+        report["frames"].back()["gpu_nr_ms"] = queries.Read(native_cost_interval + 1).gpu_ms;
+        report["frames"].back()["gpu_sr_ms"] = queries.Read(native_cost_interval + 2).gpu_ms;
+      };
+      const auto cleanup_candidate = [&] {
+        if (cleanup_attempted) return report["private_cleanup"].value("completed", false);
+        cleanup_attempted = true;
+        // On failure, discard only unsubmitted recordings. Unknown submitted
+        // work keeps its handle, parameters and GPU references until process exit.
+        bool safe = !gpu.submission_pending;
+        if (worker_submitted && !worker_completed) {
+          safe &= worker_fence != nullptr && worker_fence->GetCompletedValue() >= 1
+              && worker_fence->GetCompletedValue() != UINT64_MAX && SUCCEEDED(gpu.device->GetDeviceRemovedReason());
+        }
+        if (safe) {
+          if (worker_list != nullptr) {
+            worker_list->Close();
+            const auto allocator_reset = worker_allocator->Reset();
+            const auto list_reset = worker_list->Reset(worker_allocator.Get(), nullptr);
+            safe &= SUCCEEDED(allocator_reset) && SUCCEEDED(list_reset);
+            if (safe) submission::OnCommandListReset(worker_list.Get());
+          }
+          gpu.list->Close();
+          const auto allocator_reset = gpu.allocator->Reset();
+          const auto list_reset = gpu.list->Reset(gpu.allocator.Get(), nullptr);
+          safe &= SUCCEEDED(allocator_reset) && SUCCEEDED(list_reset);
+          if (safe) submission::OnCommandListReset(gpu.list.Get());
+          submission::PruneCompletedGenerations();
+          safe &= submission::ResourceReleasable(candidate_slot.handle)
+              && submission::ResourceReleasable(candidate_proxy.Get())
+              && submission::ResourceReleasable(candidate_output.Get());
+        }
+        auto& cleanup = report["private_cleanup"];
+        cleanup["recordings_safe"] = safe;
+        try {
+          if (safe) {
+            const serial::PresentTurn turn(true);
+            safe = turn.owns();
+            cleanup["serialized_turn"] = safe;
+            if (safe) {
+              renodx::addons::dlss5::DirectCallScope direct;
+              if (candidate_slot.handle != nullptr) {
+                const auto result = release(candidate_slot.handle);
+                cleanup["release_result"] = static_cast<uint32_t>(result);
+                safe &= NVSDK_NGX_SUCCEED(result);
+                if (NVSDK_NGX_SUCCEED(result)) candidate_slot.handle = nullptr;
+              }
+              if (safe && candidate_slot.parameters != nullptr) {
+                const auto result = destroy(candidate_slot.parameters);
+                cleanup["destroy_parameters_result"] = static_cast<uint32_t>(result);
+                safe &= NVSDK_NGX_SUCCEED(result);
+                if (NVSDK_NGX_SUCCEED(result)) candidate_slot.parameters = nullptr;
+              }
+            }
+          }
+        } catch (...) {
+          cleanup["sdk_exception"] = true;
+          safe = false;
+        }
+        cleanup["completed"] = safe;
+        if (!safe) {
+          candidate_proxy.Detach();
+          candidate_output.Detach();
+          retained_depth.Detach();
+          retained_motion.Detach();
+          worker_allocator.Detach();
+          worker_list.Detach();
+          worker_fence.Detach();
+        }
+        return safe;
+      };
+      try {
+        for (uint32_t frame = 0; frame < 3; ++frame) evaluate_source("baseline");
+        const auto resources_start = addon::SteadyNowNs();
+        candidate_proxy = gpu.Texture(candidate_width, candidate_height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+        auto candidate_desc = candidate_proxy->GetDesc();
+        candidate_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        Check(SUCCEEDED(gpu.device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &candidate_desc,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&candidate_output))), "cold prepare private output");
+        auto candidate_transfer = gpu.CreateTextureTransfer(candidate_proxy.Get());
+        std::vector<uint16_t> candidate_data(static_cast<size_t>(candidate_width) * candidate_height * 4);
+        for (UINT y = 0; y < candidate_height; ++y) {
+          for (UINT x = 0; x < candidate_width; ++x) {
+            const size_t source = (static_cast<size_t>(y) * render_height / candidate_height * render_width
+                + static_cast<size_t>(x) * render_width / candidate_width) * 4;
+            std::memcpy(candidate_data.data() + (static_cast<size_t>(y) * candidate_width + x) * 4,
+                color_data.data() + source, 4 * sizeof(uint16_t));
+          }
+        }
+        gpu.Transition(candidate_proxy.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        gpu.UploadTexture(candidate_proxy.Get(), candidate_transfer, reinterpret_cast<const uint8_t*>(candidate_data.data()),
+            candidate_data.size() * sizeof(uint16_t), candidate_width * 8);
+        gpu.Transition(candidate_proxy.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        gpu.Submit();
+        report["private_resources"] = {{"cpu_prepare_and_upload_ms", (addon::SteadyNowNs() - resources_start) / 1'000'000.},
+            {"scope", "main-thread probe setup before worker starts; not worker preparation savings"},
+            {"proxy", reinterpret_cast<uintptr_t>(candidate_proxy.Get())}, {"output", reinterpret_cast<uintptr_t>(candidate_output.Get())},
+            {"depth", reinterpret_cast<uintptr_t>(retained_depth.Get())}, {"motion", reinterpret_cast<uintptr_t>(retained_motion.Get())},
+            {"input_crc32", renodx::utils::hash::ComputeCRC32(reinterpret_cast<const uint8_t*>(candidate_data.data()), candidate_data.size() * sizeof(uint16_t))},
+            {"production_workset_added", false}};
+        auto marker_upload = gpu.Buffer(sizeof(uint32_t), D3D12_HEAP_TYPE_UPLOAD);
+        auto marker_readback = gpu.Buffer(sizeof(uint32_t), D3D12_HEAP_TYPE_READBACK);
+        uint32_t* mapped = nullptr;
+        Check(SUCCEEDED(marker_upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped))), "cold prepare marker upload map");
+        *mapped = 0x4E525750;
+        marker_upload->Unmap(0, nullptr);
+        worker = std::jthread([&] {
+          try {
+            worker_report["thread_id"] = GetCurrentThreadId();
+            const auto resources_begin = addon::SteadyNowNs();
+            const auto allocator_result = gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&worker_allocator));
+            worker_report["allocator_result"] = allocator_result;
+            Check(SUCCEEDED(allocator_result), "cold worker allocator");
+            const auto list_result = gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                worker_allocator.Get(), nullptr, IID_PPV_ARGS(&worker_list));
+            worker_report["list_result"] = list_result;
+            Check(SUCCEEDED(list_result), "cold worker list");
+            const auto fence_result = gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&worker_fence));
+            worker_report["fence_result"] = fence_result;
+            Check(SUCCEEDED(fence_result), "cold worker fence");
+            worker_report["cpu_d3d_recording_resources_ms"] = (addon::SteadyNowNs() - resources_begin) / 1'000'000.;
+            {
+              const auto turn_begin = addon::SteadyNowNs();
+              const serial::PresentTurn turn(true);
+              worker_report["cpu_turn_acquire_ms"] = (addon::SteadyNowNs() - turn_begin) / 1'000'000.;
+              worker_report["turn_acquired"] = turn.owns();
+              Check(turn.owns(), "cold worker obtains its exclusive SDK turn");
+              renodx::addons::dlss5::DirectCallScope direct;
+              worker_sdk_active.store(true, std::memory_order_release);
+              const auto allocate_begin = addon::SteadyNowNs();
+              const auto allocated = allocate(&candidate_slot.parameters);
+              worker_report["allocate_result"] = static_cast<uint32_t>(allocated);
+              Check(NVSDK_NGX_SUCCEED(allocated) && candidate_slot.parameters != nullptr, "cold worker private parameters");
+              addon::SetNrCreateParameters(candidate_slot.parameters, candidate_width, candidate_height,
+                  candidate_width, candidate_height, create_flags, hdr_mode != 0, model_preset);
+              worker_report["cpu_parameters_ms"] = (addon::SteadyNowNs() - allocate_begin) / 1'000'000.;
+              worker_report["runtime_mutex_held"] = renodx::addons::dlss5::HoldingRuntimeLock();
+              worker_report["ngx_call_depth"] = serial::depth;
+              worker_report["create_calls"] = 1;
+              const auto begin = addon::SteadyNowNs();
+              create_entered_ns.store(begin, std::memory_order_release);
+              const auto created = create(worker_list.Get(), addon::kFeatureDlssNr, candidate_slot.parameters, &candidate_slot.handle);
+              const auto end = addon::SteadyNowNs();
+              worker_sdk_active.store(false, std::memory_order_release);
+              worker_report["create_begin_ns"] = begin;
+              worker_report["create_end_ns"] = end;
+              worker_report["cpu_create_ms"] = (end - begin) / 1'000'000.;
+              worker_report["create_result"] = static_cast<uint32_t>(created);
+              if (candidate_slot.handle != nullptr) {
+                submission::TrackUse(worker_list.Get(), candidate_slot.handle);
+                create_receipt = submission::ObserveRecording(worker_list.Get());
+              }
+              Check(NVSDK_NGX_SUCCEED(created) && candidate_slot.handle != nullptr, "cold worker Feature 18 Create");
+              const auto closed = worker_list->Close();
+              worker_report["close_result"] = closed;
+              Check(SUCCEEDED(closed), "cold worker closes initialization list");
+              ID3D12CommandList* lists[]{worker_list.Get()};
+              const auto pending = submission::BeginSubmission(1, lists);
+              worker_submitted = true;
+              gpu.queue->ExecuteCommandLists(1, lists);
+              const auto signaled = gpu.queue->Signal(worker_fence.Get(), 1);
+              worker_report["signal_result"] = signaled;
+              submission::CompleteSubmission(pending, SUCCEEDED(signaled) ? worker_fence.Get() : nullptr, 1);
+              Check(SUCCEEDED(signaled), "cold worker signals initialization proof");
+            }
+            worker_report["turn_released_ns"] = addon::SteadyNowNs();
+            const auto wait_begin = addon::SteadyNowNs();
+            HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            Check(event != nullptr, "cold worker completion event");
+            const auto armed = worker_fence->SetEventOnCompletion(1, event);
+            const auto waited = SUCCEEDED(armed) ? WaitForSingleObject(event, 10000) : WAIT_FAILED;
+            CloseHandle(event);
+            worker_report["set_event_result"] = armed;
+            worker_report["wait_result"] = waited;
+            worker_report["cpu_fence_wait_ms"] = (addon::SteadyNowNs() - wait_begin) / 1'000'000.;
+            worker_completed = waited == WAIT_OBJECT_0 && worker_fence->GetCompletedValue() >= 1
+                && worker_fence->GetCompletedValue() != UINT64_MAX && SUCCEEDED(gpu.device->GetDeviceRemovedReason());
+            worker_report["completed_fence"] = worker_fence->GetCompletedValue();
+            worker_report["device_removed_reason"] = gpu.device->GetDeviceRemovedReason();
+            worker_report["initialization_completed_healthy"] = worker_completed;
+            worker_report["gpu_completed_ns"] = addon::SteadyNowNs();
+            worker_report["production_ready_state_changed"] = false;
+            Check(worker_completed, "cold worker initialization GPU completes on a healthy device");
+            const auto allocator_reset = worker_allocator->Reset();
+            const auto list_reset = worker_list->Reset(worker_allocator.Get(), nullptr);
+            worker_report["allocator_reset_result"] = allocator_reset;
+            worker_report["list_reset_result"] = list_reset;
+            Check(SUCCEEDED(allocator_reset) && SUCCEEDED(list_reset), "cold worker closes replay lifetime");
+            submission::OnCommandListReset(worker_list.Get());
+            submission::PruneCompletedGenerations();
+          } catch (...) {
+            worker_error = std::current_exception();
+            worker_sdk_active.store(false, std::memory_order_release);
+          }
+          worker_finished.store(true, std::memory_order_release);
+        });
+        const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (create_entered_ns.load(std::memory_order_acquire) == 0 && !worker_finished.load(std::memory_order_acquire)
+            && std::chrono::steady_clock::now() < ready_deadline) std::this_thread::yield();
+        Check(create_entered_ns.load(std::memory_order_acquire) != 0, "cold worker reaches its bounded Create observation point");
+        const auto marker_begin = addon::SteadyNowNs();
+        queries.Begin(gpu.list.Get(), 15);
+        gpu.Retain(marker_upload.Get());
+        gpu.Retain(marker_readback.Get());
+        gpu.list->CopyBufferRegion(marker_readback.Get(), 0, marker_upload.Get(), 0, sizeof(uint32_t));
+        queries.EndAndResolve(gpu.list.Get(), 15);
+        const auto marker_recorded = addon::SteadyNowNs();
+        gpu.Submit();
+        const auto marker_complete = addon::SteadyNowNs();
+        Check(gpu.fence->GetCompletedValue() >= gpu.serial && gpu.fence->GetCompletedValue() != UINT64_MAX
+                  && SUCCEEDED(gpu.device->GetDeviceRemovedReason()),
+              "cold marker submission completes on a healthy device");
+        Check(SUCCEEDED(marker_readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped))), "cold marker completed readback");
+        const auto marker_value = *mapped;
+        marker_readback->Unmap(0, nullptr);
+        report["marker"] = {{"begin_ns", marker_begin}, {"complete_ns", marker_complete},
+            {"recorded_ns", marker_recorded}, {"cpu_record_ms", (marker_recorded - marker_begin) / 1'000'000.},
+            {"cpu_submit_fence_ms", (marker_complete - marker_recorded) / 1'000'000.},
+            {"cpu_record_submit_fence_ms", (marker_complete - marker_begin) / 1'000'000.},
+            {"gpu_ms", queries.Read(15).gpu_ms}, {"value", marker_value}, {"expected_value", 0x4E525750}};
+        Check(marker_value == 0x4E525750, "independent D3D marker copy completes correctly");
+        evaluate_source("worker-create");
+        worker.join();
+        report["worker"] = worker_report;
+        if (worker_error != nullptr) std::rethrow_exception(worker_error);
+        {
+          std::lock_guard lock(submission::tracker_mutex);
+          Check(create_receipt != nullptr && create_receipt->closed.load() && create_receipt->submitted.load()
+                    && create_receipt->completed_healthy, "cold candidate has exact completed initialization proof");
+          report["worker"]["receipt"] = {{"list", create_receipt->list}, {"generation", create_receipt->generation},
+              {"closed", create_receipt->closed.load()}, {"submitted", create_receipt->submitted.load()},
+              {"completed_healthy", create_receipt->completed_healthy}};
+        }
+        report["worker"]["handle"] = reinterpret_cast<uintptr_t>(candidate_slot.handle);
+        report["worker"]["parameters"] = reinterpret_cast<uintptr_t>(candidate_slot.parameters);
+        report["worker"]["list"] = reinterpret_cast<uintptr_t>(worker_list.Get());
+        report["worker"]["allocator"] = reinterpret_cast<uintptr_t>(worker_allocator.Get());
+        report["worker"]["queue"] = reinterpret_cast<uintptr_t>(gpu.queue.Get());
+        Check(candidate_slot.handle != original_nr && candidate_slot.parameters != original_parameters
+                  && candidate_proxy.Get() != original_proxy, "cold candidate owns independent feature, parameters and resources");
+        const auto create_begin = worker_report["create_begin_ns"].get<int64_t>();
+        const auto create_end = worker_report["create_end_ns"].get<int64_t>();
+        const auto foreground_begin = report["frames"].back()["source_start_ns"].get<int64_t>();
+        const bool marker_overlapped = marker_begin >= create_begin && marker_complete < create_end;
+        const bool foreground_overlapped = foreground_begin >= create_begin && foreground_begin < create_end;
+        report["marker"]["completed_during_create"] = marker_overlapped;
+        report["critical_path"] = {{"status", foreground_overlapped ? "Blocked" : "Inconclusive"},
+            {"foreground_attempted_during_create", foreground_overlapped},
+            {"actual_sr_entered_after_create", report["frames"].back()["sr_enter_ns"].get<int64_t>() >= create_end},
+            {"meaning", "one serialized Core gate also delays source SR; this probe does not enable concurrent Create/Evaluate"}};
+        candidate_slot.via_core = true;
+        candidate_slot.nr_preset = model_preset;
+        candidate_slot.nr_hdr_mode = hdr_mode;
+        candidate_slot.pending_reset = true;
+        candidate_slot.pending_reset_reasons = addon::kResetCreated;
+        addon::FinalResources candidate_resources{.proxy = candidate_proxy.Get(), .nr_output = candidate_output.Get(), .hdr_mode = hdr_mode};
+        const addon::EvaluationContract candidate_frame{.source_handle = owner, .motion = retained_motion.Get(), .depth = retained_depth.Get(),
+            .input_width = render_width, .input_height = render_height, .output_width = candidate_width, .output_height = candidate_height,
+            .motion_width = render_width, .motion_height = render_height, .create_flags = create_flags,
+            .motion_scale_x = 1.f, .motion_scale_y = 1.f, .frame_reset = 1};
+        gpu.list->ClearState(nullptr);
+        gpu.Retain(candidate_proxy.Get());
+        gpu.Retain(candidate_output.Get());
+        gpu.Retain(retained_depth.Get());
+        gpu.Retain(retained_motion.Get());
+        NVSDK_NGX_Result first_result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
+        const auto first_begin = addon::SteadyNowNs();
+        {
+          const serial::PresentTurn turn(true);
+          Check(turn.owns(), "cold candidate first Evaluate serialized turn");
+          renodx::addons::dlss5::DirectCallScope direct;
+          addon::SetEvaluationParameters(candidate_state, candidate_slot, 0, addon::history_reset_epoch.load(),
+              candidate_resources, candidate_frame, candidate_width, candidate_height, candidate_width, candidate_height);
+          submission::TrackUse(gpu.list.Get(), candidate_slot.handle);
+          submission::TrackUse(gpu.list.Get(), candidate_proxy.Get());
+          submission::TrackUse(gpu.list.Get(), candidate_output.Get());
+          evaluate_receipt = submission::ObserveRecording(gpu.list.Get());
+          queries.Begin(gpu.list.Get(), 16);
+          const auto evaluate_begin = addon::SteadyNowNs();
+          first_result = evaluate(gpu.list.Get(), candidate_slot.handle, candidate_slot.parameters, nullptr);
+          report["first_evaluate"]["cpu_sdk_ms"] = (addon::SteadyNowNs() - evaluate_begin) / 1'000'000.;
+          queries.EndAndResolve(gpu.list.Get(), 16);
+        }
+        const auto first_recorded = addon::SteadyNowNs();
+        gpu.Submit();
+        const auto first_completed = addon::SteadyNowNs();
+        report["first_evaluate"].update({{"result", static_cast<uint32_t>(first_result)}, {"reset_sent", candidate_slot.model_reset},
+            {"begin_ns", first_begin}, {"recorded_ns", first_recorded}, {"completed_ns", first_completed},
+            {"cpu_record_ms", (first_recorded - first_begin) / 1'000'000.}, {"gpu_ms", queries.Read(16).gpu_ms},
+            {"cpu_submit_fence_ms", (first_completed - first_recorded) / 1'000'000.},
+            {"cpu_complete_from_start_ms", (first_completed - first_begin) / 1'000'000.},
+            {"fence", gpu.serial}, {"completed_fence", gpu.fence->GetCompletedValue()}});
+        {
+          std::lock_guard lock(submission::tracker_mutex);
+          report["first_evaluate"]["receipt"] = {{"list", evaluate_receipt->list}, {"generation", evaluate_receipt->generation},
+              {"closed", evaluate_receipt->closed.load()}, {"submitted", evaluate_receipt->submitted.load()},
+              {"completed_healthy", evaluate_receipt->completed_healthy}};
+          Check(NVSDK_NGX_SUCCEED(first_result) && candidate_slot.model_reset && evaluate_receipt->closed.load()
+                    && evaluate_receipt->submitted.load() && evaluate_receipt->completed_healthy,
+                "the privately created new-size feature accepts its first Evaluate and completes on GPU");
+        }
+        evaluate_source("after-candidate");
+        report["serialization"] = {{"sdk_entry_refused", native_cold_sdk_entry_refused},
+            {"serial_timeouts_delta", serial::serial_timeouts.load() - native_cold_serial_timeouts_before},
+            {"overlap_counter_delta", serial::overlap.load() - overlap_before},
+            {"runtime_lock_contentions_delta", renodx::addons::dlss5::runtime_lock_contended.load() - runtime_contentions_before},
+            {"submit_lock_contentions_delta", renodx::addons::dlss5::submit_lock_blocked.load() - submit_contentions_before}};
+        Check(!worker_report["runtime_mutex_held"].get<bool>() && !native_cold_sdk_entry_refused
+                  && serial::serial_timeouts.load() == native_cold_serial_timeouts_before && serial::overlap.load() == overlap_before,
+              "cold worker never holds runtime_mutex or overlaps actual source SDK work");
+        report["contract_execution"] = "Passed";
+        report["independent_d3d_progress"] = marker_overlapped ? "Passed" : "Inconclusive";
+        report["coverage"] = marker_overlapped && foreground_overlapped ? "Passed" : "Inconclusive";
+        Check(cleanup_candidate(), "cold candidate releases its completed private feature and parameters");
+      } catch (...) {
+        const auto failure = std::current_exception();
+        if (worker.joinable()) worker.join();
+        native_cost_queries = nullptr;
+        native_cost_list = nullptr;
+        addon::ngx_slot_real[0].evaluate = nullptr;
+        report["worker"] = worker_report;
+        report["contract_execution"] = "Failed";
+        report["sdk_entry_refused"] = native_cold_sdk_entry_refused;
+        report["serialization"] = {{"serial_timeouts_delta", serial::serial_timeouts.load() - native_cold_serial_timeouts_before},
+            {"overlap_counter_delta", serial::overlap.load() - overlap_before}, {"worker_joined", true}};
+        try {
+          std::rethrow_exception(failure);
+        } catch (const std::exception& error) {
+          report["failure"] = error.what();
+        } catch (...) {
+          report["failure"] = "non-standard exception";
+        }
+        cleanup_candidate();
+        native_cold_worker_sdk_active = nullptr;
+        std::ofstream file("adaptive-native-cold-prepare.json", std::ios::binary | std::ios::trunc);
+        file << report.dump(2) << '\n';
+        file.close();
+        std::rethrow_exception(failure);
+      }
+      native_cold_worker_sdk_active = nullptr;
+      native_cost_list = nullptr;
+      std::ofstream file("adaptive-native-cold-prepare.json", std::ios::binary | std::ios::trunc);
+      file << report.dump(2) << '\n';
+      file.close();
+      Check(!file.fail(), "cold prepare probe checkpoint saved before source teardown");
+    } else if (resize_test) {
       const auto* ready_environment = std::getenv("NR_NEXUS_TEST_RESIZE_READY");
       native_resize_ready = ready_environment == nullptr || std::strcmp(ready_environment, "0") != 0;
       const auto* settings_environment = std::getenv("NR_NEXUS_TEST_RESIZE_SETTINGS");
@@ -3802,7 +4329,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     std::cout << "PASS ControlMask production chain stages=" << (single_stage ? "Upscaled" : "Render+Upscaled")
               << " evidence=NATIVE_GPU+NATIVE_NGX host_sr=" << (motion_test ? "NATIVE_NGX" : "MOCK") << " frames="
               << (resize_test ? resize_report["frames"].size() : (cost ? 80 : (motion_test ? 16 : (hot_toggle ? 52 : 1))))
-              << (resize_test ? (resize_report.value("settings_reuse_sequence", false)
+              << (cold_prepare ? " frame_scope=serialized-worker-cold-prepare" : resize_test ? (resize_report.value("settings_reuse_sequence", false)
                       ? " frame_scope=high-low-high-and-settings" : " frame_scope=high-low-high")
                   : (motion_test ? " frame_scope=paired_only" : ""))
               << " size=" << width << 'x' << height << " mask="
@@ -3818,11 +4345,17 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       const auto resumed = addon::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), owner, &parameters, nullptr);
       addon::ngx_slot_real[0].evaluate = nullptr;
       gpu.Submit();
+      if (cold_prepare) {
+        resize_report["teardown_apis"]["disabled_host_result"] = static_cast<uint32_t>(resumed);
+        resize_report["teardown_apis"]["disabled_actual_sr_calls"] = native_motion_sr_calls;
+        resize_report["teardown_apis"]["disabled_actual_nr_calls"] = native_runtime_results.size();
+      }
       Check(NVSDK_NGX_SUCCEED(resumed) && native_motion_sr_calls == 1 && native_runtime_results.empty(),
             "real SR continues once with no NR Evaluate after the add-on is disabled");
       addon::ngx_slot_real[0].release = reinterpret_cast<void*>(NVSDK_NGX_D3D12_ReleaseFeature);
       const auto released = addon::HookedReleaseFeatureSlot<0>(sr_handle);
       addon::ngx_slot_real[0].release = nullptr;
+      if (cold_prepare) resize_report["teardown_apis"]["source_release_result"] = static_cast<uint32_t>(released);
       Check(NVSDK_NGX_SUCCEED(released) && !addon::features.contains(owner),
             "production Release wrapper releases the real SR owner and retires its NR slots");
       Check(addon::get_module_filename_iat == nullptr && addon::original_get_module_filename == nullptr,
@@ -3837,6 +4370,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         renodx::addons::dlss5::DirectCallScope direct_call;
         if (addon::direct_api.shutdown != nullptr) {
           const auto shutdown = addon::direct_api.shutdown(addon::direct_device);
+          if (cold_prepare) resize_report["teardown_apis"]["production_shutdown_result"] = static_cast<uint32_t>(shutdown);
           Check(NVSDK_NGX_SUCCEED(shutdown), "production Runtime shutdown");
         }
         addon::direct_device->Release();
@@ -3844,8 +4378,12 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       }
     }
     if (motion_test) {
-      Check(NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D12_DestroyParameters(sr_parameters)), "release real SR parameters");
-      Check(NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D12_Shutdown1(gpu.device.Get())), "public SDK device shutdown");
+      const auto destroyed = NVSDK_NGX_D3D12_DestroyParameters(sr_parameters);
+      if (cold_prepare) resize_report["teardown_apis"]["sr_destroy_parameters_result"] = static_cast<uint32_t>(destroyed);
+      Check(NVSDK_NGX_SUCCEED(destroyed), "release real SR parameters");
+      const auto shutdown = NVSDK_NGX_D3D12_Shutdown1(gpu.device.Get());
+      if (cold_prepare) resize_report["teardown_apis"]["public_shutdown_result"] = static_cast<uint32_t>(shutdown);
+      Check(NVSDK_NGX_SUCCEED(shutdown), "public SDK device shutdown");
       native_motion_gpu = nullptr;
       if (resize_test) {
         Check(std::none_of(addon::worksets.begin(), addon::worksets.end(),
@@ -3854,7 +4392,9 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
               "ready-cache source release and completed teardown retain no owner worksets or retired NR resources");
         resize_report["teardown"] = {{"sr_continues_without_nr", true}, {"source_release", true},
             {"sdk_shutdown", true}, {"identity_bridge_installed", false}, {"retirement_drained", true}};
-        std::ofstream file("adaptive-native-resize.json", std::ios::binary | std::ios::trunc);
+        if (cold_prepare) resize_report["teardown_status"] = "Passed";
+        std::ofstream file(cold_prepare ? "adaptive-native-cold-prepare.json" : "adaptive-native-resize.json",
+                           std::ios::binary | std::ios::trunc);
         file << resize_report.dump(2) << '\n';
         file.close();
         Check(!file.fail(), "completed ready-cache teardown evidence JSON saved");
@@ -3885,6 +4425,12 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     }
     return 0;
   } catch (const std::exception& error) {
+    if (cold_prepare && !resize_report.is_null()) {
+      resize_report["failure"] = error.what();
+      if (resize_report.value("contract_execution", "") == "Passed") resize_report["teardown_status"] = "Failed";
+      std::ofstream file("adaptive-native-cold-prepare.json", std::ios::binary | std::ios::trunc);
+      file << resize_report.dump(2) << '\n';
+    }
     std::cerr << "FAIL ControlMask production NATIVE_NGX: " << error.what() << '\n';
     return 1;
   }

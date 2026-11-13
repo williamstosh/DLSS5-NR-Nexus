@@ -312,6 +312,14 @@ SDK 动态计数、固定倍率失效和来源切换。配置保存／方案另�
 锁竞争计数及实际源帧间隔。锁等待最大值是累计值；单线程夹具没有竞争不能证明并发创建安全。
 该序列不测试模型内部身份、游戏 FPS 或动态画质。运行后恢复这两个环境变量；普通入口仍用原往返。
 
+冷准备专项可单独设置 `NR_NEXUS_TEST_RESIZE_COLD_PREPARE=1`，仍运行同一个
+`control-mask-native-ngx-resize` 入口，改为私有 worker Create 与前台真实 SR／NR 的短对照。
+worker 使用同设备的独立参数、Feature、allocator 和命令列表，保留现有 NGX 串行门禁；
+报告分别记录独立 D3D 工作、前台门禁等待、初始化 GPU 完成和候选首次 Evaluate。
+只有实际时间区间重叠才认定覆盖，未重叠记为未判定；SDK 调用超时不会转为并发调用。
+结果保存为 `adaptive-native-cold-prepare.json`。该探针不启用生产异步准备，也不测试
+Feature18 Create／Evaluate 并发安全；结束后恢复环境变量。
+
 ## 自动回归与证据保存
 
 ~~~powershell
