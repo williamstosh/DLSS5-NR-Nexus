@@ -272,6 +272,47 @@ class StaticCaptureTests(unittest.TestCase):
                          ['addon-menu-render.png', 'addon-menu-cleanup.png'])
         self.assertTrue(all(call.kwargs == dict(activate=False) for call in self.desktop.capture.call_args_list))
 
+    def test_automatic_next_request_needs_new_mock_configuration_execution(self):
+        self.request(label='baseline', expected_stage='Upscaled')
+
+        def request_next():
+            progress = static_capture.read(self.run / 'static-progress.json')
+            self.assertEqual((progress['state'], progress['labels']), ('waiting', ['baseline']))
+            self.request(label='render', expected_stage='Render')
+
+        self.actions = {.5: lambda: self.append(evaluate('Upscaled', seq=2)),
+                        1: request_next,
+                        1.5: lambda: self.append(evaluate('Render', seq=3)),
+                        2: self.complete_request,
+                        2.5: lambda: self.append('NR-VERDICT v3 state=OFF stage=- reason=disabled\n')}
+        self.collect()
+        self.assertEqual((self.outcome()['functionalOutcome'], self.outcome()['labels']),
+                         ('Observed', ['baseline', 'render']))
+        self.assertTrue(self.runner.capture_complete(self.run, 42))
+
+    def test_automatic_next_request_without_configuration_execution_stays_blocked(self):
+        self.request(label='baseline', expected_stage='Upscaled')
+
+        def request_next():
+            progress = static_capture.read(self.run / 'static-progress.json')
+            self.assertEqual((progress['state'], progress['labels']), ('waiting', ['baseline']))
+            self.request(label='render', expected_stage='Render')
+
+        self.actions = {.5: lambda: self.append(evaluate('Upscaled', seq=2)),
+                        1: request_next,
+                        3.5: self.complete_request,
+                        4: lambda: self.append('NR-VERDICT v3 state=OFF stage=- reason=disabled\n')}
+        self.collect()
+        self.assertEqual((self.outcome()['functionalOutcome'], self.outcome()['labels']),
+                         ('Blocked', ['baseline']))
+        events = static_capture.read(self.run / 'static-events.json')
+        self.assertTrue(any(e['kind'] == 'blocked' and e['reason'] == 'actual_stage_not_observed' for e in events))
+
+    def test_cleanup_claim_with_current_engaged_cannot_complete(self):
+        self.complete_request()
+        self.actions = {.5: lambda: self.append('NR-VERDICT v3 state=ENGAGED stage=- reason=active\n')}
+        self.assert_failed('cleanup was not confirmed')
+
     def test_no_progress_becomes_blocked_then_safe_cleanup_stays_blocked(self):
         self.request(label='render', expected_stage='Render')
         self.actions = {.5: lambda: self.append('stage_plan[valid=1 requested=1:Render->Render]\n'),
