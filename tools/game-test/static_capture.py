@@ -163,7 +163,7 @@ def capture(run, entry_script=None):
         run, window, settings, remaining = context(run, entry_script or Path(sys.argv[0]))
         outer_deadline = time.monotonic() + remaining
         collection_deadline = outer_deadline - settings['exit_reserve_seconds']
-        waiting_deadline = min(collection_deadline, time.monotonic() + settings['stage_timeout_seconds'])
+        waiting_deadline = collection_deadline
         log = Path(window['path']).parent / 'ReShade.log'
 
         def record(kind, **values):

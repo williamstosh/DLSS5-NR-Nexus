@@ -181,6 +181,20 @@ class StaticCaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'stale'):
             static_capture.context(self.run, self.script, NOW.replace(second=10))
 
+    def test_first_request_after_sixty_seconds_keeps_its_stage_and_cleanup_budgets(self):
+        self.target.update(capture_hold_seconds=600, run_timeout=900,
+                           static_capture=dict(hold_seconds=600, exit_reserve_seconds=60,
+                                               stage_timeout_seconds=60, startup_exit_seconds=300))
+        self.save_target()
+        self.actions = {61: lambda: self.request(label='render', expected_stage='Render'),
+                        61.5: lambda: self.append(evaluate('Render', seq=2)),
+                        62: self.complete_request,
+                        62.5: lambda: self.append('NR-VERDICT v3 state=OFF stage=- reason=disabled\n')}
+        self.collect()
+        self.assertEqual(self.outcome()['functionalOutcome'], 'Observed')
+        self.assertEqual(self.outcome()['labels'], ['render'])
+        self.assertEqual(self.elapsed, 62.5)
+
     def test_configuration_requested_or_stale_evaluate_does_not_confirm_a_stage(self):
         planned = 'stage_plan[valid=1 requested=1:Render->Render evidence=current_configuration_not_execution]'
         cases = ([planned], [evaluate('Render', seq=1)], [evaluate('Render', seq=2, age_ms=6000)],
@@ -292,10 +306,15 @@ class StaticCaptureTests(unittest.TestCase):
         self.assertTrue(any(e.get('reason') == 'confirmation_pending' for e in events))
 
     def test_confirmation_click_without_actual_stage_never_confirms(self):
+        self.target.update(capture_hold_seconds=600, run_timeout=900,
+                           static_capture=dict(hold_seconds=600, exit_reserve_seconds=60,
+                                               stage_timeout_seconds=60, startup_exit_seconds=300))
+        self.save_target()
         self.request(label='render', expected_stage='Render', confirmation_required=True, confirmation_completed=True)
         self.actions = {.5: lambda: self.append(evaluate('Upscaled', seq=2))}
         self.assert_failed('cleanup was not confirmed')
         self.assertEqual(static_capture.read(self.run / 'capture-failed.json')['functionalOutcome'], 'Blocked')
+        self.assertEqual(self.elapsed, 120)
 
     def test_preexisting_off_or_overlay_request_alone_cannot_release_hold(self):
         self.append('NR-VERDICT v3 state=OFF stage=- reason=disabled\n')
@@ -317,26 +336,36 @@ class StaticCaptureTests(unittest.TestCase):
         self.assertEqual(self.outcome()['functionalOutcome'], 'Blocked')
         self.assertEqual(self.elapsed, 8)
 
-    def test_initial_wait_is_bounded_and_repeated_control_does_not_extend_the_next_wait(self):
-        self.request(label='render', expected_stage='Render')
+    def test_stage_gap_wait_and_cleanup_stay_sixty_seconds_after_late_handoff(self):
+        self.target.update(capture_hold_seconds=600, run_timeout=900,
+                           static_capture=dict(hold_seconds=600, exit_reserve_seconds=60,
+                                               stage_timeout_seconds=60, startup_exit_seconds=300))
+        self.save_target()
         repeat = lambda: self.request(label='render', expected_stage='Render')
-        self.actions = {.5: lambda: self.append(evaluate('Render', seq=2)),
-                        1: repeat, 1.5: repeat, 2: repeat,
-                        3: self.complete_request,
-                        3.5: lambda: self.append('NR-VERDICT v3 state=OFF stage=- reason=disabled\n')}
-        self.collect()
-        self.assertEqual(self.outcome()['functionalOutcome'], 'Blocked')
+        self.actions = {61: repeat,
+                        61.5: lambda: self.append(evaluate('Render', seq=2)),
+                        62: repeat, 80: repeat, 120: repeat}
+        self.assert_failed('cleanup was not confirmed')
+        self.assertEqual(static_capture.read(self.run / 'capture-failed.json')['functionalOutcome'], 'Blocked')
         events = static_capture.read(self.run / 'static-events.json')
         blocked = next(e for e in events if e['kind'] == 'blocked')
         self.assertEqual(blocked['reason'], 'waiting_for_stage_request')
-        self.assertEqual(self.elapsed, 3.5)
+        self.assertEqual(self.elapsed, 181.5)
 
-    def test_no_initial_request_enters_cleanup_at_stage_wait_limit(self):
-        self.actions = {2.5: self.complete_request,
-                        3: lambda: self.append('NR-VERDICT v3 state=OFF stage=- reason=disabled\n')}
-        self.collect()
-        self.assertEqual(self.elapsed, 3)
-        self.assertEqual(self.outcome()['functionalOutcome'], 'Blocked')
+    def test_no_initial_request_is_bound_by_total_collection_and_cleanup_deadlines(self):
+        self.target.update(capture_hold_seconds=600, run_timeout=900,
+                           static_capture=dict(hold_seconds=600, exit_reserve_seconds=60,
+                                               stage_timeout_seconds=60, startup_exit_seconds=300))
+        self.save_target()
+        states = []
+        observe = lambda: states.append(static_capture.read(self.run / 'static-progress.json')['state'])
+        self.actions = {60.5: observe, 540.5: observe}
+        self.assert_failed('cleanup was not confirmed')
+        self.assertEqual(states, ['waiting', 'cleanup'])
+        self.assertEqual(self.elapsed, 600)
+        events = static_capture.read(self.run / 'static-events.json')
+        blocked = next(e for e in events if e['kind'] == 'blocked')
+        self.assertEqual(blocked['reason'], 'collection_budget_exhausted')
 
     def test_cancel_identity_loss_and_focus_loss_keep_completion_absent(self):
         cases = ('cancel', 'identity', 'focus')
