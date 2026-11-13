@@ -894,12 +894,81 @@ int main() {
       }
       check(applied, "R2 synthetic configuration applies with XeFG SDK enabled");
       const auto baseline = profile::Snapshot();
-      const auto record = [&](const char* step) {
+      const auto record = [&](const std::string& step) {
+        const auto& context = *ImGui::GetCurrentContext();
+        const auto* modal = ImGui::FindWindowByName("###nr_stage_change");
+        Json popups = Json::array();
+        for (const auto& popup : context.OpenPopupStack) {
+          popups.push_back({{"id", popup.PopupId}, {"window", popup.Window == nullptr ? "" : popup.Window->Name}});
+        }
+        bool modal_rendered = false;
+        for (const auto* draw_list : ImGui::GetDrawData()->CmdLists) {
+          if (modal != nullptr && draw_list == modal->DrawList) {
+            modal_rendered = true;
+          }
+        }
         const Json observed{{"step", step}, {"hook", runtime::hook_point.load()}, {"pass2_stage", runtime::pass_stage[0].load()},
                             {"pending", edit::pending}, {"confirmation_required", edit::confirmation_required},
                             {"error", edit::error}, {"writes", configuration_writes}, {"cache_hook", configuration_fixture::cache.at({runtime::kConfigSection, "NRHookPoint"})},
-                            {"profile_loaded", profile::loaded}, {"differences", Json::diff(baseline, profile::Snapshot())}};
+                            {"profile_loaded", profile::loaded}, {"differences", Json::diff(baseline, profile::Snapshot())},
+                            {"frame", context.FrameCount}, {"language", runtime::ui_language_choice.load()},
+                            {"mouse", {{"x", io.MousePos.x}, {"y", io.MousePos.y}, {"down", io.MouseDown[0]},
+                                       {"clicked", io.MouseClicked[0]}, {"released", io.MouseReleased[0]},
+                                       {"active_id", context.ActiveId}, {"hovered_id", context.HoveredId}}},
+                            {"open_popups", popups}, {"begin_popup_depth", context.BeginPopupStack.Size},
+                            {"modal", {{"id", modal == nullptr ? 0 : modal->ID}, {"popup_id", modal == nullptr ? 0 : modal->PopupId},
+                                       {"name", modal == nullptr ? "" : modal->Name}, {"active", modal != nullptr && modal->Active},
+                                       {"rendered", modal_rendered}}}};
         std::ofstream("stage-switch-actions.jsonl", std::ios::app) << observed.dump() << '\n';
+      };
+      const auto cancel_preview = [&](const std::string& step) {
+        const auto button = find("cancel_stage_change");
+        const auto* modal = ImGui::FindWindowByName("###nr_stage_change");
+        check(modal != nullptr && modal->Active && button.window == modal && edit::pending,
+              "the real Cancel button belongs to the active pending confirmation modal");
+        const ImGuiID popup_id = modal->PopupId;
+        const auto writes_before = configuration_writes;
+        const auto center = button.rect.GetCenter();
+        const auto delta_time = io.DeltaTime;
+        io.DeltaTime = .02f;
+        io.AddMousePosEvent(center.x, center.y);
+        frame();
+        record(step + "_hover");
+        io.AddMouseButtonEvent(0, true);
+        for (int held_frame = 0; held_frame < 6; ++held_frame) {
+          frame();
+          record(step + "_down_" + std::to_string(held_frame));
+          check(io.MouseDown[0] && edit::pending && modal->Active
+                    && ImGui::GetCurrentContext()->ActiveId == button.id,
+                "a 120 ms real MouseDown holds Cancel without activating its release action");
+        }
+        io.AddMouseButtonEvent(0, false);
+        frame();
+        record(step + "_up");
+        check(io.MouseReleased[0] && !edit::pending && !edit::confirmation_required
+                  && profile::Snapshot() == baseline && configuration_writes == writes_before,
+              "real Cancel release clears only the preview and leaves every setting and cache write intact");
+        for (int settled_frame = 0; settled_frame < 4; ++settled_frame) {
+          frame();
+          record(step + "_settled_" + std::to_string(settled_frame));
+          bool popup_open = false;
+          for (const auto& popup : ImGui::GetCurrentContext()->OpenPopupStack) {
+            if (popup.PopupId == popup_id) {
+              popup_open = true;
+            }
+          }
+          bool modal_rendered = false;
+          for (const auto* draw_list : ImGui::GetDrawData()->CmdLists) {
+            if (draw_list == modal->DrawList) {
+              modal_rendered = true;
+            }
+          }
+          check(!popup_open && !modal->Active && !modal_rendered
+                    && ImGui::GetCurrentContext()->BeginPopupStack.empty()
+                    && !edit::pending && profile::Snapshot() == baseline && configuration_writes == writes_before,
+                "after Cancel the proposal stays absent from popup stacks, active windows and rendered draw lists");
+        }
+        io.DeltaTime = delta_time;
       };
       record("baseline");
       check(xefg::Enabled() && !xefg::OwnsStream(),
@@ -963,9 +1032,16 @@ int main() {
       frame(); frame();
       check(profile::Snapshot() == baseline && configuration_writes == preview_writes,
             "an unconfirmed Present preview cannot change the runtime or configuration cache");
-      click(find("cancel_stage_change"));
+      cancel_preview("present_cancel");
       record("present_cancelled");
       check(!edit::pending && profile::Snapshot() == baseline, "real Cancel preserves the R2 stage chain");
+      runtime::ui_language_choice = 14;
+      frame(); frame();
+      click(find(ui::Tr("Present")));
+      record("present_preview_zh");
+      cancel_preview("present_cancel_zh");
+      runtime::ui_language_choice = 1;
+      frame(); frame();
       configuration_fixture::dropped_key = "NRHookPoint";
       check(edit::Prepare(runtime::kSetHookPoint, 1.f) && !edit::Confirm() && !edit::error.empty()
                 && profile::Snapshot() == baseline,
@@ -1029,7 +1105,7 @@ int main() {
             "the complete rejected confirmation fits inside the recorded capture canvas");
       capture("stage-confirm-error-en");
       const auto dismiss_writes = configuration_writes;
-      click(find("cancel_stage_change"));
+      cancel_preview("rejected_present_cancel");
       check(!edit::pending && edit::error.empty() && profile::Snapshot() == baseline
                 && configuration_writes == dismiss_writes,
             "real Cancel clears a rejected Present preview without changing settings");
@@ -1068,7 +1144,7 @@ int main() {
             "retrying confirmation commits both Present stages and preserves every unrelated R2 setting");
       CloseHandle(disk_lock);
       Json receipt{{"scope", "CPU real ImGui, independent ReShade cache contract model and synthetic runtime evidence"},
-                   {"input", "normal fixture click: down and up consumed in separate ImGui frames"},
+                   {"input", "real ImGui MouseDown held for six 20 ms frames, then MouseUp and four subsequent frames"},
                    {"viewport", {{"width", io.DisplaySize.x}, {"height", io.DisplaySize.y}, {"capture_matches_viewport", true}}},
                    {"render", {{"eligible", true}, {"changes", render}, {"confirmation_required", false}}},
                    {"present", {{"eligible", true}, {"changes", present}, {"confirmation_required", true}}},
@@ -1079,6 +1155,10 @@ int main() {
                                          {"post_draw_error", post_draw_error}, {"direct_visible_frames", 4}, {"modal_visible_frames", 3},
                                          {"new_request_clears_old_error", true}, {"success_clears_error", true},
                                          {"cancel_escape_title_close", "passed"}}},
+                   {"cancel_popup_lifecycle", {{"status", "passed"}, {"languages", {"en-US", "zh-CN"}},
+                                                {"held_ms", 120}, {"subsequent_frames", 4},
+                                                {"assertions", {"preview cleared", "settings unchanged", "cache writes unchanged",
+                                                                "popup stack closed", "modal inactive", "draw list absent"}}}},
                    {"actual_execution", "not run; fixture does not prove game API, GPU or visual behavior"}};
       std::ofstream("stage-switch-receipt.json") << receipt.dump(2);
       std::printf("PASS R2 stage-switch UI/cache and visible error lifecycle cases; checks=%u\n", checks);
@@ -1142,6 +1222,14 @@ int main() {
         check(!edit::pending && profile::Snapshot() == single && ini_bytes() == ini
                   && configuration_writes == write_count,
               "cancelling pass reentry preserves every active and dormant setting and exact persistence");
+        for (int settled_frame = 0; settled_frame < 4; ++settled_frame) {
+          frame();
+          const auto* modal = ImGui::FindWindowByName("###nr_stage_change");
+          check(modal != nullptr && !modal->Active && ImGui::GetCurrentContext()->OpenPopupStack.empty()
+                    && ImGui::GetCurrentContext()->BeginPopupStack.empty() && !edit::pending
+                    && profile::Snapshot() == single && ini_bytes() == ini && configuration_writes == write_count,
+                "cancelled pass reentry leaves no active modal or popup in subsequent frames");
+        }
         click(find("2"));
         click(find("confirm_stage_change"));
         auto expected = single;
