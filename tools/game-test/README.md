@@ -12,6 +12,37 @@
 
 采集器读取 capture-ready.json 的 automatic_foreground=true 和本次 owned-process.json，核对唯一进程／窗口身份并自动激活。动态采样与转镜期间持续核验前台和几何，失焦即停止，不在采样中反复激活。收到 capture-cancel.json 应停止输入并结束自己的采样子进程；异常写 capture-failed.json，成功收尾才写匹配 PID 的 capture-complete.json。使用 CaptureScript 时还必须由父进程观察到脚本零码退出并写 capture-script-result.json，worker 才允许请求正常退出。提前完成、失败／损坏凭据或超时不能释放门禁。恢复前先结束采集器和 worker，文件保护保持到本次游戏退出并恢复完成。
 
+静态阶段采证使用 `-CaptureScript tools/game-test/static_capture.py`（入口会解析为绝对路径）。采集器直接采用 runner 传入的本次目录，核对 `target.json` 哈希、脚本哈希和 owner／ready 身份，不限定 case 目录名。先生成本轮目标副本，原目标不改：
+
+```powershell
+& $pythonPath -B ./tools/game-test/static_capture.py --prepare-target $targetPath `
+    --output-target "$taskRoot/target.json" --hold-seconds 600 `
+    --exit-reserve-seconds 60 --stage-timeout-seconds 60
+```
+
+在已获授权的原受保护入口同时使用 `-TargetPath "$taskRoot/target.json" -CaptureHoldSeconds 600`。副本按原目标启动／载档预算加退出预留派生 `run_timeout`；启动120＋载档120＋采集600＋退出60秒时为900秒，原默认420秒不足。`static_capture` 专用字段记录本轮预算，collector 拒绝 Hold 与副本不一致或 overall 不足；从 ready 时间扣除已耗时间，以 Hold 减退出预留得到采证截止时间。候选、备份范围和输入／确认路线在启动前备齐，运行中只做约定阶段及进度核验，长日志和源码归因放到退出后；只安排本轮必要的三个阶段，有结果立即收尾。
+
+主代理原子写入本次 `static-control.json`，例如 `{"pid":42,"label":"render","expected_stage":"Render","expected_pass":1,"expected_plan":{"1":"Render","2":"Upscaled"},"confirmation_required":false}`（PID 取本次 ready，Pass 默认1）。等 `static-progress.json` 的 `state=awaiting_stage`、`pending_label=render` 后操作；需要确认的 UI 先实际完成确认，再在同一请求写 `confirmation_completed=true`。`expected_plan` 核对整个当前请求／有效计划；只指定 `expected_pass` 时仅核对该层，其他层不推导。Render＋Upscaled 的双层请求观察Pass1；同阶段双层周期日志常保留最后一层，Present双层应指定 `expected_pass=2`、两层Present及 `confirmation_required=true`。输入由主代理复用 `desktop.click(window,x,y,activate=False)`／`desktop.key(window,name,activate=False)`：window 来自已核对的本次 owner／ready，操作前检查取消／失败凭据和前台，坐标来自刚观察的原图，并把动作与观察时间写入本次 journal。现有 click 按下120ms、key 默认200ms，均在 finally 释放。旧的带 case 路径临时 action 脚本和一次 CUA 点击记录不能充当切换成功。collector 不自动点坐标；只有请求后的完整新增日志、超过请求前基线的序号、按首次观察区间核对的 age_ms，以及当前有效计划和成功 `last_nr_evaluate` 一致才记录 `stage_observed`。规划、旧 Evaluate、点击和未完成确认均不足；API 回执不提供 GPU 完成或视觉验收结论。
+
+已获授权的主代理动作可复用同一身份检查；下面的坐标和观察时间来自刚捕获的原图，完成点击后仍等待 collector 的实际阶段回执：
+
+```python
+run, window, _, _ = static_capture.context(run_directory, Path('tools/game-test/static_capture.py'))
+if any((run / name).exists() for name in ('capture-cancel.json', 'capture-failed.json')):
+    raise RuntimeError('Protected capture is stopping')
+progress = static_capture.read(run / 'static-progress.json')
+if progress['state'] != 'awaiting_stage' or progress['seconds_remaining'] <= 0:
+    raise RuntimeError('Static stage input window is closed')
+desktop.require_foreground(window, 'static input')
+started = stamp()
+desktop.click(window, observed_x, observed_y, activate=False)
+with (run / 'actions.jsonl').open('a', encoding='utf-8') as journal:
+    journal.write(json.dumps(dict(started=started, finished=stamp(), action='click',
+        observed_at=observed_at, x=observed_x, y=observed_y, stage_result='pending')) + '\n')
+```
+
+首次请求、每阶段执行和阶段成功后等待下一请求均限60秒；重复 control 不延长窗口。首个 baseline 应安排在 ready 后45秒内。无进展即记 `functionalOutcome=Blocked`，停止接受新阶段并进入最多60秒的清理窗口；总采证预算到期也如此。正常完成时先写同 PID 的 `{"completed":true}` 请求清理，等 `state=cleanup` 后实际关闭面板、关闭 NR，再补 `overlay_closed=true,nr_off=true`。`overlay_closed` 是主代理对实际画面的确认，不由 Home 按键推断。collector 要求清理开始后新增且最新的 NR OFF 日志，并留一张 `addon-menu-cleanup.png`，才写完成凭据并零码退出；缺证、取消、失焦、身份变化和清理超时仍失败。`static-progress.json` 分别记录当前窗口和总采集预算余量；`static-complete.json` 保留 `Blocked`／`Observed`／`NotTested`，runner 的启动／退出成功不把 `Blocked` 变为功能通过。
+
 回归覆盖后台激活、最小化恢复、身份变化拒绝、失败门禁、脚本单次启动、完成与退出顺序及保护恢复。单测属于 MOCK／本地文件合同；独立 Windows 窗口探针验证前台 API 路径，IN_GAME／VISUAL 和长时稳定性另行验收。
 
 旧桌面选档曾依赖唯一时间戳、焦点和鼠标输入；默认脚本流程不再调用这段路径。游戏桥按存档文件名加载，并将游戏引擎状态与本地存档哈希分别记录。采集前的进程响应检查仍执行；它不替代画面、视觉效果或性能验收。
@@ -36,6 +67,12 @@ Windows 入口会在替换安装文件前，通过合成文件的最终句柄路
 
 ```powershell
 & $pythonPath -B -m unittest discover -s tools/game-test -p 'test_*.py' -v
+```
+
+只验证静态采集合同可使用独立 CPU／MOCK 入口；窗口 API、进程和输入均为替身：
+
+```powershell
+& $pythonPath -B -m unittest discover -s tools/game-test -p test_static_capture.py -v
 ```
 
 单测包含真实 Windows 文件共享锁检查和 mock 编排检查，不启动游戏。符号链接用例可能因系统权限跳过。
