@@ -102,7 +102,22 @@ def capture_script_complete(out, pid):
 def dump(path, value):
     temp = Path(str(path) + '.tmp')
     temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
-    os.replace(temp, path)
+    deadline = None
+    while True:
+        try:
+            os.replace(temp, path)
+            return
+        except PermissionError as error:
+            # Windows readers without FILE_SHARE_DELETE can briefly block replacement.
+            if getattr(error, 'winerror', None) not in (5, 32):
+                raise
+            now = time.monotonic()
+            if deadline is None:
+                deadline = now + 0.5
+            remaining = deadline - now
+            if remaining <= 0:
+                raise
+            time.sleep(min(0.025, remaining))
 
 def sha(path):
     with open(path, 'rb') as stream:
