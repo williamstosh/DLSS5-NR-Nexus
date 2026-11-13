@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('all','report','branding','ui','presets','unicode-input','native','lastgasp','sdr-policy','hdr-policy','scope','config','constants','control-mask','control-mask-execution','vulkan-control-mask','fg-xefg','fg-native','lifecycle','bridge-motion','stage-plan','adaptive-resolution','copy-slots')]
+    [ValidateSet('all','report','branding','ui','dev-control','presets','unicode-input','native','lastgasp','sdr-policy','hdr-policy','scope','config','constants','control-mask','control-mask-execution','vulkan-control-mask','fg-xefg','fg-native','lifecycle','bridge-motion','stage-plan','adaptive-resolution','copy-slots')]
     [string[]]$Suite = @('all'),
     [string]$SourceRoot = (Split-Path $PSScriptRoot -Parent),
     [string]$HostRoot = (Join-Path (Split-Path $PSScriptRoot -Parent) '.local/renodx'),
@@ -116,7 +116,7 @@ foreach ($item in $Suite) {
         & (Join-Path $testRoot 'run-preset-dialog-tests.ps1') -OutputDirectory (Join-Path $OutputDirectory 'preset-dialog') -VcVars64 $VcVars64
         continue
     }
-    if ($item -in @('report','config','constants','lifecycle','ui')) {
+    if ($item -in @('report','config','constants','lifecycle','ui','dev-control')) {
         if ($BuildOnly) { throw '-BuildOnly is supported for native/policy/scope/fg-xefg/fg-native/bridge-motion; select these explicitly.' }
         $entry = switch ($item) {
             report { 'run-report-tests.ps1' }
@@ -124,9 +124,13 @@ foreach ($item in $Suite) {
             constants { 'run-present-hdr-runtime-constants-tests.ps1' }
             lifecycle { 'run-fg-lifecycle-tests.ps1' }
             ui { 'run-ui-layout-tests.ps1' }
+            'dev-control' { 'run-ui-layout-tests.ps1' }
         }
         if ($item -eq 'report') {
             & (Join-Path $testRoot $entry) @parameters -OutputDirectory $directory -PythonExecutable $PythonExecutable
+        } elseif ($item -eq 'dev-control') {
+            & (Join-Path $testRoot $entry) @parameters -OutputDirectory $directory -DevControlOnly
+            & (Join-Path $testRoot 'run-dev-control-pipe-tests.ps1') -SourceRoot $SourceRoot -HostRoot $HostRoot -OutputDirectory (Join-Path $directory 'pipe') -VcVars64 $VcVars64
         } else {
             & (Join-Path $testRoot $entry) @parameters -OutputDirectory $directory
         }

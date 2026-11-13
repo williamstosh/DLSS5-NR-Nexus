@@ -20,6 +20,34 @@
     --exit-reserve-seconds 60 --stage-timeout-seconds 60
 ```
 
+开发接口接线需显式给目标副本设置 `static_capture.dev_control=true`，或在上述准备命令增加 `--development-control`。默认仍沿用手工菜单路径。接口客户端 `tools/dev_control.py` 只依赖 Python 标准库，连接 `\\.\pipe\nr-nexus-dev-<pid>`；每帧为 4 字节小端长度和最多 64 KiB 的 UTF-8 JSON。连接等待、OVERLAPPED 读写、部分帧和确认往返共用有界 deadline。客户端核对管道服务 PID，并在请求前后核对 `owned-process.json.created` 的原始 Windows FILETIME；`--process-created` 使用该整数的十进制字符串，不转换成 Unix 时间。接口需由开发候选显式启用；本说明不授予安装或游戏启动权限。
+
+开发候选使用 `tools/build.ps1 -ToolRoot <既有工具目录> -Configuration Release -DevControl -BuildDirectory build/dev-control`；该开关不能使用普通 `build` 输出目录。普通构建显式设置 `NR_NEXUS_DEV_CONTROL=OFF`，开发目录与普通目录的 DLL 分别核对哈希和实际加载身份。无面板／绘制请求时接口仍由选定 ReShade 帧回调执行。只读配置状态不建立 GPU 完成证据；区域遮罩的 `resolved_masks` 也只表示逐层解析参数。
+
+```powershell
+& $pythonPath -B ./tools/dev_control.py --pid 42 --process-created 123 status
+& $pythonPath -B ./tools/dev_control.py --pid 42 --process-created 123 set NRHookPoint 1
+```
+
+`set` 一次提交一个现有 INI key 和 JSON 类型值。返回 `confirmation_required` 时默认停止；只有明确使用 `--confirm`，或阶段请求显式写入 `confirmation_required=true`，才将服务返回的完整 `identity` 和 `changes` 原样携带到新请求，由服务复核提案。服务复用菜单的配置缓存／持久化提交语义，受保护 runner 在退出时恢复原文件。不能把接口配置当作临时无副作用事务。`status` 遇到 `available=false` 且原因为 `runtime_busy`／`configuration_changed` 时，只在同一 deadline 内重试读取。连接失败或 `outcome_unknown` 后仅以 `status(query_id=<原请求ID>)` 查询 `receipt`，不会自动重放设置；deadline 内没有明确回执则抛出 `OutcomeUnknown`，可另用 `--query-id <原请求ID> status` 核查。
+
+collector 在每个 active 阶段先读状态，仅在 NR 关闭时请求 `NeuralUplift=true`，再设置 `NRHookPoint`（0 Upscaled／1 Render／2 Present）、所需 `NRPasses` 及第 2–4 层的 `NRPassNStage`（1 Render／2 Upscaled／3 Present，0 为继承）。依赖改动与危险阶段确认由服务生成提案，不在客户端复制菜单规则。接口模式的多层请求须提供从 Pass1 开始连续完整的 `expected_plan`；省略时为单层 Pass1。请求、实际 `changes` 和回执 `state.settings` 写入 `static-events.json`，随后仍等待当前完整计划和新序列的成功 `last_nr_evaluate`，才记录 `stage_observed`。赋值只提供配置证据，API 成功单独记为 API 证据；GPU 完成只读取 snapshot 的 `completion.current`，collector 不由配置或 API 成功推导 GPU 完成或图像质量。
+
+目标副本可进一步设置 `static_capture.stages`，按顺序自动执行三至四个阶段，免去外部脚本逐次写入 control 文件。例如：
+
+```json
+{
+  "dev_control": true,
+  "stages": [
+    {"label":"baseline","expected_stage":"Upscaled","expected_plan":{"1":"Upscaled"}},
+    {"label":"render","expected_stage":"Render","expected_plan":{"1":"Render"}},
+    {"label":"present","expected_stage":"Present","expected_plan":{"1":"Present"},"confirmation_required":true}
+  ]
+}
+```
+
+将这些字段合并进目标已有的 `static_capture` 预算对象；阶段 label 必须唯一。全部阶段观察完毕后自动进入 cleanup，请求 `NeuralUplift=false`，记录 `applied`／`unchanged` 回执及实际关闭状态。接口模式随后读取新的 status，要求 `settings.NeuralUplift=false`、来自真实 overlay 事件的 `overlay_open=false`，再等 cleanup 开始后新增 OFF 日志并采集截图，以 `API_OBSERVED_OVERLAY_CLOSED` 记录关板证据，无需外部写入手工完成文件。overlay 仍打开时持续等待至有界清理截止，不自动发送 Home 键。`disabled_resources_released` 单独记录，不由 OFF 或 API 回执推导 GPU 资源释放。父进程观察到采集脚本零码退出的完成门禁保留；非接口模式仍要求主代理观察画面后填写 overlay closed／`nr_off`。`static-control.json` 的手工阶段请求、取消与完成入口保留。少量菜单开关、确认框和 overlay 开关的实机 smoke 仍由主代理按当次授权验收。
+
 在已获授权的原受保护入口同时使用 `-TargetPath "$taskRoot/target.json" -CaptureHoldSeconds 600`。副本按原目标启动／载档预算加退出预留派生 `run_timeout`；启动120＋载档120＋采集600＋退出60秒时为900秒，原默认420秒不足。`static_capture` 专用字段记录本轮预算，collector 拒绝 Hold 与副本不一致或 overall 不足；从 ready 时间扣除已耗时间，以 Hold 减退出预留得到采证截止时间。候选、备份范围和输入／确认路线在启动前备齐，运行中只做约定阶段及进度核验，长日志和源码归因放到退出后；只安排本轮必要的三个阶段，有结果立即收尾。
 
 主代理原子写入本次 `static-control.json`，例如 `{"pid":42,"label":"render","expected_stage":"Render","expected_pass":1,"expected_plan":{"1":"Render","2":"Upscaled"},"confirmation_required":false}`（PID 取本次 ready，Pass 默认1）。等 `static-progress.json` 的 `state=awaiting_stage`、`pending_label=render` 后操作；需要确认的 UI 先实际完成确认，再在同一请求写 `confirmation_completed=true`。`expected_plan` 核对整个当前请求／有效计划；只指定 `expected_pass` 时仅核对该层，其他层不推导。Render＋Upscaled 的双层请求观察Pass1；同阶段双层周期日志常保留最后一层，Present双层应指定 `expected_pass=2`、两层Present及 `confirmation_required=true`。输入由主代理复用 `desktop.click(window,x,y,activate=False)`／`desktop.key(window,name,activate=False)`：window 来自已核对的本次 owner／ready，操作前检查取消／失败凭据和前台，坐标来自刚观察的原图，并把动作与观察时间写入本次 journal。现有 click 按下120ms、key 默认200ms，均在 finally 释放。旧的带 case 路径临时 action 脚本和一次 CUA 点击记录不能充当切换成功。collector 不自动点坐标；只有请求后的完整新增日志、超过请求前基线的序号、按首次观察区间核对的 age_ms，以及当前有效计划和成功 `last_nr_evaluate` 一致才记录 `stage_observed`。规划、旧 Evaluate、点击和未完成确认均不足；API 回执不提供 GPU 完成或视觉验收结论。
@@ -73,6 +101,7 @@ Windows 入口会在替换安装文件前，通过合成文件的最终句柄路
 
 ```powershell
 & $pythonPath -B -m unittest discover -s tools/game-test -p test_static_capture.py -v
+& $pythonPath -B -m unittest discover -s tests -p test_dev_control.py -v
 ```
 
 单测包含真实 Windows 文件共享锁检查和 mock 编排检查，不启动游戏。符号链接用例可能因系统权限跳过。

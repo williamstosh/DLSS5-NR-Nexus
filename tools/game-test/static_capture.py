@@ -45,7 +45,7 @@ def budget(target):
 
 
 def prepare_target(source, destination, hold_seconds=600, exit_reserve_seconds=60,
-                   stage_timeout_seconds=60, startup_exit_seconds=None):
+                   stage_timeout_seconds=60, startup_exit_seconds=None, development_control=False):
     """Write a new local target copy; never modify the user's original target."""
     source = Path(source).resolve(strict=True)
     destination = Path(destination).resolve()
@@ -54,14 +54,105 @@ def prepare_target(source, destination, hold_seconds=600, exit_reserve_seconds=6
     target = read(source)
     overhead = (target.get('startup_timeout', 120) + target.get('load_timeout', 120)
                 + exit_reserve_seconds if startup_exit_seconds is None else startup_exit_seconds)
-    target.update(capture_hold_seconds=hold_seconds, run_timeout=hold_seconds + overhead,
-                  static_capture=dict(hold_seconds=hold_seconds, exit_reserve_seconds=exit_reserve_seconds,
-                                      stage_timeout_seconds=stage_timeout_seconds, startup_exit_seconds=overhead))
+    options = dict(target.get('static_capture', {}))
+    options.update(hold_seconds=hold_seconds, exit_reserve_seconds=exit_reserve_seconds,
+                   stage_timeout_seconds=stage_timeout_seconds, startup_exit_seconds=overhead)
+    target.update(capture_hold_seconds=hold_seconds, run_timeout=hold_seconds + overhead, static_capture=options)
+    if type(development_control) is not bool:
+        raise ValueError('development_control must be Boolean')
+    if development_control:
+        target['static_capture']['dev_control'] = True
     budget(target)
+    development_options(target)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open('x', encoding='utf-8') as stream:
         json.dump(target, stream, ensure_ascii=False, indent=2)
     return target
+
+
+def development_options(target):
+    options = target.get('static_capture', {})
+    enabled = options.get('dev_control', False)
+    if type(enabled) is not bool:
+        raise ValueError('static_capture.dev_control must be Boolean')
+    stages = options.get('stages')
+    if stages is not None:
+        if not enabled or not isinstance(stages, list) or not 3 <= len(stages) <= 4:
+            raise ValueError('Automatic stages require dev_control=true and three or four stage requests')
+        labels = set()
+        for stage in stages:
+            if (not isinstance(stage, dict) or not isinstance(stage.get('label'), str)
+                    or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', stage['label'])
+                    or stage['label'] in labels):
+                raise ValueError('Automatic stages require distinct valid labels')
+            validate_stage(stage)
+            labels.add(stage['label'])
+    return enabled, stages
+
+
+def validate_stage(request):
+    expected = request.get('expected_stage')
+    if expected not in STAGES or type(request.get('confirmation_required', False)) is not bool:
+        raise ValueError('Stage request requires expected_stage and a Boolean confirmation_required')
+    expected_pass = integer(request.get('expected_pass', 1), 'expected_pass', 1, 4)
+    expected_plan = request.get('expected_plan')
+    if expected_plan is not None and (not isinstance(expected_plan, dict) or not expected_plan
+            or any(k not in ('1', '2', '3', '4') or v not in STAGES for k, v in expected_plan.items())
+            or expected_plan.get(str(expected_pass)) != expected):
+        raise ValueError('expected_plan must include the observed pass/stage and valid pass entries')
+    return expected_pass, expected_plan
+
+
+def development_client(window, record):
+    # Keep native Win32 and transport imports out of the inert manual collector path.
+    tools_path = str(ROOT / 'tools')
+    if tools_path not in sys.path:
+        sys.path.insert(0, tools_path)
+    from dev_control import Client
+    return Client(window['pid'], str(window['created']), journal=record)
+
+
+def configure_stage(client, request, deadline):
+    """Request desired keys; only the service computes dependent configuration patches."""
+    expected_pass, plan = validate_stage(request)
+    plan = plan or {str(expected_pass): request['expected_stage']}
+    if set(plan) != {str(index) for index in range(1, len(plan) + 1)}:
+        raise ValueError('Development stage requires a complete contiguous expected_plan beginning at pass 1')
+    snapshot = client.status(deadline=deadline)
+    if snapshot.get('ok') is not True:
+        raise RuntimeError(f'Development status failed: {snapshot.get("code", snapshot.get("reason"))}')
+    latest_receipt = None
+    confirm = request.get('confirmation_required', False)
+
+    def set_value(key, value):
+        nonlocal snapshot, latest_receipt
+        actual = snapshot.get('state', {}).get('settings', {})
+        if key in actual and actual[key] == value:
+            return
+        snapshot = client.set(key, value, confirm=confirm, deadline=deadline)
+        if (snapshot.get('ok') is not True or snapshot.get('status') not in ('applied', 'unchanged')):
+            raise RuntimeError(f'Development stage setting {key}: {snapshot.get("status")}: '
+                               f'{snapshot.get("code", snapshot.get("reason"))}')
+        latest_receipt = snapshot
+        if snapshot.get('state', {}).get('available') is False:
+            snapshot = client.status(deadline=deadline)
+            latest_receipt = dict(latest_receipt, readback=snapshot)
+            if snapshot.get('ok') is not True:
+                raise RuntimeError(f'Development readback failed: {snapshot.get("code", snapshot.get("reason"))}')
+        if snapshot.get('state', {}).get('settings', {}).get(key) != value:
+            raise RuntimeError(f'Development stage setting {key} was not reflected in actual settings')
+
+    settings = snapshot.get('state', {}).get('settings', {})
+    if type(settings.get('NeuralUplift')) is not bool:
+        raise RuntimeError('Development status is missing Boolean NeuralUplift')
+    if not settings['NeuralUplift']:
+        set_value('NeuralUplift', True)
+    set_value('NRHookPoint', {'Upscaled': 0, 'Render': 1, 'Present': 2}[plan['1']])
+    set_value('NRPasses', len(plan))
+    for number, stage in sorted(plan.items(), key=lambda item: int(item[0])):
+        if number != '1':
+            set_value('NRPass' + number + 'Stage', {'Render': 1, 'Upscaled': 2, 'Present': 3}[stage])
+    return latest_receipt if latest_receipt is not None else snapshot
 
 
 def context(run, entry_script, now=None):
@@ -165,10 +256,13 @@ def capture(run, entry_script=None):
         collection_deadline = outer_deadline - settings['exit_reserve_seconds']
         waiting_deadline = collection_deadline
         log = Path(window['path']).parent / 'ReShade.log'
+        enabled, stages = development_options(read(run / 'target.json'))
 
         def record(kind, **values):
             events.append(dict(time=stamp(), kind=kind, **values))
             dump(run / 'static-events.json', events)
+
+        client = development_client(window, record) if enabled else None
 
         def begin_cleanup(reason, current):
             nonlocal state, cleanup, active
@@ -176,6 +270,21 @@ def capture(run, entry_script=None):
             cleanup = dict(deadline=min(outer_deadline, time.monotonic() + settings['exit_reserve_seconds']),
                            baseline=current, overlay_closed=False)
             record('cleanup_started', reason=reason, functionalOutcome=outcome)
+            if client:
+                deadline = min(cleanup['deadline'], time.monotonic() + 3)
+                response = client.set('NeuralUplift', False, deadline=deadline)
+                readback = response
+                if (response.get('ok') is True and response.get('status') in ('applied', 'unchanged')
+                        and response.get('state', {}).get('available') is False):
+                    readback = client.status(deadline=deadline)
+                cleanup['dev_control_off'] = (response.get('ok') is True
+                    and response.get('status') in ('applied', 'unchanged')
+                    and readback.get('ok') is True
+                    and readback.get('state', {}).get('settings', {}).get('NeuralUplift') is False)
+                record('cleanup_dev_control_off', confirmed=cleanup['dev_control_off'], response=response,
+                       readback=readback if readback is not response else None)
+                if not cleanup['dev_control_off']:
+                    raise RuntimeError('Development control did not confirm NeuralUplift=false')
 
         while True:
             if (run / 'capture-cancel.json').exists():
@@ -191,6 +300,8 @@ def capture(run, entry_script=None):
             request = read(control) if control.exists() else {}
             if request and (type(request.get('pid')) is not int or request['pid'] != window['pid']):
                 raise RuntimeError('Static control PID mismatch')
+            if stages and not cleanup and request.get('completed') is not True and len(labels) < len(stages):
+                request = dict(stages[len(labels)], pid=window['pid'], handoff=request.get('handoff', False))
             if request.get('handoff') is not True:
                 desktop.require_foreground(window, 'static capture')
             current = log.read_bytes()
@@ -236,6 +347,8 @@ def capture(run, entry_script=None):
                     labels.add(active['label'])
                     outcome, state, active = 'Observed', 'waiting', None
                     waiting_deadline = min(collection_deadline, now + settings['stage_timeout_seconds'])
+                    if stages and len(labels) == len(stages):
+                        begin_cleanup('automatic_stages_completed', current)
                 elif now >= active['deadline']:
                     outcome = 'Blocked'
                     record('blocked', label=active['label'], expected_stage=active['expected_stage'],
@@ -250,17 +363,30 @@ def capture(run, entry_script=None):
                         record('blocked', reason='stage_incomplete_at_completion', functionalOutcome=outcome)
                     begin_cleanup('completion_requested', current)
             if cleanup:
-                # This is the main agent's observation of the actual frame, never a HOME-key assumption.
-                cleanup['overlay_closed'] = (request.get('completed') is True
-                                             and request.get('overlay_closed') is True
-                                             and request.get('nr_off') is True)
+                if client:
+                    observed = client.status(deadline=min(cleanup['deadline'], time.monotonic() + 3))
+                    snapshot = observed.get('state', {})
+                    cleanup['latest_status'] = snapshot
+                    cleanup['overlay_closed'] = (observed.get('ok') is True
+                        and observed.get('status') == 'observed'
+                        and snapshot.get('settings', {}).get('NeuralUplift') is False
+                        and snapshot.get('overlay_open') is False)
+                else:
+                    # Main-agent observation of the actual frame, never a HOME-key assumption.
+                    cleanup['overlay_closed'] = (request.get('completed') is True
+                                                 and request.get('overlay_closed') is True
+                                                 and request.get('nr_off') is True)
                 verdict = next((line for line in reversed(appended_lines(cleanup['baseline'], current))
                                 if 'NR-VERDICT v3 state=' in line), None)
-                if cleanup['overlay_closed'] and verdict and 'NR-VERDICT v3 state=OFF ' in verdict:
+                if (cleanup['overlay_closed'] and verdict and 'NR-VERDICT v3 state=OFF ' in verdict
+                        and (not client or cleanup.get('dev_control_off') is True)):
                     desktop.capture(window, run / 'addon-menu-cleanup.png', activate=False)
                     dump(run / 'static-complete.json', dict(time=stamp(), pid=window['pid'],
                         labels=sorted(labels), functionalOutcome=outcome, nr_verdict=verdict,
-                        overlay_closed='main_agent_visual_confirmation', cleanup_capture='addon-menu-cleanup.png',
+                        overlay_closed='API_OBSERVED_OVERLAY_CLOSED' if client else 'main_agent_visual_confirmation',
+                        cleanup_capture='addon-menu-cleanup.png',
+                        development_control_off=cleanup.get('dev_control_off'),
+                        disabled_resources_released=cleanup.get('latest_status', {}).get('disabled_resources_released'),
                         visual_quality='not_tested_by_collector', budget=settings))
                     dump(run / 'capture-complete.json', dict(pid=window['pid'], completed=True))
                     return
@@ -268,24 +394,36 @@ def capture(run, entry_script=None):
                 label, expected = request['label'], request.get('expected_stage')
                 if not isinstance(label, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', label):
                     raise ValueError('Invalid static evidence label')
-                if expected not in STAGES or type(request.get('confirmation_required', False)) is not bool:
-                    raise ValueError('Stage request requires expected_stage and a Boolean confirmation_required')
-                expected_pass = integer(request.get('expected_pass', 1), 'expected_pass', 1, 4)
-                expected_plan = request.get('expected_plan')
-                if expected_plan is not None and (not isinstance(expected_plan, dict) or not expected_plan
-                        or any(k not in ('1', '2', '3', '4') or v not in STAGES for k, v in expected_plan.items())
-                        or expected_plan.get(str(expected_pass)) != expected):
-                    raise ValueError('expected_plan must include the observed pass/stage and valid pass entries')
+                expected_pass, expected_plan = validate_stage(request)
                 active = dict(label=label, expected_stage=expected, expected_pass=expected_pass,
                               expected_plan=expected_plan,
                               cursor=current, sequence=sequence(current_lines), previous_read=now, evidence=None,
                               started=now, deadline=min(collection_deadline, now + settings['stage_timeout_seconds']),
-                              confirmation_required=request.get('confirmation_required', False))
+                              confirmation_required=request.get('confirmation_required', False) and not client)
                 state = 'awaiting_stage'
                 record('stage_requested', label=label, expected_stage=expected,
                        expected_pass=expected_pass,
                        expected_plan=expected_plan,
-                       confirmation_required=active['confirmation_required'])
+                       confirmation_required=request.get('confirmation_required', False))
+                if client:
+                    response = configure_stage(client, request, min(active['deadline'], time.monotonic() + 3))
+                    # Earlier setters in this stage may already have evaluated.
+                    # The final snapshot also covers observations not yet logged.
+                    snapshot = response.get('readback', response).get('state', {})
+                    observations = snapshot.get('stages')
+                    if (not isinstance(observations, list) or not observations
+                            or any(type(stage.get('last_evaluate', {}).get('sequence')) is not int
+                                   or stage['last_evaluate']['sequence'] < 0 for stage in observations)):
+                        raise RuntimeError('Development stage is missing its final execution baseline')
+                    after_configuration = log.read_bytes()
+                    appended_lines(current, after_configuration)  # Retain the log-replacement check.
+                    committed_at = time.monotonic()
+                    active.update(cursor=after_configuration,
+                        sequence=max(active['sequence'], sequence(log_lines(after_configuration)),
+                                     *(stage['last_evaluate']['sequence'] for stage in observations)),
+                        started=committed_at, previous_read=committed_at)
+                    record('stage_dev_control_configured', label=label, response=response,
+                           execution_sequence_floor=active['sequence'], evidence_level='CONFIGURATION_ONLY')
 
             dump(run / 'static-progress.json', dict(time=stamp(), pid=window['pid'], state=state,
                 functionalOutcome=outcome, labels=sorted(labels),
@@ -310,16 +448,17 @@ def main():
     parser.add_argument('--exit-reserve-seconds', type=int, default=60, help='Target preparation only')
     parser.add_argument('--stage-timeout-seconds', type=int, default=60, help='Target preparation only')
     parser.add_argument('--startup-exit-seconds', type=int, help='Target preparation only')
+    parser.add_argument('--development-control', action='store_true', help='Prepare an opt-in development-pipe target')
     args = parser.parse_args()
     if args.prepare_target:
         if args.run or not args.output_target:
             parser.error('--prepare-target requires --output-target and no run directory')
         target = prepare_target(args.prepare_target, args.output_target, args.hold_seconds,
-            args.exit_reserve_seconds, args.stage_timeout_seconds, args.startup_exit_seconds)
+            args.exit_reserve_seconds, args.stage_timeout_seconds, args.startup_exit_seconds, args.development_control)
         print(json.dumps(budget(target)))
     elif args.run and not args.output_target:
         preparation_options = {'--hold-seconds', '--exit-reserve-seconds',
-                               '--stage-timeout-seconds', '--startup-exit-seconds'}
+                               '--stage-timeout-seconds', '--startup-exit-seconds', '--development-control'}
         if preparation_options.intersection(arg.split('=')[0] for arg in sys.argv[1:]):
             parser.error('Prepare the target copy first; capture uses only its recorded budgets')
         capture(args.run)

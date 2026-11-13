@@ -11,6 +11,10 @@
 
 #include "version.h"
 
+#if defined(NR_NEXUS_DEV_CONTROL)
+#include "dev_control_pipe.hpp"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -22929,6 +22933,9 @@ inline void OnInitEffectRuntime(reshade::api::effect_runtime* runtime) {
 inline void OnDestroyEffectRuntime(reshade::api::effect_runtime* runtime) {
   std::scoped_lock lock(overlay_listener_mutex);
   std::erase(live_effect_runtimes, runtime);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (live_effect_runtimes.empty()) dev_control_pipe::Stop();
+#endif
   if (monitor_runtime.load() == runtime) {
     monitor_runtime = live_effect_runtimes.empty() ? nullptr : live_effect_runtimes.front();
     gpu_timers::monitor_events.enabled = false;
@@ -27812,6 +27819,10 @@ inline bool ui_monitor_geometry_dirty = false;
 inline bool ui_monitor_saved_pin = false;
 #include "monitor_runtime.hpp"
 
+#if defined(NR_NEXUS_DEV_CONTROL)
+#include "dev_control.hpp"
+#endif
+
 inline void CycleMonitorMode() {
   auto& state = ui_runtime_monitor_state;
   ui::AdvanceMonitorMode(&state);
@@ -27897,6 +27908,9 @@ inline void OnProfilePresent(reshade::api::effect_runtime* runtime) {
     }
   }
   profile_ui::Tick();
+#if defined(NR_NEXUS_DEV_CONTROL)
+  dev_control_pipe::Tick(addon_module, dev_control::Execute);
+#endif
   static thread_local int64_t adjustment_checked_ns = 0;
   const auto adjustment_now = SteadyNowNs();
   if (adjustment_now - adjustment_checked_ns >= kMonitorRefreshNs) {
@@ -30776,6 +30790,9 @@ inline void Use(DWORD reason, HMODULE module, LPVOID reserved) {
       lastgasp::MarkOnce("ngx:hooks-installed");
       break;
     case DLL_PROCESS_DETACH:
+#if defined(NR_NEXUS_DEV_CONTROL)
+      dev_control_pipe::Stop();
+#endif
       internal::monitor_requested = false;
       gpu_timers::monitor_events.enabled = false;
       internal::monitor_runtime = nullptr;

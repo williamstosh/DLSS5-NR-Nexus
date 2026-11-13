@@ -4,7 +4,8 @@ param(
     [Parameter(Mandatory)][string]$ToolRoot,
     [string]$BuildDirectory,
     [ValidateSet('Debug', 'Release', 'RelWithDebInfo')][string]$Configuration = 'Release',
-    [switch]$ImeDiagnostics
+    [switch]$ImeDiagnostics,
+    [switch]$DevControl
 )
 
 $ErrorActionPreference = 'Stop'
@@ -14,6 +15,9 @@ $taskRoot = Split-Path -Parent $PSScriptRoot
 $taskSource = (Resolve-Path -LiteralPath $RenodxRoot).Path
 $taskTools = (Resolve-Path -LiteralPath $ToolRoot).Path
 $taskBuild = if ($BuildDirectory) { [IO.Path]::GetFullPath($BuildDirectory) } else { Join-Path $taskRoot 'build' }
+if ($DevControl -and (-not $BuildDirectory -or $taskBuild.TrimEnd('\','/') -ieq (Join-Path $taskRoot 'build').TrimEnd('\','/'))) {
+    throw 'Development control requires an explicit separate -BuildDirectory.'
+}
 $taskAddon = Join-Path $taskSource 'src/addons/dlss5'
 $taskLock = Get-Content -LiteralPath (Join-Path $taskRoot 'host/lock.json') -Raw | ConvertFrom-Json
 if ((& git --no-optional-locks -C $taskSource rev-parse HEAD) -cne $taskLock.host.commit) {
@@ -67,6 +71,7 @@ $taskArguments = @(
     ('-DSLANGC_BIN=' + (Join-Path $taskTools 'slangc.exe')),
     '-DRENODX_BUILD_TESTS=OFF',
     ('-DNR_NEXUS_IME_DIAGNOSTICS=' + $(if ($ImeDiagnostics) { 'ON' } else { 'OFF' })),
+    ('-DNR_NEXUS_DEV_CONTROL=' + $(if ($DevControl) { 'ON' } else { 'OFF' })),
     '-DCMAKE_SYSTEM_VERSION=10.0.26100.0',
     '-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /W3 /GR /EHsc /utf-8',
     '-DCMAKE_MODULE_LINKER_FLAGS=/DELAYLOAD:winhttp.dll'

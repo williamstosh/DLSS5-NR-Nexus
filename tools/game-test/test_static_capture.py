@@ -436,6 +436,213 @@ class StaticCaptureTests(unittest.TestCase):
         self.actions = {.5: lambda: self.log.write_text(evaluate('Render', seq=99), encoding='utf-8')}
         self.assert_failed('log changed')
 
+    def enable_development(self, stages=None):
+        self.target['static_capture']['dev_control'] = True
+        if stages is not None:
+            self.target['static_capture']['stages'] = stages
+        self.save_target()
+        self.client = mock.Mock()
+        self.actual_settings = dict(NeuralUplift=False, NRHookPoint=0, NRPasses=1,
+                                    NRPass2Stage=0, NRPass3Stage=0, NRPass4Stage=0)
+        self.overlay_open = False
+
+        def receipt():
+            return dict(ok=True, status='observed', state=dict(settings=dict(self.actual_settings),
+                         overlay_open=self.overlay_open, disabled_resources_released=False,
+                         stages=[dict(last_evaluate=dict(sequence=0))]))
+
+        def set_value(key, value, **kw):
+            self.actual_settings[key] = value
+            return dict(receipt(), status='applied', changes={key: value})
+
+        self.client.status.side_effect = lambda **kw: receipt()
+        self.client.set.side_effect = set_value
+        patcher = mock.patch.object(static_capture, 'development_client', return_value=self.client)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_prepare_development_target_is_explicit_and_does_not_change_source(self):
+        source = self.root / 'source.json'
+        write(source, dict(startup_timeout=1, load_timeout=1))
+        before = source.read_bytes()
+        target = static_capture.prepare_target(source, self.root / 'dev-target.json', development_control=True)
+        self.assertIs(target['static_capture']['dev_control'], True)
+        self.assertEqual(source.read_bytes(), before)
+
+    def test_prepared_copy_preserves_explicit_development_stages_from_source(self):
+        stages = [dict(label=str(i), expected_stage='Render') for i in range(3)]
+        source = self.root / 'source.json'
+        write(source, dict(static_capture=dict(dev_control=True, stages=stages)))
+        target = static_capture.prepare_target(source, self.root / 'dev-target.json')
+        self.assertEqual(static_capture.development_options(target), (True, stages))
+
+    def test_invalid_development_plan_is_rejected_before_enabling_nr(self):
+        self.enable_development()
+        with self.assertRaisesRegex(ValueError, 'complete contiguous'):
+            static_capture.configure_stage(self.client,
+                dict(expected_stage='Present', expected_pass=2, expected_plan={'2': 'Present'}), 20)
+        self.client.status.assert_not_called()
+        self.client.set.assert_not_called()
+
+    def test_development_plan_requests_only_required_keys_and_uses_service_confirmation(self):
+        self.enable_development()
+        request = dict(expected_stage='Present', expected_pass=2,
+                       expected_plan={'1': 'Render', '2': 'Present'}, confirmation_required=True)
+        static_capture.configure_stage(self.client, request, 20)
+        calls = self.client.set.call_args_list
+        self.assertEqual([(call.args[0], call.args[1]) for call in calls],
+                         [('NeuralUplift', True), ('NRHookPoint', 1), ('NRPasses', 2), ('NRPass2Stage', 3)])
+        self.assertTrue(all(call.kwargs == dict(confirm=True, deadline=20) for call in calls))
+        self.client.set.reset_mock()
+        static_capture.configure_stage(self.client, request, 21)
+        self.client.set.assert_not_called()
+
+    def test_development_does_not_silently_approve_service_proposal(self):
+        self.enable_development()
+        self.actual_settings['NeuralUplift'] = True
+        self.client.set.side_effect = lambda *args, **kw: dict(ok=False, status='confirmation_required', reason='proposal')
+        with self.assertRaisesRegex(RuntimeError, 'confirmation_required'):
+            static_capture.configure_stage(self.client, dict(expected_stage='Present'), 20)
+        self.client.set.assert_called_once_with('NRHookPoint', 2, confirm=False, deadline=20)
+
+    def test_development_applied_busy_snapshot_reads_back_without_reapplying(self):
+        self.enable_development()
+        self.actual_settings['NeuralUplift'] = True
+        original_set = self.client.set.side_effect
+        receipt = {}
+        def applied_busy(key, value, **kw):
+            receipt.update(original_set(key, value, **kw))
+            receipt['state'] = dict(available=False, reason='runtime_busy')
+            return receipt
+        self.client.set.side_effect = applied_busy
+        actual = static_capture.configure_stage(self.client, dict(expected_stage='Render'), 20)
+        self.client.set.assert_called_once_with('NRHookPoint', 1, confirm=False, deadline=20)
+        self.assertEqual(self.client.status.call_args_list, [mock.call(deadline=20), mock.call(deadline=20)])
+        self.assertEqual(actual['state'], receipt['state'])
+        self.assertEqual(actual['changes'], {'NRHookPoint': 1})
+        self.assertEqual(actual['readback']['state']['settings']['NRHookPoint'], 1)
+
+    def test_development_cleanup_applied_busy_snapshot_reads_back_and_finishes(self):
+        self.enable_development()
+        original_set = self.client.set.side_effect
+        def applied_busy(key, value, **kw):
+            actual = original_set(key, value, **kw)
+            actual['state'] = dict(available=False, reason='runtime_busy')
+            return actual
+        self.client.set.side_effect = applied_busy
+        self.complete_request()
+        self.actions = {.5: lambda: self.append('NR-VERDICT v3 state=OFF stage=- reason=disabled\n')}
+        self.collect()
+        self.assertIs(self.outcome()['development_control_off'], True)
+        self.client.set.assert_called_once_with('NeuralUplift', False, deadline=3)
+        event = next(event for event in static_capture.read(self.run / 'static-events.json')
+                     if event['kind'] == 'cleanup_dev_control_off')
+        self.assertIs(event['response']['state']['available'], False)
+        self.assertIs(event['readback']['state']['settings']['NeuralUplift'], False)
+
+    def test_automatic_development_stages_cleanup_off_retains_new_log_and_overlay_gates(self):
+        stages = [dict(label='baseline', expected_stage='Upscaled'),
+                  dict(label='render', expected_stage='Render'),
+                  dict(label='present', expected_stage='Present', confirmation_required=True)]
+        self.enable_development(stages)
+
+        def confirm_cleanup_started():
+            progress = static_capture.read(self.run / 'static-progress.json')
+            self.assertEqual(progress['state'], 'cleanup')
+            self.assertFalse(self.actual_settings['NeuralUplift'])
+            self.assertFalse((self.run / 'capture-complete.json').exists())
+
+        self.actions = {.5: lambda: self.append(evaluate('Upscaled', seq=2)),
+                        1.5: lambda: self.append(evaluate('Render', seq=3)),
+                        2.5: lambda: self.append(evaluate('Present', seq=4)),
+                        3: confirm_cleanup_started,
+                        3.5: lambda: self.append('NR-VERDICT v3 state=OFF stage=- reason=disabled\n')}
+        self.collect()
+        result = self.outcome()
+        self.assertEqual(result['labels'], ['baseline', 'present', 'render'])
+        self.assertEqual(result['functionalOutcome'], 'Observed')
+        self.assertIs(result['development_control_off'], True)
+        self.assertEqual(result['overlay_closed'], 'API_OBSERVED_OVERLAY_CLOSED')
+        self.assertIs(result['disabled_resources_released'], False)
+        self.assertFalse((self.run / 'static-control.json').exists())
+        self.client.set.assert_any_call('NRHookPoint', 2, confirm=True, deadline=4.0)
+        self.assertEqual(self.client.set.call_args_list[-1].args, ('NeuralUplift', False))
+        self.assertEqual(self.elapsed, 3.5)
+
+    def test_development_settings_without_new_execution_are_blocked(self):
+        self.enable_development()
+        self.request(label='render', expected_stage='Render')
+        self.actions = {.5: lambda: self.append('stage_plan[valid=1 requested=1:Render->Render]\n'),
+                        2.5: self.complete_request,
+                        3: lambda: self.append('NR-VERDICT v3 state=OFF stage=- reason=disabled\n')}
+        self.collect()
+        self.assertEqual(self.outcome()['functionalOutcome'], 'Blocked')
+        self.assertEqual(self.outcome()['labels'], [])
+
+    def test_execution_between_setters_cannot_prove_the_final_configuration(self):
+        self.enable_development()
+        original_set = self.client.set.side_effect
+        def intermediate_execution(key, value, **kw):
+            reply = original_set(key, value, **kw)
+            if key == 'NRPass2Stage':
+                reply['state']['stages'] = [dict(last_evaluate=dict(sequence=20))]
+            return reply
+        self.client.set.side_effect = intermediate_execution
+        self.request(label='render', expected_stage='Render',
+                     expected_plan={'1': 'Render', '2': 'Upscaled'})
+        old_evaluate = evaluate('Render', seq=20).replace(
+            'requested=1:Render->Render ', 'requested=1:Render->Render,2:Upscaled->Upscaled ')
+        self.actions = {.5: lambda: self.append(old_evaluate),
+                        1: lambda: self.append(old_evaluate.replace('age_ms=0', 'age_ms=500')),
+                        3: lambda: self.append('NR-VERDICT v3 state=OFF stage=- reason=disabled\n')}
+        self.collect()
+        self.assertEqual(self.outcome()['functionalOutcome'], 'Blocked')
+        self.assertEqual(self.outcome()['labels'], [])
+        events = static_capture.read(self.run / 'static-events.json')
+        self.assertFalse(any(event['kind'] == 'stage_observed' for event in events))
+        self.assertEqual(next(event for event in events if event['kind'] == 'stage_dev_control_configured')
+                         ['execution_sequence_floor'], 20)
+
+    def test_development_off_receipt_without_new_off_log_cannot_release_hold(self):
+        self.enable_development()
+        self.complete_request()
+        self.assert_failed('cleanup was not confirmed')
+        self.assertFalse(self.actual_settings['NeuralUplift'])
+
+    def test_development_failed_off_receipt_cannot_release_hold(self):
+        self.enable_development()
+        self.client.set.side_effect = lambda *args, **kw: dict(ok=False, status='rejected', state={'settings': {'NeuralUplift': True}})
+        self.complete_request()
+        self.assert_failed('did not confirm NeuralUplift=false')
+
+    def test_development_open_overlay_blocks_cleanup_despite_manual_closed_claim(self):
+        self.enable_development()
+        self.overlay_open = True
+        self.complete_request()
+        self.actions = {.5: lambda: self.append('NR-VERDICT v3 state=OFF stage=- reason=disabled\n')}
+        self.assert_failed('cleanup was not confirmed')
+
+    def test_development_cleanup_accepts_later_observed_overlay_close_without_input(self):
+        self.enable_development()
+        self.overlay_open = True
+        self.complete_request()
+        self.actions = {.5: lambda: self.append('NR-VERDICT v3 state=OFF stage=- reason=disabled\n'),
+                        1: lambda: setattr(self, 'overlay_open', False)}
+        self.collect()
+        self.assertEqual(self.elapsed, 1)
+        self.assertEqual(self.outcome()['overlay_closed'], 'API_OBSERVED_OVERLAY_CLOSED')
+
+    def test_automatic_requests_are_opt_in_bounded_and_have_distinct_labels(self):
+        stages = [dict(label=str(i), expected_stage='Render') for i in range(3)]
+        self.assertEqual(static_capture.development_options({'static_capture': dict(dev_control=True, stages=stages)}),
+                         (True, stages))
+        for options in (dict(stages=stages), dict(dev_control=1),
+                        dict(dev_control=True, stages=stages[:2]),
+                        dict(dev_control=True, stages=stages + stages),
+                        dict(dev_control=True, stages=[stages[0]] * 3)):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                static_capture.development_options({'static_capture': options})
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -352,6 +352,13 @@ int main() {
         throw std::runtime_error(message);
       }
     };
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (std::getenv("NR_NEXUS_DEV_CONTROL_ONLY") != nullptr) {
+#include "dev_control_runtime_cases.hpp"
+      ImGui::DestroyContext();
+      return 0;
+    }
+#endif
     // Exercise the production loader before it has a chance to migrate or
     // stamp defaults into a fresh section. All writes stay in the fixture's INI.
     const auto load_theme_case = [&](const char* content, ui::ThemeId expected) {

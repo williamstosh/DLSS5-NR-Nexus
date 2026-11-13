@@ -7,6 +7,7 @@ param(
     [string]$OutputDirectory = (Join-Path (Split-Path $PSScriptRoot -Parent) ('tmp/tests/ui-' + [guid]::NewGuid().ToString('N'))),
     [string]$VcVars64,
     [ValidateSet('Quick','Full')][string]$SnapshotMode,
+    [switch]$DevControlOnly,
     [ValidateSet('Standard','Full','Acceptance')][string]$RetentionMode = $(if ($env:NR_NEXUS_TEST_RETENTION) { $env:NR_NEXUS_TEST_RETENTION } else { 'Standard' })
 )
 $ErrorActionPreference = 'Stop'
@@ -19,7 +20,7 @@ $imguiRoot = Join-Path $HostRoot 'external/reshade/deps/imgui'
 $executable = Join-Path $OutputDirectory 'ui-layout-tests.exe'
 $sources = @((Join-Path $SourceRoot 'tests/ui_layout_tests.cpp'))
 $sources += @('imgui.cpp','imgui_draw.cpp','imgui_tables.cpp','imgui_widgets.cpp') | ForEach-Object { Join-Path $imguiRoot $_ }
-if (-not $SnapshotMode) {
+if (-not $SnapshotMode -and -not $DevControlOnly) {
 $arguments = @('/nologo','/std:c++20','/EHsc','/O2','/MT','/utf-8','/DNOMINMAX',"/I$SourceRoot","/I$imguiRoot")
 $arguments += $sources
 $arguments += @("/Fo$OutputDirectory/", "/Fe$executable")
@@ -36,6 +37,7 @@ New-Item -ItemType Directory -Path $menuDirectory | Out-Null
 $sources[0] = Join-Path $SourceRoot 'tests/ui_menu_tests.cpp'
 $arguments = @('/nologo','/std:c++20','/EHsc','/W3','/O2','/MT','/utf-8','/DNOMINMAX','/DRESHADE_ADDON=2',
     '/DIMGUI_ENABLE_TEST_ENGINE','/bigobj','/Gy','/Gw')
+if ($DevControlOnly) { $arguments += '/DNR_NEXUS_DEV_CONTROL' }
 $arguments += @($projectInputs.Includes | ForEach-Object { "/I$_" })
 $arguments += $sources
 $arguments += @("/Fo$menuDirectory/", "/Fe$menuExecutable", '/link', '/OPT:REF', '/OPT:ICF') + $projectInputs.Libraries
@@ -55,13 +57,15 @@ $arguments | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputDirecto
 if ($LASTEXITCODE -ne 0) { throw "Production menu test build failed: $OutputDirectory/menu-compile.log" }
 $previousSnapshotMode = $env:NR_NEXUS_UI_SNAPSHOTS
 $previousAdaptiveOnly = $env:NR_NEXUS_ADAPTIVE_UI_ONLY
+$previousDevControlOnly = $env:NR_NEXUS_DEV_CONTROL_ONLY
 try {
+    if ($DevControlOnly) { $env:NR_NEXUS_DEV_CONTROL_ONLY = '1' }
     if ($SnapshotMode) { $env:NR_NEXUS_UI_SNAPSHOTS = $SnapshotMode }
     # The complete production matrix renders over 13,000 frames across themes,
     # languages and DPI sizes. Keep its bound separate from focused 45s cases
     # so slower hosted runners can finish the same assertions without retries.
     Invoke-TestProcess $menuExecutable $menuDirectory 'menu' -TimeoutMilliseconds 180000
-    if (-not $SnapshotMode -and -not $previousAdaptiveOnly) {
+    if (-not $SnapshotMode -and -not $previousAdaptiveOnly -and -not $DevControlOnly) {
         # Reuse the binary in a fresh process so adaptive fixtures cannot
         # inherit the complete menu matrix's configuration or ImGui state.
         $adaptiveDirectory = Join-Path $OutputDirectory 'adaptive'
@@ -72,6 +76,7 @@ try {
 } finally {
     $env:NR_NEXUS_UI_SNAPSHOTS = $previousSnapshotMode
     $env:NR_NEXUS_ADAPTIVE_UI_ONLY = $previousAdaptiveOnly
+    $env:NR_NEXUS_DEV_CONTROL_ONLY = $previousDevControlOnly
 }
 $timer.Stop()
 @{build='passed';run='passed';retention=$RetentionMode;seconds=$timer.Elapsed.TotalSeconds
