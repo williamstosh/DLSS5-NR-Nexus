@@ -320,6 +320,15 @@ worker 使用同设备的独立参数、Feature、allocator 和命令列表，�
 结果保存为 `adaptive-native-cold-prepare.json`。该探针不启用生产异步准备，也不测试
 Feature18 Create／Evaluate 并发安全；结束后恢复环境变量。
 
+单 Feature 有效尺寸专项可单独设置 `NR_NEXUS_TEST_RESIZE_SINGLE_FEATURE=1`，复用同一入口，
+与冷准备开关互斥。一个最大尺寸 Feature 依次运行完整尺寸、较小的标准尺寸／subrect、
+同步已知私有尺寸参数、恢复完整尺寸，再与真正使用小纹理创建的独立 Feature 对照。
+各阶段使用相同的 ROI 输入字节和只读引导资源，保留两次 Reset 前缀及八次测量。
+结果保存为 `adaptive-native-single-feature.json`，分别记录 API、逐次 CPU／GPU 时间、
+可见的直接 Dispatch、RGB／alpha 写入范围、非有限值、数值差异及资源完成／清理。
+像素覆盖和 API 成功不替代实际成本测量；直接 Dispatch 也不代表完整内部工作量。
+该探针不改变生产尺寸策略或开启 P1；结束后恢复环境变量。
+
 ## 自动回归与证据保存
 
 ~~~powershell
