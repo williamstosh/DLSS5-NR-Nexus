@@ -385,6 +385,8 @@ struct NrFeatureSlot {
   // restarts exactly when the model's own history does.
   bool model_reset = false;
   bool model_ui_sent = false;
+  uint32_t create_input_width = 0, create_input_height = 0;
+  uint32_t create_output_width = 0, create_output_height = 0;
   std::array<float, 9> model_sent{};
   float model_intensity_sent = 0.f;
   // The model steering this slot last LOGGED, in panel order (style, local
@@ -2593,6 +2595,8 @@ inline std::atomic_bool nr_adaptive_enabled{false};
 inline std::atomic<float> nr_adaptive_target_fps{60.f};
 inline std::atomic<float> nr_adaptive_min_scale{0.67f};
 inline std::atomic_bool nr_adaptive_editing{false};
+// Offline fixtures opt in; ordinary production keeps the original rebuild path.
+inline std::atomic_bool nr_adaptive_feature_capacity_reuse_experiment{false};
 inline void (*adaptive_configuration_settings)(gpu_comparison::Identity*) = nullptr;
 // Evaluation hooks and FG recording own runtime_mutex throughout this scope.
 inline const adaptive_resolution::Frame* active_adaptive_frame = nullptr;
@@ -5169,6 +5173,8 @@ inline void ReleaseNrSlot(
   slot.jitter_bound = false;
   slot.via_core = false;
   slot.tracked_since_create = false;
+  slot.create_input_width = slot.create_input_height = 0;
+  slot.create_output_width = slot.create_output_height = 0;
   slot.recording.reset();
   slot.look_history = {};
   RefreshActiveFeatureCount();
@@ -7654,6 +7660,10 @@ inline bool EnsureNrFeature(
   slot.configuration_generation = configuration_generation.load();
   slot.nr_hdr_mode = resources.hdr_mode;
   slot.nr_create_flags = NrCreateFlags(state.create_flags, resources.hdr_mode != 0);
+  slot.create_input_width = input_width;
+  slot.create_input_height = input_height;
+  slot.create_output_width = output_width;
+  slot.create_output_height = output_height;
   slot.pending_reset = true;
   slot.pending_reset_reasons |= kResetCreated;
   // fail_count is NOT cleared here: only a successful evaluate proves the
@@ -10500,7 +10510,8 @@ inline void SelectAdaptiveTier(FeatureState* feature, const NVSDK_NGX_Handle* ha
 
 template <typename Record>
 inline void PrepareAdaptiveTier(FeatureState* feature, const adaptive_resolution::Frame& frame,
-                                ID3D12GraphicsCommandList* list, bool complete, const Record& record) {
+                                ID3D12GraphicsCommandList* list, bool complete, const Record& record,
+                                bool allow_feature_capacity_reuse = false) {
   const auto cache = feature->adaptive_cache;
   if (!frame.enabled || frame.preparing || cache == nullptr || cache->failed || cache->budget_blocked
       || frame.session->failed || nr_adaptive_editing.load() || gpu_timers::ComparisonActive()) return;
@@ -10562,17 +10573,54 @@ inline void PrepareAdaptiveTier(FeatureState* feature, const adaptive_resolution
       }
     }
     if (!reusable) return;
-    ReleaseAllNrSlots(tier.state, true);
+    auto& model = tier.state.slots[0];
+    const auto target = frame.session->ladder.sizes[slot][0];
+    bool retain_feature = allow_feature_capacity_reuse && nr_adaptive_feature_capacity_reuse_experiment.load()
+        && hook_point.load() == kHookUpscaled && stack_passes.load() == 1 && tier.state.pass_offset == 0
+        && direct_runtime_requirements.file_version == "310.9.16.0"
+        && model.handle != nullptr && model.parameters != nullptr && !model.failed && model.nr_preset == 2
+        && nr_model::ResolvePreset(preset.load(), 0, direct_runtime_requirements.dual_models) == model.nr_preset
+        && model.configuration_generation == configuration_generation.load() && model.nr_hdr_mode == 1
+        && model.nr_create_flags == NrCreateFlags(tier.state.create_flags, true)
+        && model.create_input_width == model.create_output_width && model.create_input_height == model.create_output_height
+        && target.width != 0 && target.height != 0
+        && target.width <= model.create_input_width && target.height <= model.create_input_height;
+    bool found_workset = false;
+    for (const auto& [key, resources] : worksets) {
+      if (key.handle != cache->owner || key.adaptive_slot != slot) continue;
+      found_workset = true;
+      retain_feature &= !key.pre_sr && resources.format == DXGI_FORMAT_R16G16B16A16_FLOAT
+          && resources.hdr_mode == model.nr_hdr_mode && resources.stack_passes == 1;
+    }
+    retain_feature &= found_workset;
+    for (uint32_t pass = 1; pass < kMaxNrPasses; ++pass) {
+      retain_feature &= tier.state.slots[pass].handle == nullptr && tier.state.slots[pass].parameters == nullptr;
+    }
+    if (retain_feature) {
+      // All old uses passed the existing exact completion proof above.
+      // Preserve the completed slot receipt until ControlMask admits the new
+      // recording; a null receipt there intentionally recreates the Feature.
+      ClearControlMaskBinding(model);
+      for (const auto* key : {"DLSSNR.Color", "DLSSNR.Output", "DLSSNR.MVec", "DLSSNR.Depth"}) {
+        model.parameters->Set(key, static_cast<ID3D12Resource*>(nullptr));
+      }
+      for (auto*& history : model.look_history.buffers) ReleaseCom(history);
+      model.look_history = {};
+      model.pending_reset = true;
+      model.pending_reset_reasons |= kResetDimensions;
+      tier.state.input_width = target.width;
+      tier.state.input_height = target.height;
+    } else {
+      ReleaseAllNrSlots(tier.state, true);
+      for (auto& previous : tier.state.slots) previous = {};
+    }
     ReleaseCom(tier.state.norm.commit);
     tier.state.norm = {};
-    for (auto& model : tier.state.slots) {
-      model = {};
-    }
     tier.state.second_resolution = {};
     tier.state.control_mask_recording.reset();
     tier.state.control_mask_stream.reset();
     tier.state.last_workset_key = nullptr;
-    tier.state.working_resolution_committed = false;
+    tier.state.working_resolution_committed = retain_feature;
     tier.state.adaptive_resolution_generation = 0;
     for (auto it = worksets.begin(); it != worksets.end();) {
       if (it->first.handle != cache->owner || it->first.adaptive_slot != slot) {
@@ -13546,7 +13594,7 @@ inline bool ProcessInline(ID3D12GraphicsCommandList* command_list, const NVSDK_N
       *complete = prepared.group_complete && prepared.model_evaluate_mask == expected
           && prepared.model_pass_mask == expected;
       return accepted;
-    });
+    }, present == nullptr);
   }
   return result;
 }

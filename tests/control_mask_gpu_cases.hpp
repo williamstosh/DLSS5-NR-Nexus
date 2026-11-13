@@ -2526,7 +2526,8 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       && std::strcmp(cold_prepare_environment, "1") == 0;
   const auto* single_feature_environment = std::getenv("NR_NEXUS_TEST_RESIZE_SINGLE_FEATURE");
   const bool single_feature = resize_test && single_feature_environment != nullptr
-      && std::strcmp(single_feature_environment, "1") == 0;
+      && (std::strcmp(single_feature_environment, "1") == 0 || std::strcmp(single_feature_environment, "2") == 0);
+  const bool single_small_physical = single_feature && std::strcmp(single_feature_environment, "2") == 0;
   const bool diagnostic_probe = cold_prepare || single_feature;
   nlohmann::json resize_report;
   try {
@@ -2913,6 +2914,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       auto& report = resize_report;
       report = {{"schema", "nr-nexus-native-single-feature-v1"}, {"evidence", "NATIVE_GPU+NATIVE_NGX"},
           {"mode", "single-feature-effective-size-probe"}, {"production_async_enabled", false}, {"p1_enabled", false},
+          {"resource_layout_mode", single_small_physical ? "small-physical-resource" : "maximum-physical-backing"},
           {"source_version", NR_NEXUS_VERSION}, {"source_identity_scope", "exact frozen source identity is recorded by the test runner"},
           {"runtime", addon::direct_runtime_requirements.file_version}, {"nr_sha256", addon::direct_runtime_sha256},
           {"requested_model", model_preset}, {"internal_model", "unknown"}, {"format", "RGBA16F"},
@@ -2939,6 +2941,8 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       report["driver_version_raw"] = driver_version.QuadPart;
       auto queries = d3d12_test::CreateTimestampQueries(gpu, static_cast<UINT>(phase_names.size()) * evaluations_per_stage);
       const std::array<UINT, 2> physical_widths{width, small_width}, physical_heights{height, small_height};
+      const std::array<size_t, phase_names.size()> phase_resource_indices{
+          0u, single_small_physical ? 1u : 0u, single_small_physical ? 1u : 0u, 0u, 1u};
       std::array<addon::FeatureState, 2> private_features;
       std::array<ComPtr<ID3D12Resource>, 2> proxies, neural_outputs;
       std::array<d3d12_test::TextureTransfer, 2> proxy_transfers, output_transfers;
@@ -3133,6 +3137,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         dispatch_attached = true;
         for (size_t phase = 0; phase < phase_names.size(); ++phase) {
           const size_t feature_index = (phase == 4 ? 1u : 0u);
+          const size_t resource_index = phase_resource_indices[phase];
           auto& feature = private_features[feature_index];
           auto& slot = feature.slots[0];
           auto& stage = report["stages"][phase];
@@ -3144,8 +3149,14 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           const UINT effective_width = use_small_dimensions ? small_width : width,
                      effective_height = use_small_dimensions ? small_height : height;
           const bool sync_private_dimensions = phase == 2 || phase == 3;
+          stage["feature_index"] = feature_index;
+          stage["resource_index"] = resource_index;
           stage["feature_handle"] = reinterpret_cast<uintptr_t>(slot.handle);
-          stage["physical_size"] = {physical_widths[feature_index], physical_heights[feature_index]};
+          stage["feature_create_size"] = {physical_widths[feature_index], physical_heights[feature_index]};
+          stage["physical_size"] = {physical_widths[resource_index], physical_heights[resource_index]};
+          stage["actualphysical_size"] = {physical_widths[resource_index], physical_heights[resource_index]};
+          stage["proxy"] = reinterpret_cast<uintptr_t>(proxies[resource_index].Get());
+          stage["output"] = reinterpret_cast<uintptr_t>(neural_outputs[resource_index].Get());
           stage["effective_size"] = {effective_width, effective_height};
           stage["private_width_height_request"] = sync_private_dimensions ? "explicitly synchronized"
               : "Create values reasserted before every Evaluate";
@@ -3153,17 +3164,17 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           stage["status"] = "Running";
           bool accepted_all = true;
           std::vector<double> measured_gpu;
-          addon::FinalResources resources{.proxy = proxies[feature_index].Get(),
-              .nr_output = neural_outputs[feature_index].Get(), .hdr_mode = hdr_mode};
+          addon::FinalResources resources{.proxy = proxies[resource_index].Get(),
+              .nr_output = neural_outputs[resource_index].Get(), .hdr_mode = hdr_mode};
           dispatch_stable[phase] = true;
           for (UINT iteration = 0; iteration < evaluations_per_stage; ++iteration) {
             const auto frame_begin = addon::SteadyNowNs();
             gpu.list->ClearState(nullptr);
-            gpu.Transition(neural_outputs[feature_index].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-            gpu.UploadTexture(neural_outputs[feature_index].Get(), output_transfers[feature_index],
-                reinterpret_cast<const uint8_t*>(sentinel_inputs[feature_index].data()), sentinel_inputs[feature_index].size() * sizeof(uint16_t),
-                physical_widths[feature_index] * 8);
-            gpu.Transition(neural_outputs[feature_index].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            gpu.Transition(neural_outputs[resource_index].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+            gpu.UploadTexture(neural_outputs[resource_index].Get(), output_transfers[resource_index],
+                reinterpret_cast<const uint8_t*>(sentinel_inputs[resource_index].data()), sentinel_inputs[resource_index].size() * sizeof(uint16_t),
+                physical_widths[resource_index] * 8);
+            gpu.Transition(neural_outputs[resource_index].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             const addon::EvaluationContract frame{.source_handle = owner, .motion = retained_motion.Get(), .depth = retained_depth.Get(),
                 .input_width = render_width, .input_height = render_height, .output_width = effective_width, .output_height = effective_height,
                 .motion_width = render_width, .motion_height = render_height, .create_flags = create_flags,
@@ -3199,8 +3210,8 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                 stage["parameter_snapshot"]["DLSSNR.Scale"] = addon::GetFloat(slot.parameters, "DLSSNR.Scale", -1.f);
               }
               submission::TrackUse(gpu.list.Get(), slot.handle);
-              submission::TrackUse(gpu.list.Get(), proxies[feature_index].Get());
-              submission::TrackUse(gpu.list.Get(), neural_outputs[feature_index].Get());
+              submission::TrackUse(gpu.list.Get(), proxies[resource_index].Get());
+              submission::TrackUse(gpu.list.Get(), neural_outputs[resource_index].Get());
               submission::TrackUse(gpu.list.Get(), retained_depth.Get());
               submission::TrackUse(gpu.list.Get(), retained_motion.Get());
               receipt = submission::ObserveRecording(gpu.list.Get());
@@ -3254,22 +3265,22 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           }
           stage["dispatch_signature_stable"] = dispatch_stable[phase];
           stage["dispatch_visibility"] = measured_dispatches[phase].empty() ? "Unknown" : "direct Dispatch observed";
-          gpu.Transition(neural_outputs[feature_index].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-          gpu.RecordTextureReadback(neural_outputs[feature_index].Get(), output_transfers[feature_index]);
-          gpu.Transition(neural_outputs[feature_index].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+          gpu.Transition(neural_outputs[resource_index].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+          gpu.RecordTextureReadback(neural_outputs[resource_index].Get(), output_transfers[resource_index]);
+          gpu.Transition(neural_outputs[resource_index].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
           submit_healthy(nullptr);
-          stage_pixels[phase] = gpu.ReadTexture(output_transfers[feature_index]);
+          stage_pixels[phase] = gpu.ReadTexture(output_transfers[resource_index]);
           std::array<uint64_t, 4> roi_modified{}, outside_modified{}, roi_nonfinite{}, outside_nonfinite{};
           uint64_t roi_rgb_modified = 0, outside_rgb_modified = 0;
-          UINT min_x = physical_widths[feature_index], min_y = physical_heights[feature_index], max_x = 0, max_y = 0;
-          for (UINT y = 0; y < physical_heights[feature_index]; ++y) {
-            for (UINT x = 0; x < physical_widths[feature_index]; ++x) {
+          UINT min_x = physical_widths[resource_index], min_y = physical_heights[resource_index], max_x = 0, max_y = 0;
+          for (UINT y = 0; y < physical_heights[resource_index]; ++y) {
+            for (UINT x = 0; x < physical_widths[resource_index]; ++x) {
               const bool roi = x < effective_width && y < effective_height;
               bool rgb_changed = false;
               for (size_t channel = 0; channel < 4; ++channel) {
                 uint16_t bits = 0;
                 std::memcpy(&bits, stage_pixels[phase].data()
-                    + ((static_cast<size_t>(y) * physical_widths[feature_index] + x) * 4 + channel) * sizeof(uint16_t), sizeof(bits));
+                    + ((static_cast<size_t>(y) * physical_widths[resource_index] + x) * 4 + channel) * sizeof(uint16_t), sizeof(bits));
                 const bool changed = bits != sentinel[channel];
                 (roi ? roi_modified : outside_modified)[channel] += changed;
                 (roi ? roi_nonfinite : outside_nonfinite)[channel] += !std::isfinite(DirectX::PackedVector::XMConvertHalfToFloat(bits));
@@ -3290,7 +3301,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
               {"roi_nonfinite_channels", roi_nonfinite}, {"outside_nonfinite_channels", outside_nonfinite},
               {"roi_rgb_modified_pixels", roi_rgb_modified}, {"outside_rgb_modified_pixels", outside_rgb_modified},
               {"roi_pixels", static_cast<uint64_t>(effective_width) * effective_height},
-              {"outside_pixels", static_cast<uint64_t>(physical_widths[feature_index]) * physical_heights[feature_index]
+              {"outside_pixels", static_cast<uint64_t>(physical_widths[resource_index]) * physical_heights[resource_index]
                   - static_cast<uint64_t>(effective_width) * effective_height},
               {"crc32", renodx::utils::hash::ComputeCRC32(stage_pixels[phase].data(), stage_pixels[phase].size())},
               {"rgb_write_bbox", max_x == 0 ? nlohmann::json(nullptr) : nlohmann::json{min_x, min_y, max_x, max_y}},
@@ -3301,7 +3312,8 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         const auto compare_pixels = [&](size_t first, size_t second, UINT compare_width, UINT compare_height) {
           nlohmann::json comparison{{"status", "NotRun"}, {"channel_order", "RGBA"}};
           if (stage_pixels[first].empty() || stage_pixels[second].empty()) return comparison;
-          const UINT first_stride = first == 4 ? small_width : width, second_stride = second == 4 ? small_width : width;
+          const UINT first_stride = physical_widths[phase_resource_indices[first]],
+                     second_stride = physical_widths[phase_resource_indices[second]];
           std::array<double, 4> absolute_sum{}, squared_sum{}, maximum{};
           std::array<uint64_t, 4> finite_pairs{};
           for (UINT y = 0; y < compare_height; ++y) {
@@ -3917,6 +3929,11 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       const auto* expect_reuse_environment = std::getenv("NR_NEXUS_TEST_RESIZE_EXPECT_REUSE");
       const bool expect_reuse = settings_reuse && expect_reuse_environment != nullptr
           && std::strcmp(expect_reuse_environment, "1") == 0;
+      const auto* reuse_feature_environment = std::getenv("NR_NEXUS_TEST_RESIZE_REUSE_FEATURE");
+      const bool reuse_feature = reuse_feature_environment != nullptr && std::strcmp(reuse_feature_environment, "1") == 0;
+      Check(!reuse_feature || expect_reuse, "Feature capacity experiment requires the existing settings-reuse sequence");
+      Check(!addon::nr_adaptive_feature_capacity_reuse_experiment.load(), "Feature capacity reuse is disabled by default");
+      addon::nr_adaptive_feature_capacity_reuse_experiment = reuse_feature;
       const uint32_t frame_count = (settings_reuse ? 360u : 180u);
       const UINT intervals_per_frame = (native_resize_ready ? 3u : 2u);
       auto queries = d3d12_test::CreateTimestampQueries(gpu, frame_count * intervals_per_frame);
@@ -3949,6 +3966,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           {"mode", (native_resize_ready ? "ready-cache" : "cold")},
           {"settings_reuse_sequence", settings_reuse},
           {"expect_settings_reuse", expect_reuse},
+          {"feature_capacity_reuse_experiment", reuse_feature},
           {"selection", "MOCK direct Session::Request; output FPS source unavailable, no FPS accuracy claim"},
           {"timing_scope", "CPU resource/wrapper residual includes resource preparation, binding, dispatch recording, logging and retirement outside SDK calls; GPU wrapper includes real SR and NR"},
           {"synchronization", "one submitted list, fence completed before reuse; 60Hz paced starts; raw actual start intervals"},
@@ -3974,6 +3992,10 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       std::array<uint64_t, renodx::addons::dlss5::adaptive_resolution::MAX_LEVELS> stable_worksets{};
       bool recorded_ready = false;
       size_t preparing_evaluates = 0;
+      size_t endpoint_slot = 0;
+      uintptr_t endpoint_model = 0, endpoint_parameters = 0;
+      std::shared_ptr<submission::RecordingStatus> endpoint_old_completion;
+      bool endpoint_reset_seen = false, endpoint_dimension_reset_seen = false, endpoint_ready_seen = false;
       if (native_resize_ready) {
         renodx::addons::dlss5::gpu_timers::comparison_settings = addon::comparison_ui::CaptureSettings;
         addon::adaptive_configuration_settings = addon::comparison_ui::CaptureAdaptiveSettings;
@@ -4006,6 +4028,20 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
               if (expect_reuse) {
                 Check(addon::features.at(owner).adaptive_session->RequestMinimum(addon::SteadyNowNs()),
                       "native minimum request has an idle non-active slot");
+                const auto& source = addon::features.at(owner);
+                endpoint_slot = source.adaptive_session->level;
+                const auto& tier = source.adaptive_cache->tiers[endpoint_slot];
+                const auto& model = tier.state.slots[0];
+                endpoint_model = reinterpret_cast<uintptr_t>(model.handle);
+                endpoint_parameters = reinterpret_cast<uintptr_t>(model.parameters);
+                endpoint_old_completion = tier.completion;
+                report["endpoint_before_retarget"] = {{"slot", endpoint_slot}, {"model", endpoint_model}, {"parameters", endpoint_parameters},
+                    {"create_input", {model.create_input_width, model.create_input_height}},
+                    {"create_output", {model.create_output_width, model.create_output_height}},
+                    {"logical_size", {tier.state.input_width, tier.state.input_height}},
+                    {"active_model", reinterpret_cast<uintptr_t>(source.slots[0].handle)},
+                    {"old_receipt_list", endpoint_old_completion != nullptr ? endpoint_old_completion->list : 0},
+                    {"old_receipt_generation", endpoint_old_completion != nullptr ? endpoint_old_completion->generation : 0}};
                 setting_event = "request-minimum-50";
               }
               break;
@@ -4137,6 +4173,11 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
             }
             tier_states.push_back({{"slot", slot}, {"active", slot == cache->active}, {"ready", tier.ready},
                 {"model", model}, {"proxy", proxy}, {"workset_id", workset_id},
+                {"parameters", reinterpret_cast<uintptr_t>(state.slots[0].parameters)},
+                {"create_input", {state.slots[0].create_input_width, state.slots[0].create_input_height}},
+                {"create_output", {state.slots[0].create_output_width, state.slots[0].create_output_height}},
+                {"last_reset_reasons", state.slots[0].model_reset_reasons},
+                {"logical_size", {state.input_width, state.input_height}},
                 {"preparation_cpu_ms", tier.preparation_cpu_ms},
                 {"receipt_closed", tier.completion != nullptr && tier.completion->closed.load()},
                 {"receipt_submitted", tier.completion != nullptr && tier.completion->submitted.load()},
@@ -4164,6 +4205,32 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
             if (frame == 299) {
               Check(workset.input_width == width / 2 && workset.input_height == height / 2,
                     "requested new minimum reaches a completed real 50 percent NR tier");
+            }
+            if (reuse_feature && frame >= 285 && frame < 300) {
+              const auto& candidate = (cache->active == endpoint_slot ? addon::features.at(owner) : cache->tiers[endpoint_slot].state);
+              const auto& model = candidate.slots[0];
+              const auto& tier = cache->tiers[endpoint_slot];
+              endpoint_dimension_reset_seen |= (model.model_reset_reasons & addon::kResetDimensions) != 0;
+              Check(native_resize_creates == 0 && native_resize_releases == 0
+                        && reinterpret_cast<uintptr_t>(model.handle) == endpoint_model
+                        && reinterpret_cast<uintptr_t>(model.parameters) == endpoint_parameters,
+                    "capacity experiment retains only the completed candidate's own Feature and parameters without Create/Release");
+              for (size_t index = 0; index < native_resize_models.size(); ++index) {
+                if (native_resize_models[index] == endpoint_model && native_runtime_resets[index] == 1) endpoint_reset_seen = true;
+              }
+              if (tier.ready) {
+                endpoint_ready_seen = true;
+                Check(tier.completion != nullptr && tier.completion != endpoint_old_completion
+                          && tier.completion->closed.load() && tier.completion->submitted.load() && tier.completion->completed_healthy,
+                      "retargeted candidate readiness comes from a new healthy GPU-complete recording");
+              }
+              if (frame == 299) {
+                Check(endpoint_reset_seen && endpoint_dimension_reset_seen && endpoint_ready_seen && cache->active == endpoint_slot
+                          && model.create_input_width >= width / 2 && model.create_input_height >= height / 2
+                          && workset.proxy->GetDesc().Width == width / 2 && workset.proxy->GetDesc().Height == height / 2
+                          && workset.nr_output->GetDesc().Width == width / 2 && workset.nr_output->GetDesc().Height == height / 2,
+                      "the retained-capacity Feature resets and applies a real completed smaller physical workset");
+              }
             }
           }
           if (changed) {
@@ -4322,6 +4389,10 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       }
       addon::core_create_feature = native_resize_create;
       addon::core_release_feature = native_resize_release;
+      addon::nr_adaptive_feature_capacity_reuse_experiment = false;
+      report["feature_capacity_reuse_result"] = {{"requested", reuse_feature}, {"candidate_reset_observed", endpoint_reset_seen},
+          {"candidate_dimension_reset_observed", endpoint_dimension_reset_seen},
+          {"candidate_new_completion_observed", endpoint_ready_seen}, {"experiment_disabled_after_sequence", true}};
       native_cost_list = nullptr;
       Check(addon::get_module_filename_iat == nullptr && addon::original_get_module_filename == nullptr,
             "resize uses no snippet caller identity bridge");
@@ -4962,6 +5033,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     }
     return 0;
   } catch (const std::exception& error) {
+    addon::nr_adaptive_feature_capacity_reuse_experiment = false;
     if (diagnostic_probe && !resize_report.is_null()) {
       resize_report["failure"] = error.what();
       if (resize_report.value("contract_execution", "") == "Passed" || resize_report.value("probe_execution", "") == "Passed") {
@@ -4974,6 +5046,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     std::cerr << "FAIL ControlMask production NATIVE_NGX: " << error.what() << '\n';
     return 1;
   } catch (...) {
+    addon::nr_adaptive_feature_capacity_reuse_experiment = false;
     if (!diagnostic_probe) throw;
     if (!resize_report.is_null()) {
       resize_report["failure"] = "non-standard exception";

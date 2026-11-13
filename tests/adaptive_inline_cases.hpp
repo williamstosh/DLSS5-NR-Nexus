@@ -41,6 +41,7 @@ int Run() {
     native::control_mask_enabled = true;
     native::nr_adaptive_min_scale = .33f;
     native::nr_adaptive_target_fps = 116.f;
+    Check(!native::nr_adaptive_feature_capacity_reuse_experiment.load(), "Feature capacity experiment defaults to disabled");
     native::max_worksets = 4;
     native::OnNativeFgOptions(false);
     native::adaptive_configuration_settings = native::comparison_ui::CaptureAdaptiveSettings;
@@ -284,6 +285,12 @@ int Run() {
             && native::worksets_created == allocations,
             "resolve-only strength changes keep all allocations and do not request a model History reset");
 
+        native::nr_adaptive_feature_capacity_reuse_experiment = hook == native::kHookUpscaled;
+        Check(cache->tiers[1].state.slots[0].create_input_width == 5
+            && cache->tiers[1].state.slots[0].create_input_height == 5
+            && cache->tiers[1].state.slots[0].create_output_width == 5
+            && cache->tiers[1].state.slots[0].create_output_height == 5,
+            "the lower slot records its actual Create capacity independently of requested logical sizes");
         auto running_list = gpu.list;
         auto running_allocator = gpu.allocator;
         ComPtr<ID3D12CommandAllocator> pending_allocator;
@@ -337,6 +344,9 @@ int Run() {
             && native::nr_features_created == models + 1 && native::worksets_created == allocations + 2
             && !feature.adaptive_session->failed && addon::submission::ResourceReleasable(lower_model),
             "only the requested endpoint is rebuilt after exact retirement and completes both rotating outputs");
+        Check(feature.slots[0].create_input_width == 8 && feature.slots[0].create_output_width == 8
+            && feature.slots[0].handle != lower_model,
+            "the experiment cannot retain a 5-pixel capacity Feature for an 8-pixel endpoint");
         set(native::kSetAdaptiveMinScale, .8f);
         Check(record() && record() && cache->active == 0 && feature.input_width == 16
             && native::nr_features_created == models + 1,
@@ -351,6 +361,7 @@ int Run() {
         set(native::kSetStyle, saved_style);
         set(native::kSetTransferStrength, 1.f);
         Check(record() && record(), "reuse regression restores the original Evaluate and resolve controls");
+        native::nr_adaptive_feature_capacity_reuse_experiment = false;
         const auto saved_preset = native::kSetPreset.Get();
         native::comparison_ui::CaptureAdaptiveSettings(&resources_before);
         native::kSetPreset.Store(saved_preset == 1.f ? 2.f : 1.f);
