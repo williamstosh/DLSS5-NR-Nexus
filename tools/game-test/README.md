@@ -144,6 +144,19 @@ runner 与 wrapper 复用公共测试产物生命周期。结果写出后自动�
     --process "$runDirectory/owned-process.json" --output "$runDirectory/hang-evidence-manual"
 ```
 
+启动异常需要在进程退出前预先附加。已获本轮采证授权时，可在所属进程文件出现后立即运行以下独立观察器；它重新核对 PID、创建时间和路径，最多观察180秒，在首个 `C00000FD` 或任意第二次机会异常暂停期间采集一次，再继续原异常并解除附加，不操作游戏输入或关闭游戏：
+
+```powershell
+& $pythonPath -B ./tools/game-test/startup_evidence.py `
+    --process "$runDirectory/owned-process.json" --output "$runDirectory/startup-evidence" `
+    --stop-file "$runDirectory/stop-startup-evidence.json" --timeout 180 --capture-timeout 20 `
+    --module-seeds "$runDirectory/module-seeds.json"
+```
+
+输出目录须为新目录，解释器和目标须为原生 Windows x64。可省略 `--module-seeds`；指定时文件为 JSON 数组，每项含 `module`（绝对路径或模块文件名）、`sha256`、`timestamp`、`size_of_image`、`rva`，数值可写十六进制字符串。只有磁盘 SHA256、磁盘及运行模块 PE 时间戳／映像大小均匹配才读取对应一页，绝对路径种子还要求运行路径一致。采集保存异常记录、对应线程 CONTEXT、完整虚拟内存元数据和非映像可执行分配的可读区域（含同一 AllocationBase 的区域头，原始页总计上限16MiB、每分配256KiB），并复用普通栈／模块转储。普通转储无 ExceptionStream，首发异常以侧车为准；AllocationBase 本身不标识分配者。
+
+`state.json` 的 `observing` 同时确认初始附加断点已处理且 `kill_on_exit=false`。无需继续观察时创建 stop 文件，等观察器退出并确认 `state=detached` 后再开始 UI 采集。附加会改变时序及异常派发；附加前退出、未出现目标异常、读取失败或预算截断均按实际状态记录，不视为复现通过。仅异常暂停期间读取页面，不改系统 WER。定向离线验证为 `python -B -m unittest discover -s tools/game-test -p test_startup_evidence.py -v`，包含一个自有无窗口 CPU 进程的真实附加、合成异常穿透和解除附加。
+
 连续录制自动核验各原帧哈希，生成不超过 1280×720 的 WebP 回看预览并核验解码帧数／时间间隔；保留预览、摘要、录制记录及首尾原图，自动释放其余原帧。转换失败则保留整段原帧及错误记录。预览只用于采样回看；原分辨率画质分析或完整原帧专项须在启动前显式 KEEP_RAW。
 
 已授权的历史游戏产物清理可运行 `python tools/game-test/cleanup_artifacts.py --root artifacts`，只接入有完整 guard／恢复／退出证据的旧运行；游戏或 CrashReporter 仍在运行时拒绝执行。
