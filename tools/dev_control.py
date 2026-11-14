@@ -287,8 +287,8 @@ class Client:
         return response
 
     def adaptive_feature_experiment(self, mode, *, deadline=None):
-        if type(mode) is not int or mode not in (0, 1, 2):
-            raise ValueError('adaptive_feature_experiment requires integer mode 0, 1 or 2')
+        if type(mode) is not int or mode not in (0, 1, 2, 3):
+            raise ValueError('adaptive_feature_experiment requires integer mode 0, 1, 2 or 3')
         deadline = deadline if deadline is not None else time.monotonic() + self.timeout
         request = dict(id=str(uuid.uuid4()), op='adaptive_feature_experiment', mode=mode)
         return self._mutation(request, deadline)

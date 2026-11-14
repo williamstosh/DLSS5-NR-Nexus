@@ -69,7 +69,7 @@ class ClientTests(unittest.TestCase):
     def test_adaptive_feature_experiment_has_a_dedicated_integer_request_and_shared_deadline(self):
         client = self.client()
         deadline = time.monotonic() + 1
-        for mode in (0, 1, 2):
+        for mode in (0, 1, 2, 3):
             actual = client.adaptive_feature_experiment(mode, deadline=deadline)
             request = self.transport.requests[-1]
             self.assertEqual(request['op'], 'adaptive_feature_experiment')
@@ -77,12 +77,12 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(actual['id'], request['id'])
             self.assertNotIn('key', request)
             self.assertNotIn('confirm', request)
-        self.assertEqual(self.transport.deadlines, [deadline] * 3)
-        self.assertEqual(len({request['id'] for request in self.transport.requests}), 3)
+        self.assertEqual(self.transport.deadlines, [deadline] * 4)
+        self.assertEqual(len({request['id'] for request in self.transport.requests}), 4)
 
     def test_adaptive_feature_experiment_rejects_invalid_modes_without_transport(self):
         client = self.client()
-        for mode in (True, False, -1, 3, 1.0, '2', None):
+        for mode in (True, False, -1, 4, 1.0, '2', None):
             with self.subTest(mode=mode), self.assertRaises(ValueError):
                 client.adaptive_feature_experiment(mode)
         self.assertEqual(self.transport.requests, [])

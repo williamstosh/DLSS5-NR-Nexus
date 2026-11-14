@@ -209,7 +209,7 @@ inline Json Execute(const Json& request) {
   if (*operation == "adaptive_feature_experiment") {
     response["reason"] = "invalid_mode";
     const auto mode = request.find("mode");
-    if (mode == request.end() || !mode->is_number_integer() || *mode < 0 || *mode > 2) return finish();
+    if (mode == request.end() || !mode->is_number_integer() || *mode < 0 || *mode > 3) return finish();
     response["requested"] = {{"mode", *mode}};
     if (configuration_busy) {
       response["reason"] = "configuration_busy";

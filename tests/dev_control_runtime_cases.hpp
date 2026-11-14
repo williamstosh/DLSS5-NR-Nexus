@@ -211,8 +211,8 @@
   const auto experiment_generation = runtime::configuration_generation.load();
   const auto experiment_features = runtime::nr_features_created;
   check(experiment(true)["reason"] == "invalid_mode" && experiment(2.0)["reason"] == "invalid_mode"
-          && experiment(-1)["reason"] == "invalid_mode" && experiment(3)["reason"] == "invalid_mode",
-      "experimental mode accepts only the integer values zero, one and two");
+          && experiment(-1)["reason"] == "invalid_mode" && experiment(4)["reason"] == "invalid_mode",
+      "experimental mode accepts only the integer values zero through three");
   const bool released_before = runtime::disabled_resources_released.load();
   runtime::disabled_resources_released = false;
   check(experiment(2)["reason"] == "resources_not_released", "NR OFF alone does not prove its old resources are released");
@@ -240,9 +240,10 @@
   reused_experiment["mode"] = 1;
   check(control::Execute(reused_experiment)["reason"] == "request_id_reused", "a reused experimental id cannot change its requested mode");
   check(experiment(1)["ok"] && runtime::adaptive_feature_mode.load() == runtime::AdaptiveFeatureMode::RETAIN
+          && experiment(3)["ok"] && runtime::adaptive_feature_mode.load() == runtime::AdaptiveFeatureMode::UPPER_CAPACITY_ON_DEMAND
           && experiment(0)["ok"] && runtime::adaptive_feature_mode.load() == runtime::AdaptiveFeatureMode::OFF
           && experiment(0)["status"] == "unchanged",
-      "the dedicated operation supports RETAIN and returns to OFF without activation claims");
+      "the dedicated operation supports RETAIN and ON_DEMAND and returns to OFF without activation claims");
   check(configuration_writes == experiment_writes && runtime::configuration_generation == experiment_generation
           && runtime::nr_features_created == experiment_features,
       "experiment requests write no INI settings, recreate no features and leave ordinary configuration generation unchanged");
