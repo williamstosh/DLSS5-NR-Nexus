@@ -2808,8 +2808,9 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     Check(!cold_components || (selected_sequence && selected_levels == 0), "cold components requires explicit Default 0");
     if (pipeline_steps) {
       const auto* ready = std::getenv("NR_NEXUS_TEST_RESIZE_READY");
-      Check(selected_sequence && selected_levels == 0 && !cold_components && ready != nullptr && std::strcmp(ready, "1") == 0,
-          "pipeline steps requires explicit Default 0, Ready 1, and no two-source cold-components probe");
+      Check(selected_sequence && (selected_levels == 0 || selected_levels == 15) && !cold_components
+              && ready != nullptr && std::strcmp(ready, "1") == 0,
+          "pipeline steps requires explicit Default 0 or 15, Ready 1, and no two-source cold-components probe");
     }
     if (selected_sequence) {
       Check(std::strcmp(selected_environment, "0") == 0 || std::strcmp(selected_environment, "15") == 0,

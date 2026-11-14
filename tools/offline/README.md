@@ -332,7 +332,8 @@ Create／Evaluate 失败停止并保存诊断，不降低档数或重启准备�
 
 冷启用自适应的分步管线验证使用同一入口的单个冷进程。编译原生夹具时同时定义
 `NR_NEXUS_TEST_NATIVE_NGX`、`NR_NEXUS_TEST_COLD_CPU_TRACE`，设置
-`NR_NEXUS_TEST_RESIZE_PIPELINE_STEPS=1`、`NR_NEXUS_TEST_RESIZE_SELECTED_LEVELS=0`、
+`NR_NEXUS_TEST_RESIZE_PIPELINE_STEPS=1`，`NR_NEXUS_TEST_RESIZE_SELECTED_LEVELS=0`（默认）
+或 `15`（最低 33% 的完整网格），以及
 `NR_NEXUS_TEST_RESIZE_READY=1`、`NR_NEXUS_TEST_RESIZE_COLD_COMPONENTS=0`，其余专项开关
 沿上面的要求关闭。首次 prefix 源调用前就开启自适应，沿用既有 62 次 prefix 与
 180 次 selected 源硬界，保留已经推进的同一所选集合；全部档位取得健康完成收据后，
