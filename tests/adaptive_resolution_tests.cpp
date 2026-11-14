@@ -14,7 +14,7 @@ int main() {
     }
   });
   namespace adaptive = renodx::addons::dlss5::adaptive_resolution;
-  for (const uint32_t count : {4u, static_cast<uint32_t>(adaptive::MAX_PREPARED_LEVELS)}) {
+  for (const uint32_t count : {3u, 4u, static_cast<uint32_t>(adaptive::MAX_PREPARED_LEVELS)}) {
     const auto check = [&](bool condition, const char* name) {
       if (!condition) {
         std::cerr << "prepared-tiers[" << count << "]: " << name << '\n';

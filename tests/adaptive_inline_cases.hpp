@@ -41,7 +41,7 @@ int Run() {
     native::control_mask_enabled = true;
     native::nr_adaptive_min_scale = .33f;
     native::nr_adaptive_target_fps = 116.f;
-    Check(!native::nr_adaptive_feature_capacity_reuse_experiment.load(), "Feature capacity experiment defaults to disabled");
+    Check(native::adaptive_feature_mode.load() == native::AdaptiveFeatureMode::OFF, "Feature capacity experiment defaults to disabled");
     native::max_worksets = 4;
     native::OnNativeFgOptions(false);
     native::adaptive_configuration_settings = native::comparison_ui::CaptureAdaptiveSettings;
@@ -248,6 +248,15 @@ int Run() {
           "standby Evaluate calls execute and retain their preparation cost separately from source successes");
       Check(!parked_recording->closed.load() && !addon::submission::ResourceReleasable(parked_model),
           "standby preparation preserves the active tier's replayable recording protection");
+      if (hook == native::kHookUpscaled) {
+        const auto created_before = native::nr_features_created;
+        native::adaptive_feature_mode = native::AdaptiveFeatureMode::UPPER_CAPACITY;
+        Check(record() && record() && feature.adaptive_cache == cache && cache->count == 2
+            && cache->tiers[1].state.slots[0].create_input_width == 5
+            && native::nr_features_created == created_before,
+            "upper-capacity mode leaves the existing R8 rotating-output path and its original small Create capacity unchanged");
+        native::adaptive_feature_mode = native::AdaptiveFeatureMode::OFF;
+      }
       {
         const auto set = [](const native::Setting& setting, float value) {
           setting.Store(value);
@@ -256,6 +265,8 @@ int Run() {
         const auto saved_style = native::kSetStyle.Get();
         const auto upper_model = feature.slots[0].handle;
         const auto lower_model = cache->tiers[1].state.slots[0].handle;
+        // The mock allocator may reuse a retired handle's address.
+        const auto lower_model_id = *reinterpret_cast<const uint32_t*>(lower_model);
         const auto allocations = native::worksets_created;
         const auto models = native::nr_features_created;
         addon::gpu_comparison::Identity before, resources_before, after, resources_after;
@@ -285,7 +296,8 @@ int Run() {
             && native::worksets_created == allocations,
             "resolve-only strength changes keep all allocations and do not request a model History reset");
 
-        native::nr_adaptive_feature_capacity_reuse_experiment = hook == native::kHookUpscaled;
+        native::adaptive_feature_mode = (hook == native::kHookUpscaled
+            ? native::AdaptiveFeatureMode::RETAIN : native::AdaptiveFeatureMode::OFF);
         Check(cache->tiers[1].state.slots[0].create_input_width == 5
             && cache->tiers[1].state.slots[0].create_input_height == 5
             && cache->tiers[1].state.slots[0].create_output_width == 5
@@ -345,7 +357,7 @@ int Run() {
             && !feature.adaptive_session->failed && addon::submission::ResourceReleasable(lower_model),
             "only the requested endpoint is rebuilt after exact retirement and completes both rotating outputs");
         Check(feature.slots[0].create_input_width == 8 && feature.slots[0].create_output_width == 8
-            && feature.slots[0].handle != lower_model,
+            && *reinterpret_cast<const uint32_t*>(feature.slots[0].handle) != lower_model_id,
             "the experiment cannot retain a 5-pixel capacity Feature for an 8-pixel endpoint");
         set(native::kSetAdaptiveMinScale, .8f);
         Check(record() && record() && cache->active == 0 && feature.input_width == 16
@@ -361,7 +373,7 @@ int Run() {
         set(native::kSetStyle, saved_style);
         set(native::kSetTransferStrength, 1.f);
         Check(record() && record(), "reuse regression restores the original Evaluate and resolve controls");
-        native::nr_adaptive_feature_capacity_reuse_experiment = false;
+        native::adaptive_feature_mode = native::AdaptiveFeatureMode::OFF;
         const auto saved_preset = native::kSetPreset.Get();
         native::comparison_ui::CaptureAdaptiveSettings(&resources_before);
         native::kSetPreset.Store(saved_preset == 1.f ? 2.f : 1.f);

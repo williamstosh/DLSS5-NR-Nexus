@@ -489,6 +489,7 @@ struct Frame {
   uint32_t output_count = 1;
   uintptr_t output_identity = 0;
   bool enabled = false, measure = false, preparing = false, immediate = true;
+  bool upper_capacity = false;
 };
 
 }  // namespace renodx::addons::dlss5::adaptive_resolution

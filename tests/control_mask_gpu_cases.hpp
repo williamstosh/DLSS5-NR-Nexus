@@ -12,6 +12,7 @@
 #include <DirectXPackedVector.h>
 #include <psapi.h>
 #include <fstream>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <set>
 #include <thread>
@@ -3930,10 +3931,19 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       const bool expect_reuse = settings_reuse && expect_reuse_environment != nullptr
           && std::strcmp(expect_reuse_environment, "1") == 0;
       const auto* reuse_feature_environment = std::getenv("NR_NEXUS_TEST_RESIZE_REUSE_FEATURE");
-      const bool reuse_feature = reuse_feature_environment != nullptr && std::strcmp(reuse_feature_environment, "1") == 0;
+      auto feature_mode = addon::AdaptiveFeatureMode::OFF;
+      if (reuse_feature_environment != nullptr) {
+        if (std::strcmp(reuse_feature_environment, "1") == 0) {
+          feature_mode = addon::AdaptiveFeatureMode::RETAIN;
+        } else if (std::strcmp(reuse_feature_environment, "2") == 0) {
+          feature_mode = addon::AdaptiveFeatureMode::UPPER_CAPACITY;
+        }
+      }
+      const bool reuse_feature = feature_mode != addon::AdaptiveFeatureMode::OFF;
+      const bool upper_capacity = feature_mode == addon::AdaptiveFeatureMode::UPPER_CAPACITY;
       Check(!reuse_feature || expect_reuse, "Feature capacity experiment requires the existing settings-reuse sequence");
-      Check(!addon::nr_adaptive_feature_capacity_reuse_experiment.load(), "Feature capacity reuse is disabled by default");
-      addon::nr_adaptive_feature_capacity_reuse_experiment = reuse_feature;
+      Check(addon::adaptive_feature_mode.load() == addon::AdaptiveFeatureMode::OFF, "Feature capacity reuse is disabled by default");
+      addon::adaptive_feature_mode = feature_mode;
       const uint32_t frame_count = (settings_reuse ? 360u : 180u);
       const UINT intervals_per_frame = (native_resize_ready ? 3u : 2u);
       auto queries = d3d12_test::CreateTimestampQueries(gpu, frame_count * intervals_per_frame);
@@ -3967,6 +3977,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           {"settings_reuse_sequence", settings_reuse},
           {"expect_settings_reuse", expect_reuse},
           {"feature_capacity_reuse_experiment", reuse_feature},
+          {"feature_mode", upper_capacity ? "UPPER_CAPACITY" : reuse_feature ? "RETAIN" : "OFF"},
           {"selection", "MOCK direct Session::Request; output FPS source unavailable, no FPS accuracy claim"},
           {"timing_scope", "CPU resource/wrapper residual includes resource preparation, binding, dispatch recording, logging and retirement outside SDK calls; GPU wrapper includes real SR and NR"},
           {"synchronization", "one submitted list, fence completed before reuse; 60Hz paced starts; raw actual start intervals"},
@@ -3996,6 +4007,60 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       uintptr_t endpoint_model = 0, endpoint_parameters = 0;
       std::shared_ptr<submission::RecordingStatus> endpoint_old_completion;
       bool endpoint_reset_seen = false, endpoint_dimension_reset_seen = false, endpoint_ready_seen = false;
+      uint32_t initial_creates = 0, initial_releases = 0;
+      double initial_create_ms = 0.;
+      std::array<uintptr_t, renodx::addons::dlss5::adaptive_resolution::MAX_LEVELS> initial_models{}, initial_parameters{};
+      const auto observe_pixels = [&](ID3D12Resource* surface, D3D12_RESOURCE_STATES state,
+                                      uint32_t frame, const char* role) {
+        const auto desc = surface->GetDesc();
+        Check(desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT, "resize pixel observation uses the actual FP16 surface");
+        auto transfer = gpu.CreateTextureTransfer(surface);
+        gpu.Retain(surface);
+        submission::TrackUse(gpu.list.Get(), surface);
+        gpu.Transition(surface, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        gpu.RecordTextureReadback(surface, transfer);
+        gpu.Transition(surface, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
+        gpu.Submit();
+        const auto completed = gpu.fence->GetCompletedValue();
+        Check(completed >= gpu.serial && completed != UINT64_MAX && SUCCEEDED(gpu.device->GetDeviceRemovedReason()),
+              "resize pixel observation completes on a healthy device");
+        const auto bytes = gpu.ReadTexture(transfer);
+        const bool keep_raw = std::getenv("NR_NEXUS_TEST_KEEP_RAW") != nullptr
+            && std::strcmp(std::getenv("NR_NEXUS_TEST_KEEP_RAW"), "1") == 0;
+        if (keep_raw) {
+          const auto filename = "adaptive-pixels-" + std::to_string(frame) + "-" + role + ".rgba16f";
+          std::ofstream raw(filename, std::ios::binary | std::ios::trunc);
+          raw.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+          Check(raw.good(), "resize diagnostic pixel bytes are saved");
+        }
+        std::array<uint64_t, 4> nonfinite{}, finite{};
+        std::array<float, 4> minimum{}, maximum{};
+        minimum.fill(std::numeric_limits<float>::max());
+        maximum.fill(std::numeric_limits<float>::lowest());
+        for (size_t channel = 0; channel < bytes.size() / sizeof(uint16_t); ++channel) {
+          uint16_t bits = 0;
+          std::memcpy(&bits, bytes.data() + channel * sizeof(uint16_t), sizeof(bits));
+          const float value = DirectX::PackedVector::XMConvertHalfToFloat(bits);
+          const size_t component = channel % 4;
+          if (std::isfinite(value)) {
+            ++finite[component];
+            minimum[component] = std::min(minimum[component], value);
+            maximum[component] = std::max(maximum[component], value);
+          } else {
+            ++nonfinite[component];
+          }
+        }
+        nlohmann::json minima = nlohmann::json::array(), maxima = nlohmann::json::array();
+        for (size_t component = 0; component < 4; ++component) {
+          minima.push_back(finite[component] != 0 ? nlohmann::json(minimum[component]) : nlohmann::json(nullptr));
+          maxima.push_back(finite[component] != 0 ? nlohmann::json(maximum[component]) : nlohmann::json(nullptr));
+        }
+        return nlohmann::json{{"size", {desc.Width, desc.Height}}, {"format", static_cast<uint32_t>(desc.Format)},
+            {"crc32", renodx::utils::hash::ComputeCRC32(bytes.data(), bytes.size())}, {"channel_order", "RGBA"},
+            {"nonfinite_channels", nonfinite}, {"finite_channels", finite}, {"minimum", minima}, {"maximum", maxima},
+            {"raw_retained", keep_raw},
+            {"state_restored", true}, {"fence", gpu.serial}, {"completed_fence", completed}};
+      };
       if (native_resize_ready) {
         renodx::addons::dlss5::gpu_timers::comparison_settings = addon::comparison_ui::CaptureSettings;
         addon::adaptive_configuration_settings = addon::comparison_ui::CaptureAdaptiveSettings;
@@ -4155,6 +4220,12 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
             const auto model = reinterpret_cast<uintptr_t>(state.slots[0].handle);
             const auto proxy = (found != addon::worksets.end() ? reinterpret_cast<uintptr_t>(found->second.proxy) : 0);
             const auto workset_id = (found != addon::worksets.end() ? found->second.id : 0);
+            if (upper_capacity && state.slots[0].handle != nullptr) {
+              Check(cache->count == 3 && state.slots[0].create_input_width == width
+                        && state.slots[0].create_input_height == height
+                        && state.slots[0].create_output_width == width && state.slots[0].create_output_height == height,
+                    "upper-capacity mode owns three slots whose actual Feature Create dimensions remain the manual upper size");
+            }
             if (tier.ready) {
               Check(tier.completion != nullptr && tier.completion->closed.load()
                         && tier.completion->submitted.load() && tier.completion->completed_healthy,
@@ -4189,6 +4260,16 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
               report["ready_frames"].push_back(frame);
             }
             recorded_ready = true;
+            if (frame < 60 && !report.contains("initial_preparation")) {
+              for (size_t slot = 0; slot < cache->count; ++slot) {
+                const auto& state = (slot == cache->active ? addon::features.at(owner) : cache->tiers[slot].state);
+                initial_models[slot] = reinterpret_cast<uintptr_t>(state.slots[0].handle);
+                initial_parameters[slot] = reinterpret_cast<uintptr_t>(state.slots[0].parameters);
+              }
+              report["initial_preparation"] = {{"resident_slots", cache->count}, {"all_ready_frame", frame},
+                  {"logical_coefficients", std::vector<float>(cache->ladder.coefficients.begin(), cache->ladder.coefficients.begin() + cache->count)},
+                  {"tiers", tier_states}};
+            }
           }
           if (expect_reuse && frame >= 180) {
             Check(addon::features.at(owner).adaptive_session->IsLegal(
@@ -4215,6 +4296,11 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                         && reinterpret_cast<uintptr_t>(model.handle) == endpoint_model
                         && reinterpret_cast<uintptr_t>(model.parameters) == endpoint_parameters,
                     "capacity experiment retains only the completed candidate's own Feature and parameters without Create/Release");
+              if (upper_capacity) {
+                Check(endpoint_model == initial_models[endpoint_slot] && endpoint_parameters == initial_parameters[endpoint_slot]
+                          && model.create_input_width == width && model.create_input_height == height,
+                      "the new endpoint keeps the same initial upper-capacity Feature, parameter block and actual Create capacity");
+              }
               for (size_t index = 0; index < native_resize_models.size(); ++index) {
                 if (native_resize_models[index] == endpoint_model && native_runtime_resets[index] == 1) endpoint_reset_seen = true;
               }
@@ -4252,6 +4338,19 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                 {"begin_tick", sample.begin_tick}, {"end_tick", sample.end_tick}});
           }
         }
+        if (native_resize_ready && frame < 60) {
+          initial_creates += native_resize_creates;
+          initial_releases += native_resize_releases;
+          initial_create_ms += native_resize_create_ms;
+          if (frame == 59) {
+            Check(recorded_ready && initial_creates == cache->count - 1 && initial_releases == 0,
+                  "initial preparation creates exactly the non-active resident Features and releases none");
+            report["initial_preparation"]["standby_create_count"] = initial_creates;
+            report["initial_preparation"]["standby_release_count"] = initial_releases;
+            report["initial_preparation"]["cpu_create_total_ms"] = initial_create_ms;
+            if (upper_capacity) Check(initial_creates == 2, "three-slot upper-capacity mode prepares exactly two standby Features");
+          }
+        }
         Check(gpu.fence->GetCompletedValue() >= gpu.serial && gpu.fence->GetCompletedValue() != UINT64_MAX
                   && SUCCEEDED(gpu.device->GetDeviceRemovedReason()), "resize GPU fence completes on healthy device");
         report["frames"].push_back({{"frame", frame}, {"phase", phase}, {"switch_id", (changed ? phase : 0)},
@@ -4268,6 +4367,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
             {"cpu_resource_wrapper_residual_ms", wrapper_ms - native_resize_create_ms - native_resize_host_ms - native_resize_evaluate_ms},
             {"start_ms", std::chrono::duration<double, std::milli>(start - origin).count()},
             {"raw_start_interval_ms", std::chrono::duration<double, std::milli>(start - previous).count()},
+            {"source_interval_includes_previous_readback", settings_reuse && (frame == 91 || frame == 300 || (upper_capacity && frame == 299))},
             {"nr_evaluated", evaluated}, {"gpu_wrapper_ms", wrapper_gpu.gpu_ms},
             {"gpu_nr_ms", (evaluated ? nlohmann::json(nr_gpu.gpu_ms) : nlohmann::json(nullptr))},
             {"gpu_wrapper_begin_tick", wrapper_gpu.begin_tick}, {"gpu_wrapper_end_tick", wrapper_gpu.end_tick},
@@ -4302,6 +4402,18 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           report["frames"].back()["style_setting"] = addon::style.load();
           report["frames"].back()["transfer_strength_setting"] = addon::transfer_strength.load();
           report["frames"].back()["requested_slot"] = addon::features.at(owner).adaptive_session->level;
+        }
+        // Upper-capacity retargeting activates one frame earlier; 298 pairs with
+        // baseline 299 at the same number of evaluations after the final Reset.
+        if (settings_reuse && (frame == 90 || frame == 299 || (upper_capacity && frame == 298))) {
+          const auto observation_started = std::chrono::steady_clock::now();
+          report["frames"].back()["pixel_observation"] = {
+              {"neural", observe_pixels(workset.nr_output, workset.nr_output_state, frame, "neural")},
+              {"output", observe_pixels(output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, frame, "output")}};
+          report["frames"].back()["pixel_observation_cpu_ms"] = std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - observation_started).count();
+          report["frames"].back()["pixel_observation_after_measurement"] = true;
+          report["frames"].back()["next_source_interval_includes_readback"] = true;
         }
         if (changed || native_resize_creates != 0) {
           std::cout << "RESIZE switch=" << phase << " create_ms=" << native_resize_create_ms
@@ -4389,7 +4501,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       }
       addon::core_create_feature = native_resize_create;
       addon::core_release_feature = native_resize_release;
-      addon::nr_adaptive_feature_capacity_reuse_experiment = false;
+      addon::adaptive_feature_mode = addon::AdaptiveFeatureMode::OFF;
       report["feature_capacity_reuse_result"] = {{"requested", reuse_feature}, {"candidate_reset_observed", endpoint_reset_seen},
           {"candidate_dimension_reset_observed", endpoint_dimension_reset_seen},
           {"candidate_new_completion_observed", endpoint_ready_seen}, {"experiment_disabled_after_sequence", true}};
@@ -5033,7 +5145,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     }
     return 0;
   } catch (const std::exception& error) {
-    addon::nr_adaptive_feature_capacity_reuse_experiment = false;
+    addon::adaptive_feature_mode = addon::AdaptiveFeatureMode::OFF;
     if (diagnostic_probe && !resize_report.is_null()) {
       resize_report["failure"] = error.what();
       if (resize_report.value("contract_execution", "") == "Passed" || resize_report.value("probe_execution", "") == "Passed") {
@@ -5046,7 +5158,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     std::cerr << "FAIL ControlMask production NATIVE_NGX: " << error.what() << '\n';
     return 1;
   } catch (...) {
-    addon::nr_adaptive_feature_capacity_reuse_experiment = false;
+    addon::adaptive_feature_mode = addon::AdaptiveFeatureMode::OFF;
     if (!diagnostic_probe) throw;
     if (!resize_report.is_null()) {
       resize_report["failure"] = "non-standard exception";

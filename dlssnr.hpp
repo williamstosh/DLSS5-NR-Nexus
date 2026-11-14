@@ -2595,8 +2595,9 @@ inline std::atomic_bool nr_adaptive_enabled{false};
 inline std::atomic<float> nr_adaptive_target_fps{60.f};
 inline std::atomic<float> nr_adaptive_min_scale{0.67f};
 inline std::atomic_bool nr_adaptive_editing{false};
-// Offline fixtures opt in; ordinary production keeps the original rebuild path.
-inline std::atomic_bool nr_adaptive_feature_capacity_reuse_experiment{false};
+enum class AdaptiveFeatureMode : uint8_t { OFF, RETAIN, UPPER_CAPACITY };
+// Fixtures and the development interface opt in; ordinary production keeps the original rebuild path.
+inline std::atomic<AdaptiveFeatureMode> adaptive_feature_mode{AdaptiveFeatureMode::OFF};
 inline void (*adaptive_configuration_settings)(gpu_comparison::Identity*) = nullptr;
 // Evaluation hooks and FG recording own runtime_mutex throughout this scope.
 inline const adaptive_resolution::Frame* active_adaptive_frame = nullptr;
@@ -7578,15 +7579,26 @@ inline bool EnsureNrFeature(
         "NR pass " + std::to_string(logical_pass + 1) + " preset " + std::to_string(requested)
             + " is unsupported by this runtime; using A (Legacy), saved selection preserved");
   }
-  SetNrCreateParameters(parameters, input_width, input_height, output_width,
-                        output_height, state.create_flags, resources.hdr_mode != 0, slot.nr_preset);
+  uint32_t create_input_width = input_width, create_input_height = input_height;
+  uint32_t create_output_width = output_width, create_output_height = output_height;
+  if (active_adaptive_frame != nullptr && active_adaptive_frame->upper_capacity
+      && active_adaptive_frame->preparing && logical_pass == 0 && slot.nr_preset == 2) {
+    const auto capacity = active_adaptive_frame->upper[logical_pass];
+    if (capacity.width >= input_width && capacity.height >= input_height
+        && input_width == output_width && input_height == output_height) {
+      create_input_width = create_output_width = capacity.width;
+      create_input_height = create_output_height = capacity.height;
+    }
+  }
+  SetNrCreateParameters(parameters, create_input_width, create_input_height, create_output_width,
+                        create_output_height, state.create_flags, resources.hdr_mode != 0, slot.nr_preset);
   // v8.5.0-rc8: the create's shape before it runs.  Endfield rc4/rc5 died in
   // a bridge create that never returned (a C++ throw 2.5 s in, no outcome
   // line); the crash line says inside=nr-create, and this line says which.
   char starting[160];
   snprintf(starting, sizeof(starting),
            "feature 18 create starting: NR input %ux%u -> output %ux%u, flags 0x%x, %s%s",
-           input_width, input_height, output_width, output_height,
+           create_input_width, create_input_height, create_output_width, create_output_height,
            static_cast<unsigned>(state.create_flags), resources.hdr_mode != 0 ? "HDR" : "SDR",
            slot_index != 0 ? " (stack pass)" : "");
   Log(reshade::log::level::info, starting);
@@ -7660,10 +7672,10 @@ inline bool EnsureNrFeature(
   slot.configuration_generation = configuration_generation.load();
   slot.nr_hdr_mode = resources.hdr_mode;
   slot.nr_create_flags = NrCreateFlags(state.create_flags, resources.hdr_mode != 0);
-  slot.create_input_width = input_width;
-  slot.create_input_height = input_height;
-  slot.create_output_width = output_width;
-  slot.create_output_height = output_height;
+  slot.create_input_width = create_input_width;
+  slot.create_input_height = create_input_height;
+  slot.create_output_width = create_output_width;
+  slot.create_output_height = create_output_height;
   slot.pending_reset = true;
   slot.pending_reset_reasons |= kResetCreated;
   // fail_count is NOT cleared here: only a successful evaluate proves the
@@ -7673,13 +7685,13 @@ inline bool EnsureNrFeature(
   message << "feature 18 created via "
           << (slot.via_core ? "the NGX core" : "the signed snippet")
           << " after " << SourceFeatureName(state.source_feature)
-          << " for NR input " << std::dec << input_width << 'x'
-          << input_height << " -> output " << output_width << 'x'
+          << " for NR input " << std::dec << create_input_width << 'x'
+          << create_input_height << " -> output " << create_output_width << 'x'
           // The game's create-time render size, labelled as such: through rc4
           // it read "with guides", but each evaluate sizes the guides from its
           // own parameters (Alan Wake 2 rc4: frame contracts read
           // in=2227x1253 while every create line said 1280x720).
-          << output_height << ", game DLSS created at "
+          << create_output_height << ", game DLSS created at "
           << (state.create_input_width != 0 ? state.create_input_width
                                             : state.input_width)
           << 'x'
@@ -10247,7 +10259,7 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
     const stage_plan::Group& group, uint32_t reference_width, uint32_t reference_height,
     uint32_t guide_width, uint32_t guide_height, uint64_t source_identity,
     bool supported, uint64_t application_frame = 0, uint32_t required_roles = 1, bool fg_owned = false,
-    uint32_t source_outputs = 1, uint32_t observed_model_roles = 0) {
+    uint32_t source_outputs = 1, uint32_t observed_model_roles = 0, bool upper_capacity = false) {
   if (!nr_adaptive_enabled.load() && *owner == nullptr) return {};
   if (*owner == nullptr) *owner = std::make_shared<adaptive_resolution::Session>();
   adaptive_resolution::Sizes upper{}, floor{};
@@ -10320,10 +10332,15 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
   }
   supported &= capability::Query(baseline).CanSubmit();
   const uint32_t outputs = (required_roles == 3 ? 2u : 1u) * source_outputs;
-  const uint32_t levels = std::min(adaptive_resolution::MAX_PREPARED_LEVELS, max_worksets.load() / outputs);
+  const uint32_t levels = std::min(upper_capacity ? 3u : adaptive_resolution::MAX_PREPARED_LEVELS,
+                                 max_worksets.load() / outputs);
   const bool eligible = supported && plan.valid && !plan.mixed && plan.group_count == 1 && levels >= 2;
   for (const uint64_t value : {static_cast<uint64_t>(levels), static_cast<uint64_t>(source_outputs)}) {
     layout_identity ^= value;
+    layout_identity *= 1099511628211ull;
+  }
+  if (upper_capacity) {
+    layout_identity ^= 1;
     layout_identity *= 1099511628211ull;
   }
   const bool same_resources = (*owner)->resource_identity == layout_identity;
@@ -10347,7 +10364,8 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
           .application_frame = (application_frame != 0 ? application_frame : static_cast<uint64_t>(now_ns)),
           .layout_identity = layout_identity,
           .required_roles = required_roles, .output_count = source_outputs,
-           .enabled = eligible && nr_adaptive_enabled.load(), .measure = measure, .immediate = same_resources};
+           .enabled = eligible && nr_adaptive_enabled.load(), .measure = measure, .immediate = same_resources,
+           .upper_capacity = upper_capacity};
 }
 
 inline void PollAdaptiveCache(AdaptiveFeatureCache* cache) {
@@ -10575,7 +10593,9 @@ inline void PrepareAdaptiveTier(FeatureState* feature, const adaptive_resolution
     if (!reusable) return;
     auto& model = tier.state.slots[0];
     const auto target = frame.session->ladder.sizes[slot][0];
-    bool retain_feature = allow_feature_capacity_reuse && nr_adaptive_feature_capacity_reuse_experiment.load()
+    const auto mode = adaptive_feature_mode.load();
+    bool retain_feature = allow_feature_capacity_reuse
+        && (mode == AdaptiveFeatureMode::RETAIN || (mode == AdaptiveFeatureMode::UPPER_CAPACITY && frame.upper_capacity))
         && hook_point.load() == kHookUpscaled && stack_passes.load() == 1 && tier.state.pass_offset == 0
         && direct_runtime_requirements.file_version == "310.9.16.0"
         && model.handle != nullptr && model.parameters != nullptr && !model.failed && model.nr_preset == 2
@@ -11659,6 +11679,19 @@ inline bool RecordInline(
   // reference here is the DLSS output resolution.  The NR feature always
   // runs 1:1 at this working resolution and the decode stage upscales,
   // which sidesteps the low-res Color contract the signed runtime rejects.
+  uint32_t adaptive_output_count = 0;
+  if (preparing_adaptive_frame == nullptr && (present == nullptr || present->adaptive_frame == nullptr)) {
+    adaptive_output_count = AdaptiveOutputCount(&feature, handle, present != nullptr ? present->workset_key : output,
+        false, width, height, output_desc.Format);
+  }
+  const bool upper_capacity = adaptive_feature_mode.load() == AdaptiveFeatureMode::UPPER_CAPACITY
+      && present == nullptr && hook_point.load() == kHookUpscaled
+      && plan.valid && !plan.mixed && plan.group_count == 1
+      && group.stage == stage_plan::Stage::UPSCALED && group.begin == 0 && group.count == 1
+      && stack_passes.load() == 1 && adaptive_output_count == 1
+      && output_format == DXGI_FORMAT_R16G16B16A16_FLOAT && hdr_mode == 1
+      && direct_runtime_requirements.file_version == "310.9.16.0"
+      && nr_model::ResolvePreset(preset.load(), 0, direct_runtime_requirements.dual_models) == 2;
   auto adaptive = (preparing_adaptive_frame != nullptr ? *preparing_adaptive_frame
       : present != nullptr && present->adaptive_frame != nullptr ? *present->adaptive_frame
       : FreezeAdaptiveFrame(&feature.adaptive_session, plan, group, width, height,
@@ -11668,8 +11701,7 @@ inline bool RecordInline(
           !D3D11OnlySession() && (present == nullptr
               || (!present->d3d11_bridge && present->domain == present_restore_scope::Domain::FINAL_PRESENT
                   && present->stage_execution_plan == nullptr && !present->native_prefg_resolution_pair)),
-          0, 1, false, AdaptiveOutputCount(&feature, handle, present != nullptr ? present->workset_key : output,
-              false, width, height, output_desc.Format)));
+          0, 1, false, adaptive_output_count, 0, upper_capacity));
   SelectAdaptiveTier(&feature, handle, &adaptive, present != nullptr && present->adaptive_frame != nullptr,
       present != nullptr ? present->workset_key : output);
   if (adaptive_recording != nullptr) {
