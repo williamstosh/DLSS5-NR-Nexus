@@ -32,6 +32,10 @@ int main() {
     return 7;
   }
   const char* report_strings[] = {
+      "Resolution levels",
+      "Default (by capacity)",
+      "Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.",
+      "No working-resolution range to adjust",
       "Preparing working resolutions",
       "Paused: insufficient workset capacity",
       "Adaptive resolution",

@@ -2335,6 +2335,10 @@ inline constexpr Translation kZhHant[] = {
     {"Enter the target output frame rate directly (30-360). Press Enter to apply.", "直接輸入目標輸出幀率（30–360）。按 Enter 套用。"},
     {"Adaptive resolution controls the current size. Turn it off to edit the saved manual upper limit.", "自適應解析度正在控制目前尺寸。關閉後可編輯已儲存的手動上限。"},
     {"Saved manual upper limit: %s", "已儲存的手動上限：%s"},
+    {"Resolution levels", "解析度檔數"},
+    {"Default (by capacity)", "預設（依可用容量）"},
+    {"Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.", "先準備全部所選檔位。檔位越多，顯示記憶體用量越高、步距越細；準備時可能短暫卡頓。"},
+    {"No working-resolution range to adjust", "工作解析度無需調節"},
 };
 
 }  // namespace renodx::addons::dlss5::ui::lang

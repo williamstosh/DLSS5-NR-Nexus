@@ -8,6 +8,7 @@
 #include <exception>
 #include <iostream>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace adaptive_inline_cases {
@@ -39,6 +40,7 @@ int Run() {
     native::transfer_strength = 1.f;
     native::color_strength = 1.f;
     native::control_mask_enabled = true;
+    native::nr_adaptive_selected_levels = 0;
     native::nr_adaptive_min_scale = .33f;
     native::nr_adaptive_target_fps = 116.f;
     Check(native::adaptive_feature_mode.load() == native::AdaptiveFeatureMode::OFF, "Feature capacity experiment defaults to disabled");
@@ -62,10 +64,10 @@ int Run() {
     native::core_destroy_parameters = addon::bridge::DestroyOwnedParameters;
     Check(native::InstallQueueCompletionHooks(gpu.queue.Get()), "inline adaptive real queue hooks");
     Check(native::InstallCommandListStateHooks(gpu.list.Get()), "inline adaptive real list hooks");
-    const auto texture = [&](DXGI_FORMAT format, bool writable) {
+    const auto texture = [&](DXGI_FORMAT format, bool writable, uint32_t size = 16) {
       const D3D12_HEAP_PROPERTIES heap{.Type = D3D12_HEAP_TYPE_DEFAULT};
       const D3D12_RESOURCE_DESC desc{.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-          .Width = 16, .Height = 16, .DepthOrArraySize = 1, .MipLevels = 1,
+          .Width = size, .Height = size, .DepthOrArraySize = 1, .MipLevels = 1,
           .Format = format, .SampleDesc = {1, 0},
           .Flags = (writable ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE)};
       ComPtr<ID3D12Resource> resource;
@@ -117,7 +119,12 @@ int Run() {
     uint32_t active_successes = 0;
     uint32_t preparation_calls = 0;
     uint32_t preparation_failures = 0;
-    model_parameter_observer = [&](const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter*) {
+    const NVSDK_NGX_Handle* expected_reset_model = nullptr;
+    bool observed_expected_reset = false;
+    model_parameter_observer = [&](const NVSDK_NGX_Handle* model, const NVSDK_NGX_Parameter* model_parameters) {
+      if (model == expected_reset_model && native::preparing_adaptive_frame == nullptr) {
+        observed_expected_reset |= native::GetInt(model_parameters, "DLSSNR.Reset") != 0;
+      }
       const bool failing = model_calls + 1 == fail_call;
       if (native::preparing_adaptive_frame != nullptr) {
         ++preparation_calls;
@@ -133,6 +140,7 @@ int Run() {
       native::RegisterCreatedFeatureLocked(handle, native::kFeatureDlss, &parameters);
       uint32_t frame = 0;
       const auto evaluate = [&] {
+        ++native::present_generation;
         const auto before_source = native::SourceSuccessfulEvaluations();
         const auto before_active = active_successes;
         const auto before_inline = native::successful_evaluations.load();
@@ -172,6 +180,9 @@ int Run() {
           DXGI_FORMAT_R8G8B8A8_UNORM, 0, 1, 0) != nullptr, "diagnostic pressure uses a real WARP workset");
       native::features[occupied_owner].adaptive_cache = std::make_shared<native::AdaptiveFeatureCache>();
       native::features.at(occupied_owner).adaptive_cache->last_used_ns = native::SteadyNowNs();
+      native::features.at(occupied_owner).adaptive_cache->resident = true;
+      native::features.at(occupied_owner).adaptive_cache->count = 1;
+      native::features.at(occupied_owner).adaptive_cache->output_identities.insert(reinterpret_cast<uintptr_t>(outputs[0].Get()));
       native::max_worksets = 1;
       const auto calls_before = model_calls;
       const auto setup_failures = addon::nr_decline_counts[static_cast<size_t>(addon::NrDeclineReason::kWorksetSetupFailed)].load();
@@ -269,8 +280,6 @@ int Run() {
         const auto saved_style = native::kSetStyle.Get();
         const auto upper_model = feature.slots[0].handle;
         const auto lower_model = cache->tiers[1].state.slots[0].handle;
-        // The mock allocator may reuse a retired handle's address.
-        const auto lower_model_id = *reinterpret_cast<const uint32_t*>(lower_model);
         const auto allocations = native::worksets_created;
         const auto models = native::nr_features_created;
         addon::gpu_comparison::Identity before, resources_before, after, resources_after;
@@ -300,80 +309,119 @@ int Run() {
             && native::worksets_created == allocations,
             "resolve-only strength changes keep all allocations and do not request a model History reset");
 
-        native::adaptive_feature_mode = (hook == native::kHookUpscaled
-            ? native::AdaptiveFeatureMode::RETAIN : native::AdaptiveFeatureMode::OFF);
-        Check(cache->tiers[1].state.slots[0].create_input_width == 5
-            && cache->tiers[1].state.slots[0].create_input_height == 5
-            && cache->tiers[1].state.slots[0].create_output_width == 5
-            && cache->tiers[1].state.slots[0].create_output_height == 5,
-            "the lower slot records its actual Create capacity independently of requested logical sizes");
-        auto running_list = gpu.list;
-        auto running_allocator = gpu.allocator;
-        ComPtr<ID3D12CommandAllocator> pending_allocator;
-        ComPtr<ID3D12GraphicsCommandList> pending_list;
-        Check(SUCCEEDED(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-            IID_PPV_ARGS(&pending_allocator))), "minimum-change pending allocator");
-        Check(SUCCEEDED(gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-            pending_allocator.Get(), nullptr, IID_PPV_ARGS(&pending_list))), "minimum-change pending list");
-        gpu.allocator = pending_allocator;
-        gpu.list = pending_list;
-        Check(native::InstallCommandListStateHooks(gpu.list.Get()), "minimum-change pending-list hooks");
+        const auto saved_target = native::kSetAdaptiveTargetFps.Get();
+        set(native::kSetAdaptiveTargetFps, saved_target + 1.f);
+        Check(record() && record() && feature.adaptive_cache == cache
+            && native::nr_features_created == models && native::worksets_created == allocations,
+            "target FPS edits retain the entire selected collection");
+        set(native::kSetAdaptiveTargetFps, saved_target);
+        for (const auto* setting : {&native::kSetMonitorKey, &native::kSetMonitorModeKey}) {
+          const auto saved = setting->Get();
+          set(*setting, saved == 0.f ? 120.f : 0.f);
+          Check(record() && record() && native::nr_features_created == models && native::worksets_created == allocations,
+              "monitor hotkeys preserve all selected Feature and workset allocations");
+          set(*setting, saved);
+        }
+        for (const auto& [setting, value] : std::array{
+                 std::pair{&native::kSetControlMaskRed, .8f},
+                 std::pair{&native::kSetControlMaskGreen, .7f},
+                 std::pair{&native::kSetControlMaskBlue, .6f},
+                 std::pair{&native::kSetControlMaskDepthNear, .8f},
+                 std::pair{&native::kSetControlMaskDepthFar, .99999f},
+                 std::pair{&native::kSetControlMaskMotionStart, 0.f},
+                 std::pair{&native::kSetControlMaskMotionEnd, 1.f}}) {
+          const auto saved = setting->Get();
+          set(*setting, value);
+          Check(record() && record() && native::nr_features_created == models && native::worksets_created == allocations,
+              "RGB and guide thresholds update the actual mask without replacing selected allocations");
+          set(*setting, saved);
+        }
+        const auto now = native::SteadyNowNs();
+        cache->last_used_ns = now - 6'000'000'000;
+        for (auto& [key, resources] : native::worksets) {
+          if (key.handle == handle) resources.last_used_ns = now - 6'000'000'000;
+        }
+        native::max_worksets = 5;
+        Check(native::EnsureWorkset(gpu.device.Get(), occupied_owner, outputs[0].Get(), 16, 16, 16, 16,
+            DXGI_FORMAT_R8G8B8A8_UNORM, 0, 1, 0) != nullptr, "a temporary stream owns one real recent workset");
+        native::RetireSupersededWorksets(now);
+        Check(feature.adaptive_cache == cache && cache->resident
+            && std::count_if(native::worksets.begin(), native::worksets.end(),
+                [&](const auto& workset) { return workset.first.handle == handle; }) == 4,
+            "another active stream cannot retire a selected owner paused longer than five seconds");
+        native::RetireWorkset({occupied_owner, outputs[0].Get()});
+        native::DrainRetiredResources(true);
+        native::max_worksets = 4;
+        const auto after_temporary = native::worksets_created;
+        Check(native::EnsureWorkset(gpu.device.Get(), occupied_owner, outputs[0].Get(), 16, 16, 16, 16,
+            DXGI_FORMAT_R8G8B8A8_UNORM, 0, 1, 0) == nullptr && native::worksets_created == after_temporary,
+            "the LRU applies the same resident protection after the five-second idle boundary");
+        Check(record() && record() && feature.adaptive_cache == cache && native::nr_features_created == models,
+            "the original owner resumes its retained collection without a new Feature");
+        const auto before_three_models = native::nr_features_created;
+        const auto before_three_worksets = native::worksets_created;
+        set(native::kSetAdaptiveLevelCount, 3.f);
+        for (uint32_t warmup = 0; warmup < 24; ++warmup) record();
+        Check(feature.adaptive_session->settings.selected_levels == 3 && feature.adaptive_session->prepared
+            && cache->count == 3 && native::nr_features_created == before_three_models + 1
+            && native::worksets_created == before_three_worksets + 2
+            && native::adaptive_resident_worksets == 6 && native::EffectiveAdaptiveWorksetLimit() == 10
+            && native::max_worksets.load() == 4,
+            "three explicit levels own all six real rotating-output worksets without changing the ordinary four-workset setting");
+        const auto three_models = native::nr_features_created;
+        set(native::kSetAdaptiveLevelCount, 0.f);
+        native::max_worksets = 3;
+        Check(record() && record() && feature.adaptive_session->status.reason == addon::adaptive_resolution::Reason::BUDGET
+            && !feature.adaptive_session->prepared && native::nr_features_created == three_models,
+            "Default still rejects a complete two-output collection outside its actual ordinary quota");
+        set(native::kSetAdaptiveTargetFps, saved_target + 1.f);
+        Check(record() && record() && feature.adaptive_session->status.reason == addon::adaptive_resolution::Reason::BUDGET
+            && native::nr_features_created == three_models, "target FPS does not retry a denied collection");
+        native::max_worksets = 4;
+        set(native::kSetAdaptiveLevelCount, 2.f);
+        set(native::kSetAdaptiveTargetFps, saved_target);
+        Check(record() && record() && feature.adaptive_cache == cache && feature.adaptive_session->prepared
+            && cache->count == 2 && native::nr_features_created == three_models,
+            "an explicit selection rechecks budget once and reuses both retained complete-size tuples");
+
+        set(native::kSetAdaptiveMinScale, .5f);
+        record();
+        Check(!feature.adaptive_session->prepared && !feature.adaptive_session->trial && cache->active == 0,
+            "a committed missing endpoint enters preparation before any automatic request");
+        for (uint32_t warmup = 0; warmup < 24; ++warmup) record();
+        Check(feature.adaptive_cache == cache && feature.adaptive_session->prepared && cache->tiers[1].ready
+            && cache->ladder.sizes[1][0].width == 8 && feature.slots[0].handle == upper_model
+            && native::nr_features_created == three_models + 1,
+            "editing the minimum prepares the missing endpoint while retaining the complete upper allocation");
         feature.adaptive_session->Request(1, native::SteadyNowNs());
-        Check(evaluate(), "the old lower tier records on a deliberately unsubmitted list");
-        const auto pending = addon::submission::ObserveRecording(gpu.list.Get());
-        gpu.allocator = running_allocator;
-        gpu.list = running_list;
+        Check(record() && record() && cache->active == 1 && feature.input_width == 8,
+            "the prepared endpoint is available immediately when it is requested");
         feature.adaptive_session->Request(0, native::SteadyNowNs());
-        Check(record() && record(), "the upper model continues while the lower recording is pending");
-        set(native::kSetAdaptiveMinScale, .8f);
-        Check(record() && record() && feature.adaptive_cache == cache && cache->active == 0
-            && feature.adaptive_session->status.ready_levels == 1
-            && feature.adaptive_session->status.prepared_levels == 1 && native::nr_features_created == models,
-            "raising the minimum retains the old allocation but counts only the legal ready upper tier");
-        set(native::kSetAdaptiveMinScale, .5f);
-        Check(record() && record() && native::nr_features_created == models,
-            "lowering the minimum does not eagerly create new coarse tiers");
-        Check(feature.adaptive_session->RequestMinimum(native::SteadyNowNs()), "the new 50-percent endpoint is requested");
-        const auto endpoint = feature.adaptive_session->level;
-        Check(!native::AdaptiveTierUsable(*cache, *feature.adaptive_session, endpoint)
-            && cache->tiers[endpoint].ready, "old GPU-ready evidence cannot qualify the replacement size");
-        Check(record() && record() && cache->active == 0 && native::nr_features_created == models
-            && !pending->closed.load() && !pending->submitted.load()
-            && !addon::submission::ResourceReleasable(lower_model) && !feature.adaptive_session->failed,
-            "an unsubmitted old lower recording prevents slot reuse without blocking the legal active output");
-        const auto cancelled_generation = feature.adaptive_session->status.generation;
-        set(native::kSetAdaptiveMinScale, .8f);
-        Check(record() && record() && cache->active == 0
-            && feature.adaptive_session->status.generation != cancelled_generation
-            && native::nr_features_created == models && !feature.adaptive_session->failed,
-            "a new minimum cancels the pending endpoint without accepting old completion or failing the source");
-        Check(SUCCEEDED(pending_list->Close()) && SUCCEEDED(pending_allocator->Reset())
-            && SUCCEEDED(pending_list->Reset(pending_allocator.Get(), nullptr)),
-            "the fixture explicitly discards its unsubmitted old lower recording");
-        set(native::kSetAdaptiveMinScale, .5f);
-        record();
-        Check(feature.adaptive_session->RequestMinimum(native::SteadyNowNs()), "the cancelled endpoint can be requested again");
+        Check(record() && record() && cache->active == 0, "the legal upper remains available during selection edits");
+        const auto reused_upper = cache->tiers[1].state.slots[0].handle;
+        const auto before_reindex_models = native::nr_features_created;
+        expected_reset_model = reused_upper;
+        observed_expected_reset = false;
+        {
+          std::unique_lock lock(native::present_restore_configuration.mutex);
+          native::nr_resolution_scale.store(.5f);
+          ++native::nr_resolution_commit_epochs[0];
+        }
         for (uint32_t warmup = 0; warmup < 24; ++warmup) record();
-        native::PollAdaptiveCache(cache.get());
-        Check(feature.adaptive_cache == cache && cache->active == endpoint && feature.input_width == 8
-            && cache->ladder.sizes[endpoint] == feature.adaptive_session->minimum && cache->tiers[endpoint].ready
-            && native::nr_features_created == models + 1 && native::worksets_created == allocations + 2
-            && !feature.adaptive_session->failed && addon::submission::ResourceReleasable(lower_model),
-            "only the requested endpoint is rebuilt after exact retirement and completes both rotating outputs");
-        Check(feature.slots[0].create_input_width == 8 && feature.slots[0].create_output_width == 8
-            && *reinterpret_cast<const uint32_t*>(feature.slots[0].handle) != lower_model_id,
-            "the experiment cannot retain a 5-pixel capacity Feature for an 8-pixel endpoint");
-        set(native::kSetAdaptiveMinScale, .8f);
-        Check(record() && record() && cache->active == 0 && feature.input_width == 16
-            && native::nr_features_created == models + 1,
-            "an active out-of-range endpoint immediately returns to the retained legal upper model");
+        Check(feature.adaptive_cache == cache && feature.slots[0].handle == reused_upper
+            && feature.input_width == 8 && observed_expected_reset && feature.adaptive_session->prepared
+            && native::nr_features_created == before_reindex_models + 1,
+            "a previously lower complete-size tuple becomes the manual upper with its original Feature and a local History reset");
+        expected_reset_model = nullptr;
+        {
+          std::unique_lock lock(native::present_restore_configuration.mutex);
+          native::nr_resolution_scale.store(1.f);
+          ++native::nr_resolution_commit_epochs[0];
+        }
         set(native::kSetAdaptiveMinScale, .33f);
-        record();
-        Check(feature.adaptive_session->RequestMinimum(native::SteadyNowNs()), "the original exact lower endpoint is requested again");
         for (uint32_t warmup = 0; warmup < 24; ++warmup) record();
-        feature.adaptive_session->Request(0, native::SteadyNowNs());
-        Check(record() && record() && cache->active == 0 && cache->ladder.sizes[1][0].width == 5,
-            "the fixed physical lower slot returns to its original coarse size without replacing the upper tier");
+        set(native::kSetAdaptiveLevelCount, 0.f);
+
         set(native::kSetStyle, saved_style);
         set(native::kSetTransferStrength, 1.f);
         Check(record() && record(), "reuse regression restores the original Evaluate and resolve controls");
@@ -511,19 +559,82 @@ int Run() {
       const auto single_models = native::nr_features_created;
       const auto single_worksets = native::worksets_created;
       native::kSetAdaptiveMinScale.Store(.5f);
-      Check(record() && record() && feature.adaptive_cache == single_tier && single_tier->count == 1
-          && feature.adaptive_session->ladder.count == 1 && native::nr_features_created == single_models,
-          "lowering a 100-percent minimum leaves the existing one-tier allocation untouched until requested");
-      Check(feature.adaptive_session->RequestMinimum(native::SteadyNowNs())
-          && feature.adaptive_session->ladder.count == 2 && single_tier->count == 1,
-          "requesting the lower endpoint adds only one logical physical slot within the original capacity");
+      record();
+      Check(feature.adaptive_cache == single_tier && single_tier->count == 2
+          && feature.adaptive_session->ladder.count == 2 && !feature.adaptive_session->prepared
+          && feature.slots[0].handle == single_model,
+          "leaving a one-size range starts one explicit preparation and retains the original upper Feature");
       for (uint32_t warmup = 0; warmup < 24; ++warmup) record();
-      Check(feature.adaptive_cache == single_tier && single_tier->count == 2 && single_tier->active == 1
-          && single_tier->tiers[1].ready && feature.adaptive_session->status.applied[0].width == 8
-          && single_tier->tiers[0].state.slots[0].handle == single_model
+      Check(feature.adaptive_session->prepared && single_tier->active == 0 && single_tier->tiers[1].ready
           && native::nr_features_created == single_models + 1 && native::worksets_created == single_worksets + 2,
-          "the new physical slot completes both outputs without rebuilding or exceeding the retained upper allocation");
+          "the full newly selected set completes both rotating outputs before automatic control resumes");
+      feature.adaptive_session->Request(1, native::SteadyNowNs());
+      Check(record() && record() && single_tier->active == 1
+          && feature.adaptive_session->status.applied[0].width == 8
+          && single_tier->tiers[0].state.slots[0].handle == single_model,
+          "the newly prepared lower level switches without replacing the original upper allocation");
+
       native::kSetAdaptiveMinScale.Store(.33f);
+      for (uint32_t warmup = 0; warmup < 24; ++warmup) record();
+      auto binding_cache = feature.adaptive_cache;
+      const auto binding_models = native::nr_features_created;
+      const auto binding_worksets = native::worksets_created;
+      auto* rebound_resource = (hook == native::kHookUpscaled ? outputs[0].Get() : colors[0].Get());
+      uint64_t original_binding_identity = 0;
+      UINT identity_size = sizeof(original_binding_identity);
+      Check(SUCCEEDED(rebound_resource->GetPrivateData(native::kAdaptiveOutputIdentityGuid,
+          &identity_size, &original_binding_identity)) && original_binding_identity != 0,
+          "the current output carries a non-owning object-attached identity");
+      const auto changed_binding_identity = native::next_adaptive_output_identity++;
+      Check(SUCCEEDED(rebound_resource->SetPrivateData(native::kAdaptiveOutputIdentityGuid,
+          sizeof(changed_binding_identity), &changed_binding_identity)), "MOCK same-address replacement identity");
+      ++native::present_generation;
+      native::AdaptiveOutputCount(&feature, handle, rebound_resource, hook == native::kHookRender,
+          16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, rebound_resource);
+      Check(!feature.adaptive_output_blocked
+          && binding_cache->previous_output_bindings.contains(original_binding_identity),
+          "a new cookie at the same address is admitted only after healthy exact completion");
+      for (const auto& [key, resources] : native::worksets) {
+        if (key.handle != handle || key.resource != rebound_resource) continue;
+        Check(std::none_of(std::begin(resources.bound_sources), std::end(resources.bound_sources),
+            [&](const auto* source) { return source == rebound_resource; }),
+            "same-address replacement invalidates source-view pointer shortcuts before the next descriptor bind");
+      }
+      for (uint32_t step = 0; step < 4; ++step) record();
+      Check(feature.adaptive_session->prepared && native::nr_features_created == binding_models
+          && native::worksets_created == binding_worksets,
+          "MOCK identity replacement reacquires real WARP readiness without allocating a new tier");
+      const auto previous_bindings = binding_cache->previous_output_bindings.size();
+      auto third = texture(DXGI_FORMAT_R8G8B8A8_UNORM, hook == native::kHookUpscaled);
+      gpu.Submit();
+      const auto output_references_before = third->AddRef();
+      third->Release();
+      auto& changed_output = (hook == native::kHookUpscaled ? outputs[0] : colors[0]);
+      auto original_output = changed_output;
+      changed_output = third;
+      for (uint32_t step = 0; step < 4; ++step) record();
+      const auto output_references_after = third->AddRef();
+      third->Release();
+      if (hook == native::kHookUpscaled) {
+        Check(output_references_after == output_references_before + 1,
+            "output identity adds no COM ownership beyond the fixture's own current-output reference");
+      }
+      Check(feature.adaptive_cache == binding_cache && binding_cache->previous_output_bindings.size() == previous_bindings + 1
+          && native::nr_features_created == binding_models && native::worksets_created == binding_worksets,
+          "a proven same-geometry binding replacement refreshes receipts and references without replacing Feature or scratch");
+      changed_output = original_output;
+      for (uint32_t step = 0; step < 4; ++step) record();
+      Check(binding_cache->budget_blocked && feature.adaptive_session->status.reason == addon::adaptive_resolution::Reason::BUDGET
+          && native::nr_features_created == binding_models && native::worksets_created == binding_worksets,
+          "a previously rebound output returning in A/B/C/A locks budget instead of starting a rolling preparation cycle");
+      const auto previous_target = native::nr_adaptive_target_fps.load();
+      native::nr_adaptive_target_fps.store(previous_target + 1.f);
+      for (uint32_t step = 0; step < 8; ++step) record();
+      Check(binding_cache->budget_blocked && native::nr_features_created == binding_models
+          && native::worksets_created == binding_worksets,
+          "target FPS and repeated source observations cannot restart a rejected output-rotation contract");
+      native::nr_adaptive_target_fps.store(previous_target);
+
       std::cout << "ADAPTIVE_INLINE accounting hook=" << hook << " frames=" << frame
           << " source_successes=" << native::SourceSuccessfulEvaluations()
           << " model_calls=" << model_calls << " preparation_calls=" << preparation_calls
@@ -540,6 +651,180 @@ int Run() {
           "closing the fixture's completed parked recording permits exactly one normal model release");
     }
     model_parameter_observer = {};
+    {
+      native::hook_point = native::kHookUpscaled;
+      native::nr_adaptive_enabled = true;
+      native::nr_adaptive_selected_levels = addon::adaptive_resolution::MAX_PREPARED_LEVELS;
+      native::nr_adaptive_min_scale = .33f;
+      native::nr_resolution_scale = 1.f;
+      native::max_worksets = 4;
+      std::array wide_colors{texture(DXGI_FORMAT_R8G8B8A8_UNORM, false, 64),
+                            texture(DXGI_FORMAT_R8G8B8A8_UNORM, false, 64)};
+      std::array wide_outputs{texture(DXGI_FORMAT_R8G8B8A8_UNORM, true, 64),
+                             texture(DXGI_FORMAT_R8G8B8A8_UNORM, true, 64)};
+      auto wide_motion = texture(DXGI_FORMAT_R16G16_FLOAT, false, 64);
+      auto wide_depth = texture(DXGI_FORMAT_R32_FLOAT, false, 64);
+      gpu.Submit();
+      std::array output_readbacks{gpu.CreateTextureTransfer(wide_outputs[0].Get()),
+                                 gpu.CreateTextureTransfer(wide_outputs[1].Get())};
+      addon::bridge::OwnedParameters wide_parameters;
+      wide_parameters.Set(NVSDK_NGX_Parameter_Depth, wide_depth.Get());
+      wide_parameters.Set(NVSDK_NGX_Parameter_MotionVectors, wide_motion.Get());
+      for (const auto* key : {NVSDK_NGX_Parameter_Width, NVSDK_NGX_Parameter_Height,
+               NVSDK_NGX_Parameter_OutWidth, NVSDK_NGX_Parameter_OutHeight,
+               NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,
+               NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height}) {
+        wide_parameters.Set(key, 64u);
+      }
+      wide_parameters.Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags,
+          static_cast<uint32_t>(NVSDK_NGX_DLSS_Feature_Flags_MVLowRes));
+      wide_parameters.Set(NVSDK_NGX_Parameter_MV_Scale_X, 1.f);
+      wide_parameters.Set(NVSDK_NGX_Parameter_MV_Scale_Y, 1.f);
+      wide_parameters.Set(NVSDK_NGX_Parameter_Reset, 0u);
+      const auto* wide_handle = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xADA800});
+      native::RegisterCreatedFeatureLocked(wide_handle, native::kFeatureDlss, &wide_parameters);
+      const auto before_wide_models = native::nr_features_created;
+      uint32_t wide_frame = 0;
+      const auto wide_record = [&](bool verify_writeback = false) {
+        ++native::present_generation;
+        const uint32_t output = wide_frame++ % 2;
+        if (verify_writeback) {
+          gpu.Transition(wide_outputs[output].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+              D3D12_RESOURCE_STATE_COMMON);
+          gpu.Write(wide_outputs[output].Get(), 0x7f);
+          gpu.Transition(wide_outputs[output].Get(), D3D12_RESOURCE_STATE_COMMON,
+              D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        wide_parameters.Set(NVSDK_NGX_Parameter_Color, wide_colors[output].Get());
+        wide_parameters.Set(NVSDK_NGX_Parameter_Output, wide_outputs[output].Get());
+        bool accepted = false;
+        {
+          const addon::EvaluateChainScope chain;
+          const addon::SourceStageScope source(wide_handle, true);
+          if (native::hook_point.load() == native::kHookRender) {
+            native::PreSrSwap swap;
+            accepted = native::ProcessInlinePreSR(gpu.list.Get(), wide_handle, &wide_parameters, swap);
+            native::RestorePreSrColor(&wide_parameters, swap);
+          } else {
+            accepted = native::ProcessInline(gpu.list.Get(), wide_handle, &wide_parameters);
+          }
+        }
+        if (verify_writeback) {
+          gpu.Transition(wide_outputs[output].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+              D3D12_RESOURCE_STATE_COPY_SOURCE);
+          gpu.RecordTextureReadback(wide_outputs[output].Get(), output_readbacks[output]);
+          gpu.Transition(wide_outputs[output].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+              D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        submit();
+        Check(SUCCEEDED(gpu.device->GetDeviceRemovedReason())
+            && gpu.fence->GetCompletedValue() != UINT64_MAX && gpu.fence->GetCompletedValue() >= gpu.serial,
+            "every selected-level step finishes on a healthy WARP Fence");
+        if (verify_writeback) {
+          const auto pixels = gpu.ReadTexture(output_readbacks[output]);
+          bool changed = false;
+          for (size_t pixel = 0; pixel < pixels.size(); pixel += 4) {
+            changed |= pixels[pixel] != 0x7f || pixels[pixel + 1] != 0x7f || pixels[pixel + 2] != 0x7f;
+          }
+          Check(accepted && changed, "the selected level writes actual GPU model output back to the requested game surface");
+        }
+        return accepted;
+      };
+      bool ordinary_pressure = false;
+      for (uint32_t preparation = 0; preparation < 128; ++preparation) {
+        wide_record();
+        auto& wide = native::features.at(wide_handle);
+        if (!wide.adaptive_session->prepared) {
+          Check(wide.adaptive_cache->active == 0 && !wide.adaptive_session->trial,
+              "the full fifteen-size collection closes automatic decisions until every output is ready");
+        }
+        if (!ordinary_pressure && wide.adaptive_cache->resident) {
+          const auto owned = native::AdaptiveResidentWorksetCount(wide.adaptive_session);
+          for (uint32_t stream = 0; stream < 5; ++stream) {
+            const auto* ordinary = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xADA810} + stream);
+            Check(native::EnsureWorkset(gpu.device.Get(), ordinary, wide_outputs[0].Get(), 16, 16, 16, 16,
+                DXGI_FORMAT_R8G8B8A8_UNORM, 0, 1, 0) != nullptr,
+                "ordinary traffic can use and recycle its original bounded pool during preparation");
+          }
+          Check(native::AdaptiveResidentWorksetCount(wide.adaptive_session) == owned
+              && native::worksets.size() - owned == native::max_worksets.load()
+              && native::EffectiveAdaptiveWorksetLimit() == 34,
+              "unbuilt selected slots stay reserved while ordinary traffic remains at its original four-workset quota");
+          ordinary_pressure = true;
+        }
+        if (wide.adaptive_session->prepared) break;
+      }
+      auto& wide = native::features.at(wide_handle);
+      const auto collection = wide.adaptive_cache;
+      Check(wide.adaptive_session->prepared && collection->count == 15 && collection->output_count == 2
+          && native::AdaptiveResidentWorksetCount(wide.adaptive_session) == 30
+          && native::adaptive_resident_worksets == 30 && native::max_worksets.load() == 4
+          && native::nr_features_created == before_wide_models + 15,
+          "all fifteen complete-size tuples own real Features and both rotating-output worksets within their explicit reservation");
+      const auto steady_models = native::nr_features_created;
+      const auto steady_worksets = native::worksets_created;
+      for (size_t level = 0; level < collection->count; ++level) {
+        wide.adaptive_session->Request(level, native::SteadyNowNs());
+        wide_record(true);
+        wide_record(true);
+        Check(collection->active == level && wide.input_width == collection->ladder.sizes[level][0].width
+            && wide.input_height == collection->ladder.sizes[level][0].height
+            && wide.adaptive_session->status.applied == collection->ladder.sizes[level],
+            "each selected level evaluates at its actual complete working dimensions on both outputs");
+      }
+      for (const size_t level : {14u, 0u, 7u, 14u, 0u}) {
+        wide.adaptive_session->Request(level, native::SteadyNowNs());
+        wide_record(true);
+        wide_record(true);
+      }
+      Check(native::nr_features_created == steady_models && native::worksets_created == steady_worksets,
+          "all-level and immediate fifteen-level round trips perform no new Feature or workset allocations");
+      native::nr_adaptive_enabled = false;
+      wide_record();
+      wide_record();
+      Check(wide.adaptive_cache == nullptr && native::adaptive_resident_session.expired()
+          && native::adaptive_resident_worksets == 0
+          && std::count_if(native::worksets.begin(), native::worksets.end(),
+              [&](const auto& workset) { return workset.first.handle == wide_handle; }) == 2,
+          "Off releases the explicit reservation and retires every standby while retaining the legal manual upper");
+      for (uint32_t stream = 0; stream < 5; ++stream) {
+        const auto* ordinary = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xADA810} + stream);
+        native::RetireWorkset({ordinary, wide_outputs[0].Get()});
+      }
+      submit();
+      native::hook_point = native::kHookRender;
+      native::RecreateFeatures();
+      native::nr_adaptive_selected_levels = 3;
+      native::nr_adaptive_enabled = true;
+      for (uint32_t preparation = 0; preparation < 64; ++preparation) {
+        wide_record();
+        if (wide.adaptive_session->prepared) break;
+      }
+      Check(wide.adaptive_session->prepared && wide.adaptive_cache->pre_sr
+          && native::AdaptiveResidentWorksetCount(wide.adaptive_session) == 6
+          && std::count_if(native::worksets.begin(), native::worksets.end(), [&](const auto& workset) {
+               return workset.first.handle == wide_handle && !workset.first.pre_sr;
+             }) == 2,
+          "ordinary PostSR scratch survives Off and a Render switch without consuming the six selected Render slots");
+      for (uint32_t stream = 0; stream < 4; ++stream) {
+        const auto* ordinary = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xADA810} + stream);
+        Check(native::EnsureWorkset(gpu.device.Get(), ordinary, wide_outputs[0].Get(), 16, 16, 16, 16,
+            DXGI_FORMAT_R8G8B8A8_UNORM, 0, 1, 0) != nullptr, "ordinary Stage leftovers remain eligible for normal LRU");
+      }
+      Check(native::AdaptiveResidentWorksetCount(wide.adaptive_session) == 6
+          && std::none_of(native::worksets.begin(), native::worksets.end(), [&](const auto& workset) {
+               return workset.first.handle == wide_handle && !workset.first.pre_sr;
+             }), "the pool can recycle old PostSR scratch while every selected Render workset stays resident");
+      native::ForgetSourceHandleLocked(wide_handle);
+      for (uint32_t stream = 0; stream < 4; ++stream) {
+        const auto* ordinary = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xADA810} + stream);
+        native::RetireWorkset({ordinary, wide_outputs[0].Get()});
+      }
+      submit();
+      native::nr_adaptive_selected_levels = 0;
+      std::cout << "ADAPTIVE_SELECTED evidence=WARP+MOCK dimensions=64x64 levels=15 outputs=2 Features=15 selected_worksets=30 ordinary_limit=4 steady_allocations=0 native_NGX=not_run\n";
+    }
+
     native::successful_sr_device = nullptr;
     {
       ID3D12RootSignature* root = nullptr;

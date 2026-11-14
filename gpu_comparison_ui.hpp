@@ -33,7 +33,8 @@ inline void CaptureConfiguration(comparison::Identity* identity, bool include_ad
       if (!include_adaptive && key.starts_with("NRAdaptive")) continue;
       if (key.starts_with("NRScreenshot") || key == "NRToggleKey" || key == "NRGpuTimers"
           || key.starts_with("NROfficialCycle") || key.starts_with("NRCustomCycle")
-          || key == "NRCostMeter" || key == "NREditTrace") continue;
+          || key == "NRCostMeter" || key == "NREditTrace"
+          || key == "NRMonitorKey" || key == "NRMonitorModeKey") continue;
       const auto parameter = (key.starts_with("NRPass2") || key.starts_with("NRPass3") || key.starts_with("NRPass4")
           ? key.substr(7) : key.substr(2));
       // These parameters are consumed by Evaluate or the resolve without
@@ -46,7 +47,10 @@ inline void CaptureConfiguration(comparison::Identity* identity, bool include_ad
           || parameter == "ChainedHistory" || parameter == "TransferStrength" || parameter == "ColorStrength"
           || parameter == "Transfer" || parameter == "Color" || parameter == "ChromaClamp"
           || parameter == "TransferMode" || parameter == "StyleHighlightGuard" || parameter == "DisplayPedestal"
-          || parameter == "NeuralFloorGuard")) continue;
+          || parameter == "NeuralFloorGuard"
+          || parameter == "ControlMaskRed" || parameter == "ControlMaskGreen" || parameter == "ControlMaskBlue"
+          || parameter == "ControlMaskDepthNear" || parameter == "ControlMaskDepthFar"
+          || parameter == "ControlMaskMotionStart" || parameter == "ControlMaskMotionEnd")) continue;
       const bool resolution = key == "NRFollowInputRes" || key == "NRResolutionScale"
           || key.ends_with("ResolutionMode") || key.ends_with("ResolutionScale");
       auto* hash = (resolution ? &identity->resolution_hash : &identity->settings_hash);

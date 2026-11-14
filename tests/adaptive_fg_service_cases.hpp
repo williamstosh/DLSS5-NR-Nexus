@@ -79,6 +79,7 @@ int Run() {
     native::pass_transfer_strength[0].store(1.f);
     native::pass_color_strength[0].store(1.f);
     native::control_mask_enabled.store(true);
+    native::nr_adaptive_selected_levels.store(0);
     native::nr_adaptive_min_scale.store(.33f);
     native::nr_adaptive_enabled.store(false);
     native::max_worksets.store(4);
@@ -257,16 +258,25 @@ int Run() {
     service();
     auto& stream = native::fg_service::streams.at({false, input.context});
     auto cache = native::features.at(stream.roles[0].Handle()).adaptive_cache;
-    Check(cache != nullptr && cache->count == 4 && !cache->budget_blocked
+    Check(cache != nullptr && cache->count == 4 && cache->budget_blocked
+        && stream.adaptive_session->status.reason == addon::adaptive_resolution::Reason::BUDGET
         && native::nr_features_created == before_occupied_features
         && native::worksets_created == before_occupied_worksets,
-        "temporary capacity pressure defers preparation without creating or permanently blocking a tier");
+        "capacity pressure pauses the selected session before allocating an incomplete collection");
     native::RetireWorkset({occupied_owner, color.Get()});
     native::DrainRetiredResources(true);
     service();
-    Check(native::nr_features_created > before_occupied_features
-        && native::features.at(stream.roles[0].Handle()).adaptive_cache == cache,
-        "preparation resumes on the next frame after the occupying workset retires");
+    Check(native::nr_features_created == before_occupied_features && cache->budget_blocked,
+        "free capacity alone cannot retry a budget-denied session every source frame");
+    native::nr_adaptive_target_fps.store(61.f);
+    service();
+    Check(native::nr_features_created == before_occupied_features && cache->budget_blocked,
+        "editing target FPS preserves the budget pause");
+    native::nr_adaptive_enabled.store(false);
+    service();
+    native::nr_adaptive_enabled.store(true);
+    native::nr_adaptive_target_fps.store(60.f);
+
     for (uint32_t frame = 0; frame < 16; ++frame) service();
     Check(stream.adaptive_session != nullptr && !stream.adaptive_session->failed,
         "turning adaptive On after manual two-Pass does not pause a healthy service");
@@ -274,6 +284,7 @@ int Run() {
         "both Passes and standby first-evaluates use the actual GPU mask path");
     Check(preparation_calls != 0 && model_calls > native::SourceSuccessfulEvaluations() * 2,
         "additional standby model calls really execute while source successes remain active-frame only");
+    cache = native::features.at(stream.roles[0].Handle()).adaptive_cache;
     native::PollAdaptiveCache(cache.get());
     for (size_t tier = 0; tier < cache->count; ++tier) {
       Check(cache->tiers[tier].ready,
@@ -366,6 +377,21 @@ int Run() {
         "two real color roles retain two GPU-ready coarse tiers within the original four-workset budget");
     Check(partial_role_recordings > before_partial_roles,
         "dual-color cold maturation observes partial Pass masks without treating them as a complete color group");
+    const auto role_models = native::nr_features_created;
+    const auto role_worksets = native::worksets_created;
+    input.hudless = nullptr;
+    const auto missing = service();
+    Check(missing == fg::Result::PREPARED
+        && native::features.at(dual.roles[0].Handle()).adaptive_cache == primary
+        && native::features.at(dual.roles[1].Handle()).adaptive_cache == auxiliary
+        && native::nr_features_created == role_models && native::worksets_created == role_worksets,
+        "a temporarily absent prepared role pauses the frame without flushing compatible color allocations");
+    input.hudless = hudless.Get();
+    Check(service() == fg::Result::SUBMITTED && dual.adaptive_session->prepared
+        && dual.adaptive_session->status.ready_levels == 2
+        && native::nr_features_created == role_models && native::worksets_created == role_worksets,
+        "both retained colors resume as one complete selected set with no additional preparation allocation");
+
     const auto dual_models = native::nr_features_created;
     const auto dual_worksets = native::worksets_created;
     for (const auto* setting : {&native::kSetPassStructure[0], &native::kSetPassSkin[0], &native::kSetPassFollow[0]}) {
@@ -389,32 +415,34 @@ int Run() {
     Check(native::InstallCommandListStateHooks(held_list.Get()), "dual-color held-list hooks");
     const auto held_model = auxiliary->tiers[1].state.slots[0].handle;
     addon::submission::TrackUse(held_list.Get(), held_model);
-    native::kSetAdaptiveMinScale.Store(.8f);
-    service();
     native::kSetAdaptiveMinScale.Store(.5f);
     service();
-    Check(native::nr_features_created == dual_models && native::worksets_created == dual_worksets,
-        "minimum edits alone leave both color-role allocations unchanged");
-    Check(dual.adaptive_session->RequestMinimum(native::SteadyNowNs()), "dual-color new minimum is requested once");
-    for (uint32_t frame = 0; frame < 12; ++frame) service();
-    Check(primary->tiers[1].ready && primary->ladder.sizes[1] == dual.adaptive_session->minimum
-        && auxiliary->ladder.sizes[1] != dual.adaptive_session->minimum && primary->active == 0 && auxiliary->active == 0
-        && dual.adaptive_session->status.applied[0].width == 16 && !dual.adaptive_session->failed,
-        "one color can finish the new endpoint while the held old role keeps the complete group on its legal upper size");
-    Check(SUCCEEDED(held_list->Close()) && SUCCEEDED(held_allocator->Reset())
-        && SUCCEEDED(held_list->Reset(held_allocator.Get(), nullptr)),
-        "the fixture ends the old auxiliary role's unsubmitted tracked lifetime");
-    for (uint32_t frame = 0; frame < 16; ++frame) service();
-    Check(primary->active == 1 && auxiliary->active == 1
+    Check(!dual.adaptive_session->prepared && !dual.adaptive_session->trial
+        && primary->active == 0 && auxiliary->active == 0,
+        "a missing selected endpoint closes the whole-group gate before automatic switching");
+    for (uint32_t frame = 0; frame < 20; ++frame) service();
+    Check(primary->tiers[1].ready && auxiliary->tiers[1].ready && dual.adaptive_session->prepared
+        && dual.adaptive_session->status.ready_levels == 2
         && primary->ladder.sizes[1] == dual.adaptive_session->minimum
         && auxiliary->ladder.sizes[1] == dual.adaptive_session->minimum
+        && primary->active == 0 && auxiliary->active == 0
+        && native::nr_features_created == dual_models + 4 && native::worksets_created == dual_worksets + 2
+        && !addon::submission::ResourceReleasable(held_model),
+        "new independent complete-size roles become ready while exact lifetime proof retains an unrelated retired old model");
+    dual.adaptive_session->Request(1, native::SteadyNowNs());
+    Check(service() == fg::Result::SUBMITTED && primary->active == 1 && auxiliary->active == 1
         && dual.adaptive_session->status.applied[0].width == 8 && dual.adaptive_session->status.applied[1].width == 8
-        && native::nr_features_created == dual_models + 4 && native::worksets_created == dual_worksets + 2,
-        "both colors and both Passes commit only after the requested replacement is GPU-ready as one group");
+        && native::nr_features_created == dual_models + 4,
+        "both colors and both Passes switch to the already resident endpoint as one application frame");
+    Check(SUCCEEDED(held_list->Close()) && SUCCEEDED(held_allocator->Reset())
+        && SUCCEEDED(held_list->Reset(held_allocator.Get(), nullptr)),
+        "the fixture ends the old auxiliary lifetime without lending its receipt to the replacement");
     native::kSetAdaptiveMinScale.Store(.8f);
-    Check(service() == fg::Result::SUBMITTED && primary->active == 0 && auxiliary->active == 0
-        && dual.adaptive_session->status.applied[0].width == 16 && native::nr_features_created == dual_models + 4,
-        "raising the minimum returns both active colors to the retained legal upper tier without Create");
+    service();
+    Check(primary->active == 0 && auxiliary->active == 0
+        && dual.adaptive_session->status.applied[0].width == 16 && !dual.adaptive_session->failed,
+        "a new minimum restores the complete legal upper group while the new selected endpoint prepares");
+
     native::kSetPassPreset[0].Store(1.f);
     native::ApplySettingEffect(native::kSetPassPreset[0].effect);
     Check(native::features.at(dual.roles[0].Handle()).adaptive_cache == nullptr
@@ -425,6 +453,104 @@ int Run() {
         && native::features.at(dual.roles[0].Handle()).adaptive_cache != primary
         && native::features.at(dual.roles[1].Handle()).adaptive_cache != auxiliary,
         "both colors rebuild clean model contracts after the explicit model-selection change");
+    const auto previous_primary = native::features.at(dual.roles[0].Handle()).adaptive_cache;
+    input.hudless = nullptr;
+    input.color_width = input.color_height = 8;
+    for (uint32_t frame = 0; frame < 24; ++frame) service();
+    auto& changed = native::fg_service::streams.at({false, input.context});
+    Check(changed.adaptive_session != nullptr && changed.adaptive_session->prepared
+        && changed.adaptive_required_roles == 1
+        && native::features.at(changed.roles[0].Handle()).adaptive_cache != previous_primary
+        && !changed.adaptive_session->failed,
+        "a real same-epoch color geometry change prepares its new contract instead of waiting for an obsolete role");
+
+    native::fg_service::Retire();
+    gpu.Submit();
+    native::DrainRetiredResources(true);
+    native::nr_adaptive_selected_levels.store(5);
+    native::nr_adaptive_min_scale.store(.33f);
+    native::kSetPassPreset[0].Store(2.f);
+    input.context = 0xADAFA;
+    input.application_frame = 0;
+    input.color_width = input.color_height = 16;
+    input.hudless = hudless.Get();
+    const auto before_many_models = native::nr_features_created;
+    const auto before_many_worksets = native::worksets_created;
+    for (uint32_t preparation = 0; preparation < 80; ++preparation) {
+      service();
+      auto& preparing = native::fg_service::streams.at({false, input.context});
+      if (preparing.adaptive_session != nullptr && preparing.adaptive_session->prepared) break;
+      for (auto& role : preparing.roles) {
+        if (const auto feature = native::features.find(role.Handle()); feature != native::features.end()
+            && feature->second.adaptive_cache != nullptr) {
+          Check(feature->second.adaptive_cache->active == 0 && !preparing.adaptive_session->trial,
+              "neither color requests an unready member of the complete five-level group");
+        }
+      }
+    }
+    auto& many = native::fg_service::streams.at({false, input.context});
+    Check(many.adaptive_session->prepared && native::adaptive_resident_worksets == 10
+        && native::EffectiveAdaptiveWorksetLimit() == 14 && native::max_worksets.load() == 4
+        && native::AdaptiveResidentWorksetCount(many.adaptive_session) == 10
+        && native::nr_features_created == before_many_models + 20
+        && native::worksets_created == before_many_worksets + 10,
+        "five complete-size levels reserve both real color worksets and both independent model Passes per role");
+    auto primary_readback = gpu.CreateTextureTransfer(color.Get());
+    auto auxiliary_readback = gpu.CreateTextureTransfer(hudless.Get());
+    const auto many_models = native::nr_features_created;
+    const auto many_worksets = native::worksets_created;
+    for (size_t level = 0; level < many.adaptive_session->ladder.count; ++level) {
+      for (auto* surface : {color.Get(), hudless.Get()}) {
+        gpu.Transition(surface, NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
+        gpu.Write(surface, 0x7f);
+        gpu.Transition(surface, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
+      }
+      gpu.Submit();
+      many.adaptive_session->Request(level, native::SteadyNowNs());
+      Check(service() == fg::Result::SUBMITTED && many.fence->GetCompletedValue() != UINT64_MAX
+          && many.fence->GetCompletedValue() >= many.submitted && SUCCEEDED(gpu.device->GetDeviceRemovedReason()),
+          "every five-level color pair finishes its actual WARP submission with a healthy Fence");
+      for (auto& role : many.roles) {
+        const auto& feature = native::features.at(role.Handle());
+        Check(feature.adaptive_cache->active == level
+            && feature.input_width == many.adaptive_session->ladder.sizes[level][0].width
+            && feature.slots[1].create_input_width == many.adaptive_session->ladder.sizes[level][1].width,
+            "both roles use the selected first- and second-Pass working dimensions");
+      }
+      gpu.Transition(color.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      gpu.RecordTextureReadback(color.Get(), primary_readback);
+      gpu.Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, NATIVE_INPUT_STATE);
+      gpu.Transition(hudless.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      gpu.RecordTextureReadback(hudless.Get(), auxiliary_readback);
+      gpu.Transition(hudless.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, NATIVE_INPUT_STATE);
+      gpu.Submit();
+      for (const auto* readback : {&primary_readback, &auxiliary_readback}) {
+        const auto pixels = gpu.ReadTexture(*readback);
+        bool changed = false;
+        for (size_t pixel = 0; pixel < pixels.size(); pixel += 4) {
+          changed |= pixels[pixel] != 0x7f || pixels[pixel + 1] != 0x7f || pixels[pixel + 2] != 0x7f;
+        }
+        Check(changed, "each role writes actual GPU model output back at every selected level");
+      }
+    }
+    Check(native::nr_features_created == many_models && native::worksets_created == many_worksets,
+        "five-level paired steady switches require no new Feature or working surfaces");
+    native::nr_adaptive_selected_levels.store(0);
+    Check(service() == fg::Result::SUBMITTED && many.adaptive_session->prepared
+        && many.adaptive_session->ladder.count == 2 && !many.adaptive_session->failed
+        && many.adaptive_session->preparation_reason != addon::adaptive_resolution::Reason::BUDGET
+        && native::AdaptiveResidentWorksetCount(many.adaptive_session) == 4
+        && native::EffectiveAdaptiveWorksetLimit() == 4
+        && native::nr_features_created == many_models && native::worksets_created == many_worksets,
+        "five-to-Default reconciles both role selections before budget adjudication and reuses the retained endpoints");
+    native::nr_adaptive_enabled.store(false);
+    Check(service() == fg::Result::SUBMITTED && native::adaptive_resident_session.expired()
+        && native::adaptive_resident_worksets == 0
+        && native::features.at(many.roles[0].Handle()).adaptive_cache == nullptr
+        && native::features.at(many.roles[1].Handle()).adaptive_cache == nullptr,
+        "Off releases both selected-role reservations after the larger collection");
+    std::cout << "ADAPTIVE_SELECTED evidence=WARP+MOCK levels=5 roles=2 Passes=2 Features=20 selected_worksets=10 ordinary_limit=4 steady_allocations=0 native_NGX=not_run\n";
+
     model_parameter_observer = {};
     native::fg_service::Retire();
     gpu.Submit();

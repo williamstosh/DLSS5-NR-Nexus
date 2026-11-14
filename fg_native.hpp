@@ -25,6 +25,7 @@ struct Stream {
   std::shared_ptr<adaptive_resolution::Session> adaptive_session;
   adaptive_resolution::Frame adaptive_frame;
   uint32_t adaptive_model_roles = 0;
+  uint32_t adaptive_required_roles = 0;
   ID3D12Device* device = nullptr;
   ID3D12CommandQueue* queue = nullptr;
   ID3D12Fence* fence = nullptr;
@@ -378,17 +379,36 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
   contract.create_flags = (real_guides ? input.init_flags : NVSDK_NGX_DLSS_Feature_Flags_DepthInverted);
   contract.frame_reset = (input.reset ? 1 : 0);
   const uint64_t previous_adaptive_layout = stream->adaptive_frame.layout_identity;
+  uint32_t required_model_roles = (may_compose && stream->adaptive_model_roles == 2
+      ? 2u : (has_hudless && !coupled_ui ? 3u : 1u));
+  const bool missing_prepared_role = nr_adaptive_enabled.load() && (stream->adaptive_required_roles & 2u) != 0 && !has_hudless;
   const auto adaptive_plan = EvaluationStagePlan(stream->roles[0].Handle(), false);
-  stream->adaptive_frame = FreezeAdaptiveFrame(&stream->adaptive_session, adaptive_plan,
+  const auto freeze_adaptive = [&](uint32_t roles) {
+    return FreezeAdaptiveFrame(&stream->adaptive_session, adaptive_plan,
       {.stage = stage_plan::Stage::PRESENT, .count = adaptive_plan.pass_count},
       input.color_width, input.color_height, contract.input_width, contract.input_height,
       reinterpret_cast<uintptr_t>(stream) ^ reinterpret_cast<uintptr_t>(stream->device)
-          ^ reinterpret_cast<uintptr_t>(stream->queue) ^ input.epoch
-          ^ stream->native_options_generation ^ static_cast<uint64_t>(base.hdr_mode)
+          ^ reinterpret_cast<uintptr_t>(stream->queue) ^ input.epoch ^ static_cast<uint64_t>(base.hdr_mode)
            ^ (static_cast<uint64_t>(input.backbuffer->GetDesc().Format) * 1099511628211ull) ^ contract.create_flags
           ^ (static_cast<uint64_t>(coupled_ui) << 40) ^ (static_cast<uint64_t>(may_compose) << 41),
       !base.d3d11_bridge && !base.native_prefg_resolution_pair,
-      input.application_frame, (has_hudless && !coupled_ui ? 3u : 1u), true, 1, stream->adaptive_model_roles);
+      input.application_frame, roles, true, 1, stream->adaptive_model_roles);
+  };
+  stream->adaptive_frame = freeze_adaptive(missing_prepared_role ? stream->adaptive_required_roles : required_model_roles);
+  if (missing_prepared_role && previous_adaptive_layout == stream->adaptive_frame.layout_identity
+      && stream->adaptive_session != nullptr) {
+    auto& session = *stream->adaptive_session;
+    if (session.trial) session.Request(session.previous_level, SteadyNowNs());
+    session.trial = false;
+    session.ResetMeasurements();
+    session.stable_after_ns = SteadyNowNs() + adaptive_resolution::WARMUP_NS;
+    session.status.reason = adaptive_resolution::Reason::PREPARING;
+    PublishAdaptiveStatus(session.status);
+    // Absence pauses only the same resource/composition contract. Real layout
+    // changes below retain their normal invalidation and preparation path.
+    return fg::Result::PREPARED;
+  }
+  if (missing_prepared_role) stream->adaptive_frame = freeze_adaptive(required_model_roles);
   if (!nr_adaptive_enabled.load() && stream->adaptive_session != nullptr) {
     for (auto& role : stream->roles) {
       if (const auto feature = features.find(role.Handle()); feature != features.end()
@@ -399,13 +419,76 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
       }
     }
   }
-  if (previous_adaptive_layout != stream->adaptive_frame.layout_identity) stream->adaptive_model_roles = 0;
-  const uint32_t required_model_roles = (may_compose && stream->adaptive_model_roles == 2
-      ? 2u : (has_hudless && !coupled_ui ? 3u : 1u));
+  if (previous_adaptive_layout != stream->adaptive_frame.layout_identity) {
+    stream->adaptive_model_roles = 0;
+    stream->adaptive_required_roles = 0;
+    for (auto& role : stream->roles) {
+      if (const auto feature = features.find(role.Handle()); feature != features.end()
+          && feature->second.adaptive_cache != nullptr
+          && feature->second.adaptive_cache->identity != stream->adaptive_frame.layout_identity) {
+        ReleaseAdaptiveCache(&feature->second, true);
+      }
+    }
+  }
+  if (stream->adaptive_session != nullptr && stream->adaptive_frame.enabled) {
+    bool selection_pending = false;
+    for (uint32_t i = 0; i < 2; ++i) {
+      const auto feature = features.find(stream->roles[i].Handle());
+      if (feature == features.end() || feature->second.adaptive_cache == nullptr
+          || !feature->second.adaptive_cache->resident) continue;
+      auto& cache = *feature->second.adaptive_cache;
+      if ((required_model_roles & (1u << i)) == 0) {
+        if (stream->adaptive_session->settings.selected_levels == 0) {
+          // Default uses the original ordinary pool. Preserve the inactive
+          // upper model, but retire its optional collection and scratch so
+          // an old explicit selection cannot permanently consume that pool.
+          ActivateAdaptiveTier(&feature->second, 0);
+          ReleaseAdaptiveStandby(&cache, true);
+          cache.resident = false;
+          feature->second.adaptive_cache.reset();
+          for (auto it = worksets.begin(); it != worksets.end();) {
+            if (it->first.handle != stream->roles[i].Handle()) {
+              ++it;
+              continue;
+            }
+            RetireWorksetResources(std::move(it->second));
+            it = worksets.erase(it);
+          }
+          for (auto& model : feature->second.slots) {
+            model.pending_reset = true;
+            model.pending_reset_reasons |= kResetDimensions;
+          }
+        }
+        continue;
+      }
+      selection_pending |= cache.count != stream->adaptive_session->ladder.count
+          || cache.ladder.sizes != stream->adaptive_session->ladder.sizes;
+    }
+    if (selection_pending) {
+      // A role's normal ProcessInline advances preparation before Record
+      // reaches the next role. Reconcile the shared selection first, so an
+      // intermediate old/new count can never latch a false budget failure.
+      for (uint32_t i = 0; i < 2; ++i) {
+        if ((required_model_roles & (1u << i)) == 0) continue;
+        const auto feature = features.find(stream->roles[i].Handle());
+        if (feature == features.end() || feature->second.adaptive_cache == nullptr
+            || !feature->second.adaptive_cache->resident) continue;
+        auto selected = stream->adaptive_frame;
+        selected.role = 1u << i;
+        selected.slot = 0;
+        SelectAdaptiveTier(&feature->second, stream->roles[i].Handle(), &selected, true,
+            reinterpret_cast<const ID3D12Resource*>(&stream->roles[i]));
+      }
+    }
+  }
   if (stream->adaptive_session != nullptr && stream->adaptive_frame.enabled) {
     const size_t requested_slot = stream->adaptive_session->level;
     bool group_ready = true;
     bool missing_role = false;
+    bool group_failed = false, group_budget = false;
+    bool upper_ready = true;
+    std::array<bool, adaptive_resolution::MAX_PREPARED_LEVELS> selected_ready;
+    selected_ready.fill(true);
     size_t current_slot = adaptive_resolution::MAX_LEVELS;
     for (uint32_t i = 0; i < 2; ++i) {
       if ((required_model_roles & (1u << i)) == 0) continue;
@@ -414,6 +497,8 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
           || feature->second.adaptive_cache->identity != stream->adaptive_frame.layout_identity) {
         group_ready = false;
         missing_role = true;
+        upper_ready = false;
+        selected_ready.fill(false);
         continue;
       }
       auto& cache = *feature->second.adaptive_cache;
@@ -426,8 +511,30 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
       }
       group_ready &= !cache.failed && !cache.budget_blocked
           && AdaptiveTierUsable(cache, *stream->adaptive_session, requested_slot);
+      group_failed |= cache.failed;
+      group_budget |= cache.budget_blocked;
+      const auto& upper_state = (cache.active == 0 ? feature->second : cache.tiers[0].state);
+      upper_ready &= cache.tiers[0].ready
+          && std::none_of(std::begin(upper_state.slots), std::end(upper_state.slots),
+              [](const auto& model) { return model.failed; });
+      for (size_t tier = 0; tier < stream->adaptive_session->ladder.count; ++tier) {
+        selected_ready[tier] &= tier < cache.count && cache.tiers[tier].ready
+            && cache.ladder.sizes[tier] == stream->adaptive_session->ladder.sizes[tier];
+      }
     }
-    const size_t slot = (group_ready ? requested_slot : (missing_role ? 0u : current_slot));
+    if (!stream->adaptive_session->settings.legacy_preparation) {
+      uint32_t ready = 0;
+      for (size_t tier = 0; tier < stream->adaptive_session->ladder.count; ++tier) ready += selected_ready[tier];
+      stream->adaptive_session->UpdatePreparation(stream->adaptive_frame.preparation_epoch, ready,
+          static_cast<uint32_t>(stream->adaptive_session->ladder.count),
+          group_failed ? adaptive_resolution::Reason::FAILED
+              : (group_budget ? adaptive_resolution::Reason::BUDGET : adaptive_resolution::Reason::PREPARING), SteadyNowNs());
+      group_ready &= stream->adaptive_session->prepared;
+      PublishAdaptiveStatus(stream->adaptive_session->status);
+    }
+    const bool return_upper = upper_ready && (group_failed || group_budget
+        || stream->adaptive_session->preparation_reason == adaptive_resolution::Reason::BUDGET);
+    const size_t slot = (return_upper ? 0u : (group_ready ? requested_slot : (missing_role ? 0u : current_slot)));
     stream->adaptive_frame.slot = static_cast<uint32_t>(slot);
     stream->adaptive_frame.sizes = stream->adaptive_session->ladder.sizes[slot];
   }
@@ -675,7 +782,9 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
       FillPresentBlock(&role, input.hudless, motion, depth, contract,
                        input.color_width, input.color_height, 1.f, 1);
       PresentTarget target = base;
-      target.adaptive_frame = &stream->adaptive_frame;
+      auto adaptive_role = stream->adaptive_frame;
+      adaptive_role.role = 2;
+      target.adaptive_frame = &adaptive_role;
       target.game_frame_observed = true;
       target.source_color = nullptr;
       target.output_state = kRead;
@@ -695,6 +804,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     if ((*recordings)[i].model_recorded) measured_roles |= 1u << i;
   }
   stream->adaptive_model_roles = measured_roles;
+  stream->adaptive_required_roles = measured_roles;
   for (auto& segment : gpu_timers::internal::segments) {
     if (segment.adaptive.session == stream->adaptive_session
         && segment.adaptive.application_frame == stream->adaptive_frame.application_frame

@@ -13,7 +13,7 @@ inline Json last_receipt;
 inline bool Allowed(std::string_view key) {
   constexpr std::string_view base[] = {
       "NeuralUplift", "NRHookPoint", "NRPasses", "NRFollowInputRes", "NRResolutionScale",
-      "NRAdaptiveEnabled", "NRAdaptiveTargetFPS", "NRAdaptiveMinScale", "NRControlMaskEnabled",
+      "NRAdaptiveEnabled", "NRAdaptiveTargetFPS", "NRAdaptiveMinScale", "NRAdaptiveLevelCount", "NRControlMaskEnabled",
       "NRControlMaskMode", "NRControlMaskBlendMode", "NRControlMaskRed", "NRControlMaskGreen",
       "NRControlMaskBlue", "NRControlMaskDepthNear", "NRControlMaskDepthFar",
       "NRControlMaskMotionEnabled", "NRControlMaskMotionStart", "NRControlMaskMotionEnd"};

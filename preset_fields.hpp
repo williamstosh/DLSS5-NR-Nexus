@@ -9,6 +9,8 @@
 #include <string_view>
 #include <vector>
 
+#include "adaptive_resolution.hpp"
+
 namespace renodx::addons::dlss5::presets {
 
 struct FieldRule {
@@ -138,6 +140,7 @@ inline const std::vector<FieldRule>& FieldRules() {
       {.key = "NRAdaptiveEnabled", .label = "Adaptive resolution", .group = "Resolution", .minimum = 0, .maximum = 1, .category = FieldRule::QUALITY},
       {.key = "NRAdaptiveTargetFPS", .label = "Target output FPS", .group = "Resolution", .minimum = 30, .maximum = 360, .category = FieldRule::QUALITY},
       {.key = "NRAdaptiveMinScale", .label = "Minimum relative scale", .group = "Resolution", .minimum = 0.33f, .maximum = 1, .category = FieldRule::QUALITY},
+      {.key = "NRAdaptiveLevelCount", .label = "Resolution levels", .group = "Resolution", .minimum = 0, .maximum = adaptive_resolution::MAX_PREPARED_LEVELS, .category = FieldRule::QUALITY},
       {.key = "NRLookUpsample", .label = "Upsampling", .group = "Resolution", .minimum = 0, .maximum = 3, .category = FieldRule::QUALITY},
       {.key = "NRCodecMode", .label = "HDR mode", .group = "HDR", .minimum = 0, .maximum = 3, .category = FieldRule::COMPATIBILITY},
       {.key = "NRProxyAnchor", .label = "Proxy anchor (nits)", .group = "HDR", .minimum = 0.5, .maximum = 32, .category = FieldRule::COMPATIBILITY},

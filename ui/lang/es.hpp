@@ -2336,6 +2336,10 @@ inline constexpr Translation kEs[] = {
     {"Enter the target output frame rate directly (30-360). Press Enter to apply.", "Introduce directamente los FPS de salida objetivo (30–360). Pulsa Intro para aplicar."},
     {"Adaptive resolution controls the current size. Turn it off to edit the saved manual upper limit.", "La resolución adaptativa controla el tamaño actual. Desactívala para editar el límite manual guardado."},
     {"Saved manual upper limit: %s", "Límite manual guardado: %s"},
+    {"Resolution levels", "Niveles de resolución"},
+    {"Default (by capacity)", "Predeterminado (según capacidad)"},
+    {"Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.", "Primero se preparan los niveles elegidos. Más niveles usan más memoria y ofrecen pasos más pequeños. La preparación puede causar una pausa breve."},
+    {"No working-resolution range to adjust", "No hay un rango de resolución de trabajo que ajustar"},
 };
 
 }  // namespace renodx::addons::dlss5::ui::lang

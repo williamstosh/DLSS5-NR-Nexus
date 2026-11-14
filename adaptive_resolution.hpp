@@ -17,11 +17,17 @@ constexpr int64_t SAMPLE_INTERVAL_NS = 250'000'000;
 constexpr int64_t SAMPLE_MAX_AGE_NS = 2'000'000'000;
 constexpr int64_t WARMUP_NS = 1'000'000'000;
 constexpr size_t MAX_PASSES = 4, MAX_LEVELS = 16;
-constexpr uint32_t MAX_PREPARED_LEVELS = 8;
+constexpr uint32_t MINIMUM_SCALE_PERCENT = 33, SCALE_STEP_PERCENT = 5;
+constexpr float MINIMUM_SCALE = static_cast<float>(MINIMUM_SCALE_PERCENT) / 100.f;
+constexpr float SCALE_STEP = static_cast<float>(SCALE_STEP_PERCENT) / 100.f;
+constexpr uint32_t MAX_PREPARED_LEVELS =
+    1u + (100u - MINIMUM_SCALE_PERCENT + SCALE_STEP_PERCENT - 1u) / SCALE_STEP_PERCENT;
+static_assert(MAX_PREPARED_LEVELS <= MAX_LEVELS);
 
 enum class Reason : uint8_t {
   DISABLED, UNSUPPORTED, OUTPUT_UNAVAILABLE, COLLECTING, WARMING, OBSERVING,
   LOWERING, RAISING, NO_BENEFIT, AT_MINIMUM, FROZEN, FAILED, PREPARING, BUDGET,
+  NO_RANGE,
 };
 
 inline const char* ReasonText(Reason reason) {
@@ -40,6 +46,7 @@ inline const char* ReasonText(Reason reason) {
     case Reason::FAILED: return "Paused after an NR execution failure";
     case Reason::PREPARING: return "Preparing working resolutions";
     case Reason::BUDGET: return "Paused: insufficient workset capacity";
+    case Reason::NO_RANGE: return "No working-resolution range to adjust";
   }
   return "Collecting stable samples";
 }
@@ -53,6 +60,9 @@ struct Settings {
   bool enabled = false;
   float target_fps = 60.f, minimum_scale = 0.67f;
   uint32_t prepared_levels = 0;
+  uint32_t selected_levels = 0;
+  // The default-off preparation experiments retain their original on-demand ladder.
+  bool legacy_preparation = false;
   bool operator==(const Settings&) const = default;
 };
 struct Output {
@@ -69,11 +79,12 @@ struct Ladder {
   size_t count = 0;
 };
 
-inline Ladder BuildLadder(const Sizes& upper, const Sizes& stage_floor, float minimum_scale) {
+inline Ladder BuildLadder(const Sizes& upper, const Sizes& stage_floor, float minimum_scale,
+                          uint32_t selected_levels = 0) {
   Ladder result;
-  minimum_scale = (std::isfinite(minimum_scale) ? std::clamp(minimum_scale, 0.33f, 1.f) : 0.67f);
+  minimum_scale = (std::isfinite(minimum_scale) ? std::clamp(minimum_scale, MINIMUM_SCALE, 1.f) : 0.67f);
   for (size_t step = 0; step < MAX_LEVELS; ++step) {
-    const float coefficient = std::max(minimum_scale, 1.f - static_cast<float>(step) * 0.05f);
+    const float coefficient = std::max(minimum_scale, 1.f - static_cast<float>(step) * SCALE_STEP);
     Sizes sizes;
     for (size_t pass = 0; pass < MAX_PASSES; ++pass) {
       if (upper[pass].width == 0 || upper[pass].height == 0) continue;
@@ -88,6 +99,16 @@ inline Ladder BuildLadder(const Sizes& upper, const Sizes& stage_floor, float mi
       result.coefficients[result.count++] = coefficient;
     }
     if (coefficient <= minimum_scale) break;
+  }
+  if (selected_levels >= 2 && result.count > selected_levels) {
+    Ladder selected;
+    selected.count = selected_levels;
+    for (size_t tier = 0; tier < selected.count; ++tier) {
+      const size_t index = tier * (result.count - 1) / (selected.count - 1);
+      selected.sizes[tier] = result.sizes[index];
+      selected.coefficients[tier] = result.coefficients[index];
+    }
+    return selected;
   }
   return result;
 }
@@ -117,6 +138,9 @@ struct Session {
   uint64_t identity = 0, output_source = 0, output_generation = 0, output_configuration = 0;
   uint64_t resource_identity = 0;
   uint64_t configuration_epoch = 0;
+  uint64_t preparation_epoch = 0;
+  bool prepared = false;
+  Reason preparation_reason = Reason::PREPARING;
   Sizes minimum{};
   uint64_t last_output_serial = 0, last_sequence = 0, gpu_context = 0;
   size_t level = 0, previous_level = 0, active_level = 0;
@@ -200,6 +224,11 @@ struct Session {
     }
     ladder.sizes[replacement] = minimum;
     ladder.coefficients[replacement] = settings.minimum_scale;
+    ++preparation_epoch;
+    prepared = false;
+    preparation_reason = Reason::PREPARING;
+    status.ready_levels = 0;
+    status.prepared_levels = static_cast<uint32_t>(ladder.count);
     defer_preparation = true;
     minimum_pending = false;
     Request(replacement, now_ns);
@@ -218,13 +247,57 @@ struct Session {
   void Fail(uint64_t generation) {
     if (generation != status.generation) return;
     failed = true;
+    prepared = false;
+    preparation_reason = Reason::FAILED;
     trial = false;
     status.reason = Reason::FAILED;
     ResetMeasurements();
   }
 
+  void UpdatePreparation(uint64_t epoch, uint32_t ready, uint32_t required, Reason reason, int64_t now_ns) {
+    if (epoch != preparation_epoch || !settings.enabled) return;
+    status.ready_levels = std::min(ready, required);
+    status.prepared_levels = required;
+    if (failed || preparation_reason == Reason::FAILED) {
+      status.reason = Reason::FAILED;
+      return;
+    }
+    if (reason == Reason::FAILED) {
+      if (level != 0) Request(0, now_ns);
+      Fail(status.generation);
+      return;
+    }
+    if (reason == Reason::BUDGET || preparation_reason == Reason::BUDGET) {
+      if (level != 0) Request(0, now_ns);
+      prepared = false;
+      trial = false;
+      preparation_reason = Reason::BUDGET;
+      status.reason = Reason::BUDGET;
+      ResetMeasurements();
+      return;
+    }
+    const bool complete = required == ladder.count && required != 0 && ready == required;
+    if (!complete) {
+      if (prepared) {
+        ResetMeasurements();
+      }
+      prepared = false;
+      trial = false;
+      preparation_reason = Reason::PREPARING;
+      status.reason = Reason::PREPARING;
+      return;
+    }
+    if (!prepared) {
+      prepared = true;
+      ResetMeasurements();
+      stable_after_ns = now_ns + WARMUP_NS;
+      preparation_reason = Reason::PREPARING;
+      status.reason = Reason::WARMING;
+    }
+  }
+
   void ObserveGpu(const GpuSample& sample, int64_t now_ns) {
-    if (sample.generation != status.generation
+    if ((!prepared && !settings.legacy_preparation) || sample.generation != status.generation
         || (sample.sequence <= last_sequence && (pending_roles == 0 || sample.frame != pending.frame))) return;
     last_sequence = std::max(last_sequence, sample.sequence);
     if (!sample.valid || !sample.stable || sample.recorded_ns < stable_after_ns || applied_ns == 0
@@ -278,49 +351,80 @@ struct Session {
                uint64_t allocation_identity = 0) {
     Settings next = requested_settings;
     next.target_fps = (std::isfinite(next.target_fps) ? std::clamp(next.target_fps, 30.f, 360.f) : 60.f);
-    next.minimum_scale = (std::isfinite(next.minimum_scale) ? std::clamp(next.minimum_scale, 0.33f, 1.f) : 0.67f);
+    next.minimum_scale = (std::isfinite(next.minimum_scale) ? std::clamp(next.minimum_scale, MINIMUM_SCALE, 1.f) : 0.67f);
+    next.prepared_levels = std::min(next.prepared_levels, MAX_PREPARED_LEVELS);
+    if (next.selected_levels != 0) {
+      next.selected_levels = std::clamp(next.selected_levels, 2u, MAX_PREPARED_LEVELS);
+    }
     if (allocation_identity == 0) {
       allocation_identity = source_identity;
     }
-    const bool changed = identity != source_identity || settings != next || status.upper != upper;
-    const bool allocations_changed = resource_identity != allocation_identity || status.upper != upper
-        || settings.prepared_levels != next.prepared_levels;
-    if (allocations_changed) {
+    const uint32_t selected_levels = (next.selected_levels != 0 ? next.selected_levels
+        : (next.legacy_preparation ? next.prepared_levels : std::max(2u, next.prepared_levels)));
+    auto selected = BuildLadder(upper, floor, next.minimum_scale, selected_levels);
+    const auto next_minimum = selected.sizes[selected.count - 1];
+    const bool resources_changed = resource_identity != allocation_identity;
+    const bool retain_legacy = next.legacy_preparation && settings.legacy_preparation && !resources_changed
+        && status.upper == upper && settings.prepared_levels == next.prepared_levels;
+    if (retain_legacy) {
+      selected = ladder;
+    }
+    const bool selection_changed = ladder.count != selected.count || ladder.sizes != selected.sizes;
+    const bool selection_edited = settings.selected_levels != next.selected_levels || settings.minimum_scale != next.minimum_scale;
+    const bool toggled = settings.enabled != next.enabled;
+    const bool preparation_mode_changed = settings.legacy_preparation != next.legacy_preparation;
+    const bool changed = identity != source_identity || settings != next || status.upper != upper || selection_changed;
+    if (resources_changed) {
       const uint64_t generation = status.generation + 1;
+      const uint64_t epoch = preparation_epoch + 1;
       *this = Session{};
       status.generation = generation;
+      preparation_epoch = epoch;
       settings = next;
       identity = source_identity;
       resource_identity = allocation_identity;
       status.upper = upper;
-      ladder = BuildLadder(upper, floor, next.minimum_scale);
-      minimum = ladder.sizes[ladder.count - 1];
-      if (next.prepared_levels >= 2 && ladder.count > next.prepared_levels) {
-        Ladder prepared;
-        prepared.count = next.prepared_levels;
-        for (size_t tier = 0; tier < prepared.count; ++tier) {
-          const size_t index = tier * (ladder.count - 1) / (prepared.count - 1);
-          prepared.sizes[tier] = ladder.sizes[index];
-          prepared.coefficients[tier] = ladder.coefficients[index];
-        }
-        ladder = prepared;
-      }
+      ladder = selected;
+      minimum = next_minimum;
+      status.prepared_levels = static_cast<uint32_t>(ladder.count);
       Request(0, now_ns);
     } else if (changed) {
-      defer_preparation |= settings.minimum_scale != next.minimum_scale;
+      const auto retained = (trial ? ladder.sizes[previous_level] : status.applied);
+      const bool defer_legacy = retain_legacy && (defer_preparation || settings.minimum_scale != next.minimum_scale);
+      const bool retry_budget = preparation_reason == Reason::BUDGET && selection_edited;
+      if (selection_changed || toggled || preparation_mode_changed || retry_budget) {
+        ++preparation_epoch;
+        prepared = false;
+        status.ready_levels = 0;
+        status.prepared_levels = static_cast<uint32_t>(selected.count);
+      }
+      if ((!settings.enabled && next.enabled) || retry_budget) {
+        preparation_reason = Reason::PREPARING;
+      }
+      if (!settings.enabled && next.enabled) {
+        failed = false;
+      }
       settings = next;
       identity = source_identity;
-      const auto legal = BuildLadder(upper, floor, next.minimum_scale);
-      minimum = legal.sizes[legal.count - 1];
-      size_t candidate = (trial ? previous_level : active_level);
-      if (!next.enabled || candidate >= ladder.count || !IsLegal(ladder.sizes[candidate])) {
-        candidate = 0;
+      status.upper = upper;
+      ladder = selected;
+      minimum = next_minimum;
+      size_t candidate = 0;
+      active_level = 0;
+      for (size_t slot = 0; slot < ladder.count; ++slot) {
+        if (ladder.sizes[slot] == status.applied) {
+          active_level = slot;
+        }
+        if (next.enabled && ladder.sizes[slot] == retained && IsLegal(ladder.sizes[slot])) {
+          candidate = slot;
+        }
       }
       trial = false;
       raising = false;
       extra_window = false;
       blocked = false;
       minimum_pending = false;
+      defer_preparation = defer_legacy;
       failed_raise_level = MAX_LEVELS;
       failed_raise_until_ns = 0;
       previous_level = candidate;
@@ -341,6 +445,18 @@ struct Session {
       trial = false;
       ResetMeasurements();
       status.reason = Reason::FROZEN;
+      return;
+    }
+    if (!settings.legacy_preparation && (preparation_reason == Reason::BUDGET || ladder.count > settings.prepared_levels)) {
+      UpdatePreparation(preparation_epoch, status.ready_levels, static_cast<uint32_t>(ladder.count), Reason::BUDGET, now_ns);
+      return;
+    }
+    if (!settings.legacy_preparation && !prepared) {
+      status.reason = Reason::PREPARING;
+      return;
+    }
+    if (!settings.legacy_preparation && ladder.count == 1) {
+      status.reason = Reason::NO_RANGE;
       return;
     }
     const bool output_changed = output_source != output.source || output_generation != output.generation
@@ -444,8 +560,9 @@ struct Session {
       return result;
     };
     if (output.fps < settings.target_fps * 0.95 && !blocked && now_ns - last_switch_ns >= 3'000'000'000) {
-      candidate = (minimum_pending ? MAX_LEVELS : adjacent(false, settings.prepared_levels != 0 ? 1 : 2));
-      if (candidate == level && ladder.sizes[level] != minimum) {
+      candidate = (settings.legacy_preparation && minimum_pending ? MAX_LEVELS
+          : adjacent(false, settings.legacy_preparation && settings.prepared_levels == 0 ? 2 : 1));
+      if (settings.legacy_preparation && candidate == level && ladder.sizes[level] != minimum) {
         candidate = MAX_LEVELS;
       }
       raising = false;
@@ -484,6 +601,7 @@ struct Frame {
   Sizes sizes{}, upper{};
   uint64_t generation = 0, application_frame = 0;
   uint64_t layout_identity = 0;
+  uint64_t preparation_epoch = 0;
   uint32_t required_roles = 1, role = 1;
   uint32_t slot = 0;
   uint32_t output_count = 1;

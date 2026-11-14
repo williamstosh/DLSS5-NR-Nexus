@@ -168,6 +168,9 @@
   check(set("NRAdaptiveEnabled", true)["ok"] && runtime::nr_adaptive_enabled,
       "adaptive preference is committed independently of controller readiness");
   check(set("NRAdaptiveMinScale", .67f)["ok"], "adaptive minimum uses production validation");
+  check(set("NRAdaptiveLevelCount", 15u)["ok"] && runtime::nr_adaptive_selected_levels == 15u,
+      "selected level count uses the registered setting without activating an experimental mode");
+  check(!set("NRAdaptiveLevelCount", 16u)["ok"].get<bool>(), "unsupported level count is rejected");
   check(set("NRControlMaskEnabled", true)["ok"], "region mask activation uses the production setting");
   check(set("NRPass2ControlMaskFollowPass1", false)["ok"], "a pass can select its existing independent mask settings");
   reply = set("NRPass2ControlMaskBlue", .25f);

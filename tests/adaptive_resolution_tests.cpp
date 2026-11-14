@@ -39,6 +39,8 @@ int main() {
       output.end_ns = now;
       output.fps = fps;
       session.Prepare(settings, upper, floor, 1, output, now, true, false);
+      session.UpdatePreparation(session.preparation_epoch, static_cast<uint32_t>(session.ladder.count),
+          static_cast<uint32_t>(session.ladder.count), adaptive::Reason::PREPARING, now);
       session.Applied(session.status.generation, session.status.requested, now);
     };
     tick(0, 50., 3000.);

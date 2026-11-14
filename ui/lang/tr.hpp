@@ -2336,6 +2336,10 @@ inline constexpr Translation kTr[] = {
     {"Enter the target output frame rate directly (30-360). Press Enter to apply.", "Hedef çıkış kare hızını doğrudan girin (30–360). Uygulamak için Enter tuşuna basın."},
     {"Adaptive resolution controls the current size. Turn it off to edit the saved manual upper limit.", "Uyarlanabilir çözünürlük mevcut boyutu denetler. Kayıtlı elle ayarlanan üst sınırı düzenlemek için kapatın."},
     {"Saved manual upper limit: %s", "Kayıtlı elle ayarlanan üst sınır: %s"},
+    {"Resolution levels", "Çözünürlük düzeyi sayısı"},
+    {"Default (by capacity)", "Varsayılan (kapasiteye göre)"},
+    {"Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.", "Önce seçilen düzeyler hazırlanır. Daha fazla düzey daha çok bellek kullanır ve daha küçük adımlar sağlar. Hazırlık kısa süreli takılmaya yol açabilir."},
+    {"No working-resolution range to adjust", "Ayarlanacak çalışma çözünürlüğü aralığı yok"},
 };
 
 }  // namespace renodx::addons::dlss5::ui::lang

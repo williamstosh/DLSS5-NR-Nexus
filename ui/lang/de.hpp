@@ -2336,6 +2336,10 @@ inline constexpr Translation kDe[] = {
     {"Enter the target output frame rate directly (30-360). Press Enter to apply.", "Zielbildrate direkt eingeben (30–360). Mit Enter anwenden."},
     {"Adaptive resolution controls the current size. Turn it off to edit the saved manual upper limit.", "Die adaptive Auflösung steuert die aktuelle Größe. Zum Bearbeiten der gespeicherten manuellen Obergrenze ausschalten."},
     {"Saved manual upper limit: %s", "Gespeicherte manuelle Obergrenze: %s"},
+    {"Resolution levels", "Auflösungsstufen"},
+    {"Default (by capacity)", "Standard (nach Kapazität)"},
+    {"Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.", "Alle gewählten Stufen werden zuerst vorbereitet. Mehr Stufen benötigen mehr Speicher und bieten feinere Schritte. Die Vorbereitung kann kurz ruckeln."},
+    {"No working-resolution range to adjust", "Kein Bereich zur Anpassung der Arbeitsauflösung"},
 };
 
 }  // namespace renodx::addons::dlss5::ui::lang

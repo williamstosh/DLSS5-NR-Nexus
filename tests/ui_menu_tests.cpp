@@ -190,7 +190,7 @@ void ImGuiTestEngineHook_ItemAdd(ImGuiContext* context, ImGuiID id, const ImRect
   }
   // BeginCombo does not emit ItemInfo in the pinned ImGui version.
   if (context->CurrentWindow != nullptr && !context->CurrentWindow->IDStack.empty()) {
-    for (const char* label : {"##model", "##theme", "##resolution"}) {
+    for (const char* label : {"##model", "##theme", "##resolution", "##adaptive_levels"}) {
       if (id == context->CurrentWindow->GetID(label)) {
         items[id].label = label;
       }

@@ -2336,6 +2336,10 @@ inline constexpr Translation kIt[] = {
     {"Enter the target output frame rate directly (30-360). Press Enter to apply.", "Inserisci direttamente gli FPS di uscita desiderati (30–360). Premi Invio per applicare."},
     {"Adaptive resolution controls the current size. Turn it off to edit the saved manual upper limit.", "La risoluzione adattiva controlla le dimensioni attuali. Disattivala per modificare il limite manuale salvato."},
     {"Saved manual upper limit: %s", "Limite manuale salvato: %s"},
+    {"Resolution levels", "Livelli di risoluzione"},
+    {"Default (by capacity)", "Predefinito (in base alla capacità)"},
+    {"Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.", "Prima vengono preparati tutti i livelli scelti. Più livelli usano più memoria e offrono passi più piccoli. La preparazione può causare brevi scatti."},
+    {"No working-resolution range to adjust", "Nessun intervallo di risoluzione di lavoro da regolare"},
 };
 
 }  // namespace renodx::addons::dlss5::ui::lang

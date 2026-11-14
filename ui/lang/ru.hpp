@@ -2336,6 +2336,10 @@ inline constexpr Translation kRu[] = {
     {"Enter the target output frame rate directly (30-360). Press Enter to apply.", "Введите целевую выходную частоту кадров (30–360). Нажмите Enter для применения."},
     {"Adaptive resolution controls the current size. Turn it off to edit the saved manual upper limit.", "Адаптивное разрешение управляет текущим размером. Отключите его для изменения сохранённого ручного предела."},
     {"Saved manual upper limit: %s", "Сохранённый ручной предел: %s"},
+    {"Resolution levels", "Число уровней разрешения"},
+    {"Default (by capacity)", "По умолчанию (по доступной ёмкости)"},
+    {"Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.", "Сначала подготавливаются выбранные уровни. Больше уровней требуют больше памяти и дают более мелкий шаг. Подготовка может вызвать короткую задержку."},
+    {"No working-resolution range to adjust", "Нет диапазона рабочего разрешения для регулировки"},
 };
 
 }  // namespace renodx::addons::dlss5::ui::lang

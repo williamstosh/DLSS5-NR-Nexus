@@ -2336,6 +2336,10 @@ inline constexpr Translation kTh[] = {
     {"Enter the target output frame rate directly (30-360). Press Enter to apply.", "ป้อนอัตราเฟรมขาออกเป้าหมายโดยตรง (30–360) กด Enter เพื่อใช้"},
     {"Adaptive resolution controls the current size. Turn it off to edit the saved manual upper limit.", "ความละเอียดอัตโนมัติควบคุมขนาดปัจจุบัน ปิดเพื่อแก้ไขขีดจำกัดแบบกำหนดเองที่บันทึกไว้"},
     {"Saved manual upper limit: %s", "ขีดจำกัดแบบกำหนดเองที่บันทึกไว้: %s"},
+    {"Resolution levels", "จำนวนระดับความละเอียด"},
+    {"Default (by capacity)", "ค่าเริ่มต้น (ตามความจุที่มี)"},
+    {"Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.", "เตรียมระดับที่เลือกทั้งหมดก่อน ระดับที่มากขึ้นใช้หน่วยความจำมากขึ้นและปรับได้ละเอียดขึ้น ระหว่างเตรียมอาจกระตุกชั่วครู่"},
+    {"No working-resolution range to adjust", "ไม่มีช่วงความละเอียดการทำงานให้ปรับ"},
 };
 
 }  // namespace renodx::addons::dlss5::ui::lang
