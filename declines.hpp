@@ -42,6 +42,8 @@ enum class NrDeclineReason : uint8_t {
   kStateShadowUnavailable,
   kPreSrNoStateTarget,
   kWorksetSetupFailed,
+  // A source waiting for cold pipeline preparation or frame-ahead slot
+  // maturation. The existing warmup slug includes both startup gates.
   kSlotWarmupMaturation,
   // Renamed from kHardInvalidBypass (v6.8.0-alpha4).  The "hard-invalid
   // evidence state" it was named for is a v5-era concept that no longer
@@ -222,10 +224,10 @@ inline const char* const kNrDeclineNames[
     "root arguments/PSO unobserved)",
     "pre-SR: compute-state restore target incomplete",
     "workset/codec setup failed",
-    "slot warm-up (frame-ahead maturation, image passes through)",
+    "startup warm-up (pipeline preparation or frame-ahead slot maturation, image passes through)",
     "every pass at zero strength (exact passthrough: the image is left"
     " untouched by design)",
-    "failed NR slot waiting out its retry interval",
+    "failed NR preparation or slot waiting for retry",
     "enclosing hook of an evaluate an inner hook already injected (benign)",
     "the signed NR runtime (nvngx_dlssnr.dll) is not available in this"
     " process",

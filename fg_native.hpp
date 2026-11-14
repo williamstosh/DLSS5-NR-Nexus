@@ -17,6 +17,7 @@ struct Slot {
   ID3D12Resource* coupled_ui = nullptr;
   ID3D12DescriptorHeap* color_heap = nullptr;
   bool color_inputs_prepared = false;
+  bool pipeline_pending = false;
   uint64_t fence_value = 0;
   bool quarantined = false;
 };
@@ -356,13 +357,24 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
   *output_ready = false;
   *recordings = {};
   slot->color_inputs_prepared = false;
+  slot->pipeline_pending = false;
+  const PipelinePreparationScope pipeline_scope;
+  if (!enabled.load(std::memory_order_relaxed)) return fg::Result::NOT_SERVED;
+  if (nr_adaptive_enabled.load(std::memory_order_relaxed) || codec_pipeline.incremental_preparation) {
+    // Runtime/device adoption can release the old global codec. It must run
+    // before this CPU-only gate, while no FeatureState references are held.
+    auto decline = NrDeclineReason::kNrRuntimeUnavailable;
+    if (!EnsureDirectRuntime(list, &decline)) {
+      CountNrDecline(decline);
+      return fg::Result::NOT_SERVED;
+    }
+  }
   if (!nr_adaptive_enabled.load()) {
     stream->adaptive_role_unavailable = false;
   }
   constexpr auto kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
   const bool has_hudless = input.hudless != nullptr && input.hudless != input.backbuffer;
   const bool coupled_ui = NeedsNativeColorCoupling(input, native_parameters, ui_recomposition);
-  if (coupled_ui && !PrepareNativeColorInputs(stream, slot, input)) return fg::Result::NOT_SERVED;
   const bool may_compose = ui_recomposition && has_hudless && native_parameters != nullptr && input.ui != nullptr
       && input.color_x == 0 && input.color_y == 0;
   const uint32_t guide_mode = diagnostics::GuideMode(
@@ -510,6 +522,36 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
             reinterpret_cast<const ID3D12Resource*>(&stream->roles[i]));
       }
     }
+  }
+  const bool mask_pipeline = control_mask_enabled.load(std::memory_order_relaxed)
+      && nr_model::SupportsControlMask(direct_runtime_requirements.file_version)
+      && !base.native_prefg_resolution_pair;
+  const auto pipeline_wait = [&](PipelinePreparationResult result) {
+    CountNrDecline(result == PipelinePreparationResult::PENDING
+        ? NrDeclineReason::kSlotWarmupMaturation : NrDeclineReason::kFailureBackoff);
+    slot->pipeline_pending = true;
+    return fg::Result::PREPARED;
+  };
+  const auto pipeline_preparation = PrepareAdaptivePipelines(stream->device, stream->adaptive_frame, base.hdr_mode, mask_pipeline);
+  if (pipeline_preparation != PipelinePreparationResult::READY) {
+    return pipeline_wait(pipeline_preparation);
+  }
+  if (coupled_ui && stream->color_pipeline == nullptr && stream->adaptive_session != nullptr
+      && stream->adaptive_session->failed) {
+    // Generic device pipelines may already be healthy, but that does not
+    // authorize another attempt at this failed stream's missing color PSO.
+    return pipeline_wait(PipelinePreparationResult::FAILED);
+  }
+  if (coupled_ui && !PrepareNativeColorInputs(stream, slot, input)) {
+    if (codec_pipeline.incremental_preparation
+        && (codec_pipeline.preparation_failed || pipeline_preparation_opportunity->deferred)) {
+      return pipeline_wait(PrepareAdaptivePipelines(stream->device, stream->adaptive_frame, base.hdr_mode, mask_pipeline));
+    }
+    return fg::Result::NOT_SERVED;
+  }
+  if (codec_pipeline.incremental_preparation && pipeline_preparation_opportunity->created) {
+    // The coupled-color PSO shares this source's budget with codec/look.
+    return pipeline_wait(PrepareAdaptivePipelines(stream->device, stream->adaptive_frame, base.hdr_mode, mask_pipeline));
   }
   if (stream->adaptive_session != nullptr && stream->adaptive_frame.enabled) {
     const size_t requested_slot = stream->adaptive_session->level;
@@ -1708,7 +1750,9 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     // These commands belong to the game's list and cannot be rolled back.
     // Private colors preserve both game surfaces on any partial failure;
     // discontinuous model history is rebuilt before the next application frame.
-    envelope.MarkInjectionCommandsRecorded();
+    if (!slot->pipeline_pending) {
+      envelope.MarkInjectionCommandsRecorded();
+    }
     if (resolution_pair && (configuration != configuration_generation.load()
         || options_generation != native_fg_options_generation.load()
         || display_epoch != history_reset_epoch.load()

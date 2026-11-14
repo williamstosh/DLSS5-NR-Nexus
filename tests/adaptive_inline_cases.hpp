@@ -14,6 +14,20 @@
 namespace adaptive_inline_cases {
 namespace addon = renodx::addons::dlss5;
 
+using CreatePipelineFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
+CreatePipelineFn real_create_pipeline = nullptr;
+uint32_t pipeline_calls = 0;
+uint32_t fail_pipeline_call = 0;
+
+HRESULT STDMETHODCALLTYPE ObserveCreatePipeline(ID3D12Device* device,
+    const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID iid, void** pipeline) {
+  if (++pipeline_calls == fail_pipeline_call) {
+    *pipeline = nullptr;
+    return E_FAIL;
+  }
+  return real_create_pipeline(device, desc, iid, pipeline);
+}
+
 int Run() {
   try {
     reshade::internal::get_reshade_module_handle(GetModuleHandleW(nullptr));
@@ -116,6 +130,136 @@ int Run() {
     parameters.Set(NVSDK_NGX_Parameter_MV_Scale_X, 1.f);
     parameters.Set(NVSDK_NGX_Parameter_MV_Scale_Y, 1.f);
     parameters.Set(NVSDK_NGX_Parameter_Reset, 0u);
+    // A genuinely cold adaptive source, before any manual NR warm-up. Count
+    // the real WARP device API; the only mocked failure is one explicit PSO.
+    {
+      real_create_pipeline = reinterpret_cast<CreatePipelineFn>((*reinterpret_cast<void***>(gpu.device.Get()))[11]);
+      Check(DetourTransactionBegin() == NO_ERROR && DetourUpdateThread(GetCurrentThread()) == NO_ERROR
+          && DetourAttach(reinterpret_cast<PVOID*>(&real_create_pipeline), reinterpret_cast<PVOID>(ObserveCreatePipeline)) == NO_ERROR
+          && DetourTransactionCommit() == NO_ERROR, "cold inline PSO observer attach");
+      auto cold_color = texture(DXGI_FORMAT_R16G16B16A16_FLOAT, false);
+      auto cold_output = texture(DXGI_FORMAT_R16G16B16A16_FLOAT, true);
+      parameters.Set(NVSDK_NGX_Parameter_Color, cold_color.Get());
+      parameters.Set(NVSDK_NGX_Parameter_Output, cold_output.Get());
+      parameters.Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags,
+          static_cast<uint32_t>(NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes));
+      native::hook_point = native::kHookUpscaled;
+      native::stack_passes = 2;
+      native::nr_adaptive_enabled = true;
+      const auto* cold_handle = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xADA080});
+      native::RegisterCreatedFeatureLocked(cold_handle, native::kFeatureDlss, &parameters);
+      const auto models_before = next_handle;
+      const auto evaluates_before = model_calls;
+      const auto worksets_before = native::worksets_created;
+      uint32_t cold_sources = 0;
+      const auto cold_record = [&](bool models_only = false) {
+        ++cold_sources;
+        ++native::present_generation;
+        const auto pipelines_before = pipeline_calls;
+        native::NrRecording recording;
+        bool accepted = false;
+        {
+          const addon::EvaluateChainScope chain;
+          const addon::SourceStageScope source(cold_handle, true);
+          const native::PipelinePreparationScope opportunity;
+          accepted = native::ProcessInline(gpu.list.Get(), cold_handle, &parameters, nullptr, nullptr, &recording, models_only);
+          if (!accepted && native::enabled.load()
+              && (pipeline_calls != pipelines_before || native::codec_pipeline.preparation_failed)) {
+            native::NrRecording second;
+            Check(!native::ProcessInline(gpu.list.Get(), cold_handle, &parameters, nullptr, nullptr, &second, true)
+                && !second.prepared && !second.model_invoked && !second.model_recorded && !second.output_ready
+                && !second.group_complete && second.model_evaluate_mask == 0 && second.model_pass_mask == 0,
+                "model-only recursion cannot bypass the shared cold pipeline gate");
+          }
+        }
+        Check(pipeline_calls - pipelines_before <= 1, "one cold source creates at most one actual compute pipeline");
+        if (pipeline_calls != pipelines_before || native::features.at(cold_handle).adaptive_session->failed) {
+          Check(!accepted && !recording.prepared && !recording.model_invoked && !recording.model_recorded
+              && !recording.output_ready && !recording.group_complete && recording.model_evaluate_mask == 0
+              && recording.model_pass_mask == 0 && next_handle == models_before && model_calls == evaluates_before
+              && native::worksets_created == worksets_before && !native::features.at(cold_handle).adaptive_session->prepared,
+              "pipeline pending/failure has zero model creation, evaluation, scratch allocation and ready publication");
+        }
+        std::cout << "ADAPTIVE_PIPELINE source=" << cold_sources << " actual_PSO=" << pipeline_calls - pipelines_before
+            << " models=" << next_handle - models_before << " evaluates=" << model_calls - evaluates_before
+            << " worksets=" << native::worksets_created - worksets_before << " accepted=" << accepted << '\n';
+        submit();
+        return accepted;
+      };
+      cold_record();
+      cold_record();
+      const auto* first_pipeline = native::codec_pipeline.linearize;
+      fail_pipeline_call = pipeline_calls + 1;
+      cold_record();
+      Check(native::codec_pipeline.preparation_failed && native::features.at(cold_handle).adaptive_session->failed,
+          "one actual PSO API failure latches the current preparation");
+      const auto first_failure_calls = pipeline_calls;
+      const auto* second_source = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xADA081});
+      native::RegisterCreatedFeatureLocked(second_source, native::kFeatureDlss, &parameters);
+      {
+        const addon::EvaluateChainScope chain;
+        const addon::SourceStageScope source(second_source, true);
+        ++native::present_generation;
+        Check(!native::ProcessInline(gpu.list.Get(), second_source, &parameters)
+            && !native::features.at(second_source).adaptive_session->failed && pipeline_calls == first_failure_calls + 1,
+            "a new real source Session can resume one bounded PSO preparation opportunity");
+      }
+      cold_record();
+      Check(pipeline_calls == first_failure_calls + 1,
+          "returning to the old failed source cannot advance or repeatedly retry the new owner's preparation");
+      native::ReleaseFeatureState(native::features.at(second_source));
+      native::features.erase(second_source);
+      const auto failed_calls = pipeline_calls;
+      native::nr_adaptive_target_fps = 115.f;
+      for (uint32_t repeat = 0; repeat < 3; ++repeat) cold_record();
+      Check(pipeline_calls == failed_calls && native::codec_pipeline.linearize == first_pipeline,
+          "FPS edits and repeated sources neither retry failure nor release successful partial pipelines");
+      native::nr_adaptive_enabled = false;
+      cold_record();
+      native::nr_adaptive_enabled = true;
+      cold_record();
+      Check(!native::codec_pipeline.preparation_failed && pipeline_calls == failed_calls + 1,
+          "an explicit adaptive Off/On permits one bounded preparation retry");
+      native::nr_adaptive_enabled = false;
+      cold_record();
+      Check(pipeline_calls == failed_calls + 2, "turning automatic sizing off cannot synchronously fill remaining pipelines");
+      native::enabled = false;
+      cold_record();
+      Check(pipeline_calls == failed_calls + 2, "NR Off stops all pipeline preparation immediately");
+      native::enabled = true;
+      native::nr_adaptive_enabled = true;
+      for (uint32_t step = 0; step < 16 && pipeline_calls < 15; ++step) cold_record();
+      // Nine v6 + four look + one ControlMask; one additional API attempt failed.
+      Check(pipeline_calls == 15 && next_handle == models_before && model_calls == evaluates_before,
+          "the complete fourteen-PSO family finishes before the first NGX Create/Evaluate");
+      for (uint32_t step = 0; step < 32; ++step) cold_record();
+      Check(native::features.at(cold_handle).adaptive_session->prepared && model_calls > evaluates_before
+          && pipeline_calls == 15, "ready two-Pass operation reuses every prepared pipeline");
+      Check(DetourTransactionBegin() == NO_ERROR && DetourUpdateThread(GetCurrentThread()) == NO_ERROR
+          && DetourDetach(reinterpret_cast<PVOID*>(&real_create_pipeline), reinterpret_cast<PVOID>(ObserveCreatePipeline)) == NO_ERROR
+          && DetourTransactionCommit() == NO_ERROR, "cold inline PSO observer detach");
+      native::nr_adaptive_enabled = false;
+      native::ReleaseAdaptiveCache(&native::features.at(cold_handle), true);
+      native::ReleaseAllNrSlots(native::features.at(cold_handle), true);
+      native::ReleaseCom(native::features.at(cold_handle).norm.commit);
+      for (auto it = native::worksets.begin(); it != native::worksets.end();) {
+        if (it->first.handle != cold_handle) {
+          ++it;
+          continue;
+        }
+        const auto key = it++->first;
+        native::RetireWorkset(key);
+      }
+      native::features.erase(cold_handle);
+      submit();
+      native::ReleaseCodecPipeline();
+      native::stack_passes = 1;
+      native::nr_adaptive_target_fps = 116.f;
+      parameters.Set(NVSDK_NGX_Parameter_Color, colors[0].Get());
+      parameters.Set(NVSDK_NGX_Parameter_Output, outputs[0].Get());
+      parameters.Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags,
+          static_cast<uint32_t>(NVSDK_NGX_DLSS_Feature_Flags_MVLowRes));
+    }
     uint32_t active_successes = 0;
     uint32_t preparation_calls = 0;
     uint32_t preparation_failures = 0;

@@ -738,6 +738,12 @@ struct CodecPipeline {
   // The NR look stage: its own root signature (look::SerializeRootSignature)
   // and programs, created on first use (EnsureLookPipeline).
   look::Pipeline look;
+  // Cold adaptive activation prepares the existing device cache one PSO per
+  // source opportunity. Disabling automatic sizing cannot turn remaining
+  // preparation back into a synchronous batch.
+  bool incremental_preparation = false;
+  bool preparation_failed = false;
+  std::weak_ptr<adaptive_resolution::Session> preparation_session;
 };
 
 // Workset descriptor-heap layout (see EnsureWorkset):
@@ -1127,6 +1133,30 @@ inline bool direct_runtime_failed = false;
 inline std::string direct_runtime_sha256;
 inline bool direct_runtime_reference_match = false;
 inline CodecPipeline codec_pipeline;
+struct PipelinePreparationOpportunity {
+  bool created = false;
+  bool deferred = false;
+};
+inline thread_local PipelinePreparationOpportunity* pipeline_preparation_opportunity = nullptr;
+
+// Source wrappers own the budget; role/pass/standby recursion borrows it.
+// Direct ProcessInline callers get the same boundary without a wrapper.
+class PipelinePreparationScope {
+ public:
+  explicit PipelinePreparationScope(bool source_owner = false)
+      : previous_(pipeline_preparation_opportunity) {
+    if (previous_ == nullptr || source_owner) {
+      pipeline_preparation_opportunity = &opportunity_;
+    }
+  }
+  ~PipelinePreparationScope() {
+    pipeline_preparation_opportunity = previous_;
+  }
+
+ private:
+  PipelinePreparationOpportunity opportunity_;
+  PipelinePreparationOpportunity* previous_;
+};
 // Multi-pass support: a bounded pool of per-output NR worksets instead of one
 // shared scratch set.  A multi-pass title evaluates more than one DLSS-family
 // pass per frame (upscaler + RR, chained denoisers, per-eye passes), and the
@@ -6184,6 +6214,15 @@ inline bool CreateCodecPipelineState(
     const char* log_name,
     ID3D12RootSignature* root_signature = codec_pipeline.root_signature) {
   if (*pipeline != nullptr) return true;
+  if (codec_pipeline.incremental_preparation) {
+    if (codec_pipeline.preparation_failed) return false;
+    if (pipeline_preparation_opportunity == nullptr) return false;
+    if (!enabled.load(std::memory_order_relaxed) || pipeline_preparation_opportunity->created) {
+      pipeline_preparation_opportunity->deferred = true;
+      return false;
+    }
+    pipeline_preparation_opportunity->created = true;
+  }
   D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
   desc.pRootSignature = root_signature;
   desc.CS = {bytecode.data(), bytecode.size()};
@@ -6196,6 +6235,12 @@ inline bool CreateCodecPipelineState(
   pipeline_trace.End();
 #endif
   if (FAILED(result) || *pipeline == nullptr) {
+    if (codec_pipeline.incremental_preparation) {
+      codec_pipeline.preparation_failed = true;
+      if (const auto session = codec_pipeline.preparation_session.lock()) {
+        session->Fail(session->status.generation);
+      }
+    }
     std::ostringstream message;
     message << log_name << " PSO creation failed with HRESULT 0x" << std::hex
             << static_cast<uint32_t>(result) << " (api=ID3D12Device::CreateComputePipelineState)";
@@ -6217,7 +6262,8 @@ inline bool EnsureControlMaskPipeline(ID3D12Device* device) {
 inline bool EnsureLegacyCodecPipeline(ID3D12Device* device) {
   if (codec_pipeline.encode != nullptr && codec_pipeline.decode != nullptr
       && codec_pipeline.block_mean_reduce != nullptr
-      && codec_pipeline.black_restore_apply != nullptr) {
+      && codec_pipeline.black_restore_apply != nullptr
+      && (!codec_pipeline.incremental_preparation || codec_pipeline.block_mean_reduce_unshaped != nullptr)) {
     return true;
   }
   if (!EnsureCodecRootSignature(device)) return false;
@@ -6245,18 +6291,20 @@ inline bool EnsureLegacyCodecPipeline(ID3D12Device* device) {
           &codec_pipeline.black_restore_apply,
           L"" NR_NEXUS_NAME " black level restore",
           "legacy black level restore")) {
+    if (codec_pipeline.incremental_preparation) return false;
     ReleaseCom(codec_pipeline.encode);
     ReleaseCom(codec_pipeline.decode);
     ReleaseCom(codec_pipeline.block_mean_reduce);
     ReleaseCom(codec_pipeline.black_restore_apply);
     return false;
   }
-  CreateCodecPipelineState(
+  const bool unshaped = CreateCodecPipelineState(
       device,
       __legacy_reduce_unshaped,
       &codec_pipeline.block_mean_reduce_unshaped,
       L"" NR_NEXUS_NAME " block mean reduce (unshaped)",
       "legacy block mean reduce, unshaped");
+  if (!unshaped && codec_pipeline.incremental_preparation) return false;
   Log(
       reshade::log::level::info,
       "created legacy NR codec from build-validated shader bytecode");
@@ -6270,7 +6318,10 @@ inline bool EnsureV6CodecPipeline(ID3D12Device* device) {
   if (codec_pipeline.linearize != nullptr && codec_pipeline.encode_v6 != nullptr
       && codec_pipeline.resolve_v6 != nullptr
       && codec_pipeline.pedestal_reduce != nullptr
-      && codec_pipeline.commit != nullptr && codec_pipeline.autoscale != nullptr) {
+      && codec_pipeline.commit != nullptr && codec_pipeline.autoscale != nullptr
+      && (!codec_pipeline.incremental_preparation
+          || (codec_pipeline.pedestal_reduce_unshaped != nullptr
+              && codec_pipeline.exposure_scale != nullptr && codec_pipeline.commit_exposure != nullptr))) {
     return true;
   }
   if (!EnsureCodecRootSignature(device)) return false;
@@ -6310,6 +6361,7 @@ inline bool EnsureV6CodecPipeline(ID3D12Device* device) {
           &codec_pipeline.autoscale,
           L"" NR_NEXUS_NAME " v6 same-frame autoscale",
           "v6 same-frame autoscale")) {
+    if (codec_pipeline.incremental_preparation) return false;
     ReleaseCom(codec_pipeline.linearize);
     ReleaseCom(codec_pipeline.encode_v6);
     ReleaseCom(codec_pipeline.resolve_v6);
@@ -6318,12 +6370,13 @@ inline bool EnsureV6CodecPipeline(ID3D12Device* device) {
     ReleaseCom(codec_pipeline.autoscale);
     return false;
   }
-  CreateCodecPipelineState(
+  const bool unshaped = CreateCodecPipelineState(
       device,
       __v6_pedestal_reduce_unshaped,
       &codec_pipeline.pedestal_reduce_unshaped,
       L"" NR_NEXUS_NAME " v6 pedestal reduce (unshaped)",
       "v6 pedestal reduce, unshaped");
+  if (!unshaped && codec_pipeline.incremental_preparation) return false;
   // Feed v2 is a mode beside v1: if either program fails, FrameFeed runs v1.
   if (!CreateCodecPipelineState(
           device,
@@ -6337,6 +6390,7 @@ inline bool EnsureV6CodecPipeline(ID3D12Device* device) {
           &codec_pipeline.commit_exposure,
           L"" NR_NEXUS_NAME " v6 commit (feed v2)",
           "v6 commit, feed v2")) {
+    if (codec_pipeline.incremental_preparation) return false;
     ReleaseCom(codec_pipeline.exposure_scale);
     ReleaseCom(codec_pipeline.commit_exposure);
   }
@@ -6397,6 +6451,7 @@ inline bool EnsureLookPipeline(ID3D12Device* device) {
       || !CreateCodecPipelineState(
           device, __look_trace, &pipeline.trace, L"" NR_NEXUS_NAME " look edit trace",
           "look edit trace", pipeline.root_signature)) {
+    if (codec_pipeline.incremental_preparation) return false;
     ReleaseCom(pipeline.compose);
     ReleaseCom(pipeline.band);
     ReleaseCom(pipeline.upsample);
@@ -6407,6 +6462,68 @@ inline bool EnsureLookPipeline(ID3D12Device* device) {
       reshade::log::level::info,
       "created the NR look stage from build-validated shader bytecode");
   return true;
+}
+
+enum class PipelinePreparationResult { READY, PENDING, FAILED };
+
+inline PipelinePreparationResult PrepareAdaptivePipelines(
+    ID3D12Device* device, const adaptive_resolution::Frame& frame, int hdr_mode,
+    bool control_mask) {
+  if (frame.enabled && frame.session != nullptr && !frame.session->settings.legacy_preparation) {
+    codec_pipeline.incremental_preparation = true;
+    if (codec_pipeline.preparation_failed && !frame.session->failed) {
+      // Each Session gets one legitimate preparation attempt. Real contracts
+      // and off/on clear its existing failure; returning failed sources do not.
+      codec_pipeline.preparation_failed = false;
+    }
+    if (!codec_pipeline.preparation_failed) {
+      codec_pipeline.preparation_session = frame.session;
+    }
+  }
+  if (!codec_pipeline.incremental_preparation) return PipelinePreparationResult::READY;
+  if (!enabled.load(std::memory_order_relaxed)) return PipelinePreparationResult::PENDING;
+  const bool cached_codec = (hdr_mode != 0
+      ? codec_pipeline.linearize != nullptr && codec_pipeline.encode_v6 != nullptr
+          && codec_pipeline.resolve_v6 != nullptr && codec_pipeline.pedestal_reduce != nullptr
+          && codec_pipeline.commit != nullptr && codec_pipeline.autoscale != nullptr
+          && codec_pipeline.pedestal_reduce_unshaped != nullptr && codec_pipeline.exposure_scale != nullptr
+          && codec_pipeline.commit_exposure != nullptr
+      : codec_pipeline.encode != nullptr && codec_pipeline.decode != nullptr
+          && codec_pipeline.block_mean_reduce != nullptr && codec_pipeline.black_restore_apply != nullptr
+          && codec_pipeline.block_mean_reduce_unshaped != nullptr);
+  const auto& look = codec_pipeline.look;
+  const bool cached = cached_codec && (!control_mask || codec_pipeline.control_mask != nullptr)
+      && look.compose != nullptr && look.band != nullptr && look.upsample != nullptr && look.trace != nullptr;
+  // A failed source cannot advance someone else's incomplete preparation.
+  // Complete device caches still allow the existing healthy-upper fallback.
+  bool failed = codec_pipeline.preparation_failed
+      || (frame.session != nullptr && frame.session->failed && !cached);
+  bool ready = false;
+  if (!failed) {
+    // Finish the existing families before preparing models. Lower-grid look
+    // transport and optional v6 modes must not first compile on a tier switch.
+    ready = (hdr_mode != 0 ? EnsureV6CodecPipeline(device) : EnsureLegacyCodecPipeline(device))
+        && (!control_mask || EnsureControlMaskPipeline(device)) && EnsureLookPipeline(device);
+    failed = codec_pipeline.preparation_failed;
+    if (!ready && !failed && pipeline_preparation_opportunity != nullptr
+        && !pipeline_preparation_opportunity->deferred) {
+      // Root-signature failures do not pass through the PSO API.
+      codec_pipeline.preparation_failed = true;
+      failed = true;
+    }
+  }
+  // Keep the last synchronous PSO and the first NGX Create on distinct source
+  // opportunities, even when the final Ensure now reports a complete cache.
+  if (ready && pipeline_preparation_opportunity != nullptr && !pipeline_preparation_opportunity->created) {
+    return PipelinePreparationResult::READY;
+  }
+  if (frame.enabled && frame.session != nullptr) {
+    frame.session->UpdatePreparation(frame.preparation_epoch, 0,
+        static_cast<uint32_t>(frame.session->ladder.count),
+        failed ? adaptive_resolution::Reason::FAILED : adaptive_resolution::Reason::PREPARING, SteadyNowNs());
+    PublishAdaptiveStatus(frame.session->status);
+  }
+  return failed ? PipelinePreparationResult::FAILED : PipelinePreparationResult::PENDING;
 }
 
 inline bool CreateScratchTexture(
@@ -12729,6 +12846,16 @@ inline bool RecordInline(
     }
   }
 
+  const auto pipeline_preparation = PrepareAdaptivePipelines(device, adaptive, hdr_mode, control_mask_eligible);
+  if (pipeline_preparation != PipelinePreparationResult::READY) {
+    if (!prepare_models_only && preparing_adaptive_frame == nullptr) {
+      CountNrDecline(pipeline_preparation == PipelinePreparationResult::PENDING
+          ? NrDeclineReason::kSlotWarmupMaturation : NrDeclineReason::kFailureBackoff);
+    }
+    device->Release();
+    return false;
+  }
+
   // Native FG can stop consuming explicit UI and expose a known HUDLess
   // input later. Prepare that role's model on an earlier application list,
   // preserving frame-ahead maturation without evaluating or reading color.
@@ -14332,6 +14459,7 @@ inline bool ProcessInline(ID3D12GraphicsCommandList* command_list, const NVSDK_N
   const ColdCpuTraceScope cold_trace("ProcessInline");
 #endif
   AdaptiveRecording adaptive;
+  const PipelinePreparationScope pipeline_scope;
   const bool result = RecordInline(command_list, handle, game_parameters, command_list_touched, present,
       recording, prepare_models_only, &adaptive);
   if (result && adaptive.feature != nullptr && !prepare_models_only && adaptive.complete) {
@@ -14968,6 +15096,15 @@ inline bool RecordInlinePreSR(
     }
   }
 
+  const auto pipeline_preparation = PrepareAdaptivePipelines(device, adaptive, hdr_mode, control_mask_eligible);
+  if (pipeline_preparation != PipelinePreparationResult::READY) {
+    if (preparing_adaptive_frame == nullptr) {
+      CountNrDecline(pipeline_preparation == PipelinePreparationResult::PENDING
+          ? NrDeclineReason::kSlotWarmupMaturation : NrDeclineReason::kFailureBackoff);
+    }
+    device->Release();
+    return false;
+  }
   const bool codec_ok = hdr_mode != 0 ? EnsureV6CodecPipeline(device)
                                       : EnsureLegacyCodecPipeline(device);
   const bool control_mask_pipeline_ok = !control_mask_eligible
@@ -15945,6 +16082,7 @@ inline bool RecordInlinePreSR(
 
 inline bool ProcessInlinePreSR(ID3D12GraphicsCommandList* command_list, const NVSDK_NGX_Handle* handle,
     const NVSDK_NGX_Parameter* game_parameters, PreSrSwap& swap, bool* commands_recorded = nullptr) {
+  const PipelinePreparationScope pipeline_scope;
   AdaptiveRecording adaptive;
   const bool result = RecordInlinePreSR(command_list, handle, game_parameters, swap, commands_recorded, &adaptive);
   if (result && adaptive.feature != nullptr && adaptive.complete) {
@@ -18932,6 +19070,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
   const screenshot::EvaluationScope capture_scope;
   const bool nested_in_c_wrapper = inside_game_evaluate_wrapper;
   const SourceStageScope source_scope(handle, !nested_in_c_wrapper && !InsideDirectCall());
+  const PipelinePreparationScope pipeline_scope(source_scope.owner && !InsideDirectCall());
   // Counted in `seen` from here until this evaluate names its terminal.
   const EvaluateInFlightScope in_flight(!nested_in_c_wrapper);
   if (!nested_in_c_wrapper) {
@@ -19231,6 +19370,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
   const screenshot::EvaluationScope capture_scope;
   const EvaluateInFlightScope in_flight(true);
   const SourceStageScope source_scope(handle, !InsideDirectCall());
+  const PipelinePreparationScope pipeline_scope(source_scope.owner && !InsideDirectCall());
   ++intercepted_evaluations;
   if (InsideDirectCall()) {
     own_evaluations.fetch_add(1, std::memory_order_relaxed);
@@ -24329,6 +24469,7 @@ inline void OnPresent(
 
 inline void RecreateFeaturesLocked() {
   ++configuration_generation;
+  codec_pipeline.preparation_failed = false;
   RequestHistoryReset(HistoryResetSource::kRecreate);
   if (native_fg_owns.load(std::memory_order_acquire) && hook_point.load() == kHookPresent) {
     native_fg_marker.store(nullptr, std::memory_order_release);

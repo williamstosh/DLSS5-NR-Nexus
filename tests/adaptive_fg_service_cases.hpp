@@ -25,6 +25,20 @@ struct ListCall {
   HRESULT result;
 };
 std::vector<ListCall> list_calls;
+using CreatePipelineFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
+CreatePipelineFn real_create_pipeline = nullptr;
+uint32_t pipeline_calls = 0;
+bool fail_next_pipeline = false;
+
+HRESULT STDMETHODCALLTYPE ObserveCreatePipeline(ID3D12Device* device,
+    const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID iid, void** pipeline) {
+  ++pipeline_calls;
+  if (std::exchange(fail_next_pipeline, false)) {
+    *pipeline = nullptr;
+    return E_FAIL;
+  }
+  return real_create_pipeline(device, desc, iid, pipeline);
+}
 
 HRESULT STDMETHODCALLTYPE ObserveClose(ID3D12GraphicsCommandList* list) {
   const auto result = real_close(list);
@@ -251,6 +265,118 @@ int Run() {
           << '\n';
       return result;
     };
+    {
+      real_create_pipeline = reinterpret_cast<CreatePipelineFn>((*reinterpret_cast<void***>(gpu.device.Get()))[11]);
+      Check(DetourTransactionBegin() == NO_ERROR && DetourUpdateThread(GetCurrentThread()) == NO_ERROR
+          && DetourAttach(reinterpret_cast<PVOID*>(&real_create_pipeline), reinterpret_cast<PVOID>(ObserveCreatePipeline)) == NO_ERROR
+          && DetourTransactionCommit() == NO_ERROR, "cold Service PSO observer attach");
+      auto cold_hudless = texture(DXGI_FORMAT_R8G8B8A8_UNORM);
+      gpu.Submit();
+      input.context = 0xADAF5;
+      input.hudless = cold_hudless.Get();
+      input.hudless_state = NATIVE_INPUT_STATE;
+      native::nr_adaptive_enabled = true;
+      const auto models_before = next_handle;
+      const auto evaluates_before = model_calls;
+      const auto worksets_before = native::worksets_created;
+      // A rejected runtime must be distinguished from CPU pipeline pending,
+      // and must be checked before using the global codec/device cache.
+      auto* runtime_device = std::exchange(native::direct_device, nullptr);
+      native::direct_runtime_failed = true;
+      Check(service() == fg::Result::NOT_SERVED && pipeline_calls == 0,
+          "runtime unavailability returns its original failure before any PSO creation");
+      native::direct_device = runtime_device;
+      native::direct_runtime_failed = false;
+      for (uint32_t source = 0; source < 10; ++source) {
+        const auto before = pipeline_calls;
+        Check(service() == fg::Result::PREPARED && pipeline_calls == before + 1,
+            "one dual-color two-Pass application source creates one actual PSO and remains unserved");
+        const auto& cold = native::fg_service::streams.at({false, input.context});
+        Check(next_handle == models_before && model_calls == evaluates_before
+            && native::worksets_created == worksets_before && !cold.adaptive_session->prepared
+            && cold.adaptive_model_roles == 0 && cold.adaptive_required_roles == 0
+            && cold.last_model_frame[0] == 0 && cold.last_model_frame[1] == 0,
+            "CPU pending never publishes model preparation, role completion, scratch or selected-tier readiness");
+        for (const auto& role : cold.roles) {
+          Check(!native::features.contains(role.Handle()), "CPU pending has no feature or tier completion receipt");
+        }
+        std::cout << "ADAPTIVE_PIPELINE_SERVICE source=" << source + 1 << " actual_PSO=" << pipeline_calls - before
+            << " roles=2 Passes=2 models=0 evaluates=0 selected_worksets=0 ready=0\n";
+      }
+      auto primary = gpu.CreateTextureTransfer(color.Get());
+      auto auxiliary = gpu.CreateTextureTransfer(cold_hudless.Get());
+      for (const auto& [surface, readback] : {std::pair{color.Get(), &primary}, std::pair{cold_hudless.Get(), &auxiliary}}) {
+        gpu.Transition(surface, NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        gpu.RecordTextureReadback(surface, *readback);
+        gpu.Transition(surface, D3D12_RESOURCE_STATE_COPY_SOURCE, NATIVE_INPUT_STATE);
+      }
+      gpu.Submit();
+      for (const auto* readback : {&primary, &auxiliary}) {
+        const auto pixels = gpu.ReadTexture(*readback);
+        Check(std::all_of(pixels.begin(), pixels.end(), [](uint8_t value) { return value == 0; }),
+            "CPU-only pending leaves both actual game color surfaces unchanged");
+      }
+      for (uint32_t source = 0; source < 32; ++source) service();
+      Check(native::fg_service::streams.at({false, input.context}).adaptive_session->prepared
+          && model_calls > evaluates_before && pipeline_calls == 10,
+          "both roles and Passes reach full ready with cache hits after the final cold PSO source");
+      {
+        auto ui = texture(DXGI_FORMAT_R8G8B8A8_UNORM);
+        gpu.Submit();
+        native::fg_service::Stream coupled{.device = gpu.device.Get(), .queue = gpu.queue.Get()};
+        native::fg_service::Slot coupled_slot;
+        auto coupled_input = input;
+        coupled_input.ui = ui.Get();
+        addon::bridge::OwnedParameters composition;
+        composition.Set(NVSDK_NGX_DLSSG_Parameter_UI, ui.Get());
+        native::PresentTarget target;
+        bool output_ready = false;
+        std::array<native::NrRecording, 2> recordings;
+        fail_next_pipeline = true;
+        Check(native::fg_service::Record(&coupled, &coupled_slot, gpu.list.Get(), coupled_input, target,
+                  &output_ready, &recordings, &composition, false) == fg::Result::PREPARED
+            && !output_ready && coupled.adaptive_session->failed && coupled.color_pipeline == nullptr
+            && pipeline_calls == 11 && native::codec_pipeline.preparation_failed,
+            "coupled-color PSO failure latches its real stream after all generic pipelines are ready");
+        // The already healthy Service is a different real Session. It can
+        // clear the shared API latch without granting the failed stream a retry.
+        service();
+        Check(!native::codec_pipeline.preparation_failed && pipeline_calls == 11,
+            "another healthy Session can use the complete generic cache without creating a PSO");
+        const auto calls = model_calls;
+        const auto models = next_handle;
+        const auto scratch = native::worksets_created;
+        for (uint32_t returned_source = 0; returned_source < 2; ++returned_source) {
+          ++coupled_input.application_frame;
+          Check(native::fg_service::Record(&coupled, &coupled_slot, gpu.list.Get(), coupled_input, target,
+                    &output_ready, &recordings, &composition, false) == fg::Result::PREPARED
+              && !output_ready && coupled_slot.pipeline_pending && coupled.adaptive_session->failed
+              && coupled.color_pipeline == nullptr && pipeline_calls == 11
+              && model_calls == calls && next_handle == models && native::worksets_created == scratch,
+              "returning failed coupled source cannot retry its missing PSO through the generic healthy-upper exception");
+          for (const auto& recording : recordings) {
+            Check(!recording.prepared && !recording.model_invoked && !recording.model_recorded
+                && !recording.output_ready && !recording.group_complete && recording.model_evaluate_mask == 0
+                && recording.model_pass_mask == 0, "failed coupled preparation keeps every model/output field empty");
+          }
+        }
+      }
+      Check(DetourTransactionBegin() == NO_ERROR && DetourUpdateThread(GetCurrentThread()) == NO_ERROR
+          && DetourDetach(reinterpret_cast<PVOID*>(&real_create_pipeline), reinterpret_cast<PVOID>(ObserveCreatePipeline)) == NO_ERROR
+          && DetourTransactionCommit() == NO_ERROR, "cold Service PSO observer detach");
+      native::nr_adaptive_enabled = false;
+      native::fg_service::Retire();
+      gpu.Submit();
+      native::DrainRetiredResources(true);
+      native::ReleaseCodecPipeline();
+      gpu.Transition(color.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
+      gpu.Write(color.Get(), 0);
+      gpu.Transition(color.Get(), D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
+      gpu.Submit();
+      input.context = 0xADAF6;
+      input.application_frame = 0;
+      input.hudless = nullptr;
+    }
     for (uint32_t frame = 0; frame < 8; ++frame) service();
     Check(service() == fg::Result::SUBMITTED, "manual two-Pass single Backbuffer matures");
     const auto* occupied_owner = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xADAF7});
