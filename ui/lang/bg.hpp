@@ -2336,6 +2336,10 @@ inline constexpr Translation kBg[] = {
     {"Enter the target output frame rate directly (30-360). Press Enter to apply.", "Въведете целевата изходна кадрова честота (30–360). Натиснете Enter за прилагане."},
     {"Adaptive resolution controls the current size. Turn it off to edit the saved manual upper limit.", "Адаптивната резолюция управлява текущия размер. Изключете я, за да редактирате запазената ръчна горна граница."},
     {"Saved manual upper limit: %s", "Запазена ръчна горна граница: %s"},
+    {"Resolution levels", "Брой нива на резолюцията"},
+    {"Default (by capacity)", "По подразбиране (според капацитета)"},
+    {"Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.", "Първо се подготвят избраните нива. Повече нива използват повече памет и дават по-малки стъпки. Подготовката може да причини кратко забавяне."},
+    {"No working-resolution range to adjust", "Няма диапазон на работната резолюция за регулиране"},
 };
 
 }  // namespace renodx::addons::dlss5::ui::lang

@@ -1,12 +1,134 @@
 """Regression checks for exit races and focus validation without launching a game."""
+from contextlib import contextmanager
+import ctypes
+from ctypes import wintypes
 import json
 from pathlib import Path
 import tempfile
 import sys
+import threading
+import time
 import unittest
 from unittest import mock
 from PIL import Image, ImageDraw
 import runner
+
+
+class DumpTests(unittest.TestCase):
+    def setUp(self):
+        (runner.ROOT / 'tmp').mkdir(exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=runner.ROOT / 'tmp')
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / 'progress.json'
+        runner.dump(self.path, {'state': 'old'})
+        self.before = self.path.read_bytes()
+
+    @contextmanager
+    def reader_without_delete_share(self):
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.CreateFileW(str(self.path), 0x80000000, 0x1 | 0x2, None, 3, 0, None)
+        if handle == wintypes.HANDLE(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        def release():
+            nonlocal handle
+            if handle is not None:
+                owned, handle = handle, None
+                if not kernel32.CloseHandle(owned):
+                    raise ctypes.WinError(ctypes.get_last_error())
+
+        try:
+            yield release
+        finally:
+            release()
+
+    def test_plain_write_replaces_complete_json_without_sleep(self):
+        with mock.patch.object(runner.time, 'sleep') as sleep:
+            runner.dump(self.path, {'state': 'new', 'text': '\u6d4b\u8bd5'})
+        sleep.assert_not_called()
+        self.assertEqual(json.loads(self.path.read_text(encoding='utf-8')),
+                         {'state': 'new', 'text': '\u6d4b\u8bd5'})
+        self.assertFalse(Path(str(self.path) + '.tmp').exists())
+
+    def test_old_replace_fails_under_real_windows_reader(self):
+        temp = Path(str(self.path) + '.tmp')
+        temp.write_text(json.dumps({'state': 'new'}), encoding='utf-8')
+        with self.reader_without_delete_share():
+            with self.assertRaises(PermissionError) as raised:
+                runner.os.replace(temp, self.path)
+            self.assertIn(raised.exception.winerror, (5, 32))
+            self.assertEqual(self.path.read_bytes(), self.before)
+
+    def test_real_windows_reader_release_allows_atomic_update(self):
+        with self.reader_without_delete_share() as release:
+            timer = threading.Timer(0.1, release)
+            timer.start()
+            try:
+                with mock.patch.object(runner.os, 'replace', wraps=runner.os.replace) as replace:
+                    runner.dump(self.path, {'state': 'new'})
+            finally:
+                timer.join()
+        self.assertGreater(replace.call_count, 1)
+        self.assertEqual(json.loads(self.path.read_text(encoding='utf-8')), {'state': 'new'})
+        self.assertFalse(Path(str(self.path) + '.tmp').exists())
+
+    def test_permanent_real_windows_reader_fails_bounded_and_preserves_json(self):
+        with self.reader_without_delete_share():
+            started = time.monotonic()
+            with self.assertRaises(PermissionError) as raised:
+                runner.dump(self.path, {'state': 'new'})
+            elapsed = time.monotonic() - started
+            self.assertIn(raised.exception.winerror, (5, 32))
+            self.assertGreaterEqual(elapsed, 0.45)
+            self.assertLess(elapsed, 1.5)
+            self.assertEqual(self.path.read_bytes(), self.before)
+            self.assertEqual(json.loads(Path(str(self.path) + '.tmp').read_text(encoding='utf-8')),
+                             {'state': 'new'})
+
+    def test_retry_deadline_preserves_original_error(self):
+        for code in (5, 32):
+            with self.subTest(winerror=code):
+                error = ctypes.WinError(code)
+                with (mock.patch.object(runner.os, 'replace', side_effect=error) as replace,
+                      mock.patch.object(runner.time, 'monotonic', side_effect=[1, 1.1, 1.5]),
+                      mock.patch.object(runner.time, 'sleep') as sleep):
+                    with self.assertRaises(PermissionError) as raised:
+                        runner.dump(self.path, {'state': 'new'})
+                self.assertIs(raised.exception, error)
+                self.assertEqual(replace.call_count, 3)
+                self.assertEqual(sleep.call_args_list, [mock.call(0.025), mock.call(0.025)])
+                self.assertEqual(self.path.read_bytes(), self.before)
+
+    def test_unrelated_replace_errors_are_not_retried(self):
+        for error in (PermissionError('non-Windows permission error'), ctypes.WinError(2),
+                      ctypes.WinError(19), OSError('other I/O failure')):
+            with self.subTest(error=repr(error)):
+                with (mock.patch.object(runner.os, 'replace', side_effect=error) as replace,
+                      mock.patch.object(runner.time, 'sleep') as sleep):
+                    with self.assertRaises(OSError) as raised:
+                        runner.dump(self.path, {'state': 'new'})
+                self.assertIs(raised.exception, error)
+                replace.assert_called_once()
+                sleep.assert_not_called()
+                self.assertEqual(self.path.read_bytes(), self.before)
+
+    def test_temporary_write_error_is_not_retried(self):
+        error = ctypes.WinError(5)
+        with (mock.patch.object(Path, 'write_text', side_effect=error) as write,
+              mock.patch.object(runner.os, 'replace') as replace,
+              mock.patch.object(runner.time, 'sleep') as sleep):
+            with self.assertRaises(PermissionError) as raised:
+                runner.dump(self.path, {'state': 'new'})
+        self.assertIs(raised.exception, error)
+        write.assert_called_once()
+        replace.assert_not_called()
+        sleep.assert_not_called()
+        self.assertEqual(self.path.read_bytes(), self.before)
 
 
 class ExitTests(unittest.TestCase):

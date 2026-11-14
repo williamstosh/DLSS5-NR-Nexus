@@ -14,7 +14,7 @@ int main() {
     }
   });
   namespace adaptive = renodx::addons::dlss5::adaptive_resolution;
-  for (const uint32_t count : {4u, static_cast<uint32_t>(adaptive::MAX_PREPARED_LEVELS)}) {
+  for (const uint32_t count : {3u, 4u, static_cast<uint32_t>(adaptive::MAX_PREPARED_LEVELS)}) {
     const auto check = [&](bool condition, const char* name) {
       if (!condition) {
         std::cerr << "prepared-tiers[" << count << "]: " << name << '\n';
@@ -39,6 +39,8 @@ int main() {
       output.end_ns = now;
       output.fps = fps;
       session.Prepare(settings, upper, floor, 1, output, now, true, false);
+      session.UpdatePreparation(session.preparation_epoch, static_cast<uint32_t>(session.ladder.count),
+          static_cast<uint32_t>(session.ladder.count), adaptive::Reason::PREPARING, now);
       session.Applied(session.status.generation, session.status.requested, now);
     };
     tick(0, 50., 3000.);

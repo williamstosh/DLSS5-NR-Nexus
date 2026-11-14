@@ -164,6 +164,7 @@ void RunOutputFramerateCases(const Check& check) {
   adaptive::Sizes upper{}, floor{};
   upper[0] = {.width = 1920, .height = 1080};
   floor[0] = {.width = 634, .height = 356};
+  const adaptive::Settings controller_settings{.enabled = true, .target_fps = 250.f, .prepared_levels = 4};
   rate::ReleaseNative();
   rate::ObserveNativeOptions(7, 5, 3, 4);
   adaptive::Session unpaired;
@@ -174,8 +175,10 @@ void RunOutputFramerateCases(const Check& check) {
         .frame = static_cast<uint64_t>(index + 1), .sequence = static_cast<uint64_t>(index + 1),
         .context = 1, .recorded_ns = now, .completed_ns = now,
         .total_us = 3000., .valid = true, .stable = true}, now);
-    unpaired.Prepare({.enabled = true, .target_fps = 250.f}, upper, floor, 1,
+    unpaired.Prepare(controller_settings, upper, floor, 1,
         controller_output(rate::Read(now)), now, true, false);
+    unpaired.UpdatePreparation(unpaired.preparation_epoch, static_cast<uint32_t>(unpaired.ladder.count),
+        static_cast<uint32_t>(unpaired.ladder.count), adaptive::Reason::PREPARING, now);
     unpaired.Applied(unpaired.status.generation, unpaired.status.requested, now);
   }
   check(rate::Read(start + 400 * step).available && unpaired.level == 0 && !unpaired.trial
@@ -203,8 +206,10 @@ void RunOutputFramerateCases(const Check& check) {
         .frame = static_cast<uint64_t>(index), .sequence = static_cast<uint64_t>(index),
         .context = 1, .recorded_ns = now, .completed_ns = now + 1,
         .total_us = (paired.level == 0 ? 3000. : 2900.), .valid = true, .stable = true}, now + 1);
-    paired.Prepare({.enabled = true, .target_fps = 250.f}, upper, floor, 1,
+    paired.Prepare(controller_settings, upper, floor, 1,
         controller_output(sample), now + 1, true, false);
+    paired.UpdatePreparation(paired.preparation_epoch, static_cast<uint32_t>(paired.ladder.count),
+        static_cast<uint32_t>(paired.ladder.count), adaptive::Reason::PREPARING, now + 1);
     paired.Applied(paired.status.generation, paired.status.requested, now + 1);
     if (paired.trial && paired.level != 0) raised_multiplier = true;
     accepted_confounded_quality |= raised_multiplier && paired.level != 0 && !paired.trial;

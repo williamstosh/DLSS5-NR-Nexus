@@ -2336,6 +2336,10 @@ inline constexpr Translation kJa[] = {
     {"Enter the target output frame rate directly (30-360). Press Enter to apply.", "目標出力フレームレートを直接入力します（30～360）。 Enterで適用します。"},
     {"Adaptive resolution controls the current size. Turn it off to edit the saved manual upper limit.", "自動解像度が現在のサイズを制御しています。保存された手動上限を編集するには無効にしてください。"},
     {"Saved manual upper limit: %s", "保存された手動上限: %s"},
+    {"Resolution levels", "解像度の段階数"},
+    {"Default (by capacity)", "既定（使用可能容量に応じる）"},
+    {"Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.", "選んだ段階を先にすべて準備します。段階数を増やすとメモリ使用量が増え、調整幅が細かくなります。準備中は一時的にカクつく場合があります。"},
+    {"No working-resolution range to adjust", "調整できる処理解像度の範囲がありません"},
 };
 
 }  // namespace renodx::addons::dlss5::ui::lang

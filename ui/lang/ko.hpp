@@ -2336,6 +2336,10 @@ inline constexpr Translation kKo[] = {
     {"Enter the target output frame rate directly (30-360). Press Enter to apply.", "목표 출력 프레임률을 직접 입력합니다(30~360). Enter를 눌러 적용하세요."},
     {"Adaptive resolution controls the current size. Turn it off to edit the saved manual upper limit.", "적응형 해상도가 현재 크기를 제어합니다. 저장된 수동 상한을 편집하려면 끄세요."},
     {"Saved manual upper limit: %s", "저장된 수동 상한: %s"},
+    {"Resolution levels", "해상도 단계 수"},
+    {"Default (by capacity)", "기본값 (가용 용량 기준)"},
+    {"Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.", "선택한 단계를 먼저 모두 준비합니다. 단계가 많을수록 메모리 사용량이 늘고 조정 간격이 작아집니다. 준비 중 잠시 끊길 수 있습니다."},
+    {"No working-resolution range to adjust", "조정할 작업 해상도 범위가 없습니다"},
 };
 
 }  // namespace renodx::addons::dlss5::ui::lang

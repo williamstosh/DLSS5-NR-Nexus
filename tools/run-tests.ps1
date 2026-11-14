@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('all','report','branding','ui','presets','unicode-input','native','sdr-policy','hdr-policy','scope','config','constants','control-mask','control-mask-execution','vulkan-control-mask','fg-xefg','fg-native','lifecycle','bridge-motion','stage-plan','adaptive-resolution','copy-slots')]
+    [ValidateSet('all','report','branding','ui','dev-control','presets','unicode-input','native','lastgasp','sdr-policy','hdr-policy','scope','config','constants','control-mask','control-mask-execution','vulkan-control-mask','fg-xefg','fg-native','lifecycle','bridge-motion','stage-plan','adaptive-resolution','copy-slots')]
     [string[]]$Suite = @('all'),
     [string]$SourceRoot = (Split-Path $PSScriptRoot -Parent),
     [string]$HostRoot = (Join-Path (Split-Path $PSScriptRoot -Parent) '.local/renodx'),
@@ -12,7 +12,7 @@ param(
     [string]$DetoursLibrary,
     [string]$PythonExecutable,
     [ValidateSet('Auto','Quick','Full','None')][string]$UiPreview = 'Auto',
-    [ValidateSet('control-mask','control-mask-safety','control-mask-safety-hardware','control-mask-capture','control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','control-mask-native-ngx-fg','gpu-pass-diagnostics','native-required-menu','native-owner-idle','native-options-resume','native-options-delayed','native-guide-contract','present-guide-models','adaptive-fg-service','adaptive-inline','vulkan-recorded-use-contract','native-present-decision','trace-metadata','stage-chain','stage-resolution','stage-resolution-hardware','same-stage-resolution','same-stage-resolution-hardware','render-stage-resolution','render-stage-resolution-hardware','present-stage-resolution','present-stage-resolution-hardware','native-prefg-resolution','native-prefg-resolution-hardware','native-frame-identity','same-stage-model-pair','same-stage-mixed-pair','source-lifecycle','feature-switch','feature-switch-hardware','f5-mixed','present-chain','present-chain-hardware','present-chain-scrgb','present-chain-hdr10','native-full','native-full-hardware')]
+    [ValidateSet('inline-restore-roi','control-mask','control-mask-safety','control-mask-safety-hardware','control-mask-capture','control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','control-mask-native-ngx-fg','gpu-pass-diagnostics','native-required-menu','native-owner-idle','native-options-resume','native-options-delayed','native-guide-contract','present-guide-models','adaptive-fg-service','adaptive-inline','vulkan-recorded-use-contract','native-present-decision','trace-metadata','stage-chain','stage-resolution','stage-resolution-hardware','same-stage-resolution','same-stage-resolution-hardware','render-stage-resolution','render-stage-resolution-hardware','present-stage-resolution','present-stage-resolution-hardware','native-prefg-resolution','native-prefg-resolution-hardware','native-frame-identity','same-stage-model-pair','same-stage-mixed-pair','source-lifecycle','feature-switch','feature-switch-hardware','f5-mixed','present-chain','present-chain-hardware','present-chain-scrgb','present-chain-hdr10','native-full','native-full-hardware')]
     [string[]]$NativeCase = @(),
     [switch]$VulkanNativeNgx,
     [string]$NativeNgxProjectIdPath,
@@ -45,6 +45,7 @@ $sources = [ordered]@{
     'unicode-input'='unicode_input_tests'
     branding='branding_tests'
     native='native_contract_tests'; 'sdr-policy'='present_sdr_restore_policy_tests'
+    lastgasp='lastgasp_tests'
     'hdr-policy'='present_hdr_pedestal_policy_tests'; scope='present_restore_scope_tests'
     config='present_restore_configuration_tests'; constants='present_hdr_runtime_constants_tests'
     'control-mask'='control_mask_contract_tests'
@@ -115,7 +116,7 @@ foreach ($item in $Suite) {
         & (Join-Path $testRoot 'run-preset-dialog-tests.ps1') -OutputDirectory (Join-Path $OutputDirectory 'preset-dialog') -VcVars64 $VcVars64
         continue
     }
-    if ($item -in @('report','config','constants','lifecycle','ui')) {
+    if ($item -in @('report','config','constants','lifecycle','ui','dev-control')) {
         if ($BuildOnly) { throw '-BuildOnly is supported for native/policy/scope/fg-xefg/fg-native/bridge-motion; select these explicitly.' }
         $entry = switch ($item) {
             report { 'run-report-tests.ps1' }
@@ -123,9 +124,13 @@ foreach ($item in $Suite) {
             constants { 'run-present-hdr-runtime-constants-tests.ps1' }
             lifecycle { 'run-fg-lifecycle-tests.ps1' }
             ui { 'run-ui-layout-tests.ps1' }
+            'dev-control' { 'run-ui-layout-tests.ps1' }
         }
         if ($item -eq 'report') {
             & (Join-Path $testRoot $entry) @parameters -OutputDirectory $directory -PythonExecutable $PythonExecutable
+        } elseif ($item -eq 'dev-control') {
+            & (Join-Path $testRoot $entry) @parameters -OutputDirectory $directory -DevControlOnly
+            & (Join-Path $testRoot 'run-dev-control-pipe-tests.ps1') -SourceRoot $SourceRoot -HostRoot $HostRoot -OutputDirectory (Join-Path $directory 'pipe') -VcVars64 $VcVars64
         } else {
             & (Join-Path $testRoot $entry) @parameters -OutputDirectory $directory
         }
@@ -148,6 +153,9 @@ foreach ($item in $Suite) {
         $arguments += @('/bigobj','/Gy','/Gw','/DNDEBUG','/DRESHADE_ADDON=1',
             "/I$ShaderIncludeDirectory", "/I$HostRoot/external/DLSS/include",
             "/I$HostRoot/external/json/include", "/I$HostRoot/external/frozen/include", "/I$HostRoot/external/gtl/include")
+        if ($item -eq 'fg-native' -and $NativeCase -contains 'inline-restore-roi') {
+            $arguments += '/DNR_NEXUS_DEV_CONTROL'
+        }
         if ($item -eq 'vulkan-control-mask') { $arguments += "/I$VulkanIncludeDirectory" }
         $link += @('user32.lib','gdi32.lib','ole32.lib','psapi.lib')
         if ($item -in @('fg-native','vulkan-control-mask') -and $NativeNgxSdkLibraryDirectory) {

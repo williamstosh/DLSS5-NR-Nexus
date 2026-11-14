@@ -286,7 +286,7 @@ SDK 动态计数、固定倍率失效和来源切换。配置保存／方案另�
 ./tools/run-tests.ps1 -Suite fg-native -NativeCase adaptive-inline -SoftwareOnly
 ~~~
 
-`adaptive-fg-service` 使用 16×16 WARP、模型替身和实际 Service／提交路径，覆盖四档就绪、临时容量占用解除后恢复、ControlMask 未提交时的当前档／预备档等待，以及真正 Evaluate 失败后的显式清锁重建。`adaptive-inline` 使用生产 Render／Upscaled 入口，核对轮换输出的档位准备、GPU 完成、模拟输出帧率驱动的自动降档及清锁恢复。两者还检查 Off→On→Off→On、实际工作尺寸，以及额外准备 Evaluate 不计入成功源帧累计；均为 WARP＋MOCK，不调用硬件 NR Runtime 或游戏。
+`adaptive-fg-service` 使用 WARP、模型替身和实际 Service／提交路径，覆盖双颜色双 Pass 的完整所选集合、5 档切回默认、缺输入暂停／恢复及真实合同变化。`adaptive-inline` 使用生产 Render／Upscaled 入口，覆盖 64×64 输入的 15 档／两输出、真实尺寸及写回、准备完成后的切档零新增分配、旧 Stage 工作集归属和清锁恢复。两者还核对临时容量占用、ControlMask 未提交、Off／On、兼容设置复用及失败停止。未提交旧录制阻止槽位复用，额外准备 Evaluate 不计入活动角色成功累计；角色计数与完整 Pass／颜色组完成分开。均为 WARP＋MOCK，不调用硬件 NR Runtime 或游戏。
 
 默认 `-Suite fg-native` 会复用同一编译产物，分别在独立进程执行这两个自适应用例；默认 `-Suite ui` 也会复用菜单二进制，在独立进程执行自适应真实 ImGui 交互，包括三种介入点连续往返与配置保存。CI 的 `-Suite all -SoftwareOnly` 沿用这些入口；`NR_NEXUS_ADAPTIVE_UI_ONLY=1` 仍可单独运行自适应 UI，快照模式不额外运行回归。
 
@@ -303,6 +303,135 @@ SDK 动态计数、固定倍率失效和来源切换。配置保存／方案另�
 工作集与显存信息。创建后暂未执行 NR 的帧单独记录，不能当作零成本执行。
 冷切换、预备成本和 ready 档重新激活分别比较；离线原生结果不包含游戏 FG、
 显示帧率对照或动态视觉验收。WARP／硬件遮罩用例另核对自动缩放时的手动上限运动参考。
+
+完整所选集合的原生对照使用同一个已构建 EXE，分别在独立进程设置
+`NR_NEXUS_TEST_RESIZE_SELECTED_LEVELS=0`（默认，实际四档）和 `15`。两组固定最低
+33%、普通工作集池 4、实验模式 OFF，保持真实 SR 1280×720→1920×1080、Upscaled、
+B 请求、单 Pass／单颜色和 RGBA16F。其他 `RESIZE_SETTINGS`、`EXPECT_REUSE`、
+`COLD_PREPARE`、`SINGLE_FEATURE`、`REUSE_FEATURE`、`FIXED_INPUT`、`DEMAND_PREPARE`
+开关须为 `0` 或未设置，`NR_NEXUS_TEST_RESIZE_READY=1`。
+
+~~~powershell
+$env:NR_NEXUS_TEST_RESIZE_SELECTED_LEVELS = '0'
+& '<同一已构建的fg_native_tests.exe>' --control-mask-native-ngx-resize '<已有ProjectID文件>'
+$env:NR_NEXUS_TEST_RESIZE_SELECTED_LEVELS = '15'
+& '<同一已构建的fg_native_tests.exe>' --control-mask-native-ngx-resize '<已有ProjectID文件>'
+Remove-Item Env:NR_NEXUS_TEST_RESIZE_SELECTED_LEVELS
+~~~
+
+两次运行分别保留 `adaptive-native-resize.json`，核对 EXE／Runtime 身份和输入 CRC 一致。
+报告沿用 `nr-nexus-native-resize-v1`，新增 `selected_collection`（子 schema
+`nr-nexus-native-selected-v1`）：包含上限首次创建的 prefix、完整准备 CPU 合计、两段准备
+墙时、夹具设置间隙、端到端就绪时间、采样显存峰值和最长源调用／源间隔。显存采样包含实际
+SR、NR 和退休资源占用；不等于连续测得的瞬时峰值。SDK／设备初始化位于准备计量之前。
+prefix 沿用 62 次源调用上限，后续准备与请求合计最多 180 次；整组 `Session.prepared`
+及健康提交收据齐全后，连续执行 `{0,last,0,middle,last,0}` 六次请求便结束计时，核对实际
+尺寸、Reset、Fence、全部模型／代理／工作集身份，以及零 Create／Release／工作集新增。
+选择是 MOCK 直接请求，SR／NR 为真实 NGX；不测输出 FPS。预算拒绝保留 Blocked，实际
+Create／Evaluate 失败停止并保存诊断，不降低档数或重启准备。结束后沿用真实 Off 和 SDK 收尾。
+
+冷启用自适应的分步管线验证使用同一入口的单个冷进程。编译原生夹具时同时定义
+`NR_NEXUS_TEST_NATIVE_NGX`、`NR_NEXUS_TEST_COLD_CPU_TRACE`，设置
+`NR_NEXUS_TEST_RESIZE_PIPELINE_STEPS=1`，`NR_NEXUS_TEST_RESIZE_SELECTED_LEVELS=0`（默认）
+或 `15`（最低 33% 的完整网格），以及
+`NR_NEXUS_TEST_RESIZE_READY=1`、`NR_NEXUS_TEST_RESIZE_COLD_COMPONENTS=0`，其余专项开关
+沿上面的要求关闭。首次 prefix 源调用前就开启自适应，沿用既有 62 次 prefix 与
+180 次 selected 源硬界，保留已经推进的同一所选集合；全部档位取得健康完成收据后，
+只执行 `{0,last,0}` 三次即时切换，再运行原有 Off、SR 恢复、source Release 与 SDK 收尾。
+
+此模式在 `adaptive-native-resize.json` 增加 `pipeline_steps` 汇总，并复用
+`cold_cpu_trace` 为每个 prefix/selected 源保存至多 512 个嵌套 span。记录实际 PSO API
+次数、NGX Create、SR/NR Evaluate CPU 成本、最长源调用和准备墙时；每源最多一次插件
+PSO 创建，最后一个 PSO 所在源不叠加 NGX Create 或 NR Evaluate，ready 切换不新增管线、
+模型或工作集。trace 使用有界堆存储，JSON 转换在 Hook 计时外；墙时和源间隔包含报告、
+导出与夹具限速开销。SDK/provider、codec 根签名与 ControlMask PSO 的前置准备状态单独
+记录。同步的单个创建仍不可拆分，这项验证不预设总准备时间或单次延迟上限。
+
+首调用 CPU 归因另用原生测试编译宏 `NR_NEXUS_TEST_COLD_CPU_TRACE`，配合
+`NR_NEXUS_TEST_RESIZE_COLD_COMPONENTS=1`、`NR_NEXUS_TEST_RESIZE_SELECTED_LEVELS=0`
+和 `NR_NEXUS_TEST_RESIZE_READY=1`，其他专项关闭，仍调用同一 resize 入口。只运行首两次
+prefix 源调用；不足、API 失败或记录溢出即失败，不延长。随后直接执行关闭、一次真实 SR
+恢复、source Release 和 SDK 收尾，跳过完整档位准备／切档及最终图像读回。
+正常生产构建不含这些计时或回调；测试构建也只在受测 Hook 的调用线程内激活固定内存记录。
+
+`cold_components` 记录边界及结果，`cold_cpu_trace` 使用 `nr-nexus-cold-cpu-trace-v1`，
+每次源调用最多 512 个父子 span。起止时间和 inclusive／exclusive 均保留；exclusive 是
+父区间减直接子区间，包含未细分工作和观测开销，不能再将 inclusive 父子相加。
+覆盖入口生命周期／锁、Runtime helper、管线及实际 PSO、Look 根签名、工作集及资源／描述符、
+Feature 参数分配和既有 SDK Create／Evaluate。日志发送区间涵盖同步回调及 stdout，调用者
+预先格式化文本的时间留在所属父区间；SDK 内部后台线程未细分。JSON 转换在受测调用后，
+提交／Fence、退休和调用至提交间隙独立记录。SDK/provider、codec 根签名和 ControlMask PSO
+在 prefix 前已准备，报告明确记录，结果不作为完整游戏冷启动成本。运行后恢复探针环境变量。
+
+设置复用对照可在同一入口显式设置 `NR_NEXUS_TEST_RESIZE_SETTINGS=1`，将原有
+180 帧往返扩为 360 帧，依次编辑风格、混合强度及最低比例 80%→50%→67%。
+同时设置 `NR_NEXUS_TEST_RESIZE_EXPECT_REUSE=1` 时，断言兼容设置编辑不冷建，
+风格变化仍重置历史，并在第 285 帧请求新 50% 档、第 300 帧提高下限后核对合法回退。
+结果区分设置编辑与实际新尺寸请求，保留逐帧 Create／Release、GPU Evaluate／Fence、
+锁竞争计数及实际源帧间隔。锁等待最大值是累计值；单线程夹具没有竞争不能证明并发创建安全。
+该序列不测试模型内部身份、游戏 FPS 或动态画质。运行后恢复这两个环境变量；普通入口仍用原往返。
+
+候选 Feature 容量复用的开发实验默认关闭。设置上述两个开关后，可另外设置
+`NR_NEXUS_TEST_RESIZE_REUSE_FEATURE=1`，在同一 360 帧序列中开启容量内复用对照。
+范围限定为已核对的 Runtime 310.9.16.0、B 模型、单 Pass DX12 Upscaled 和 FP16 线性 HDR。
+实验只保留已完成使用的非活动候选自身 Feature／参数，资源退休、历史重置及就绪凭据仍按原流程核验；
+配置不兼容或容量不足时沿用重建。比较时保持其余输入一致，分别记录新端点的创建、录制、
+GPU 完成及完整源调用间隔。普通插件没有此实验的配置入口，P1 和异步准备均未开启。
+
+同一开关设为 `2` 时，增加上限容量备用档的首次准备对照：在上述合同的单输出路径中，
+最多驻留三档，新备用 Feature 按手动上限容量 Create，工作纹理和 Evaluate 保持实际档位尺寸。
+现有阶梯压缩仍生效，默认最低 67% 时三档为 100／85／67%，尚未拆分逻辑档与物理槽。
+与开关 `0` 的默认四档串行对照初始 Create 次数／总耗时、就绪帧、显存峰值及新端点成本；
+不能只以 Create 次数较少认定初始化更快。开关 `1` 保留原容量内复用实验。
+
+按需准备对照使用 `NR_NEXUS_TEST_RESIZE_DEMAND_PREPARE=1`，分别设
+`NR_NEXUS_TEST_RESIZE_REUSE_FEATURE=2`／`3`，不同时开启设置编辑、固定输入或其他专项。
+该序列运行 900 帧：目标 100 FPS，前 360 帧提供 MOCK 120 FPS，随后提供 MOCK 80 FPS。
+档位由生产控制器决定，没有直接请求档位；SR／NR 及控制器 GPU 成本采样仍为原生执行。
+模式 3 沿用上限容量合同，仅准备当前请求的候选。分别核对初始备用 Create、首次请求的
+前台 Create、等待期间合法活动档、GPU 完成后切换、无收益回到原上限资源，以及未使用槽。
+MOCK FPS 不用于验证 SDK 输出帧率准确性；省掉未使用档与延后必要冷 Create 分开报告。
+结束恢复两个环境变量；上述按需实验仍默认 OFF，档位范围沿用旧实验，不启用异步准备。
+
+将 `NR_NEXUS_TEST_RESIZE_DEMAND_PREPARE` 设为 `2`，可用相同入口比较按需模式 `3` 与
+一份相邻热备模式 `4`。仍为 900 帧、目标 100；前 360 帧提供 MOCK 120 FPS，之后按
+实际活动档提供 80／90／100 FPS，让真实控制器和 GPU 成本判断两次连续降档是否有效。
+模式 4 启动只预热最近低档，接受试探且未发出下一请求时才补相邻低档；试探期间保留回退链。
+逐次比较请求到应用、补备 Create／首次 Evaluate、后继源调用间隔和峰值显存。
+若接受试探时已经立即请求下一档，记录补备窗口不足；不得延后请求来制造热备命中。
+请求时无冷创建不等于整段没有停顿，补备的前台成本必须单列。
+此模式只由原生夹具开启，开发实时接口仍只接受 0–3；默认行为与三档映射保持，不启用 P1。
+
+设置编辑序列还读回 67% 和 50% 的实际代理输入、NR／最终输出，记录尺寸、RGBA 有限值数量与 CRC。
+容量复用会提前一帧激活新端点，因此额外读回其第 298 帧，用于和基线第 299 帧按 Reset 后
+Evaluate 次数对齐；比较仍须核对实际输入与历史，CRC 不同不能直接归因于容量。读回在计时
+结束后执行，受读回影响的下一次源间隔单独标记。仅 `NR_NEXUS_TEST_KEEP_RAW=1` 输出
+`adaptive-pixels-<frame>-<role>.rgba16f`，用于定量差异分析；用途结束后按产物规则收尾。
+
+归因时可另设 `NR_NEXUS_TEST_RESIZE_FIXED_INPUT=1`：在每次实际 Core Evaluate 前，将完整
+有效 Color 区域替换为按实际尺寸生成的同一 FP16 渐变，保留生产 Reset 和资源提交流程。
+第 285–299 帧还记录实际 Core 参数、资源尺寸及参数可用状态；比较必须分别对齐源帧与
+Reset 后的 Evaluate 次数。固定输入上传和复制会计入 wrapper／NR GPU 区间，因此这一组
+只用于像素归因，不能据其计时宣称性能收益。最终合成仍使用原 SR 图像，NR 相等不自动使最终图相等。
+
+冷准备专项可单独设置 `NR_NEXUS_TEST_RESIZE_COLD_PREPARE=1`，仍运行同一个
+`control-mask-native-ngx-resize` 入口，改为私有 worker Create 与前台真实 SR／NR 的短对照。
+worker 使用同设备的独立参数、Feature、allocator 和命令列表，保留现有 NGX 串行门禁；
+报告分别记录独立 D3D 工作、前台门禁等待、初始化 GPU 完成和候选首次 Evaluate。
+只有实际时间区间重叠才认定覆盖，未重叠记为未判定；SDK 调用超时不会转为并发调用。
+结果保存为 `adaptive-native-cold-prepare.json`。该探针不启用生产异步准备，也不测试
+Feature18 Create／Evaluate 并发安全；结束后恢复环境变量。
+
+单 Feature 有效尺寸专项可单独设置 `NR_NEXUS_TEST_RESIZE_SINGLE_FEATURE=1`，复用同一入口，
+与冷准备开关互斥。一个最大尺寸 Feature 依次运行完整尺寸、较小的标准尺寸／subrect、
+同步已知私有尺寸参数、恢复完整尺寸，再与真正使用小纹理创建的独立 Feature 对照。
+各阶段使用相同的 ROI 输入字节和只读引导资源，保留两次 Reset 前缀及八次测量。
+结果保存为 `adaptive-native-single-feature.json`，分别记录 API、逐次 CPU／GPU 时间、
+可见的直接 Dispatch、RGB／alpha 写入范围、非有限值、数值差异及资源完成／清理。
+像素覆盖和 API 成功不替代实际成本测量；直接 Dispatch 也不代表完整内部工作量。
+该探针不改变生产尺寸策略或开启 P1；结束后恢复环境变量。
+将该开关设为 `2` 时，两种缩小请求改为给同一最大 Feature 绑定真正的小纹理，
+其余五阶段、参考输入和测量方法不变，用于单独核对物理资源布局的兼容性。
 
 ## 自动回归与证据保存
 

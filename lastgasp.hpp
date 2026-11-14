@@ -18,16 +18,16 @@
 // one would need continuation semantics we do not own, and one misjudged
 // benign code either floods the log or interferes with the game's recovery.
 // At last chance there are no false positives: anything that arrives here is
-// a real death, so every code is recorded (the owner's set - 0xC0000005,
-// 0xC0000409, 0xC000001D, 0xC00000FD, 0xC0000374 - and anything else that
-// got this far).  Known gaps, stated so support can recognize them: a
+// a real death. Ordinary faults are recorded; stack overflow is forwarded
+// directly to the previous filter or WER without entering the recorder.
+// Known gaps, stated so support can recognize them: a
 // genuine __fastfail (int 29h) never reaches user-mode dispatch at all
 // (neither filter nor vectored; WER only), and a host that replaces the
 // process's unhandled filter after we install ours takes the slot with it.
 //
 // Handler constraints (domain, not style): the crashing thread's heap, CRT
-// file layer and possibly its locks are dead or held, so the handler only
-// formats into a stack buffer (snprintf does not allocate) and writes with
+// file layer and possibly its locks are dead or held, so the ordinary recorder
+// formats into a stack buffer and writes with
 // WriteFile/FlushFileBuffers on the handle pre-opened at install.  The file
 // write comes BEFORE the best-effort reshade::log line, because that call
 // can deadlock on ReShade's log mutex if the crashing thread held it - the
@@ -35,7 +35,9 @@
 // swallows a crash: it hands it to the filter that was installed before it
 // (the host's own crash reporter - RE Engine and most engines register one
 // at start-up, before any add-on loads), or continues the search to WER when
-// there was none.  Until v8.0.2 it returned EXCEPTION_CONTINUE_SEARCH
+// there was none. The stack-overflow entry stays separate from the recorder's
+// buffers and CRT calls: even formatting a crash line can fault on that stack.
+// Until v8.0.2 it returned EXCEPTION_CONTINUE_SEARCH
 // unconditionally, which at last chance does NOT reach the previous filter:
 // installing this reporter took the host's crash handling away.
 //
@@ -499,11 +501,9 @@ inline size_t DescribeCxxThrow(const EXCEPTION_RECORD& record, char (&out)[320])
 // first-chance recorder ("[first-chance]"): version, pid/tid, uptime, code
 // and name, the access-violation detail, image+offset, whether the image is
 // this addon, and the release marks.  The 2048-byte buffer covers the
-// longest image name, the mark ring and the access-violation detail; on a
-// stack overflow the remaining guard-released stack may be smaller than the
-// caller's frame, the fault then re-enters a guarded handler and the process
-// dies through WER - degraded, not swallowed.  Returns the length, newline
-// included.
+// longest image name, the mark ring and the access-violation detail. Stack
+// overflow bypasses this formatter before the recorder's buffers are allocated.
+// Returns the length, newline included.
 inline size_t FormatFaultLine(char (&line)[2048], const char* tag,
                               const EXCEPTION_RECORD& record,
                               const FaultImage& image) noexcept {
@@ -717,13 +717,8 @@ inline void WriteDump(EXCEPTION_POINTERS* info, const char* reason) noexcept {
   if (length > 0) AppendLine(crash_file, line, std::min<size_t>(length, sizeof(line) - 1));
 }
 
-inline LONG WINAPI CrashFilter(EXCEPTION_POINTERS* info) noexcept {
-  bool expected = false;
-  if (!filter_entered.compare_exchange_strong(expected, true)) {
-    // Re-entered: a fault inside this handler, or a previous filter that
-    // calls back into ours.  Never chain from here - that could loop.
-    return EXCEPTION_CONTINUE_SEARCH;
-  }
+// Keep these buffers out of the filter entry, including optimized builds.
+__declspec(noinline) inline void RecordCrash(EXCEPTION_POINTERS* info) noexcept {
   if (crash_file != nullptr && info != nullptr && info->ExceptionRecord != nullptr) {
     FaultImage image;
     ResolveFaultImage(reinterpret_cast<DWORD64>(info->ExceptionRecord->ExceptionAddress),
@@ -751,10 +746,22 @@ inline LONG WINAPI CrashFilter(EXCEPTION_POINTERS* info) noexcept {
       WriteDump(info, "crash");
     }
   }
-  // The host's crash handling runs exactly as it would have without this
-  // reporter: its filter writes its dump, shows its dialog, or continues
-  // the search to WER.
-  return previous_filter != nullptr ? previous_filter(info) : EXCEPTION_CONTINUE_SEARCH;
+}
+
+__declspec(noinline) inline LONG WINAPI CrashFilter(EXCEPTION_POINTERS* info) noexcept {
+  bool expected = false;
+  if (!filter_entered.compare_exchange_strong(expected, true)) {
+    // A fault in the recorder or a previous filter calling back must not chain.
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+  if (info != nullptr && info->ExceptionRecord != nullptr
+      && info->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW) {
+    if (previous_filter != nullptr) return previous_filter(info);
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+  RecordCrash(info);
+  if (previous_filter != nullptr) return previous_filter(info);
+  return EXCEPTION_CONTINUE_SEARCH;
 }
 
 // The first-chance recorder (header comment, v8.0.2).  Always returns

@@ -26,6 +26,10 @@ function(nr_nexus_apply_version)
   if(NR_NEXUS_IME_DIAGNOSTICS)
     target_compile_definitions(dlss5 PRIVATE NR_NEXUS_IME_DIAGNOSTICS)
   endif()
+  option(NR_NEXUS_DEV_CONTROL "Enable the local development-only configuration pipe" OFF)
+  if(NR_NEXUS_DEV_CONTROL)
+    target_compile_definitions(dlss5 PRIVATE NR_NEXUS_DEV_CONTROL)
+  endif()
   target_compile_definitions(dlss5 PRIVATE
     "VER_FILEVERSION=${nexus_major},${nexus_minor},${nexus_patch},0"
     "VER_FILEVERSION_STR=\"${nexus_version}\\0\""

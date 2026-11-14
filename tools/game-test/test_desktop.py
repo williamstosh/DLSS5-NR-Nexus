@@ -291,6 +291,30 @@ class DesktopTests(unittest.TestCase):
                 desktop.click(self.window, 100, 100)
         self.assertEqual(order, [2, 4])
 
+    def test_f6_capture_hotkey_holds_its_scan_and_releases_after_interruption(self):
+        for interrupted in (False, True):
+            with self.subTest(interrupted=interrupted):
+                events = []
+                self.u.GetForegroundWindow.return_value = self.window['hwnd']
+
+                def send(count, event, size):
+                    events.append(('scan', event._obj.ki.wScan, event._obj.ki.dwFlags))
+                    return 1
+
+                def hold(seconds):
+                    events.append(('hold', seconds))
+                    if interrupted:
+                        raise RuntimeError('hold interrupted')
+
+                self.u.SendInput.side_effect = send
+                with mock.patch.object(desktop.time, 'sleep', side_effect=hold):
+                    if interrupted:
+                        with self.assertRaisesRegex(RuntimeError, 'hold interrupted'):
+                            desktop.key(self.window, 'F6', activate=False)
+                    else:
+                        desktop.key(self.window, 'F6', activate=False)
+                self.assertEqual(events, [('scan', 0x40, 8), ('hold', .2), ('scan', 0x40, 10)])
+
     def test_default_menu_key_spans_render_polls(self):
         order = []
         self.u.SendInput.side_effect = lambda count, value, size: order.append(value._obj.ki.dwFlags) or 1

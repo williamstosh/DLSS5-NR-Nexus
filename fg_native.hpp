@@ -17,6 +17,7 @@ struct Slot {
   ID3D12Resource* coupled_ui = nullptr;
   ID3D12DescriptorHeap* color_heap = nullptr;
   bool color_inputs_prepared = false;
+  bool pipeline_pending = false;
   uint64_t fence_value = 0;
   bool quarantined = false;
 };
@@ -25,6 +26,8 @@ struct Stream {
   std::shared_ptr<adaptive_resolution::Session> adaptive_session;
   adaptive_resolution::Frame adaptive_frame;
   uint32_t adaptive_model_roles = 0;
+  uint32_t adaptive_required_roles = 0;
+  bool adaptive_role_unavailable = false;
   ID3D12Device* device = nullptr;
   ID3D12CommandQueue* queue = nullptr;
   ID3D12Fence* fence = nullptr;
@@ -118,6 +121,7 @@ inline bool PrepareCapture(ID3D12GraphicsCommandList* list) noexcept {
 // An unsubmitted recording can have created handles and advanced NGX CPU
 // history. Rebuild the feature and workset, including their GPU state ledger.
 inline void Invalidate(Stream* stream) {
+  stream->adaptive_role_unavailable = false;
   stream->cached = nullptr;
   stream->native_pair_producer_marker = nullptr;
   stream->native_pair_completion = {};
@@ -171,19 +175,26 @@ inline void Release(Stream* stream) {
   ReleaseCom(stream->device);
 }
 
+// Caller owns the NGX PresentTurn and runtime_mutex. These private XeFG lists
+// cannot be replayed after their pool is removed; outstanding GPU uses still
+// retain their retired resources. Native game recordings are never closed here.
+inline void RetireServiceStreamsLocked() {
+  for (auto it = streams.begin(); it != streams.end();) {
+    if (it->first.first) {
+      ++it;
+      continue;
+    }
+    Release(&it->second);
+    it = streams.erase(it);
+  }
+}
+
 inline void Retire() noexcept {
   try {
     const ngx_serial::PresentTurn turn(true);
     if (!turn.owns()) return;
     RuntimeLock lock(runtime_mutex);
-    for (auto it = streams.begin(); it != streams.end();) {
-      if (it->first.first) {
-        ++it;
-        continue;
-      }
-      Release(&it->second);
-      it = streams.erase(it);
-    }
+    RetireServiceStreamsLocked();
   } catch (...) {
   }
 }
@@ -353,10 +364,24 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
   *output_ready = false;
   *recordings = {};
   slot->color_inputs_prepared = false;
+  slot->pipeline_pending = false;
+  const PipelinePreparationScope pipeline_scope;
+  if (!enabled.load(std::memory_order_relaxed)) return fg::Result::NOT_SERVED;
+  if (nr_adaptive_enabled.load(std::memory_order_relaxed) || codec_pipeline.incremental_preparation) {
+    // Runtime/device adoption can release the old global codec. It must run
+    // before this CPU-only gate, while no FeatureState references are held.
+    auto decline = NrDeclineReason::kNrRuntimeUnavailable;
+    if (!EnsureDirectRuntime(list, &decline)) {
+      CountNrDecline(decline);
+      return fg::Result::NOT_SERVED;
+    }
+  }
+  if (!nr_adaptive_enabled.load()) {
+    stream->adaptive_role_unavailable = false;
+  }
   constexpr auto kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
   const bool has_hudless = input.hudless != nullptr && input.hudless != input.backbuffer;
   const bool coupled_ui = NeedsNativeColorCoupling(input, native_parameters, ui_recomposition);
-  if (coupled_ui && !PrepareNativeColorInputs(stream, slot, input)) return fg::Result::NOT_SERVED;
   const bool may_compose = ui_recomposition && has_hudless && native_parameters != nullptr && input.ui != nullptr
       && input.color_x == 0 && input.color_y == 0;
   const uint32_t guide_mode = diagnostics::GuideMode(
@@ -378,16 +403,61 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
   contract.create_flags = (real_guides ? input.init_flags : NVSDK_NGX_DLSS_Feature_Flags_DepthInverted);
   contract.frame_reset = (input.reset ? 1 : 0);
   const uint64_t previous_adaptive_layout = stream->adaptive_frame.layout_identity;
+  uint32_t required_model_roles = (may_compose && stream->adaptive_model_roles == 2
+      ? 2u : (has_hudless && !coupled_ui ? 3u : 1u));
+  const bool missing_prepared_role = nr_adaptive_enabled.load() && (stream->adaptive_required_roles & 2u) != 0 && !has_hudless;
   const auto adaptive_plan = EvaluationStagePlan(stream->roles[0].Handle(), false);
-  stream->adaptive_frame = FreezeAdaptiveFrame(&stream->adaptive_session, adaptive_plan,
+  const auto freeze_adaptive = [&](uint32_t roles) {
+    return FreezeAdaptiveFrame(&stream->adaptive_session, adaptive_plan,
       {.stage = stage_plan::Stage::PRESENT, .count = adaptive_plan.pass_count},
       input.color_width, input.color_height, contract.input_width, contract.input_height,
       reinterpret_cast<uintptr_t>(stream) ^ reinterpret_cast<uintptr_t>(stream->device)
-          ^ reinterpret_cast<uintptr_t>(stream->queue) ^ input.epoch
-          ^ stream->native_options_generation ^ static_cast<uint64_t>(base.hdr_mode)
+          ^ reinterpret_cast<uintptr_t>(stream->queue) ^ input.epoch ^ static_cast<uint64_t>(base.hdr_mode)
+           ^ (static_cast<uint64_t>(input.backbuffer->GetDesc().Format) * 1099511628211ull) ^ contract.create_flags
           ^ (static_cast<uint64_t>(coupled_ui) << 40) ^ (static_cast<uint64_t>(may_compose) << 41),
       !base.d3d11_bridge && !base.native_prefg_resolution_pair,
-      input.application_frame, (has_hudless && !coupled_ui ? 3u : 1u), true, 1, stream->adaptive_model_roles);
+      input.application_frame, roles, true, 1, stream->adaptive_model_roles);
+  };
+  stream->adaptive_frame = freeze_adaptive(missing_prepared_role ? stream->adaptive_required_roles : required_model_roles);
+  if (missing_prepared_role && previous_adaptive_layout == stream->adaptive_frame.layout_identity
+      && stream->adaptive_session != nullptr) {
+    auto& session = *stream->adaptive_session;
+    if (!stream->adaptive_role_unavailable) {
+      if (session.trial) {
+        session.Request(session.previous_level, SteadyNowNs());
+      }
+      session.trial = false;
+      session.ResetMeasurements();
+      session.UpdatePreparation(stream->adaptive_frame.preparation_epoch, 0,
+          static_cast<uint32_t>(session.ladder.count), adaptive_resolution::Reason::PREPARING, SteadyNowNs());
+      stream->adaptive_role_unavailable = true;
+      LogPresent(reshade::log::level::info,
+          "NR adaptive paused: required HUDLess input is unavailable; retaining compatible selected resources");
+    }
+    if (!session.failed && session.preparation_reason != adaptive_resolution::Reason::BUDGET) {
+      session.status.reason = adaptive_resolution::Reason::UNSUPPORTED;
+    }
+    PublishAdaptiveStatus(session.status);
+    // Absence pauses only the same resource/composition contract. Real layout
+    // changes below retain their normal invalidation and preparation path.
+    // PREPARED preserves the Service recording contract, not color readiness.
+    return fg::Result::PREPARED;
+  }
+  if (missing_prepared_role) stream->adaptive_frame = freeze_adaptive(required_model_roles);
+  if (stream->adaptive_role_unavailable) {
+    stream->adaptive_role_unavailable = false;
+    if (previous_adaptive_layout == stream->adaptive_frame.layout_identity && stream->adaptive_frame.enabled) {
+      for (uint32_t i = 0; i < 2; ++i) {
+        if ((required_model_roles & (1u << i)) != 0) {
+          ResetPresentStreamHistory(&stream->roles[i]);
+        }
+      }
+      if (stream->adaptive_session->settings.legacy_preparation) {
+        stream->adaptive_session->ResetMeasurements();
+        stream->adaptive_session->stable_after_ns = SteadyNowNs() + adaptive_resolution::WARMUP_NS;
+      }
+    }
+  }
   if (!nr_adaptive_enabled.load() && stream->adaptive_session != nullptr) {
     for (auto& role : stream->roles) {
       if (const auto feature = features.find(role.Handle()); feature != features.end()
@@ -398,14 +468,107 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
       }
     }
   }
-  if (previous_adaptive_layout != stream->adaptive_frame.layout_identity) stream->adaptive_model_roles = 0;
-  const uint32_t required_model_roles = (may_compose && stream->adaptive_model_roles == 2
-      ? 2u : (has_hudless && !coupled_ui ? 3u : 1u));
+  if (previous_adaptive_layout != stream->adaptive_frame.layout_identity) {
+    stream->adaptive_model_roles = 0;
+    stream->adaptive_required_roles = 0;
+    for (auto& role : stream->roles) {
+      if (const auto feature = features.find(role.Handle()); feature != features.end()
+          && feature->second.adaptive_cache != nullptr
+          && feature->second.adaptive_cache->identity != stream->adaptive_frame.layout_identity) {
+        ReleaseAdaptiveCache(&feature->second, true);
+      }
+    }
+  }
+  if (stream->adaptive_session != nullptr && stream->adaptive_frame.enabled) {
+    bool selection_pending = false;
+    for (uint32_t i = 0; i < 2; ++i) {
+      const auto feature = features.find(stream->roles[i].Handle());
+      if (feature == features.end() || feature->second.adaptive_cache == nullptr
+          || !feature->second.adaptive_cache->resident) continue;
+      auto& cache = *feature->second.adaptive_cache;
+      if ((required_model_roles & (1u << i)) == 0) {
+        if (stream->adaptive_session->settings.selected_levels == 0) {
+          // Default uses the original ordinary pool. Preserve the inactive
+          // upper model, but retire its optional collection and scratch so
+          // an old explicit selection cannot permanently consume that pool.
+          ActivateAdaptiveTier(&feature->second, 0);
+          ReleaseAdaptiveStandby(&cache, true);
+          cache.resident = false;
+          feature->second.adaptive_cache.reset();
+          for (auto it = worksets.begin(); it != worksets.end();) {
+            if (it->first.handle != stream->roles[i].Handle()) {
+              ++it;
+              continue;
+            }
+            RetireWorksetResources(std::move(it->second));
+            it = worksets.erase(it);
+          }
+          for (auto& model : feature->second.slots) {
+            model.pending_reset = true;
+            model.pending_reset_reasons |= kResetDimensions;
+          }
+        }
+        continue;
+      }
+      selection_pending |= cache.count != stream->adaptive_session->ladder.count
+          || cache.ladder.sizes != stream->adaptive_session->ladder.sizes;
+    }
+    if (selection_pending) {
+      // A role's normal ProcessInline advances preparation before Record
+      // reaches the next role. Reconcile the shared selection first, so an
+      // intermediate old/new count can never latch a false budget failure.
+      for (uint32_t i = 0; i < 2; ++i) {
+        if ((required_model_roles & (1u << i)) == 0) continue;
+        const auto feature = features.find(stream->roles[i].Handle());
+        if (feature == features.end() || feature->second.adaptive_cache == nullptr
+            || !feature->second.adaptive_cache->resident) continue;
+        auto selected = stream->adaptive_frame;
+        selected.role = 1u << i;
+        selected.slot = 0;
+        SelectAdaptiveTier(&feature->second, stream->roles[i].Handle(), &selected, true,
+            reinterpret_cast<const ID3D12Resource*>(&stream->roles[i]));
+      }
+    }
+  }
+  const bool mask_pipeline = control_mask_enabled.load(std::memory_order_relaxed)
+      && nr_model::SupportsControlMask(direct_runtime_requirements.file_version)
+      && !base.native_prefg_resolution_pair;
+  const auto pipeline_wait = [&](PipelinePreparationResult result) {
+    CountNrDecline(result == PipelinePreparationResult::PENDING
+        ? NrDeclineReason::kSlotWarmupMaturation : NrDeclineReason::kFailureBackoff);
+    slot->pipeline_pending = true;
+    return fg::Result::PREPARED;
+  };
+  const auto pipeline_preparation = PrepareAdaptivePipelines(stream->device, stream->adaptive_frame, base.hdr_mode, mask_pipeline);
+  if (pipeline_preparation != PipelinePreparationResult::READY) {
+    return pipeline_wait(pipeline_preparation);
+  }
+  if (coupled_ui && stream->color_pipeline == nullptr && stream->adaptive_session != nullptr
+      && stream->adaptive_session->failed) {
+    // Generic device pipelines may already be healthy, but that does not
+    // authorize another attempt at this failed stream's missing color PSO.
+    return pipeline_wait(PipelinePreparationResult::FAILED);
+  }
+  if (coupled_ui && !PrepareNativeColorInputs(stream, slot, input)) {
+    if (codec_pipeline.incremental_preparation
+        && (codec_pipeline.preparation_failed || pipeline_preparation_opportunity->deferred)) {
+      return pipeline_wait(PrepareAdaptivePipelines(stream->device, stream->adaptive_frame, base.hdr_mode, mask_pipeline));
+    }
+    return fg::Result::NOT_SERVED;
+  }
+  if (codec_pipeline.incremental_preparation && pipeline_preparation_opportunity->created) {
+    // The coupled-color PSO shares this source's budget with codec/look.
+    return pipeline_wait(PrepareAdaptivePipelines(stream->device, stream->adaptive_frame, base.hdr_mode, mask_pipeline));
+  }
   if (stream->adaptive_session != nullptr && stream->adaptive_frame.enabled) {
     const size_t requested_slot = stream->adaptive_session->level;
     bool group_ready = true;
     bool missing_role = false;
-    size_t current_slot = 0;
+    bool group_failed = false, group_budget = false;
+    bool upper_ready = true;
+    std::array<bool, adaptive_resolution::MAX_PREPARED_LEVELS> selected_ready;
+    selected_ready.fill(true);
+    size_t current_slot = adaptive_resolution::MAX_LEVELS;
     for (uint32_t i = 0; i < 2; ++i) {
       if ((required_model_roles & (1u << i)) == 0) continue;
       const auto feature = features.find(stream->roles[i].Handle());
@@ -413,15 +576,44 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
           || feature->second.adaptive_cache->identity != stream->adaptive_frame.layout_identity) {
         group_ready = false;
         missing_role = true;
+        upper_ready = false;
+        selected_ready.fill(false);
         continue;
       }
       auto& cache = *feature->second.adaptive_cache;
       PollAdaptiveCache(&cache);
-      current_slot = cache.active;
-      group_ready &= requested_slot < cache.count && !cache.failed && !cache.budget_blocked
-          && (requested_slot == cache.active || cache.tiers[requested_slot].ready);
+      const size_t active = (AdaptiveTierUsable(cache, *stream->adaptive_session, cache.active) ? cache.active : 0u);
+      if (current_slot == adaptive_resolution::MAX_LEVELS) {
+        current_slot = active;
+      } else if (current_slot != active) {
+        current_slot = 0;
+      }
+      group_ready &= !cache.failed && !cache.budget_blocked
+          && AdaptiveTierUsable(cache, *stream->adaptive_session, requested_slot);
+      group_failed |= cache.failed;
+      group_budget |= cache.budget_blocked;
+      const auto& upper_state = (cache.active == 0 ? feature->second : cache.tiers[0].state);
+      upper_ready &= cache.tiers[0].ready
+          && std::none_of(std::begin(upper_state.slots), std::end(upper_state.slots),
+              [](const auto& model) { return model.failed; });
+      for (size_t tier = 0; tier < stream->adaptive_session->ladder.count; ++tier) {
+        selected_ready[tier] &= tier < cache.count && cache.tiers[tier].ready
+            && cache.ladder.sizes[tier] == stream->adaptive_session->ladder.sizes[tier];
+      }
     }
-    const size_t slot = (group_ready ? requested_slot : (missing_role ? 0u : current_slot));
+    if (!stream->adaptive_session->settings.legacy_preparation) {
+      uint32_t ready = 0;
+      for (size_t tier = 0; tier < stream->adaptive_session->ladder.count; ++tier) ready += selected_ready[tier];
+      stream->adaptive_session->UpdatePreparation(stream->adaptive_frame.preparation_epoch, ready,
+          static_cast<uint32_t>(stream->adaptive_session->ladder.count),
+          group_failed ? adaptive_resolution::Reason::FAILED
+              : (group_budget ? adaptive_resolution::Reason::BUDGET : adaptive_resolution::Reason::PREPARING), SteadyNowNs());
+      group_ready &= stream->adaptive_session->prepared;
+      PublishAdaptiveStatus(stream->adaptive_session->status);
+    }
+    const bool return_upper = upper_ready && (group_failed || group_budget
+        || stream->adaptive_session->preparation_reason == adaptive_resolution::Reason::BUDGET);
+    const size_t slot = (return_upper ? 0u : (group_ready ? requested_slot : (missing_role ? 0u : current_slot)));
     stream->adaptive_frame.slot = static_cast<uint32_t>(slot);
     stream->adaptive_frame.sizes = stream->adaptive_session->ladder.sizes[slot];
   }
@@ -638,7 +830,8 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
         const auto backbuffer = features.find(stream->roles[0].Handle());
         const auto cache = (backbuffer != features.end() ? backbuffer->second.adaptive_cache : nullptr);
         if (cache == nullptr || cache->identity != stream->adaptive_frame.layout_identity
-            || cache->failed || cache->budget_blocked || stream->adaptive_frame.slot >= cache->count
+            || cache->failed || cache->budget_blocked
+            || !AdaptiveTierUsable(*cache, *stream->adaptive_session, stream->adaptive_frame.slot)
             || !cache->tiers[stream->adaptive_frame.slot].ready) {
           // A new fallback role cannot publish half a lower-resolution frame.
           // Its upper tier matures on the next application frame as a complete pair.
@@ -668,7 +861,9 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
       FillPresentBlock(&role, input.hudless, motion, depth, contract,
                        input.color_width, input.color_height, 1.f, 1);
       PresentTarget target = base;
-      target.adaptive_frame = &stream->adaptive_frame;
+      auto adaptive_role = stream->adaptive_frame;
+      adaptive_role.role = 2;
+      target.adaptive_frame = &adaptive_role;
       target.game_frame_observed = true;
       target.source_color = nullptr;
       target.output_state = kRead;
@@ -688,6 +883,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     if ((*recordings)[i].model_recorded) measured_roles |= 1u << i;
   }
   stream->adaptive_model_roles = measured_roles;
+  stream->adaptive_required_roles = measured_roles;
   for (auto& segment : gpu_timers::internal::segments) {
     if (segment.adaptive.session == stream->adaptive_session
         && segment.adaptive.application_frame == stream->adaptive_frame.application_frame
@@ -1561,7 +1757,9 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     // These commands belong to the game's list and cannot be rolled back.
     // Private colors preserve both game surfaces on any partial failure;
     // discontinuous model history is rebuilt before the next application frame.
-    envelope.MarkInjectionCommandsRecorded();
+    if (!slot->pipeline_pending) {
+      envelope.MarkInjectionCommandsRecorded();
+    }
     if (resolution_pair && (configuration != configuration_generation.load()
         || options_generation != native_fg_options_generation.load()
         || display_epoch != history_reset_epoch.load()

@@ -12,6 +12,88 @@
 
 采集器读取 capture-ready.json 的 automatic_foreground=true 和本次 owned-process.json，核对唯一进程／窗口身份并自动激活。动态采样与转镜期间持续核验前台和几何，失焦即停止，不在采样中反复激活。收到 capture-cancel.json 应停止输入并结束自己的采样子进程；异常写 capture-failed.json，成功收尾才写匹配 PID 的 capture-complete.json。使用 CaptureScript 时还必须由父进程观察到脚本零码退出并写 capture-script-result.json，worker 才允许请求正常退出。提前完成、失败／损坏凭据或超时不能释放门禁。恢复前先结束采集器和 worker，文件保护保持到本次游戏退出并恢复完成。
 
+静态阶段采证使用 `-CaptureScript tools/game-test/static_capture.py`（入口会解析为绝对路径）。采集器直接采用 runner 传入的本次目录，核对 `target.json` 哈希、脚本哈希和 owner／ready 身份，不限定 case 目录名。先生成本轮目标副本，原目标不改：
+
+```powershell
+& $pythonPath -B ./tools/game-test/static_capture.py --prepare-target $targetPath `
+    --output-target "$taskRoot/target.json" --hold-seconds 600 `
+    --exit-reserve-seconds 60 --stage-timeout-seconds 60
+```
+
+开发接口接线需显式给目标副本设置 `static_capture.dev_control=true`，或在上述准备命令增加 `--development-control`。默认仍沿用手工菜单路径。接口客户端 `tools/dev_control.py` 只依赖 Python 标准库，连接 `\\.\pipe\nr-nexus-dev-<pid>`；每帧为 4 字节小端长度和最多 64 KiB 的 UTF-8 JSON。连接等待、OVERLAPPED 读写、部分帧和确认往返共用有界 deadline。客户端核对管道服务 PID，并在请求前后核对 `owned-process.json.created` 的原始 Windows FILETIME；`--process-created` 使用该整数的十进制字符串，不转换成 Unix 时间。接口需由开发候选显式启用；本说明不授予安装或游戏启动权限。
+
+开发候选使用 `tools/build.ps1 -ToolRoot <既有工具目录> -Configuration Release -DevControl -BuildDirectory build/dev-control`；该开关不能使用普通 `build` 输出目录。普通构建显式设置 `NR_NEXUS_DEV_CONTROL=OFF`，开发目录与普通目录的 DLL 分别核对哈希和实际加载身份。无面板／绘制请求时接口仍由选定 ReShade 帧回调执行。只读配置状态不建立 GPU 完成证据；区域遮罩的 `resolved_masks` 也只表示逐层解析参数。
+
+```powershell
+& $pythonPath -B ./tools/dev_control.py --pid 42 --process-created 123 status
+& $pythonPath -B ./tools/dev_control.py --pid 42 --process-created 123 set NRHookPoint 1
+```
+
+Mafia 单 Pass Upscaled 的恢复诊断使用独立请求 `inline-restore-roi <绝对目录>`，协议操作为 `inline_restore_roi`，字段为 `output_directory`。它只布防一次求值，不提交画质设置或切换接入点。目标目录须为 D 盘本项目 `tmp/mafia-same-frame-roi/<capture_id>/` 下尚未创建的批次目录，`capture_id` 使用英文字母、数字、连字符或下划线，最长 96 个字符。请求接受时冻结目录；目录无效或写盘失败会报告失败，不使用游戏截图目录。
+
+这条诊断的状态、API、取样插点和热路径判断全部受 `NR_NEXUS_DEV_CONTROL` 编译条件保护。普通发布构建关闭该选项，保留原有结构、函数签名和调用路径；开发构建才包含采集能力。认领一次合格求值后新增四次 `CopyTextureRegion` 和八次复制前后的资源状态转换，净原码为 175,392 字节；READBACK 还包含行填充与堆分配对齐。它复用已有求值、提交与完成证明，不新增模型调用或渲染线程等待。实机 GPU 拷贝耗时及帧时影响尚未测量。
+
+```powershell
+# 仅在另行授权并核实 PID／创建时间的实机窗口中执行。
+$taskRoiDirectory = [IO.Path]::GetFullPath((Join-Path $PWD 'tmp/mafia-same-frame-roi/indoor-001'))
+& $pythonPath -B ./tools/dev_control.py --pid 42 --process-created 123 `
+    inline-restore-roi $taskRoiDirectory
+& $pythonPath -B ./tools/dev_control.py --pid 42 --process-created 123 status
+```
+
+保持原室内机位、K 请求、HDR Proxy 和 NR On；采集合同固定为 3840×2160、legacy codec 2、RGBA16 UNORM、单 Pass Upscaled。三张颜色面 `original`／`post_resolve`／`post_restore` 的 ROI 为 `[1936,2088)×[1106,1154)`；`restore_blocks` 为块坐标 `[60,66)×[34,37)` 的真实 RGBA32F 统计。四份同名 `.raw` 共 175,392 字节，均为小端紧密行；`capture.meta.txt` 记录同次求值序号、recording、实际恢复参数与提交完成凭据。请求接收与最终落盘分开查看：用 `status` 中的 `state.inline_restore_roi` 跟踪结果，最终核对 `written`、侧车 `capture_valid=1`、四面齐全及 GPU 完成、输出写回、桥接回拷记录。失败或缺面不从下一帧补齐；连接结果不明时仍只查询原请求回执，不重复布防。请求设有 30 秒期限，并沿用已有提交完成检查的有界失败处理。
+
+后续分析先确认目标轮廓确实位于 `post_restore`，再用实际块统计按恢复 Shader 插值，比较恢复前后 RGB 扣减和跨门槛位置。当前诊断入口不改变恢复算法；只有同帧数据满足判据才能归因。该入口不新增 NR 开关、双 Pass 或 Present 对照要求。
+
+开发状态还包含输出 FPS 的来源、有效窗口、generation、FPS／MAD 及请求／观测倍率；无效或过期测量为 null。
+`adaptive_caches` 分开报告物理槽、逻辑尺寸、Feature 的 Create 容量与就绪状态。Python 客户端的
+`adaptive_feature_experiment(0|1|2|3)` 专用于默认关闭的容量实验，不是 INI 设置：分别请求关闭、已有容量复用、
+三槽上限容量、上限容量按需准备。模式 3 只准备控制器当前请求的候选；首次请求的冷 Create 仍在前台。
+请求只在 NR OFF、真实资源已释放且配置空闲时接受；实验取证应临时使用现有
+`NRDisableRelease=1` 和 `NRWorksetFreePolicy=0`，结束恢复原值。模式请求不等于实际准入，仍须检查槽、容量和 GPU 完成。
+
+`set` 一次提交一个现有 INI key 和 JSON 类型值。返回 `confirmation_required` 时默认停止；只有明确使用 `--confirm`，或阶段请求显式写入 `confirmation_required=true`，才将服务返回的完整 `identity` 和 `changes` 原样携带到新请求，由服务复核提案。服务复用菜单的配置缓存／持久化提交语义，受保护 runner 在退出时恢复原文件。不能把接口配置当作临时无副作用事务。`status` 遇到 `available=false` 且原因为 `runtime_busy`／`configuration_changed` 时，只在同一 deadline 内重试读取。连接失败或 `outcome_unknown` 后仅以 `status(query_id=<原请求ID>)` 查询 `receipt`，不会自动重放设置；deadline 内没有明确回执则抛出 `OutcomeUnknown`，可另用 `--query-id <原请求ID> status` 核查。
+
+collector 在每个 active 阶段先读状态，仅在 NR 关闭时请求 `NeuralUplift=true`，再设置 `NRHookPoint`（0 Upscaled／1 Render／2 Present）、所需 `NRPasses` 及第 2–4 层的 `NRPassNStage`（1 Render／2 Upscaled／3 Present，0 为继承）。依赖改动与危险阶段确认由服务生成提案，不在客户端复制菜单规则。接口模式的多层请求须提供从 Pass1 开始连续完整的 `expected_plan`；省略时为单层 Pass1。请求、实际 `changes` 和回执 `state.settings` 写入 `static-events.json`，随后仍等待当前完整计划和新序列的成功 `last_nr_evaluate`，才记录 `stage_observed`。赋值只提供配置证据，API 成功单独记为 API 证据；GPU 完成只读取 snapshot 的 `completion.current`，collector 不由配置或 API 成功推导 GPU 完成或图像质量。
+
+目标副本可进一步设置 `static_capture.stages`，按顺序自动执行三至四个阶段，免去外部脚本逐次写入 control 文件。例如：
+
+```json
+{
+  "dev_control": true,
+  "stages": [
+    {"label":"baseline","expected_stage":"Upscaled","expected_plan":{"1":"Upscaled"}},
+    {"label":"render","expected_stage":"Render","expected_plan":{"1":"Render"}},
+    {"label":"present","expected_stage":"Present","expected_plan":{"1":"Present"},"confirmation_required":true}
+  ]
+}
+```
+
+将这些字段合并进目标已有的 `static_capture` 预算对象；阶段 label 必须唯一。全部阶段观察完毕后自动进入 cleanup，请求 `NeuralUplift=false`，记录 `applied`／`unchanged` 回执及实际关闭状态。接口模式随后读取新的 status，要求 `settings.NeuralUplift=false`、来自真实 overlay 事件的 `overlay_open=false`，再等 cleanup 开始后新增 OFF 日志并采集截图，以 `API_OBSERVED_OVERLAY_CLOSED` 记录关板证据，无需外部写入手工完成文件。overlay 仍打开时持续等待至有界清理截止，不自动发送 Home 键。`disabled_resources_released` 单独记录，不由 OFF 或 API 回执推导 GPU 资源释放。父进程观察到采集脚本零码退出的完成门禁保留；非接口模式仍要求主代理观察画面后填写 overlay closed／`nr_off`。`static-control.json` 的手工阶段请求、取消与完成入口保留。少量菜单开关、确认框和 overlay 开关的实机 smoke 仍由主代理按当次授权验收。
+
+在已获授权的原受保护入口同时使用 `-TargetPath "$taskRoot/target.json" -CaptureHoldSeconds 600`。副本按原目标启动／载档预算加退出预留派生 `run_timeout`；启动120＋载档120＋采集600＋退出60秒时为900秒，原默认420秒不足。`static_capture` 专用字段记录本轮预算，collector 拒绝 Hold 与副本不一致或 overall 不足；从 ready 时间扣除已耗时间，以 Hold 减退出预留得到采证截止时间。候选、备份范围和输入／确认路线在启动前备齐，运行中只做约定阶段及进度核验，长日志和源码归因放到退出后；只安排本轮必要的三个阶段，有结果立即收尾。
+
+主代理原子写入本次 `static-control.json`，例如 `{"pid":42,"label":"render","expected_stage":"Render","expected_pass":1,"expected_plan":{"1":"Render","2":"Upscaled"},"confirmation_required":false}`（PID 取本次 ready，Pass 默认1）。等 `static-progress.json` 的 `state=awaiting_stage`、`pending_label=render` 后操作；需要确认的 UI 先实际完成确认，再在同一请求写 `confirmation_completed=true`。`expected_plan` 核对整个当前请求／有效计划；只指定 `expected_pass` 时仅核对该层，其他层不推导。Render＋Upscaled 的双层请求观察Pass1；同阶段双层周期日志常保留最后一层，Present双层应指定 `expected_pass=2`、两层Present及 `confirmation_required=true`。输入由主代理复用 `desktop.click(window,x,y,activate=False)`／`desktop.key(window,name,activate=False)`：window 来自已核对的本次 owner／ready，操作前检查取消／失败凭据和前台，坐标来自刚观察的原图，并把动作与观察时间写入本次 journal。现有 click 按下120ms、key 默认200ms，均在 finally 释放。旧的带 case 路径临时 action 脚本和一次 CUA 点击记录不能充当切换成功。collector 不自动点坐标；只有请求后的完整新增日志、超过请求前基线的序号、按首次观察区间核对的 age_ms，以及当前有效计划和成功 `last_nr_evaluate` 一致才记录 `stage_observed`。规划、旧 Evaluate、点击和未完成确认均不足；API 回执不提供 GPU 完成或视觉验收结论。
+
+已获授权的主代理动作可复用同一身份检查；下面的坐标和观察时间来自刚捕获的原图，完成点击后仍等待 collector 的实际阶段回执：
+
+```python
+run, window, _, _ = static_capture.context(run_directory, Path('tools/game-test/static_capture.py'))
+if any((run / name).exists() for name in ('capture-cancel.json', 'capture-failed.json')):
+    raise RuntimeError('Protected capture is stopping')
+progress = static_capture.read(run / 'static-progress.json')
+if progress['state'] != 'awaiting_stage' or progress['seconds_remaining'] <= 0:
+    raise RuntimeError('Static stage input window is closed')
+desktop.require_foreground(window, 'static input')
+started = stamp()
+desktop.click(window, observed_x, observed_y, activate=False)
+with (run / 'actions.jsonl').open('a', encoding='utf-8') as journal:
+    journal.write(json.dumps(dict(started=started, finished=stamp(), action='click',
+        observed_at=observed_at, x=observed_x, y=observed_y, stage_result='pending')) + '\n')
+```
+
+首次控制接管前的等待受总采证截止时间约束；600秒总采集、60秒退出预留时，初次请求须在 ready 后540秒前到达，已耗时间始终扣除。首个实际阶段请求到来后，每阶段执行和阶段成功后等待下一请求均限60秒；重复 control 不延长窗口。阶段无进展即记 `functionalOutcome=Blocked`，停止接受新阶段并进入最多60秒的清理窗口；总采证预算到期也如此，清理仍不得越过总600秒。正常完成时先写同 PID 的 `{"completed":true}` 请求清理，等 `state=cleanup` 后实际关闭面板、关闭 NR，再补 `overlay_closed=true,nr_off=true`。`overlay_closed` 是主代理对实际画面的确认，不由 Home 按键推断。collector 要求清理开始后新增且最新的 NR OFF 日志，并留一张 `addon-menu-cleanup.png`，才写完成凭据并零码退出；缺证、取消、失焦、身份变化和清理超时仍失败。`static-progress.json` 分别记录当前窗口和总采集预算余量；`static-complete.json` 保留 `Blocked`／`Observed`／`NotTested`，runner 的启动／退出成功不把 `Blocked` 变为功能通过。
+
 回归覆盖后台激活、最小化恢复、身份变化拒绝、失败门禁、脚本单次启动、完成与退出顺序及保护恢复。单测属于 MOCK／本地文件合同；独立 Windows 窗口探针验证前台 API 路径，IN_GAME／VISUAL 和长时稳定性另行验收。
 
 旧桌面选档曾依赖唯一时间戳、焦点和鼠标输入；默认脚本流程不再调用这段路径。游戏桥按存档文件名加载，并将游戏引擎状态与本地存档哈希分别记录。采集前的进程响应检查仍执行；它不替代画面、视觉效果或性能验收。
@@ -36,6 +118,13 @@ Windows 入口会在替换安装文件前，通过合成文件的最终句柄路
 
 ```powershell
 & $pythonPath -B -m unittest discover -s tools/game-test -p 'test_*.py' -v
+```
+
+只验证静态采集合同可使用独立 CPU／MOCK 入口；窗口 API、进程和输入均为替身：
+
+```powershell
+& $pythonPath -B -m unittest discover -s tools/game-test -p test_static_capture.py -v
+& $pythonPath -B -m unittest discover -s tests -p test_dev_control.py -v
 ```
 
 单测包含真实 Windows 文件共享锁检查和 mock 编排检查，不启动游戏。符号链接用例可能因系统权限跳过。
@@ -106,6 +195,19 @@ runner 与 wrapper 复用公共测试产物生命周期。结果写出后自动�
 & $pythonPath -B ./tools/game-test/hang_evidence.py `
     --process "$runDirectory/owned-process.json" --output "$runDirectory/hang-evidence-manual"
 ```
+
+启动异常需要在进程退出前预先附加。已获本轮采证授权时，可在所属进程文件出现后立即运行以下独立观察器；它重新核对 PID、创建时间和路径，最多观察180秒，在首个 `C00000FD` 或任意第二次机会异常暂停期间采集一次，再继续原异常并解除附加，不操作游戏输入或关闭游戏：
+
+```powershell
+& $pythonPath -B ./tools/game-test/startup_evidence.py `
+    --process "$runDirectory/owned-process.json" --output "$runDirectory/startup-evidence" `
+    --stop-file "$runDirectory/stop-startup-evidence.json" --timeout 180 --capture-timeout 20 `
+    --module-seeds "$runDirectory/module-seeds.json"
+```
+
+输出目录须为新目录，解释器和目标须为原生 Windows x64。可省略 `--module-seeds`；指定时文件为 JSON 数组，每项含 `module`（绝对路径或模块文件名）、`sha256`、`timestamp`、`size_of_image`、`rva`，数值可写十六进制字符串。只有磁盘 SHA256、磁盘及运行模块 PE 时间戳／映像大小均匹配才读取对应一页，绝对路径种子还要求运行路径一致。采集保存异常记录、对应线程 CONTEXT、完整虚拟内存元数据和非映像可执行分配的可读区域（含同一 AllocationBase 的区域头，原始页总计上限16MiB、每分配256KiB），并复用普通栈／模块转储。普通转储无 ExceptionStream，首发异常以侧车为准；AllocationBase 本身不标识分配者。
+
+`state.json` 的 `observing` 同时确认初始附加断点已处理且 `kill_on_exit=false`。无需继续观察时创建 stop 文件，等观察器退出并确认 `state=detached` 后再开始 UI 采集。附加会改变时序及异常派发；附加前退出、未出现目标异常、读取失败或预算截断均按实际状态记录，不视为复现通过。仅异常暂停期间读取页面，不改系统 WER。定向离线验证为 `python -B -m unittest discover -s tools/game-test -p test_startup_evidence.py -v`，包含一个自有无窗口 CPU 进程的真实附加、合成异常穿透和解除附加。
 
 连续录制自动核验各原帧哈希，生成不超过 1280×720 的 WebP 回看预览并核验解码帧数／时间间隔；保留预览、摘要、录制记录及首尾原图，自动释放其余原帧。转换失败则保留整段原帧及错误记录。预览只用于采样回看；原分辨率画质分析或完整原帧专项须在启动前显式 KEEP_RAW。
 

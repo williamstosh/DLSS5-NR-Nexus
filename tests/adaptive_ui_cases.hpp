@@ -258,6 +258,11 @@
       session.Prepare(settings, upper, floor, 42, output, now - 10'000'000'000, true, false);
       session.Request(minimum_reached ? session.ladder.count - 1 : 0, now - 10'000'000'000);
       session.Applied(session.status.generation, session.status.requested, now - 10'000'000'000);
+      // Complete owner readiness and bind the output before collecting stable samples.
+      const auto prepared_levels = static_cast<uint32_t>(session.ladder.count);
+      session.UpdatePreparation(session.preparation_epoch, prepared_levels, prepared_levels,
+          adaptive::Reason::PREPARING, now - 10'000'000'000);
+      session.Prepare(settings, upper, floor, 42, output, now - 10'000'000'000, true, false);
       for (uint64_t sample = 0; sample < 5; ++sample) {
         session.ObserveGpu({.generation = session.status.generation, .frame = sample + 1, .sequence = sample + 1,
             .recorded_ns = now - 1'500'000'000 + static_cast<int64_t>(sample) * 250'000'000,

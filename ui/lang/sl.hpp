@@ -2336,6 +2336,10 @@ inline constexpr Translation kSl[] = {
     {"Enter the target output frame rate directly (30-360). Press Enter to apply.", "Neposredno vnesite ciljno izhodno hitrost sličic (30–360). Za uveljavitev pritisnite Enter."},
     {"Adaptive resolution controls the current size. Turn it off to edit the saved manual upper limit.", "Prilagodljiva ločljivost upravlja trenutno velikost. Za urejanje shranjene ročne zgornje meje jo izklopite."},
     {"Saved manual upper limit: %s", "Shranjena ročna zgornja meja: %s"},
+    {"Resolution levels", "Število ravni ločljivosti"},
+    {"Default (by capacity)", "Privzeto (glede na zmogljivost)"},
+    {"Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.", "Najprej se pripravijo izbrane ravni. Več ravni porabi več pomnilnika in omogoča manjše korake. Priprava lahko povzroči kratek zastoj."},
+    {"No working-resolution range to adjust", "Ni razpona delovne ločljivosti za prilagajanje"},
 };
 
 }  // namespace renodx::addons::dlss5::ui::lang

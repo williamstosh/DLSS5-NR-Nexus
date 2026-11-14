@@ -1399,6 +1399,11 @@ inline bool RunBridge(ID3D11DeviceContext* context,
   bool touched = false;
   bool issued = false;
   bool independent_present_pair = false;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  NrRecording inline_restore_recording;
+  uint64_t inline_restore_submission = 0;
+  bool inline_restore_submitted = false;
+#endif
   const auto name = [&named](NrDeclineReason reason) {
     CountNrDecline(reason);
     named = true;
@@ -1654,8 +1659,17 @@ inline bool RunBridge(ID3D11DeviceContext* context,
         at_present.output_state = nr_twin_state;
         at_present.d3d11_bridge = true;
         at_present.independent_resolution_pair = independent_present_pair;
+#if defined(NR_NEXUS_DEV_CONTROL)
+        const bool capture_inline_restore = present == nullptr && !plan.mixed
+            && screenshot::internal::inline_restore_active.load(std::memory_order_acquire);
+        completed = ProcessInline(slot.list, handle, &view, &touched,
+                                  present != nullptr ? &at_present : nullptr,
+                                  (capture_inline_restore ? &inline_restore_recording : nullptr),
+                                  false, capture_inline_restore);
+#else
         completed = ProcessInline(slot.list, handle, &view, &touched,
                                   present != nullptr ? &at_present : nullptr);
+#endif
       }
       RecordInjectionCpu(started_ns);
       Transition(slot.list, nr_twin, nr_twin_state, D3D12_RESOURCE_STATE_COMMON);
@@ -1763,11 +1777,22 @@ inline bool RunBridge(ID3D11DeviceContext* context,
       bridge_waits.fetch_add(1, std::memory_order_relaxed);
       ID3D12CommandList* const lists[] = {slot.list};
       bridge.queue->ExecuteCommandLists(1, lists);
+#if defined(NR_NEXUS_DEV_CONTROL)
+      if (inline_restore_recording.inline_restore_serial != 0) {
+        screenshot::PreserveStageSubmissionProofs();
+      }
+#endif
       issued = true;
       bridge_submits.fetch_add(1, std::memory_order_relaxed);
       submitted = SUCCEEDED(bridge.queue->Signal(bridge.fence_out12, value))
                   && SUCCEEDED(bridge.queue->Signal(bridge.fence_done12, value));
     }
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (inline_restore_recording.inline_restore_serial != 0) {
+      inline_restore_submission = value;
+      inline_restore_submitted = submitted;
+    }
+#endif
     slot.value = value;
     set->last_value = value;
     bridge_submitted_value.store(value, std::memory_order_release);
@@ -1849,6 +1874,13 @@ inline bool RunBridge(ID3D11DeviceContext* context,
       cpu.return_ns += SteadyNowNs() - cpu_start;
     }
   });
+#if defined(NR_NEXUS_DEV_CONTROL)
+  screenshot::SealInlineRestoreBridge(inline_restore_recording.inline_restore_serial,
+      completed && inline_restore_recording.output_ready && inline_restore_recording.group_complete
+          && inline_restore_recording.model_evaluate_mask == 1 && inline_restore_recording.model_pass_mask == 1
+          && inline_restore_recording.model_reset_mask == 0,
+      inline_restore_submission, inline_restore_submitted, delivered);
+#endif
   if (independent_present_pair && !delivered) {
     const BridgeDeviceLock device_lock(context);
     RuntimeLock lock(runtime_mutex);
