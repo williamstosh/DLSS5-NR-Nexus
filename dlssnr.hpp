@@ -8785,6 +8785,10 @@ inline void BindCodec(
   command_list->SetPipelineState(pipeline);
   const D3D12_GPU_DESCRIPTOR_HANDLE heap_start =
       resources.descriptors->GetGPUDescriptorHandleForHeapStart();
+  // The shared root signature can retain ControlMask's depth table from
+  // another workset. Rebind it whenever this codec selects its own heap.
+  command_list->SetComputeRootDescriptorTable(
+      3, DescriptorHeapSlot(heap_start, kDescriptorControlMaskDepthNullSrv, resources.descriptor_size));
   command_list->SetComputeRootDescriptorTable(
       4, DescriptorHeapSlot(heap_start, kDescriptorControlMaskMotionNullSrv, resources.descriptor_size));
   command_list->SetComputeRootDescriptorTable(
