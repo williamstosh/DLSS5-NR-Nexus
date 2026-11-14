@@ -339,8 +339,8 @@ void RunBorrowedCore(Gpu& gpu, bool hardware, bool second_adapter) {
     addon::stack_passes = 2;
     Check(!addon::EnsureDirectRuntime(gpu.list.Get()), "stack cannot borrow P0 context");
     addon::stack_passes = 1;
-    if (second_adapter) {
-      Gpu other(!hardware);
+    if (second_adapter && hardware) {
+      Gpu other(false);
       Check(other.device.Get() != gpu.device.Get(), "distinct adapter device");
       Check(!addon::EnsureDirectRuntime(other.list.Get()), "SR credential cannot lend another device");
       {
@@ -349,6 +349,8 @@ void RunBorrowedCore(Gpu& gpu, bool hardware, bool second_adapter) {
         Check(addon::EnsureDirectRuntime(other.list.Get()), "device change adopts only nested successful SR face");
       }
       Check(addon::EnsureDirectRuntime(gpu.list.Get()), "outer credential restored after device change");
+    } else if (second_adapter) {
+      std::cout << "CASE location=borrowed-core-device-change evidence=NOT_RUN recovery=requires-explicit-hardware-case\n";
     }
     addon::FeatureState state;
     addon::FinalResources resources;
@@ -1613,9 +1615,10 @@ void RunInline(Gpu& gpu, bool hardware, bool safety) {
   Check(!addon::ServicePendingTeardown() && !addon::Shutdown(false)
             && addon::worksets.contains(key), "all teardown entries retain completed replayable list");
   // D3D12CreateDevice may return the existing device on the same adapter.
-  // Use the other already-supported adapter to obtain a distinct generation.
+  // Only the explicit hardware case may use WARP as a distinct second adapter.
+  // A software-only case must never create a hardware device for recovery.
   std::unique_ptr<Gpu> recovery_gpu;
-  if (safety) recovery_gpu = std::make_unique<Gpu>(!hardware);
+  if (safety && hardware) recovery_gpu = std::make_unique<Gpu>(false);
   if (recovery_gpu != nullptr) {
   auto& recovered = *recovery_gpu;
   Check(recovered.device.Get() != gpu.device.Get(), "recovery uses a genuinely distinct device");
@@ -1695,7 +1698,7 @@ void RunInline(Gpu& gpu, bool hardware, bool safety) {
     submission::OnCommandListReset(gpu.list.Get());
     addon::teardown_pending = false;
     addon::teardown_other_device_waiting = false;
-    std::cout << "CASE location=device-removal evidence=NOT_RUN recovery=requires-explicit-safety-case-and-second-adapter\n";
+    std::cout << "CASE location=device-removal evidence=NOT_RUN recovery=requires-explicit-hardware-safety-case\n";
   }
   Check(DetourTransactionBegin() == NO_ERROR && DetourUpdateThread(GetCurrentThread()) == NO_ERROR
             && DetourDetach(reinterpret_cast<PVOID*>(&real_dispatch), reinterpret_cast<PVOID>(ObserveDispatch)) == NO_ERROR
