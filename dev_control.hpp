@@ -32,7 +32,8 @@ inline Json Identity() {
   comparison_ui::CaptureSettings(&identity);
   return {{"configuration_generation", identity.configuration_generation}, {"config_epoch", identity.config_epoch},
       {"settings_hash", identity.settings_hash}, {"resolution_hash", identity.resolution_hash},
-      {"route", identity.route}, {"fg", identity.fg}};
+      {"route", identity.route}, {"fg", identity.fg},
+      {"experiments", {{"adaptive_feature_mode", static_cast<uint32_t>(adaptive_feature_mode.load())}}}};
 }
 
 inline Json Snapshot() {
@@ -105,6 +106,30 @@ inline Json Snapshot() {
       sizes[name].push_back({{"pass", pass + 1}, {"width", (*values)[pass].width}, {"height", (*values)[pass].height}});
     }
   }
+  const auto output = output_framerate::Read(now);
+  Json caches = Json::array();
+  for (const auto& [handle, feature] : features) {
+    const auto& cache = feature.adaptive_cache;
+    if (cache == nullptr) continue;
+    Json slots = Json::array();
+    for (size_t index = 0; index < cache->count; ++index) {
+      const auto& tier = cache->tiers[index];
+      const auto& current = (index == cache->active ? feature : tier.state);
+      Json models = Json::array();
+      for (uint32_t pass = 0; pass < kMaxNrPasses; ++pass) {
+        const auto& model = current.slots[pass];
+        if (model.handle == nullptr) continue;
+        models.push_back({{"pass", pass + 1}, {"handle", reinterpret_cast<uintptr_t>(model.handle)},
+            {"parameters", reinterpret_cast<uintptr_t>(model.parameters)},
+            {"create_input", {model.create_input_width, model.create_input_height}},
+            {"create_output", {model.create_output_width, model.create_output_height}}});
+      }
+      slots.push_back({{"slot", index}, {"active", index == cache->active}, {"ready", tier.ready},
+          {"logical_size", {current.input_width, current.input_height}}, {"models", std::move(models)}});
+    }
+    caches.push_back({{"source_handle", reinterpret_cast<uintptr_t>(handle)}, {"physical_slot_count", cache->count},
+        {"active_slot", cache->active}, {"slots", std::move(slots)}});
+  }
   if (identity != Identity()) {
     state["reason"] = "configuration_changed";
     return state;
@@ -113,13 +138,31 @@ inline Json Snapshot() {
       {"settings", std::move(settings)}, {"configuration_generation", identity["configuration_generation"]},
       {"config_epoch", identity["config_epoch"]}, {"presents", presents_observed.load()},
       {"successful_source_frames", SourceSuccessfulEvaluations()},
+      {"nr_features_created", nr_features_created},
+      {"experiments", {{"adaptive_feature_mode", identity["experiments"]["adaptive_feature_mode"]},
+          {"evidence", "requested_mode_not_activation"}}},
+      {"adaptive_caches", std::move(caches)},
+      {"output_framerate", {{"available", output.available}, {"reason", output_framerate::ReasonText(output.reason)},
+          {"source", output_framerate::SourceText(output.source)}, {"source_generation", output.source_generation},
+          {"configuration_generation", output.configuration_generation}, {"window_serial", output.window_serial},
+          {"window_begin_ns", output.window_begin_ns}, {"window_end_ns", output.window_end_ns},
+          {"fps", output.available ? Json(output.fps) : Json(nullptr)},
+          {"fps_mad", output.available ? Json(output.fps_mad) : Json(nullptr)},
+          {"requested_multiplier", output.requested_multiplier != 0 ? Json(output.requested_multiplier) : Json(nullptr)},
+          {"observed_multiplier", output.available && output.observed_multiplier > 0. ? Json(output.observed_multiplier) : Json(nullptr)}}},
       {"disabled_resources_released", disabled_resources_released.load()}, {"overlay_open", hud_overlay_open.load()},
       {"plan", {{"valid", plan.valid}, {"reason", stage_plan::ReasonText(plan.reason)}, {"passes", std::move(passes)}}},
       {"stages", std::move(stages)}, {"resolved_masks", std::move(masks)},
       {"adaptive", {{"reason", adaptive_resolution::ReasonText(adaptive.reason)}, {"generation", adaptive.generation},
           {"coefficient", adaptive.coefficient}, {"ready_levels", adaptive.ready_levels},
           {"prepared_levels", adaptive.prepared_levels}, {"upper", sizes["upper"]},
-          {"requested", sizes["requested"]}, {"applied", sizes["applied"]}}}});
+          {"requested", sizes["requested"]}, {"applied", sizes["applied"]},
+          {"output_fps", output.available && adaptive.output_fps > 0. ? Json(adaptive.output_fps) : Json(nullptr)},
+          {"gpu_ms", adaptive.gpu_ms > 0. ? Json(adaptive.gpu_ms) : Json(nullptr)},
+          {"measurement_scope", "last_controller_observation"},
+          {"preparation_cpu_ms", adaptive.preparation_cpu_ms},
+          {"preparation_vram_delta_bytes", adaptive.preparation_vram_delta_bytes},
+          {"peak_process_vram_bytes", adaptive.peak_process_vram_bytes}}}});
   return state;
 }
 
@@ -142,7 +185,9 @@ inline Json Execute(const Json& request) {
         {"receipt", request.contains("query_id") && last_request.is_object()
                 && request["query_id"] == last_request["id"] ? last_receipt : Json(nullptr)}};
   }
-  if (*operation != "set") return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "invalid_operation"}};
+  if (*operation != "set" && *operation != "adaptive_feature_experiment") {
+    return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "invalid_operation"}};
+  }
   if (last_request.is_object() && last_request["id"] == *id) {
     if (request == last_request) return last_receipt;
     return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "request_id_reused"}};
@@ -158,6 +203,37 @@ inline Json Execute(const Json& request) {
         + " status=" + response["status"].get<std::string>() + " reason=" + response["reason"].get<std::string>());
     return response;
   };
+  const bool configuration_busy = shutting_down.load() || slider_pending != nullptr || stage_edit::pending || resolution_edit::pending
+      || stage_edit_request.setting != nullptr || !resolution_edit_request.empty() || profile_ui::Busy()
+      || profile_ui::pending_action != profile_ui::Action::NONE || preset_ui::manager_geometry.was_open;
+  if (*operation == "adaptive_feature_experiment") {
+    response["reason"] = "invalid_mode";
+    const auto mode = request.find("mode");
+    if (mode == request.end() || !mode->is_number_integer() || *mode < 0 || *mode > 2) return finish();
+    response["requested"] = {{"mode", *mode}};
+    if (configuration_busy) {
+      response["reason"] = "configuration_busy";
+      return finish();
+    }
+    {
+      RuntimeTryLock runtime_lock(runtime_mutex);
+      if (!runtime_lock.owns_lock()) {
+        response["reason"] = "runtime_busy";
+      } else if (enabled.load()) {
+        response["reason"] = "nr_running";
+      } else if (!disabled_resources_released.load()) {
+        response["reason"] = "resources_not_released";
+      } else {
+        const auto requested = static_cast<AdaptiveFeatureMode>(mode->get<uint32_t>());
+        const bool unchanged = adaptive_feature_mode.load() == requested;
+        adaptive_feature_mode.store(requested);
+        response["ok"] = true;
+        response["status"] = unchanged ? "unchanged" : "applied";
+        response["reason"] = "experiment_requested";
+      }
+    }
+    return finish();
+  }
   if (!request.contains("key") || !request["key"].is_string() || !request.contains("value")) return finish();
   const auto key = request["key"].get<std::string>();
   const auto& value = request["value"];
@@ -169,9 +245,7 @@ inline Json Execute(const Json& request) {
     response["reason"] = "invalid_value";
     return finish();
   }
-  if (shutting_down.load() || slider_pending != nullptr || stage_edit::pending || resolution_edit::pending
-      || stage_edit_request.setting != nullptr || !resolution_edit_request.empty() || profile_ui::Busy()
-      || profile_ui::pending_action != profile_ui::Action::NONE || preset_ui::manager_geometry.was_open) {
+  if (configuration_busy) {
     response["reason"] = "configuration_busy";
     return finish();
   }

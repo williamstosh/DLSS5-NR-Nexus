@@ -66,6 +66,46 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(confirmed['confirm'], dict(identity=response(initial)['identity'], changes={'NRPasses': 2}))
         self.assertEqual(self.transport.deadlines[-2], self.transport.deadlines[-1])
 
+    def test_adaptive_feature_experiment_has_a_dedicated_integer_request_and_shared_deadline(self):
+        client = self.client()
+        deadline = time.monotonic() + 1
+        for mode in (0, 1, 2):
+            actual = client.adaptive_feature_experiment(mode, deadline=deadline)
+            request = self.transport.requests[-1]
+            self.assertEqual(request['op'], 'adaptive_feature_experiment')
+            self.assertEqual(request['mode'], mode)
+            self.assertEqual(actual['id'], request['id'])
+            self.assertNotIn('key', request)
+            self.assertNotIn('confirm', request)
+        self.assertEqual(self.transport.deadlines, [deadline] * 3)
+        self.assertEqual(len({request['id'] for request in self.transport.requests}), 3)
+
+    def test_adaptive_feature_experiment_rejects_invalid_modes_without_transport(self):
+        client = self.client()
+        for mode in (True, False, -1, 3, 1.0, '2', None):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                client.adaptive_feature_experiment(mode)
+        self.assertEqual(self.transport.requests, [])
+
+    def test_lost_experiment_receipt_is_queried_without_replaying_the_operation(self):
+        original = {}
+        def action(request):
+            if request['op'] == 'adaptive_feature_experiment':
+                original.update(request)
+                raise OSError('synthetic experiment response disconnect')
+            result = response(request)
+            result['state']['experiments'] = dict(adaptive_feature_mode=2, evidence='requested_mode_not_activation')
+            result['receipt'] = response(original)
+            result['receipt']['state']['experiments'] = result['state']['experiments']
+            return result
+        client = self.client(action)
+        actual = client.adaptive_feature_experiment(2)
+        self.assertEqual(actual['id'], original['id'])
+        self.assertEqual(actual['state']['experiments']['adaptive_feature_mode'], 2)
+        self.assertEqual([request['op'] for request in self.transport.requests], ['adaptive_feature_experiment', 'status'])
+        self.assertEqual(self.transport.requests[1]['query_id'], original['id'])
+        self.assertEqual(self.transport.deadlines[0], self.transport.deadlines[1])
+
     def test_transport_failure_queries_receipt_without_replaying_mutation(self):
         original = {}
         def action(request):

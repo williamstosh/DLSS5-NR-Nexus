@@ -29,6 +29,12 @@
 & $pythonPath -B ./tools/dev_control.py --pid 42 --process-created 123 set NRHookPoint 1
 ```
 
+开发状态还包含输出 FPS 的来源、有效窗口、generation、FPS／MAD 及请求／观测倍率；无效或过期测量为 null。
+`adaptive_caches` 分开报告物理槽、逻辑尺寸、Feature 的 Create 容量与就绪状态。Python 客户端的
+`adaptive_feature_experiment(0|1|2)` 专用于默认关闭的容量实验，不是 INI 设置：分别请求关闭、已有容量复用、
+三槽上限容量。请求只在 NR OFF、真实资源已释放且配置空闲时接受；实验取证应临时使用现有
+`NRDisableRelease=1` 和 `NRWorksetFreePolicy=0`，结束恢复原值。模式请求不等于实际准入，仍须检查槽、容量和 GPU 完成。
+
 `set` 一次提交一个现有 INI key 和 JSON 类型值。返回 `confirmation_required` 时默认停止；只有明确使用 `--confirm`，或阶段请求显式写入 `confirmation_required=true`，才将服务返回的完整 `identity` 和 `changes` 原样携带到新请求，由服务复核提案。服务复用菜单的配置缓存／持久化提交语义，受保护 runner 在退出时恢复原文件。不能把接口配置当作临时无副作用事务。`status` 遇到 `available=false` 且原因为 `runtime_busy`／`configuration_changed` 时，只在同一 deadline 内重试读取。连接失败或 `outcome_unknown` 后仅以 `status(query_id=<原请求ID>)` 查询 `receipt`，不会自动重放设置；deadline 内没有明确回执则抛出 `OutcomeUnknown`，可另用 `--query-id <原请求ID> status` 核查。
 
 collector 在每个 active 阶段先读状态，仅在 NR 关闭时请求 `NeuralUplift=true`，再设置 `NRHookPoint`（0 Upscaled／1 Render／2 Present）、所需 `NRPasses` 及第 2–4 层的 `NRPassNStage`（1 Render／2 Upscaled／3 Present，0 为继承）。依赖改动与危险阶段确认由服务生成提案，不在客户端复制菜单规则。接口模式的多层请求须提供从 Pass1 开始连续完整的 `expected_plan`；省略时为单层 Pass1。请求、实际 `changes` 和回执 `state.settings` 写入 `static-events.json`，随后仍等待当前完整计划和新序列的成功 `last_nr_evaluate`，才记录 `stage_observed`。赋值只提供配置证据，API 成功单独记为 API 证据；GPU 完成只读取 snapshot 的 `completion.current`，collector 不由配置或 API 成功推导 GPU 完成或图像质量。

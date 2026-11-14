@@ -76,6 +76,62 @@
   check(status["state"]["stages"][1]["last_evaluate"]["api_returned"]
           && !status["state"]["stages"][1]["completion"]["current"].get<bool>(),
       "successful Evaluate API observation remains separate from GPU completion");
+  check(status["state"]["experiments"]["adaptive_feature_mode"] == 0
+          && status["identity"]["experiments"]["adaptive_feature_mode"] == 0
+          && status["state"]["experiments"]["evidence"] == "requested_mode_not_activation"
+          && status["state"]["adaptive_caches"].is_array(),
+      "the experiment defaults to OFF and reports its request separately from execution");
+  namespace rate = renodx::addons::dlss5::output_framerate;
+  namespace adaptive = renodx::addons::dlss5::adaptive_resolution;
+  rate::Stream saved_output;
+  const auto saved_adaptive = runtime::CopyAdaptiveStatus();
+  {
+    std::unique_lock lock(rate::internal::state.mutex);
+    saved_output = rate::internal::state.stream;
+    rate::internal::state.stream = {};
+  }
+  status = control::Snapshot();
+  check(!status["output_framerate"]["available"].get<bool>() && status["output_framerate"]["fps"].is_null()
+          && status["output_framerate"]["fps_mad"].is_null() && status["output_framerate"]["observed_multiplier"].is_null(),
+      "an unavailable output source cannot publish valid frame rate or observed multiplier values");
+  const auto sampled_ns = runtime::SteadyNowNs();
+  {
+    std::unique_lock lock(rate::internal::state.mutex);
+    auto& stream = rate::internal::state.stream;
+    stream.previous_ns = sampled_ns;
+    stream.snapshot = {.available = true, .reason = rate::Reason::kREADY, .source = rate::Source::XEFG_STATUS,
+        .source_generation = 9, .configuration_generation = 11, .window_serial = 4,
+        .window_begin_ns = sampled_ns - 2'000'000'000, .window_end_ns = sampled_ns,
+        .fps = 144., .fps_mad = 2., .requested_multiplier = 4, .observed_multiplier = 3.6};
+  }
+  runtime::PublishAdaptiveStatus({.reason = adaptive::Reason::OBSERVING,
+      .generation = 7, .output_fps = 144., .gpu_ms = 2., .prepared_levels = 3,
+      .preparation_cpu_ms = 5., .preparation_vram_delta_bytes = 4096, .peak_process_vram_bytes = 8192});
+  status = control::Snapshot();
+  check(status["output_framerate"]["available"] && status["output_framerate"]["source"] == rate::SourceText(rate::Source::XEFG_STATUS)
+          && status["output_framerate"]["source_generation"] == 9 && status["output_framerate"]["configuration_generation"] == 11
+          && status["output_framerate"]["window_serial"] == 4 && status["output_framerate"]["window_end_ns"] == sampled_ns
+          && status["output_framerate"]["fps"] == 144. && status["output_framerate"]["fps_mad"] == 2.
+          && status["output_framerate"]["requested_multiplier"] == 4 && status["output_framerate"]["observed_multiplier"] == 3.6,
+      "status carries the synthetic SDK observation identity, complete window and separate multiplier values");
+  check(status["adaptive"]["output_fps"] == 144. && status["adaptive"]["gpu_ms"] == 2.
+          && status["adaptive"]["measurement_scope"] == "last_controller_observation"
+          && status["adaptive"]["preparation_cpu_ms"] == 5. && status["adaptive"]["preparation_vram_delta_bytes"] == 4096
+          && status["adaptive"]["peak_process_vram_bytes"] == 8192,
+      "controller observations and preparation counters remain distinct from current GPU completion proof");
+  {
+    std::unique_lock lock(rate::internal::state.mutex);
+    rate::internal::state.stream.previous_ns = sampled_ns - rate::Stream::STALE_NS - 1;
+  }
+  status = control::Snapshot();
+  check(!status["output_framerate"]["available"].get<bool>() && status["output_framerate"]["fps"].is_null()
+          && status["output_framerate"]["fps_mad"].is_null() && status["adaptive"]["output_fps"].is_null(),
+      "stale SDK observations keep their source metadata but do not expose a valid current FPS");
+  {
+    std::unique_lock lock(rate::internal::state.mutex);
+    rate::internal::state.stream = saved_output;
+  }
+  runtime::PublishAdaptiveStatus(saved_adaptive);
   check(set("EnableHooks", 0)["reason"] == "invalid_setting", "startup hook policy stays outside the control whitelist");
   check(set("NRHookPoint", 3)["reason"] == "invalid_value", "invalid hook is rejected before mutation");
   check(set("NeuralUplift", 1)["reason"] == "invalid_value", "booleans require JSON booleans");
@@ -147,6 +203,50 @@
   check(set("NeuralUplift", true)["ok"] && runtime::enabled && runtime::configuration_generation == before_off + 1,
       "NR re-enable retains production failure-latch reset and recreation");
   check(set("NeuralUplift", false)["ok"], "the offline fixture finishes with NR disabled");
+  const auto experiment = [&](Json mode) {
+    return control::Execute({{"id", "experiment-" + std::to_string(++serial)},
+        {"op", "adaptive_feature_experiment"}, {"mode", std::move(mode)}});
+  };
+  const auto experiment_writes = configuration_writes;
+  const auto experiment_generation = runtime::configuration_generation.load();
+  const auto experiment_features = runtime::nr_features_created;
+  check(experiment(true)["reason"] == "invalid_mode" && experiment(2.0)["reason"] == "invalid_mode"
+          && experiment(-1)["reason"] == "invalid_mode" && experiment(3)["reason"] == "invalid_mode",
+      "experimental mode accepts only the integer values zero, one and two");
+  const bool released_before = runtime::disabled_resources_released.load();
+  runtime::disabled_resources_released = false;
+  check(experiment(2)["reason"] == "resources_not_released", "NR OFF alone does not prove its old resources are released");
+  // This fixture has no GPU resources; the release proof is explicitly mocked.
+  runtime::disabled_resources_released = true;
+  runtime::enabled = true;
+  check(experiment(2)["reason"] == "nr_running", "a running NR chain cannot change the experimental mode");
+  runtime::enabled = false;
+  runtime::slider_pending = &runtime::kSetAdaptiveTargetFps;
+  check(experiment(2)["reason"] == "configuration_busy", "another configuration edit owns the experiment admission boundary");
+  runtime::slider_pending = nullptr;
+  check(runtime::adaptive_feature_mode.load() == runtime::AdaptiveFeatureMode::OFF,
+      "rejected experiment requests leave the mode disabled");
+  const Json experiment_request{{"id", "experiment-idempotent"}, {"op", "adaptive_feature_experiment"}, {"mode", 2}};
+  const auto experimental = control::Execute(experiment_request);
+  check(experimental["ok"] && experimental["state"]["available"]
+          && experimental["state"]["experiments"]["adaptive_feature_mode"] == 2
+          && runtime::adaptive_feature_mode.load() == runtime::AdaptiveFeatureMode::UPPER_CAPACITY,
+      "an admitted experiment request reads back after releasing the nonrecursive runtime lock");
+  check(control::Execute(experiment_request) == experimental,
+      "same-id experimental replay returns its original receipt without another mutation");
+  status = control::Execute({{"id", "query-experiment"}, {"op", "status"}, {"query_id", "experiment-idempotent"}});
+  check(status["receipt"] == experimental, "the dedicated experiment operation uses the existing receipt lookup");
+  auto reused_experiment = experiment_request;
+  reused_experiment["mode"] = 1;
+  check(control::Execute(reused_experiment)["reason"] == "request_id_reused", "a reused experimental id cannot change its requested mode");
+  check(experiment(1)["ok"] && runtime::adaptive_feature_mode.load() == runtime::AdaptiveFeatureMode::RETAIN
+          && experiment(0)["ok"] && runtime::adaptive_feature_mode.load() == runtime::AdaptiveFeatureMode::OFF
+          && experiment(0)["status"] == "unchanged",
+      "the dedicated operation supports RETAIN and returns to OFF without activation claims");
+  check(configuration_writes == experiment_writes && runtime::configuration_generation == experiment_generation
+          && runtime::nr_features_created == experiment_features,
+      "experiment requests write no INI settings, recreate no features and leave ordinary configuration generation unchanged");
+  runtime::disabled_resources_released = released_before;
   Json receipt{{"scope", "CPU production configuration and status adapters with synthetic ReShade cache; no GPU, NGX or game"},
       {"checks", checks}, {"configuration_writes", configuration_writes}, {"final", control::Snapshot()}};
   std::ofstream("dev-control-runtime.json") << receipt.dump(2);
