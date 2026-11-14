@@ -769,6 +769,96 @@ int Run() {
         "Off releases both selected-role reservations after the larger collection");
     std::cout << "ADAPTIVE_SELECTED evidence=WARP+MOCK levels=5 roles=2 Passes=2 Features=20 selected_worksets=10 ordinary_limit=4 steady_allocations=0 native_NGX=not_run\n";
 
+    {
+      native::fg_service::Slot* last_slot = nullptr;
+      for (auto& candidate : many.slots) {
+        if (candidate.list != nullptr && candidate.fence_value == many.submitted) {
+          last_slot = &candidate;
+        }
+      }
+      Check(last_slot != nullptr && last_slot->color[0] != nullptr
+          && many.fence->GetCompletedValue() != UINT64_MAX && many.fence->GetCompletedValue() >= many.submitted,
+          "the final real Service slot completed on its healthy private Fence");
+      const auto service_recording = addon::submission::ObserveRecording(last_slot->list);
+      Check(service_recording->submitted.load() && !service_recording->closed.load()
+          && native::TeardownProof() == addon::submission::RecordedWork::kReplayable,
+          "completed private Service recording remains replayable before Off without another Service or Resize");
+
+      // A separate host recording really reads the service color on the GPU.
+      // Its owner keeps replay eligibility after the completion Fence.
+      auto* retained_color = last_slot->color[0];
+      auto* retained_root = native::codec_pipeline.root_signature;
+      auto readback = gpu.CreateTextureTransfer(retained_color);
+      addon::submission::TrackUse(gpu.list.Get(), retained_color);
+      addon::submission::TrackUse(gpu.list.Get(), retained_root);
+      gpu.Transition(retained_color, NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      gpu.RecordTextureReadback(retained_color, readback);
+      gpu.Transition(retained_color, D3D12_RESOURCE_STATE_COPY_SOURCE, NATIVE_INPUT_STATE);
+      const auto host_recording = addon::submission::ObserveRecording(gpu.list.Get());
+      Check(SUCCEEDED(gpu.list->Close()), "external replayable host recording close");
+      ID3D12CommandList* lists[]{gpu.list.Get()};
+      gpu.queue->ExecuteCommandLists(1, lists);
+      gpu.submission_pending = true;
+      Check(SUCCEEDED(gpu.queue->Signal(gpu.fence.Get(), ++gpu.serial)), "external host completion signal");
+      HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+      Check(event != nullptr, "external host completion event");
+      const auto signal = gpu.fence->SetEventOnCompletion(gpu.serial, event);
+      const auto wait = (SUCCEEDED(signal) ? WaitForSingleObject(event, 10000) : WAIT_FAILED);
+      CloseHandle(event);
+      Check(wait == WAIT_OBJECT_0 && gpu.fence->GetCompletedValue() != UINT64_MAX
+          && gpu.fence->GetCompletedValue() >= gpu.serial && SUCCEEDED(gpu.device->GetDeviceRemovedReason()),
+          "external host GPU read finishes without closing its replayable generation");
+      gpu.submission_pending = false;
+      Check(host_recording->submitted.load() && !host_recording->closed.load(),
+          "the external recording is independently submitted and replayable");
+
+      native::hook_point = native::kHookUpscaled;
+      native::enabled = false;
+      native::disable_release_mode = 1;
+      native::workset_free_policy = 0;
+      native::disabled_resources_released = false;
+      native::shutdown_quiesce_latched = false;
+      native::ServiceDisabledNr();
+      Check(service_recording->closed.load() && !host_recording->closed.load()
+          && native::fg_service::streams.empty() && !native::disabled_resources_released.load()
+          && native::TeardownProof() == addon::submission::RecordedWork::kReplayable
+          && native::codec_pipeline.root_signature == retained_root
+          && !addon::submission::ResourceReleasable(retained_color),
+          "Off retires only the addon-owned XeFG pool while the external recording still blocks full release");
+      native::DrainRetiredResources(true);
+      native::ServiceDisabledNr();
+      Check(!native::disabled_resources_released.load() && !native::present_retired.empty()
+          && !host_recording->closed.load(),
+          "remaining Present retirement cannot be mistaken for the never-engaged empty shortcut");
+      Check(SUCCEEDED(gpu.allocator->Reset()) && SUCCEEDED(gpu.list->Reset(gpu.allocator.Get(), nullptr)),
+          "only the host's legitimate Reset ends its external recording");
+      addon::submission::OnCommandListReset(gpu.list.Get());
+      addon::submission::PruneCompletedGenerations();
+      native::ServiceDisabledNr();
+      Check(host_recording->closed.load() && native::disabled_resources_released.load()
+          && native::worksets.empty() && native::retired_final_resources.empty()
+          && native::retired_nr_features.empty() && native::present_retired.empty()
+          && native::active_features.load() == 0 && native::codec_pipeline.root_signature == nullptr,
+          "Off releases the completed resource set only after every external recording is closed");
+
+      // The old pool is destroyed. New COM objects may reuse its addresses;
+      // live-object Close/Reset checks start again at this lifetime boundary.
+      list_calls.clear();
+      native::enabled = true;
+      native::hook_point = native::kHookPresent;
+      native::ServiceDisabledNr();
+      Check(!native::disabled_resources_released.load(), "re-enable re-arms normal resource creation");
+      bool resumed = false;
+      for (uint32_t frame = 0; frame < native::kContractDebounceFrames + 8 && !resumed; ++frame) {
+        resumed = service() == fg::Result::SUBMITTED;
+      }
+      Check(resumed, "the real Service can create fresh models and submit again after complete Off retirement");
+      native::enabled = false;
+      native::ServiceDisabledNr();
+      Check(native::disabled_resources_released.load() && native::fg_service::streams.empty()
+          && native::present_retired.empty(), "a subsequent Off also completes without another Service or Resize");
+      std::cout << "ADAPTIVE_OFF evidence=WARP+MOCK private_replay_closed=1 external_replay_retained=1 released=1 reenabled=1\n";
+    }
     model_parameter_observer = {};
     native::fg_service::Retire();
     gpu.Submit();

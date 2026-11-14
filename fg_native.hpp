@@ -175,19 +175,26 @@ inline void Release(Stream* stream) {
   ReleaseCom(stream->device);
 }
 
+// Caller owns the NGX PresentTurn and runtime_mutex. These private XeFG lists
+// cannot be replayed after their pool is removed; outstanding GPU uses still
+// retain their retired resources. Native game recordings are never closed here.
+inline void RetireServiceStreamsLocked() {
+  for (auto it = streams.begin(); it != streams.end();) {
+    if (it->first.first) {
+      ++it;
+      continue;
+    }
+    Release(&it->second);
+    it = streams.erase(it);
+  }
+}
+
 inline void Retire() noexcept {
   try {
     const ngx_serial::PresentTurn turn(true);
     if (!turn.owns()) return;
     RuntimeLock lock(runtime_mutex);
-    for (auto it = streams.begin(); it != streams.end();) {
-      if (it->first.first) {
-        ++it;
-        continue;
-      }
-      Release(&it->second);
-      it = streams.erase(it);
-    }
+    RetireServiceStreamsLocked();
   } catch (...) {
   }
 }

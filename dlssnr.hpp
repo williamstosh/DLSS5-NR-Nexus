@@ -24025,7 +24025,7 @@ inline void ServiceDisabledNr() {
   if (worksets.empty() && retired_final_resources.empty()
       && active_features.load(std::memory_order_relaxed) == 0u
       && retired_nr_features.empty() && present_ring.device == nullptr
-      && present_streams.empty()) {
+      && present_streams.empty() && fg_service::streams.empty() && present_retired.empty()) {
     disabled_resources_released.store(true, std::memory_order_relaxed);
     ngx_serial::retirement_armed.store(false, std::memory_order_release);
     return;
@@ -24055,8 +24055,13 @@ inline void ServiceDisabledNr() {
       slot.value = 0;
     }
   }
-  if (!ReleasePresentRing()
-      || TeardownProof() != submission::RecordedWork::kComplete) return;
+  if (!ReleasePresentRing()) return;
+  // Switching away from Present stops XeFG Service before its final private
+  // lists can be recycled. Close that owned pool before asking the global
+  // proof; otherwise a completed but replayable service list blocks its own
+  // retirement forever. Foreign/game recordings retain the original gate.
+  fg_service::RetireServiceStreamsLocked();
+  if (TeardownProof() != submission::RecordedWork::kComplete) return;
   // The addon owns the Present recordings and can discard them after their
   // fence; a game's completed but replayable recording NEVER passes this
   // proof. No age, CPU present count or abandoned-device rule can free it.
