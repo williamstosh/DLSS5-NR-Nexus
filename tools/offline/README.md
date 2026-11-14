@@ -330,6 +330,22 @@ prefix 沿用 62 次源调用上限，后续准备与请求合计最多 180 次�
 选择是 MOCK 直接请求，SR／NR 为真实 NGX；不测输出 FPS。预算拒绝保留 Blocked，实际
 Create／Evaluate 失败停止并保存诊断，不降低档数或重启准备。结束后沿用真实 Off 和 SDK 收尾。
 
+冷启用自适应的分步管线验证使用同一入口的单个冷进程。编译原生夹具时同时定义
+`NR_NEXUS_TEST_NATIVE_NGX`、`NR_NEXUS_TEST_COLD_CPU_TRACE`，设置
+`NR_NEXUS_TEST_RESIZE_PIPELINE_STEPS=1`、`NR_NEXUS_TEST_RESIZE_SELECTED_LEVELS=0`、
+`NR_NEXUS_TEST_RESIZE_READY=1`、`NR_NEXUS_TEST_RESIZE_COLD_COMPONENTS=0`，其余专项开关
+沿上面的要求关闭。首次 prefix 源调用前就开启自适应，沿用既有 62 次 prefix 与
+180 次 selected 源硬界，保留已经推进的同一所选集合；全部档位取得健康完成收据后，
+只执行 `{0,last,0}` 三次即时切换，再运行原有 Off、SR 恢复、source Release 与 SDK 收尾。
+
+此模式在 `adaptive-native-resize.json` 增加 `pipeline_steps` 汇总，并复用
+`cold_cpu_trace` 为每个 prefix/selected 源保存至多 512 个嵌套 span。记录实际 PSO API
+次数、NGX Create、SR/NR Evaluate CPU 成本、最长源调用和准备墙时；每源最多一次插件
+PSO 创建，最后一个 PSO 所在源不叠加 NGX Create 或 NR Evaluate，ready 切换不新增管线、
+模型或工作集。trace 使用有界堆存储，JSON 转换在 Hook 计时外；墙时和源间隔包含报告、
+导出与夹具限速开销。SDK/provider、codec 根签名与 ControlMask PSO 的前置准备状态单独
+记录。同步的单个创建仍不可拆分，这项验证不预设总准备时间或单次延迟上限。
+
 首调用 CPU 归因另用原生测试编译宏 `NR_NEXUS_TEST_COLD_CPU_TRACE`，配合
 `NR_NEXUS_TEST_RESIZE_COLD_COMPONENTS=1`、`NR_NEXUS_TEST_RESIZE_SELECTED_LEVELS=0`
 和 `NR_NEXUS_TEST_RESIZE_READY=1`，其他专项关闭，仍调用同一 resize 入口。只运行首两次

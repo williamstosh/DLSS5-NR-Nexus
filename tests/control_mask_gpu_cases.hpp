@@ -2731,15 +2731,18 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       ? renodx::addons::dlss5::adaptive_resolution::MAX_PREPARED_LEVELS : 0u);
   const auto* components_environment = std::getenv("NR_NEXUS_TEST_RESIZE_COLD_COMPONENTS");
   const bool cold_components = resize_test && components_environment != nullptr && std::strcmp(components_environment, "1") == 0;
+  const auto* pipeline_environment = std::getenv("NR_NEXUS_TEST_RESIZE_PIPELINE_STEPS");
+  const bool pipeline_steps = resize_test && pipeline_environment != nullptr && std::strcmp(pipeline_environment, "1") == 0;
   bool cold_components_failed = false;
   bool cold_teardown_started = false;
   bool demand_validation_failed = false;
   nlohmann::json resize_report;
 #if defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
-  std::array<addon::ColdCpuTraceState, 2> cold_cpu_traces{};
-  std::array<bool, 2> cold_cpu_exported{};
+  const uint32_t cold_source_limit = (pipeline_steps ? addon::kContractDebounceFrames + 32u + 180u : 2u);
+  std::vector<addon::ColdCpuTraceState> cold_cpu_traces(cold_source_limit);
+  std::vector<bool> cold_cpu_exported(cold_source_limit, false);
   const auto export_cold_cpu_trace = [&](bool partial) {
-    if (!cold_components) return;
+    if (!cold_components && !pipeline_steps) return;
     for (uint32_t source_call = 0; source_call < cold_cpu_traces.size(); ++source_call) {
       if (cold_cpu_exported[source_call] || cold_cpu_traces[source_call].count == 0) continue;
       const auto& trace = cold_cpu_traces[source_call];
@@ -2747,6 +2750,8 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       nlohmann::json spans = nlohmann::json::array();
       int64_t log_ns = 0;
       uint32_t log_count = 0;
+      uint32_t pso_calls = 0, ngx_creates = 0, sr_evaluates = 0, nr_evaluates = 0;
+      int64_t pso_ns = 0, ngx_create_ns = 0, sr_evaluate_ns = 0, nr_evaluate_ns = 0;
       for (uint32_t index = 0; index < trace.count; ++index) {
         const auto& span = trace.spans[index];
         const int64_t inclusive = span.end_ns - span.begin_ns;
@@ -2762,10 +2767,33 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           log_ns += inclusive;
           ++log_count;
         }
+        if (pipeline_steps && span.name != nullptr) {
+          if (std::strcmp(span.name, "D3D12.CreateComputePipelineState") == 0) {
+            ++pso_calls;
+            pso_ns += inclusive;
+          } else if (std::strcmp(span.name, "SDK.CoreCreateFeature") == 0) {
+            ++ngx_creates;
+            ngx_create_ns += inclusive;
+          } else if (std::strcmp(span.name, "SDK.SREvaluateFeature") == 0) {
+            ++sr_evaluates;
+            sr_evaluate_ns += inclusive;
+          } else if (std::strcmp(span.name, "SDK.NREvaluateFeature") == 0) {
+            ++nr_evaluates;
+            nr_evaluate_ns += inclusive;
+          }
+        }
       }
       resize_report["cold_cpu_trace"]["frames"].push_back({{"source_call", source_call}, {"thread_id", GetCurrentThreadId()},
           {"valid", valid}, {"partial", partial}, {"overflow", trace.overflow}, {"log_emit_count", log_count},
           {"log_emit_total_ns", log_ns}, {"spans", std::move(spans)}});
+      if (pipeline_steps) {
+        resize_report["cold_cpu_trace"]["frames"].back().update({
+            {"stage", (trace.spans[0].name != nullptr && std::strcmp(trace.spans[0].name, "prefix.source_call") == 0 ? "prefix" : "selected")},
+            {"pso_create_api_calls", pso_calls}, {"pso_create_cpu_ns", pso_ns},
+            {"ngx_create_calls", ngx_creates}, {"ngx_create_cpu_ns", ngx_create_ns},
+            {"sr_evaluate_calls", sr_evaluates}, {"sr_evaluate_cpu_ns", sr_evaluate_ns},
+            {"nr_evaluate_calls", nr_evaluates}, {"nr_evaluate_cpu_ns", nr_evaluate_ns}});
+      }
       cold_cpu_exported[source_call] = true;
       cold_components_failed |= partial || !valid;
     }
@@ -2775,9 +2803,14 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     Check(!cold_prepare || !single_feature, "resize diagnostic modes are separate probes");
     Check(!demand_prepare || !diagnostic_probe, "demand preparation uses the ordinary native resize fixture");
 #if !defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
-    Check(!cold_components, "cold components requires the dedicated NR_NEXUS_TEST_COLD_CPU_TRACE native build");
+    Check(!cold_components && !pipeline_steps, "cold CPU probes require the dedicated NR_NEXUS_TEST_COLD_CPU_TRACE native build");
 #endif
     Check(!cold_components || (selected_sequence && selected_levels == 0), "cold components requires explicit Default 0");
+    if (pipeline_steps) {
+      const auto* ready = std::getenv("NR_NEXUS_TEST_RESIZE_READY");
+      Check(selected_sequence && selected_levels == 0 && !cold_components && ready != nullptr && std::strcmp(ready, "1") == 0,
+          "pipeline steps requires explicit Default 0, Ready 1, and no two-source cold-components probe");
+    }
     if (selected_sequence) {
       Check(std::strcmp(selected_environment, "0") == 0 || std::strcmp(selected_environment, "15") == 0,
           "selected comparison accepts Default 0 or the complete 15-level grid");
@@ -3136,10 +3169,18 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
               {"prefix_cpu_wrapper_ms", 0.}, {"prefix_cpu_create_ms", 0.}, {"prefix_cpu_release_ms", 0.},
               {"prefix_cpu_host_sr_ms", 0.}, {"prefix_cpu_nr_evaluate_ms", 0.},
               {"prefix_create_count", 0u}, {"prefix_release_count", 0u}, {"prefix_frames", nlohmann::json::array()}}}};
-      addon::kSetAdaptiveEnabled.Store(0.f);
+      addon::kSetAdaptiveEnabled.Store(pipeline_steps ? 1.f : 0.f);
       addon::kSetAdaptiveLevelCount.Store(selected_levels);
       addon::kSetAdaptiveMinScale.Store(0.33f);
       addon::max_worksets = 4;
+      if (pipeline_steps) {
+        // Match the later selected loop before the first source; changing
+        // these identity providers midway would restart the same collection.
+        renodx::addons::dlss5::gpu_timers::comparison_settings = addon::comparison_ui::CaptureSettings;
+        addon::adaptive_configuration_settings = addon::comparison_ui::CaptureAdaptiveSettings;
+        Check(addon::adaptive_feature_mode.load() == addon::AdaptiveFeatureMode::OFF,
+            "pipeline steps uses the ordinary selected collection with every preparation experiment off");
+      }
       native_resize_selected_sequence = true;
       native_resize_ready = true;
       native_resize_create = addon::core_create_feature;
@@ -3147,7 +3188,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       addon::core_create_feature = ObserveNativeResizeCreate;
       addon::core_release_feature = ObserveNativeResizeRelease;
     }
-    if (cold_components) {
+    if (cold_components || pipeline_steps) {
       resize_report.update({{"host_sr", "NATIVE_NGX"}, {"render_size", {render_width, render_height}},
           {"output_size", {width, height}}, {"stage", "Upscaled"}, {"passes", 1}, {"colors", 1},
           {"format", "RGBA16F"}, {"requested_model", "B"}, {"internal_model", "unknown"},
@@ -3157,16 +3198,22 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           {"input_depth_crc32", renodx::utils::hash::ComputeCRC32(reinterpret_cast<const uint8_t*>(depth_data.data()), depth_data.size() * sizeof(float))},
           {"input_motion_crc32", renodx::utils::hash::ComputeCRC32(reinterpret_cast<const uint8_t*>(motion_data.data()), motion_data.size() * sizeof(uint16_t))}});
       resize_report["frames"] = nlohmann::json::array();
-      resize_report["selected_collection"]["source_frame_limit"] = 0;
-      resize_report["selected_collection"]["prefix_frame_limit"] = 2;
-      resize_report["cold_components"] = {{"source_call_limit", 2}, {"complete_selected_sequence", false},
+      if (cold_components) {
+        resize_report["selected_collection"]["source_frame_limit"] = 0;
+        resize_report["selected_collection"]["prefix_frame_limit"] = 2;
+      }
+      resize_report[cold_components ? "cold_components" : "pipeline_steps"] = {
+          {"source_call_limit", (cold_components ? 2u : addon::kContractDebounceFrames + 32u + 180u)},
+          {"adaptive_enabled_before_first_source", pipeline_steps}, {"complete_selected_sequence", pipeline_steps},
           {"final_output_readback", false}, {"sdk_initialized_before_measurement", true},
           {"codec_root_prepared_before_measurement", addon::codec_pipeline.root_signature != nullptr},
           {"control_mask_pso_prepared_before_measurement", addon::codec_pipeline.control_mask != nullptr},
           {"external_timing_scope", "submit/fence includes Close/Execute/Signal/wait/fixture Reset; retire includes Drain/Poll/reference cleanup; record-to-submit includes export/query outside Hook"},
           {"runtime_scope", "public SDK/provider setup precedes measurement; SDK-internal lazy work remains inside its actual calls"}};
       resize_report["cold_cpu_trace"] = {{"schema", "nr-nexus-cold-cpu-trace-v1"}, {"spans_per_source_limit", 512},
-          {"scope", "calling thread only; fixed storage active only during the first two prefix Hook calls"},
+          {"scope", pipeline_steps
+              ? "calling thread only; 512 spans per source in bounded heap storage; active only inside each prefix/selected Hook call"
+              : "calling thread only; fixed storage active only during the first two prefix Hook calls"},
           {"accounting", "inclusive spans nest; exclusive is inclusive minus direct children, retaining uninstrumented work and observer overhead; never sum inclusive parent and child values"},
           {"log_scope", "Log includes message prefix construction and synchronous ReShade callback/capture/stdout; caller formatting remains with its parent"},
           {"frames", nlohmann::json::array()}};
@@ -3199,17 +3246,25 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       {
 #if defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
         const addon::ColdCpuTraceScope source_trace("prefix.source_call", nullptr,
-            cold_components ? &cold_cpu_traces[attempt] : nullptr);
+            (cold_components || pipeline_steps) ? &cold_cpu_traces[attempt] : nullptr);
 #endif
         result = addon::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), owner, &parameters, nullptr);
       }
       const auto prefix_recorded = std::chrono::steady_clock::now();
       addon::ngx_slot_real[0].evaluate = nullptr;
 #if defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
-      if (cold_components && cold_cpu_traces[attempt].count == 0) {
+      if ((cold_components || pipeline_steps) && cold_cpu_traces[attempt].count == 0) {
         cold_components_failed = true;
       }
       export_cold_cpu_trace(false);
+      if (pipeline_steps) {
+        Check(!cold_components_failed && resize_report["cold_cpu_trace"]["frames"].back().at("pso_create_api_calls").get<uint32_t>() <= 1,
+            "each pipeline-prefix source has a complete bounded trace and at most one actual PSO API call");
+        if (resize_report["cold_cpu_trace"]["frames"].back().at("pso_create_api_calls").get<uint32_t>() != 0) {
+          Check(native_resize_creates == 0 && native_runtime_results.empty(),
+              "a synchronous pipeline step never shares its source with NGX Create or NR Evaluate");
+        }
+      }
 #endif
       if (selected_sequence) {
         auto& selected = resize_report["selected_collection"];
@@ -3240,6 +3295,19 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                   && std::all_of(native_resize_create_calls.begin(), native_resize_create_calls.end(),
                       [](const auto& call) { return NVSDK_NGX_SUCCEED(static_cast<NVSDK_NGX_Result>(call.at("result").template get<uint32_t>())); })
                   && !addon::features.at(owner).slots[0].failed;
+        if (pipeline_steps) {
+          const auto& feature = addon::features.at(owner);
+          if (feature.adaptive_session != nullptr) {
+            selected["last_recording"]["reason"] = renodx::addons::dlss5::adaptive_resolution::ReasonText(feature.adaptive_session->status.reason);
+            if (feature.adaptive_session->preparation_reason == renodx::addons::dlss5::adaptive_resolution::Reason::BUDGET) {
+              resize_report["probe_execution"] = "Blocked";
+            }
+            Check(!feature.adaptive_session->failed
+                && feature.adaptive_session->preparation_reason != renodx::addons::dlss5::adaptive_resolution::Reason::BUDGET,
+                "pipeline prefix stops on the first preparation failure or real budget rejection");
+          }
+          selected["last_recording"]["pso_create_api_calls"] = resize_report["cold_cpu_trace"]["frames"].back().at("pso_create_api_calls");
+        }
         if (cold_components) {
           cold_components_failed |= !prefix_ok
               || (attempt == 0 && (native_resize_creates != 1 || !native_runtime_results.empty()));
@@ -3271,7 +3339,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           gpu.uploads.clear();
           gpu.retained_resources.clear();
         }
-        if (cold_components) {
+        if (cold_components || pipeline_steps) {
           resize_report["selected_collection"]["last_recording"].update({
               {"record_to_submit_ms", std::chrono::duration<double, std::milli>(submit_begin - prefix_recorded).count()},
               {"cpu_submit_fence_ms", std::chrono::duration<double, std::milli>(gpu_completed - submit_begin).count()},
@@ -3353,7 +3421,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     if (selected_sequence) {
       resize_report["selected_collection"]["prefix_wall_ms"] = std::chrono::duration<double, std::milli>(
           selected_prefix_completed - selected_prefix_begin).count();
-      if (!cold_components) {
+      if (!cold_components && !pipeline_steps) {
         Check(resize_report["selected_collection"].at("prefix_create_count").get<uint32_t>() == 1
                   && resize_report["selected_collection"].at("prefix_release_count").get<uint32_t>() == 0,
             "selected preparation accounts for exactly one real initial upper Feature");
@@ -4475,6 +4543,8 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       }
       auto& report = resize_report;
       auto selected_report = (selected_sequence ? std::move(report["selected_collection"]) : nlohmann::json{});
+      auto pipeline_report = (pipeline_steps ? std::move(report["pipeline_steps"]) : nlohmann::json{});
+      auto trace_report = (pipeline_steps ? std::move(report["cold_cpu_trace"]) : nlohmann::json{});
       report = {{"schema", "nr-nexus-native-resize-v1"}, {"evidence", "NATIVE_GPU+NATIVE_NGX"},
           {"backend", "production owned NR; public SDK ProjectID preinitialization"},
           {"host_sr", "NATIVE_NGX fixed 1280x720 to 1920x1080"}, {"stage", "Upscaled"},
@@ -4522,6 +4592,13 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         selected["full_preparation_create_count"] = selected.at("prefix_create_count");
         selected["full_preparation_release_count"] = selected.at("prefix_release_count");
       }
+      if (pipeline_steps) {
+        report["pipeline_steps"] = std::move(pipeline_report);
+        report["cold_cpu_trace"] = std::move(trace_report);
+        report["mode"] = "cold-adaptive-pipeline-steps";
+        report["render_size"] = {render_width, render_height};
+        report["output_size"] = {width, height};
+      }
       report["loaded_ngx_modules"] = nlohmann::json::array();
       std::array<HMODULE, 1024> modules{};
       DWORD module_bytes = 0;
@@ -4548,7 +4625,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       uint32_t selected_ready_creates = 0, selected_ready_releases = 0;
       uint64_t selected_ready_worksets = 0;
       auto selected_prepare_begin = std::chrono::steady_clock::time_point{};
-      std::array<size_t, 6> selected_requests{};
+      std::vector<size_t> selected_requests(pipeline_steps ? 3u : 6u);
       size_t preparing_evaluates = 0;
       size_t endpoint_slot = 0;
       uintptr_t endpoint_model = 0, endpoint_parameters = 0;
@@ -4787,10 +4864,27 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         const auto submit_contentions_before = renodx::addons::dlss5::submit_lock_blocked.load();
         addon::ngx_slot_real[0].evaluate = reinterpret_cast<void*>(ObserveNativeHostEvaluate);
         const auto source_successes_before = addon::SourceSuccessfulEvaluations();
-        const auto result = addon::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), owner, &parameters, nullptr);
+        NVSDK_NGX_Result result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
+        {
+#if defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+          const addon::ColdCpuTraceScope source_trace("selected.source_call", nullptr,
+              pipeline_steps ? &cold_cpu_traces[prefix_host_evaluates + frame] : nullptr);
+#endif
+          result = addon::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), owner, &parameters, nullptr);
+        }
         const auto source_successes_after = addon::SourceSuccessfulEvaluations();
         addon::ngx_slot_real[0].evaluate = nullptr;
         const auto recorded = std::chrono::steady_clock::now();
+#if defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+        if (pipeline_steps) {
+          Check(cold_cpu_traces[prefix_host_evaluates + frame].count != 0,
+              "every selected source has its own bounded cold CPU trace");
+          export_cold_cpu_trace(false);
+          const auto& trace = report["cold_cpu_trace"]["frames"].back();
+          Check(!cold_components_failed && trace.at("pso_create_api_calls").get<uint32_t>() == 0,
+              "a complete prefix pipeline cache needs no further PSO creation during selected preparation or ready switching");
+        }
+#endif
         const double wrapper_ms = std::chrono::duration<double, std::milli>(recorded - start).count();
         if (selected_sequence) {
           selected_max_wrapper_ms = std::max(selected_max_wrapper_ms, wrapper_ms);
@@ -5035,7 +5129,8 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
               selected_ready_frame = frame;
               selected_ready_features = addon::nr_features_created;
               selected_ready_worksets = addon::worksets_created;
-              selected_requests = {0, cache->count - 1, 0, cache->count / 2, cache->count - 1, 0};
+              selected_requests = (pipeline_steps ? std::vector<size_t>{0, cache->count - 1, 0}
+                  : std::vector<size_t>{0, cache->count - 1, 0, cache->count / 2, cache->count - 1, 0});
               auto& selected = report["selected_collection"];
               selected["ready_frame"] = frame;
               selected["actual_levels"] = cache->count;
@@ -5385,7 +5480,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       }
       if (selected_sequence) {
         Check(selected_request_index == selected_requests.size() && selected_ready_frame != UINT32_MAX,
-            "the full selected collection and all six immediate requests complete within the original 180-source bound");
+            "the full selected collection and requested roundtrip complete within the original 180-source bound");
         auto& selected = report["selected_collection"];
         selected["actual_source_frames"] = report["frames"].size();
         selected["ready_request_count"] = selected_request_index;
@@ -5398,6 +5493,35 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         selected["max_source_start_interval_ms_including_setup"] = std::max(selected_max_source_interval_ms,
             selected.at("prefix_to_selected_first_source_interval_ms").get<double>());
         selected["cpu_scope"] = "HookedEvaluateFeature CPU sums include real host SR and NR wrapper work; SDK Create and Evaluate are separate; fences, pacing and probe setup remain wall time";
+        if (pipeline_steps) {
+          const auto& trace_frames = report["cold_cpu_trace"]["frames"];
+          Check(trace_frames.size() == prefix_host_evaluates + report["frames"].size() && !cold_components_failed,
+              "every prefix and selected source has exactly one valid complete trace");
+          uint32_t pso_calls = 0, max_pso_calls = 0, ngx_creates = 0, sr_calls = 0, nr_calls = 0;
+          int64_t pso_ns = 0, ngx_ns = 0, sr_ns = 0, nr_ns = 0;
+          for (const auto& source : trace_frames) {
+            const auto pso = source.at("pso_create_api_calls").get<uint32_t>();
+            pso_calls += pso;
+            max_pso_calls = std::max(max_pso_calls, pso);
+            ngx_creates += source.at("ngx_create_calls").get<uint32_t>();
+            sr_calls += source.at("sr_evaluate_calls").get<uint32_t>();
+            nr_calls += source.at("nr_evaluate_calls").get<uint32_t>();
+            pso_ns += source.at("pso_create_cpu_ns").get<int64_t>();
+            ngx_ns += source.at("ngx_create_cpu_ns").get<int64_t>();
+            sr_ns += source.at("sr_evaluate_cpu_ns").get<int64_t>();
+            nr_ns += source.at("nr_evaluate_cpu_ns").get<int64_t>();
+          }
+          report["pipeline_steps"].update({{"prefix_sources", prefix_host_evaluates},
+              {"selected_sources", report["frames"].size()}, {"pso_create_api_calls", pso_calls},
+              {"max_pso_create_api_calls_per_source", max_pso_calls}, {"pso_create_cpu_ns", pso_ns},
+              {"ngx_create_calls", ngx_creates}, {"ngx_create_cpu_ns", ngx_ns},
+              {"sr_evaluate_calls", sr_calls}, {"sr_evaluate_cpu_ns", sr_ns},
+              {"nr_evaluate_calls", nr_calls}, {"nr_evaluate_cpu_ns", nr_ns},
+              {"max_source_call_ms", selected_max_wrapper_ms}, {"ready_pso_create_calls", 0},
+              {"full_preparation_wall_ms_excluding_setup", selected.at("full_preparation_wall_ms_excluding_setup")},
+              {"end_to_end_ready_wall_ms", selected.at("end_to_end_ready_wall_ms")},
+              {"wall_scope", "includes measured-source reporting/export and pacing; fixture setup gap is separately reported; no total-time or per-source latency guarantee"}});
+        }
         report["probe_execution"] = "Passed";
       }
       if (native_resize_ready) {
@@ -5447,7 +5571,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         }
         auto& before_off = addon::features.at(owner);
         size_t low_slot = 0;
-        if (!demand_prepare) {
+        if (!demand_prepare && !pipeline_steps) {
           for (size_t slot = 1; slot < before_off.adaptive_cache->count; ++slot) {
             const auto& cache = *before_off.adaptive_cache;
             if (cache.tiers[slot].ready && before_off.adaptive_session->IsLegal(cache.ladder.sizes[slot])
@@ -5528,7 +5652,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
               {"source_successes_delta", source_successes_after - source_successes_before},
               {"fence", gpu.serial}, {"completed_fence", gpu.fence->GetCompletedValue()}});
         };
-        if (!demand_prepare) {
+        if (!demand_prepare && !pipeline_steps) {
           evaluate_transaction("ready-low-before-off", false);
         }
         evaluate_transaction("adaptive-off-real-setting", true);
@@ -6062,7 +6186,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     std::vector<uint8_t> output_bytes;
     ComPtr<ID3D12Resource> output_readback;
     bool keep_raw_output = false;
-    if (!cold_components) {
+    if (!cold_components && !pipeline_steps) {
       const D3D12_RESOURCE_DESC final_output_desc = output->GetDesc();
       D3D12_PLACED_SUBRESOURCE_FOOTPRINT output_footprint{};
       UINT64 output_readback_size = 0;
@@ -6118,7 +6242,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     }
 
     if (motion_test) {
-      if (cold_components) {
+      if (cold_components || pipeline_steps) {
         cold_teardown_started = true;
       }
       addon::enabled = false;
@@ -6257,7 +6381,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       if ((demand_prepare || selected_sequence) && resize_report.value("probe_execution", "") == "Running") {
         resize_report["probe_execution"] = "Failed";
       }
-      if ((cold_components && cold_teardown_started)
+      if (((cold_components || pipeline_steps) && cold_teardown_started)
           || resize_report.value("contract_execution", "") == "Passed" || resize_report.value("probe_execution", "") == "Passed") {
         resize_report["teardown_status"] = "Failed";
       }
@@ -6300,7 +6424,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       if ((demand_prepare || selected_sequence) && resize_report.value("probe_execution", "") == "Running") {
         resize_report["probe_execution"] = "Failed";
       }
-      if ((cold_components && cold_teardown_started)
+      if (((cold_components || pipeline_steps) && cold_teardown_started)
           || resize_report.value("contract_execution", "") == "Passed" || resize_report.value("probe_execution", "") == "Passed") {
         resize_report["teardown_status"] = "Failed";
       }
