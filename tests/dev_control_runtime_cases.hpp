@@ -251,6 +251,42 @@
           && runtime::nr_features_created == experiment_features,
       "experiment requests write no INI settings, recreate no features and leave ordinary configuration generation unchanged");
   runtime::disabled_resources_released = released_before;
+  {
+    namespace screenshot = renodx::addons::dlss5::screenshot;
+    const auto before_identity = control::Identity();
+    const auto before_history = runtime::history_reset_epoch.load();
+    const auto before_writes = configuration_writes;
+    const auto before_route = runtime::hook_point.load();
+    auto project = std::filesystem::current_path();
+    while (project.filename() != L"RenoDX-DLSSNR-Nexus" && project.has_parent_path()
+           && project.parent_path() != project) project = project.parent_path();
+    check(project.filename() == L"RenoDX-DLSSNR-Nexus", "ROI control fixture resolves the authorized project");
+    const auto output = project / L"tmp" / L"mafia-same-frame-roi" / L"dev-control-contract";
+    const auto worker_started = screenshot::internal::worker_started.exchange(true);
+    const Json request{{"id", "roi-idempotent"}, {"op", "inline_restore_roi"},
+        {"output_directory", output.string()}};
+    const auto armed = control::Execute(request);
+    const auto request_id = screenshot::internal::inline_restore_request_id.load();
+    check(armed["ok"] && armed["status"] == "armed"
+            && armed["state"]["inline_restore_roi"]["status"] == "armed",
+        "dedicated ROI operation arms without a device or configuration edits");
+    check(control::Execute(request) == armed && screenshot::internal::inline_restore_request_id == request_id,
+        "same-id ROI replay returns the original receipt without rearming");
+    status = control::Execute({{"id", "roi-status"}, {"op", "status"}, {"query_id", "roi-idempotent"}});
+    check(status["receipt"] == armed && status["state"]["inline_restore_roi"]["status"] == "armed",
+        "ROI progress and cached receipt are observable through status");
+    check(control::Execute({{"id", "roi-busy"}, {"op", "inline_restore_roi"},
+              {"output_directory", output.string()}})["reason"] == "capture_busy",
+        "a different ROI request cannot replace the armed capture");
+    check(control::Identity() == before_identity && runtime::history_reset_epoch == before_history
+            && runtime::hook_point == before_route && configuration_writes == before_writes,
+        "ROI arm, status and retries write no settings, reset no history and change no route");
+    screenshot::AbortPending();
+    check(!screenshot::internal::inline_restore_active
+            && control::Snapshot()["inline_restore_roi"]["status"] == "failed",
+        "aborting an unclaimed ROI request releases its slot and records failure");
+    screenshot::internal::worker_started = worker_started;
+  }
   Json receipt{{"scope", "CPU production configuration and status adapters with synthetic ReShade cache; no GPU, NGX or game"},
       {"checks", checks}, {"configuration_writes", configuration_writes}, {"final", control::Snapshot()}};
   std::ofstream("dev-control-runtime.json") << receipt.dump(2);

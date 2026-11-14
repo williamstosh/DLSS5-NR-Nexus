@@ -29,6 +29,22 @@
 & $pythonPath -B ./tools/dev_control.py --pid 42 --process-created 123 set NRHookPoint 1
 ```
 
+Mafia 单 Pass Upscaled 的恢复诊断使用独立请求 `inline-restore-roi <绝对目录>`，协议操作为 `inline_restore_roi`，字段为 `output_directory`。它只布防一次求值，不提交画质设置或切换接入点。目标目录须为 D 盘本项目 `tmp/mafia-same-frame-roi/<capture_id>/` 下尚未创建的批次目录，`capture_id` 使用英文字母、数字、连字符或下划线，最长 96 个字符。请求接受时冻结目录；目录无效或写盘失败会报告失败，不使用游戏截图目录。
+
+这条诊断的状态、API、取样插点和热路径判断全部受 `NR_NEXUS_DEV_CONTROL` 编译条件保护。普通发布构建关闭该选项，保留原有结构、函数签名和调用路径；开发构建才包含采集能力。认领一次合格求值后新增四次 `CopyTextureRegion` 和八次复制前后的资源状态转换，净原码为 175,392 字节；READBACK 还包含行填充与堆分配对齐。它复用已有求值、提交与完成证明，不新增模型调用或渲染线程等待。实机 GPU 拷贝耗时及帧时影响尚未测量。
+
+```powershell
+# 仅在另行授权并核实 PID／创建时间的实机窗口中执行。
+$taskRoiDirectory = [IO.Path]::GetFullPath((Join-Path $PWD 'tmp/mafia-same-frame-roi/indoor-001'))
+& $pythonPath -B ./tools/dev_control.py --pid 42 --process-created 123 `
+    inline-restore-roi $taskRoiDirectory
+& $pythonPath -B ./tools/dev_control.py --pid 42 --process-created 123 status
+```
+
+保持原室内机位、K 请求、HDR Proxy 和 NR On；采集合同固定为 3840×2160、legacy codec 2、RGBA16 UNORM、单 Pass Upscaled。三张颜色面 `original`／`post_resolve`／`post_restore` 的 ROI 为 `[1936,2088)×[1106,1154)`；`restore_blocks` 为块坐标 `[60,66)×[34,37)` 的真实 RGBA32F 统计。四份同名 `.raw` 共 175,392 字节，均为小端紧密行；`capture.meta.txt` 记录同次求值序号、recording、实际恢复参数与提交完成凭据。请求接收与最终落盘分开查看：用 `status` 中的 `state.inline_restore_roi` 跟踪结果，最终核对 `written`、侧车 `capture_valid=1`、四面齐全及 GPU 完成、输出写回、桥接回拷记录。失败或缺面不从下一帧补齐；连接结果不明时仍只查询原请求回执，不重复布防。请求设有 30 秒期限，并沿用已有提交完成检查的有界失败处理。
+
+后续分析先确认目标轮廓确实位于 `post_restore`，再用实际块统计按恢复 Shader 插值，比较恢复前后 RGB 扣减和跨门槛位置。当前诊断入口不改变恢复算法；只有同帧数据满足判据才能归因。该入口不新增 NR 开关、双 Pass 或 Present 对照要求。
+
 开发状态还包含输出 FPS 的来源、有效窗口、generation、FPS／MAD 及请求／观测倍率；无效或过期测量为 null。
 `adaptive_caches` 分开报告物理槽、逻辑尺寸、Feature 的 Create 容量与就绪状态。Python 客户端的
 `adaptive_feature_experiment(0|1|2|3)` 专用于默认关闭的容量实验，不是 INI 设置：分别请求关闭、已有容量复用、

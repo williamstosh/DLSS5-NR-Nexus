@@ -9474,7 +9474,11 @@ inline void RunBlackLevelRestore(
     // The look shaped this pass (LookRoute::shaped): measure NR's own lift
     // from the unshaped model output instead of the shaped write surface.
     bool measure_unshaped,
-    std::optional<uint32_t> restore_mode = std::nullopt) {
+    std::optional<uint32_t> restore_mode = std::nullopt
+#if defined(NR_NEXUS_DEV_CONTROL)
+    , uint64_t inline_restore_serial = 0
+#endif
+) {
   if (codec_mode.load() == 0 || resources.hdr_mode != 0) return;
   if (codec_pipeline.block_mean_reduce == nullptr
       || codec_pipeline.black_restore_apply == nullptr
@@ -9523,6 +9527,16 @@ inline void RunBlackLevelRestore(
   command_list->Dispatch(blocks_x, blocks_y, 1);
   UavBarrier(command_list, resources.block_mean);
   UavBarrier(command_list, write_surface);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (inline_restore_serial != 0) {
+    ID3D12Device* device = nullptr;
+    if (SUCCEEDED(command_list->GetDevice(IID_PPV_ARGS(&device)))) {
+      screenshot::CaptureInlineRestorePlane(device, command_list, inline_restore_serial, "restore_blocks",
+          resources.block_mean, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      device->Release();
+    }
+  }
+#endif
   BindCodec(
       command_list,
       resources,
@@ -9555,6 +9569,18 @@ inline void RunBlackLevelRestore(
   command_list->SetComputeRoot32BitConstants(2, 2, sdr_restore_constants, 16);
   command_list->Dispatch((width + 15) / 16, (height + 15) / 16, 1);
   UavBarrier(command_list, write_surface);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (inline_restore_serial != 0) {
+    ID3D12Device* device = nullptr;
+    if (SUCCEEDED(command_list->GetDevice(IID_PPV_ARGS(&device)))) {
+      screenshot::CaptureInlineRestorePlane(device, command_list, inline_restore_serial, "post_restore",
+          write_surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+          screenshot::InlineRestoreExecution{.mode = sdr_restore_mode, .gate = sdr_restore_constants[0],
+              .reduce_unshaped = measure_unshaped && codec_pipeline.block_mean_reduce_unshaped != nullptr});
+      device->Release();
+    }
+  }
+#endif
 }
 
 // Writes one SRV into a workset's shader-visible heap, but only when the
@@ -12118,6 +12144,9 @@ struct NrRecording {
   uint32_t model_reset_mask = 0;
   std::array<uint32_t, kMaxNrPasses> model_reset_reasons{};
   uint32_t model_pass_mask = 0;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  uint64_t inline_restore_serial = 0;
+#endif
 };
 
 struct AdaptiveRecording {
@@ -12157,7 +12186,11 @@ inline bool RecordInline(
     const PresentTarget* present = nullptr,
     NrRecording* recording = nullptr,
     bool prepare_models_only = false,
-    AdaptiveRecording* adaptive_recording = nullptr) {
+    AdaptiveRecording* adaptive_recording = nullptr
+#if defined(NR_NEXUS_DEV_CONTROL)
+    , bool inline_restore_bridge = false
+#endif
+) {
 #if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
   const ColdCpuTraceScope cold_trace("RecordInline");
 #endif
@@ -13429,6 +13462,9 @@ inline bool RecordInline(
   float final_pass_transfer = 0.f;
   float final_pass_color = 0.f;
   bool final_pass_shaped = false;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  uint64_t inline_restore_serial = 0;
+#endif
   for (uint32_t pass = 0; pass < requested_stack; ++pass) {
     // Encode source and decode reference for this pass: the copied DLSS
     // output for the first pass, the previous pass's decoded result after.
@@ -13894,6 +13930,31 @@ inline bool RecordInline(
     }
     command_list->Dispatch((width + 15) / 16, (height + 15) / 16, 1);
     UavBarrier(command_list, write_surface);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (inline_restore_bridge && screenshot::internal::inline_restore_active.load(std::memory_order_acquire)) {
+      const auto& observed = stage_stats.last_evaluate;
+      inline_restore_serial = screenshot::ClaimInlineRestoreRoi(command_list, {
+          .d3d11_bridge = true, .mixed = plan.mixed, .present = present != nullptr,
+          .preparing = adaptive.preparing || prepare_models_only, .warmup = !nr_returned,
+          .reset_sent = observed.reset_sent, .upscaled = execution_stage == stage_plan::Stage::UPSCALED,
+          .api_returned = observed.api_returned, .ngx_succeeded = nr_returned && NVSDK_NGX_SUCCEED(nr_result),
+          .group_begin = group.begin, .stack = requested_stack, .pass = pass,
+          .work_width = nr_input_width, .work_height = nr_input_height,
+          .output_width = resource_width, .output_height = resource_height,
+          .output_rect = {.x = output_rect.x, .y = output_rect.y, .width = output_rect.width, .height = output_rect.height},
+          .hdr_mode = res.hdr_mode, .codec = codec_mode.load(), .ngx_result = static_cast<uint32_t>(nr_result),
+          .reset_reasons = observed.reset_reasons, .format = res.format,
+          .evaluation_sequence = observed.sequence, .source_generation = observed.source_generation,
+          .present_generation = present_generation});
+      if (inline_restore_serial != 0) {
+        if (recording != nullptr) recording->inline_restore_serial = inline_restore_serial;
+        screenshot::CaptureInlineRestorePlane(device, command_list, inline_restore_serial, "original",
+            res.original, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        screenshot::CaptureInlineRestorePlane(device, command_list, inline_restore_serial, "post_resolve",
+            write_surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      }
+    }
+#endif
     capture_stage("post_resolve", write_surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                   width, height, pass, requested_stack);
     if (present == nullptr
@@ -13911,7 +13972,11 @@ inline bool RecordInline(
           pass_transfer,
           pass_color,
           route.shaped,
-          (present != nullptr ? std::optional<uint32_t>{present->sdr_restore_effective_mode} : std::nullopt));
+          (present != nullptr ? std::optional<uint32_t>{present->sdr_restore_effective_mode} : std::nullopt)
+#if defined(NR_NEXUS_DEV_CONTROL)
+          , inline_restore_serial
+#endif
+      );
     }
     capture_stage("post_restore", write_surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                   width, height, pass, requested_stack);
@@ -14454,14 +14519,22 @@ inline bool RecordInline(
 inline bool ProcessInline(ID3D12GraphicsCommandList* command_list, const NVSDK_NGX_Handle* handle,
                           const NVSDK_NGX_Parameter* game_parameters, bool* command_list_touched = nullptr,
                           const PresentTarget* present = nullptr, NrRecording* recording = nullptr,
-                          bool prepare_models_only = false) {
+                          bool prepare_models_only = false
+#if defined(NR_NEXUS_DEV_CONTROL)
+                          , bool inline_restore_bridge = false
+#endif
+) {
 #if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
   const ColdCpuTraceScope cold_trace("ProcessInline");
 #endif
   AdaptiveRecording adaptive;
   const PipelinePreparationScope pipeline_scope;
   const bool result = RecordInline(command_list, handle, game_parameters, command_list_touched, present,
-      recording, prepare_models_only, &adaptive);
+      recording, prepare_models_only, &adaptive
+#if defined(NR_NEXUS_DEV_CONTROL)
+      , inline_restore_bridge
+#endif
+  );
   if (result && adaptive.feature != nullptr && !prepare_models_only && adaptive.complete) {
     PrepareAdaptiveTier(adaptive.feature, adaptive.frame, command_list, true, [&](bool* complete) {
       NrRecording prepared;

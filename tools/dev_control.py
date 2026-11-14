@@ -293,6 +293,13 @@ class Client:
         request = dict(id=str(uuid.uuid4()), op='adaptive_feature_experiment', mode=mode)
         return self._mutation(request, deadline)
 
+    def inline_restore_roi(self, output_directory, *, deadline=None):
+        if not isinstance(output_directory, str) or not output_directory.strip():
+            raise ValueError('inline_restore_roi requires an output directory')
+        deadline = deadline if deadline is not None else time.monotonic() + self.timeout
+        request = dict(id=str(uuid.uuid4()), op='inline_restore_roi', output_directory=output_directory)
+        return self._mutation(request, deadline)
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -301,7 +308,7 @@ def main():
     parser.add_argument('--timeout', type=float, default=3)
     parser.add_argument('--query-id', help='status only: look up an uncertain original request receipt')
     parser.add_argument('--confirm', action='store_true', help='Explicitly approve a returned configuration proposal')
-    parser.add_argument('op', choices=('status', 'set'))
+    parser.add_argument('op', choices=('status', 'set', 'inline-restore-roi'))
     parser.add_argument('key', nargs='?')
     parser.add_argument('value', nargs='?', help='JSON typed value')
     args = parser.parse_args()
@@ -310,6 +317,10 @@ def main():
         if not args.key or args.value is None or args.query_id:
             parser.error('set requires key and JSON value')
         response = client.set(args.key, json.loads(args.value), confirm=args.confirm)
+    elif args.op == 'inline-restore-roi':
+        if not args.key or args.value is not None or args.query_id or args.confirm:
+            parser.error('inline-restore-roi requires one output directory and no setting or confirmation')
+        response = client.inline_restore_roi(args.key)
     else:
         if args.key or args.value or args.confirm:
             parser.error('status accepts no setting or confirmation')

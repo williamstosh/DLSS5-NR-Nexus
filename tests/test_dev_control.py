@@ -80,6 +80,43 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(self.transport.deadlines, [deadline] * 4)
         self.assertEqual(len({request['id'] for request in self.transport.requests}), 4)
 
+    def test_inline_restore_roi_freezes_directory_without_setting_or_confirmation(self):
+        client = self.client()
+        directory = r'D:\workspace\RenoDX-DLSSNR-Nexus\tmp\mafia-same-frame-roi\capture-42'
+        deadline = time.monotonic() + 1
+        actual = client.inline_restore_roi(directory, deadline=deadline)
+        request = self.transport.requests[0]
+        self.assertEqual(request['op'], 'inline_restore_roi')
+        self.assertEqual(request['output_directory'], directory)
+        self.assertEqual(actual['id'], request['id'])
+        self.assertNotIn('key', request)
+        self.assertNotIn('confirm', request)
+        self.assertEqual(self.transport.deadlines, [deadline])
+
+    def test_inline_restore_roi_rejects_missing_directory_before_transport(self):
+        client = self.client()
+        for directory in (None, '', '   ', 42, True):
+            with self.subTest(directory=directory), self.assertRaises(ValueError):
+                client.inline_restore_roi(directory)
+        self.assertEqual(self.transport.requests, [])
+
+    def test_lost_inline_capture_receipt_is_queried_without_arming_twice(self):
+        original = {}
+        def action(request):
+            if request['op'] == 'inline_restore_roi':
+                original.update(request)
+                raise OSError('synthetic capture response disconnect')
+            result = response(request)
+            result['receipt'] = dict(response(original), status='armed')
+            return result
+        client = self.client(action)
+        actual = client.inline_restore_roi(r'D:\capture')
+        self.assertEqual(actual['status'], 'armed')
+        self.assertEqual(actual['id'], original['id'])
+        self.assertEqual([r['op'] for r in self.transport.requests], ['inline_restore_roi', 'status'])
+        self.assertEqual(self.transport.requests[1]['query_id'], original['id'])
+        self.assertEqual(self.transport.deadlines[0], self.transport.deadlines[1])
+
     def test_adaptive_feature_experiment_rejects_invalid_modes_without_transport(self):
         client = self.client()
         for mode in (True, False, -1, 4, 1.0, '2', None):

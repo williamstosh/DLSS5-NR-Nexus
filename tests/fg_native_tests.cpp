@@ -738,8 +738,14 @@ int RunNativeRequiredMenuTest() {
 #include "control_mask_capture_cases.hpp"
 #include "adaptive_fg_service_cases.hpp"
 #include "adaptive_inline_cases.hpp"
+#if defined(NR_NEXUS_DEV_CONTROL)
+#include "inline_restore_roi_cases.hpp"
+#endif
 
 int main(int argc, char** argv) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (argc == 2 && std::strcmp(argv[1], "--inline-restore-roi") == 0) return inline_restore_roi_cases::Run();
+#endif
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-inline") == 0) return adaptive_inline_cases::Run();
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-fg-service") == 0) return adaptive_fg_service_cases::Run();
 #if defined(NR_NEXUS_TEST_NATIVE_NGX)

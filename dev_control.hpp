@@ -42,6 +42,9 @@ inline Json Snapshot() {
   Json state{{"pid", GetCurrentProcessId()},
       {"process_created", process_known ? Json(std::to_string((uint64_t{created.dwHighDateTime} << 32) | created.dwLowDateTime)) : Json(nullptr)},
       {"version", kAddonVersion}, {"available", false}, {"reason", "runtime_busy"}};
+  const auto roi = screenshot::GetInlineRestoreStatus();
+  state["inline_restore_roi"] = {{"capture_id", roi.capture_id}, {"status", roi.status},
+      {"reason", roi.reason}, {"serial", roi.serial}};
   RuntimeTryLock lock(runtime_mutex);
   if (!lock.owns_lock()) return state;
   const auto identity = Identity();
@@ -185,7 +188,7 @@ inline Json Execute(const Json& request) {
         {"receipt", request.contains("query_id") && last_request.is_object()
                 && request["query_id"] == last_request["id"] ? last_receipt : Json(nullptr)}};
   }
-  if (*operation != "set" && *operation != "adaptive_feature_experiment") {
+  if (*operation != "set" && *operation != "adaptive_feature_experiment" && *operation != "inline_restore_roi") {
     return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "invalid_operation"}};
   }
   if (last_request.is_object() && last_request["id"] == *id) {
@@ -206,6 +209,27 @@ inline Json Execute(const Json& request) {
   const bool configuration_busy = shutting_down.load() || slider_pending != nullptr || stage_edit::pending || resolution_edit::pending
       || stage_edit_request.setting != nullptr || !resolution_edit_request.empty() || profile_ui::Busy()
       || profile_ui::pending_action != profile_ui::Action::NONE || preset_ui::manager_geometry.was_open;
+  if (*operation == "inline_restore_roi") {
+    response["reason"] = "invalid_output_directory";
+    const auto directory = request.find("output_directory");
+    if (directory == request.end() || !directory->is_string()) return finish();
+    if (configuration_busy) {
+      response["reason"] = "configuration_busy";
+      return finish();
+    }
+    std::string reason;
+    try {
+      const auto& utf8_directory = directory->get_ref<const std::string&>();
+      const bool armed = screenshot::RequestInlineRestoreRoi(
+          std::filesystem::path(std::u8string(utf8_directory.begin(), utf8_directory.end())), &reason);
+      response["ok"] = armed;
+      response["status"] = (armed ? "armed" : "rejected");
+      response["reason"] = reason;
+    } catch (...) {
+      response["reason"] = "invalid_output_directory";
+    }
+    return finish();
+  }
   if (*operation == "adaptive_feature_experiment") {
     response["reason"] = "invalid_mode";
     const auto mode = request.find("mode");
