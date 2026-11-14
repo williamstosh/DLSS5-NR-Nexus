@@ -251,7 +251,8 @@ int Run() {
       if (hook == native::kHookUpscaled) {
         const auto created_before = native::nr_features_created;
         for (const auto mode : {native::AdaptiveFeatureMode::UPPER_CAPACITY,
-                               native::AdaptiveFeatureMode::UPPER_CAPACITY_ON_DEMAND}) {
+                               native::AdaptiveFeatureMode::UPPER_CAPACITY_ON_DEMAND,
+                               native::AdaptiveFeatureMode::UPPER_CAPACITY_ADJACENT}) {
           native::adaptive_feature_mode = mode;
           Check(record() && record() && feature.adaptive_cache == cache && cache->count == 2
               && cache->tiers[1].state.slots[0].create_input_width == 5

@@ -2595,7 +2595,13 @@ inline std::atomic_bool nr_adaptive_enabled{false};
 inline std::atomic<float> nr_adaptive_target_fps{60.f};
 inline std::atomic<float> nr_adaptive_min_scale{0.67f};
 inline std::atomic_bool nr_adaptive_editing{false};
-enum class AdaptiveFeatureMode : uint8_t { OFF, RETAIN, UPPER_CAPACITY, UPPER_CAPACITY_ON_DEMAND };
+enum class AdaptiveFeatureMode : uint8_t {
+  OFF,
+  RETAIN,
+  UPPER_CAPACITY,
+  UPPER_CAPACITY_ON_DEMAND,
+  UPPER_CAPACITY_ADJACENT,
+};
 // Fixtures and the development interface opt in; ordinary production keeps the original rebuild path.
 inline std::atomic<AdaptiveFeatureMode> adaptive_feature_mode{AdaptiveFeatureMode::OFF};
 inline void (*adaptive_configuration_settings)(gpu_comparison::Identity*) = nullptr;
@@ -10554,6 +10560,20 @@ inline void PrepareAdaptiveTier(FeatureState* feature, const adaptive_resolution
   }
   PollAdaptiveCache(cache.get());
   const auto mode = adaptive_feature_mode.load();
+  const bool adjacent_preparation = frame.upper_capacity && mode == AdaptiveFeatureMode::UPPER_CAPACITY_ADJACENT;
+  size_t preparation_slot = frame.session->level;
+  if (adjacent_preparation && cache->active == frame.session->level
+      && !frame.session->trial && !frame.session->blocked && !frame.session->defer_preparation) {
+    preparation_slot = cache->count;
+    for (size_t index = 0; index < cache->count; ++index) {
+      if (!frame.session->IsLegal(frame.session->ladder.sizes[index])) continue;
+      const float coefficient = frame.session->ladder.coefficients[index];
+      if (coefficient >= frame.session->ladder.coefficients[cache->active]) continue;
+      if (preparation_slot == cache->count || coefficient > frame.session->ladder.coefficients[preparation_slot]) {
+        preparation_slot = index;
+      }
+    }
+  }
   size_t slot = cache->count;
   for (size_t index = 0; index < cache->count; ++index) {
     const auto& tier = cache->tiers[index];
@@ -10562,8 +10582,9 @@ inline void PrepareAdaptiveTier(FeatureState* feature, const adaptive_resolution
     }
     if (index == cache->active || !frame.session->IsLegal(frame.session->ladder.sizes[index])) continue;
     if ((frame.session->defer_preparation
-            || (frame.upper_capacity && mode == AdaptiveFeatureMode::UPPER_CAPACITY_ON_DEMAND))
-        && index != frame.session->level) continue;
+            || (frame.upper_capacity && mode == AdaptiveFeatureMode::UPPER_CAPACITY_ON_DEMAND)
+            || adjacent_preparation)
+        && index != preparation_slot) continue;
     if ((cache->ladder.sizes[index] != frame.session->ladder.sizes[index]
             || !tier.output_completions.contains(frame.output_identity)) && slot == cache->count) {
       slot = index;
@@ -10599,7 +10620,8 @@ inline void PrepareAdaptiveTier(FeatureState* feature, const adaptive_resolution
     bool retain_feature = allow_feature_capacity_reuse
         && (mode == AdaptiveFeatureMode::RETAIN
             || (frame.upper_capacity && (mode == AdaptiveFeatureMode::UPPER_CAPACITY
-                || mode == AdaptiveFeatureMode::UPPER_CAPACITY_ON_DEMAND)))
+                || mode == AdaptiveFeatureMode::UPPER_CAPACITY_ON_DEMAND
+                || mode == AdaptiveFeatureMode::UPPER_CAPACITY_ADJACENT)))
         && hook_point.load() == kHookUpscaled && stack_passes.load() == 1 && tier.state.pass_offset == 0
         && direct_runtime_requirements.file_version == "310.9.16.0"
         && model.handle != nullptr && model.parameters != nullptr && !model.failed && model.nr_preset == 2
@@ -11690,7 +11712,8 @@ inline bool RecordInline(
   }
   const auto feature_mode = adaptive_feature_mode.load();
   const bool upper_capacity = (feature_mode == AdaptiveFeatureMode::UPPER_CAPACITY
-          || feature_mode == AdaptiveFeatureMode::UPPER_CAPACITY_ON_DEMAND)
+          || feature_mode == AdaptiveFeatureMode::UPPER_CAPACITY_ON_DEMAND
+          || feature_mode == AdaptiveFeatureMode::UPPER_CAPACITY_ADJACENT)
       && present == nullptr && hook_point.load() == kHookUpscaled
       && plan.valid && !plan.mixed && plan.group_count == 1
       && group.stage == stage_plan::Stage::UPSCALED && group.begin == 0 && group.count == 1

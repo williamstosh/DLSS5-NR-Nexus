@@ -2412,9 +2412,11 @@ inline bool native_resize_ready = false;
 inline bool native_resize_create_runtime_locked = false;
 inline bool native_resize_create_ngx_call = false;
 inline bool native_resize_demand_prepare = false;
+inline bool native_resize_create_gpu = false;
 inline std::vector<nlohmann::json> native_resize_create_calls;
 inline std::vector<uintptr_t> native_resize_models;
 inline std::vector<bool> native_resize_preparing;
+inline std::vector<double> native_resize_evaluate_cpu_ms;
 inline bool native_resize_fixed_input = false;
 inline bool native_resize_observe_parameters = false;
 inline uint32_t native_resize_frame = UINT32_MAX;
@@ -2438,10 +2440,18 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeResizeCreate(
     const NVSDK_NGX_Parameter* parameters, NVSDK_NGX_Handle** handle) {
   native_resize_create_runtime_locked = renodx::addons::dlss5::runtime_lock::State::HeldByThisThread();
   native_resize_create_ngx_call = renodx::addons::dlss5::ngx_serial::depth != 0;
+  const bool timed = native_resize_create_gpu && native_cost_queries != nullptr && list == native_cost_list;
+  if (timed) {
+    Check(native_resize_creates == 0, "consecutive demand records at most one actual Create per source frame");
+    native_cost_queries->Begin(list, native_cost_interval + 3);
+  }
   const auto start = std::chrono::steady_clock::now();
   const auto result = native_resize_create(list, feature, parameters, handle);
   const auto end = std::chrono::steady_clock::now();
   const double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
+  if (timed) {
+    list->EndQuery(native_cost_queries->heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2 * (native_cost_interval + 3) + 1);
+  }
   native_resize_create_ms += elapsed_ms;
   ++native_resize_creates;
   if (native_resize_demand_prepare) {
@@ -2452,6 +2462,13 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeResizeCreate(
         {"cpu_ms", elapsed_ms}, {"begin_ns", std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count()},
         {"end_ns", std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count()},
         {"runtime_mutex_held", native_resize_create_runtime_locked}, {"ngx_call_active", native_resize_create_ngx_call}});
+    const auto* frame = (addon::preparing_adaptive_frame != nullptr ? addon::preparing_adaptive_frame : addon::active_adaptive_frame);
+    if (frame != nullptr && frame->session != nullptr) {
+      const auto& session = *frame->session;
+      native_resize_create_calls.back()["session"] = {{"requested_slot", session.level}, {"source_active_slot", session.active_level},
+          {"preparing_slot", frame->slot}, {"preparing", frame->preparing}, {"trial", session.trial},
+          {"blocked", session.blocked}, {"defer_preparation", session.defer_preparation}};
+    }
   }
   return result;
 }
@@ -2631,7 +2648,8 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeRuntimeEvaluate(
   }
   const auto start = std::chrono::steady_clock::now();
   const NVSDK_NGX_Result result = native_runtime_evaluate(command_list, handle, parameters, progress);
-  native_resize_evaluate_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  const double evaluate_cpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  native_resize_evaluate_ms += evaluate_cpu_ms;
   if (observe_parameters) {
     native_resize_parameter_snapshots.back()["result"] = static_cast<uint32_t>(result);
   }
@@ -2648,6 +2666,9 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeRuntimeEvaluate(
   if (native_resize_ready) {
     native_resize_models.push_back(reinterpret_cast<uintptr_t>(handle));
     native_resize_preparing.push_back(addon::preparing_adaptive_frame != nullptr);
+    if (native_resize_demand_prepare) {
+      native_resize_evaluate_cpu_ms.push_back(evaluate_cpu_ms);
+    }
   }
   native_runtime_results.push_back(result);
   return result;
@@ -2666,7 +2687,8 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
   const bool diagnostic_probe = cold_prepare || single_feature;
   const auto* demand_prepare_environment = std::getenv("NR_NEXUS_TEST_RESIZE_DEMAND_PREPARE");
   const bool demand_prepare = resize_test && demand_prepare_environment != nullptr
-      && std::strcmp(demand_prepare_environment, "1") == 0;
+      && (std::strcmp(demand_prepare_environment, "1") == 0 || std::strcmp(demand_prepare_environment, "2") == 0);
+  const bool demand_adjacent = demand_prepare && std::strcmp(demand_prepare_environment, "2") == 0;
   bool demand_validation_failed = false;
   nlohmann::json resize_report;
   try {
@@ -4073,21 +4095,32 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       const bool expect_reuse = expect_requested && !demand_prepare;
       const auto* reuse_feature_environment = std::getenv("NR_NEXUS_TEST_RESIZE_REUSE_FEATURE");
       auto feature_mode = addon::AdaptiveFeatureMode::OFF;
+      const char* feature_mode_name = "OFF";
       if (reuse_feature_environment != nullptr) {
         if (std::strcmp(reuse_feature_environment, "1") == 0) {
           feature_mode = addon::AdaptiveFeatureMode::RETAIN;
+          feature_mode_name = "RETAIN";
         } else if (std::strcmp(reuse_feature_environment, "2") == 0) {
           feature_mode = addon::AdaptiveFeatureMode::UPPER_CAPACITY;
+          feature_mode_name = "UPPER_CAPACITY";
         } else if (std::strcmp(reuse_feature_environment, "3") == 0) {
           Check(demand_prepare, "mode 3 is only supported by the Session-driven demand fixture");
           feature_mode = addon::AdaptiveFeatureMode::UPPER_CAPACITY_ON_DEMAND;
+          feature_mode_name = "UPPER_CAPACITY_ON_DEMAND";
+        } else if (std::strcmp(reuse_feature_environment, "4") == 0) {
+          Check(demand_adjacent, "mode 4 is only supported by the consecutive demand fixture");
+          feature_mode = addon::AdaptiveFeatureMode::UPPER_CAPACITY_ADJACENT;
+          feature_mode_name = "UPPER_CAPACITY_ADJACENT";
         }
       }
       const bool reuse_feature = feature_mode != addon::AdaptiveFeatureMode::OFF;
       const bool on_demand = feature_mode == addon::AdaptiveFeatureMode::UPPER_CAPACITY_ON_DEMAND;
-      const bool upper_capacity = feature_mode == addon::AdaptiveFeatureMode::UPPER_CAPACITY || on_demand;
-      Check(!demand_prepare || (native_resize_ready && upper_capacity && !settings_requested),
-            "demand comparison requires the ready fixture and mode 2 or 3 with the old settings sequence disabled");
+      const bool adjacent_ready = feature_mode == addon::AdaptiveFeatureMode::UPPER_CAPACITY_ADJACENT;
+      const bool upper_capacity = feature_mode == addon::AdaptiveFeatureMode::UPPER_CAPACITY || on_demand || adjacent_ready;
+      const bool demand_mode_valid = on_demand
+          || (demand_adjacent ? adjacent_ready : feature_mode == addon::AdaptiveFeatureMode::UPPER_CAPACITY);
+      Check(!demand_prepare || (native_resize_ready && demand_mode_valid && !settings_requested),
+            "demand comparison requires ready mode 2/3 for variant 1 or mode 3/4 for variant 2, with settings edits disabled");
       const auto* fixed_input_environment = std::getenv("NR_NEXUS_TEST_RESIZE_FIXED_INPUT");
       const bool fixed_input = fixed_input_environment != nullptr && std::strcmp(fixed_input_environment, "1") == 0;
       Check(!fixed_input || settings_reuse, "fixed-input attribution requires the existing settings sequence");
@@ -4101,8 +4134,9 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       Check(addon::adaptive_feature_mode.load() == addon::AdaptiveFeatureMode::OFF, "Feature capacity reuse is disabled by default");
       addon::adaptive_feature_mode = feature_mode;
       native_resize_demand_prepare = demand_prepare;
+      native_resize_create_gpu = demand_adjacent;
       const uint32_t frame_count = (demand_prepare ? 900u : (settings_reuse ? 360u : 180u));
-      const UINT intervals_per_frame = (native_resize_ready ? 3u : 2u);
+      const UINT intervals_per_frame = (demand_adjacent ? 4u : (native_resize_ready ? 3u : 2u));
       auto queries = d3d12_test::CreateTimestampQueries(gpu, frame_count * intervals_per_frame);
       ComPtr<IDXGIAdapter3> adapter;
       Check(SUCCEEDED(gpu.factory->EnumAdapterByLuid(gpu.device->GetAdapterLuid(), IID_PPV_ARGS(&adapter))),
@@ -4134,8 +4168,9 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           {"settings_reuse_sequence", settings_reuse},
           {"expect_settings_reuse", expect_reuse},
           {"demand_prepare_sequence", demand_prepare},
+          {"demand_prepare_variant", (demand_prepare ? (demand_adjacent ? 2 : 1) : 0)},
           {"feature_capacity_reuse_experiment", reuse_feature},
-          {"feature_mode", (on_demand ? "UPPER_CAPACITY_ON_DEMAND" : (upper_capacity ? "UPPER_CAPACITY" : (reuse_feature ? "RETAIN" : "OFF")))},
+          {"feature_mode", feature_mode_name},
           {"fixed_input_probe", fixed_input},
           {"performance_comparison_valid", !fixed_input},
           {"parameter_snapshot_scope", "actual Core entry at frames 285-299; scalar availability recorded by type; identities are separate"},
@@ -4181,6 +4216,11 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       double demand_startup_create_ms = 0., demand_total_create_ms = 0.;
       uint64_t demand_peak_bytes = 0;
       size_t demand_previous_active = 0;
+      size_t demand_previous_requested = 0;
+      bool demand_previous_trial = false;
+      std::array<bool, 3> demand_trial_accepted{}, demand_applied_slots{}, demand_standby_evaluated{};
+      bool demand_initial_neighbor_ready = false;
+      bool demand_second_prefetch_observed = false;
       bool demand_lower_applied = false, demand_returned_upper = false;
       namespace output_rate = renodx::addons::dlss5::output_framerate;
       namespace adaptive = renodx::addons::dlss5::adaptive_resolution;
@@ -4199,6 +4239,11 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
             {"upper_model", initial_models[0]}, {"upper_parameters", initial_parameters[0]},
             {"submission_path", "queue hook registers once; healthy fixture fence, Reset, production receipt preservation and timing Poll"},
             {"cost_scope", "each frame retains actual Create calls, wrapper time and next successful source-start gap; deferred Create remains foreground cold cost"}};
+        if (demand_adjacent) {
+          report["demand_preparation"]["mock_fps_from_frame_360"] = nullptr;
+          report["demand_preparation"]["mock_fps_by_frame_start_active_slot"] = {80, 90, 100};
+          report["demand_preparation"]["create_gpu_scope"] = "timestamps bracket commands recorded by Create on the provided list; internal GPU/model preparation remains unobserved";
+        }
       }
       const auto submit_resize = [&] {
         if (!demand_prepare) {
@@ -4291,17 +4336,23 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         const bool changed = !demand_prepare && (frame == 60 || frame == 120);
         const char* setting_event = "none";
         std::array<bool, renodx::addons::dlss5::adaptive_resolution::MAX_LEVELS> demand_ready_before{};
-        const double mock_output_fps = (frame < 360 ? 120. : 80.);
+        double mock_output_fps = (frame < 360 ? 120. : 80.);
+        size_t demand_active_before = 0;
         int64_t mock_window_end_ns = 0;
         if (demand_prepare) {
           mock_window_end_ns = addon::SteadyNowNs();
           const auto& feature = addon::features.at(owner);
           if (feature.adaptive_cache != nullptr) {
+            demand_active_before = feature.adaptive_cache->active;
             for (size_t slot = 0; slot < feature.adaptive_cache->count; ++slot) {
               const auto& tier = feature.adaptive_cache->tiers[slot];
               demand_ready_before[slot] = tier.ready && tier.completion != nullptr
                   && tier.completion->closed.load() && tier.completion->submitted.load() && tier.completion->completed_healthy;
             }
+          }
+          if (demand_adjacent && frame >= 360) {
+            Check(demand_active_before < 3, "consecutive MOCK output uses the actual three-slot active state");
+            mock_output_fps = 80. + 10. * demand_active_before;
           }
           std::unique_lock lock(output_rate::internal::state.mutex);
           auto& estimate = output_rate::internal::state.stream;
@@ -4377,6 +4428,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         native_runtime_resets.clear();
         native_resize_models.clear();
         native_resize_preparing.clear();
+        native_resize_evaluate_cpu_ms.clear();
         native_resize_parameter_snapshots.clear();
         native_resize_create_calls.clear();
         native_resize_fixed_input_cpu_ms = 0.;
@@ -4410,10 +4462,16 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         gpu.list->ResolveQueryData(queries.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
             2 * native_cost_interval, 2u * (1u + static_cast<UINT>(native_runtime_results.size())),
             queries.readback.Get(), 2ull * native_cost_interval * sizeof(uint64_t));
+        if (demand_adjacent && native_resize_creates != 0) {
+          gpu.list->ResolveQueryData(queries.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+              2 * (native_cost_interval + 3), 2, queries.readback.Get(),
+              2ull * (native_cost_interval + 3) * sizeof(uint64_t));
+        }
         nlohmann::json tiers_before = nlohmann::json::array();
         if (native_resize_ready) {
           Check(native_resize_preparing.size() == native_runtime_results.size()
-                    && native_resize_models.size() == native_runtime_results.size(),
+                    && native_resize_models.size() == native_runtime_results.size()
+                    && (!demand_prepare || native_resize_evaluate_cpu_ms.size() == native_runtime_results.size()),
                 "every real resize Evaluate records its model and preparation context");
           const auto preparation_count = static_cast<size_t>(std::count(native_resize_preparing.begin(), native_resize_preparing.end(), true));
           const auto active_count = native_resize_preparing.size() - preparation_count;
@@ -4455,13 +4513,21 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         Check(SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memory_after)), "resize memory after retirement");
         const auto wrapper_gpu = queries.Read(native_cost_interval);
         const auto nr_gpu = (evaluated ? queries.Read(native_cost_interval + 1) : d3d12_test::TimestampSample{});
+        if (demand_adjacent && native_resize_creates != 0) {
+          const auto create_gpu = queries.Read(native_cost_interval + 3);
+          for (auto& call : native_resize_create_calls) {
+            call["gpu_recording_ms"] = create_gpu.gpu_ms;
+            call["gpu_begin_tick"] = create_gpu.begin_tick;
+            call["gpu_end_tick"] = create_gpu.end_tick;
+          }
+        }
         const auto cache = addon::features.at(owner).adaptive_cache;
         if (native_resize_ready) addon::PollAdaptiveCache(cache.get());
         const auto active = (native_resize_ready ? static_cast<uint32_t>(cache->active) : 0u);
         const auto& workset = addon::worksets.at({owner, output.Get(), false, active});
         nlohmann::json tier_states = nlohmann::json::array();
         nlohmann::json evaluations = nlohmann::json::array();
-        uint32_t actual_resident_features = 0, new_demand_models = 0;
+        uint32_t actual_resident_features = 0, new_demand_models = 0, first_standby_evaluates = 0;
         if (native_resize_ready) {
           bool all_ready = true;
           std::set<uintptr_t> models, proxies;
@@ -4482,13 +4548,25 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                 ++demand_slot_creates[slot];
                 initial_models[slot] = model;
                 initial_parameters[slot] = model_parameters;
-                Check(!on_demand || (slot == 1 && addon::features.at(owner).adaptive_session->level == slot),
-                      "on-demand creates only the first tier actually requested by Session");
+                Check(!on_demand || ((slot == 1 || (demand_adjacent && slot == 2))
+                          && addon::features.at(owner).adaptive_session->level == slot),
+                      "on-demand creates only a tier actually requested by Session");
                 bool observed_create = false;
                 for (auto& call : native_resize_create_calls) {
                   if (call.at("model").get<uintptr_t>() == model) {
                     call["slot"] = slot;
                     observed_create = true;
+                    if (adjacent_ready && call.at("session").at("requested_slot").get<size_t>() != slot) {
+                      const auto& context = call.at("session");
+                      const auto requested = context.at("requested_slot").get<size_t>();
+                      Check(slot == requested + 1 && context.at("source_active_slot").get<size_t>() == requested
+                                && !context.at("trial").get<bool>() && !context.at("blocked").get<bool>()
+                                && !context.at("defer_preparation").get<bool>(),
+                            "unrequested adjacent Create occurs only beside the accepted legal active tier outside a trial");
+                      if (slot == 2) {
+                        demand_second_prefetch_observed = true;
+                      }
+                    }
                   }
                 }
                 Check(observed_create, "each newly resident demand Feature has an actual observed Create call");
@@ -4499,7 +4577,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                 Check(proxy == stable_proxies[slot] && workset_id == stable_worksets[slot],
                       "demand decisions preserve each previously allocated workset and proxy");
               }
-              if (on_demand && slot == 2) {
+              if (on_demand && !demand_adjacent && slot == 2) {
                 Check(model == 0 && proxy == 0 && tier.completion == nullptr && !tier.ready,
                       "the unrequested second standby owns no Feature, workset or readiness receipt");
               }
@@ -4620,6 +4698,21 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                 {"preparing", static_cast<bool>(native_resize_preparing[index])},
                 {"reset", native_runtime_resets[index]}, {"gpu_ms", sample.gpu_ms},
                 {"begin_tick", sample.begin_tick}, {"end_tick", sample.end_tick}});
+            if (demand_prepare) {
+              evaluations.back()["cpu_ms"] = native_resize_evaluate_cpu_ms[index];
+            }
+            if (demand_adjacent) {
+              size_t slot = 0;
+              while (slot < cache->count && initial_models[slot] != native_resize_models[index]) {
+                ++slot;
+              }
+              Check(slot < cache->count, "consecutive Evaluate belongs to an observed retained Feature slot");
+              const bool first = slot != 0 && !demand_standby_evaluated[slot];
+              demand_standby_evaluated[slot] = true;
+              first_standby_evaluates += first;
+              evaluations.back()["slot"] = slot;
+              evaluations.back()["first_standby_evaluate"] = first;
+            }
           }
         }
         if (native_resize_ready && !demand_prepare && frame < 60) {
@@ -4638,9 +4731,10 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         if (demand_prepare) {
           auto& session = *addon::features.at(owner).adaptive_session;
           auto& demand = report["demand_preparation"];
-          Check(cache->count == 3 && session.level < 2 && active < 2 && new_demand_models == native_resize_creates
+          Check(cache->count == 3 && session.level < (demand_adjacent ? 3u : 2u) && active < (demand_adjacent ? 3u : 2u)
+                    && new_demand_models == native_resize_creates
                     && native_resize_releases == 0 && source_successes_after == source_successes_before + 1,
-                "Session demand run preserves the active source chain and never requests the unused second standby");
+                "Session demand run preserves the active source chain and stays within its tested logical tiers");
           demand_requested_slots[session.level] = true;
           demand_total_creates += native_resize_creates;
           demand_total_create_ms += native_resize_create_ms;
@@ -4659,25 +4753,56 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
             demand["first_request_baseline_gpu_ms"] = session.baseline_gpu_us / 1000.;
             demand["first_request_baseline_fps"] = session.baseline_fps;
           }
+          if (demand_adjacent && session.level == 2 && !demand.contains("second_request_frame")) {
+            demand["second_request_frame"] = frame;
+            demand["second_request_baseline_gpu_ms"] = session.baseline_gpu_us / 1000.;
+            demand["second_request_baseline_fps"] = session.baseline_fps;
+          }
           if (session.level != active) {
             ++demand_wait_frames;
-            Check(session.level == 1 && active == 0 && native_resize_models[0] == initial_models[0]
+            Check((demand_adjacent ? session.level == active + 1 : session.level == 1 && active == 0)
+                      && native_resize_models[0] == initial_models[active]
                       && !native_resize_preparing[0],
-                  "while demand preparation is pending, the actual successful NR output remains the legal upper Feature");
+                  "while demand preparation is pending, actual successful NR continues on the legal current Feature");
           }
           if (active != demand_previous_active) {
             Check(demand_ready_before[active] && native_resize_models[0] == initial_models[active]
                       && !native_resize_preparing[0] && native_runtime_resets[0] == 1,
                   "demand activation evaluates the retained Feature with Reset after an already healthy preparation receipt");
+            if (demand_adjacent && active > demand_previous_active) {
+              Check(active == demand_previous_active + 1, "consecutive demand descends through the adjacent healthy tiers in order");
+            }
           }
-          if (active == 1) {
+          if (active == 1 || (demand_adjacent && active == 2)) {
             demand_lower_applied = true;
             Check(cache->tiers[active].ready && session.status.applied == session.ladder.sizes[active]
                       && workset.input_width == session.ladder.sizes[active][0].width
                       && workset.input_height == session.ladder.sizes[active][0].height,
                   "the requested smaller physical NR workset actually applies after healthy GPU preparation");
-            if (!demand.contains("first_lower_applied_frame")) {
+            if (active == 1 && !demand.contains("first_lower_applied_frame")) {
               demand["first_lower_applied_frame"] = frame;
+            }
+            if (demand_adjacent && active == 2 && !demand.contains("second_lower_applied_frame")) {
+              demand["second_lower_applied_frame"] = frame;
+            }
+          }
+          if (demand_adjacent) {
+            demand_applied_slots[active] = true;
+            if (demand_previous_trial && demand_previous_requested == 1 && session.level == 2 && !demand_trial_accepted[1]) {
+              // Prepare can accept trial 1 and request tier 2 in the same call.
+              demand_trial_accepted[1] = true;
+              demand["first_trial_accepted_frame"] = frame;
+              demand["first_trial_acceptance_observation"] = "inferred from Session accepting trial 1 before requesting tier 2 in the same Prepare";
+            }
+            if (active != 0 && session.level == active && demand_previous_requested == active && demand_previous_trial
+                && !session.trial && !session.blocked && session.status.reason == adaptive::Reason::OBSERVING
+                && !demand_trial_accepted[active]) {
+              demand_trial_accepted[active] = true;
+              const char* key = (active == 1 ? "first_trial_accepted_frame" : "second_trial_accepted_frame");
+              demand[key] = frame;
+              if (active == 1) {
+                demand["first_trial_acceptance_observation"] = "observed trial completion while tier 1 remained active and requested";
+              }
             }
           }
           if (demand_lower_applied && active == 0 && session.level == 0 && session.status.reason == adaptive::Reason::NO_BENEFIT) {
@@ -4693,8 +4818,14 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
             demand["startup"] = {{"configured_slots", cache->count}, {"actual_resident_features", actual_resident_features},
                 {"standby_create_count", demand_startup_creates}, {"cpu_create_total_ms", demand_startup_create_ms},
                 {"peak_local_bytes", demand_peak_bytes}, {"tiers", tier_states}};
+            if (demand_adjacent) {
+              demand_initial_neighbor_ready = cache->tiers[1].ready;
+              demand["startup"]["first_neighbor_ready"] = demand_initial_neighbor_ready;
+            }
           }
           demand_previous_active = active;
+          demand_previous_requested = session.level;
+          demand_previous_trial = session.trial;
         }
         Check(gpu.fence->GetCompletedValue() >= gpu.serial && gpu.fence->GetCompletedValue() != UINT64_MAX
                   && SUCCEEDED(gpu.device->GetDeviceRemovedReason()), "resize GPU fence completes on healthy device");
@@ -4769,9 +4900,15 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
               {"requested_slot_ready_before_recording", demand_ready_before[session.level]},
               {"active_slot_ready_before_recording", demand_ready_before[active]},
               {"actual_resident_features", actual_resident_features}, {"configured_slots", cache->count}};
+          if (demand_adjacent) {
+            report["frames"].back()["first_standby_evaluate_count"] = first_standby_evaluates;
+            report["frames"].back()["demand"]["frame_start_active_slot"] = demand_active_before;
+            report["frames"].back()["demand"]["defer_preparation"] = session.defer_preparation;
+          }
           if (frame != 0) {
             auto& previous_frame = report["frames"][frame - 1];
-            if (previous_frame.at("cpu_create_count").get<uint32_t>() != 0) {
+            if (previous_frame.at("cpu_create_count").get<uint32_t>() != 0
+                || (demand_adjacent && previous_frame.value("first_standby_evaluate_count", 0u) != 0)) {
               previous_frame["next_successful_source_frame"] = frame;
               previous_frame["next_successful_source_start_gap_ms"] = report["frames"].back().at("start_ms").get<double>()
                   - previous_frame.at("start_ms").get<double>();
@@ -4811,16 +4948,35 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
               {"slot_create_counts", demand_slot_creates}, {"requested_slots", demand_requested_slots},
               {"pending_upper_source_frames", demand_wait_frames}, {"lower_actually_applied", demand_lower_applied},
               {"no_benefit_returned_original_upper", demand_returned_upper}, {"peak_local_bytes", demand_peak_bytes}};
-          const bool passed = preparing_evaluates != 0 && demand_startup_creates == (on_demand ? 0u : 2u)
+          bool passed = false;
+          if (demand_adjacent) {
+            auto& result = report["demand_preparation"]["result"];
+            result.erase("pending_upper_source_frames");
+            result.erase("no_benefit_returned_original_upper");
+            result["pending_legal_source_frames"] = demand_wait_frames;
+            result["applied_slots"] = demand_applied_slots;
+            result["trial_accepted"] = demand_trial_accepted;
+            result["second_standby_unrequested_create"] = demand_second_prefetch_observed;
+            result["final_active_slot"] = addon::features.at(owner).adaptive_cache->active;
+            passed = preparing_evaluates != 0 && demand_startup_creates == (adjacent_ready ? 1u : 0u)
+                && demand_total_creates == 2 && demand_slot_creates[1] == 1 && demand_slot_creates[2] == 1
+                && demand_requested_slots[1] && demand_requested_slots[2] && demand_applied_slots[1] && demand_applied_slots[2]
+                && demand_trial_accepted[1] && demand_trial_accepted[2] && (!adjacent_ready || demand_initial_neighbor_ready)
+                && addon::features.at(owner).adaptive_cache->active == 2 && addon::nr_resolution_scale.load() == 1.f;
+          } else {
+            passed = preparing_evaluates != 0 && demand_startup_creates == (on_demand ? 0u : 2u)
                     && demand_total_creates == (on_demand ? 1u : 2u)
                     && demand_slot_creates[1] == 1 && demand_slot_creates[2] == (on_demand ? 0u : 1u)
                     && !demand_requested_slots[2] && demand_requested_slots[1]
                     && demand_lower_applied && demand_returned_upper && (!on_demand || demand_wait_frames != 0)
                     && addon::nr_resolution_scale.load() == 1.f;
+          }
           report["probe_execution"] = (passed ? "Passed" : "Failed");
           if (!passed) {
             demand_validation_failed = true;
-            report["failure"] = "real Session demand trial did not reach its completed lower tier and return to the original upper with the expected standby Create counts";
+            report["failure"] = (demand_adjacent
+                ? "real Session did not accept both consecutive healthy lower tiers with the expected standby Create counts and initial adjacent readiness"
+                : "real Session demand trial did not reach its completed lower tier and return to the original upper with the expected standby Create counts");
           }
         } else {
           Check(recorded_ready && addon::nr_resolution_scale.load() == 1.f,
@@ -4848,6 +5004,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           native_runtime_resets.clear();
           native_resize_models.clear();
           native_resize_preparing.clear();
+          native_resize_evaluate_cpu_ms.clear();
           native_resize_create_ms = native_resize_release_ms = native_resize_host_ms = native_resize_evaluate_ms = 0;
           native_resize_creates = native_resize_releases = 0;
           gpu.list->ClearState(nullptr);
@@ -4917,7 +5074,9 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       addon::core_release_feature = native_resize_release;
       addon::adaptive_feature_mode = addon::AdaptiveFeatureMode::OFF;
       native_resize_demand_prepare = false;
+      native_resize_create_gpu = false;
       native_resize_create_calls.clear();
+      native_resize_evaluate_cpu_ms.clear();
       if (demand_prepare) {
         std::unique_lock lock(output_rate::internal::state.mutex);
         output_rate::internal::state.stream = {};
@@ -5593,12 +5752,14 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
   } catch (const std::exception& error) {
     addon::adaptive_feature_mode = addon::AdaptiveFeatureMode::OFF;
     native_resize_demand_prepare = false;
+    native_resize_create_gpu = false;
     if (demand_prepare) {
       resize_report["failed_create_calls"] = native_resize_create_calls;
       std::unique_lock lock(renodx::addons::dlss5::output_framerate::internal::state.mutex);
       renodx::addons::dlss5::output_framerate::internal::state.stream = {};
     }
     native_resize_create_calls.clear();
+    native_resize_evaluate_cpu_ms.clear();
     native_resize_fixed_input = false;
     native_resize_observe_parameters = false;
     native_resize_frame = UINT32_MAX;
@@ -5621,12 +5782,14 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
   } catch (...) {
     addon::adaptive_feature_mode = addon::AdaptiveFeatureMode::OFF;
     native_resize_demand_prepare = false;
+    native_resize_create_gpu = false;
     if (demand_prepare) {
       resize_report["failed_create_calls"] = native_resize_create_calls;
       std::unique_lock lock(renodx::addons::dlss5::output_framerate::internal::state.mutex);
       renodx::addons::dlss5::output_framerate::internal::state.stream = {};
     }
     native_resize_create_calls.clear();
+    native_resize_evaluate_cpu_ms.clear();
     native_resize_fixed_input = false;
     native_resize_observe_parameters = false;
     native_resize_frame = UINT32_MAX;
