@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <utility>
 #include <vector>
 
 namespace adaptive_fg_service_cases {
@@ -104,7 +105,7 @@ int Run() {
     uint32_t preparation_calls = 0;
     uint32_t preparation_failures = 0;
     uint64_t observing_context = 0;
-    std::array<uint32_t, 2> active_pass_masks{}, failed_pass_masks{};
+    std::array<uint32_t, 2> active_pass_masks{}, failed_pass_masks{}, reset_pass_masks{};
     uint32_t partial_role_recordings = 0;
     model_parameter_observer = [&](const NVSDK_NGX_Handle* model, const NVSDK_NGX_Parameter* parameters) {
       Check(native::GetD3D12Resource(parameters, "DLSSNR.ControlMask") != nullptr,
@@ -126,6 +127,9 @@ int Run() {
             Check(!identified && ((active_pass_masks[role] | failed_pass_masks[role]) & (1u << pass)) == 0,
                 "the actual model handle identifies one active role and one new Pass invocation");
             identified = true;
+            if (native::GetInt(parameters, "DLSSNR.Reset") != 0) {
+              reset_pass_masks[role] |= 1u << pass;
+            }
             if (failing) {
               failed_pass_masks[role] |= 1u << pass;
             } else {
@@ -189,6 +193,7 @@ int Run() {
       observing_context = input.context;
       active_pass_masks = {};
       failed_pass_masks = {};
+      reset_pass_masks = {};
       const auto before_list_calls = list_calls.size();
       const auto result = native::fg_service::Service(input);
       for (size_t index = before_list_calls; index < list_calls.size(); ++index) {
@@ -379,18 +384,89 @@ int Run() {
         "dual-color cold maturation observes partial Pass masks without treating them as a complete color group");
     const auto role_models = native::nr_features_created;
     const auto role_worksets = native::worksets_created;
+    auto paused_primary_readback = gpu.CreateTextureTransfer(color.Get());
+    auto paused_auxiliary_readback = gpu.CreateTextureTransfer(hudless.Get());
+    const auto seed_paused_colors = [&] {
+      for (auto* surface : {color.Get(), hudless.Get()}) {
+        gpu.Transition(surface, NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
+        gpu.Write(surface, 0x7f);
+        gpu.Transition(surface, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
+      }
+      gpu.Submit();
+    };
+    const auto check_paused_colors = [&] {
+      for (const auto& [surface, readback] : {std::pair{color.Get(), &paused_primary_readback},
+               std::pair{hudless.Get(), &paused_auxiliary_readback}}) {
+        gpu.Transition(surface, NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        gpu.RecordTextureReadback(surface, *readback);
+        gpu.Transition(surface, D3D12_RESOURCE_STATE_COPY_SOURCE, NATIVE_INPUT_STATE);
+      }
+      gpu.Submit();
+      for (const auto* readback : {&paused_primary_readback, &paused_auxiliary_readback}) {
+        const auto pixels = gpu.ReadTexture(*readback);
+        Check(std::all_of(pixels.begin(), pixels.end(), [](uint8_t value) { return value == 0x7f; }),
+            "an unavailable role never writes a retained old NR color back to either game surface");
+      }
+    };
+    seed_paused_colors();
     input.hudless = nullptr;
+    const auto before_missing_calls = model_calls;
     const auto missing = service();
+    // PREPARED is the Service recording contract; the selected color group is not ready.
     Check(missing == fg::Result::PREPARED
+        && dual.adaptive_role_unavailable && !dual.adaptive_session->prepared
+        && dual.adaptive_session->status.reason == addon::adaptive_resolution::Reason::UNSUPPORTED
+        && !dual.adaptive_session->failed && model_calls == before_missing_calls
         && native::features.at(dual.roles[0].Handle()).adaptive_cache == primary
         && native::features.at(dual.roles[1].Handle()).adaptive_cache == auxiliary
         && native::nr_features_created == role_models && native::worksets_created == role_worksets,
-        "a temporarily absent prepared role pauses the frame without flushing compatible color allocations");
+        "a temporarily absent role closes the ready gate and reports input unavailability while retaining compatible allocations");
+    check_paused_colors();
     input.hudless = hudless.Get();
+    const auto short_resume_ns = native::SteadyNowNs();
     Check(service() == fg::Result::SUBMITTED && dual.adaptive_session->prepared
+        && !dual.adaptive_role_unavailable && reset_pass_masks[0] == 3 && reset_pass_masks[1] == 3
         && dual.adaptive_session->status.ready_levels == 2
+        && dual.adaptive_session->stable_after_ns >= short_resume_ns + addon::adaptive_resolution::WARMUP_NS
         && native::nr_features_created == role_models && native::worksets_created == role_worksets,
-        "both retained colors resume as one complete selected set with no additional preparation allocation");
+        "both retained colors and both Passes resume with Reset and one new warmup without additional preparation allocation");
+    const auto short_resume_stable_ns = dual.adaptive_session->stable_after_ns;
+    Check(service() == fg::Result::SUBMITTED && dual.adaptive_session->stable_after_ns == short_resume_stable_ns,
+        "a subsequent healthy frame does not restart the resumed collection's warmup");
+
+    seed_paused_colors();
+    input.hudless = nullptr;
+    Check(service() == fg::Result::PREPARED, "a second role interruption begins a retained pause");
+    const auto paused_stable_ns = dual.adaptive_session->stable_after_ns;
+    const auto paused_calls = model_calls;
+    const auto paused_preparation_calls = preparation_calls;
+    const auto paused_source_successes = native::SourceSuccessfulEvaluations();
+    for (uint32_t frame = 0; frame <= native::kContractDebounceFrames * 8; ++frame) {
+      Check(service() == fg::Result::PREPARED && dual.adaptive_role_unavailable
+          && !dual.adaptive_session->prepared && !dual.adaptive_session->failed && !dual.adaptive_session->trial
+          && dual.adaptive_session->status.reason == addon::adaptive_resolution::Reason::UNSUPPORTED
+          && dual.adaptive_session->status.ready_levels == 0
+          && dual.adaptive_session->stable_after_ns == paused_stable_ns
+          && model_calls == paused_calls && preparation_calls == paused_preparation_calls
+          && native::SourceSuccessfulEvaluations() == paused_source_successes
+          && native::features.at(dual.roles[0].Handle()).adaptive_cache == primary
+          && native::features.at(dual.roles[1].Handle()).adaptive_cache == auxiliary
+          && native::nr_features_created == role_models && native::worksets_created == role_worksets,
+          "persistent missing input stays unavailable beyond 240 frames without execution, preparation, allocation, or warmup refresh");
+    }
+    check_paused_colors();
+    input.hudless = hudless.Get();
+    const auto long_resume_ns = native::SteadyNowNs();
+    Check(service() == fg::Result::SUBMITTED && dual.adaptive_session->prepared
+        && !dual.adaptive_role_unavailable && !dual.adaptive_session->failed
+        && reset_pass_masks[0] == 3 && reset_pass_masks[1] == 3
+        && dual.adaptive_session->status.ready_levels == 2
+        && dual.adaptive_session->stable_after_ns >= long_resume_ns + addon::adaptive_resolution::WARMUP_NS
+        && native::nr_features_created == role_models && native::worksets_created == role_worksets,
+        "a long missing-input pause resumes both complete color/Pass groups with Reset and retained allocations");
+    const auto long_resume_stable_ns = dual.adaptive_session->stable_after_ns;
+    Check(service() == fg::Result::SUBMITTED && dual.adaptive_session->stable_after_ns == long_resume_stable_ns,
+        "continuous healthy output after a long pause preserves the resumed warmup deadline");
 
     const auto dual_models = native::nr_features_created;
     const auto dual_worksets = native::worksets_created;
@@ -455,12 +531,24 @@ int Run() {
         "both colors rebuild clean model contracts after the explicit model-selection change");
     const auto previous_primary = native::features.at(dual.roles[0].Handle()).adaptive_cache;
     input.hudless = nullptr;
+    Check(service() == fg::Result::PREPARED && dual.adaptive_role_unavailable
+        && dual.adaptive_session->status.reason == addon::adaptive_resolution::Reason::UNSUPPORTED,
+        "a real contract transition starts while the old required role is unavailable");
+    ++input.epoch;
+    for (uint32_t frame = 0; frame < 24; ++frame) service();
+    Check(!dual.adaptive_role_unavailable && dual.epoch == input.epoch
+        && dual.adaptive_session != nullptr && dual.adaptive_session->prepared
+        && dual.adaptive_required_roles == 1 && !dual.adaptive_session->failed
+        && native::features.at(dual.roles[0].Handle()).adaptive_cache != previous_primary,
+        "a real epoch change retires the unavailable old contract and prepares the new single-role group");
+    const auto epoch_primary = native::features.at(dual.roles[0].Handle()).adaptive_cache;
     input.color_width = input.color_height = 8;
     for (uint32_t frame = 0; frame < 24; ++frame) service();
     auto& changed = native::fg_service::streams.at({false, input.context});
     Check(changed.adaptive_session != nullptr && changed.adaptive_session->prepared
         && changed.adaptive_required_roles == 1
-        && native::features.at(changed.roles[0].Handle()).adaptive_cache != previous_primary
+        && !changed.adaptive_role_unavailable
+        && native::features.at(changed.roles[0].Handle()).adaptive_cache != epoch_primary
         && !changed.adaptive_session->failed,
         "a real same-epoch color geometry change prepares its new contract instead of waiting for an obsolete role");
 
@@ -543,8 +631,12 @@ int Run() {
         && native::EffectiveAdaptiveWorksetLimit() == 4
         && native::nr_features_created == many_models && native::worksets_created == many_worksets,
         "five-to-Default reconciles both role selections before budget adjudication and reuses the retained endpoints");
+    input.hudless = nullptr;
+    Check(service() == fg::Result::PREPARED && many.adaptive_role_unavailable,
+        "the selected collection is paused for missing input before Off");
     native::nr_adaptive_enabled.store(false);
-    Check(service() == fg::Result::SUBMITTED && native::adaptive_resident_session.expired()
+    Check(service() == fg::Result::SUBMITTED && !many.adaptive_role_unavailable
+        && native::adaptive_resident_session.expired()
         && native::adaptive_resident_worksets == 0
         && native::features.at(many.roles[0].Handle()).adaptive_cache == nullptr
         && native::features.at(many.roles[1].Handle()).adaptive_cache == nullptr,

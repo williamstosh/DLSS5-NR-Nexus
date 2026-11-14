@@ -26,6 +26,7 @@ struct Stream {
   adaptive_resolution::Frame adaptive_frame;
   uint32_t adaptive_model_roles = 0;
   uint32_t adaptive_required_roles = 0;
+  bool adaptive_role_unavailable = false;
   ID3D12Device* device = nullptr;
   ID3D12CommandQueue* queue = nullptr;
   ID3D12Fence* fence = nullptr;
@@ -119,6 +120,7 @@ inline bool PrepareCapture(ID3D12GraphicsCommandList* list) noexcept {
 // An unsubmitted recording can have created handles and advanced NGX CPU
 // history. Rebuild the feature and workset, including their GPU state ledger.
 inline void Invalidate(Stream* stream) {
+  stream->adaptive_role_unavailable = false;
   stream->cached = nullptr;
   stream->native_pair_producer_marker = nullptr;
   stream->native_pair_completion = {};
@@ -354,6 +356,9 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
   *output_ready = false;
   *recordings = {};
   slot->color_inputs_prepared = false;
+  if (!nr_adaptive_enabled.load()) {
+    stream->adaptive_role_unavailable = false;
+  }
   constexpr auto kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
   const bool has_hudless = input.hudless != nullptr && input.hudless != input.backbuffer;
   const bool coupled_ui = NeedsNativeColorCoupling(input, native_parameters, ui_recomposition);
@@ -398,17 +403,42 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
   if (missing_prepared_role && previous_adaptive_layout == stream->adaptive_frame.layout_identity
       && stream->adaptive_session != nullptr) {
     auto& session = *stream->adaptive_session;
-    if (session.trial) session.Request(session.previous_level, SteadyNowNs());
-    session.trial = false;
-    session.ResetMeasurements();
-    session.stable_after_ns = SteadyNowNs() + adaptive_resolution::WARMUP_NS;
-    session.status.reason = adaptive_resolution::Reason::PREPARING;
+    if (!stream->adaptive_role_unavailable) {
+      if (session.trial) {
+        session.Request(session.previous_level, SteadyNowNs());
+      }
+      session.trial = false;
+      session.ResetMeasurements();
+      session.UpdatePreparation(stream->adaptive_frame.preparation_epoch, 0,
+          static_cast<uint32_t>(session.ladder.count), adaptive_resolution::Reason::PREPARING, SteadyNowNs());
+      stream->adaptive_role_unavailable = true;
+      LogPresent(reshade::log::level::info,
+          "NR adaptive paused: required HUDLess input is unavailable; retaining compatible selected resources");
+    }
+    if (!session.failed && session.preparation_reason != adaptive_resolution::Reason::BUDGET) {
+      session.status.reason = adaptive_resolution::Reason::UNSUPPORTED;
+    }
     PublishAdaptiveStatus(session.status);
     // Absence pauses only the same resource/composition contract. Real layout
     // changes below retain their normal invalidation and preparation path.
+    // PREPARED preserves the Service recording contract, not color readiness.
     return fg::Result::PREPARED;
   }
   if (missing_prepared_role) stream->adaptive_frame = freeze_adaptive(required_model_roles);
+  if (stream->adaptive_role_unavailable) {
+    stream->adaptive_role_unavailable = false;
+    if (previous_adaptive_layout == stream->adaptive_frame.layout_identity && stream->adaptive_frame.enabled) {
+      for (uint32_t i = 0; i < 2; ++i) {
+        if ((required_model_roles & (1u << i)) != 0) {
+          ResetPresentStreamHistory(&stream->roles[i]);
+        }
+      }
+      if (stream->adaptive_session->settings.legacy_preparation) {
+        stream->adaptive_session->ResetMeasurements();
+        stream->adaptive_session->stable_after_ns = SteadyNowNs() + adaptive_resolution::WARMUP_NS;
+      }
+    }
+  }
   if (!nr_adaptive_enabled.load() && stream->adaptive_session != nullptr) {
     for (auto& role : stream->roles) {
       if (const auto feature = features.find(role.Handle()); feature != features.end()
