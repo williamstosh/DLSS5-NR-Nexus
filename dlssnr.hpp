@@ -3207,6 +3207,66 @@ inline int64_t SteadyNowNs() {
       .count();
 }
 
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+// The native prefix probe activates this fixed storage on its calling thread.
+// Ordinary builds contain neither these records nor the scope clock reads.
+struct ColdCpuTraceSpan {
+  const char* name = nullptr;
+  const char* detail = nullptr;
+  uint32_t parent = UINT32_MAX;
+  int64_t begin_ns = 0, end_ns = 0, children_ns = 0;
+};
+struct ColdCpuTraceState {
+  std::array<ColdCpuTraceSpan, 512> spans{};
+  uint32_t count = 0, current = UINT32_MAX;
+  bool overflow = false;
+};
+inline thread_local ColdCpuTraceState* cold_cpu_trace_active = nullptr;
+
+class ColdCpuTraceScope {
+ public:
+  explicit ColdCpuTraceScope(const char* name, const char* detail = nullptr, ColdCpuTraceState* activate = nullptr) noexcept
+      : previous_(cold_cpu_trace_active), activated_(activate != nullptr) {
+    if (activated_) {
+      cold_cpu_trace_active = activate;
+    }
+    state_ = cold_cpu_trace_active;
+    if (state_ == nullptr) return;
+    if (state_->count == state_->spans.size()) {
+      state_->overflow = true;
+      return;
+    }
+    index_ = state_->count++;
+    state_->spans[index_] = {.name = name, .detail = detail, .parent = state_->current, .begin_ns = SteadyNowNs()};
+    state_->current = index_;
+  }
+  ColdCpuTraceScope(const ColdCpuTraceScope&) = delete;
+  ColdCpuTraceScope& operator=(const ColdCpuTraceScope&) = delete;
+  void End() noexcept {
+    if (index_ == UINT32_MAX) return;
+    auto& span = state_->spans[index_];
+    span.end_ns = SteadyNowNs();
+    state_->current = span.parent;
+    if (span.parent != UINT32_MAX) {
+      state_->spans[span.parent].children_ns += span.end_ns - span.begin_ns;
+    }
+    index_ = UINT32_MAX;
+  }
+  ~ColdCpuTraceScope() {
+    End();
+    if (activated_) {
+      cold_cpu_trace_active = previous_;
+    }
+  }
+
+ private:
+  ColdCpuTraceState* state_ = nullptr;
+  ColdCpuTraceState* previous_ = nullptr;
+  uint32_t index_ = UINT32_MAX;
+  bool activated_ = false;
+};
+#endif
+
 // Runtime telemetry window (NRTelemetrySeconds, telemetry.hpp; emitted by
 // EmitTelemetry from the lifecycle tick).  One line per interval answers what
 // a "slow after a while / after changing a setting" report raises: frame
@@ -3366,6 +3426,9 @@ inline decltype(&slFreeResources) real_streamline_free[2] = {};
 inline detour_guard::Record streamline_records[5];
 
 inline void Log(reshade::log::level level, const std::string& message) {
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  const ColdCpuTraceScope cold_trace("Log.emit_callback_output");
+#endif
   reshade::log::message(level, (NR_NEXUS_NAME ": " + message).c_str());
 }
 
@@ -4497,6 +4560,9 @@ inline void* GatewayLookupSeh(void* (*gateway)(const char*), const char* name,
 // null leaves that identity "unknown", which every consumer treats as no
 // verdict.
 inline void PrimeNgxLoaderSymbols(ID3D12Device* device) {
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  const ColdCpuTraceScope cold_trace("PrimeNgxLoaderSymbols");
+#endif
   {
     const NgxLoaderSymbols& published = NgxLoaderView();
     if ((published.nr_ready || published.nr_failed) && published.core_ready) {
@@ -5573,6 +5639,9 @@ inline bool WaitForTrackedQueues() {
 // left as the caller set it for every other failure.
 inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
                                 NrDeclineReason* decline = nullptr) {
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  const ColdCpuTraceScope cold_trace("EnsureDirectRuntime");
+#endif
   if (control_mask_use_core_context.load() || direct_api.borrowed_core_context) {
     if (!control_mask_use_core_context.load()
         || hook_point.load() != kHookUpscaled || stack_passes.load() != 1
@@ -6015,11 +6084,17 @@ inline bool CreateRootSignature(
     return false;
   }
   ReleaseCom(errors);
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  ColdCpuTraceScope root_trace("D3D12.CreateRootSignature");
+#endif
   const HRESULT result = device->CreateRootSignature(
       0,
       serialized->GetBufferPointer(),
       serialized->GetBufferSize(),
       IID_PPV_ARGS(root_signature));
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  root_trace.End();
+#endif
   ReleaseCom(serialized);
   if (FAILED(result) || *root_signature == nullptr) {
     std::ostringstream message;
@@ -6112,8 +6187,14 @@ inline bool CreateCodecPipelineState(
   D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
   desc.pRootSignature = root_signature;
   desc.CS = {bytecode.data(), bytecode.size()};
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  ColdCpuTraceScope pipeline_trace("D3D12.CreateComputePipelineState", log_name);
+#endif
   const HRESULT result =
       device->CreateComputePipelineState(&desc, IID_PPV_ARGS(pipeline));
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  pipeline_trace.End();
+#endif
   if (FAILED(result) || *pipeline == nullptr) {
     std::ostringstream message;
     message << log_name << " PSO creation failed with HRESULT 0x" << std::hex
@@ -6183,6 +6264,9 @@ inline bool EnsureLegacyCodecPipeline(ID3D12Device* device) {
 }
 
 inline bool EnsureV6CodecPipeline(ID3D12Device* device) {
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  const ColdCpuTraceScope cold_trace("EnsureV6CodecPipeline");
+#endif
   if (codec_pipeline.linearize != nullptr && codec_pipeline.encode_v6 != nullptr
       && codec_pipeline.resolve_v6 != nullptr
       && codec_pipeline.pedestal_reduce != nullptr
@@ -6267,6 +6351,9 @@ inline bool EnsureV6CodecPipeline(ID3D12Device* device) {
 // use: a session that never shapes the result or traces the edit never
 // builds them.
 inline bool EnsureLookPipeline(ID3D12Device* device) {
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  const ColdCpuTraceScope cold_trace("EnsureLookPipeline");
+#endif
   look::Pipeline& pipeline = codec_pipeline.look;
   if (pipeline.compose != nullptr && pipeline.band != nullptr
       && pipeline.upsample != nullptr && pipeline.trace != nullptr) {
@@ -6281,8 +6368,14 @@ inline bool EnsureLookPipeline(ID3D12Device* device) {
     }
     ID3DBlob* serialized = nullptr;
     ID3DBlob* errors = nullptr;
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+    ColdCpuTraceScope root_trace("Look.SerializeRootSignature");
+#endif
     const HRESULT result = look::SerializeRootSignature(
         renodx::utils::directx::pD3D12SerializeRootSignature, &serialized, &errors);
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+    root_trace.End();
+#endif
     if (!CreateRootSignature(
             device, result, serialized, errors, &pipeline.root_signature,
             L"" NR_NEXUS_NAME " look root signature",
@@ -6339,6 +6432,9 @@ inline bool CreateScratchTexture(
   heap.Type = D3D12_HEAP_TYPE_DEFAULT;
   heap.CreationNodeMask = 1;
   heap.VisibleNodeMask = 1;
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  ColdCpuTraceScope resource_trace("D3D12.CreateCommittedResource.texture");
+#endif
   const HRESULT result = device->CreateCommittedResource(
       &heap,
       D3D12_HEAP_FLAG_NONE,
@@ -6346,6 +6442,9 @@ inline bool CreateScratchTexture(
       initial_state,
       nullptr,
       IID_PPV_ARGS(resource));
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  resource_trace.End();
+#endif
   if (FAILED(result) || *resource == nullptr) {
     std::ostringstream message;
     message << "scratch texture creation failed with HRESULT 0x" << std::hex
@@ -6379,9 +6478,15 @@ inline bool CreateScratchBuffer(
   heap.Type = D3D12_HEAP_TYPE_DEFAULT;
   heap.CreationNodeMask = 1;
   heap.VisibleNodeMask = 1;
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  ColdCpuTraceScope resource_trace("D3D12.CreateCommittedResource.buffer");
+#endif
   const HRESULT result = device->CreateCommittedResource(
       &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
       IID_PPV_ARGS(resource));
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  resource_trace.End();
+#endif
   if (FAILED(result) || *resource == nullptr) {
     std::ostringstream message;
     message << "scratch buffer creation failed with HRESULT 0x" << std::hex
@@ -6710,6 +6815,9 @@ inline FinalResources* EnsureWorkset(
     FinalResources* stage_resources = nullptr,
     bool create_control_mask = false,
     const char** rejection_reason = nullptr) {
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  const ColdCpuTraceScope cold_trace("EnsureWorkset");
+#endif
   if (rejection_reason != nullptr) {
     *rejection_reason = nullptr;
   }
@@ -7204,8 +7312,14 @@ inline FinalResources* EnsureWorkset(
   // heap slots while a command list that reads them is being recorded.
   heap_desc.NumDescriptors = kDescriptorHeapSize;
   heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  ColdCpuTraceScope descriptor_trace("D3D12.CreateDescriptorHeap");
+#endif
   const HRESULT heap_result = device->CreateDescriptorHeap(
       &heap_desc, IID_PPV_ARGS(&resources.descriptors));
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  descriptor_trace.End();
+#endif
   if (FAILED(heap_result) || resources.descriptors == nullptr) {
     std::ostringstream message;
     message << "v6 workset descriptor heap creation failed (hr=0x" << std::hex
@@ -7652,6 +7766,9 @@ inline bool EnsureNrFeature(
     uint32_t input_height,
     uint32_t output_width,
     uint32_t output_height) {
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  const ColdCpuTraceScope cold_trace("EnsureNrFeature");
+#endif
   NrFeatureSlot& slot = state.slots[slot_index];
   if (slot.handle != nullptr) {
     if (control_mask_use_core_context.load() || direct_api.borrowed_core_context) {
@@ -7663,8 +7780,14 @@ inline bool EnsureNrFeature(
   if (!EnsureDirectRuntime(command_list)) return false;
 
   if (slot.parameters == nullptr) {
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+    ColdCpuTraceScope allocation_trace("SDK.CoreAllocateParameters");
+#endif
     const NVSDK_NGX_Result allocate_result =
         core_allocate_parameters(&slot.parameters);
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+    allocation_trace.End();
+#endif
     last_result = static_cast<uint32_t>(allocate_result);
     if (NVSDK_NGX_FAILED(allocate_result) || slot.parameters == nullptr) {
       slot.failed = true;
@@ -11918,6 +12041,9 @@ inline bool RecordInline(
     NrRecording* recording = nullptr,
     bool prepare_models_only = false,
     AdaptiveRecording* adaptive_recording = nullptr) {
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  const ColdCpuTraceScope cold_trace("RecordInline");
+#endif
   if (recording != nullptr) *recording = {};
   std::optional<PresentTarget> present_snapshot;
   if (present != nullptr) {
@@ -14202,6 +14328,9 @@ inline bool ProcessInline(ID3D12GraphicsCommandList* command_list, const NVSDK_N
                           const NVSDK_NGX_Parameter* game_parameters, bool* command_list_touched = nullptr,
                           const PresentTarget* present = nullptr, NrRecording* recording = nullptr,
                           bool prepare_models_only = false) {
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  const ColdCpuTraceScope cold_trace("ProcessInline");
+#endif
   AdaptiveRecording adaptive;
   const bool result = RecordInline(command_list, handle, game_parameters, command_list_touched, present,
       recording, prepare_models_only, &adaptive);
@@ -18767,6 +18896,9 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
     const NVSDK_NGX_Handle* handle,
     const NVSDK_NGX_Parameter* parameters,
     PFN_NVSDK_NGX_ProgressCallback callback) {
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  const ColdCpuTraceScope cold_trace("HookedEvaluateFeatureSlot");
+#endif
   debug::TouchNgxEval();
   ngx_entry_evaluate[Slot].fetch_add(1, std::memory_order_relaxed);
   const auto real = ngx_serial::Serialized(
@@ -18818,6 +18950,9 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
   // work: the helper takes queue_hook_mutex and a Detours transaction, and
   // must never do so under runtime_mutex.
   if (!nested_in_c_wrapper && !InsideDirectCall()) {
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+    const ColdCpuTraceScope foreign_trace("EnsureForeignEntryInstalls");
+#endif
     EnsureForeignEntryInstalls(command_list);
   }
   // Ask the loader for what this evaluate is about to need, HERE, before
@@ -18833,7 +18968,13 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
   // Cover pre-FG/pre-SR admission, the game's call and after-path injection
   // with one turn, acquired before runtime_mutex. A DirectCallScope inside
   // ProcessInline then nests instead of waiting while holding that mutex.
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  ColdCpuTraceScope turn_trace("NGX.outer_turn.acquire");
+#endif
   const ngx_serial::Call ngx_turn;
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  turn_trace.End();
+#endif
   if (!logged_first_evaluate.exchange(true)) {
     Log(
         reshade::log::level::info,
@@ -18858,7 +18999,13 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
   bool prefg_owner = false;
   bool frame_generation = false;
   if (!nested_in_c_wrapper && !InsideDirectCall()) {
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+    ColdCpuTraceScope lock_trace("runtime_mutex.acquire.pre_source");
+#endif
     RuntimeLock lock(runtime_mutex);
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+    lock_trace.End();
+#endif
     // NRPresentPreFg (present_path.hpp): a DLSS-G evaluate gets NR on its
     // input frame here, recorded into its list before DLSS-G reads it, and
     // a HUD-less stand-in in its block for the duration of real().
@@ -18969,7 +19116,13 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
     return result;
   }
 
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  ColdCpuTraceScope lock_trace("runtime_mutex.acquire.after_source");
+#endif
   RuntimeLock lock(runtime_mutex);
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  lock_trace.End();
+#endif
   // The taxonomy always had kNgxNotDlssEvaluation and `eligible` always
   // subtracted it - but no call site ever counted it, so every DLSSG
   // evaluate on an MFG-generated frame was eligible-but-unnamed (~6744 in
@@ -23622,6 +23775,9 @@ inline void RunLifecycleTick(int64_t present_ns, bool from_present) {
 // evaluate (not InsideDirectCall(), not a nested C-wrapper re-entry): our
 // internal NR evaluates run under runtime_mutex, which this would re-lock.
 inline void NgxLifecycleTick() {
+#if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
+  const ColdCpuTraceScope cold_trace("NgxLifecycleTick");
+#endif
   if (shutting_down.load(std::memory_order_acquire)) return;
   // A present deferred its tick (RunLifecycleTick): paid here, before this
   // evaluate's admission.

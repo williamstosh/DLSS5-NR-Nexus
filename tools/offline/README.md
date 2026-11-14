@@ -330,6 +330,22 @@ prefix 沿用 62 次源调用上限，后续准备与请求合计最多 180 次�
 选择是 MOCK 直接请求，SR／NR 为真实 NGX；不测输出 FPS。预算拒绝保留 Blocked，实际
 Create／Evaluate 失败停止并保存诊断，不降低档数或重启准备。结束后沿用真实 Off 和 SDK 收尾。
 
+首调用 CPU 归因另用原生测试编译宏 `NR_NEXUS_TEST_COLD_CPU_TRACE`，配合
+`NR_NEXUS_TEST_RESIZE_COLD_COMPONENTS=1`、`NR_NEXUS_TEST_RESIZE_SELECTED_LEVELS=0`
+和 `NR_NEXUS_TEST_RESIZE_READY=1`，其他专项关闭，仍调用同一 resize 入口。只运行首两次
+prefix 源调用；不足、API 失败或记录溢出即失败，不延长。随后直接执行关闭、一次真实 SR
+恢复、source Release 和 SDK 收尾，跳过完整档位准备／切档及最终图像读回。
+正常生产构建不含这些计时或回调；测试构建也只在受测 Hook 的调用线程内激活固定内存记录。
+
+`cold_components` 记录边界及结果，`cold_cpu_trace` 使用 `nr-nexus-cold-cpu-trace-v1`，
+每次源调用最多 512 个父子 span。起止时间和 inclusive／exclusive 均保留；exclusive 是
+父区间减直接子区间，包含未细分工作和观测开销，不能再将 inclusive 父子相加。
+覆盖入口生命周期／锁、Runtime helper、管线及实际 PSO、Look 根签名、工作集及资源／描述符、
+Feature 参数分配和既有 SDK Create／Evaluate。日志发送区间涵盖同步回调及 stdout，调用者
+预先格式化文本的时间留在所属父区间；SDK 内部后台线程未细分。JSON 转换在受测调用后，
+提交／Fence、退休和调用至提交间隙独立记录。SDK/provider、codec 根签名和 ControlMask PSO
+在 prefix 前已准备，报告明确记录，结果不作为完整游戏冷启动成本。运行后恢复探针环境变量。
+
 设置复用对照可在同一入口显式设置 `NR_NEXUS_TEST_RESIZE_SETTINGS=1`，将原有
 180 帧往返扩为 360 帧，依次编辑风格、混合强度及最低比例 80%→50%→67%。
 同时设置 `NR_NEXUS_TEST_RESIZE_EXPECT_REUSE=1` 时，断言兼容设置编辑不冷建，
