@@ -325,11 +325,26 @@ GPU 完成及完整源调用间隔。普通插件没有此实验的配置入口�
 与开关 `0` 的默认四档串行对照初始 Create 次数／总耗时、就绪帧、显存峰值及新端点成本；
 不能只以 Create 次数较少认定初始化更快。开关 `1` 保留原容量内复用实验。
 
-设置编辑序列还读回 67% 和 50% 的实际 NR／最终输出，记录尺寸、RGBA 有限值数量与 CRC。
+按需准备对照使用 `NR_NEXUS_TEST_RESIZE_DEMAND_PREPARE=1`，分别设
+`NR_NEXUS_TEST_RESIZE_REUSE_FEATURE=2`／`3`，不同时开启设置编辑、固定输入或其他专项。
+该序列运行 900 帧：目标 100 FPS，前 360 帧提供 MOCK 120 FPS，随后提供 MOCK 80 FPS。
+档位由生产控制器决定，没有直接请求档位；SR／NR 及控制器 GPU 成本采样仍为原生执行。
+模式 3 沿用上限容量合同，仅准备当前请求的候选。分别核对初始备用 Create、首次请求的
+前台 Create、等待期间合法活动档、GPU 完成后切换、无收益回到原上限资源，以及未使用槽。
+MOCK FPS 不用于验证 SDK 输出帧率准确性；省掉未使用档与延后必要冷 Create 分开报告。
+结束恢复两个环境变量，实验默认 OFF，未开放更多逻辑档或异步准备。
+
+设置编辑序列还读回 67% 和 50% 的实际代理输入、NR／最终输出，记录尺寸、RGBA 有限值数量与 CRC。
 容量复用会提前一帧激活新端点，因此额外读回其第 298 帧，用于和基线第 299 帧按 Reset 后
 Evaluate 次数对齐；比较仍须核对实际输入与历史，CRC 不同不能直接归因于容量。读回在计时
 结束后执行，受读回影响的下一次源间隔单独标记。仅 `NR_NEXUS_TEST_KEEP_RAW=1` 输出
 `adaptive-pixels-<frame>-<role>.rgba16f`，用于定量差异分析；用途结束后按产物规则收尾。
+
+归因时可另设 `NR_NEXUS_TEST_RESIZE_FIXED_INPUT=1`：在每次实际 Core Evaluate 前，将完整
+有效 Color 区域替换为按实际尺寸生成的同一 FP16 渐变，保留生产 Reset 和资源提交流程。
+第 285–299 帧还记录实际 Core 参数、资源尺寸及参数可用状态；比较必须分别对齐源帧与
+Reset 后的 Evaluate 次数。固定输入上传和复制会计入 wrapper／NR GPU 区间，因此这一组
+只用于像素归因，不能据其计时宣称性能收益。最终合成仍使用原 SR 图像，NR 相等不自动使最终图相等。
 
 冷准备专项可单独设置 `NR_NEXUS_TEST_RESIZE_COLD_PREPARE=1`，仍运行同一个
 `control-mask-native-ngx-resize` 入口，改为私有 worker Create 与前台真实 SR／NR 的短对照。

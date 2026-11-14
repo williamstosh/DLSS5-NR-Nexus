@@ -250,11 +250,14 @@ int Run() {
           "standby preparation preserves the active tier's replayable recording protection");
       if (hook == native::kHookUpscaled) {
         const auto created_before = native::nr_features_created;
-        native::adaptive_feature_mode = native::AdaptiveFeatureMode::UPPER_CAPACITY;
-        Check(record() && record() && feature.adaptive_cache == cache && cache->count == 2
-            && cache->tiers[1].state.slots[0].create_input_width == 5
-            && native::nr_features_created == created_before,
-            "upper-capacity mode leaves the existing R8 rotating-output path and its original small Create capacity unchanged");
+        for (const auto mode : {native::AdaptiveFeatureMode::UPPER_CAPACITY,
+                               native::AdaptiveFeatureMode::UPPER_CAPACITY_ON_DEMAND}) {
+          native::adaptive_feature_mode = mode;
+          Check(record() && record() && feature.adaptive_cache == cache && cache->count == 2
+              && cache->tiers[1].state.slots[0].create_input_width == 5
+              && native::nr_features_created == created_before,
+              "upper-capacity modes leave the existing R8 rotating-output path and its original small Create capacity unchanged");
+        }
         native::adaptive_feature_mode = native::AdaptiveFeatureMode::OFF;
       }
       {
