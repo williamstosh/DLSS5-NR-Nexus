@@ -331,6 +331,8 @@ inline constexpr uint32_t kPresentPreFgCleanFrames = 30;
 // recycled game-resource addresses never retain a stale descriptor.
 inline constexpr uint32_t kPresentPreFgComposeSets = 16;
 inline constexpr uint32_t kPresentPreFgComposeDescriptors = 6;
+inline constexpr uint32_t kPresentPreFgComposeDepthNullSrv = kPresentPreFgComposeSets * kPresentPreFgComposeDescriptors;
+inline constexpr uint32_t kPresentPreFgComposeMotionNullSrv = kPresentPreFgComposeDepthNullSrv + 1;
 // Per slot: [HUD pixels, serial, grain-sized pixels] (the shader's Stats).
 inline constexpr uint32_t kPresentPreFgStatsWords = 3;
 // Under runtime_mutex.  The composite's objects, made in the world (device
@@ -1618,7 +1620,7 @@ inline uint32_t ComposePresentPreFg(ID3D12GraphicsCommandList* command_list,
   if (compose.heap == nullptr) {
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heap_desc.NumDescriptors = kPresentPreFgComposeSets * kPresentPreFgComposeDescriptors;
+    heap_desc.NumDescriptors = kPresentPreFgComposeMotionNullSrv + 1;
     heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&compose.heap)))) {
       compose.heap = nullptr;
@@ -1626,6 +1628,18 @@ inline uint32_t ComposePresentPreFg(ID3D12GraphicsCommandList* command_list,
       compose.heap->SetName(L"" NR_NEXUS_NAME " pre-FG compose descriptors");
       compose.descriptor_size =
           device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+      D3D12_SHADER_RESOURCE_VIEW_DESC null_guide{};
+      null_guide.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      null_guide.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      null_guide.Texture2D.MipLevels = 1;
+      null_guide.Format = DXGI_FORMAT_R32_FLOAT;
+      device->CreateShaderResourceView(nullptr, &null_guide,
+          DescriptorHeapSlot(compose.heap->GetCPUDescriptorHandleForHeapStart(),
+              kPresentPreFgComposeDepthNullSrv, compose.descriptor_size));
+      null_guide.Format = DXGI_FORMAT_R16G16_FLOAT;
+      device->CreateShaderResourceView(nullptr, &null_guide,
+          DescriptorHeapSlot(compose.heap->GetCPUDescriptorHandleForHeapStart(),
+              kPresentPreFgComposeMotionNullSrv, compose.descriptor_size));
     }
   }
   if (compose.heap == nullptr || !SupportsCodecFormat(device, format)
@@ -1843,6 +1857,10 @@ inline uint32_t ComposePresentPreFg(ID3D12GraphicsCommandList* command_list,
       0, DescriptorHeapSlot(gpu_start, base, compose.descriptor_size));
   command_list->SetComputeRootDescriptorTable(
       1, DescriptorHeapSlot(gpu_start, base + 4, compose.descriptor_size));
+  command_list->SetComputeRootDescriptorTable(
+      3, DescriptorHeapSlot(gpu_start, kPresentPreFgComposeDepthNullSrv, compose.descriptor_size));
+  command_list->SetComputeRootDescriptorTable(
+      4, DescriptorHeapSlot(gpu_start, kPresentPreFgComposeMotionNullSrv, compose.descriptor_size));
   // The shader's ComposeConstants (9 of the codec signature's 28 dwords).
   // Difference-mask mode needs stage 0's current-frame count before stage 1;
   // exact UI-alpha modes have no statistics dependency and run stage 1 once.
@@ -2821,15 +2839,27 @@ inline MixedCopyRegionFn real_mixed_copy_region = nullptr;
 inline std::shared_mutex mixed_copy_hook_mutex;
 inline bool mixed_copy_hooks_installed = false;
 
+// Runtime/debug-layer forwarding can call a second hooked copy method on an
+// internal list. It belongs to the outer API operation, not another producer.
+inline thread_local uint32_t mixed_copy_forward_depth = 0;
+struct MixedCopyForwardScope {
+  const bool outermost = (mixed_copy_forward_depth++ == 0);
+  ~MixedCopyForwardScope() { --mixed_copy_forward_depth; }
+};
+
 inline void STDMETHODCALLTYPE HookedMixedCopyResource(ID3D12GraphicsCommandList* list,
     ID3D12Resource* destination, ID3D12Resource* source) {
+  const MixedCopyForwardScope copy_scope;
   real_mixed_copy_resource(list, destination, source);
+  if (!copy_scope.outermost) return;
   GuardHook([&] { ObserveMixedPresentCopy(list, source, destination); });
 }
 inline void STDMETHODCALLTYPE HookedMixedCopyRegion(ID3D12GraphicsCommandList* list,
     const D3D12_TEXTURE_COPY_LOCATION* destination, UINT x, UINT y, UINT z,
     const D3D12_TEXTURE_COPY_LOCATION* source, const D3D12_BOX* box) {
+  const MixedCopyForwardScope copy_scope;
   real_mixed_copy_region(list, destination, x, y, z, source, box);
+  if (!copy_scope.outermost) return;
   if (source == nullptr || destination == nullptr) return;
   const bool full = x == 0 && y == 0 && z == 0 && box == nullptr
       && source->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && source->SubresourceIndex == 0

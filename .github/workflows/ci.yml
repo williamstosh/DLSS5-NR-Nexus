@@ -9,11 +9,31 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run_core: ${{ steps.evidence.outputs.run_core }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Resolve exact-tree core evidence
+        id: evidence
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./tools/ci-evidence.ps1 -Mode Branch
   windows:
+    needs: evidence
+    if: ${{ needs.evidence.outputs.run_core == 'true' }}
     uses: ./.github/workflows/build-windows.yml
+    with:
+      run_core: true

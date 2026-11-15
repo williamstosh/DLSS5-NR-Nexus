@@ -31,6 +31,32 @@ HostRoot、ShaderIncludeDirectory、Fxc、EmbedFile 参数可显式指定已有�
 专项确需完整原始数据集时，在启动前显式设置 `$env:NR_NEXUS_TEST_KEEP_RAW='1'`。
 工具将选择写入本次生命周期标记，后续维护继续尊重该选择；Full／Acceptance 本身不会开启它。
 
+## 本地发布预检
+
+~~~powershell
+./tools/run-release-preflight.ps1 -Mode Software -OutputDirectory tmp/release-preflight/software
+~~~
+
+软件入口先原样执行 `Suite all -SoftwareOnly`（包括默认五组 FG），再复用编译产物执行
+16 个独立 FG 阶段、分辨率、生命周期及 pre-FG 入口和 4 个 Bridge 分辨率入口。
+`result.json` 逐项记录 Passed、Failed 或 NotRun；Vulkan 在软件模式只编译，执行记为 NotRun。
+这些是 CPU／WARP 与模型替身证据，包含有限的隐藏窗口夹具，不提供游戏或动态视觉验收。
+
+已有完整 `all` 结果可通过 `-ReuseAllOutputDirectory` 复用，入口校验每项实际编译输入；
+仅 FG 夹具有修正时可加 `-RefreshFg` 重编并重跑默认五组，其他结果仍须通过输入校验。
+显式 `run-tests -NativeCase` 会替换默认 FG 组，因此不能用单个专项结果充当默认组已通过。
+
+原生检查使用独立的本地分支，需先取得空闲设备窗口：`-Mode NativeGpu` 运行现有
+`native-full-hardware`、`native-prefg-resolution-hardware` 和 `present-chain-hardware`
+（真实 D3D12、模型替身，一次编译后串行执行）；`-Mode NativeNgx` 运行
+`control-mask-native-ngx-fg`，并须提供 `NativeNgxProjectIdPath`、
+`NativeNgxSdkLibraryDirectory`、`NativeNgxRuntimePath`。后者实际执行 NGX
+Init／Create／Evaluate；`ngx_probe` 仅检查能力，不能替代此结果。缺依赖或未获窗口时记为 NotRun。
+原生分支不重跑软件默认组，也不加入 GitHub CI。
+
+入口要求默认 FG 的 Debug Layer／InfoQueue 检查存在；部分独立夹具的检查范围仍较窄，
+详见结果中的 `limits`。统一入口固定复用已有用例，名称不表示所有格式、初始相位和平台组合均已覆盖。
+
 ## 阴影调整复用核验
 
 ~~~powershell
@@ -288,7 +314,7 @@ SDK 动态计数、固定倍率失效和来源切换。配置保存／方案另�
 
 `adaptive-fg-service` 使用 WARP、模型替身和实际 Service／提交路径，覆盖双颜色双 Pass 的完整所选集合、5 档切回默认、缺输入暂停／恢复及真实合同变化。`adaptive-inline` 使用生产 Render／Upscaled 入口，覆盖 64×64 输入的 15 档／两输出、真实尺寸及写回、准备完成后的切档零新增分配、旧 Stage 工作集归属和清锁恢复。两者还核对临时容量占用、ControlMask 未提交、Off／On、兼容设置复用及失败停止。未提交旧录制阻止槽位复用，额外准备 Evaluate 不计入活动角色成功累计；角色计数与完整 Pass／颜色组完成分开。均为 WARP＋MOCK，不调用硬件 NR Runtime 或游戏。
 
-默认 `-Suite fg-native` 会复用同一编译产物，分别在独立进程执行这两个自适应用例；默认 `-Suite ui` 也会复用菜单二进制，在独立进程执行自适应真实 ImGui 交互，包括三种介入点连续往返与配置保存。CI 的 `-Suite all -SoftwareOnly` 沿用这些入口；`NR_NEXUS_ADAPTIVE_UI_ONLY=1` 仍可单独运行自适应 UI，快照模式不额外运行回归。
+默认 `-Suite fg-native` 会复用同一编译产物，分别在独立进程执行这两个自适应用例；默认 `-Suite ui` 也会复用菜单二进制，在独立进程执行自适应真实 ImGui 交互，包括三种介入点连续往返与配置保存。本地完整发布预检保留这些入口；远端核心回归保留 FG 默认组，UI 全量检查由本地初审承担。`NR_NEXUS_ADAPTIVE_UI_ONLY=1` 仍可单独运行自适应 UI，快照模式不额外运行回归。
 
 真实 NR 尺寸往返复用公开 SDK 预初始化入口：
 
@@ -434,6 +460,10 @@ Feature18 Create／Evaluate 并发安全；结束后恢复环境变量。
 其余五阶段、参考输入和测量方法不变，用于单独核对物理资源布局的兼容性。
 
 ## 自动回归与证据保存
+
+GitHub 分支 CI 使用 [`ci-core.ps1`](../ci-core.ps1)：保留核心 CPU／配置／生命周期检查、FG 的五个默认组，以及复用同一 EXE、在独立进程执行的 pre-FG 异尺寸与复制链回归。完整本地发布初审继续使用 `run-release-preflight.ps1`，不因远端精简删减。远端产物为 `core-regression-<attempt>`（检查结果与失败日志）和 `windows-x64-<attempt>`（安装包及 SHA-256）。
+
+`main` 的 [`ci-evidence.ps1`](../ci-evidence.ps1) 仅复用完整 Git 根 tree 相同的成功核心记录，依赖锁、工具锁和 workflow 均包含在 tree 中；找不到或状态不符则执行核心验证。Tag 必须先取得同身份成功核心证据，再重新构建 Publishing 并通过 [`check-publishing.ps1`](../check-publishing.ps1) 核对 DEV-OFF 编译命令、诊断标记、版本、包白名单与哈希，不重跑完整测试。原始 run／源码／tree 及复用来源显示在 Actions summary。
 
 ~~~powershell
 python -m unittest discover -s tests -p 'test_offline_*.py' -v

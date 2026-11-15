@@ -443,6 +443,9 @@ int Run(bool hardware, DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM) {
     Check(SUCCEEDED(gpu.list->Close()), "B1 learning replay close");
     ID3D12CommandList* replay[]{gpu.list.Get()};
     gpu.queue->ExecuteCommandLists(1, replay);
+    // The same closed recording may be replayed only after its previous GPU
+    // execution completes; keep its generation and submission receipts live.
+    finish();
     gpu.queue->ExecuteCommandLists(1, replay);
     finish();
     Check(!tail(), "B1 learning replay cannot run B");
@@ -496,16 +499,6 @@ int Run(bool hardware, DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM) {
     Check(after_failure.Pixels() == std::vector<uint8_t>(256, 176), "B1 failure retains game post-processing output");
     for (uint32_t i = 0; i < 4; ++i) { begin(); submit(); tail(); finish(); }
 
-    // A source submitted to an actual different queue remains inadmissible
-    // even after that queue completes: B1 never adds a cross-queue Wait.
-    ComPtr<ID3D12CommandQueue> other_queue;
-    const D3D12_COMMAND_QUEUE_DESC queue_desc{};
-    Check(SUCCEEDED(gpu.device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&other_queue))), "B1 second real queue");
-    begin(false, false, false, false);
-    submit(true, other_queue.Get());
-    rejected("present_target_changed");
-    for (uint32_t i = 0; i < 3; ++i) { begin(); submit(); tail(); finish(); }
-
     // Same-queue ordered work need not be GPU-complete at admission. Hold
     // the real queue, submit both groups, then release the external test gate.
     ComPtr<ID3D12Fence> gate;
@@ -516,6 +509,10 @@ int Run(bool hardware, DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM) {
       begin();
       submit(false);
       ordered_tail = tail();
+      if (!ordered_tail) {
+        std::cerr << "B1 pending source status=" << native::mixed_present_status << '\n';
+      }
+      Check(ordered_tail, "B1 same-queue pending source can order B without waiting on CPU");
       Check(native::present_ring.fence->GetCompletedValue() < native::present_ring.submitted,
           "B1 submitted does not claim GPU completion");
     } catch (...) {
@@ -524,12 +521,21 @@ int Run(bool hardware, DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM) {
     }
     Check(SUCCEEDED(gate->Signal(1)), "B1 release fixture gate");
     finish();
-    Check(ordered_tail, "B1 same-queue pending source can order B without waiting on CPU");
     Check(SUCCEEDED(gpu.allocator->Reset()), "B1 pending allocator reset");
     Check(SUCCEEDED(gpu.list->Reset(gpu.allocator.Get(), nullptr)), "B1 pending list reset");
     submission::OnCommandListReset(gpu.list.Get());
     submission::PruneCompletedGenerations(native::PreservePresentCaptureProof);
     gpu.uploads.clear();
+
+    // Foreign-queue ownership remains latched for this target, so exercise
+    // it after the independent same-queue admission probe.
+    ComPtr<ID3D12CommandQueue> other_queue;
+    const D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    Check(SUCCEEDED(gpu.device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&other_queue))), "B1 second real queue");
+    begin(false, false, false, false);
+    submit(true, other_queue.Get());
+    rejected("present_target_changed");
+    for (uint32_t i = 0; i < 3; ++i) { begin(); submit(); tail(); finish(); }
     }
 
     native::ForgetSourceHandleLocked(handle);
