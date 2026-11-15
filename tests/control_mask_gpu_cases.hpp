@@ -2782,6 +2782,7 @@ inline bool native_resize_create_ngx_call = false;
 inline bool native_resize_demand_prepare = false;
 inline bool native_resize_selected_sequence = false;
 inline PsoFn native_limited_pso = nullptr;
+inline DWORD native_limited_main_thread_id = 0;
 inline const std::array<std::span<const uint8_t>, 2> native_limited_bytecodes{__v6_autoscale, __look_band};
 inline const std::array<ID3D12PipelineState**, 2> native_limited_slots{
     &addon::codec_pipeline.autoscale, &addon::codec_pipeline.look.band};
@@ -2814,7 +2815,8 @@ HRESULT STDMETHODCALLTYPE ObserveNativeLimitedPso(ID3D12Device* device,
   if (target == native_limited_bytecodes.size()) return native_limited_pso(device, desc, iid, result);
   auto& observation = native_limited_targets[target];
   const DWORD worker_id = GetCurrentThreadId();
-  const HANDLE worker = OpenThread(SYNCHRONIZE, FALSE, worker_id);
+  const HANDLE worker = (worker_id != native_limited_main_thread_id
+      ? OpenThread(SYNCHRONIZE, FALSE, worker_id) : nullptr);
   size_t call_index;
   try {
     std::unique_lock lock(observation.mutex);
@@ -2854,13 +2856,16 @@ HRESULT STDMETHODCALLTYPE ObserveNativeLimitedPso(ID3D12Device* device,
 struct NativeLimitedAutoscaleProbe {
   bool attached = false;
   bool exercised = false;
+  bool asynchronous = true;
   std::array<std::shared_ptr<addon::AsyncAutoscalePreparation>, 2> tasks;
   std::array<uint32_t, 2> pending_source_returns{};
   std::array<bool, 2> accepted{};
   std::array<int64_t, 2> accepted_observed_ns{};
   std::array<uint32_t, 2> accepted_source_call{UINT32_MAX, UINT32_MAX};
 
-  void Attach(ID3D12Device* device) {
+  void Attach(ID3D12Device* device, bool use_async) {
+    asynchronous = use_async;
+    native_limited_main_thread_id = GetCurrentThreadId();
     native_limited_pso = reinterpret_cast<PsoFn>((*reinterpret_cast<void***>(device))[11]);
     Check(DetourTransactionBegin() == NO_ERROR && DetourUpdateThread(GetCurrentThread()) == NO_ERROR
         && DetourAttach(reinterpret_cast<PVOID*>(&native_limited_pso), reinterpret_cast<PVOID>(ObserveNativeLimitedPso)) == NO_ERROR
@@ -2886,6 +2891,7 @@ struct NativeLimitedAutoscaleProbe {
     for (auto& observation : native_limited_targets) {
       std::unique_lock lock(observation.mutex);
       for (auto& call : observation.calls) {
+        if (call.worker_id == native_limited_main_thread_id) continue;
         if (call.worker != nullptr) {
           call.worker_exited = call.worker_id != GetCurrentThreadId()
               && WaitForSingleObject(call.worker, 10000) == WAIT_OBJECT_0;
@@ -2916,15 +2922,18 @@ struct NativeLimitedAutoscaleProbe {
         }
       }
     }
-    nlohmann::json snapshot{{"schema", "nr-nexus-native-private-pso-v2"},
-        {"scope", "separate fixed shader/slot targets; worker API intervals exclude observer locking and are not added to main-source cold traces; acceptance is observed after source return"}};
+    nlohmann::json snapshot{{"schema", "nr-nexus-native-private-pso-v2"}, {"mode", asynchronous ? "async" : "sync"},
+        {"scope", "separate fixed shader/slot targets; API intervals exclude observer locking; sync intervals are nested in main-source traces, async intervals run on workers; no nested sums; acceptance is observed after source return"}};
     for (size_t target = 0; target < native_limited_targets.size(); ++target) {
       auto& entry = snapshot["targets"][native_limited_target_names[target]];
-      entry = {{"main_thread_id", GetCurrentThreadId()}, {"accepted", accepted[target]},
+      entry = {{"main_thread_id", native_limited_main_thread_id}, {"accepted", accepted[target]},
+          {"admission_source", asynchronous ? "private task result to production slot" : "synchronous API result to production slot"},
           {"accepted_observed_ns", accepted_observed_ns[target]},
           {"accepted_source_call", accepted[target] ? nlohmann::json(accepted_source_call[target]) : nlohmann::json(nullptr)},
           {"pending_source_returns_before_worker_complete", pending_source_returns[target]},
-          {"pending_overlap_observation", (pending_source_returns[target] != 0 ? "Observed" : "NotObserved; scheduler timing, no product failure; deterministic WARP coverage is separate")},
+          {"pending_overlap_observation", asynchronous
+                  ? (pending_source_returns[target] != 0 ? "Observed" : "NotObserved; scheduler timing, no product failure; deterministic WARP coverage is separate")
+                  : "NotApplicable: synchronous source call"},
           {"api_calls", nlohmann::json::array()}};
       {
         auto& observation = native_limited_targets[target];
@@ -2932,7 +2941,10 @@ struct NativeLimitedAutoscaleProbe {
         entry["calls"] = observation.calls.size();
         for (const auto& call : observation.calls) {
           const bool api_finished = call.api_returned || call.api_threw;
-          entry["api_calls"].push_back({{"worker_thread_id", call.worker_id},
+          const bool source_thread = call.worker_id == native_limited_main_thread_id;
+          entry["api_calls"].push_back({{"thread_id", call.worker_id},
+              {"execution_thread", source_thread ? "main source" : "worker"},
+              {"worker_thread_id", source_thread ? nlohmann::json(nullptr) : nlohmann::json(call.worker_id)},
               {"begin_ns", call.begin_ns}, {"end_ns", call.end_ns}, {"api_finished", api_finished},
               {"api_returned", call.api_returned}, {"api_threw", call.api_threw},
               {"api_cpu_ms", (api_finished && call.end_ns >= call.begin_ns
@@ -2940,7 +2952,9 @@ struct NativeLimitedAutoscaleProbe {
               {"inflight_observer_elapsed_ms", (!api_finished
                       ? nlohmann::json((addon::SteadyNowNs() - call.observed_begin_ns) / 1.e6) : nlohmann::json(nullptr))},
               {"result", call.api_returned ? nlohmann::json(call.result) : nlohmann::json(nullptr)},
-              {"pipeline", call.pipeline}, {"worker_exited", call.worker_exited}});
+              {"pipeline", call.pipeline},
+              {"worker_exited", source_thread ? nlohmann::json(nullptr) : nlohmann::json(call.worker_exited)},
+              {"worker_exit_status", source_thread ? "NotApplicable: synchronous source call" : (call.worker_exited ? "Exited" : "NotProven")}});
         }
       }
       const auto task = observed_tasks[target];
@@ -3385,6 +3399,9 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
   const bool automatic_limited = resize_test && limited_environment != nullptr && std::strcmp(limited_environment, "2") == 0;
   const bool limited_sequence = automatic_limited
       || (resize_test && limited_environment != nullptr && std::strcmp(limited_environment, "1") == 0);
+  const auto* async_pso_environment = std::getenv("NR_NEXUS_TEST_RESIZE_ASYNC_PSO");
+  const bool limited_async_pso = limited_sequence && !automatic_limited
+      && (async_pso_environment == nullptr || std::strcmp(async_pso_environment, "1") == 0);
   const auto* selected_environment = std::getenv("NR_NEXUS_TEST_RESIZE_SELECTED_LEVELS");
   const bool selected_sequence = resize_test && selected_environment != nullptr;
   const uint32_t selected_levels = (selected_sequence && std::strcmp(selected_environment, "0") != 0
@@ -3473,6 +3490,9 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
   try {
     Check(!cold_prepare || !single_feature, "resize diagnostic modes are separate probes");
     Check(!demand_prepare || !diagnostic_probe, "demand preparation uses the ordinary native resize fixture");
+    Check(async_pso_environment == nullptr || (limited_sequence && !automatic_limited
+        && (std::strcmp(async_pso_environment, "0") == 0 || std::strcmp(async_pso_environment, "1") == 0)),
+        "the private PSO comparison switch accepts only 0/1 within the existing limited case 1");
     Check(!limited_sequence || (selected_sequence && !demand_prepare
         && (automatic_limited ? selected_levels == 3 && !pipeline_steps : selected_levels == 15 && pipeline_steps)),
         "limited case 1 requires selected 15/pipeline steps; automatic case 2 requires selected 3/no pipeline probe; neither uses legacy demand");
@@ -4039,21 +4059,25 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           addon::ApplySettingEffect(addon::kSetAdaptiveLimitedResidency.effect);
           addon::kSetAdaptiveTargetFps.Store(100.f);
         } else {
-          Check(addon::codec_pipeline.look.band == nullptr, "private native observation also starts with a cold look bands target");
+          Check(addon::codec_pipeline.look.band == nullptr && addon::async_autoscale_task == nullptr,
+              "private native observation also starts with a cold look bands target and no previous task");
           addon::nr_adaptive_limited_residency = true;
-          addon::async_autoscale_preparation = true;
-          limited_pso_probe.Attach(gpu.device.Get());
+          addon::async_autoscale_preparation = limited_async_pso;
+          limited_pso_probe.Attach(gpu.device.Get(), limited_async_pso);
         }
         resize_report["selected_collection"]["limited_residency"] = {
-            {"enabled", true}, {"async_autoscale", !automatic_limited}, {"async_look_bands", !automatic_limited},
+            {"enabled", true}, {"async_autoscale", limited_async_pso}, {"async_look_bands", limited_async_pso},
+            {"private_pso_mode", automatic_limited ? "disabled" : (limited_async_pso ? "async" : "sync")},
             {"logical_levels", selected_levels},
             {"selection_scope", automatic_limited
                 ? "production Session/Controller decisions; MOCK output FPS; real SR/NR and GPU samples; no direct Request or state edits"
                 : "direct Session requests; real SR/NR; no automatic FPS or dynamic visual claim"},
             {"prefix_source_cadence", "60 Hz paced source opportunities, same as the selected loop; no worker join or additional source attempts"},
             {"ready_wall_comparison_limit", "ready wall includes the 60 Hz prefix cadence; not directly comparable with the former unpaced synchronous prefix"},
+            {"cache_scope", "process-cold production slots; driver/disk caches are not reset or controlled, so run order is not a cold-cache guarantee"},
             {"async_start_boundary", automatic_limited ? "NotRun: private PSO experiment remains off"
-                : "tool calls production StartAsyncAutoscalePreparation before the next source, outside runtime_mutex"}};
+                : (limited_async_pso ? "tool calls production StartAsyncAutoscalePreparation before the next source, outside runtime_mutex"
+                                     : "NotApplicable: synchronous production API calls remain inside the source")}};
       }
       if (pipeline_steps || automatic_limited) {
         // Match the later selected loop before the first source; changing
@@ -4127,7 +4151,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       gpu.list->ClearState(nullptr);
       std::shared_ptr<addon::AsyncAutoscalePreparation> limited_pending_task;
       size_t limited_pending_target = native_limited_slots.size();
-      if (limited_sequence && !automatic_limited) {
+      if (limited_async_pso) {
         addon::StartAsyncAutoscalePreparation();
         limited_pending_task = addon::async_autoscale_task;
         if (limited_pending_task != nullptr) {
@@ -4176,7 +4200,8 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       }
       if (limited_sequence && !automatic_limited) {
         for (size_t target = 0; target < native_limited_targets.size(); ++target) {
-          if (limited_pso_probe.accepted[target] || limited_pso_probe.tasks[target] == nullptr) continue;
+          if (limited_pso_probe.accepted[target]
+              || (limited_async_pso && limited_pso_probe.tasks[target] == nullptr)) continue;
           auto& observation = native_limited_targets[target];
           std::shared_lock lock(observation.mutex);
           for (const auto& call : observation.calls) {
@@ -4371,9 +4396,17 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           std::shared_lock lock(observation.mutex);
           Check(observation.calls.size() == 1 && observation.calls[0].api_returned
               && SUCCEEDED(observation.calls[0].result)
-              && observation.calls[0].worker_id != GetCurrentThreadId() && observation.calls[0].worker_exited
               && limited_pso_probe.accepted[target],
-              "each fixed native private PSO target is created once, accepted into its own slot and has a real worker exit proof");
+              "each fixed native PSO target is created once and its exact API result is accepted into its own slot");
+          if (limited_async_pso) {
+            Check(observation.calls[0].worker_id != native_limited_main_thread_id && observation.calls[0].worker_exited
+                && limited_pso_probe.tasks[target] != nullptr,
+                "each asynchronous native PSO target has its actual task and a real worker exit proof");
+          } else {
+            Check(observation.calls[0].worker_id == native_limited_main_thread_id
+                && observation.calls[0].worker == nullptr && limited_pso_probe.tasks[target] == nullptr,
+                "the synchronous native PSO baseline has no task or worker and requires no main-thread exit wait");
+          }
         }
         resize_report["selected_collection"]["limited_residency"]["async_pso"] = limited_pso_probe.Snapshot();
       }
@@ -7856,7 +7889,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
             {"max_source_call_ms", selected_max_wrapper_ms}, {"sampled_peak_process_local_bytes", selected_peak_local_bytes},
             {"memory_scope", "QueryVideoMemoryInfo LOCAL CurrentUsage; complete process including SR, NR, inputs/outputs, working surfaces and retirement; sampled, not incremental tier-only or instantaneous peak"},
             {"not_tested", "dynamic visual quality, automatic output-FPS decisions and resource-failure injection"}};
-        report["mode"] = "cold-limited-target-ready-async-autoscale";
+        report["mode"] = (limited_async_pso ? "cold-limited-target-ready-async-psos" : "cold-limited-target-ready-sync-psos");
         report["selection"] = "MOCK direct target requests; real SR/NR and exact retirement; no full-ladder readiness claim";
         report["probe_execution"] = "Passed";
       } else if (selected_sequence) {

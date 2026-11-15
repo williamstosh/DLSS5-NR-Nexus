@@ -586,15 +586,22 @@ PSO 创建，最后一个 PSO 所在源不叠加 NGX Create 或 NR Evaluate，re
 它保留15个逻辑档位，验证上限→冷档→上限、旧录制仍可重放时拒绝添档、反向取消、
 真实退休后再准备和原有 OFF 收尾；只要求目标整组就绪并实际应用，不把 `Session.prepared`
 伪装为真。档位请求是夹具直接驱动，SR／NR、GPU 完成和资源退休是真实执行。
-此单例同时显式开启内部私有PSO实验，autoscale与look bands共用单个在途任务；
-玩家的有限驻留选项不自动开启它。`async_pso` 使用
+此单例默认显式开启内部私有PSO实验，autoscale与look bands共用单个在途任务；
+玩家的有限驻留选项不自动开启它。仅此`LIMITED=1`夹具可用
+`NR_NEXUS_TEST_RESIZE_ASYNC_PSO=0`执行同步基线；省略或设为`1`保留私有任务路径。
+两个新进程可使用同一二进制对照；这同时切换两个PSO，驱动／磁盘缓存不受控，
+不将全局就绪墙时差单独归因Look。此路径需编译`NR_NEXUS_TEST_COLD_CPU_TRACE`。
+`async_pso` 使用
 `nr-nexus-native-private-pso-v2`，在 `targets.autoscale` 与 `targets.look_bands`
 分别记录真实API区间、返回／异常、线程身份及OS退出凭据、pending源返回次数，
-并以实际task的shader／slot和生产槽中的同一pipeline核对接纳。接纳时间是源调用返回后
-的观测时刻；API返回、槽接纳与线程退出分别判断，未完成值保留为空。
+并以真实API产物与生产槽中的同一pipeline核对接纳，私有模式还核实际task的shader／slot。
+接纳时间是源调用返回后的观测时刻；API返回、槽接纳与线程退出分别判断，
+未完成值保留为空，同步主线程没有worker，退出字段为`null / NotApplicable`。
 成功收尾也会递增取消代次，`task.canceled_at_snapshot`不代表此前接纳被拒。
 取消、失败归属及顺序接纳仍由`adaptive-inline`严格WARP用例覆盖；旧autoscale单项
-记录不能证明look bands原生通过。主线程嵌套trace不包含worker，不能重复加总。
+记录不能证明look bands原生通过。同步API位于主线程嵌套trace内，私有worker另行记录，
+不能重复加总。源CPU区间为`HookedEvaluateFeatureSlot`，不含夹具在其前调用的
+`StartAsyncAutoscalePreparation`；总就绪墙时及实际源起点间隔包含这些间隙。
 前缀沿用 selected 循环的60 Hz节奏，62／180次源界限不变；准备墙时包含该节奏，
 不能直接对比旧零节拍前缀。`selected_collection.limited_residency` 保存目标、应用、
 驻留与退休数量；本模式的旧 `full_preparation_*` 字段仅继承首次上限前缀合计，完整范围
