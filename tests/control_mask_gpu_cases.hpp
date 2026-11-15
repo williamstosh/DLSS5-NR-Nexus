@@ -2916,16 +2916,20 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
   const bool demand_prepare = resize_test && demand_prepare_environment != nullptr
       && (std::strcmp(demand_prepare_environment, "1") == 0 || std::strcmp(demand_prepare_environment, "2") == 0);
   const bool demand_adjacent = demand_prepare && std::strcmp(demand_prepare_environment, "2") == 0;
+  const auto* limited_environment = std::getenv("NR_NEXUS_TEST_RESIZE_LIMITED");
+  const bool automatic_limited = resize_test && limited_environment != nullptr && std::strcmp(limited_environment, "2") == 0;
+  const bool limited_sequence = automatic_limited
+      || (resize_test && limited_environment != nullptr && std::strcmp(limited_environment, "1") == 0);
   const auto* selected_environment = std::getenv("NR_NEXUS_TEST_RESIZE_SELECTED_LEVELS");
   const bool selected_sequence = resize_test && selected_environment != nullptr;
   const uint32_t selected_levels = (selected_sequence && std::strcmp(selected_environment, "0") != 0
-      ? renodx::addons::dlss5::adaptive_resolution::MAX_PREPARED_LEVELS : 0u);
+      ? (automatic_limited && std::strcmp(selected_environment, "3") == 0
+              ? 3u : renodx::addons::dlss5::adaptive_resolution::MAX_PREPARED_LEVELS) : 0u);
+  const uint32_t selected_source_limit = (automatic_limited ? 900u : 180u);
   const auto* components_environment = std::getenv("NR_NEXUS_TEST_RESIZE_COLD_COMPONENTS");
   const bool cold_components = resize_test && components_environment != nullptr && std::strcmp(components_environment, "1") == 0;
   const auto* pipeline_environment = std::getenv("NR_NEXUS_TEST_RESIZE_PIPELINE_STEPS");
   const bool pipeline_steps = resize_test && pipeline_environment != nullptr && std::strcmp(pipeline_environment, "1") == 0;
-  const auto* limited_environment = std::getenv("NR_NEXUS_TEST_RESIZE_LIMITED");
-  const bool limited_sequence = resize_test && limited_environment != nullptr && std::strcmp(limited_environment, "1") == 0;
   NativeLimitedAutoscaleProbe limited_pso_probe;
   uint32_t limited_pending_source_returns = 0;
   bool cold_components_failed = false;
@@ -2933,7 +2937,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
   bool demand_validation_failed = false;
   nlohmann::json resize_report;
   const auto save_limited_worker_failure = [&] {
-    if (!limited_sequence) return;
+    if (!limited_sequence || automatic_limited) return;
     auto& observation = resize_report["selected_collection"]["limited_residency"]["async_pso_failure"];
     observation["before_cleanup"] = limited_pso_probe.Snapshot(limited_pending_source_returns);
     observation["private_worker_cleanup_completed"] = limited_pso_probe.Finish();
@@ -3005,8 +3009,9 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
   try {
     Check(!cold_prepare || !single_feature, "resize diagnostic modes are separate probes");
     Check(!demand_prepare || !diagnostic_probe, "demand preparation uses the ordinary native resize fixture");
-    Check(!limited_sequence || (selected_sequence && selected_levels == 15 && pipeline_steps && !demand_prepare),
-        "limited native single case requires selected 15 and pipeline steps, without legacy demand experiments");
+    Check(!limited_sequence || (selected_sequence && !demand_prepare
+        && (automatic_limited ? selected_levels == 3 && !pipeline_steps : selected_levels == 15 && pipeline_steps)),
+        "limited case 1 requires selected 15/pipeline steps; automatic case 2 requires selected 3/no pipeline probe; neither uses legacy demand");
 #if !defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
     Check(!cold_components && !pipeline_steps, "cold CPU probes require the dedicated NR_NEXUS_TEST_COLD_CPU_TRACE native build");
 #endif
@@ -3018,8 +3023,9 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           "pipeline steps requires explicit Default 0 or 15, Ready 1, and no two-source cold-components probe");
     }
     if (selected_sequence) {
-      Check(std::strcmp(selected_environment, "0") == 0 || std::strcmp(selected_environment, "15") == 0,
-          "selected comparison accepts Default 0 or the complete 15-level grid");
+      Check(std::strcmp(selected_environment, "0") == 0 || std::strcmp(selected_environment, "15") == 0
+          || (automatic_limited && std::strcmp(selected_environment, "3") == 0),
+          "selected comparison accepts Default 0 or 15; the automatic limited single case selects three logical levels");
       Check(!diagnostic_probe && !demand_prepare, "selected comparison excludes the existing diagnostic experiments");
       for (const char* key : {"NR_NEXUS_TEST_RESIZE_SETTINGS", "NR_NEXUS_TEST_RESIZE_EXPECT_REUSE",
                "NR_NEXUS_TEST_RESIZE_REUSE_FEATURE", "NR_NEXUS_TEST_RESIZE_FIXED_INPUT"}) {
@@ -3521,30 +3527,40 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       resize_report = {{"schema", "nr-nexus-native-resize-v1"}, {"evidence", "NATIVE_GPU+NATIVE_NGX"},
           {"probe_execution", "Running"}, {"teardown_status", "NotRun"},
           {"selected_collection", {{"schema", "nr-nexus-native-selected-v1"}, {"selected_levels", selected_levels},
-              {"minimum_scale", 0.33}, {"ordinary_workset_limit", 4}, {"source_frame_limit", 180},
+              {"minimum_scale", automatic_limited ? .5 : .33}, {"ordinary_workset_limit", 4}, {"source_frame_limit", selected_source_limit},
               {"prefix_frame_limit", addon::kContractDebounceFrames + 32},
               {"memory_baseline_process_local_bytes", memory.CurrentUsage}, {"memory_baseline_budget_bytes", memory.Budget},
               {"prefix_cpu_wrapper_ms", 0.}, {"prefix_cpu_create_ms", 0.}, {"prefix_cpu_release_ms", 0.},
               {"prefix_cpu_host_sr_ms", 0.}, {"prefix_cpu_nr_evaluate_ms", 0.},
               {"prefix_create_count", 0u}, {"prefix_release_count", 0u}, {"prefix_frames", nlohmann::json::array()}}}};
-      addon::kSetAdaptiveEnabled.Store(pipeline_steps ? 1.f : 0.f);
+      addon::kSetAdaptiveEnabled.Store(pipeline_steps || automatic_limited ? 1.f : 0.f);
       addon::kSetAdaptiveLevelCount.Store(selected_levels);
-      addon::kSetAdaptiveMinScale.Store(0.33f);
+      addon::kSetAdaptiveMinScale.Store(automatic_limited ? .5f : .33f);
       addon::max_worksets = 4;
       if (limited_sequence) {
         Check(width == 1920 && height == 1080 && addon::stack_passes.load() == 1
             && addon::codec_pipeline.autoscale == nullptr, "limited native case is one cold 1080p single-pass autoscale source");
-        addon::nr_adaptive_limited_residency = true;
-        addon::async_autoscale_preparation = true;
-        limited_pso_probe.Attach(gpu.device.Get());
+        if (automatic_limited) {
+          Check(!addon::async_autoscale_preparation.load(), "automatic player-mode probe leaves private asynchronous PSO preparation off");
+          addon::kSetAdaptiveLimitedResidency.Store(1.f);
+          addon::ApplySettingEffect(addon::kSetAdaptiveLimitedResidency.effect);
+          addon::kSetAdaptiveTargetFps.Store(100.f);
+        } else {
+          addon::nr_adaptive_limited_residency = true;
+          addon::async_autoscale_preparation = true;
+          limited_pso_probe.Attach(gpu.device.Get());
+        }
         resize_report["selected_collection"]["limited_residency"] = {
-            {"enabled", true}, {"async_autoscale", true}, {"logical_levels", 15},
-            {"selection_scope", "direct Session requests; real SR/NR; no automatic FPS or dynamic visual claim"},
+            {"enabled", true}, {"async_autoscale", !automatic_limited}, {"logical_levels", selected_levels},
+            {"selection_scope", automatic_limited
+                ? "production Session/Controller decisions; MOCK output FPS; real SR/NR and GPU samples; no direct Request or state edits"
+                : "direct Session requests; real SR/NR; no automatic FPS or dynamic visual claim"},
             {"prefix_source_cadence", "60 Hz paced source opportunities, same as the selected loop; no worker join or additional source attempts"},
             {"ready_wall_comparison_limit", "ready wall includes the 60 Hz prefix cadence; not directly comparable with the former unpaced synchronous prefix"},
-            {"async_start_boundary", "tool calls production StartAsyncAutoscalePreparation before the next source, outside runtime_mutex"}};
+            {"async_start_boundary", automatic_limited ? "NotRun: private PSO experiment remains off"
+                : "tool calls production StartAsyncAutoscalePreparation before the next source, outside runtime_mutex"}};
       }
-      if (pipeline_steps) {
+      if (pipeline_steps || automatic_limited) {
         // Match the later selected loop before the first source; changing
         // these identity providers midway would restart the same collection.
         renodx::addons::dlss5::gpu_timers::comparison_settings = addon::comparison_ui::CaptureSettings;
@@ -3614,7 +3630,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       }
       gpu.list->ClearState(nullptr);
       std::shared_ptr<addon::AsyncAutoscalePreparation> limited_pending_task;
-      if (limited_sequence) {
+      if (limited_sequence && !automatic_limited) {
         addon::StartAsyncAutoscalePreparation();
         limited_pending_task = addon::async_autoscale_task;
       }
@@ -3825,7 +3841,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                   && resize_report["selected_collection"].at("prefix_release_count").get<uint32_t>() == 0,
             "selected preparation accounts for exactly one real initial upper Feature");
       }
-      if (limited_sequence) {
+      if (limited_sequence && !automatic_limited) {
         Check(limited_pso_probe.Finish() && limited_pso_probe.worker_exited
             && native_limited_pso_calls.load() == 1 && SUCCEEDED(native_limited_pso_result.load())
             && native_limited_worker_id.load() != GetCurrentThreadId(),
@@ -5625,7 +5641,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       addon::adaptive_feature_mode = feature_mode;
       native_resize_demand_prepare = demand_prepare;
       native_resize_create_gpu = demand_adjacent;
-      const uint32_t frame_count = (demand_prepare ? 900u : (settings_reuse ? 360u : 180u));
+      const uint32_t frame_count = (automatic_limited ? selected_source_limit : (demand_prepare ? 900u : (settings_reuse ? 360u : 180u)));
       const UINT intervals_per_frame = (demand_adjacent ? 4u : (native_resize_ready ? 3u : 2u));
       auto queries = d3d12_test::CreateTimestampQueries(gpu, frame_count * intervals_per_frame);
       ComPtr<IDXGIAdapter3> adapter;
@@ -5699,6 +5715,10 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         report["render_size"] = {render_width, render_height};
         report["output_size"] = {width, height};
       }
+      if (automatic_limited) {
+        report["mode"] = "automatic-player-limited-residency";
+        report["selection"] = "production Controller with MOCK FPS; actual GPU timing, real NGX and monotonic time; no direct requests";
+      }
       report["loaded_ngx_modules"] = nlohmann::json::array();
       std::array<HMODULE, 1024> modules{};
       DWORD module_bytes = 0;
@@ -5754,6 +5774,22 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       bool demand_lower_applied = false, demand_returned_upper = false;
       namespace output_rate = renodx::addons::dlss5::output_framerate;
       namespace adaptive = renodx::addons::dlss5::adaptive_resolution;
+      uint32_t automatic_phase = 0, automatic_pending_frames = 0, automatic_peak_features = 0;
+      std::array<uint32_t, 3> automatic_slot_creates{};
+      const NVSDK_NGX_Handle* automatic_anchor = nullptr;
+      int64_t automatic_cooldown_deadline = 0;
+      std::string automatic_failure;
+      if (automatic_limited) {
+        report["selected_collection"]["limited_residency"]["automatic"] = {
+            {"input_evidence", "MOCK FPS by actual Applied size: upper 80; first 75% 84; 50% 60; returned 75% 60"},
+            {"gpu_evidence", "NATIVE_GPU production timestamps and actual Session median/MAD; no injected GPU samples"},
+            {"clock", "real SteadyNowNs/steady_clock; no time, level, Request or blocked-state edits"},
+            {"cooldown_scope", "30-second expiry NotRun; synthetic 84-to-60 FPS workload change reopens production blocked gate"},
+            {"feature_count_scope", "sampled after each source submit/Reset/drain; live plus pending retired NR Features, not an instantaneous SDK allocation peak"},
+            {"frame_limit", frame_count}, {"wall_limit_ms_including_prefix", 20000}, {"source_cadence_hz", 60},
+            {"target_fps", 100}, {"mock_fps_mad", 0}, {"logical_levels", 3}, {"minimum_scale", .5},
+            {"events", nlohmann::json::array()}, {"states", nlohmann::json::array()}};
+      }
       if (demand_prepare) {
         const auto& upper = addon::features.at(owner).slots[0];
         initial_models[0] = reinterpret_cast<uintptr_t>(upper.handle);
@@ -5835,6 +5871,10 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         }
       }
       for (uint32_t frame = 0; frame < frame_count; ++frame) {
+        if (automatic_limited && std::chrono::steady_clock::now() - selected_prefix_begin >= std::chrono::seconds(20)) {
+          automatic_failure = "20-second real wall bound reached before the automatic decision sequence completed";
+          break;
+        }
         native_resize_frame = frame;
         const uint32_t phase = (selected_sequence ? (recorded_ready ? 1u : 0u)
             : (demand_prepare ? (frame < 360 ? 0u : 1u) : frame / 60));
@@ -5847,7 +5887,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           changed = source.adaptive_cache->active != selected_requested_slot;
           source.adaptive_session->Request(selected_requested_slot, addon::SteadyNowNs());
         }
-        if (limited_sequence && limited_phase != 0 && !limited_request_issued) {
+        if (limited_sequence && !automatic_limited && limited_phase != 0 && !limited_request_issued) {
           auto& session = *addon::features.at(owner).adaptive_session;
           const size_t target = (limited_phase == 1 ? 6u : (limited_phase == 3 || limited_phase == 5 ? 10u : 0u));
           session.Request(target, addon::SteadyNowNs());
@@ -5858,7 +5898,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         double mock_output_fps = (frame < 360 ? 120. : 80.);
         size_t demand_active_before = 0;
         int64_t mock_window_end_ns = 0;
-        if (demand_prepare) {
+        if (demand_prepare || automatic_limited) {
           mock_window_end_ns = addon::SteadyNowNs();
           const auto& feature = addon::features.at(owner);
           if (feature.adaptive_cache != nullptr) {
@@ -5873,6 +5913,15 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
             Check(demand_active_before < 3, "consecutive MOCK output uses the actual three-slot active state");
             mock_output_fps = 80. + 10. * demand_active_before;
           }
+          if (automatic_limited) {
+            const auto& session = *feature.adaptive_session;
+            Check(session.ladder.count == 3 && session.settings.limited_residency
+                && !session.settings.legacy_preparation && !addon::async_autoscale_preparation.load(),
+                "automatic player mode keeps three logical tiers with legacy and private PSO experiments off");
+            const auto applied = session.status.applied[0];
+            mock_output_fps = (applied == session.ladder.sizes[1][0] ? (automatic_phase >= 6 ? 60. : 84.)
+                : (applied == session.ladder.sizes[2][0] ? 60. : 80.));
+          }
           std::unique_lock lock(output_rate::internal::state.mutex);
           auto& estimate = output_rate::internal::state.stream;
           estimate.previous_ns = mock_window_end_ns;
@@ -5881,6 +5930,19 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
               .window_serial = frame + 1, .window_begin_ns = mock_window_end_ns - 500'000'000,
               .window_end_ns = mock_window_end_ns, .fps = mock_output_fps, .fps_mad = 0., .fg_off = true};
         }
+        const auto automatic_session_before = (automatic_limited ? addon::features.at(owner).adaptive_session : nullptr);
+        const auto automatic_applied_before = (automatic_limited ? automatic_session_before->status.applied : adaptive::Sizes{});
+        const bool automatic_retiring_before = automatic_limited && addon::AdaptiveRetirementPending(owner);
+        const auto automatic_requested_before = (automatic_limited ? automatic_session_before->level : 0u);
+        const auto automatic_generation_before = (automatic_limited ? automatic_session_before->status.generation : 0u);
+        const bool automatic_trial_before = automatic_limited && automatic_session_before->trial;
+        const auto automatic_previous_before = (automatic_limited ? automatic_session_before->previous_level : 0u);
+        const double automatic_baseline_fps_before = (automatic_limited ? automatic_session_before->baseline_fps : 0.);
+        const auto automatic_applied_ns_before = (automatic_limited ? automatic_session_before->applied_ns : 0);
+        const double automatic_baseline_before = (automatic_limited ? automatic_session_before->baseline_gpu_us : 0.);
+        double automatic_gpu_before = 0., automatic_gpu_mad_before = 0.;
+        const bool automatic_gpu_valid_before = automatic_limited
+            && automatic_session_before->GpuStatistics(mock_window_end_ns, &automatic_gpu_before, &automatic_gpu_mad_before);
         if (settings_reuse) {
           switch (frame) {
             case 180:
@@ -6085,7 +6147,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         Check(SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memory_before)), "resize memory before submit");
         const auto submitted = std::chrono::steady_clock::now();
         const auto before_submit_cache = addon::features.at(owner).adaptive_cache;
-        const bool retain_limited_source = limited_sequence && limited_phase == 1
+        const bool retain_limited_source = limited_sequence && !automatic_limited && limited_phase == 1
             && limited_retained_list == nullptr && before_submit_cache != nullptr && before_submit_cache->active == 6;
         submit_resize(!retain_limited_source);
         const auto completed = std::chrono::steady_clock::now();
@@ -6241,7 +6303,131 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           if (selected_sequence && !limited_sequence) {
             all_ready &= addon::features.at(owner).adaptive_session->prepared;
           }
-          if (limited_sequence) {
+          if (automatic_limited) {
+            auto& session = *addon::features.at(owner).adaptive_session;
+            auto& automatic = report["selected_collection"]["limited_residency"]["automatic"];
+            const auto now_ns = addon::SteadyNowNs();
+            const bool applied_target = session.TargetReady() && cache->active == session.level
+                && session.status.applied == cache->ladder.sizes[cache->active] && session.applied_ns != 0;
+            Check(cache->count == 3 && session.settings.selected_levels == 3 && session.settings.limited_residency
+                && !session.settings.legacy_preparation && !addon::async_autoscale_preparation.load()
+                && addon::adaptive_feature_mode.load() == addon::AdaptiveFeatureMode::OFF,
+                "automatic player limited mode retains its selected logical count and ordinary independent Features");
+            for (const auto& call : native_resize_create_calls) {
+              Check(call.contains("session") && call.at("session").at("preparing_slot").get<size_t>() < 3,
+                  "each automatic Create belongs to an observed production tier");
+              const auto slot = call.at("session").at("preparing_slot").get<size_t>();
+              ++automatic_slot_creates[slot];
+              Check(call.at("input")[0] == session.ladder.sizes[slot][0].width
+                  && call.at("input")[1] == session.ladder.sizes[slot][0].height,
+                  "automatic Create uses its actual selected dimensions rather than the old capacity-reuse experiment");
+            }
+            automatic_peak_features = std::max(automatic_peak_features,
+                actual_resident_features + static_cast<uint32_t>(addon::retired_nr_features.size()));
+            Check(addon::nr_features_created - selected_features_before <= 4,
+                "the bounded automatic sequence cannot create beyond upper, 75 percent and two 50 percent candidates");
+            if (session.level != active) {
+              ++automatic_pending_frames;
+              Check(session.status.applied == automatic_applied_before
+                  && session.applied_ns == 0 && session.gpu_count == 0,
+                  "cold waiting preserves the real Applied output and does not measure fallback GPU work for the target");
+            }
+            if (active != demand_active_before) {
+              Check(demand_ready_before[active] && native_runtime_resets[0] == 1 && applied_target,
+                  "automatic activation uses an earlier complete healthy receipt and a real Reset before committing Applied");
+            }
+            if (addon::AdaptiveRetirementPending(owner)) {
+              Check(native_resize_creates == 0, "an outstanding ordinary retirement cannot admit another automatic cold model");
+            }
+            const auto phase_before = automatic_phase;
+            if (automatic_phase == 0 && applied_target && active == 0) {
+              recorded_ready = true;
+              selected_ready_frame = frame;
+              automatic_slot_creates[0] = report["selected_collection"].at("prefix_create_count").get<uint32_t>();
+              Check(automatic_slot_creates[0] == 1 && actual_resident_features == 1,
+                  "player on-demand startup has only the actual complete upper");
+              ++automatic_phase;
+            } else if (automatic_phase == 1 && session.level == 1 && session.trial && session.previous_level == 0) {
+              Check(session.baseline_fps == 80. && !demand_ready_before[1],
+                  "the real Controller requests its first cold adjacent tier from the injected 80 FPS upper window");
+              ++automatic_phase;
+            } else if (automatic_phase == 2 && applied_target && active == 1) {
+              automatic_anchor = addon::features.at(owner).slots[0].handle;
+              Check(automatic_slot_creates[1] == 1 && actual_resident_features == 2,
+                  "first automatic cold preparation actually applies the 75-percent model while retaining its upper anchor");
+              ++automatic_phase;
+            } else if (automatic_phase == 3 && session.level == 2 && session.trial && session.previous_level == 1) {
+              Check(session.baseline_fps == 84. && !demand_ready_before[2],
+                  "the Controller accepts the real cheaper 75-percent trial before requesting a second cold descent from its 84 FPS anchor");
+              ++automatic_phase;
+            } else if (automatic_phase == 4 && applied_target && active == 2) {
+              Check(automatic_slot_creates[2] == 1 && addon::nr_features_created - selected_features_before == 3,
+                  "the second automatically requested target reaches real 50-percent Applied dimensions");
+              ++automatic_phase;
+            } else if (automatic_phase == 5 && automatic_trial_before && automatic_requested_before == 2
+                && automatic_previous_before == 1 && automatic_baseline_fps_before == 84.
+                && session.status.generation > automatic_generation_before && session.blocked && !session.trial
+                && session.level == 1) {
+              // A ready rollback may already have replaced the display reason
+              // with WARMING in this source. Observe the decision transition.
+              Check(session.baseline_fps == 84. && session.status.requested == session.ladder.sizes[1],
+                  "the worse 60 FPS result returns through the actual no-benefit branch to the accepted 75-percent anchor");
+              automatic_cooldown_deadline = session.blocked_until_ns;
+              ++automatic_phase;
+            } else if (automatic_phase == 6 && applied_target && active == 1) {
+              Check(addon::features.at(owner).slots[0].handle == automatic_anchor
+                  && automatic_slot_creates[1] == 1 && session.blocked,
+                  "the observed rollback Applied uses the original accepted 75-percent Feature without recreating it");
+              ++automatic_phase;
+            } else if (automatic_phase == 7 && session.level == 2 && session.trial && session.previous_level == 1) {
+              Check(!session.blocked && now_ns < automatic_cooldown_deadline && session.baseline_fps == 60.
+                  && !demand_ready_before[2],
+                  "a synthetic 84-to-60 workload change reopens the real controller before cooldown expiry after the old 50-percent target retired");
+              ++automatic_phase;
+            } else if (automatic_phase == 8 && applied_target && active == 2) {
+              Check(automatic_slot_creates == std::array<uint32_t, 3>{1, 1, 2}
+                  && addon::nr_features_created - selected_features_before == 4
+                  && cache->tiers[1].state.slots[0].handle == automatic_anchor,
+                  "automatic re-exploration cold-creates a new 50-percent target while preserving the accepted rollback Feature");
+              ++automatic_phase;
+            }
+            double gpu_median = 0., gpu_mad = 0.;
+            const bool gpu_valid = session.GpuStatistics(now_ns, &gpu_median, &gpu_mad);
+            automatic["states"].push_back({{"frame", frame}, {"phase", automatic_phase}, {"now_ns", now_ns},
+                {"requested_slot", session.level}, {"active_slot", active}, {"generation", session.status.generation},
+                {"target_ready", session.TargetReady()}, {"full_prepared", session.prepared}, {"applied_ns", session.applied_ns},
+                {"applied_size", {session.status.applied[0].width, session.status.applied[0].height}},
+                {"mock_fps", mock_output_fps}, {"reason", adaptive::ReasonText(session.status.reason)},
+                {"trial", session.trial}, {"previous_level", session.previous_level}, {"blocked", session.blocked},
+                {"blocked_until_ns", session.blocked_until_ns}, {"baseline_fps", session.baseline_fps},
+                {"baseline_gpu_us", session.baseline_gpu_us}, {"baseline_gpu_mad", session.baseline_gpu_mad},
+                {"gpu_sample_count", session.gpu_count}, {"gpu_statistics_available", gpu_valid},
+                {"gpu_median_us", gpu_valid ? nlohmann::json(gpu_median) : nlohmann::json(nullptr)},
+                {"gpu_mad_us", gpu_valid ? nlohmann::json(gpu_mad) : nlohmann::json(nullptr)},
+                {"before_gpu_statistics_available", automatic_gpu_valid_before},
+                {"before_gpu_median_us", automatic_gpu_valid_before ? nlohmann::json(automatic_gpu_before) : nlohmann::json(nullptr)},
+                {"before_gpu_mad_us", automatic_gpu_valid_before ? nlohmann::json(automatic_gpu_mad_before) : nlohmann::json(nullptr)},
+                {"before_baseline_gpu_us", automatic_baseline_before}, {"before_requested_slot", automatic_requested_before},
+                {"before_trial", automatic_trial_before}, {"before_previous_level", automatic_previous_before},
+                {"before_baseline_fps", automatic_baseline_fps_before},
+                {"before_generation", automatic_generation_before}, {"before_applied_ns", automatic_applied_ns_before},
+                {"retirement_pending_before", automatic_retiring_before}, {"retirement_pending_after", addon::AdaptiveRetirementPending(owner)},
+                {"resident_features", actual_resident_features}, {"retiring_features", addon::retired_nr_features.size()},
+                {"slot_create_counts", automatic_slot_creates}});
+            if (automatic_phase != phase_before) {
+              automatic["events"].push_back(automatic["states"].back());
+              auto& event = automatic["events"].back();
+              event["event"] = (phase_before == 5 ? "no_benefit_rollback_decision"
+                  : (phase_before == 6 ? "accepted_anchor_applied_observed" : "controller_progress_observed"));
+              if (phase_before == 5) {
+                event["rollback_applied_in_same_source"] = applied_target && active == 1
+                    && session.status.applied != automatic_applied_before;
+              }
+            }
+            if (session.blocked && automatic_phase >= 2 && automatic_phase <= 4) {
+              automatic_failure = "the genuine GPU/FPS acceptance gate rejected an earlier trial; later automatic stages were not reached";
+            }
+          } else if (limited_sequence) {
             auto& session = *addon::features.at(owner).adaptive_session;
             Check(cache->count == 15 && session.settings.limited_residency && !session.prepared,
                 "limited native mode preserves fifteen logical tiers without claiming full-ladder readiness");
@@ -6595,7 +6781,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
             {"fence", gpu.serial}, {"completed_fence", gpu.fence->GetCompletedValue()}});
         report["frames"].back()["active_slot"] = active;
         if (limited_sequence) {
-          report["frames"].back()["limited_phase_after_source"] = limited_phase;
+          report["frames"].back()["limited_phase_after_source"] = (automatic_limited ? automatic_phase : limited_phase);
           report["frames"].back()["fixture_recording_replacement_ms"] = limited_list_replacement_ms;
           report["frames"].back()["fixture_recording_replacement_scope"] = "after the measured submit/Fence completion, before retirement polling; excluded from Hook and GPU timestamps";
         }
@@ -6629,7 +6815,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           report["frames"].back()["transfer_strength_setting"] = addon::transfer_strength.load();
           report["frames"].back()["requested_slot"] = addon::features.at(owner).adaptive_session->level;
         }
-        if (demand_prepare) {
+        if (demand_prepare || automatic_limited) {
           const auto& session = *addon::features.at(owner).adaptive_session;
           report["frames"].back()["create_calls"] = native_resize_create_calls;
           report["frames"].back()["demand"] = {{"fps_evidence", "MOCK"}, {"mock_output_fps", mock_output_fps},
@@ -6679,12 +6865,36 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                     << " completion_ms=" << std::chrono::duration<double, std::milli>(completed - start).count() << std::endl;
         }
         previous = start;
-        if ((limited_sequence && limited_phase == 7)
+        if ((automatic_limited && (automatic_phase == 9 || !automatic_failure.empty()))
+            || (limited_sequence && !automatic_limited && limited_phase == 7)
             || (selected_sequence && !limited_sequence && selected_request_index == selected_requests.size())) break;
         deadline = std::max(deadline + std::chrono::microseconds(16667), std::chrono::steady_clock::now());
         std::this_thread::sleep_until(deadline);
       }
-      if (limited_sequence) {
+      if (automatic_limited) {
+        auto& finite = report["selected_collection"]["limited_residency"];
+        const double wall_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - selected_prefix_begin).count();
+        if (wall_ms > 20000. && automatic_failure.empty()) {
+          automatic_failure = "automatic sequence exceeded the fixed 20-second real wall bound including prefix";
+        }
+        const bool passed = automatic_phase == 9 && automatic_failure.empty() && recorded_ready
+            && automatic_slot_creates == std::array<uint32_t, 3>{1, 1, 2} && automatic_pending_frames != 0;
+        if (!passed && automatic_failure.empty()) {
+          automatic_failure = "900-source bound reached without all automatic stages; inspect real GPU median/MAD and controller reasons";
+        }
+        finite["automatic"]["result"] = {{"status", passed ? "Passed" : "Failed"}, {"completed_phase", automatic_phase},
+            {"failure", passed ? nlohmann::json(nullptr) : nlohmann::json(automatic_failure)},
+            {"actual_source_frames", report["frames"].size()}, {"prefix_source_calls", prefix_host_evaluates},
+            {"wall_ms_including_prefix", wall_ms},
+            {"slot_create_counts", automatic_slot_creates}, {"waiting_target_source_frames", automatic_pending_frames},
+            {"peak_features_including_retirement", automatic_peak_features}, {"sampled_peak_process_local_bytes", selected_peak_local_bytes},
+            {"direct_session_requests", false}, {"injected_gpu_samples", false}, {"synthetic_time", false},
+            {"async_autoscale", false}, {"cooldown_expiry_tested", false},
+            {"not_tested", "game output-FPS accuracy, dynamic visual quality, full 15-level automatic exploration and allocation failure"}};
+        report["probe_execution"] = (passed ? "Passed" : "Failed");
+        demand_validation_failed |= !passed;
+      } else if (limited_sequence) {
         Check(limited_phase == 7 && recorded_ready && selected_ready_frame != UINT32_MAX,
             "the limited target-ready roundtrip and reverse request finish within the existing source bound");
         auto& finite = report["selected_collection"]["limited_residency"];
@@ -6745,7 +6955,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         report["probe_execution"] = "Passed";
       }
       if (native_resize_ready) {
-        if (!demand_prepare) {
+        if (!demand_prepare && !automatic_limited) {
           Check(preparing_evaluates != 0, "real ready-cache run includes extra preparation Evaluate calls");
         }
         report["preparing_nr_evaluate_count"] = preparing_evaluates;
@@ -6791,7 +7001,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         }
         auto& before_off = addon::features.at(owner);
         size_t low_slot = 0;
-        if (!demand_prepare && !pipeline_steps) {
+        if (!demand_prepare && !pipeline_steps && !automatic_limited) {
           for (size_t slot = 1; slot < before_off.adaptive_cache->count; ++slot) {
             const auto& cache = *before_off.adaptive_cache;
             if (cache.tiers[slot].ready && before_off.adaptive_session->IsLegal(cache.ladder.sizes[slot])
@@ -6872,7 +7082,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
               {"source_successes_delta", source_successes_after - source_successes_before},
               {"fence", gpu.serial}, {"completed_fence", gpu.fence->GetCompletedValue()}});
         };
-        if (!demand_prepare && !pipeline_steps) {
+        if (!demand_prepare && !pipeline_steps && !automatic_limited) {
           evaluate_transaction("ready-low-before-off", false);
         }
         evaluate_transaction("adaptive-off-real-setting", true);
@@ -6885,7 +7095,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       native_resize_create_gpu = false;
       native_resize_create_calls.clear();
       native_resize_evaluate_cpu_ms.clear();
-      if (demand_prepare) {
+      if (demand_prepare || automatic_limited) {
         std::unique_lock lock(output_rate::internal::state.mutex);
         output_rate::internal::state.stream = {};
       }
@@ -7690,7 +7900,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     if (demand_prepare || selected_sequence) {
       resize_report["failed_create_calls"] = native_resize_create_calls;
     }
-    if (demand_prepare) {
+    if (demand_prepare || automatic_limited) {
       std::unique_lock lock(renodx::addons::dlss5::output_framerate::internal::state.mutex);
       renodx::addons::dlss5::output_framerate::internal::state.stream = {};
     }
@@ -7734,7 +7944,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     if (demand_prepare || selected_sequence) {
       resize_report["failed_create_calls"] = native_resize_create_calls;
     }
-    if (demand_prepare) {
+    if (demand_prepare || automatic_limited) {
       std::unique_lock lock(renodx::addons::dlss5::output_framerate::internal::state.mutex);
       renodx::addons::dlss5::output_framerate::internal::state.stream = {};
     }

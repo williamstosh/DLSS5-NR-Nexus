@@ -526,6 +526,20 @@ worker API 时间、线程身份及退出单独记录；主线程嵌套 trace �
 以 `initial_target` 和 `phase_states` 为准。显存使用 `QueryVideoMemoryInfo` 的进程
 LOCAL CurrentUsage采样，含SR、NR、输入输出、工作集及待退休资源，不是额外档位显存或瞬时峰值。
 
+自动控制器单例改用 `NR_NEXUS_TEST_RESIZE_LIMITED=2`、`SELECTED_LEVELS=3`、
+`PIPELINE_STEPS=0`、`READY=1`，其他 resize 实验关闭。它通过玩家按需设置进入真实
+Controller，不直接调用 `Session.Request`，也不修改档位、blocked 状态或时钟。
+三个逻辑档为100%／75%／50%；仅输出FPS为MOCK，按实际Applied尺寸依次提供
+80／84／60 FPS，回退75%后保持60 FPS以模拟负载变化。SR／NR、GPU时间戳、
+完成凭据和资源退休均真实执行；不注入GPU收益，私有PSO实验保持关闭。
+用例在最多900个源机会、含前缀20秒内验证连续冷降档、应用、无益回退和再次探索，
+GPU收益门禁不满足即如实失败。回退通过请求代际／trial／blocked转换观察，不依赖
+可能在同源被WARMING覆盖的显示文案。最终应累计创建1／1／2个Feature，复用75%
+回退锚并先退休旧50%资源，再沿原OFF路径收尾。详细证据位于
+`selected_collection.limited_residency.automatic`；旧 `full_preparation_*` 字段仍只表示
+首次上限前缀，不是全档预备。此用例不覆盖30秒冷却自然到期、游戏FPS采集准确性、
+动态画质、完整15档探索或分配失败；没有与全档模式作成对性能比较。
+
 首调用 CPU 归因另用原生测试编译宏 `NR_NEXUS_TEST_COLD_CPU_TRACE`，配合
 `NR_NEXUS_TEST_RESIZE_COLD_COMPONENTS=1`、`NR_NEXUS_TEST_RESIZE_SELECTED_LEVELS=0`
 和 `NR_NEXUS_TEST_RESIZE_READY=1`，其他专项关闭，仍调用同一 resize 入口。只运行首两次

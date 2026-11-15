@@ -607,6 +607,82 @@ inline bool Run() {
   mode_switch.Prepare(mode_settings, full_upper, full_floor, 1, limited_output, start + 7, true, false, 72);
   check(mode_switch.failed && mode_switch.status.reason == adaptive::Reason::FAILED && !mode_switch.TargetReady(),
       "a mode edit does not retry an actual execution failure through the budget recovery path");
+
+  // CPU design check only: FPS, GPU durations, completion delay and time are
+  // synthetic here. The native single case obtains GPU samples and time live.
+  adaptive::Session automatic_player;
+  const adaptive::Settings automatic_settings{.enabled = true, .target_fps = 100.f, .minimum_scale = .5f,
+      .prepared_levels = 3, .selected_levels = 3, .limited_residency = true};
+  adaptive::Output automatic_output{.available = true, .source = 1, .generation = 1, .configuration = 1};
+  uint32_t automatic_phase = 0, completion_ticks = 0;
+  uint64_t completion_generation = 0;
+  size_t actual_slot = 0;
+  int64_t rejected_cooldown = 0;
+  bool returned_anchor = false, anchor_ready = false, same_tick_rollback = false;
+  for (uint64_t index = 0; index <= 80 && automatic_phase != 9; ++index) {
+    const auto now = start + static_cast<int64_t>(index) * adaptive::SAMPLE_INTERVAL_NS;
+    automatic_player.ObserveGpu({.generation = automatic_player.status.generation,
+        .frame = index + 1, .sequence = index + 1, .context = 1, .recorded_ns = now, .completed_ns = now,
+        .total_us = (actual_slot == 0 ? 4000. : (actual_slot == 1 ? 3000. : 2000.)),
+        .valid = true, .stable = true}, now);
+    ++automatic_output.serial;
+    automatic_output.begin_ns = now - 500'000'000;
+    automatic_output.end_ns = now;
+    automatic_output.fps = (actual_slot == 0 ? 80. : (actual_slot == 1 && !returned_anchor ? 84. : 60.));
+    const auto before_requested = automatic_player.level;
+    const auto before_generation = automatic_player.status.generation;
+    const bool before_trial = automatic_player.trial;
+    const auto before_previous = automatic_player.previous_level;
+    const double before_baseline_fps = automatic_player.baseline_fps;
+    automatic_player.Prepare(automatic_settings, full_upper, full_floor, 1, automatic_output, now, true, false, 73);
+    if (completion_generation != automatic_player.status.generation) {
+      completion_generation = automatic_player.status.generation;
+      completion_ticks = 0;
+    }
+    const bool ready = actual_slot == automatic_player.level
+        || (automatic_player.level == 1 && anchor_ready) || ++completion_ticks >= 3;
+    automatic_player.UpdateTargetPreparation(automatic_player.preparation_epoch, completion_generation,
+        ready ? 2u : 1u, 3, ready, adaptive::Reason::PREPARING, now);
+    if (ready) {
+      automatic_player.Applied(completion_generation, automatic_player.status.requested, now);
+      actual_slot = automatic_player.active_level;
+      anchor_ready |= actual_slot == 1;
+    }
+    if (automatic_phase == 0 && automatic_player.TargetReady() && actual_slot == 0) {
+      check(automatic_player.ladder.count == 3 && automatic_player.ladder.coefficients[1] == .75f
+          && automatic_player.ladder.coefficients[2] == .5f, "the bounded player curve uses exactly 100/75/50 logical sizes");
+      ++automatic_phase;
+    } else if (automatic_phase == 1 && automatic_player.level == 1 && automatic_player.trial) {
+      ++automatic_phase;
+    } else if (automatic_phase == 2 && automatic_player.TargetReady() && actual_slot == 1) {
+      ++automatic_phase;
+    } else if (automatic_phase == 3 && automatic_player.level == 2 && automatic_player.trial
+        && automatic_player.previous_level == 1 && automatic_player.baseline_fps == 84.) {
+      ++automatic_phase;
+    } else if (automatic_phase == 4 && automatic_player.TargetReady() && actual_slot == 2) {
+      ++automatic_phase;
+    } else if (automatic_phase == 5 && before_trial && before_requested == 2 && before_previous == 1
+        && before_baseline_fps == 84. && automatic_player.status.generation > before_generation
+        && automatic_player.level == 1 && automatic_player.blocked && !automatic_player.trial) {
+      rejected_cooldown = automatic_player.blocked_until_ns;
+      returned_anchor = true;
+      same_tick_rollback = actual_slot == 1 && automatic_player.applied_ns == now;
+      check(same_tick_rollback, "a hot rollback is observed even when Applied completes in the same synthetic tick");
+      ++automatic_phase;
+    } else if (automatic_phase == 6 && automatic_player.TargetReady() && actual_slot == 1) {
+      ++automatic_phase;
+    } else if (automatic_phase == 7 && automatic_player.level == 2 && automatic_player.trial && !automatic_player.blocked) {
+      check(now < rejected_cooldown && automatic_player.baseline_fps == 60.,
+          "the synthetic workload change reopens the existing gate before its unchanged 30-second expiry");
+      ++automatic_phase;
+    } else if (automatic_phase == 8 && automatic_player.TargetReady() && actual_slot == 2) {
+      ++automatic_phase;
+    }
+  }
+  check(automatic_phase == 9 && actual_slot == 2 && automatic_player.previous_level == 1 && same_tick_rollback,
+      "synthetic CPU input validates two automatic cold descents, no-benefit rollback and workload-triggered re-exploration");
+  std::cout << "ADAPTIVE_AUTOMATIC_DESIGN evidence=CPU synthetic_FPS_GPU_completion_time=1 completed_phase=" << automatic_phase
+      << " hot_rollback_same_tick=" << same_tick_rollback << '\n';
   return passed;
 }
 }  // namespace adaptive_resolution_cases
