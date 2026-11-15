@@ -72,9 +72,11 @@ Bridge 两档接入使用独立的 DEV 请求：`Client.bridge_adaptive_experime
 `sampling` 分别反映源序号、试档状态和已完成采样。统计有效时 `median_us`／`mad_us` 是每源完整 NR 链成本，
 x2 先平均相邻两源再统计；未满窗口或过期时为 null。请求、计数、已完成成本和实际档位须分别判断。
 输出 FPS 沿用真实 `Present cadence estimate` 或 `XeFG SDK output estimate`，两者均不报告显示器扫描完成。
-DEV 两档 x2 另可接纳与当前 D3D12 源、真实来源链→XeFG proxy Present 关联及 context 代次绑定的成功
+DEV 两档 x2 另可接纳与当前 D3D12 源、真实来源链与 XeFG proxy 的嵌套 Present 关联及 context 代次绑定的成功
 `SetEnabled(false)`。它保持原生 FG 声明不变；Unknown 自身不能准入。`state.edit_reuse.xefg_off_sources`
-报告凭据及 provider 匹配情况，SDK FPS 必须来自同一个 context 且当前观测为 Off。重建或重新关联会清掉旧编辑与成对测量。
+报告凭据及 provider 匹配情况；`source_link_reason` 独立说明来源关联状态，`reason` 说明关闭凭据状态。
+D3D12 可观察来源调用 proxy 或 proxy 调用唯一登记来源；内外调用都成功后才能建立关联，同设备及 proxy 自身不能替代嵌套证据。
+SDK FPS 必须来自同一个 context 且当前观测为 Off。重建或重新关联会清掉旧编辑与成对测量。
 公开配置请求或倍率 1 都不能代替关闭回执；可用已配置的 FG 快捷键触发实际 SDK 调用。
 离屏原生 NGX 夹具无 Present 循环，其串行吞吐或合成 FPS 不可替代上述来源。
 

@@ -196,6 +196,7 @@ int32_t receipt_sdk_status = 0;
 void (*receipt_during_sdk)() = nullptr;
 IUnknown* receipt_proxy = nullptr;  // Borrowed only across the mock SDK callback.
 IUnknown* receipt_secondary_proxy = nullptr;
+IDXGISwapChain* receipt_inner_source = nullptr;
 void* receipt_context_handle = nullptr;
 xefg::BridgeSourceObservation ObserveReceiptSource(uintptr_t device11) noexcept {
   xefg::BridgeSourceObservation observation{.queried_device11 = device11,
@@ -955,6 +956,132 @@ int main(int argc, char** argv) {
         xefg::ForgetBridgeSourceSwapchain(SOURCE_OWNER);
         register_source();
         accept_link();
+        {
+          // Reverse the same callbacks: the SDK proxy now presents the
+          // registered D3D12 chain inside its own original Present call.
+          const auto saved_secondary_real = adapter::proxies[1].real[0];
+          adapter::proxies[1].real[0] = reinterpret_cast<void*>(&FakePresent);
+          adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakeSourcePresent);
+          receipt_inner_source = source_swapchain.Get();
+          const auto leaf_present = +[](ReceiptSwapchain*, UINT, UINT) { return S_OK; };
+          source_swapchain->present_callback = leaf_present;
+          const auto reverse_present = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+            return adapter::SourcePresentHooks<0>::Present(receipt_inner_source, interval, flags);
+          };
+          sdk_proxy->present_callback = reverse_present;
+          const auto run_proxy = [&](UINT flags = 0) {
+            return adapter::ProxyHooks<0>::Present(sdk_proxy.Get(), 0, flags);
+          };
+          const auto accept_reverse = [&] {
+            Check(run_proxy() == S_OK && Hooks::Enable(context_handle, 0) == 0
+                      && xefg::QueryBridgeOff(receipt_source).available,
+                "one successful reverse D3D12 proxy/source call accepts its own public Disable");
+          };
+          adapter::BeforeResize(sdk_proxy.Get());
+          sdk_proxy->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+            const auto status = adapter::SourcePresentHooks<0>::Present(receipt_inner_source, interval, flags);
+            Check(adapter::state.contexts.at(receipt_context_handle)->bridge_source_swapchain == 0,
+                "a completed inner D3D12 source cannot grant a link before the outer SDK proxy returns");
+            return status;
+          };
+          accept_reverse();
+          sdk_proxy->present_callback = reverse_present;
+          const auto reverse_link = xefg::QueryBridgeOff(receipt_source);
+          Check(std::strcmp(reverse_link.source_link_reason, "proxy_to_source_mapping_observed") == 0,
+              "reverse mapping reports its actual observed call direction as metadata");
+          accept_reverse();
+          Check(xefg::QueryBridgeOff(receipt_source).source_link_generation == reverse_link.source_link_generation
+                    && source_swapchain->references == source_refs,
+              "repeated reverse Presents retain the link generation without owning the source swapchain");
+          sdk_proxy->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+            adapter::SourcePresentHooks<0>::Present(receipt_inner_source, interval, flags);
+            return E_FAIL;
+          };
+          Check(run_proxy() == E_FAIL && !xefg::QueryBridgeOff(receipt_source).available
+                    && context->bridge_source_swapchain == 0,
+              "a successful inner source cannot preserve proof after its outer proxy fails");
+          sdk_proxy->present_callback = reverse_present;
+          accept_reverse();
+          sdk_proxy->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+            adapter::SourcePresentHooks<0>::Present(receipt_inner_source, interval, flags);
+            return adapter::SourcePresentHooks<0>::Present(receipt_inner_source, interval, flags);
+          };
+          Check(run_proxy() == S_OK && !xefg::QueryBridgeOff(receipt_source).available
+                    && context->bridge_source_swapchain == 0,
+              "two inner D3D12 source Presents cannot certify a one-to-one reverse relation");
+          sdk_proxy->present_callback = reverse_present;
+          accept_reverse();
+          source_swapchain->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+            return adapter::ProxyHooks<1>::Present(static_cast<IDXGISwapChain*>(receipt_proxy), interval, flags);
+          };
+          Check(run_proxy() == S_OK && !xefg::QueryBridgeOff(receipt_source).available,
+              "another proxy entry inside the reverse source revokes the one-to-one proof");
+          source_swapchain->present_callback = leaf_present;
+          accept_reverse();
+          sdk_proxy->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+            const auto status = adapter::SourcePresentHooks<0>::Present(receipt_inner_source, interval, flags);
+            ++receipt_source.generation;
+            return status;
+          };
+          Check(run_proxy() == S_OK && !xefg::QueryBridgeOff(receipt_source).available
+                    && context->bridge_source_swapchain == 0,
+              "a source rebuilt after the inner return cannot receive the outer proxy's pending link");
+          adapter::BeforeResize(sdk_proxy.Get());
+          sdk_proxy->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+            const auto status = adapter::SourcePresentHooks<0>::Present(receipt_inner_source, interval, flags);
+            ++adapter::state.contexts.at(receipt_context_handle)->epoch;
+            return status;
+          };
+          Check(run_proxy() == S_OK && !xefg::QueryBridgeOff(receipt_source).available
+                    && context->bridge_source_swapchain == 0,
+              "an epoch change after the inner return cannot accept a pending reverse link");
+          sdk_proxy->present_callback = reverse_present;
+          accept_reverse();
+          sdk_proxy->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+            const auto status = adapter::SourcePresentHooks<0>::Present(receipt_inner_source, interval, flags);
+            adapter::state.contexts.at(receipt_context_handle) = std::make_shared<adapter::Context>();
+            return status;
+          };
+          Check(run_proxy() == S_OK && !xefg::QueryBridgeOff(receipt_source).available
+                    && context->bridge_source_swapchain == 0,
+              "a replacement context at the same SDK handle cannot receive a pending reverse link");
+          adapter::state.contexts[context_handle] = context;
+          sdk_proxy->present_callback = reverse_present;
+          accept_reverse();
+          sdk_proxy->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) -> HRESULT {
+            adapter::SourcePresentHooks<0>::Present(receipt_inner_source, interval, flags);
+            throw std::runtime_error("MOCK outer SDK proxy exception");
+          };
+          bool caught = false;
+          try { run_proxy(); } catch (const std::runtime_error&) { caught = true; }
+          Check(caught && !xefg::QueryBridgeOff(receipt_source).available
+                    && adapter::BridgeSourcePresent::current == nullptr
+                    && adapter::D3D12ProxyPresentObservation::current == nullptr && adapter::proxy_entry_depth == 0,
+              "an exceptional reverse outer return revokes proof and restores all observation TLS");
+          sdk_proxy->present_callback = reverse_present;
+          accept_reverse();
+          sdk_proxy->present_callback = leaf_present;
+          Check(run_proxy() == S_OK && !xefg::QueryBridgeOff(receipt_source).available
+                    && context->bridge_source_swapchain == 0,
+              "a later SDK proxy without its registered inner source revokes an earlier reverse proof");
+          sdk_proxy->present_callback = reverse_present;
+          Check(run_proxy(DXGI_PRESENT_TEST) == S_OK && context->bridge_source_swapchain == 0,
+              "reverse test Presents cannot establish a source relation");
+          accept_reverse();
+          adapter::BeforeResize(sdk_proxy.Get());
+          xefg::ConfigureD3D12Source(nullptr);
+          Check(run_proxy() == S_OK && context->bridge_source_swapchain == 0
+                    && adapter::D3D12ProxyPresentObservation::current == nullptr,
+              "an unconfigured production observer cannot activate reverse D3D12 observation");
+          xefg::ConfigureD3D12Source(&ObserveReceiptD3D12Source);
+          receipt_inner_source = nullptr;
+          adapter::proxies[1].real[0] = saved_secondary_real;
+          adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakePresent);
+          source_swapchain->present_callback = normal_present;
+          sdk_proxy->present_callback = nullptr;
+          accept_link();
+          std::cout << "PASS CPU MOCK reverse D3D12 Present: deferred commit, public Disable, failure, ambiguity, generation and TLS; GPU=NotRun\n";
+        }
         receipt_sdk_status = -19;
         Hooks::Init(context_handle, nullptr, nullptr);
         Check(!xefg::QueryBridgeOff(receipt_source).available && !context->bridge_context_ready,

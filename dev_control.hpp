@@ -125,7 +125,7 @@ inline Json Snapshot() {
       edit_off_sources.push_back({{"source_handle", reinterpret_cast<uintptr_t>(handle)},
           {"source_generation", source.source_generation},
           {"device12", reinterpret_cast<uintptr_t>(source.source_device12_identity.Get())},
-          {"available", off.available}, {"reason", off.reason},
+          {"available", off.available}, {"reason", off.reason}, {"source_link_reason", off.source_link_reason},
           {"context_identity", off.context_identity}, {"context_epoch", off.epoch},
           {"source_link_generation", off.source_link_generation}, {"uses_source_link", off.uses_source_link},
           {"source_swapchain", off.source_swapchain}, {"source_swapchain_generation", off.source_swapchain_generation},

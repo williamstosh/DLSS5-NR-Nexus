@@ -717,13 +717,7 @@ struct ProxySlot {
 };
 inline std::array<ProxySlot, 4> proxies;
 
-// A registration owns its device, never the swapchain. The actual Present
-// argument is borrowed only on this thread's call stack, including on unwind.
-struct BridgeSourcePresent {
-  inline static thread_local BridgeSourcePresent* current = nullptr;
-  BridgeSourcePresent* previous = current;
-  BridgeSourcePresent* root = this;
-  IDXGISwapChain* borrowed_swapchain = nullptr;
+struct BridgeSourcePresentMapping {
   std::shared_ptr<BridgeSourceSwapchain> registration;
   BridgeSourceObservation before;
   std::shared_ptr<Context> context;
@@ -731,8 +725,114 @@ struct BridgeSourcePresent {
   uintptr_t proxy = 0;
   uint64_t declaration = 0;
   uint64_t epoch = 0;
-  uint32_t proxy_calls = 0;
   const char* failure = nullptr;
+  bool proxy_outer = false;
+};
+
+// Both call directions commit only after their outer Present returns. All
+// COM and source-observer calls finish before this state-only transaction.
+inline void RecordSourcePresentMapping(const BridgeSourcePresentMapping& mapping, const BridgeSourceObservation& after) {
+  const auto& registration = mapping.registration;
+  if (registration == nullptr) return;
+  const bool native12 = registration->device12 != nullptr;
+  const auto expected = (native12 ? registration->device12.Get() : registration->device11.Get());
+  const auto& before = mapping.before;
+  const auto& context = mapping.context;
+  const auto proxy = mapping.proxy;
+  const char* reason = mapping.failure;
+  if (reason == nullptr && (before.state == BridgeSnapshotState::RUNTIME_BUSY
+      || after.state == BridgeSnapshotState::RUNTIME_BUSY)) {
+    reason = "source_observer_busy";
+  }
+  if (reason == nullptr && (before.identity.handle == 0 || before.identity.generation == 0
+      || (native12 ? before.identity.device11 != 0 || before.identity.device12 != reinterpret_cast<uintptr_t>(expected)
+                   : before.identity.device12 != 0 || before.identity.device11 != reinterpret_cast<uintptr_t>(expected)))) {
+    reason = "source_missing_before_present";
+  }
+  if (reason == nullptr && before.identity != after.identity) {
+    reason = "source_changed_during_present";
+  }
+  if (reason == nullptr && native12 && registration->identity == proxy) {
+    reason = "source_is_sdk_proxy";
+  }
+  std::unique_lock lock(state.mutex);
+  const auto registered = state.bridge_swapchains.find(registration->owner);
+  if (registered == state.bridge_swapchains.end() || registered->second != registration) return;
+  if (reason == nullptr) {
+    const auto active = state.contexts.find(mapping.context_handle);
+    if (stopped.load() || !sdk_detours_enabled.load() || active == state.contexts.end() || active->second != context
+        || !context->bridge_context_ready || !context->bridge_proxy_ready || context->proxy_identity != proxy) {
+      reason = "context_changed_during_present";
+    } else if (native12 && (context->device_identity.Get() != expected
+        || context->bridge_application_device11 != nullptr || context->bridge_proxy_device11 != nullptr)) {
+      reason = "source_device12_conflict";
+    } else if (!native12 && context->bridge_application_device11 != nullptr
+        && reinterpret_cast<uintptr_t>(context->bridge_application_device11.Get()) != before.identity.device11) {
+      reason = "application_source_conflict";
+    } else if (context->bridge_declaration != mapping.declaration || context->epoch != mapping.epoch) {
+      // A concurrent Enable/Disable owns its new receipt. An old candidate
+      // cannot refresh or revoke an independently proven, unchanged link.
+      registration->reason = "present_declaration_changed";
+      return;
+    }
+  }
+  if (reason != nullptr) {
+    registration->reason = reason;
+    if (std::strcmp(reason, "source_observer_busy") == 0) return;
+    if (const auto old = registration->context.lock(); old != nullptr
+        && old->bridge_source_swapchain == registration->owner
+        && old->bridge_source_generation == registration->generation) {
+      RevokeBridgeSourceLinkLocked(old.get(), reason);
+    }
+    registration->context.reset();
+    registration->proxy = 0;
+    return;
+  }
+  registration->context = context;
+  registration->proxy = proxy;
+  const char* observed_reason = (mapping.proxy_outer ? "proxy_to_source_mapping_observed" : "source_mapping_observed");
+  registration->reason = observed_reason;
+  uint32_t sources = 0;
+  for (const auto& [owner, candidate] : state.bridge_swapchains) {
+    if (native12 ? candidate->device12 == registration->device12
+                 : candidate->context.lock() == context && candidate->proxy == proxy) {
+      ++sources;
+    }
+  }
+  if (sources != 1) {
+    registration->reason = "multiple_source_swapchains";
+    RevokeBridgeSourceLinkLocked(context.get(), "multiple_source_swapchains");
+    return;
+  }
+  if (context->bridge_source_swapchain != registration->owner
+      || context->bridge_source_generation != registration->generation || context->bridge_link_source != before.identity) {
+    RevokeBridgeSourceLinkLocked(context.get(), "source_mapping_changed");
+    context->bridge_source_swapchain = registration->owner;
+    context->bridge_source_generation = registration->generation;
+    context->bridge_link_source = before.identity;
+    context->bridge_link_generation = ++state.bridge_link_generation;
+  }
+  context->bridge_link_reason = observed_reason;
+}
+
+struct D3D12ProxyPresentObservation {
+  inline static thread_local D3D12ProxyPresentObservation* current = nullptr;
+  D3D12ProxyPresentObservation* previous = current;
+  BridgeSourcePresentMapping mapping;
+  IUnknown* device = nullptr;  // The captured Context owns this device.
+  uint32_t source_calls = 0;
+  bool source_finished = false;
+};
+
+// A registration owns its device, never the swapchain. The actual Present
+// argument is borrowed only on this thread's call stack, including on unwind.
+struct BridgeSourcePresent : BridgeSourcePresentMapping {
+  inline static thread_local BridgeSourcePresent* current = nullptr;
+  BridgeSourcePresent* previous = current;
+  BridgeSourcePresent* root = this;
+  IDXGISwapChain* borrowed_swapchain = nullptr;
+  D3D12ProxyPresentObservation* outer_proxy = nullptr;
+  uint32_t proxy_calls = 0;
   bool test = false;
   bool finished = false;
 
@@ -761,6 +861,14 @@ struct BridgeSourcePresent {
         }
         if (root == this && registration != nullptr && !test && failure == nullptr) {
           const bool native12 = registration->device12 != nullptr;
+          if (native12 && D3D12ProxyPresentObservation::current != nullptr) {
+            outer_proxy = D3D12ProxyPresentObservation::current;
+            if (++outer_proxy->source_calls != 1) {
+              outer_proxy->mapping.failure = "multiple_source_presents";
+            } else {
+              outer_proxy->mapping.registration = registration;
+            }
+          }
           const auto device = (native12 ? D3D12SourceDeviceIdentity(swapchain) : BridgeDeviceIdentity(swapchain));
           const auto expected = (native12 ? registration->device12.Get() : registration->device11.Get());
           if (device.Get() != expected) {
@@ -784,7 +892,9 @@ struct BridgeSourcePresent {
     finished = true;
     current = previous;
     if (root != this) {
-      if (FAILED(status)) root->failure = "source_present_failed";
+      if (FAILED(status)) {
+        root->failure = "source_present_failed";
+      }
       return;
     }
     if (registration == nullptr || test) return;
@@ -798,85 +908,35 @@ struct BridgeSourcePresent {
         after = observer(reinterpret_cast<uintptr_t>(expected));
       }
       const char* reason = failure;
-      if (FAILED(status)) reason = (failure != nullptr ? failure : "source_present_failed");
+      if (FAILED(status)) {
+        reason = (failure != nullptr ? failure : "source_present_failed");
+      }
       const auto current_device = (native12 ? D3D12SourceDeviceIdentity(borrowed_swapchain)
                                             : BridgeDeviceIdentity(borrowed_swapchain));
       if (reason == nullptr && (Identity(borrowed_swapchain) != registration->identity
           || current_device.Get() != expected)) {
         reason = "source_device_changed";
       }
-      if (reason == nullptr && (before.state == BridgeSnapshotState::RUNTIME_BUSY
-          || after.state == BridgeSnapshotState::RUNTIME_BUSY)) reason = "source_observer_busy";
-      if (reason == nullptr && (before.identity.handle == 0 || before.identity.generation == 0
-          || (native12 ? before.identity.device11 != 0 || before.identity.device12 != reinterpret_cast<uintptr_t>(expected)
-                       : before.identity.device12 != 0 || before.identity.device11 != reinterpret_cast<uintptr_t>(expected)))) {
-        reason = "source_missing_before_present";
-      }
-      if (reason == nullptr && before.identity != after.identity) reason = "source_changed_during_present";
-      if (reason == nullptr && (context == nullptr || proxy_calls != 1)) reason = "nested_proxy_unobserved";
-      if (reason == nullptr && native12 && registration->identity == proxy) {
-        reason = "source_is_sdk_proxy";
-      }
-      std::unique_lock lock(state.mutex);
-      const auto registered = state.bridge_swapchains.find(registration->owner);
-      if (registered == state.bridge_swapchains.end() || registered->second != registration) return;
-      if (reason == nullptr) {
-        const auto active = state.contexts.find(context_handle);
-        if (stopped.load() || !sdk_detours_enabled.load() || active == state.contexts.end() || active->second != context
-            || !context->bridge_context_ready || !context->bridge_proxy_ready || context->proxy_identity != proxy) {
-          reason = "context_changed_during_present";
-        } else if (native12 && (context->device_identity.Get() != expected
-            || context->bridge_application_device11 != nullptr || context->bridge_proxy_device11 != nullptr)) {
-          reason = "source_device12_conflict";
-        } else if (!native12 && context->bridge_application_device11 != nullptr
-            && reinterpret_cast<uintptr_t>(context->bridge_application_device11.Get()) != before.identity.device11) {
-          reason = "application_source_conflict";
-        } else if (context->bridge_declaration != declaration || context->epoch != epoch) {
-          // SetEnabled can legitimately overlap this Present and has already
-          // decided its own receipt. Do not refresh this candidate or revoke
-          // an unchanged, independently proven source/context/proxy relation.
-          registration->reason = "present_declaration_changed";
-          return;
+      if (outer_proxy != nullptr) {
+        if (reason == nullptr && (before.state == BridgeSnapshotState::RUNTIME_BUSY
+            || after.state == BridgeSnapshotState::RUNTIME_BUSY)) {
+          reason = "source_observer_busy";
         }
-      }
-      if (reason != nullptr) {
-        registration->reason = reason;
-        // A missed nonblocking snapshot is not evidence that a proven call
-        // relation changed. It cannot establish or refresh a new relation.
-        if (std::strcmp(reason, "source_observer_busy") == 0) return;
-        if (const auto old = registration->context.lock(); old != nullptr
-            && old->bridge_source_swapchain == registration->owner
-            && old->bridge_source_generation == registration->generation) {
-          RevokeBridgeSourceLinkLocked(old.get(), reason);
+        if (reason == nullptr && (before.identity != outer_proxy->mapping.before.identity
+            || after.identity != before.identity)) {
+          reason = "source_changed_during_present";
         }
-        registration->context.reset();
-        registration->proxy = 0;
+        if (reason != nullptr && outer_proxy->mapping.failure == nullptr) {
+          outer_proxy->mapping.failure = reason;
+        }
+        outer_proxy->source_finished = true;
         return;
       }
-      registration->context = context;
-      registration->proxy = proxy;
-      registration->reason = "source_mapping_observed";
-      uint32_t sources = 0;
-      for (const auto& [owner, candidate] : state.bridge_swapchains) {
-        if (native12 ? candidate->device12 == registration->device12
-                     : candidate->context.lock() == context && candidate->proxy == proxy) {
-          ++sources;
-        }
+      if (reason == nullptr && (context == nullptr || proxy_calls != 1)) {
+        reason = "nested_proxy_unobserved";
       }
-      if (sources != 1) {
-        registration->reason = "multiple_source_swapchains";
-        RevokeBridgeSourceLinkLocked(context.get(), "multiple_source_swapchains");
-        return;
-      }
-      if (context->bridge_source_swapchain != registration->owner
-          || context->bridge_source_generation != registration->generation || context->bridge_link_source != before.identity) {
-        RevokeBridgeSourceLinkLocked(context.get(), "source_mapping_changed");
-        context->bridge_source_swapchain = registration->owner;
-        context->bridge_source_generation = registration->generation;
-        context->bridge_link_source = before.identity;
-        context->bridge_link_generation = ++state.bridge_link_generation;
-      }
-      context->bridge_link_reason = "source_mapping_observed";
+      failure = reason;
+      RecordSourcePresentMapping(*this, after);
     } catch (...) {
       // QueryBridgeOff must fail closed even if the observation bookkeeping
       // itself cannot finish; the caller's original Present result is preserved.
@@ -899,36 +959,106 @@ struct BridgeProxyPresent {
   uintptr_t proxy = 0;
   uint64_t declaration = 0;
   uint64_t epoch = 0;
+  IDXGISwapChain* borrowed_swapchain = nullptr;
+  D3D12ProxyPresentObservation reverse;
+  bool reverse_active = false;
   bool finished = false;
 
-  BridgeProxyPresent(IDXGISwapChain* swapchain, UINT flags) noexcept {
+  BridgeProxyPresent(IDXGISwapChain* swapchain, UINT flags) noexcept : borrowed_swapchain(swapchain) {
     const auto current = BridgeSourcePresent::current;
-    if (current == nullptr || current->test || (flags & DXGI_PRESENT_TEST) != 0) return;
-    source = current->root;
-    if (source->registration == nullptr) { source = nullptr; return; }
+    if ((flags & DXGI_PRESENT_TEST) != 0 || (current != nullptr && current->test)) return;
+    if (current == nullptr && d3d12_source_observer.load(std::memory_order_acquire) == nullptr) return;
+    if (current != nullptr) {
+      source = current->root;
+      if (source->registration == nullptr) {
+        source = nullptr;
+        return;
+      }
+    }
     try {
       proxy = Identity(swapchain);
-      ++source->proxy_calls;
-      std::shared_lock lock(state.mutex);
-      for (const auto& [candidate_handle, candidate] : state.contexts) {
-        if (proxy == 0 || candidate->proxy_identity != proxy) continue;
-        if (context != nullptr || !candidate->bridge_context_ready || !candidate->bridge_proxy_ready) {
-          source->failure = "proxy_context_ambiguous_or_unready";
+      if (source != nullptr) {
+        ++source->proxy_calls;
+      }
+      {
+        std::shared_lock lock(state.mutex);
+        for (const auto& [candidate_handle, candidate] : state.contexts) {
+          if (proxy == 0 || candidate->proxy_identity != proxy) continue;
+          if (context != nullptr || !candidate->bridge_context_ready || !candidate->bridge_proxy_ready) {
+            if (source != nullptr) {
+              source->failure = "proxy_context_ambiguous_or_unready";
+            }
+            return;
+          }
+          context = candidate;
+          handle = candidate_handle;
+          declaration = context->bridge_declaration;
+          epoch = context->epoch;
+        }
+        if (source == nullptr && context != nullptr && context->bridge_application_device11 == nullptr
+            && context->bridge_proxy_device11 == nullptr) {
+          reverse.device = context->device_identity.Get();
+          if (const auto old = state.bridge_swapchains.find(context->bridge_source_swapchain);
+              old != state.bridge_swapchains.end()) {
+            reverse.mapping.registration = old->second;
+          }
+        }
+      }
+      if (source != nullptr) {
+        if (context == nullptr) {
+          source->failure = "proxy_context_unobserved";
+        }
+      } else if (reverse.device != nullptr) {
+        if (reverse.previous != nullptr) {
+          reverse.previous->mapping.failure = "multiple_proxy_presents";
           return;
         }
-        context = candidate;
-        handle = candidate_handle;
-        declaration = context->bridge_declaration;
-        epoch = context->epoch;
+        reverse.mapping.context = context;
+        reverse.mapping.context_handle = handle;
+        reverse.mapping.proxy = proxy;
+        reverse.mapping.declaration = declaration;
+        reverse.mapping.epoch = epoch;
+        reverse.mapping.proxy_outer = true;
+        const auto observer = d3d12_source_observer.load(std::memory_order_acquire);
+        if (observer != nullptr) {
+          reverse.mapping.before = observer(reinterpret_cast<uintptr_t>(reverse.device));
+        }
+        D3D12ProxyPresentObservation::current = &reverse;
+        reverse_active = true;
       }
-      if (context == nullptr) source->failure = "proxy_context_unobserved";
     } catch (...) {
-      source->failure = "proxy_present_observation_failed";
+      if (source != nullptr) {
+        source->failure = "proxy_present_observation_failed";
+      }
     }
   }
 
   void Finish(HRESULT status) noexcept {
     finished = true;
+    if (reverse_active) {
+      D3D12ProxyPresentObservation::current = reverse.previous;
+      reverse_active = false;
+      try {
+        if (FAILED(status) && reverse.mapping.failure == nullptr) {
+          reverse.mapping.failure = "proxy_present_failed";
+        }
+        if (reverse.mapping.failure == nullptr && (reverse.source_calls != 1 || !reverse.source_finished)) {
+          reverse.mapping.failure = "nested_source_unobserved";
+        }
+        if (reverse.mapping.failure == nullptr && Identity(borrowed_swapchain) != proxy) {
+          reverse.mapping.failure = "proxy_changed_during_present";
+        }
+        BridgeSourceObservation after;
+        const auto observer = d3d12_source_observer.load(std::memory_order_acquire);
+        if (observer != nullptr) {
+          after = observer(reinterpret_cast<uintptr_t>(reverse.device));
+        }
+        RecordSourcePresentMapping(reverse.mapping, after);
+      } catch (...) {
+        stopped.store(true, std::memory_order_release);
+      }
+      return;
+    }
     if (source == nullptr) return;
     if (FAILED(status)) {
       source->failure = "proxy_present_failed";
@@ -946,7 +1076,13 @@ struct BridgeProxyPresent {
   }
 
   ~BridgeProxyPresent() {
-    if (!finished && source != nullptr) source->failure = "proxy_present_exception";
+    if (reverse_active) {
+      reverse.mapping.failure = "proxy_present_exception";
+      Finish(E_FAIL);
+    }
+    if (!finished && source != nullptr) {
+      source->failure = "proxy_present_exception";
+    }
   }
 };
 
@@ -1314,13 +1450,22 @@ inline void BeforeResize(IDXGISwapChain* swapchain) {
   PublishResult(Result::NOT_SERVED);
 }
 
+struct ProxyEntryScope {
+  ProxyEntryScope() { ++proxy_entry_depth; }
+  ~ProxyEntryScope() { --proxy_entry_depth; }
+};
+
 template <size_t Index>
 struct ProxyHooks {
   static HRESULT STDMETHODCALLTYPE Present(IDXGISwapChain* swapchain, UINT interval, UINT flags) {
     if (proxy_entry_depth != 0) {
+      if (auto* reverse = D3D12ProxyPresentObservation::current; reverse != nullptr
+          && (BridgeSourcePresent::current != nullptr || Identity(swapchain) != reverse->mapping.proxy)) {
+        reverse->mapping.failure = "multiple_proxy_presents";
+      }
       return reinterpret_cast<PresentFn>(proxies[Index].real[0])(swapchain, interval, flags);
     }
-    ++proxy_entry_depth;
+    const ProxyEntryScope entry;
     BridgeProxyPresent bridge_present(swapchain, flags);
     PresentFrame present;
     try { present = BeginPresent(swapchain, flags); } catch (...) { PublishResult(Result::FAILED); }
@@ -1329,15 +1474,18 @@ struct ProxyHooks {
     if (present.service_owned) --proxy_depth;
     try { EndPresent(&present, status); } catch (...) { PublishResult(Result::FAILED); }
     bridge_present.Finish(status);
-    --proxy_entry_depth;
     return status;
   }
   static HRESULT STDMETHODCALLTYPE Present1(IDXGISwapChain1* swapchain, UINT interval, UINT flags,
                                             const DXGI_PRESENT_PARAMETERS* parameters) {
     if (proxy_entry_depth != 0) {
+      if (auto* reverse = D3D12ProxyPresentObservation::current; reverse != nullptr
+          && (BridgeSourcePresent::current != nullptr || Identity(swapchain) != reverse->mapping.proxy)) {
+        reverse->mapping.failure = "multiple_proxy_presents";
+      }
       return reinterpret_cast<Present1Fn>(proxies[Index].real[1])(swapchain, interval, flags, parameters);
     }
-    ++proxy_entry_depth;
+    const ProxyEntryScope entry;
     BridgeProxyPresent bridge_present(swapchain, flags);
     PresentFrame present;
     try { present = BeginPresent(swapchain, flags); } catch (...) { PublishResult(Result::FAILED); }
@@ -1346,7 +1494,6 @@ struct ProxyHooks {
     if (present.service_owned) --proxy_depth;
     try { EndPresent(&present, status); } catch (...) { PublishResult(Result::FAILED); }
     bridge_present.Finish(status);
-    --proxy_entry_depth;
     return status;
   }
   static HRESULT STDMETHODCALLTYPE Resize(IDXGISwapChain* swapchain, UINT count, UINT width, UINT height,
