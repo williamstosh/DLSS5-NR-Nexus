@@ -100,6 +100,8 @@ struct BridgeOffEvidence {
   uint64_t source_link_generation = 0;
   bool uses_source_link = false;
   uintptr_t context_identity = 0;
+  uint32_t source_present_thread_id = 0;
+  uint32_t source_present_proxy_entry_depth = 0;
   bool MatchesOutput(const output_framerate::Snapshot& output) const {
     return available && context_identity != 0 && output.available && output.fg_off
         && output.source == output_framerate::Source::XEFG_STATUS && output.identity == context_identity;
@@ -336,6 +338,8 @@ struct BridgeSourceSwapchain {
   uintptr_t proxy = 0;
   const char* reason = "source_present_unobserved";
   ComPtr<IUnknown> device12;
+  uint32_t source_present_thread_id = 0;
+  uint32_t source_present_proxy_entry_depth = 0;
 };
 struct State {
   std::shared_mutex mutex;
@@ -727,6 +731,9 @@ struct BridgeSourcePresentMapping {
   uint64_t epoch = 0;
   const char* failure = nullptr;
   bool proxy_outer = false;
+  bool unregistered_outer = false;
+  uint32_t source_present_thread_id = 0;
+  uint32_t source_present_proxy_entry_depth = 0;
 };
 
 // Both call directions commit only after their outer Present returns. All
@@ -758,6 +765,10 @@ inline void RecordSourcePresentMapping(const BridgeSourcePresentMapping& mapping
   std::unique_lock lock(state.mutex);
   const auto registered = state.bridge_swapchains.find(registration->owner);
   if (registered == state.bridge_swapchains.end() || registered->second != registration) return;
+  if (mapping.source_present_thread_id != 0) {
+    registration->source_present_thread_id = mapping.source_present_thread_id;
+    registration->source_present_proxy_entry_depth = mapping.source_present_proxy_entry_depth;
+  }
   if (reason == nullptr) {
     const auto active = state.contexts.find(mapping.context_handle);
     if (stopped.load() || !sdk_detours_enabled.load() || active == state.contexts.end() || active->second != context
@@ -790,7 +801,11 @@ inline void RecordSourcePresentMapping(const BridgeSourcePresentMapping& mapping
   }
   registration->context = context;
   registration->proxy = proxy;
-  const char* observed_reason = (mapping.proxy_outer ? "proxy_to_source_mapping_observed" : "source_mapping_observed");
+  const char* observed_reason = "source_mapping_observed";
+  if (mapping.proxy_outer) {
+    observed_reason = (mapping.unregistered_outer ? "proxy_to_source_mapping_observed_unregistered_outer"
+                                                : "proxy_to_source_mapping_observed");
+  }
   registration->reason = observed_reason;
   uint32_t sources = 0;
   for (const auto& [owner, candidate] : state.bridge_swapchains) {
@@ -852,6 +867,10 @@ struct BridgeSourcePresent : BridgeSourcePresentMapping {
             registration = candidate;
           }
         }
+        if (registration != nullptr) {
+          source_present_thread_id = GetCurrentThreadId();
+          source_present_proxy_entry_depth = proxy_entry_depth;
+        }
         if (previous != nullptr && !test && !previous->test) {
           if (registration != nullptr && previous->registration == registration) {
             root = previous->root;  // The same wrapper's Present1 can call Present.
@@ -867,6 +886,8 @@ struct BridgeSourcePresent : BridgeSourcePresentMapping {
               outer_proxy->mapping.failure = "multiple_source_presents";
             } else {
               outer_proxy->mapping.registration = registration;
+              outer_proxy->mapping.source_present_thread_id = source_present_thread_id;
+              outer_proxy->mapping.source_present_proxy_entry_depth = source_present_proxy_entry_depth;
             }
           }
           const auto device = (native12 ? D3D12SourceDeviceIdentity(swapchain) : BridgeDeviceIdentity(swapchain));
@@ -965,15 +986,18 @@ struct BridgeProxyPresent {
   bool finished = false;
 
   BridgeProxyPresent(IDXGISwapChain* swapchain, UINT flags) noexcept : borrowed_swapchain(swapchain) {
-    const auto current = BridgeSourcePresent::current;
+    auto* current = BridgeSourcePresent::current;
     if ((flags & DXGI_PRESENT_TEST) != 0 || (current != nullptr && current->test)) return;
+    bool unregistered_outer = false;
+    // Function detours also enter for other objects sharing the method. Only
+    // a registered source can select the forward association path.
+    while (current != nullptr && current->root->registration == nullptr) {
+      unregistered_outer = true;
+      current = current->previous;
+    }
     if (current == nullptr && d3d12_source_observer.load(std::memory_order_acquire) == nullptr) return;
     if (current != nullptr) {
       source = current->root;
-      if (source->registration == nullptr) {
-        source = nullptr;
-        return;
-      }
     }
     try {
       proxy = Identity(swapchain);
@@ -1019,6 +1043,7 @@ struct BridgeProxyPresent {
         reverse.mapping.declaration = declaration;
         reverse.mapping.epoch = epoch;
         reverse.mapping.proxy_outer = true;
+        reverse.mapping.unregistered_outer = unregistered_outer;
         const auto observer = d3d12_source_observer.load(std::memory_order_acquire);
         if (observer != nullptr) {
           reverse.mapping.before = observer(reinterpret_cast<uintptr_t>(reverse.device));
@@ -2168,6 +2193,12 @@ inline BridgeOffEvidence QueryBridgeOff(const BridgeSourceIdentity& source) {
       evidence.source_swapchain = owner;
       evidence.source_swapchain_generation = registered->generation;
     }
+  }
+  if (const auto registered = internal::state.bridge_swapchains.find(evidence.source_swapchain);
+      registered != internal::state.bridge_swapchains.end()
+      && registered->second->generation == evidence.source_swapchain_generation) {
+    evidence.source_present_thread_id = registered->second->source_present_thread_id;
+    evidence.source_present_proxy_entry_depth = registered->second->source_present_proxy_entry_depth;
   }
   evidence.reason = context->bridge_off_reason;
   if (!context->bridge_context_ready || !context->bridge_proxy_ready || context->bridge_enable_inflight != 0

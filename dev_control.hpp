@@ -117,6 +117,11 @@ inline Json Snapshot() {
     }
   }
   const auto output = output_framerate::Read(now);
+  const auto device_observation = [](const fg::xefg::BridgeDeviceObservation& observed) {
+    return Json{{"object_present", observed.object_present}, {"swapchain_unwrapped", observed.swapchain_unwrapped},
+        {"swapchain_result", observed.swapchain_result}, {"device11_result", observed.device11_result},
+        {"device12_result", observed.device12_result}};
+  };
   Json edit_off_sources = Json::array();
   if (edit_reuse_adaptive_experiment.load()) {
     for (const auto& [handle, source] : create_contracts) {
@@ -127,8 +132,14 @@ inline Json Snapshot() {
           {"device12", reinterpret_cast<uintptr_t>(source.source_device12_identity.Get())},
           {"available", off.available}, {"reason", off.reason}, {"source_link_reason", off.source_link_reason},
           {"context_identity", off.context_identity}, {"context_epoch", off.epoch},
+          {"sdk_context", off.context}, {"sdk_proxy", off.proxy}, {"init_kind", off.init_kind},
+          {"application_device11", off.application_device11}, {"proxy_device11", off.proxy_device11},
+          {"application_device_observation", device_observation(off.application)},
+          {"proxy_device_observation", device_observation(off.proxy_device)},
           {"source_link_generation", off.source_link_generation}, {"uses_source_link", off.uses_source_link},
           {"source_swapchain", off.source_swapchain}, {"source_swapchain_generation", off.source_swapchain_generation},
+          {"source_present_thread_id", off.source_present_thread_id},
+          {"source_present_proxy_entry_depth", off.source_present_proxy_entry_depth},
           {"provider_matches", off.MatchesOutput(output)}});
     }
   }

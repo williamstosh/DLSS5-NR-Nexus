@@ -868,7 +868,8 @@ int main(int argc, char** argv) {
         Check(linked.context == reinterpret_cast<uintptr_t>(context_handle)
                   && linked.context_identity == sdk_output.identity && linked.uses_source_link
                   && linked.source == receipt_source && linked.source_swapchain == SOURCE_OWNER
-                  && linked.source.device11 == 0 && source_swapchain->references == source_refs,
+                  && linked.source.device11 == 0 && source_swapchain->references == source_refs
+                  && linked.source_present_thread_id == GetCurrentThreadId() && linked.source_present_proxy_entry_depth == 0,
             "D3D12 Off evidence binds SDK handle, output identity, source generation and borrowed source swapchain");
         auto matched_output = sdk_output;
         matched_output.available = true;  // MOCK ready window; no wall-clock/GPU measurement.
@@ -989,10 +990,73 @@ int main(int argc, char** argv) {
           const auto reverse_link = xefg::QueryBridgeOff(receipt_source);
           Check(std::strcmp(reverse_link.source_link_reason, "proxy_to_source_mapping_observed") == 0,
               "reverse mapping reports its actual observed call direction as metadata");
+          Check(reverse_link.source_present_thread_id == GetCurrentThreadId()
+                    && reverse_link.source_present_proxy_entry_depth == 1,
+              "reverse source metadata records its actual entry thread and SDK proxy depth");
           accept_reverse();
           Check(xefg::QueryBridgeOff(receipt_source).source_link_generation == reverse_link.source_link_generation
                     && source_swapchain->references == source_refs,
               "repeated reverse Presents retain the link generation without owning the source swapchain");
+          {
+            // Function detours also see unregistered objects sharing the same
+            // Present implementation; their scope must not hide the SDK call.
+            ComPtr<ReceiptSwapchain> unregistered_outer;
+            unregistered_outer.Attach(new ReceiptSwapchain(nullptr));
+            unregistered_outer->reported_device12 = identity;
+            unregistered_outer->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+              return adapter::ProxyHooks<0>::Present(static_cast<IDXGISwapChain*>(receipt_proxy), interval, flags);
+            };
+            ComPtr<ReceiptSwapchain> unregistered_inner;
+            unregistered_inner.Attach(new ReceiptSwapchain(nullptr));
+            unregistered_inner->reported_device12 = identity;
+            unregistered_inner->present_callback = leaf_present;
+            Check(adapter::Identity(unregistered_outer.Get()) != adapter::Identity(sdk_proxy.Get())
+                      && adapter::Identity(unregistered_outer.Get()) != adapter::Identity(source_swapchain.Get())
+                      && adapter::Identity(sdk_proxy.Get()) != adapter::Identity(source_swapchain.Get()),
+                "unregistered outer, SDK proxy and registered source use different IUnknown identities");
+            const auto run_wrapped_proxy = [&] {
+              return adapter::SourcePresentHooks<0>::Present(unregistered_outer.Get(), 0, 0);
+            };
+            adapter::BeforeResize(sdk_proxy.Get());
+            receipt_inner_source = unregistered_inner.Get();
+            Check(run_wrapped_proxy() == S_OK && Hooks::Enable(context_handle, 0) == 0
+                      && !xefg::QueryBridgeOff(receipt_source).available && context->bridge_source_swapchain == 0,
+                "an unregistered outer and unregistered inner cannot certify a D3D12 source relation");
+            receipt_inner_source = source_swapchain.Get();
+            sdk_proxy->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+              adapter::SourcePresentHooks<0>::Present(receipt_inner_source, interval, flags);
+              return adapter::SourcePresentHooks<0>::Present(receipt_inner_source, interval, flags);
+            };
+            Check(run_wrapped_proxy() == S_OK && Hooks::Enable(context_handle, 0) == 0
+                      && !xefg::QueryBridgeOff(receipt_source).available && context->bridge_source_swapchain == 0,
+                "an unregistered outer does not authorize two registered inner source Presents");
+            std::cout << "PASS CPU MOCK unregistered-scope safety: missing registered inner and duplicate inner remain rejected\n";
+            sdk_proxy->present_callback = reverse_present;
+            source_swapchain->present_callback = +[](ReceiptSwapchain*, UINT, UINT) {
+              Check(adapter::proxy_entry_depth == 1,
+                  "the registered source runs inside the actual instrumented SDK proxy call");
+              Check(adapter::state.contexts.at(receipt_context_handle)->bridge_source_swapchain == 0,
+                  "the unregistered-wrapper reverse candidate stays pending until outer SDK success");
+              std::cout << "OBS CPU MOCK unregistered-scope inner: proxy_entry_depth=" << adapter::proxy_entry_depth
+                        << " reverse_scope=" << (adapter::D3D12ProxyPresentObservation::current != nullptr) << '\n';
+              return S_OK;
+            };
+            const auto presents_before = context->application_frame;
+            const auto status = run_wrapped_proxy();
+            const auto disable = Hooks::Enable(context_handle, 0);
+            const auto wrapped_link = xefg::QueryBridgeOff(receipt_source);
+            std::cout << "OBS CPU MOCK unregistered-scope result: present_status=" << status << " disable_status=" << disable
+                      << " sdk_application_presents=" << context->application_frame - presents_before
+                      << " source_link_reason=" << wrapped_link.source_link_reason
+                      << " source_link_generation=" << wrapped_link.source_link_generation
+                      << " available=" << wrapped_link.available << "; GPU=NotRun\n";
+            Check(status == S_OK && disable == 0 && wrapped_link.available
+                      && std::strcmp(wrapped_link.source_link_reason, "proxy_to_source_mapping_observed_unregistered_outer") == 0
+                      && wrapped_link.source_present_thread_id == GetCurrentThreadId()
+                      && wrapped_link.source_present_proxy_entry_depth == 1,
+                "an unregistered source detour wrapper must not hide the strict reverse D3D12 source/proxy relation");
+            source_swapchain->present_callback = leaf_present;
+          }
           sdk_proxy->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
             adapter::SourcePresentHooks<0>::Present(receipt_inner_source, interval, flags);
             return E_FAIL;

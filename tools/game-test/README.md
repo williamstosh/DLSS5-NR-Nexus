@@ -75,7 +75,9 @@ x2 先平均相邻两源再统计；未满窗口或过期时为 null。请求、
 DEV 两档 x2 另可接纳与当前 D3D12 源、真实来源链与 XeFG proxy 的嵌套 Present 关联及 context 代次绑定的成功
 `SetEnabled(false)`。它保持原生 FG 声明不变；Unknown 自身不能准入。`state.edit_reuse.xefg_off_sources`
 报告凭据及 provider 匹配情况；`source_link_reason` 独立说明来源关联状态，`reason` 说明关闭凭据状态。
+设备接口查询结果与最近登记来源 Present 的线程 ID／SDK 嵌套深度也单独记录；这些诊断字段不参与准入。
 D3D12 可观察来源调用 proxy 或 proxy 调用唯一登记来源；内外调用都成功后才能建立关联，同设备及 proxy 自身不能替代嵌套证据。
+共享方法钩子命中的未登记外层不充当来源，实际登记来源及 SDK proxy 仍须完整匹配。
 SDK FPS 必须来自同一个 context 且当前观测为 Off。重建或重新关联会清掉旧编辑与成对测量。
 公开配置请求或倍率 1 都不能代替关闭回执；可用已配置的 FG 快捷键触发实际 SDK 调用。
 离屏原生 NGX 夹具无 Present 循环，其串行吞吐或合成 FPS 不可替代上述来源。
