@@ -20,7 +20,8 @@ void RunOutputFramerateCases(const Check& check) {
   auto snapshot = stream.Read(start + 200 * step);
   check(snapshot.available && std::abs(snapshot.fps - 300) < 0.001
           && snapshot.window_begin_ns == start && snapshot.window_end_ns == start + 200 * step
-          && snapshot.fps_mad == 0 && snapshot.requested_multiplier == 4 && snapshot.observed_multiplier == 3,
+          && snapshot.fps_mad == 0 && snapshot.requested_multiplier == 4 && snapshot.observed_multiplier == 3
+          && snapshot.identity == 1,
       "SDK counts establish four complete output bins independently of requested multiplier");
   const auto generation = snapshot.source_generation;
   stream.Observe(rate::Source::XEFG_STATUS, 1, 3, start + 201 * step, 4, 4, 4);
@@ -48,6 +49,23 @@ void RunOutputFramerateCases(const Check& check) {
   }
   check(std::abs(fractional.Read(start + 200 * step).observed_multiplier - 3.7) < 0.001,
       "observed XeFG multiplier is the full-window output to application count ratio");
+
+  rate::Stream sdk_off;
+  for (int64_t index = 0; index <= 200; ++index) {
+    sdk_off.Observe(rate::Source::XEFG_STATUS, 77, 9, start + index * step, 1, 3, 1, false, 4, true);
+  }
+  snapshot = sdk_off.Read(start + 200 * step);
+  check(snapshot.available && snapshot.identity == 77 && snapshot.source == rate::Source::XEFG_STATUS
+          && snapshot.fg_off && std::abs(snapshot.fps - 100.) < 0.001 && snapshot.observed_multiplier == 1.
+          && snapshot.requested_multiplier == 3,
+      "SDK Off counts retain the output context identity and SDK source independently of its requested multiplier");
+  sdk_off.Observe(rate::Source::XEFG_STATUS, 78, 9, start + 201 * step, 1, 3, 1, false, 4, true);
+  snapshot = sdk_off.Read(start + 201 * step);
+  check(!snapshot.available && snapshot.identity == 78 && snapshot.fg_off,
+      "a different SDK context exposes its own identity and cannot inherit the preceding FPS window");
+  snapshot = sdk_off.Read(start + 302 * step);
+  check(!snapshot.available && !snapshot.fg_off,
+      "stale SDK output cannot retain positive Off sample metadata");
 
   {
     std::unique_lock lock(rate::internal::state.mutex);

@@ -470,6 +470,9 @@ struct FeatureState {
   std::shared_ptr<control_mask_execution::Stream> control_mask_stream;
   uint64_t source_generation = 0;
   Microsoft::WRL::ComPtr<IUnknown> source_device11_identity;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  Microsoft::WRL::ComPtr<IUnknown> source_device12_identity;
+#endif
   uint64_t sr_sequence = 0;
   bool mixed_recording_discarded = false;
   // Stage-local dimensions, normalization and slots must not alternate
@@ -2424,12 +2427,27 @@ struct SuccessfulSrCoreScope {
   ID3D12Device* previous = successful_sr_device;
   ID3D12Device* device = nullptr;
 
-  explicit SuccessfulSrCoreScope(ID3D12GraphicsCommandList* list) {
+  explicit SuccessfulSrCoreScope(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle = nullptr) {
     if (list != nullptr && FAILED(list->GetDevice(IID_PPV_ARGS(&device)))) {
       if (device != nullptr) device->Release();
       device = nullptr;
     }
     successful_sr_device = device;
+#if defined(NR_NEXUS_DEV_CONTROL)
+    const auto created = create_contracts.find(handle);
+    if (device != nullptr && created != create_contracts.end() && created->second.source_type_confirmed
+        && created->second.source_generation != 0 && created->second.source_device11_identity == nullptr) {
+      auto* native_device = device;
+      renodx::utils::directx::NativeFromReShadeProxy(&native_device);
+      Microsoft::WRL::ComPtr<IUnknown> identity;
+      if (native_device != nullptr && SUCCEEDED(native_device->QueryInterface(IID_PPV_ARGS(&identity)))) {
+        created->second.source_device12_identity = identity;
+        if (const auto current = features.find(handle); current != features.end()) {
+          current->second.source_device12_identity = identity;
+        }
+      }
+    }
+#endif
   }
   ~SuccessfulSrCoreScope() {
     successful_sr_device = previous;
@@ -11356,13 +11374,64 @@ inline bool BridgeAdaptiveEligible(const BridgeAdaptiveSource& source,
       && !auto_fg_fallback_active.load();
 }
 
+#if defined(NR_NEXUS_DEV_CONTROL)
+// A successful host SR supplies this device identity; an SDK Init or a shared
+// device alone does not establish the source-to-proxy Present link.
+inline fg::xefg::BridgeSourceIdentity UniqueD3D12SourceLocked(uintptr_t device12) {
+  fg::xefg::BridgeSourceIdentity source{.device12 = device12};
+  if (device12 == 0) return source;
+  for (const auto& [handle, contract] : create_contracts) {
+    if (reinterpret_cast<uintptr_t>(contract.source_device12_identity.Get()) != device12) continue;
+    if (!contract.source_type_confirmed || contract.source_generation == 0 || source.handle != 0) {
+      return {.device12 = device12};
+    }
+    source.handle = reinterpret_cast<uintptr_t>(handle);
+    source.generation = contract.source_generation;
+  }
+  return source;
+}
+
+inline fg::xefg::BridgeSourceObservation ObserveD3D12SourceForXefg(uintptr_t device12) noexcept {
+  fg::xefg::BridgeSourceObservation observation{
+      .state = fg::xefg::BridgeSnapshotState::RUNTIME_BUSY, .queried_device12 = device12};
+  RuntimeTryLock lock(runtime_mutex);
+  if (!lock.owns_lock()) return observation;
+  if (shutting_down.load(std::memory_order_acquire)) {
+    observation.state = fg::xefg::BridgeSnapshotState::SHUTTING_DOWN;
+    return observation;
+  }
+  observation.state = fg::xefg::BridgeSnapshotState::LOCKED;
+  for (const auto& [handle, contract] : create_contracts) {
+    if (handle == nullptr || !contract.source_type_confirmed || contract.source_generation == 0
+        || contract.source_device12_identity == nullptr) continue;
+    ++observation.candidates;
+    if (reinterpret_cast<uintptr_t>(contract.source_device12_identity.Get()) == device12) ++observation.matches;
+  }
+  observation.identity = UniqueD3D12SourceLocked(device12);
+  return observation;
+}
+
+inline fg::xefg::BridgeOffEvidence EditReuseXefgOffLocked(const NVSDK_NGX_Handle* handle, uint64_t generation = 0) {
+  const auto created = create_contracts.find(handle);
+  const auto source = UniqueD3D12SourceLocked(created != create_contracts.end()
+      ? reinterpret_cast<uintptr_t>(created->second.source_device12_identity.Get()) : 0);
+  auto evidence = fg::xefg::QueryBridgeOff(source);
+  if (evidence.available && (source.handle != reinterpret_cast<uintptr_t>(handle)
+      || (generation != 0 && source.generation != generation))) {
+    evidence.available = false;
+    evidence.reason = "edit_source_does_not_match_disable";
+  }
+  return evidence;
+}
+#endif
+
 inline adaptive_resolution::Frame FreezeAdaptiveFrame(
     std::shared_ptr<adaptive_resolution::Session>* owner, const stage_plan::Plan& plan,
     const stage_plan::Group& group, uint32_t reference_width, uint32_t reference_height,
     uint32_t guide_width, uint32_t guide_height, uint64_t source_identity,
     bool supported, uint64_t application_frame = 0, uint32_t required_roles = 1, bool fg_owned = false,
     uint32_t source_outputs = 1, uint32_t observed_model_roles = 0, bool upper_capacity = false,
-    const BridgeAdaptiveSource* bridge_source = nullptr) {
+    const BridgeAdaptiveSource* bridge_source = nullptr, const fg::xefg::BridgeOffEvidence* edit_off = nullptr) {
   if (!nr_adaptive_enabled.load() && *owner == nullptr) return {};
   if (*owner == nullptr) *owner = std::make_shared<adaptive_resolution::Session>();
   adaptive_resolution::Sizes upper{}, floor{};
@@ -11417,7 +11486,10 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
     source_identity *= 1099511628211ull;
   }
   const int64_t now_ns = SteadyNowNs();
-  const auto output = output_framerate::Read(now_ns);
+  auto output = output_framerate::Read(now_ns);
+  if (edit_off != nullptr) {
+    output.available = edit_off->MatchesOutput(output);
+  }
   capability::Input baseline;
   baseline.api = (bridge_source != nullptr ? bridge_source->api : capability::Api::DX12);
   baseline.backend = (bridge_source != nullptr ? bridge_source->backend : capability::Backend::NATIVE);
@@ -13515,6 +13587,16 @@ inline bool RecordInline(
       && nr_model::ResolvePreset(preset.load(), 0, direct_runtime_requirements.dual_models) == 2;
   const bool bridge_adaptive = bridge_source != nullptr
       && BridgeAdaptiveEligible(*bridge_source, command_list, device, handle, plan);
+  fg::xefg::BridgeOffEvidence edit_off;
+  const fg::xefg::BridgeOffEvidence* edit_output_contract = nullptr;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (edit_reuse_enabled.load() && edit_reuse_adaptive_experiment.load()
+      && !(native_fg_public_off.load() && native_fg_declaration.load() == NativeFgDeclaration::kOff)
+      && present == nullptr && bridge_source == nullptr) {
+    edit_off = EditReuseXefgOffLocked(handle, feature.source_generation);
+    edit_output_contract = &edit_off;
+  }
+#endif
   auto adaptive = (preparing_adaptive_frame != nullptr ? *preparing_adaptive_frame
       : present != nullptr && present->adaptive_frame != nullptr ? *present->adaptive_frame
       : FreezeAdaptiveFrame(&feature.adaptive_session, plan, group, width, height,
@@ -13525,7 +13607,7 @@ inline bool RecordInline(
           bridge_adaptive || (bridge_source == nullptr && !D3D11OnlySession() && (present == nullptr
               || (!present->d3d11_bridge && present->domain == present_restore_scope::Domain::FINAL_PRESENT
                   && present->stage_execution_plan == nullptr && !present->native_prefg_resolution_pair))),
-          0, 1, false, adaptive_output_count, 0, upper_capacity, bridge_source));
+          0, 1, false, adaptive_output_count, 0, upper_capacity, bridge_source, edit_output_contract));
   SelectAdaptiveTier(&feature, handle, &adaptive, present != nullptr && present->adaptive_frame != nullptr,
       present != nullptr ? present->workset_key : output);
   if (feature.adaptive_output_blocked || feature.adaptive_retirement_blocked) {
@@ -13599,9 +13681,18 @@ inline bool RecordInline(
   stage_stats.width = width;
   stage_stats.height = height;
   const bool edit_reuse_requested = edit_reuse_enabled.load(std::memory_order_relaxed);
+  // Tier preparation can yield to a public FG call. Recheck its receipt at
+  // reuse admission, while retaining the unchanged native-Off gate.
+  const bool edit_reuse_current_native_off = native_fg_public_off.load()
+      && native_fg_declaration.load() == NativeFgDeclaration::kOff;
+  if (edit_reuse_current_native_off) edit_off = {};
+#if defined(NR_NEXUS_DEV_CONTROL)
+  else if (edit_output_contract != nullptr) edit_off = EditReuseXefgOffLocked(handle, feature.source_generation);
+#endif
   const bool edit_reuse_inline_route = present == nullptr
       && hook_point.load() == kHookUpscaled && successful_sr_device == device
-      && native_fg_public_off.load() && native_fg_declaration.load() == NativeFgDeclaration::kOff
+      && (edit_reuse_current_native_off || (edit_off.available && nr_adaptive_enabled.load()
+          && native_fg_declaration.load() != NativeFgDeclaration::kOn))
       && !native_fg_owns.load() && !fg::xefg::Enabled() && !fg::xefg::OwnsStream()
       && !auto_fg_fallback_active.load() && !mixed_present_fg_seen.load();
   const bool edit_reuse_xefg_route = present != nullptr && present->xefg_edit_reuse_frame != 0
@@ -13665,7 +13756,15 @@ inline bool RecordInline(
       && ((!nr_adaptive_enabled.load() && !adaptive.enabled && nr_input_width == width && nr_input_height == height)
           || edit_reuse_adaptive_route);
   if (adaptive.session != nullptr && !adaptive.preparing) {
-    adaptive.session->SetPairedSampling(edit_reuse_adaptive_route && edit_reuse_route_eligible);
+    uint64_t off_identity = 0;
+    if (edit_off.available) {
+      off_identity = 1469598103934665603ull;
+      for (const auto value : {static_cast<uint64_t>(edit_off.context_identity), edit_off.epoch,
+               edit_off.source_link_generation}) {
+        off_identity = (off_identity ^ value) * 1099511628211ull;
+      }
+    }
+    adaptive.session->SetPairedSampling(edit_reuse_adaptive_route && edit_reuse_route_eligible, off_identity);
     adaptive.paired = adaptive.session->paired_sampling;
     adaptive.sampling_generation = adaptive.session->sampling_generation;
     if (adaptive.paired) {
@@ -14527,9 +14626,11 @@ inline bool RecordInline(
         std::bit_cast<uint32_t>(norm_attack_stops.load()), std::bit_cast<uint32_t>(norm_release_stops.load()),
         std::bit_cast<uint32_t>(norm_slew_stops.load()), norm_cut_aware.load(),
         std::bit_cast<uint32_t>(proxy_anchor_nits.load()),
-        (present != nullptr ? present->restore_config_epoch : 0u),
-        (present != nullptr ? std::bit_cast<uint32_t>(frame_divisor) : 0u),
-        (present != nullptr ? static_cast<uint32_t>(frame.ui_correction) : 0u),
+        // Inline SDK-Off reuse is also bound to the observed source/proxy
+        // lifetime; repeated Disable calls do not change these stable keys.
+        (present != nullptr ? present->restore_config_epoch : edit_off.context_identity),
+        (present != nullptr ? std::bit_cast<uint32_t>(frame_divisor) : edit_off.epoch),
+        (present != nullptr ? static_cast<uint32_t>(frame.ui_correction) : edit_off.source_link_generation),
         static_cast<uint32_t>(output_desc.Format), hdr_mode, v6_encoding, nr_input_width, nr_input_height};
     if (auto& cache = feature.slots[0].edit_reuse; cache != nullptr) {
       if (cache->width != nr_input_width || cache->height != nr_input_height
@@ -17772,6 +17873,17 @@ inline bool CreatedSrHandle(const NVSDK_NGX_Handle* handle) {
       && (created->second == kFeatureDlss || created->second == kFeatureDlssd);
 }
 
+#if defined(NR_NEXUS_DEV_CONTROL)
+// The public Disable must be observable while NR is released. Record only a
+// successful, registered host SR; this probe does not run or prepare NR.
+inline void ObserveReleasedD3D12Source(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle) {
+  if (!edit_reuse_adaptive_experiment.load() || enabled.load()) return;
+  RuntimeTryLock lock(runtime_mutex);
+  if (!lock.owns_lock() || !CreatedSrHandle(handle)) return;
+  const SuccessfulSrCoreScope core_scope(list, handle);
+}
+#endif
+
 // A DLSSG.* resource of an evaluate's block (DLSS-G, nvsdk_ngx_defs_dlssg.h),
 // set as a D3D12 resource or as a void pointer.
 inline ID3D12Resource* PreFgResource(const NVSDK_NGX_Parameter* parameters, const char* key) {
@@ -20635,6 +20747,9 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
     CountNrDecline(NrDeclineReason::kGameEvaluateFailed);
     return result;
   }
+#if defined(NR_NEXUS_DEV_CONTROL)
+  ObserveReleasedD3D12Source(command_list, handle);
+#endif
   if (!enabled.load()) {
     CountNrDecline(NrDeclineReason::kNrDisabledEvaluation);
     return result;
@@ -20662,7 +20777,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
     return result;
   }
   const SuccessfulSrCoreScope core_scope(
-      CreatedSrHandle(handle) ? command_list : nullptr);
+      CreatedSrHandle(handle) ? command_list : nullptr, handle);
   ObservePresentDlssEvaluate(parameters);
   ngx_dlss_evaluate_seen.store(true, std::memory_order_relaxed);
   // Both insertion modes: the pre-SR block above skipped its pass silently.
@@ -20870,6 +20985,9 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
     CountNrDecline(NrDeclineReason::kGameEvaluateFailed);
     return result;
   }
+#if defined(NR_NEXUS_DEV_CONTROL)
+  ObserveReleasedD3D12Source(command_list, handle);
+#endif
   if (!enabled.load()) {
     CountNrDecline(NrDeclineReason::kNrDisabledEvaluation);
     return result;
@@ -20885,7 +21003,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
     return result;
   }
   const SuccessfulSrCoreScope core_scope(
-      CreatedSrHandle(handle) ? command_list : nullptr);
+      CreatedSrHandle(handle) ? command_list : nullptr, handle);
   ObservePresentDlssEvaluate(parameters);
   ngx_dlss_evaluate_seen.store(true, std::memory_order_relaxed);
   if (NrYieldsToForeign()) {
@@ -22441,6 +22559,10 @@ inline void OnInitSwapchain(reshade::api::swapchain* swapchain, bool /*resize*/)
     return;
   }
   d3d12_swapchain_seen.store(true, std::memory_order_relaxed);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  fg::xefg::RegisterD3D12SourceSwapchain(
+      reinterpret_cast<uintptr_t>(swapchain), reinterpret_cast<IDXGISwapChain*>(swapchain->get_native()));
+#endif
   if (dx11_source.load(std::memory_order_relaxed) != kDx11SourceOff) return;
   InstallHooks();
   if (dx11_source_off_device_deferred.exchange(false, std::memory_order_acq_rel)) {
@@ -33246,6 +33368,9 @@ inline void Use(DWORD reason, HMODULE module, LPVOID reserved) {
       gpu_timers::comparison_settings = internal::comparison_ui::CaptureSettings;
       internal::adaptive_configuration_settings = internal::comparison_ui::CaptureAdaptiveSettings;
       fg::xefg::ConfigureBridgeSource(internal::ObserveBridgeSourceForXefg);
+#if defined(NR_NEXUS_DEV_CONTROL)
+      fg::xefg::ConfigureD3D12Source(internal::ObserveD3D12SourceForXefg);
+#endif
       debug::Mark("attach:config-loaded");
       internal::Log(
           reshade::log::level::info,

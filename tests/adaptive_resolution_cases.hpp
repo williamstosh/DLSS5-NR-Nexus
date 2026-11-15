@@ -173,7 +173,7 @@ inline bool Run() {
     pairing.prepared = true;
     pairing.status.generation = 1;
     pairing.applied_ns = pairing.stable_after_ns = start;
-    pairing.SetPairedSampling(true);
+    pairing.SetPairedSampling(true, 0xA1);
     const auto feed = [&](uint64_t frame, uint64_t first, bool valid = true, uint64_t context = 1) {
       const int64_t now = start + static_cast<int64_t>(frame) * 10'000'000;
       pairing.ObserveGpu(paired_sample(pairing, frame, first, now, 2000., valid, context), now);
@@ -198,11 +198,34 @@ inline bool Run() {
     feed(11, 10, true, 2);
     check(pairing.gpu_count == 1 && pairing.gpu_us[0] == 2000., "a fresh complete pair resumes after rejected halves");
     feed(12, 12, true, 2);
+    check(pairing.SelectMeasurementPair(12, true) == 12, "the identity probe has a scheduled adjacent source");
+    pairing.trial = true;
+    const auto identity_epoch = pairing.sampling_generation;
+    const auto identity_sequence = pairing.last_sequence;
+    pairing.SetPairedSampling(true, 0xA1);
+    check(pairing.paired_identity == 0xA1 && pairing.sampling_generation == identity_epoch
+              && pairing.gpu_count == 1 && pairing.gpu_us[0] == 2000. && pairing.trial
+              && pairing.pending_pair.frame == 12 && pairing.measure_pair_first_frame == 12,
+          "the same paired identity preserves costs, in-flight halves, scheduling and the active trial");
     old_completion = paired_sample(pairing, 13, 12, start + 130'000'000, 2000., true, 2);
-    pairing.SetPairedSampling(false);
+    pairing.SetPairedSampling(true, 0xB2);
+    check(pairing.paired_sampling && pairing.paired_identity == 0xB2
+              && pairing.sampling_generation == identity_epoch + 1 && pairing.gpu_count == 0 && !pairing.trial
+              && pairing.pending_pair.frame == 0 && pairing.pending_roles == 0 && pairing.measure_pair_first_frame == 0,
+          "a changed paired identity clears costs and in-flight work and cancels the old trial");
     pairing.ObserveGpu(old_completion, old_completion.completed_ns);
-    check(pairing.gpu_count == 0, "leaving paired sampling rejects old-mode completions");
-    auto ordinary = paired_sample(pairing, 14, 0, start + 140'000'000, 3000., true, 2);
+    check(pairing.gpu_count == 0 && pairing.pending_pair.frame == 0 && pairing.last_sequence == identity_sequence,
+          "an old-identity completion cannot advance the current sampling sequence or seed a half pair");
+    feed(14, 14, true, 2);
+    feed(15, 14, true, 2);
+    check(pairing.gpu_count == 1 && pairing.gpu_us[0] == 2000., "new-identity adjacent sources resume complete cost pairs");
+    feed(16, 16, true, 2);
+    old_completion = paired_sample(pairing, 17, 16, start + 170'000'000, 2000., true, 2);
+    pairing.SetPairedSampling(false, 0xB2);
+    pairing.ObserveGpu(old_completion, old_completion.completed_ns);
+    check(pairing.gpu_count == 0 && !pairing.paired_sampling && pairing.paired_identity == 0,
+          "leaving paired sampling zeroes its identity and rejects old-mode completions");
+    auto ordinary = paired_sample(pairing, 18, 0, start + 180'000'000, 3000., true, 2);
     ordinary.paired = false;
     pairing.ObserveGpu(ordinary, ordinary.completed_ns);
     check(pairing.gpu_count == 1 && pairing.gpu_us[0] == 3000., "ordinary single-source sampling resumes after paired mode");

@@ -999,6 +999,71 @@ int Run() {
       checked_frame(0, 0);
       Check(native::nr_features_created == models && native::worksets_created == allocations,
             "upper/lower/upper reuse creates no additional model or adaptive workset");
+#if defined(NR_NEXUS_DEV_CONTROL)
+      {
+        namespace xefg = addon::fg::xefg;
+        namespace xi = xefg::internal;
+        native::native_fg_public_off = false;
+        native::native_fg_declaration = native::NativeFgDeclaration::kUnknown;
+        checked_frame(0, 1);
+        Check(feature.slots[0].edit_reuse == nullptr && !feature.adaptive_session->paired_sampling,
+              "Unknown without a public Off receipt never admits two-tier reuse");
+        // Only the receipt is MOCK here. Public Enable/link acceptance is
+        // exercised by fg_xefg_tests; recording, shaders and retirement use WARP.
+        const bool stopped = xi::stopped.exchange(false);
+        const bool sdk_enabled = xi::sdk_detours_enabled.exchange(true);
+        Check(xi::state.contexts.empty() && xi::state.bridge_swapchains.empty(), "isolated SDK receipt fixture");
+        auto context = std::make_shared<xi::Context>();
+        context->device = gpu.device;
+        context->device_identity = renodx::utils::directx::NativeIdentity(gpu.device.Get());
+        context->proxy_identity = 0xE012;
+        context->bridge_context_ready = context->bridge_proxy_ready = context->bridge_off_observed = true;
+        context->bridge_off_epoch = context->epoch;
+        context->bridge_off_uses_source_link = true;
+        context->bridge_source_swapchain = 0xE011;
+        context->bridge_source_generation = 1;
+        context->bridge_link_generation = context->bridge_off_link_generation = 1;
+        context->bridge_link_source = context->bridge_off_source = {
+            .handle = reinterpret_cast<uintptr_t>(owner), .generation = feature.source_generation,
+            .device12 = reinterpret_cast<uintptr_t>(context->device_identity.Get())};
+        auto source_chain = std::make_shared<xi::BridgeSourceSwapchain>();
+        source_chain->owner = context->bridge_source_swapchain;
+        source_chain->identity = 0xE013;
+        source_chain->device12 = context->device_identity;
+        source_chain->generation = context->bridge_source_generation;
+        source_chain->hook_ready = true;
+        source_chain->context = context;
+        source_chain->proxy = context->proxy_identity;
+        xi::state.contexts.emplace(reinterpret_cast<void*>(uintptr_t{0xE014}), context);
+        xi::state.bridge_swapchains.emplace(source_chain->owner, source_chain);
+        Check(native::EditReuseXefgOffLocked(owner).available,
+              "a source-bound MOCK SDK Disable is available without changing the native declaration");
+        Check(!native::EditReuseXefgOffLocked(owner, feature.source_generation + 1).available,
+              "a current Disable cannot admit a recording from a different source generation");
+        checked_frame(0, 1);
+        Check(feature.adaptive_session->paired_sampling && !native::native_fg_public_off.load()
+                  && native::native_fg_declaration.load() == native::NativeFgDeclaration::kUnknown,
+              "DEV accepts the independent SDK receipt and preserves native Unknown");
+        checked_frame(0, 0);
+        const auto sampling = feature.adaptive_session->sampling_generation;
+        ++context->bridge_link_generation;
+        context->bridge_off_link_generation = context->bridge_link_generation;
+        checked_frame(0, 1);
+        Check(feature.adaptive_session->sampling_generation > sampling && model_resets.back() == 1,
+              "a newly accepted source link invalidates paired measurements and old NR edit history");
+        checked_frame(0, 0);
+        ++context->epoch;
+        checked_frame(0, 1);
+        Check(feature.slots[0].edit_reuse == nullptr && !feature.adaptive_session->paired_sampling,
+              "a stale Disable epoch stops reuse and paired sampling immediately");
+        xefg::ForgetBridgeSourceSwapchain(source_chain->owner);
+        xi::state.contexts.clear();
+        xi::sdk_detours_enabled = sdk_enabled;
+        xi::stopped = stopped;
+        native::native_fg_public_off = true;
+        native::native_fg_declaration = native::NativeFgDeclaration::kOff;
+      }
+#endif
       native::edit_reuse_adaptive_experiment = false;
       const auto reuses = native::edit_reuse_reuses.load();
       checked_frame(0, 1);

@@ -88,6 +88,9 @@
           && status["state"]["experiments"]["evidence"] == "requested_mode_not_activation"
           && status["state"]["adaptive_caches"].is_array(),
       "the experiment defaults to OFF and reports its request separately from execution");
+  check(status["state"]["edit_reuse"]["xefg_off_sources"].is_array()
+          && status["state"]["edit_reuse"]["xefg_off_sources"].empty(),
+      "status reports an empty XeFG Off source list when this CPU fixture has no recorded D3D12 sources");
   namespace rate = renodx::addons::dlss5::output_framerate;
   namespace adaptive = renodx::addons::dlss5::adaptive_resolution;
   {
@@ -174,13 +177,16 @@
   }
   status = control::Snapshot();
   check(!status["output_framerate"]["available"].get<bool>() && status["output_framerate"]["fps"].is_null()
-          && status["output_framerate"]["fps_mad"].is_null() && status["output_framerate"]["observed_multiplier"].is_null(),
+          && status["output_framerate"]["fps_mad"].is_null() && status["output_framerate"]["observed_multiplier"].is_null()
+          && status["output_framerate"]["identity"] == 0 && !status["output_framerate"]["fg_off"].get<bool>(),
       "an unavailable output source cannot publish valid frame rate or observed multiplier values");
   const auto sampled_ns = runtime::SteadyNowNs();
+  constexpr uint64_t output_context = 0xCEF0;
   {
     std::unique_lock lock(rate::internal::state.mutex);
     auto& stream = rate::internal::state.stream;
     stream.previous_ns = sampled_ns;
+    stream.identity = output_context;
     stream.snapshot = {.available = true, .reason = rate::Reason::kREADY, .source = rate::Source::XEFG_STATUS,
         .source_generation = 9, .configuration_generation = 11, .window_serial = 4,
         .window_begin_ns = sampled_ns - 2'000'000'000, .window_end_ns = sampled_ns,
@@ -192,6 +198,7 @@
   status = control::Snapshot();
   check(status["output_framerate"]["available"] && status["output_framerate"]["source"] == rate::SourceText(rate::Source::XEFG_STATUS)
           && status["output_framerate"]["source_generation"] == 9 && status["output_framerate"]["configuration_generation"] == 11
+          && status["output_framerate"]["identity"] == output_context && !status["output_framerate"]["fg_off"].get<bool>()
           && status["output_framerate"]["window_serial"] == 4 && status["output_framerate"]["window_end_ns"] == sampled_ns
           && status["output_framerate"]["fps"] == 144. && status["output_framerate"]["fps_mad"] == 2.
           && status["output_framerate"]["requested_multiplier"] == 4 && status["output_framerate"]["observed_multiplier"] == 3.6,
@@ -203,11 +210,23 @@
       "controller observations and preparation counters remain distinct from current GPU completion proof");
   {
     std::unique_lock lock(rate::internal::state.mutex);
+    rate::internal::state.stream.snapshot.fg_off = true;
+    rate::internal::state.stream.snapshot.requested_multiplier = 0;
+    rate::internal::state.stream.snapshot.observed_multiplier = 1.;
+  }
+  status = control::Snapshot();
+  check(status["output_framerate"]["identity"] == output_context && status["output_framerate"]["fg_off"]
+          && status["output_framerate"]["observed_multiplier"] == 1.
+          && status["edit_reuse"]["xefg_off_sources"].empty(),
+      "an observed SDK Off flag retains its provider identity without inventing a linked source");
+  {
+    std::unique_lock lock(rate::internal::state.mutex);
     rate::internal::state.stream.previous_ns = sampled_ns - rate::Stream::STALE_NS - 1;
   }
   status = control::Snapshot();
   check(!status["output_framerate"]["available"].get<bool>() && status["output_framerate"]["fps"].is_null()
-          && status["output_framerate"]["fps_mad"].is_null() && status["adaptive"]["output_fps"].is_null(),
+          && status["output_framerate"]["fps_mad"].is_null() && status["adaptive"]["output_fps"].is_null()
+          && status["output_framerate"]["identity"] == output_context && !status["output_framerate"]["fg_off"].get<bool>(),
       "stale SDK observations keep their source metadata but do not expose a valid current FPS");
   {
     std::unique_lock lock(rate::internal::state.mutex);
@@ -431,6 +450,8 @@
     enabled_identity["experiments"][operation] = true;
     check(boolean_enabled["ok"] && boolean_enabled["state"]["available"]
             && boolean_enabled["identity"] == enabled_identity && requested_flag.load()
+            && boolean_enabled["state"]["edit_reuse"]["xefg_off_sources"].is_array()
+            && boolean_enabled["state"]["edit_reuse"]["xefg_off_sources"].empty()
             && boolean_enabled["state"]["experiments"][evidence_key] == "requested_enabled_not_activation",
         "Boolean enable publishes only the independent requested flag and its confirmation identity");
     check(control::Execute(boolean_request) == boolean_enabled, "same-id Boolean enable returns the original receipt");

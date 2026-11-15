@@ -191,6 +191,7 @@ struct ReceiptSwapchain : IDXGISwapChain {
 xefg::BridgeSourceIdentity receipt_source;
 bool receipt_source_available = true;
 uint32_t receipt_candidates = 1;
+uint32_t receipt_device12_matches = 1;
 int32_t receipt_sdk_status = 0;
 void (*receipt_during_sdk)() = nullptr;
 IUnknown* receipt_proxy = nullptr;  // Borrowed only across the mock SDK callback.
@@ -209,6 +210,23 @@ xefg::BridgeSourceObservation ObserveReceiptSource(uintptr_t device11) noexcept 
     observation.identity.device11 = device11;
   }
   return observation;
+}
+xefg::BridgeSourceObservation ObserveReceiptD3D12Source(uintptr_t device12) noexcept {
+  xefg::BridgeSourceObservation observation{.state = xefg::BridgeSnapshotState::RUNTIME_BUSY,
+      .queried_device12 = device12};
+  if (!receipt_source_available) return observation;
+  observation.state = xefg::BridgeSnapshotState::LOCKED;
+  observation.candidates = receipt_device12_matches;
+  if (receipt_source.device11 == 0 && receipt_source.device12 == device12) {
+    observation.matches = receipt_device12_matches;
+    if (receipt_device12_matches == 1) observation.identity = receipt_source;
+  }
+  observation.identity.device12 = device12;
+  return observation;
+}
+int32_t FakeReceiptPresentStatus(void*, xefg::abi::PresentStatus* status) {
+  *status = {.frames_presented = 1, .frame_gen_result = 0, .enabled = 0};
+  return 0;
 }
 int32_t ReceiptSdkCall() {
   Check(!xefg::QueryBridgeOff(receipt_source).available, "old Off cannot authorize while the SDK contract call is in flight");
@@ -779,6 +797,178 @@ int main(int argc, char** argv) {
             "Stop retires registered devices outside the state lock");
         adapter::stopped.store(false);
         std::cout << "PASS CPU MOCK source Present association: nested SDK boundary, identity, failure, ambiguity and teardown\n";
+      }
+      {
+        const auto saved_proxy_real = adapter::proxies[0].real;
+        auto& source_slot = adapter::source_present_slots[0];
+        const auto saved_source_real = source_slot.real;
+        const auto saved_source_target = source_slot.records[0].target;
+        const bool saved_source_installed = source_slot.installed;
+        const bool saved_source_complete = source_slot.complete;
+        ComPtr<ReceiptSwapchain> source_swapchain;
+        source_swapchain.Attach(new ReceiptSwapchain(nullptr));
+        source_swapchain->reported_device12 = identity;
+        ComPtr<ReceiptSwapchain> sdk_proxy;
+        sdk_proxy.Attach(new ReceiptSwapchain(nullptr));
+        sdk_proxy->reported_device12 = identity;
+        receipt_proxy = sdk_proxy.Get();
+        receipt_context_handle = context_handle;
+        receipt_source = {.handle = 0xD312, .generation = 1,
+            .device12 = reinterpret_cast<uintptr_t>(identity.Get())};
+        xefg::ConfigureD3D12Source(&ObserveReceiptD3D12Source);
+        context = fresh_context();
+        context->bridge_application_device11.Reset();
+        context->bridge_proxy_device11.Reset();
+        context->device_identity = identity;
+        context->proxy_identity = adapter::Identity(sdk_proxy.Get());
+        context->get_status = &FakeReceiptPresentStatus;
+        adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakePresent);
+        // Reuse a MOCK installed slot, so registration exercises its real
+        // bookkeeping without installing a detour or creating a GPU device.
+        source_slot.real[0] = reinterpret_cast<void*>(&FakeSourcePresent);
+        source_slot.records[0].target = reinterpret_cast<uint8_t*>((*reinterpret_cast<void***>(source_swapchain.Get()))[8]);
+        source_slot.installed = source_slot.complete = true;
+        constexpr uintptr_t SOURCE_OWNER = 0xED012;
+        const auto source_refs = source_swapchain->references;
+        const auto register_source = [&] {
+          Check(xefg::RegisterD3D12SourceSwapchain(SOURCE_OWNER, source_swapchain.Get()),
+              "D3D12 source registration reuses its captured native device and installed source hook");
+        };
+        const auto normal_present = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+          return adapter::ProxyHooks<0>::Present(static_cast<IDXGISwapChain*>(receipt_proxy), interval, flags);
+        };
+        source_swapchain->present_callback = normal_present;
+        const auto run_source = [&](UINT flags = 0) {
+          return adapter::SourcePresentHooks<0>::Present(source_swapchain.Get(), 0, flags);
+        };
+        const auto accept_link = [&] {
+          Check(run_source() == S_OK, "D3D12 source forwards one successful nested SDK proxy Present");
+          Hooks::Enable(context_handle, 0);
+          Check(xefg::QueryBridgeOff(receipt_source).available,
+              "D3D12 linked source accepts its own successful explicit Disable");
+        };
+        register_source();
+        Check(adapter::BridgeDeviceIdentity(source_swapchain.Get()) == nullptr
+                  && adapter::D3D12SourceDeviceIdentity(source_swapchain.Get()) == identity,
+            "D3D12 identity stays separate from the established D3D11 capture contract");
+        Hooks::Enable(context_handle, 0);
+        Check(!xefg::QueryBridgeOff(receipt_source).available,
+            "same device and a unique D3D12 source cannot substitute for a nested source/proxy link");
+        adapter::ProxyHooks<0>::Present(sdk_proxy.Get(), 0, 0);
+        const auto sdk_output = renodx::addons::dlss5::output_framerate::Read(
+            renodx::addons::dlss5::output_framerate::NowNs());
+        Check(sdk_output.fg_off && sdk_output.identity == reinterpret_cast<uintptr_t>(context.get())
+                  && !xefg::QueryBridgeOff(receipt_source).available,
+            "SDK Off samples expose the real output context token without inventing a Disable receipt");
+        Check(run_source(DXGI_PRESENT_TEST) == S_OK && context->bridge_source_swapchain == 0,
+            "D3D12 test Presents cannot establish the source/proxy relation");
+        accept_link();
+        const auto linked = xefg::QueryBridgeOff(receipt_source);
+        Check(linked.context == reinterpret_cast<uintptr_t>(context_handle)
+                  && linked.context_identity == sdk_output.identity && linked.uses_source_link
+                  && linked.source == receipt_source && linked.source_swapchain == SOURCE_OWNER
+                  && linked.source.device11 == 0 && source_swapchain->references == source_refs,
+            "D3D12 Off evidence binds SDK handle, output identity, source generation and borrowed source swapchain");
+        auto matched_output = sdk_output;
+        matched_output.available = true;  // MOCK ready window; no wall-clock/GPU measurement.
+        Check(linked.MatchesOutput(matched_output), "D3D12 Off receipt accepts a ready Off SDK window from its exact context");
+        ++matched_output.identity;
+        Check(!linked.MatchesOutput(matched_output), "D3D12 Off receipt rejects another context's SDK FPS");
+        matched_output.identity = linked.context_identity;
+        matched_output.source = renodx::addons::dlss5::output_framerate::Source::PRESENT;
+        Check(!linked.MatchesOutput(matched_output), "D3D12 Off receipt does not relabel Present cadence as SDK output");
+        matched_output.source = sdk_output.source;
+        matched_output.fg_off = false;
+        Check(!linked.MatchesOutput(matched_output), "D3D12 Off receipt rejects SDK windows without Off samples");
+        matched_output.fg_off = true;
+        matched_output.available = false;
+        Check(!linked.MatchesOutput(matched_output), "D3D12 Off receipt rejects a warming or stale SDK window");
+        matched_output.available = true;
+        auto unobserved_off = linked;
+        unobserved_off.available = false;
+        Check(!unobserved_off.MatchesOutput(matched_output), "ready SDK Off samples cannot replace an explicit Disable receipt");
+        Check(run_source() == S_OK && Hooks::Enable(context_handle, 0) == 0
+                  && xefg::QueryBridgeOff(receipt_source).available
+                  && context->epoch == linked.epoch && context->bridge_link_generation == linked.source_link_generation
+                  && context->bridge_declaration != linked.declaration,
+            "repeated identical Disable calls preserve the stable epoch/link cache key");
+        receipt_sdk_status = -19;
+        Hooks::Enable(context_handle, 0);
+        Check(!xefg::QueryBridgeOff(receipt_source).available,
+            "D3D12 failed Disable revokes the old receipt despite Off status samples");
+        receipt_sdk_status = 0;
+        accept_link();
+        receipt_source_available = false;
+        Hooks::Enable(context_handle, 0);
+        Check(!xefg::QueryBridgeOff(receipt_source).available,
+            "a busy D3D12 observer cannot preserve the previous Disable receipt");
+        receipt_source_available = true;
+        accept_link();
+        receipt_during_sdk = +[] { ++receipt_source.generation; };
+        Hooks::Enable(context_handle, 0);
+        Check(!xefg::QueryBridgeOff(receipt_source).available,
+            "D3D12 source generation changing inside Disable rejects the result");
+        receipt_during_sdk = nullptr;
+        accept_link();
+        receipt_device12_matches = 2;
+        Check(run_source() == S_OK && !xefg::QueryBridgeOff(receipt_source).available,
+            "multiple D3D12 SR sources on one device revoke the established relation");
+        receipt_device12_matches = 1;
+        Check(!xefg::QueryBridgeOff(receipt_source).available,
+            "removing the source ambiguity cannot revive its old Disable receipt");
+        accept_link();
+        ComPtr<ReceiptSwapchain> second_source;
+        second_source.Attach(new ReceiptSwapchain(nullptr));
+        second_source->reported_device12 = identity;
+        Check(xefg::RegisterD3D12SourceSwapchain(SOURCE_OWNER + 1, second_source.Get())
+                  && !xefg::QueryBridgeOff(receipt_source).available,
+            "a second registered D3D12 chain immediately revokes same-device Off before it presents");
+        Check(run_source() == S_OK && context->bridge_source_swapchain == 0,
+            "a proven chain cannot overwrite same-device D3D12 chain ambiguity");
+        xefg::ForgetBridgeSourceSwapchain(SOURCE_OWNER + 1);
+        Check(!xefg::QueryBridgeOff(receipt_source).available,
+            "removing the second D3D12 chain does not revive a revoked receipt");
+        accept_link();
+        context->device_identity = other_identity;
+        Check(run_source() == S_OK && !xefg::QueryBridgeOff(receipt_source).available,
+            "a nested proxy on another D3D12 device cannot authorize the source");
+        context->device_identity = identity;
+        accept_link();
+        Hooks::Enable(context_handle, 1);
+        Check(!xefg::QueryBridgeOff(receipt_source).available, "D3D12 Enable immediately revokes explicit Off");
+        Hooks::Enable(context_handle, 0);
+        Check(xefg::QueryBridgeOff(receipt_source).available && context->epoch != linked.epoch,
+            "D3D12 reenable/disable changes the epoch before accepting a new receipt");
+        adapter::BeforeResize(sdk_proxy.Get());
+        Check(!xefg::QueryBridgeOff(receipt_source).available,
+            "D3D12 SDK proxy resize revokes its source link and Disable receipt");
+        accept_link();
+        xefg::ForgetBridgeSourceSwapchain(SOURCE_OWNER);
+        Check(!xefg::QueryBridgeOff(receipt_source).available && source_swapchain->references == source_refs,
+            "D3D12 source teardown revokes Off without retaining the swapchain");
+        sdk_proxy->present_callback = normal_present;
+        Check(xefg::RegisterD3D12SourceSwapchain(SOURCE_OWNER, sdk_proxy.Get()),
+            "MOCK can register the SDK proxy itself to test rejection at the nested boundary");
+        Check(adapter::SourcePresentHooks<0>::Present(sdk_proxy.Get(), 0, 0) == S_OK
+                  && context->bridge_source_swapchain == 0 && !xefg::QueryBridgeOff(receipt_source).available,
+            "D3D12 SDK proxy cannot self-certify as an independent source chain");
+        xefg::ForgetBridgeSourceSwapchain(SOURCE_OWNER);
+        register_source();
+        accept_link();
+        receipt_sdk_status = -19;
+        Hooks::Init(context_handle, nullptr, nullptr);
+        Check(!xefg::QueryBridgeOff(receipt_source).available && !context->bridge_context_ready,
+            "D3D12 failed reinitialization revokes Off before the real SDK call");
+        receipt_sdk_status = 0;
+        xefg::ForgetBridgeSourceSwapchain(SOURCE_OWNER);
+        xefg::ConfigureD3D12Source(nullptr);
+        adapter::proxies[0].real = saved_proxy_real;
+        source_slot.real = saved_source_real;
+        source_slot.records[0].target = saved_source_target;
+        source_slot.installed = saved_source_installed;
+        source_slot.complete = saved_source_complete;
+        receipt_proxy = nullptr;
+        std::cout << "PASS CPU MOCK D3D12 explicit Off: nested source/proxy/device identity, SDK FPS token, failure and revocation; GPU=NotRun\n";
       }
       adapter::state.contexts.clear();
       adapter::modules[0].real = saved_real;

@@ -117,6 +117,21 @@ inline Json Snapshot() {
     }
   }
   const auto output = output_framerate::Read(now);
+  Json edit_off_sources = Json::array();
+  if (edit_reuse_adaptive_experiment.load()) {
+    for (const auto& [handle, source] : create_contracts) {
+      if (source.source_device12_identity == nullptr) continue;
+      const auto off = EditReuseXefgOffLocked(handle);
+      edit_off_sources.push_back({{"source_handle", reinterpret_cast<uintptr_t>(handle)},
+          {"source_generation", source.source_generation},
+          {"device12", reinterpret_cast<uintptr_t>(source.source_device12_identity.Get())},
+          {"available", off.available}, {"reason", off.reason},
+          {"context_identity", off.context_identity}, {"context_epoch", off.epoch},
+          {"source_link_generation", off.source_link_generation}, {"uses_source_link", off.uses_source_link},
+          {"source_swapchain", off.source_swapchain}, {"source_swapchain_generation", off.source_swapchain_generation},
+          {"provider_matches", off.MatchesOutput(output)}});
+    }
+  }
   Json caches = Json::array();
   for (const auto& [handle, feature] : features) {
     const auto& cache = feature.adaptive_cache;
@@ -164,6 +179,7 @@ inline Json Snapshot() {
       {"nr_features_created", nr_features_created},
       {"edit_reuse", {{"requested", edit_reuse_enabled.load()}, {"refreshes", edit_reuse_refreshes.load()},
           {"reuses", edit_reuse_reuses.load()}, {"fallbacks", edit_reuse_fallbacks.load()},
+          {"xefg_off_sources", std::move(edit_off_sources)},
           {"evidence", "process_counters_not_activation_or_gpu_completion"}}},
       {"experiments", {{"adaptive_feature_mode", identity["experiments"]["adaptive_feature_mode"]},
           {"bridge_adaptive_experiment", identity["experiments"]["bridge_adaptive_experiment"]},
@@ -174,6 +190,7 @@ inline Json Snapshot() {
       {"adaptive_caches", std::move(caches)},
       {"output_framerate", {{"available", output.available}, {"reason", output_framerate::ReasonText(output.reason)},
           {"source", output_framerate::SourceText(output.source)}, {"source_generation", output.source_generation},
+          {"identity", output.identity}, {"fg_off", output.fg_off},
           {"configuration_generation", output.configuration_generation}, {"window_serial", output.window_serial},
           {"window_begin_ns", output.window_begin_ns}, {"window_end_ns", output.window_end_ns},
           {"fps", output.available ? Json(output.fps) : Json(nullptr)},

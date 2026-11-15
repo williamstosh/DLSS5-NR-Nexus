@@ -71,8 +71,12 @@ Bridge 两档接入使用独立的 DEV 请求：`Client.bridge_adaptive_experime
 `state.edit_reuse` 返回请求开关和进程级刷新／复用／回退计数；`adaptive_caches` 中的 `source_frame`、`trial`、
 `sampling` 分别反映源序号、试档状态和已完成采样。统计有效时 `median_us`／`mad_us` 是每源完整 NR 链成本，
 x2 先平均相邻两源再统计；未满窗口或过期时为 null。请求、计数、已完成成本和实际档位须分别判断。
-FG Off 的现成输出来源为 ReShade Present 回调的 `Present cadence estimate`；它不报告显示器扫描完成。
-离屏原生 NGX 夹具无 Present 循环，其串行吞吐或合成 FPS 不可替代该来源。
+输出 FPS 沿用真实 `Present cadence estimate` 或 `XeFG SDK output estimate`，两者均不报告显示器扫描完成。
+DEV 两档 x2 另可接纳与当前 D3D12 源、真实来源链→XeFG proxy Present 关联及 context 代次绑定的成功
+`SetEnabled(false)`。它保持原生 FG 声明不变；Unknown 自身不能准入。`state.edit_reuse.xefg_off_sources`
+报告凭据及 provider 匹配情况，SDK FPS 必须来自同一个 context 且当前观测为 Off。重建或重新关联会清掉旧编辑与成对测量。
+公开配置请求或倍率 1 都不能代替关闭回执；可用已配置的 FG 快捷键触发实际 SDK 调用。
+离屏原生 NGX 夹具无 Present 循环，其串行吞吐或合成 FPS 不可替代上述来源。
 
 可信 FG Off 可以来自成功的 Streamline `SetOptions(eOff)`，或绑定当前 XeFG context／proxy、
 D3D11 设备和源代次的成功 `SetEnabled(false)`。XeFG 路径要求关闭调用前后均能观察到同一个已创建来源；
@@ -127,6 +131,10 @@ with (run / 'actions.jsonl').open('a', encoding='utf-8') as journal:
 ```
 
 首次控制接管前的等待受总采证截止时间约束；600秒总采集、60秒退出预留时，初次请求须在 ready 后540秒前到达，已耗时间始终扣除。首个实际阶段请求到来后，每阶段执行和阶段成功后等待下一请求均限60秒；重复 control 不延长窗口。阶段无进展即记 `functionalOutcome=Blocked`，停止接受新阶段并进入最多60秒的清理窗口；总采证预算到期也如此，清理仍不得越过总600秒。正常完成时先写同 PID 的 `{"completed":true}` 请求清理，等 `state=cleanup` 后实际关闭面板、关闭 NR，再补 `overlay_closed=true,nr_off=true`。`overlay_closed` 是主代理对实际画面的确认，不由 Home 按键推断。collector 要求清理开始后新增且最新的 NR OFF 日志，并留一张 `addon-menu-cleanup.png`，才写完成凭据并零码退出；缺证、取消、失焦、身份变化和清理超时仍失败。`static-progress.json` 分别记录当前窗口和总采集预算余量；`static-complete.json` 保留 `Blocked`／`Observed`／`NotTested`，runner 的启动／退出成功不把 `Blocked` 变为功能通过。
+
+自动采集失败时，worker 保持输入封锁；父进程确认采集器停止后，脚本后端先核对所属进程及调试桥监听归属，
+尝试现有游戏脚本 Exit 并等待退出。桥不可用或退出超时才保留所属进程终止兜底；`protected-script-exit.json`
+与 `recovery.json` 分别记录尝试和实际方法。失败采集仍记失败，Manual IME 行为不变，原文件保护持续到退出恢复。
 
 回归覆盖后台激活、最小化恢复、身份变化拒绝、失败门禁、脚本单次启动、完成与退出顺序及保护恢复。单测属于 MOCK／本地文件合同；独立 Windows 窗口探针验证前台 API 路径，IN_GAME／VISUAL 和长时稳定性另行验收。
 

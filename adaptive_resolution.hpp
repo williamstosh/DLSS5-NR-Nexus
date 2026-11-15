@@ -166,6 +166,7 @@ struct Session {
   GpuSample pending;
   uint32_t pending_roles = 0;
   bool paired_sampling = false;
+  uint64_t paired_identity = 0;
   uint64_t sampling_generation = 0, measure_pair_first_frame = 0;
   GpuSample pending_pair;
 
@@ -186,9 +187,11 @@ struct Session {
     ResetMeasurements();
   }
 
-  void SetPairedSampling(bool enabled) {
-    if (paired_sampling == enabled) return;
+  void SetPairedSampling(bool enabled, uint64_t sampling_identity = 0) {
+    if (!enabled) sampling_identity = 0;
+    if (paired_sampling == enabled && paired_identity == sampling_identity) return;
     paired_sampling = enabled;
+    paired_identity = sampling_identity;
     InvalidateSampling();
     trial = false;
   }

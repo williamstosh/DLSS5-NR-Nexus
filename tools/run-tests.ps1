@@ -166,7 +166,7 @@ foreach ($item in $Suite) {
         $arguments += @('/bigobj','/Gy','/Gw','/DNDEBUG','/DRESHADE_ADDON=1',
             "/I$ShaderIncludeDirectory", "/I$HostRoot/external/DLSS/include",
             "/I$HostRoot/external/json/include", "/I$HostRoot/external/frozen/include", "/I$HostRoot/external/gtl/include")
-        if ($item -eq 'fg-native' -and $NativeCase -contains 'inline-restore-roi') {
+        if ($item -eq 'fg-native' -and ($NativeCase -contains 'inline-restore-roi' -or $NativeCase -contains 'nr-edit-reuse-contracts')) {
             $arguments += '/DNR_NEXUS_DEV_CONTROL'
         }
         if ($item -eq 'vulkan-control-mask') { $arguments += "/I$VulkanIncludeDirectory" }
