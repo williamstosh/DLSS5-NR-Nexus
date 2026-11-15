@@ -118,6 +118,59 @@ struct ReceiptDeviceIdentity : IUnknown {
     return remaining;
   }
 };
+struct ReceiptSwapchain : IDXGISwapChain {
+  ULONG references = 1;
+  uint32_t get_device_calls = 0;
+  ComPtr<IUnknown> reported_device;
+  ComPtr<IDXGISwapChain> native_swapchain;
+  explicit ReceiptSwapchain(IUnknown* device, IDXGISwapChain* native = nullptr)
+      : reported_device(device), native_swapchain(native) {}
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** output) override {
+    if (output == nullptr) return E_POINTER;
+    *output = nullptr;
+    if (iid == __uuidof(renodx::utils::directx::ReShadeRetrieveBaseInterface) && native_swapchain != nullptr) {
+      return native_swapchain->QueryInterface(__uuidof(IDXGISwapChain), output);
+    }
+    if (iid != IID_IUnknown && iid != __uuidof(IDXGIObject) && iid != __uuidof(IDXGIDeviceSubObject)
+        && iid != __uuidof(IDXGISwapChain)) return E_NOINTERFACE;
+    *output = static_cast<IDXGISwapChain*>(this);
+    AddRef();
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return ++references; }
+  ULONG STDMETHODCALLTYPE Release() override {
+    const auto remaining = --references;
+    if (remaining == 0) {
+      delete this;
+    }
+    return remaining;
+  }
+  HRESULT STDMETHODCALLTYPE GetDevice(REFIID iid, void** output) override {
+    ++get_device_calls;
+    if (output == nullptr) return E_POINTER;
+    *output = nullptr;
+    if (iid != __uuidof(ID3D11Device) || reported_device == nullptr) return E_NOINTERFACE;
+    // The identity-only MOCK supports the IUnknown methods used by capture;
+    // no D3D11 device method or GPU operation is emulated or executed.
+    *output = reported_device.Get();
+    reported_device->AddRef();
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetParent(REFIID, void**) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE Present(UINT, UINT) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetBuffer(UINT, REFIID, void**) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL, IDXGIOutput*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetFullscreenState(BOOL*, IDXGIOutput**) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetDesc(DXGI_SWAP_CHAIN_DESC*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE ResizeBuffers(UINT, UINT, UINT, DXGI_FORMAT, UINT) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE ResizeTarget(const DXGI_MODE_DESC*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetContainingOutput(IDXGIOutput**) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetFrameStatistics(DXGI_FRAME_STATISTICS*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetLastPresentCount(UINT*) override { return E_NOTIMPL; }
+};
 xefg::BridgeSourceIdentity receipt_source;
 bool receipt_source_available = true;
 int32_t receipt_sdk_status = 0;
@@ -276,8 +329,9 @@ void TestRouteDiagnostics(Gpu* gpu) {
   std::cout << "PASS last Present route/reason diagnostics: successful roles, SDK consumers, Off, skipped and failed\n";
 }
 }  // namespace
-int main() {
+int main(int argc, char** argv) {
   try {
+    const bool bridge_off_cpu = argc == 2 && std::strcmp(argv[1], "--bridge-off-cpu") == 0;
     reshade::internal::get_reshade_module_handle(GetModuleHandleW(nullptr));
     TestDiagnosticBudgets();
     std::cout << "PASS bounded XeFG contract diagnostics\n";
@@ -326,6 +380,33 @@ int main() {
       adapter::modules[0].real[8] = reinterpret_cast<void*>(&FakeReceiptDestroy);
       xefg::ConfigureBridgeSource(&ObserveReceiptSource);
       auto context = fresh_context();
+      {
+        ComPtr<ReceiptSwapchain> native_swapchain;
+        native_swapchain.Attach(new ReceiptSwapchain(identity.Get()));
+        ComPtr<ReceiptSwapchain> wrapper;
+        wrapper.Attach(new ReceiptSwapchain(other_identity.Get(), native_swapchain.Get()));
+        const auto native_refs = native_swapchain->references;
+        const auto wrapper_refs = wrapper->references;
+        const auto captured = adapter::BridgeDeviceIdentity(wrapper.Get());
+        Check(captured.Get() == identity.Get() && wrapper->get_device_calls == 0 && native_swapchain->get_device_calls == 1,
+            "known ReShade swapchain base supplies the canonical source device before proxy GetDevice can select another face");
+        Check(wrapper->references == wrapper_refs && native_swapchain->references == native_refs,
+            "Bridge identity capture balances outer and borrowed-base swapchain references");
+        context->bridge_application_device11.Reset();
+        context->bridge_proxy_device11 = captured;
+        Hooks::Enable(context_handle, 0);
+        Check(xefg::QueryBridgeOff(receipt_source).available,
+            "the captured matching native device still requires and accepts a successful same-source SDK Disable");
+        context = fresh_context();
+        ComPtr<ReceiptSwapchain> different_swapchain;
+        different_swapchain.Attach(new ReceiptSwapchain(other_identity.Get()));
+        context->bridge_application_device11.Reset();
+        context->bridge_proxy_device11 = adapter::BridgeDeviceIdentity(different_swapchain.Get());
+        Hooks::Enable(context_handle, 0);
+        Check(!xefg::QueryBridgeOff(receipt_source).available,
+            "an unwrapped but genuinely different device cannot claim the source's Disable receipt");
+        context = fresh_context();
+      }
       Check(!xefg::QueryBridgeOff(receipt_source).available, "default enabled=false is not an observed Disable");
       receipt_sdk_status = -19;
       Check(Hooks::Enable(context_handle, 0) == -19 && !xefg::QueryBridgeOff(receipt_source).available,
@@ -417,6 +498,10 @@ int main() {
       xefg::ConfigureBridgeSource(nullptr);
       receipt_source = {};
       std::cout << "PASS CPU mocked SDK Off receipt: in-flight/failure, source/proxy/context identity, reenable and recovery\n";
+    }
+    if (bridge_off_cpu) {
+      std::cout << "PASS CPU-only Bridge device capture and existing Off receipts; GPU=NotRun\n";
+      return 0;
     }
     adapter::modules[0].complete = true;
     adapter::modules[0].real[0] = reinterpret_cast<void*>(&FakeInit);

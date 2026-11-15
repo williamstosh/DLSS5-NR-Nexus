@@ -384,8 +384,14 @@ inline uintptr_t Identity(IUnknown* object) {
 inline ComPtr<IUnknown> BridgeDeviceIdentity(IUnknown* object) {
   ComPtr<IDXGISwapChain> swapchain;
   ComPtr<ID3D11Device> device;
-  if (object == nullptr || FAILED(object->QueryInterface(IID_PPV_ARGS(&swapchain)))
-      || FAILED(swapchain->GetDevice(IID_PPV_ARGS(&device)))) return {};
+  if (object == nullptr || FAILED(object->QueryInterface(IID_PPV_ARGS(&swapchain)))) return {};
+  auto* native_swapchain = swapchain.Get();
+  if (renodx::utils::directx::NativeFromReShadeProxy(&native_swapchain)) {
+    // Own the borrowed base before releasing the outer interface, then query
+    // the known base's device rather than the wrapper's reported interface.
+    swapchain = native_swapchain;
+  }
+  if (FAILED(swapchain->GetDevice(IID_PPV_ARGS(&device)))) return {};
   return ComPtr<IUnknown>(renodx::utils::directx::NativeIdentity(device.Get()));
 }
 
