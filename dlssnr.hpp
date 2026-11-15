@@ -31,6 +31,7 @@
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -1146,6 +1147,35 @@ inline bool direct_runtime_failed = false;
 inline std::string direct_runtime_sha256;
 inline bool direct_runtime_reference_match = false;
 inline CodecPipeline codec_pipeline;
+// Private experiment: no config/UI surface; the existing synchronous path is the default.
+static std::atomic_bool async_autoscale_preparation{false};
+static const auto async_autoscale_cancellation = std::make_shared<std::atomic_uint64_t>(1);
+// Separate from codec_pipeline: ReleaseCodecPipeline must not reset the generation to zero.
+static uint64_t async_autoscale_cache_epoch = 1;
+struct AsyncAutoscalePreparation {
+  std::shared_mutex mutex;
+  std::shared_ptr<const std::atomic_uint64_t> cancellation;
+  uint64_t cancellation_epoch = 0;
+  uint64_t cache_epoch = 0;
+  ID3D12Device* device_identity = nullptr;
+  ID3D12RootSignature* root_identity = nullptr;
+  ID3D12Device* device = nullptr;
+  ID3D12RootSignature* root = nullptr;
+  std::span<const uint8_t> bytecode;
+  std::weak_ptr<adaptive_resolution::Session> session;
+  uint64_t preparation_epoch = 0;
+  bool session_owned = false;
+  bool started = false;
+  bool complete = false;
+  HRESULT result = E_PENDING;
+  DWORD system_error = ERROR_SUCCESS;
+  const char* operation = "queued";
+  std::array<char, 256> exception{};
+  // Explicitly reclaimed only at safe source/Present/Shutdown boundaries. As with
+  // the existing raw codec cache, loader detach must not call into the D3D driver.
+  ID3D12PipelineState* pipeline = nullptr;
+};
+static std::shared_ptr<AsyncAutoscalePreparation> async_autoscale_task;
 struct PipelinePreparationOpportunity {
   bool created = false;
   bool deferred = false;
@@ -5684,7 +5714,44 @@ inline void FlushRetiredResources() {
   nr_retirement_pending.store(false, std::memory_order_relaxed);
 }
 
+// Safe at loader detach: no mutex, allocation, wait or driver/module release.
+inline void CancelAsyncAutoscalePreparation() {
+  async_autoscale_cancellation->fetch_add(1, std::memory_order_acq_rel);
+}
+
+// runtime_mutex is held. A started task owns its input references until complete.
+inline bool DiscardAsyncAutoscalePreparation() {
+  if (async_autoscale_task == nullptr) return true;
+  const auto task = async_autoscale_task;
+  std::unique_lock lock(task->mutex);
+  if (task->started && !task->complete) return false;
+  auto* device = std::exchange(task->device, nullptr);
+  auto* root = std::exchange(task->root, nullptr);
+  auto* pipeline = std::exchange(task->pipeline, nullptr);
+  const HRESULT result = task->result;
+  const DWORD system_error = task->system_error;
+  const char* operation = task->operation;
+  const auto exception = task->exception;
+  lock.unlock();
+  ReleaseCom(pipeline);
+  ReleaseCom(root);
+  ReleaseCom(device);
+  async_autoscale_task.reset();
+  if (FAILED(result) && result != E_PENDING && result != E_ABORT) {
+    std::ostringstream message;
+    message << "v6 same-frame autoscale private preparation failed: " << operation
+            << " hr=0x" << std::hex << static_cast<uint32_t>(result)
+            << std::dec << " win32=" << system_error;
+    if (exception[0] != '\0') message << " exception=" << exception.data();
+    Log(reshade::log::level::error, message.str());
+  }
+  return true;
+}
+
 inline void ReleaseCodecPipeline() {
+  ++async_autoscale_cache_epoch;
+  CancelAsyncAutoscalePreparation();
+  DiscardAsyncAutoscalePreparation();
   ReleaseCom(codec_pipeline.hdr_commit_capture);
   ReleaseCom(codec_pipeline.hdr_commit_exposure_capture);
   ReleaseCom(codec_pipeline.hdr_capture_root);
@@ -6349,6 +6416,104 @@ inline bool CreateCodecPipelineState(
   return true;
 }
 
+// Both the worker and launch-failure path finish their own private input refs.
+// No global/TLS/cache access, NGX gate, command recording or runtime lock here.
+inline void CompleteAsyncAutoscalePreparation(
+    const std::shared_ptr<AsyncAutoscalePreparation>& task,
+    HRESULT result, ID3D12PipelineState* pipeline, const char* operation,
+    DWORD system_error = ERROR_SUCCESS, const char* exception = nullptr) {
+  ReleaseCom(task->root);
+  ReleaseCom(task->device);
+  if (task->cancellation->load(std::memory_order_acquire) != task->cancellation_epoch) {
+    ReleaseCom(pipeline);
+  }
+  std::unique_lock lock(task->mutex);
+  task->pipeline = pipeline;
+  task->result = result;
+  task->operation = operation;
+  task->system_error = system_error;
+  if (exception != nullptr) std::snprintf(task->exception.data(), task->exception.size(), "%s", exception);
+  task->complete = true;
+}
+
+struct AsyncAutoscaleWorkerContext {
+  HMODULE module = nullptr;
+  std::shared_ptr<AsyncAutoscalePreparation> task;
+};
+
+static DWORD WINAPI CreateAsyncAutoscalePipeline(void* argument) {
+  auto* context = static_cast<AsyncAutoscaleWorkerContext*>(argument);
+  const HMODULE module = context->module;
+  {
+    const auto task = std::move(context->task);
+    delete context;
+    ID3D12PipelineState* pipeline = nullptr;
+    HRESULT result = E_ABORT;
+    try {
+      if (task->cancellation->load(std::memory_order_acquire) == task->cancellation_epoch) {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+        desc.pRootSignature = task->root;
+        desc.CS = {task->bytecode.data(), task->bytecode.size()};
+        result = task->device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipeline));
+        if (SUCCEEDED(result) && pipeline == nullptr) result = E_FAIL;
+      }
+      CompleteAsyncAutoscalePreparation(task, result, pipeline, "ID3D12Device::CreateComputePipelineState");
+    } catch (const std::bad_alloc& error) {
+      CompleteAsyncAutoscalePreparation(task, E_OUTOFMEMORY, pipeline, "worker exception", 0, error.what());
+    } catch (const std::exception& error) {
+      CompleteAsyncAutoscalePreparation(task, E_FAIL, pipeline, "worker exception", 0, error.what());
+    } catch (...) {
+      CompleteAsyncAutoscalePreparation(task, E_FAIL, pipeline, "worker exception", 0, "unknown C++ exception");
+    }
+  }
+  // All C++ objects and private input refs die BEFORE the final module release.
+  if (module != nullptr) FreeLibraryAndExitThread(module, 0);
+  return 0;
+}
+
+// Called only by OnPresent outside runtime_mutex. The sole task is registered by
+// a source opportunity; this boundary never scans or schedules other shaders.
+inline void StartAsyncAutoscalePreparation() {
+  std::shared_ptr<AsyncAutoscalePreparation> task;
+  {
+    RuntimeTryLock lock(runtime_mutex);
+    if (!lock.owns_lock() || async_autoscale_task == nullptr
+        || !enabled.load(std::memory_order_acquire)
+        || shutting_down.load(std::memory_order_acquire)) return;
+    task = async_autoscale_task;
+    std::unique_lock task_lock(task->mutex);
+    if (task->started || task->complete) return;
+    if (task->cancellation->load(std::memory_order_acquire) != task->cancellation_epoch) {
+      task_lock.unlock();
+      DiscardAsyncAutoscalePreparation();
+      return;
+    }
+    task->started = true;
+  }
+  HMODULE module = nullptr;
+  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+          reinterpret_cast<LPCWSTR>(CreateAsyncAutoscalePipeline), &module)) {
+    const DWORD error = GetLastError();
+    CompleteAsyncAutoscalePreparation(task, HRESULT_FROM_WIN32(error), nullptr, "GetModuleHandleExW", error);
+    return;
+  }
+  // The existing EXE fixture has no DLL module to unload.
+  if (module == GetModuleHandleW(nullptr)) module = nullptr;
+  auto* context = new (std::nothrow) AsyncAutoscaleWorkerContext{.module = module, .task = task};
+  if (context == nullptr) {
+    CompleteAsyncAutoscalePreparation(task, E_OUTOFMEMORY, nullptr, "worker context allocation");
+  } else if (HANDLE thread = CreateThread(nullptr, 0, CreateAsyncAutoscalePipeline, context, 0, nullptr)) {
+    CloseHandle(thread);
+    return;
+  } else {
+    const DWORD error = GetLastError();
+    delete context;
+    CompleteAsyncAutoscalePreparation(task, HRESULT_FROM_WIN32(error), nullptr, "CreateThread", error);
+  }
+  // Launch failures release the added module reference with no runtime/task lock.
+  if (module != nullptr) FreeLibrary(module);
+}
+
 inline bool EnsureControlMaskPipeline(ID3D12Device* device) {
   return EnsureCodecRootSignature(device)
       && CreateCodecPipelineState(
@@ -6409,6 +6574,8 @@ inline bool EnsureLegacyCodecPipeline(ID3D12Device* device) {
 }
 
 inline bool EnsureV6CodecPipeline(ID3D12Device* device) {
+  if (async_autoscale_task != nullptr && !codec_pipeline.incremental_preparation
+      && !DiscardAsyncAutoscalePreparation()) return false;
 #if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
   const ColdCpuTraceScope cold_trace("EnsureV6CodecPipeline");
 #endif
@@ -6422,6 +6589,84 @@ inline bool EnsureV6CodecPipeline(ID3D12Device* device) {
     return true;
   }
   if (!EnsureCodecRootSignature(device)) return false;
+  const auto ensure_autoscale = [&] {
+    if (codec_pipeline.autoscale != nullptr) return true;
+    if (!codec_pipeline.incremental_preparation
+        || (!async_autoscale_preparation.load(std::memory_order_relaxed) && async_autoscale_task == nullptr)) {
+      return CreateCodecPipelineState(device, __v6_autoscale, &codec_pipeline.autoscale,
+          L"" NR_NEXUS_NAME " v6 same-frame autoscale", "v6 same-frame autoscale");
+    }
+    if (codec_pipeline.preparation_failed || pipeline_preparation_opportunity == nullptr) return false;
+    if (!enabled.load(std::memory_order_acquire) || shutting_down.load(std::memory_order_acquire)
+        || pipeline_preparation_opportunity->created) {
+      pipeline_preparation_opportunity->deferred = true;
+      return false;
+    }
+    if (async_autoscale_task != nullptr) {
+      const auto task = async_autoscale_task;
+      std::unique_lock lock(task->mutex);
+      if (!task->complete) {
+        pipeline_preparation_opportunity->deferred = true;
+        return false;
+      }
+      const bool current = task->cache_epoch == async_autoscale_cache_epoch
+          && task->cancellation_epoch == async_autoscale_cancellation->load(std::memory_order_acquire)
+          && task->device_identity == device && task->root_identity == codec_pipeline.root_signature;
+      const bool succeeded = current && SUCCEEDED(task->result) && task->pipeline != nullptr;
+      const auto attempt_session = task->session.lock();
+      const auto preparation_session = codec_pipeline.preparation_session.lock();
+      const bool current_attempt = current
+          && (task->session_owned
+                  ? attempt_session != nullptr && attempt_session == preparation_session
+                      && attempt_session->preparation_epoch == task->preparation_epoch
+                  : preparation_session == nullptr);
+      if (succeeded) {
+        codec_pipeline.autoscale = std::exchange(task->pipeline, nullptr);
+        pipeline_preparation_opportunity->created = true;
+      } else if (current_attempt) {
+        codec_pipeline.preparation_failed = true;
+        if (attempt_session != nullptr) attempt_session->Fail(attempt_session->status.generation);
+      }
+      lock.unlock();
+      DiscardAsyncAutoscalePreparation();
+      if (succeeded) {
+        codec_pipeline.autoscale->SetName(L"" NR_NEXUS_NAME " v6 same-frame autoscale");
+        return true;
+      }
+      if (current_attempt) return false;
+    }
+    // An old attempt may finish after Session replacement. Discard its failure
+    // without poisoning the current frame, then give the new owner one attempt.
+    const auto preparation_session = codec_pipeline.preparation_session.lock();
+    if (preparation_session != nullptr && preparation_session->failed) {
+      pipeline_preparation_opportunity->deferred = true;
+      return false;
+    }
+    try {
+      auto task = std::make_shared<AsyncAutoscalePreparation>();
+      task->cancellation = async_autoscale_cancellation;
+      task->cancellation_epoch = async_autoscale_cancellation->load(std::memory_order_acquire);
+      task->cache_epoch = async_autoscale_cache_epoch;
+      task->device_identity = device;
+      task->root_identity = codec_pipeline.root_signature;
+      task->bytecode = __v6_autoscale;
+      task->session = preparation_session;
+      task->session_owned = preparation_session != nullptr;
+      task->preparation_epoch = (preparation_session != nullptr ? preparation_session->preparation_epoch : 0);
+      task->device = device;
+      task->device->AddRef();
+      task->root = codec_pipeline.root_signature;
+      task->root->AddRef();
+      async_autoscale_task = std::move(task);
+      pipeline_preparation_opportunity->created = true;
+      pipeline_preparation_opportunity->deferred = true;
+    } catch (const std::bad_alloc&) {
+      codec_pipeline.preparation_failed = true;
+      if (const auto session = codec_pipeline.preparation_session.lock()) session->Fail(session->status.generation);
+      Log(reshade::log::level::error, "v6 same-frame autoscale private task allocation failed (E_OUTOFMEMORY)");
+    }
+    return false;
+  };
   if (!CreateCodecPipelineState(
           device,
           __v6_linearize,
@@ -6452,12 +6697,7 @@ inline bool EnsureV6CodecPipeline(ID3D12Device* device) {
           &codec_pipeline.commit,
           L"" NR_NEXUS_NAME " v6 commit",
           "v6 commit")
-      || !CreateCodecPipelineState(
-          device,
-          __v6_autoscale,
-          &codec_pipeline.autoscale,
-          L"" NR_NEXUS_NAME " v6 same-frame autoscale",
-          "v6 same-frame autoscale")) {
+      || !ensure_autoscale()) {
     if (codec_pipeline.incremental_preparation) return false;
     ReleaseCom(codec_pipeline.linearize);
     ReleaseCom(codec_pipeline.encode_v6);
@@ -11209,7 +11449,8 @@ inline void SelectAdaptiveTier(FeatureState* feature, const NVSDK_NGX_Handle* ha
             && cache->identity == frame->layout_identity && cache->upper == frame->upper)) return false;
     if (cache != nullptr && frame->session != nullptr && frame->session->settings.limited_residency
         && cache->identity == frame->layout_identity && cache->upper == frame->upper
-        && cache->preparation_epoch == frame->preparation_epoch && !cache->failed && !cache->budget_blocked
+        && (!frame->enabled || cache->preparation_epoch == frame->preparation_epoch)
+        && !cache->failed && !cache->budget_blocked
         && !cache->standby_retired) {
       // Ordinary eviction retains the healthy active chain. Only new cold
       // preparation waits for this group's exact retirement proof.
@@ -11235,7 +11476,12 @@ inline void SelectAdaptiveTier(FeatureState* feature, const NVSDK_NGX_Handle* ha
     }
     ActivateAdaptiveTier(feature, 0);
     ReleaseAdaptiveStandby(cache.get(), true);
-    feature->adaptive_cache.reset();
+    // Retain only the healthy manual-upper contract while an ordinary limited
+    // eviction is still replayable. Re-enable keeps its original epoch gate.
+    if (!(frame->session != nullptr && frame->session->settings.limited_residency
+            && !cache->budget_blocked && !cache->standby_retired && AdaptiveRetirementPending(handle))) {
+      feature->adaptive_cache.reset();
+    }
     feature->adaptive_output_blocked = false;
     if (adaptive_resident_session.lock() == frame->session) {
       adaptive_resident_session.reset();
@@ -21770,6 +22016,7 @@ inline constexpr int64_t kHudToastNs = 2'000'000'000LL;
 inline std::array<std::atomic_uint64_t, kMaxNrPasses> model_adjustment_notice_signatures{};
 
 inline void NotifyNrOperation(bool on) {
+  if (!on) CancelAsyncAutoscalePreparation();
   std::unique_lock lock(profile_feedback.mutex);
   profile_feedback.operation = (on ? "NR enabled" : "NR disabled");
   profile_feedback_until_ns.store(SteadyNowNs() + kHudToastNs, std::memory_order_release);
@@ -24619,6 +24866,15 @@ inline void OnDestroyEffectRuntime(reshade::api::effect_runtime* runtime) {
 // and Render while cleanup retries; OnPresent's normal Present-only arming
 // cannot lower it. Every wait precedes runtime_mutex, and GPU proof is polled.
 inline void ServiceDisabledNr() {
+  if (!enabled.load(std::memory_order_acquire)) {
+    CancelAsyncAutoscalePreparation();
+    RuntimeTryLock lock(runtime_mutex);
+    if (!lock.owns_lock()) return;
+    if (!DiscardAsyncAutoscalePreparation()) {
+      disabled_resources_released.store(false, std::memory_order_relaxed);
+      return;
+    }
+  }
   if (!ngx_serial::retirement_armed.load(std::memory_order_acquire)
       && (enabled.load(std::memory_order_acquire)
               ? !disabled_resources_released.load(std::memory_order_relaxed)
@@ -24651,7 +24907,9 @@ inline void ServiceDisabledNr() {
   if (worksets.empty() && retired_final_resources.empty()
       && active_features.load(std::memory_order_relaxed) == 0u
       && retired_nr_features.empty() && present_ring.device == nullptr
-      && present_streams.empty() && fg_service::streams.empty() && present_retired.empty()) {
+      && present_streams.empty() && fg_service::streams.empty() && present_retired.empty()
+      && codec_pipeline.root_signature == nullptr && codec_pipeline.look.root_signature == nullptr
+      && codec_pipeline.hdr_capture_root == nullptr) {
     disabled_resources_released.store(true, std::memory_order_relaxed);
     ngx_serial::retirement_armed.store(false, std::memory_order_release);
     return;
@@ -24712,6 +24970,7 @@ inline void OnPresent(
     uint32_t,
     const reshade::api::rect*) {
   if (shutting_down.load(std::memory_order_acquire)) return;
+  StartAsyncAutoscalePreparation();
   // Bind to the selected runtime's device and first backbuffer, rather than
   // interleaving different swapchains or treating lifecycle ticks as presents.
   if (swapchain != nullptr && swapchain->get_back_buffer_count() != 0
@@ -25208,6 +25467,7 @@ struct Setting {
   }
   // Caller owns the configuration lock; preset batches publish one epoch.
   void StoreLocked(float value) const {
+    if (b == &enabled && value == 0.f) CancelAsyncAutoscalePreparation();
     if (f != nullptr) {
       f->store(value);
     } else if (u != nullptr) {
@@ -32106,6 +32366,7 @@ inline void UnhookInstalledDetours() {
 // detours must die with the DLL that owns them.
 inline void DetachLite() {
   shutting_down.store(true, std::memory_order_release);
+  CancelAsyncAutoscalePreparation();
   UnhookMixedPresentCopyHooks();
   UnhookCommandListStateHooks();
   UnhookDeviceStateHooks();
@@ -32165,6 +32426,7 @@ inline bool Shutdown(bool proof_gated) {
   // caller: acquiring runtime_mutex later cannot make a queue-fence snapshot
   // taken while a callback still records cover that callback's later work.
   shutting_down.store(true, std::memory_order_seq_cst);
+  CancelAsyncAutoscalePreparation();
   const int64_t drain_deadline_ns = SteadyNowNs() + 500 * 1000000LL;
   while (callbacks_in_flight.load(std::memory_order_seq_cst) != 0
          && SteadyNowNs() < drain_deadline_ns) {
@@ -32299,6 +32561,10 @@ inline bool Shutdown(bool proof_gated) {
   HMODULE unload = nullptr;
   {
     RuntimeLock lock(runtime_mutex);
+    if (!DiscardAsyncAutoscalePreparation()) {
+      shutting_down.store(false, std::memory_order_release);
+      return false;
+    }
     UnhookInstalledDetours();
     // The queue detour stays installed; tracking is off while the state it
     // proves is released here, and re-arms at the end of this function.

@@ -5,6 +5,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <exception>
 #include <iostream>
 #include <thread>
@@ -16,12 +17,105 @@ namespace addon = renodx::addons::dlss5;
 
 using CreatePipelineFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
 CreatePipelineFn real_create_pipeline = nullptr;
-uint32_t pipeline_calls = 0;
-uint32_t fail_pipeline_call = 0;
+std::atomic_uint32_t pipeline_calls = 0;
+std::atomic_uint32_t fail_pipeline_call = 0;
+std::atomic<HANDLE> async_entered = nullptr;
+std::atomic<HANDLE> async_release = nullptr;
+std::atomic<HANDLE> async_worker_thread = nullptr;
+std::atomic_uint32_t async_pipeline_calls = 0;
+std::atomic_uint32_t async_threads_started = 0;
+std::atomic_uint32_t async_threads_joined = 0;
+std::atomic_bool fail_async_pipeline = false;
+std::atomic_bool async_gate_failed = false;
+using CreateThreadFn = HANDLE(WINAPI*)(LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE, LPVOID, DWORD, LPDWORD);
+CreateThreadFn real_create_thread = CreateThread;
+
+HANDLE WINAPI ObserveCreateThread(LPSECURITY_ATTRIBUTES attributes, SIZE_T stack_size,
+    LPTHREAD_START_ROUTINE entry, LPVOID argument, DWORD flags, LPDWORD id) {
+  HANDLE thread = real_create_thread(attributes, stack_size, entry, argument, flags, id);
+  if (thread != nullptr && entry == native::CreateAsyncAutoscalePipeline) {
+    ++async_threads_started;
+    HANDLE proof = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), thread, GetCurrentProcess(), &proof, SYNCHRONIZE, FALSE, 0)) {
+      async_gate_failed = true;
+    }
+    async_worker_thread.store(proof);
+  }
+  return thread;
+}
+
+struct AsyncPipelineGate {
+  HANDLE entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  HANDLE release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  bool thread_observer_attached = false;
+
+  AsyncPipelineGate() {
+    async_entered.store(entered);
+    async_release.store(release);
+  }
+
+  bool Finish() {
+    if (release != nullptr) SetEvent(release);
+    const HANDLE worker = async_worker_thread.exchange(nullptr);
+    if (worker == nullptr) return !async_gate_failed.load();
+    const DWORD wait = WaitForSingleObject(worker, 15000);
+    if (wait != WAIT_OBJECT_0) {
+      async_worker_thread.store(worker);
+      return false;
+    }
+    CloseHandle(worker);
+    ++async_threads_joined;
+    return true;
+  }
+
+  void Reset() {
+    Check(Finish(), "private PSO previous real worker exited");
+    Check(ResetEvent(entered) && ResetEvent(release), "private PSO event reset");
+  }
+
+  ~AsyncPipelineGate() {
+    native::async_autoscale_preparation = false;
+    native::CancelAsyncAutoscalePreparation();
+    const bool finished = Finish();
+    if (finished) {
+      {
+        addon::RuntimeLock lock(native::runtime_mutex);
+        native::DiscardAsyncAutoscalePreparation();
+      }
+      async_entered.store(nullptr);
+      async_release.store(nullptr);
+      if (entered != nullptr) CloseHandle(entered);
+      if (release != nullptr) CloseHandle(release);
+      if (thread_observer_attached) {
+        const bool detached = DetourTransactionBegin() == NO_ERROR && DetourUpdateThread(GetCurrentThread()) == NO_ERROR
+            && DetourDetach(reinterpret_cast<PVOID*>(&real_create_thread), reinterpret_cast<PVOID>(ObserveCreateThread)) == NO_ERROR
+            && DetourTransactionCommit() == NO_ERROR;
+        if (!detached) std::cerr << "ADAPTIVE_ASYNC thread_observer_detach_failed=1\n";
+      }
+    } else {
+      std::cerr << "ADAPTIVE_ASYNC worker_cleanup_timeout=1 events_kept_open=1\n";
+    }
+  }
+};
 
 HRESULT STDMETHODCALLTYPE ObserveCreatePipeline(ID3D12Device* device,
     const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID iid, void** pipeline) {
-  if (++pipeline_calls == fail_pipeline_call) {
+  const auto call = ++pipeline_calls;
+  if (async_release.load() != nullptr && desc->CS.BytecodeLength == __v6_autoscale.size()
+      && std::memcmp(desc->CS.pShaderBytecode, __v6_autoscale.data(), __v6_autoscale.size()) == 0) {
+    ++async_pipeline_calls;
+    SetEvent(async_entered.load());
+    if (WaitForSingleObject(async_release.load(), 10000) != WAIT_OBJECT_0) {
+      async_gate_failed = true;
+      *pipeline = nullptr;
+      return E_ABORT;
+    }
+    if (fail_async_pipeline.exchange(false)) {
+      *pipeline = nullptr;
+      return E_FAIL;
+    }
+  }
+  if (call == fail_pipeline_call.load()) {
     *pipeline = nullptr;
     return E_FAIL;
   }
@@ -177,7 +271,7 @@ int Run() {
       const auto cold_record = [&](bool models_only = false) {
         ++cold_sources;
         ++native::present_generation;
-        const auto pipelines_before = pipeline_calls;
+        const auto pipelines_before = pipeline_calls.load();
         native::NrRecording recording;
         bool accepted = false;
         {
@@ -215,7 +309,7 @@ int Run() {
       cold_record();
       Check(native::codec_pipeline.preparation_failed && native::features.at(cold_handle).adaptive_session->failed,
           "one actual PSO API failure latches the current preparation");
-      const auto first_failure_calls = pipeline_calls;
+      const auto first_failure_calls = pipeline_calls.load();
       const auto* second_source = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xADA081});
       native::RegisterCreatedFeatureLocked(second_source, native::kFeatureDlss, &parameters);
       {
@@ -231,7 +325,7 @@ int Run() {
           "returning to the old failed source cannot advance or repeatedly retry the new owner's preparation");
       native::ReleaseFeatureState(native::features.at(second_source));
       native::features.erase(second_source);
-      const auto failed_calls = pipeline_calls;
+      const auto failed_calls = pipeline_calls.load();
       native::nr_adaptive_target_fps = 115.f;
       for (uint32_t repeat = 0; repeat < 3; ++repeat) cold_record();
       Check(pipeline_calls == failed_calls && native::codec_pipeline.linearize == first_pipeline,
@@ -257,6 +351,185 @@ int Run() {
       for (uint32_t step = 0; step < 32; ++step) cold_record();
       Check(native::features.at(cold_handle).adaptive_session->prepared && model_calls > evaluates_before
           && pipeline_calls == 15, "ready two-Pass operation reuses every prepared pipeline");
+      {
+        Check(!native::async_autoscale_preparation.load(), "private autoscale experiment defaults to disabled");
+        AsyncPipelineGate gate;
+        Check(gate.entered != nullptr && gate.release != nullptr, "private PSO deterministic events");
+        Check(DetourTransactionBegin() == NO_ERROR && DetourUpdateThread(GetCurrentThread()) == NO_ERROR
+            && DetourAttach(reinterpret_cast<PVOID*>(&real_create_thread), reinterpret_cast<PVOID>(ObserveCreateThread)) == NO_ERROR
+            && DetourTransactionCommit() == NO_ERROR, "private PSO actual worker thread exit observer attach");
+        gate.thread_observer_attached = true;
+        ComPtr<ID3D12PipelineState> synchronous_autoscale = native::codec_pipeline.autoscale;
+        const auto original_session = native::features.at(cold_handle).adaptive_session;
+        addon::adaptive_resolution::Frame async_frame{
+            .session = original_session, .preparation_epoch = original_session->preparation_epoch, .enabled = true};
+        const auto pipeline_source = [&] {
+          addon::RuntimeLock lock(native::runtime_mutex);
+          const native::PipelinePreparationScope opportunity;
+          const auto result = native::PrepareAdaptivePipelines(gpu.device.Get(), async_frame, 1, true);
+          return std::pair{result, native::pipeline_preparation_opportunity->created};
+        };
+        const auto wait_entered = [&] {
+          Check(WaitForSingleObject(gate.entered, 10000) == WAIT_OBJECT_0
+              && async_worker_thread.load() != nullptr, "private PSO production Start created a real worker");
+        };
+        const auto meter = std::find_if(native::worksets.begin(), native::worksets.end(), [&](const auto& entry) {
+          return entry.first.handle == cold_handle && entry.second.norm_scale != nullptr && entry.second.norm_commit != nullptr;
+        });
+        Check(meter != native::worksets.end(), "private PSO equivalence uses the existing real HDR workset");
+        const auto sample_autoscale = [&](ID3D12PipelineState* pipeline) {
+          auto& resources = meter->second;
+          const auto previous_state = resources.norm_scale_state;
+          native::Transition(gpu.list.Get(), resources.norm_scale, previous_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+          native::UavBarrier(gpu.list.Get(), resources.norm_commit);
+          native::BindCodecV6(gpu.list.Get(), resources, pipeline,
+              native::kDescriptorMeterSet, native::kDescriptorNormScaleUav,
+              1, 1, resources.width, resources.height, 0, 0, 1, 1, 1, 1, 0.f, 0.f, 0.f, 0.f, 1u, 0.f, 0.f);
+          const float snap = 1.f;
+          gpu.list->SetComputeRoot32BitConstants(2, 1, &snap,
+              offsetof(native::V6CodecConstants, snap_now) / sizeof(uint32_t));
+          gpu.list->Dispatch(1, 1, 1);
+          auto transfer = gpu.CreateTextureTransfer(resources.norm_scale);
+          native::Transition(gpu.list.Get(), resources.norm_scale,
+              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+          gpu.RecordTextureReadback(resources.norm_scale, transfer);
+          native::Transition(gpu.list.Get(), resources.norm_scale, D3D12_RESOURCE_STATE_COPY_SOURCE, previous_state);
+          submit();
+          return gpu.ReadTexture(transfer);
+        };
+        const auto synchronous_pixels = sample_autoscale(synchronous_autoscale.Get());
+        Check(std::any_of(synchronous_pixels.begin(), synchronous_pixels.end(), [](uint8_t value) { return value != 0; }),
+            "synchronous autoscale comparison dispatched and returned nonzero scale data");
+        native::async_autoscale_preparation = true;
+        native::ReleaseCom(native::codec_pipeline.autoscale);
+        Check(pipeline_source().first == native::PipelinePreparationResult::PENDING
+            && native::async_autoscale_task != nullptr && async_pipeline_calls == 0,
+            "a source registers only the private target and waits for the existing Present start boundary");
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        const auto waiting_models = next_handle;
+        const auto waiting_evaluates = model_calls;
+        const auto waiting_worksets = native::worksets_created;
+        {
+          const addon::EvaluateChainScope chain;
+          const addon::SourceStageScope source(cold_handle, true);
+          native::NrRecording recording;
+          Check(!native::ProcessInline(gpu.list.Get(), cold_handle, &parameters, nullptr, nullptr, &recording)
+              && !recording.model_invoked && !recording.output_ready
+              && next_handle == waiting_models && model_calls == waiting_evaluates
+              && native::worksets_created == waiting_worksets
+              && WaitForSingleObject(gate.release, 0) == WAIT_TIMEOUT && !async_gate_failed.load(),
+              "a real blocked PSO worker leaves source pending with zero NGX/scratch work and no source wait");
+        }
+        submit();
+        Check(gate.Finish(), "private PSO real worker exited before result admission");
+        const auto accepted = pipeline_source();
+        auto* accepted_pipeline = native::codec_pipeline.autoscale;
+        Check(accepted.first == native::PipelinePreparationResult::PENDING && accepted.second
+            && accepted_pipeline != nullptr && async_pipeline_calls == 1,
+            "one successful private result consumes its source opportunity before any NGX Create");
+        Check(pipeline_source().first == native::PipelinePreparationResult::READY
+            && native::codec_pipeline.autoscale == accepted_pipeline && async_pipeline_calls == 1
+            && next_handle == waiting_models && model_calls == waiting_evaluates,
+            "the result is accepted once and the next source sees a complete unchanged pipeline cache");
+        Check(sample_autoscale(accepted_pipeline) == synchronous_pixels,
+            "private and synchronous PSOs use the exact embedded shader and produce identical WARP autoscale pixels");
+
+        gate.Reset();
+        native::ReleaseCom(native::codec_pipeline.autoscale);
+        async_frame.enabled = false;
+        async_frame.session.reset();
+        native::codec_pipeline.preparation_session.reset();
+        Check(pipeline_source().first == native::PipelinePreparationResult::PENDING, "manual upper can register without a Session owner");
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        Check(gate.Finish(), "manual-upper private worker exits");
+        pipeline_source();
+        Check(pipeline_source().first == native::PipelinePreparationResult::READY,
+            "disabling only Adaptive cannot strand the legal manual upper behind a missing weak Session");
+        gate.Reset();
+        native::ReleaseCom(native::codec_pipeline.autoscale);
+        pipeline_source();
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        fail_async_pipeline = true;
+        Check(gate.Finish(), "ownerless failure worker actually exits");
+        Check(pipeline_source().first == native::PipelinePreparationResult::FAILED
+            && native::codec_pipeline.preparation_failed && async_frame.session == nullptr,
+            "an ownerless manual preparation failure latches its device attempt without dereferencing a missing Session");
+        const auto ownerless_failure_calls = async_pipeline_calls.load();
+        pipeline_source();
+        Check(async_pipeline_calls == ownerless_failure_calls, "ownerless failure cannot requeue every source");
+
+        gate.Reset();
+        async_frame.session = original_session;
+        async_frame.preparation_epoch = original_session->preparation_epoch;
+        async_frame.enabled = true;
+        native::ReleaseCom(native::codec_pipeline.autoscale);
+        pipeline_source();
+        native::CancelAsyncAutoscalePreparation();
+        const auto canceled_calls = async_pipeline_calls.load();
+        native::StartAsyncAutoscalePreparation();
+        Check(native::async_autoscale_task == nullptr && async_pipeline_calls == canceled_calls,
+            "a canceled queued task is reclaimed before module/thread startup");
+        pipeline_source();
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        auto* retained_root = native::codec_pipeline.root_signature;
+        native::disable_release_mode = 0;
+        native::enabled = false;
+        native::ServiceDisabledNr();
+        Check(!native::disabled_resources_released.load() && native::codec_pipeline.root_signature == retained_root,
+            "NR Off cancels a running private task at release=0 without claiming exit or clearing retained cache");
+        Check(gate.Finish(), "canceled private worker actually exits");
+        native::ServiceDisabledNr();
+        Check(native::async_autoscale_task == nullptr && native::codec_pipeline.autoscale == nullptr
+            && native::codec_pipeline.root_signature == retained_root, "the canceled late PSO is never admitted");
+        native::enabled = true;
+        gate.Reset();
+        pipeline_source();
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        Check(gate.Finish(), "reenabled private worker exits");
+        pipeline_source();
+        Check(pipeline_source().first == native::PipelinePreparationResult::READY,
+            "ordinary re-enable recovers with a new valid private attempt");
+
+        gate.Reset();
+        native::ReleaseCom(native::codec_pipeline.autoscale);
+        pipeline_source();
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        async_frame.session = std::make_shared<addon::adaptive_resolution::Session>(*original_session);
+        async_frame.preparation_epoch = async_frame.session->preparation_epoch;
+        pipeline_source();
+        fail_async_pipeline = true;
+        Check(gate.Finish(), "obsolete attempt failure worker exits");
+        pipeline_source();
+        Check(!native::codec_pipeline.preparation_failed && !async_frame.session->failed
+            && native::async_autoscale_task != nullptr && !native::async_autoscale_task->started,
+            "an old Session failure is recorded and discarded without poisoning the current frame or blocking its one attempt");
+        gate.Reset();
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        fail_async_pipeline = true;
+        Check(gate.Finish(), "current attempt failure worker exits");
+        Check(pipeline_source().first == native::PipelinePreparationResult::FAILED
+            && native::codec_pipeline.preparation_failed && async_frame.session->failed && !original_session->failed,
+            "only the matching current attempt latches pipeline and Session failure");
+        const auto failed_async_calls = async_pipeline_calls.load();
+        pipeline_source();
+        pipeline_source();
+        Check(async_pipeline_calls == failed_async_calls && native::async_autoscale_task == nullptr && !async_gate_failed.load(),
+            "failed preparation neither requeues every source nor leaves a stuck worker gate");
+        Check(async_threads_started == async_threads_joined, "every real private worker has an OS thread exit proof");
+        native::codec_pipeline.preparation_failed = false;
+        native::codec_pipeline.preparation_session = original_session;
+        Check(SUCCEEDED(synchronous_autoscale.CopyTo(&native::codec_pipeline.autoscale)), "restore the original completed autoscale cache");
+        std::cout << "ADAPTIVE_ASYNC evidence=WARP+MOCK real_threads=" << async_threads_started.load()
+            << " thread_exit_proofs=" << async_threads_joined.load()
+            << " pending_zero_NGX=1 admitted_once=1 pixel_equal=1 ownerless_manual=1 off_late_rejected=1 stale_failure_isolated=1 current_failure_bounded=1\n";
+      }
       {
         real_create_resource = reinterpret_cast<CreateResourceFn>((*reinterpret_cast<void***>(gpu.device.Get()))[27]);
         Check(DetourTransactionBegin() == NO_ERROR && DetourUpdateThread(GetCurrentThread()) == NO_ERROR
@@ -1199,8 +1472,36 @@ int Run() {
           && wide.adaptive_session->status.applied == limited->ladder.sizes[10]
           && native::nr_features_created == waiting_models + 1 && !wide.adaptive_session->prepared,
           "a retired slot can be reused for one new complete target without claiming full-ladder preparedness");
-      native::nr_adaptive_enabled = false;
+      wide_record(false, false);
+      auto off_retained_allocator = gpu.allocator;
+      auto off_retained_list = gpu.list;
+      const auto* off_retained_model = wide.slots[0].handle;
+      // The earlier retained list was Reset above and is still open and empty.
+      gpu.allocator = retained_allocator;
+      gpu.list = retained_list;
+      wide.adaptive_session->Request(0, native::SteadyNowNs());
       wide_record();
+      wide_record();
+      Check(limited->active == 0 && native::AdaptiveRetirementPending(wide_handle)
+          && !addon::submission::ResourceReleasable(off_retained_model),
+          "the final optional target genuinely remains replayable while the healthy upper is active");
+      native::nr_adaptive_enabled = false;
+      const bool off_accepted = wide_record();
+      Check(off_accepted && wide.adaptive_cache == limited
+          && wide.adaptive_session->status.applied == wide.adaptive_session->status.upper
+          && native::AdaptiveRetirementPending(wide_handle)
+          && !addon::submission::ResourceReleasable(off_retained_model),
+          "disabling Adaptive renders with the retained healthy upper without releasing the old replayable target");
+      Check(wide_record() && wide.adaptive_cache == limited
+          && wide.adaptive_session->status.applied == wide.adaptive_session->status.upper
+          && native::AdaptiveRetirementPending(wide_handle)
+          && !addon::submission::ResourceReleasable(off_retained_model)
+          && native::nr_features_created == waiting_models + 1,
+          "successive Adaptive-Off frames keep the upper contract without recreating or releasing pending resources");
+      Check(SUCCEEDED(off_retained_allocator->Reset())
+          && SUCCEEDED(off_retained_list->Reset(off_retained_allocator.Get(), nullptr))
+          && SUCCEEDED(off_retained_list->Close()), "discard the final retired recording only after its real Fence");
+      native::DrainRetiredResources(true);
       wide_record();
       Check(wide.adaptive_cache == nullptr && wide.adaptive_session->status.applied == wide.adaptive_session->status.upper,
           "limited adaptive Off restores the retained manual upper and retires optional tiers");
