@@ -1300,7 +1300,7 @@ def worker(out):
         dump(out / 'result.json', session.status)
     return 0 if session.status['result'] != 'failed' else 1
 
-def recover_owned(cfg, out, owned):
+def recover_owned(cfg, out, owned, *, capture_stopped=False):
     """Do not release original-file locks while the owned game may still be alive."""
     if not owned:
         return False
@@ -1310,6 +1310,26 @@ def recover_owned(cfg, out, owned):
         freeze_logs(cfg, out / 'recovery-logs')
         if cfg.get('manual_ime_session'):
             raise RuntimeError('Manual IME session requires user exit; automatic game termination disabled')
+        if cfg.get('capture_script') and not capture_stopped:
+            raise RuntimeError('Capture process exit is unconfirmed; protected recovery must wait')
+        if cfg.get('control_backend') == 'script' and capture_stopped:
+            session = None
+            try:
+                session = Session(cfg, out)
+                session.window = owned
+                session.script_log_path = Path(cfg.get('profile') or Path(cfg['executable']).parent) / 'scriptslog.txt'
+                session.request_exit()
+                dump(out / 'protected-script-exit.json', dict(time=stamp(), process=owned,
+                    status=session.status['safe_exit'], capture_process_exited=True))
+                return 'game_script_api_process_exit_confirmed'
+            except Exception as error:
+                dump(out / 'protected-script-exit.json', dict(time=stamp(), process=owned,
+                    status='failed', error=repr(error), capture_process_exited=True))
+            finally:
+                if session is not None and session.debugger is not None:
+                    session.debugger.close()
+        if not desktop.same_process(owned):
+            return 'owned_process_exited_before_termination'
         desktop.terminate(owned)
         if desktop.same_process(owned):
             raise RuntimeError('Owned process survived termination')
@@ -1326,7 +1346,7 @@ def recover_owned(cfg, out, owned):
                 pass
             time.sleep(2)
         dump(out / 'intervention-resolved.json', dict(time=stamp(), owned_process_exited=True))
-    return True
+    return 'owned_process_termination_or_manual_recovery'
 
 
 def summarize_motion(recording):
@@ -1444,6 +1464,7 @@ def run_attempt(cfg, out):
     mod_lease = None
     mod_installed_by_runner = False
     capture_started = False
+    capture_stopped = False
     hang_capture_reason = None
     crashes_before = crash_reports()
     final = dict(result='failed', started=stamp())
@@ -1586,6 +1607,7 @@ def run_attempt(cfg, out):
                         elif capture_stop_errors:
                             best_effort_capture_receipt('capture-stop-error.json', dict(
                                 time=stamp(), capture_pid=capture_child.pid, errors=capture_stop_errors))
+                    capture_stopped = capture_child is None or not capture_is_alive()
                     if capture_log is not None:
                         capture_log.close()
                     if child and child.poll() is None:
@@ -1628,9 +1650,11 @@ def run_attempt(cfg, out):
                         except Exception as error:
                             final['diagnostic_error'] = str(error)
                             problem = problem or 'diagnostic_collection_failed'
-                    if recover_owned(cfg, out, owned):
+                    recovery_method = recover_owned(cfg, out, owned, capture_stopped=capture_stopped)
+                    if recovery_method:
                         problem = problem or 'worker_left_owned_process'
-                        dump(out / 'recovery.json', dict(time=stamp(), reason=problem, method='owned_process_termination_or_manual_recovery'))
+                        final['protected_recovery_method'] = recovery_method
+                        dump(out / 'recovery.json', dict(time=stamp(), reason=problem, method=recovery_method))
         guard_ok = True
     except BaseException as error:
         problem = problem or str(error)
