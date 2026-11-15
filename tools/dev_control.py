@@ -301,6 +301,14 @@ class Client:
         request = dict(id=str(uuid.uuid4()), op='bridge_adaptive_experiment', enabled=enabled)
         return self._mutation(request, deadline)
 
+    def edit_reuse_adaptive_experiment(self, enabled, *, deadline=None):
+        """Request the DEV two-tier x2 experiment; admission is observed separately."""
+        if type(enabled) is not bool:
+            raise ValueError('edit_reuse_adaptive_experiment requires Boolean enabled')
+        deadline = deadline if deadline is not None else time.monotonic() + self.timeout
+        request = dict(id=str(uuid.uuid4()), op='edit_reuse_adaptive_experiment', enabled=enabled)
+        return self._mutation(request, deadline)
+
     def inline_restore_roi(self, output_directory, *, tail_frames=None, deadline=None):
         if not isinstance(output_directory, str) or not output_directory.strip():
             raise ValueError('inline_restore_roi requires an output directory')

@@ -80,12 +80,91 @@
           && status["identity"]["experiments"]["adaptive_feature_mode"] == 0
           && !status["state"]["experiments"]["bridge_adaptive_experiment"].get<bool>()
           && !status["identity"]["experiments"]["bridge_adaptive_experiment"].get<bool>()
+          && !status["state"]["experiments"]["edit_reuse_adaptive_experiment"].get<bool>()
+          && !status["identity"]["experiments"]["edit_reuse_adaptive_experiment"].get<bool>()
+          && status["identity"]["experiments"]["edit_reuse_adaptive_evidence"] == "requested_enabled_not_activation"
+          && status["state"]["experiments"]["edit_reuse_adaptive_evidence"] == "requested_enabled_not_activation"
           && status["state"]["experiments"]["bridge_adaptive_evidence"] == "requested_enabled_not_activation"
           && status["state"]["experiments"]["evidence"] == "requested_mode_not_activation"
           && status["state"]["adaptive_caches"].is_array(),
       "the experiment defaults to OFF and reports its request separately from execution");
   namespace rate = renodx::addons::dlss5::output_framerate;
   namespace adaptive = renodx::addons::dlss5::adaptive_resolution;
+  {
+    const auto* source_handle = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xD3C044});
+    auto [source, inserted] = runtime::features.try_emplace(source_handle);
+    check(inserted, "the CPU sampling observation owns a distinct synthetic source");
+    source->second.sr_sequence = 44;
+    source->second.adaptive_cache = std::make_shared<runtime::AdaptiveFeatureCache>();
+    source->second.adaptive_cache->count = 1;
+    const auto cache_status = [&]() {
+      const auto state = control::Snapshot();
+      for (const auto& cache : state["adaptive_caches"]) {
+        if (cache["source_handle"] == reinterpret_cast<uintptr_t>(source_handle)) return cache;
+      }
+      return Json(nullptr);
+    };
+    check(cache_status()["source_frame"] == 44 && cache_status()["sampling"].is_null() && cache_status()["trial"].is_null(),
+        "an existing cache reports its source clock without inventing a missing Session");
+    source->second.adaptive_session = std::make_shared<adaptive::Session>();
+    auto& session = *source->second.adaptive_session;
+    session.paired_sampling = true;
+    session.sampling_generation = 7;
+    session.trial = true;
+    session.pending_pair.frame = 44;
+    session.pending_pair.total_us = 8000.;
+    auto cache = cache_status();
+    check(cache["trial"] && cache["sampling"]["paired_sampling"] && cache["sampling"]["sampling_generation"] == 7
+            && cache["sampling"]["gpu_count"] == 0 && cache["sampling"]["latest_recorded_ns"].is_null()
+            && !cache["sampling"]["statistics_valid"].get<bool>() && cache["sampling"]["median_us"].is_null()
+            && cache["sampling"]["mad_us"].is_null(),
+        "a synthetic half pair is not a completed controller sample or a valid cost window");
+    // These CPU observations test serialization, not GPU completion or actual pair production.
+    const auto recorded_ns = runtime::SteadyNowNs();
+    session.gpu_us = {1900., 2100., 2000., 1800., 2200.};
+    for (size_t index = 0; index < session.gpu_recorded_ns.size(); ++index) {
+      session.gpu_recorded_ns[index] = recorded_ns - adaptive::WARMUP_NS
+          + static_cast<int64_t>(index) * adaptive::SAMPLE_INTERVAL_NS;
+    }
+    session.trial = false;
+    session.gpu_count = session.gpu_us.size() - 1;
+    cache = cache_status();
+    check(!cache["trial"].get<bool>() && !cache["sampling"]["statistics_valid"].get<bool>()
+            && cache["sampling"]["median_us"].is_null(),
+        "an incomplete five-sample window publishes no valid median");
+    session.gpu_count = session.gpu_us.size();
+    cache = cache_status();
+    check(cache["sampling"]["statistics_valid"] && cache["sampling"]["gpu_count"] == 5
+            && cache["sampling"]["latest_recorded_ns"] == recorded_ns
+            && cache["sampling"]["median_us"] == 2000. && cache["sampling"]["mad_us"] == 100.
+            && cache["sampling"]["evidence"] == "controller_per_source_gpu_chain",
+        "status uses the actual Session statistics and identifies the per-source GPU-chain scope");
+    for (auto& timestamp : session.gpu_recorded_ns) {
+      timestamp -= adaptive::SAMPLE_MAX_AGE_NS + 1;
+    }
+    cache = cache_status();
+    check(!cache["sampling"]["statistics_valid"].get<bool>() && cache["sampling"]["median_us"].is_null()
+            && cache["sampling"]["mad_us"].is_null() && !cache["sampling"]["latest_recorded_ns"].is_null(),
+        "expired statistics retain their last observation time but expose no current cost");
+    const auto saved_counters = std::tuple{runtime::edit_reuse_enabled.load(), runtime::edit_reuse_refreshes.load(),
+        runtime::edit_reuse_reuses.load(), runtime::edit_reuse_fallbacks.load()};
+    runtime::edit_reuse_enabled = true;
+    runtime::edit_reuse_refreshes = 3;
+    runtime::edit_reuse_reuses = 5;
+    runtime::edit_reuse_fallbacks = 7;
+    status = control::Snapshot();
+    check(status["edit_reuse"]["requested"] && status["edit_reuse"]["refreshes"] == 3
+            && status["edit_reuse"]["reuses"] == 5 && status["edit_reuse"]["fallbacks"] == 7
+            && status["edit_reuse"]["evidence"] == "process_counters_not_activation_or_gpu_completion"
+            && !status["experiments"]["edit_reuse_adaptive_experiment"].get<bool>()
+            && !status["adaptive_caches"].empty() && !cache["slots"][0]["ready"].get<bool>(),
+        "process counters and the NREditReuse request do not assert experiment activation or a ready tier");
+    runtime::edit_reuse_enabled = std::get<0>(saved_counters);
+    runtime::edit_reuse_refreshes = std::get<1>(saved_counters);
+    runtime::edit_reuse_reuses = std::get<2>(saved_counters);
+    runtime::edit_reuse_fallbacks = std::get<3>(saved_counters);
+    runtime::features.erase(source);
+  }
   rate::Stream saved_output;
   const auto saved_adaptive = runtime::CopyAdaptiveStatus();
   {
@@ -136,6 +215,7 @@
   }
   runtime::PublishAdaptiveStatus(saved_adaptive);
   check(set("EnableHooks", 0)["reason"] == "invalid_setting", "startup hook policy stays outside the control whitelist");
+  check(set("NREditReuse", true)["reason"] == "invalid_setting", "the existing x2 INI setting stays outside the DEV whitelist");
   check(set("NRHookPoint", 3)["reason"] == "invalid_value", "invalid hook is rejected before mutation");
   check(set("NeuralUplift", 1)["reason"] == "invalid_value", "booleans require JSON booleans");
   check(set("NRPasses", 0)["reason"] == "invalid_value", "zero pass count is rejected");
@@ -289,35 +369,43 @@
           && runtime::nr_features_created == experiment_features,
       "experiment requests write no INI settings, recreate no features and leave ordinary configuration generation unchanged");
   runtime::disabled_resources_released = released_before;
-  {
-    const auto bridge_experiment = [&](Json enabled) {
-      return control::Execute({{"id", "bridge-experiment-" + std::to_string(++serial)},
-          {"op", "bridge_adaptive_experiment"}, {"enabled", std::move(enabled)}});
+  for (const auto* operation : {"bridge_adaptive_experiment", "edit_reuse_adaptive_experiment"}) {
+    const bool bridge = std::string_view(operation) == "bridge_adaptive_experiment";
+    auto& requested_flag = (bridge ? runtime::bridge_adaptive_experiment : runtime::edit_reuse_adaptive_experiment);
+    const auto* evidence_key = (bridge ? "bridge_adaptive_evidence" : "edit_reuse_adaptive_evidence");
+    const auto boolean_experiment = [&](Json enabled) {
+      return control::Execute({{"id", std::string(operation) + "-" + std::to_string(++serial)},
+          {"op", operation}, {"enabled", std::move(enabled)}});
     };
-    const auto bridge_identity = control::Identity();
-    const auto bridge_settings = runtime::profile_ui::Snapshot(true);
-    const auto bridge_adaptive = runtime::CopyAdaptiveStatus();
-    const auto bridge_sources = runtime::features.size();
-    const auto bridge_fg = std::tuple{runtime::native_fg_public_off.load(), runtime::native_fg_declaration.load(),
+    const auto boolean_identity = control::Identity();
+    const auto boolean_settings = runtime::profile_ui::Snapshot(true);
+    const auto boolean_adaptive = runtime::CopyAdaptiveStatus();
+    const auto boolean_sources = runtime::features.size();
+    const auto boolean_evaluates = runtime::SourceSuccessfulEvaluations();
+    const auto boolean_counters = std::tuple{runtime::edit_reuse_enabled.load(), runtime::edit_reuse_refreshes.load(),
+        runtime::edit_reuse_reuses.load(), runtime::edit_reuse_fallbacks.load()};
+    const auto boolean_fg = std::tuple{runtime::native_fg_public_off.load(), runtime::native_fg_declaration.load(),
         runtime::native_fg_owns.load(), runtime::native_fg_options_generation.load()};
-    check(bridge_experiment(1)["reason"] == "invalid_enabled" && bridge_experiment(0)["reason"] == "invalid_enabled"
-            && bridge_experiment(1.0)["reason"] == "invalid_enabled" && bridge_experiment("true")["reason"] == "invalid_enabled"
-            && bridge_experiment(nullptr)["reason"] == "invalid_enabled"
-            && control::Execute({{"id", "bridge-missing-enabled"}, {"op", "bridge_adaptive_experiment"}})["reason"] == "invalid_enabled",
-        "Bridge experiment requires an explicit Boolean instead of a legacy mode or setting value");
+    check(boolean_experiment(1)["reason"] == "invalid_enabled" && boolean_experiment(0)["reason"] == "invalid_enabled"
+            && boolean_experiment(1.0)["reason"] == "invalid_enabled" && boolean_experiment("true")["reason"] == "invalid_enabled"
+            && boolean_experiment(nullptr)["reason"] == "invalid_enabled"
+            && control::Execute({{"id", std::string(operation) + "-missing"}, {"op", operation}})["reason"] == "invalid_enabled",
+        "Boolean experiments require an explicit Boolean instead of a legacy mode or setting value");
     // No GPU exists in this CPU fixture; only its release-proof input is mocked.
     runtime::disabled_resources_released = false;
-    check(bridge_experiment(true)["reason"] == "resources_not_released"
-            && bridge_experiment(false)["reason"] == "resources_not_released"
+    check(boolean_experiment(true)["reason"] == "resources_not_released"
+            && boolean_experiment(false)["reason"] == "resources_not_released"
             && !runtime::disabled_resources_released.load(),
-        "neither Bridge experiment direction accepts NR OFF without the existing release proof");
+        "neither Boolean experiment direction accepts NR OFF without the existing release proof");
     runtime::disabled_resources_released = true;
     runtime::enabled = true;
-    check(bridge_experiment(true)["reason"] == "nr_running" && bridge_experiment(false)["reason"] == "nr_running",
-        "both Bridge experiment directions reject a running NR chain even with a stale release flag");
+    check(boolean_experiment(true)["reason"] == "nr_running" && boolean_experiment(false)["reason"] == "nr_running",
+        "both Boolean experiment directions reject a running NR chain even with a stale release flag");
     runtime::enabled = false;
     runtime::slider_pending = &runtime::kSetAdaptiveTargetFps;
-    check(bridge_experiment(true)["reason"] == "configuration_busy", "Bridge requests respect the existing UI transaction owner");
+    check(boolean_experiment(true)["reason"] == "configuration_busy"
+            && boolean_experiment(false)["reason"] == "configuration_busy",
+        "Boolean requests respect the existing UI transaction owner in both directions");
     runtime::slider_pending = nullptr;
     {
       std::atomic_bool held{false};
@@ -333,51 +421,54 @@
         Sleep(1);
       }
       check(held.load(std::memory_order_acquire), "the CPU fixture owns the actual runtime mutex on another thread");
-      check(bridge_experiment(true)["reason"] == "runtime_busy" && bridge_experiment(false)["reason"] == "runtime_busy",
-          "Bridge experiment mutation never waits on another runtime owner");
+      check(boolean_experiment(true)["reason"] == "runtime_busy" && boolean_experiment(false)["reason"] == "runtime_busy",
+          "Boolean experiment mutation never waits on another runtime owner");
     }
-    check(!runtime::bridge_adaptive_experiment.load(), "rejected Bridge requests cannot enable the experiment");
-    const Json bridge_request{{"id", "bridge-idempotent"}, {"op", "bridge_adaptive_experiment"}, {"enabled", true}};
-    const auto bridge_enabled = control::Execute(bridge_request);
-    auto enabled_identity = bridge_identity;
-    enabled_identity["experiments"]["bridge_adaptive_experiment"] = true;
-    check(bridge_enabled["ok"] && bridge_enabled["state"]["available"]
-            && bridge_enabled["identity"] == enabled_identity && runtime::bridge_adaptive_experiment.load()
-            && bridge_enabled["state"]["experiments"]["bridge_adaptive_evidence"] == "requested_enabled_not_activation",
-        "Bridge enable publishes only the independent requested flag and its confirmation identity");
-    check(control::Execute(bridge_request) == bridge_enabled, "same-id Bridge enable returns the original receipt");
-    status = control::Execute({{"id", "query-bridge"}, {"op", "status"}, {"query_id", "bridge-idempotent"}});
-    check(status["receipt"] == bridge_enabled, "lost Bridge enable receipts use the existing status lookup");
-    auto reused_bridge = bridge_request;
-    reused_bridge["enabled"] = false;
-    check(control::Execute(reused_bridge)["reason"] == "request_id_reused", "reused Bridge ids cannot change the requested Boolean");
+    check(!requested_flag.load(), "rejected Boolean requests cannot enable the experiment");
+    const Json boolean_request{{"id", std::string(operation) + "-idempotent"}, {"op", operation}, {"enabled", true}};
+    const auto boolean_enabled = control::Execute(boolean_request);
+    auto enabled_identity = boolean_identity;
+    enabled_identity["experiments"][operation] = true;
+    check(boolean_enabled["ok"] && boolean_enabled["state"]["available"]
+            && boolean_enabled["identity"] == enabled_identity && requested_flag.load()
+            && boolean_enabled["state"]["experiments"][evidence_key] == "requested_enabled_not_activation",
+        "Boolean enable publishes only the independent requested flag and its confirmation identity");
+    check(control::Execute(boolean_request) == boolean_enabled, "same-id Boolean enable returns the original receipt");
+    status = control::Execute({{"id", "query-" + std::string(operation)}, {"op", "status"}, {"query_id", boolean_request["id"]}});
+    check(status["receipt"] == boolean_enabled, "lost Boolean enable receipts use the existing status lookup");
+    auto reused_boolean = boolean_request;
+    reused_boolean["enabled"] = false;
+    check(control::Execute(reused_boolean)["reason"] == "request_id_reused", "reused Boolean ids cannot change the requested flag");
     check(set("NRAdaptiveTargetFPS", runtime::nr_adaptive_target_fps.load(),
-              {{"identity", bridge_identity}, {"changes", {{"NRAdaptiveTargetFPS", runtime::nr_adaptive_target_fps.load()}}}})["reason"]
+              {{"identity", boolean_identity}, {"changes", {{"NRAdaptiveTargetFPS", runtime::nr_adaptive_target_fps.load()}}}})["reason"]
             == "configuration_changed",
-        "a pre-experiment confirmation cannot commit after the Bridge identity changes");
+        "a pre-experiment confirmation cannot commit after the Boolean identity changes");
     runtime::enabled = true;
-    check(bridge_experiment(false)["reason"] == "nr_running" && runtime::bridge_adaptive_experiment.load(),
-        "disabling an enabled Bridge experiment also requires NR OFF");
+    check(boolean_experiment(false)["reason"] == "nr_running" && requested_flag.load(),
+        "disabling an enabled Boolean experiment also requires NR OFF");
     runtime::enabled = false;
     runtime::disabled_resources_released = false;
-    check(bridge_experiment(false)["reason"] == "resources_not_released" && runtime::bridge_adaptive_experiment.load(),
-        "disabling an enabled Bridge experiment never bypasses resource retirement");
+    check(boolean_experiment(false)["reason"] == "resources_not_released" && requested_flag.load(),
+        "disabling an enabled Boolean experiment never bypasses resource retirement");
     runtime::disabled_resources_released = true;
-    check(bridge_experiment(false)["ok"] && !runtime::bridge_adaptive_experiment.load()
-            && bridge_experiment(true)["ok"] && runtime::bridge_adaptive_experiment.load()
-            && bridge_experiment(false)["ok"] && bridge_experiment(false)["status"] == "unchanged",
-        "Bridge requested state can turn off, reopen and return to its default without changing ordinary settings");
-    const auto after_bridge = runtime::CopyAdaptiveStatus();
-    check(control::Identity() == bridge_identity && runtime::profile_ui::Snapshot(true) == bridge_settings
+    check(boolean_experiment(false)["ok"] && !requested_flag.load()
+            && boolean_experiment(true)["ok"] && requested_flag.load()
+            && boolean_experiment(false)["ok"] && boolean_experiment(false)["status"] == "unchanged",
+        "Boolean requested state can turn off, reopen and return to its default without changing ordinary settings");
+    const auto after_boolean = runtime::CopyAdaptiveStatus();
+    check(control::Identity() == boolean_identity && runtime::profile_ui::Snapshot(true) == boolean_settings
             && configuration_writes == experiment_writes && runtime::configuration_generation == experiment_generation
-            && runtime::nr_features_created == experiment_features && runtime::features.size() == bridge_sources
+            && runtime::nr_features_created == experiment_features && runtime::features.size() == boolean_sources
+            && runtime::SourceSuccessfulEvaluations() == boolean_evaluates
+            && boolean_counters == std::tuple{runtime::edit_reuse_enabled.load(), runtime::edit_reuse_refreshes.load(),
+                runtime::edit_reuse_reuses.load(), runtime::edit_reuse_fallbacks.load()}
             && runtime::disabled_resources_released.load(),
-        "Bridge requests neither persist settings, create sources/models nor manufacture a release proof");
-    check(bridge_fg == std::tuple{runtime::native_fg_public_off.load(), runtime::native_fg_declaration.load(),
+        "Boolean requests neither persist settings, evaluate/create sources/models nor change x2 counters or release proof");
+    check(boolean_fg == std::tuple{runtime::native_fg_public_off.load(), runtime::native_fg_declaration.load(),
               runtime::native_fg_owns.load(), runtime::native_fg_options_generation.load()}
-            && after_bridge.generation == bridge_adaptive.generation && after_bridge.reason == bridge_adaptive.reason
-            && after_bridge.requested == bridge_adaptive.requested && after_bridge.applied == bridge_adaptive.applied,
-        "request acceptance cannot manufacture FG Off, an eligible Bridge source or an actual applied tier");
+            && after_boolean.generation == boolean_adaptive.generation && after_boolean.reason == boolean_adaptive.reason
+            && after_boolean.requested == boolean_adaptive.requested && after_boolean.applied == boolean_adaptive.applied,
+        "request acceptance cannot manufacture FG Off, an eligible source or an actual applied tier");
     runtime::disabled_resources_released = released_before;
   }
   {

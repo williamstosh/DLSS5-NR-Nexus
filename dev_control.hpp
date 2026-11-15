@@ -35,7 +35,9 @@ inline Json Identity() {
       {"settings_hash", identity.settings_hash}, {"resolution_hash", identity.resolution_hash},
       {"route", identity.route}, {"fg", identity.fg},
       {"experiments", {{"adaptive_feature_mode", static_cast<uint32_t>(adaptive_feature_mode.load())},
-          {"bridge_adaptive_experiment", bridge_adaptive_experiment.load()}}}};
+          {"bridge_adaptive_experiment", bridge_adaptive_experiment.load()},
+          {"edit_reuse_adaptive_experiment", edit_reuse_adaptive_experiment.load()},
+          {"edit_reuse_adaptive_evidence", "requested_enabled_not_activation"}}}};
 }
 
 inline Json Snapshot() {
@@ -135,8 +137,21 @@ inline Json Snapshot() {
       slots.push_back({{"slot", index}, {"active", index == cache->active}, {"ready", tier.ready},
           {"logical_size", {current.input_width, current.input_height}}, {"models", std::move(models)}});
     }
+    Json sampling = nullptr;
+    if (feature.adaptive_session != nullptr) {
+      const auto& session = *feature.adaptive_session;
+      double median = 0., mad = 0.;
+      const bool statistics_valid = session.GpuStatistics(now, &median, &mad);
+      sampling = {{"paired_sampling", session.paired_sampling}, {"sampling_generation", session.sampling_generation},
+          {"gpu_count", session.gpu_count},
+          {"latest_recorded_ns", session.gpu_count != 0 ? Json(session.gpu_recorded_ns[session.gpu_count - 1]) : Json(nullptr)},
+          {"statistics_valid", statistics_valid}, {"median_us", statistics_valid ? Json(median) : Json(nullptr)},
+          {"mad_us", statistics_valid ? Json(mad) : Json(nullptr)}, {"evidence", "controller_per_source_gpu_chain"}};
+    }
     caches.push_back({{"source_handle", reinterpret_cast<uintptr_t>(handle)}, {"physical_slot_count", cache->count},
-        {"active_slot", cache->active}, {"slots", std::move(slots)}});
+        {"active_slot", cache->active}, {"source_frame", feature.sr_sequence},
+        {"trial", feature.adaptive_session != nullptr ? Json(feature.adaptive_session->trial) : Json(nullptr)},
+        {"sampling", std::move(sampling)}, {"slots", std::move(slots)}});
   }
   if (identity != Identity()) {
     state["reason"] = "configuration_changed";
@@ -147,9 +162,14 @@ inline Json Snapshot() {
       {"config_epoch", identity["config_epoch"]}, {"presents", presents_observed.load()},
       {"successful_source_frames", SourceSuccessfulEvaluations()},
       {"nr_features_created", nr_features_created},
+      {"edit_reuse", {{"requested", edit_reuse_enabled.load()}, {"refreshes", edit_reuse_refreshes.load()},
+          {"reuses", edit_reuse_reuses.load()}, {"fallbacks", edit_reuse_fallbacks.load()},
+          {"evidence", "process_counters_not_activation_or_gpu_completion"}}},
       {"experiments", {{"adaptive_feature_mode", identity["experiments"]["adaptive_feature_mode"]},
           {"bridge_adaptive_experiment", identity["experiments"]["bridge_adaptive_experiment"]},
           {"bridge_adaptive_evidence", "requested_enabled_not_activation"},
+          {"edit_reuse_adaptive_experiment", identity["experiments"]["edit_reuse_adaptive_experiment"]},
+          {"edit_reuse_adaptive_evidence", identity["experiments"]["edit_reuse_adaptive_evidence"]},
           {"evidence", "requested_mode_not_activation"}}},
       {"adaptive_caches", std::move(caches)},
       {"output_framerate", {{"available", output.available}, {"reason", output_framerate::ReasonText(output.reason)},
@@ -196,7 +216,8 @@ inline Json Execute(const Json& request) {
                 && request["query_id"] == last_request["id"] ? last_receipt : Json(nullptr)}};
   }
   if (*operation != "set" && *operation != "adaptive_feature_experiment"
-      && *operation != "bridge_adaptive_experiment" && *operation != "inline_restore_roi") {
+      && *operation != "bridge_adaptive_experiment" && *operation != "edit_reuse_adaptive_experiment"
+      && *operation != "inline_restore_roi") {
     return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "invalid_operation"}};
   }
   if (last_request.is_object() && last_request["id"] == *id) {
@@ -247,15 +268,16 @@ inline Json Execute(const Json& request) {
     return finish();
   }
   const bool bridge_experiment = *operation == "bridge_adaptive_experiment";
-  if (*operation == "adaptive_feature_experiment" || bridge_experiment) {
-    const auto value = request.find(bridge_experiment ? "enabled" : "mode");
-    response["reason"] = (bridge_experiment ? "invalid_enabled" : "invalid_mode");
-    if (bridge_experiment) {
+  const bool boolean_experiment = bridge_experiment || *operation == "edit_reuse_adaptive_experiment";
+  if (*operation == "adaptive_feature_experiment" || boolean_experiment) {
+    const auto value = request.find(boolean_experiment ? "enabled" : "mode");
+    response["reason"] = (boolean_experiment ? "invalid_enabled" : "invalid_mode");
+    if (boolean_experiment) {
       if (value == request.end() || !value->is_boolean()) return finish();
     } else if (value == request.end() || !value->is_number_integer() || *value < 0 || *value > 3) {
       return finish();
     }
-    response["requested"] = {{bridge_experiment ? "enabled" : "mode", *value}};
+    response["requested"] = {{boolean_experiment ? "enabled" : "mode", *value}};
     if (configuration_busy) {
       response["reason"] = "configuration_busy";
       return finish();
@@ -270,10 +292,11 @@ inline Json Execute(const Json& request) {
         response["reason"] = "resources_not_released";
       } else {
         bool unchanged = false;
-        if (bridge_experiment) {
+        if (boolean_experiment) {
+          auto& requested_flag = (bridge_experiment ? bridge_adaptive_experiment : edit_reuse_adaptive_experiment);
           const bool requested = value->get<bool>();
-          unchanged = bridge_adaptive_experiment.load() == requested;
-          bridge_adaptive_experiment.store(requested);
+          unchanged = requested_flag.load() == requested;
+          requested_flag.store(requested);
         } else {
           const auto requested = static_cast<AdaptiveFeatureMode>(value->get<uint32_t>());
           unchanged = adaptive_feature_mode.load() == requested;

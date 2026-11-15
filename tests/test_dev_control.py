@@ -80,57 +80,63 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(self.transport.deadlines, [deadline] * 4)
         self.assertEqual(len({request['id'] for request in self.transport.requests}), 4)
 
-    def test_bridge_experiment_has_an_independent_boolean_request_and_shared_deadline(self):
-        client = self.client()
-        deadline = time.monotonic() + 1
-        for enabled in (True, False, True):
-            actual = client.bridge_adaptive_experiment(enabled, deadline=deadline)
-            request = self.transport.requests[-1]
-            self.assertEqual(request['op'], 'bridge_adaptive_experiment')
-            self.assertIs(request['enabled'], enabled)
-            self.assertEqual(actual['id'], request['id'])
-            self.assertTrue({'mode', 'key', 'value', 'confirm'}.isdisjoint(request))
-        self.assertEqual(self.transport.deadlines, [deadline] * 3)
-        self.assertEqual(len({request['id'] for request in self.transport.requests}), 3)
+    def test_boolean_experiments_have_independent_requests_and_shared_deadlines(self):
+        for operation in ('bridge_adaptive_experiment', 'edit_reuse_adaptive_experiment'):
+            with self.subTest(operation=operation):
+                client = self.client()
+                deadline = time.monotonic() + 1
+                for enabled in (True, False, True):
+                    actual = getattr(client, operation)(enabled, deadline=deadline)
+                    request = self.transport.requests[-1]
+                    self.assertEqual(request['op'], operation)
+                    self.assertIs(request['enabled'], enabled)
+                    self.assertEqual(actual['id'], request['id'])
+                    self.assertTrue({'mode', 'key', 'value', 'confirm'}.isdisjoint(request))
+                self.assertEqual(self.transport.deadlines, [deadline] * 3)
+                self.assertEqual(len({request['id'] for request in self.transport.requests}), 3)
 
-    def test_bridge_experiment_rejects_non_boolean_before_transport(self):
-        client = self.client()
-        for enabled in (0, 1, -1, 1.0, 'true', None):
-            with self.subTest(enabled=enabled), self.assertRaises(ValueError):
-                client.bridge_adaptive_experiment(enabled)
-        self.assertEqual(self.transport.requests, [])
+    def test_boolean_experiments_reject_non_boolean_before_transport(self):
+        for operation in ('bridge_adaptive_experiment', 'edit_reuse_adaptive_experiment'):
+            client = self.client()
+            for enabled in (0, 1, -1, 1.0, 'true', None):
+                with self.subTest(operation=operation, enabled=enabled), self.assertRaises(ValueError):
+                    getattr(client, operation)(enabled)
+            self.assertEqual(self.transport.requests, [])
 
-    def test_lost_bridge_receipt_queries_without_replaying_or_claiming_activation(self):
-        original = {}
-        def action(request):
-            if request['op'] == 'bridge_adaptive_experiment':
-                original.update(request)
-                raise OSError('synthetic Bridge response disconnect')
-            result = response(request)
-            receipt = response(original)
-            receipt['state']['experiments'] = dict(bridge_adaptive_experiment=True,
-                bridge_adaptive_evidence='requested_enabled_not_activation')
-            receipt['identity']['experiments'] = dict(bridge_adaptive_experiment=True)
-            result['receipt'] = receipt
-            return result
-        client = self.client(action)
-        actual = client.bridge_adaptive_experiment(True)
-        self.assertEqual(actual['id'], original['id'])
-        self.assertTrue(actual['state']['experiments']['bridge_adaptive_experiment'])
-        self.assertEqual(actual['state']['experiments']['bridge_adaptive_evidence'], 'requested_enabled_not_activation')
-        self.assertNotIn('active', actual['state']['experiments'])
-        self.assertEqual([request['op'] for request in self.transport.requests], ['bridge_adaptive_experiment', 'status'])
-        self.assertEqual(self.transport.requests[1]['query_id'], original['id'])
-        self.assertEqual(self.transport.deadlines[0], self.transport.deadlines[1])
+    def test_lost_experiment_receipt_queries_without_replaying_or_claiming_activation(self):
+        for operation in ('bridge_adaptive_experiment', 'edit_reuse_adaptive_experiment'):
+            with self.subTest(operation=operation):
+                original = {}
+                evidence_key = operation.removesuffix('_experiment') + '_evidence'
+                def action(request):
+                    if request['op'] == operation:
+                        original.update(request)
+                        raise OSError('synthetic experiment response disconnect')
+                    result = response(request)
+                    receipt = response(original)
+                    receipt['state']['experiments'] = {operation: True, evidence_key: 'requested_enabled_not_activation'}
+                    receipt['identity']['experiments'] = {operation: True}
+                    result['receipt'] = receipt
+                    return result
+                client = self.client(action)
+                actual = getattr(client, operation)(True)
+                self.assertEqual(actual['id'], original['id'])
+                self.assertTrue(actual['state']['experiments'][operation])
+                self.assertEqual(actual['state']['experiments'][evidence_key], 'requested_enabled_not_activation')
+                self.assertNotIn('active', actual['state']['experiments'])
+                self.assertEqual([request['op'] for request in self.transport.requests], [operation, 'status'])
+                self.assertEqual(self.transport.requests[1]['query_id'], original['id'])
+                self.assertEqual(self.transport.deadlines[0], self.transport.deadlines[1])
 
-    def test_bridge_admission_rejection_is_returned_without_retry(self):
-        for reason in ('configuration_busy', 'runtime_busy', 'nr_running', 'resources_not_released'):
-            with self.subTest(reason=reason):
-                client = self.client(lambda request: dict(response(request), ok=False, status='rejected', reason=reason))
-                actual = client.bridge_adaptive_experiment(False)
-                self.assertFalse(actual['ok'])
-                self.assertEqual(actual['reason'], reason)
-                self.assertEqual(len(self.transport.requests), 1)
+    def test_experiment_admission_rejection_is_returned_without_retry(self):
+        for operation in ('bridge_adaptive_experiment', 'edit_reuse_adaptive_experiment'):
+            for reason in ('configuration_busy', 'runtime_busy', 'nr_running', 'resources_not_released'):
+                with self.subTest(operation=operation, reason=reason):
+                    client = self.client(lambda request: dict(response(request), ok=False, status='rejected', reason=reason))
+                    actual = getattr(client, operation)(False)
+                    self.assertFalse(actual['ok'])
+                    self.assertEqual(actual['reason'], reason)
+                    self.assertEqual(len(self.transport.requests), 1)
 
     def test_inline_restore_roi_freezes_directory_without_setting_or_confirmation(self):
         client = self.client()
@@ -408,8 +414,11 @@ class NativeTransportMockTests(unittest.TestCase):
         for mode in ('read', 'write'):
             dev._pending.clear()
             native = FakeKernel(pending=mode == 'write', read_pending=mode == 'read')
-            with self.subTest(mode=mode), mock.patch.object(dev, '_kernel', return_value=native), self.assertRaises(TimeoutError):
-                dev.NamedPipeTransport(42).exchange(b'{}', time.monotonic() + .1)
+            # Keep the 100ms boundary exact; uptime + .1 can round above .1
+            # on Windows' coarse monotonic clock before ceil converts to ms.
+            with self.subTest(mode=mode), mock.patch.object(dev, '_kernel', return_value=native), \
+                    mock.patch.object(dev.time, 'monotonic', return_value=0.), self.assertRaises(TimeoutError):
+                dev.NamedPipeTransport(42).exchange(b'{}', .1)
             self.assertTrue(native.cancelled)
             self.assertTrue(all(0 <= wait <= 100 for wait in native.waits))
             self.assertEqual(len(dev._pending), 1)
@@ -426,8 +435,9 @@ class NativeTransportMockTests(unittest.TestCase):
             return False
         native.CreateFileW = busy
         native.WaitNamedPipeW = wait
-        with mock.patch.object(dev, '_kernel', return_value=native), self.assertRaises(OSError):
-            dev.NamedPipeTransport(42).exchange(b'{}', time.monotonic() + .1)
+        with mock.patch.object(dev, '_kernel', return_value=native), \
+                mock.patch.object(dev.time, 'monotonic', return_value=0.), self.assertRaises(OSError):
+            dev.NamedPipeTransport(42).exchange(b'{}', .1)
         self.assertEqual(native.output, b'')
         self.assertTrue(all(0 < wait <= 100 for wait in native.waits))
 

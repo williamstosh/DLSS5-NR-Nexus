@@ -62,6 +62,16 @@ Bridge 两档接入使用独立的 DEV 请求：`Client.bridge_adaptive_experime
 释放未完成时保持原请求状态。该通道仅编入 `NR_NEXUS_DEV_CONTROL` 开发候选，普通 Publishing 不含入口，
 不是玩家兼容开关；`status`／原 ID 回执查询及同一 deadline 的规则与其他开发请求相同。
 
+内部两档 x2 接线复用 `Client.edit_reuse_adaptive_experiment(True|False)`，协议为
+`{"id":"edit-reuse-enable-1","op":"edit_reuse_adaptive_experiment","enabled":true}`。
+它沿用上述双向 OFF／释放／配置空闲门禁，仅改变 DEV 实验请求；启动配置 `NREditReuse`、默认值和生产准入不变。
+该组合仍限原生 D3D12 Upscaled、FG Off、单 Pass／单输出和两个完整预备档。
+`state.edit_reuse` 返回请求开关和进程级刷新／复用／回退计数；`adaptive_caches` 中的 `source_frame`、`trial`、
+`sampling` 分别反映源序号、试档状态和已完成采样。统计有效时 `median_us`／`mad_us` 是每源完整 NR 链成本，
+x2 先平均相邻两源再统计；未满窗口或过期时为 null。请求、计数、已完成成本和实际档位须分别判断。
+FG Off 的现成输出来源为 ReShade Present 回调的 `Present cadence estimate`；它不报告显示器扫描完成。
+离屏原生 NGX 夹具无 Present 循环，其串行吞吐或合成 FPS 不可替代该来源。
+
 可信 FG Off 可以来自成功的 Streamline `SetOptions(eOff)`，或绑定当前 XeFG context／proxy、
 D3D11 设备和源代次的成功 `SetEnabled(false)`。XeFG 路径要求关闭调用前后均能观察到同一个已创建来源；
 重新启用、重建、来源变化或失败／在途调用撤销旧回执。默认 `enabled=false` 与配置请求不提供此证明。
