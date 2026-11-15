@@ -23,6 +23,8 @@ cbuffer ReuseConstants : register(b0) {
   uint Padding;
   float2 RasterOffset;
   float2 PreviousMotionOffset;
+  uint2 OutputSize;
+  uint2 OutputPadding;
 };
 
 static const float kEditFloor = 1.0 / 1024.0;
@@ -55,12 +57,32 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     ComposedMotion[pixel] = all(isfinite(composed)) ? composed : 0.0;
     return;
   }
-  if (any(pixel >= Size)) return;
-  const uint index = pixel.y * Size.x + pixel.x;
   if (Phase == 4u) {
-    if (Validity.Load(index * 4u) == 0u) Target[pixel] = Original.Load(int3(pixel, 0));
+    if (any(pixel >= OutputSize)) return;
+    bool valid;
+    if (all(Size == OutputSize)) {
+      valid = Validity.Load((pixel.y * Size.x + pixel.x) * 4u) != 0u;
+    } else {
+      // Match v6 Resolve's decoded-linear bilinear footprint, including its
+      // clamped base coordinate and zero-weight edge taps.
+      const float2 pos = ((float2(pixel) + 0.5) * float2(Size)) / float2(OutputSize) - 0.5;
+      const int2 max_coord = int2(Size) - int2(1, 1);
+      const int2 b0 = clamp(int2(floor(pos)), int2(0, 0), max_coord);
+      const int2 b1 = min(b0 + int2(1, 1), max_coord);
+      const float2 f = saturate(pos - float2(b0));
+      const int2 taps[4] = {b0, int2(b1.x, b0.y), int2(b0.x, b1.y), b1};
+      const float weights[4] = {(1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y};
+      valid = true;
+      for (uint tap = 0u; tap < 4u; ++tap) {
+        if (weights[tap] <= 0.0) continue;
+        valid = valid && Validity.Load((uint(taps[tap].y) * Size.x + uint(taps[tap].x)) * 4u) != 0u;
+      }
+    }
+    if (!valid) Target[pixel] = Original.Load(int3(pixel, 0));
     return;
   }
+  if (any(pixel >= Size)) return;
+  const uint index = pixel.y * Size.x + pixel.x;
   const float2 guide_position = (float2(pixel) + 0.5) * float2(MotionSize) / float2(Size) + RasterOffset;
   const bool guide_valid = all(guide_position >= 0.0) && all(guide_position < float2(MotionSize));
   const uint2 guide = uint2(clamp(floor(guide_position), 0.0, float2(MotionSize - 1u)));

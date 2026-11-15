@@ -95,6 +95,7 @@ int Run() {
     native::intensity = 1.f;
     native::preset = 2;
     native::edit_reuse_enabled = true;
+    native::direct_api.private_instance = true;
     native::direct_api.module = GetModuleHandleW(nullptr);
     native::direct_api.create = CreateModel;
     native::direct_api.evaluate = nr_edit_reuse_gpu_cases::NeutralModel;
@@ -105,6 +106,14 @@ int Run() {
     native::direct_device_native = gpu.device.Get();
     native::direct_runtime_requirements.dual_models = true;
     native::direct_runtime_requirements.file_version = "310.9.16.0";
+    // Supply the existing model substitute as the explicitly private pre-FG
+    // provider. The real loader and NVIDIA runtime are outside this fixture.
+    native::ngx_loader_staging = {};
+    native::ngx_loader_staging.nr_ready = true;
+    native::ngx_loader_staging.native_ready = true;
+    native::ngx_loader_staging.native_api = native::direct_api;
+    native::ngx_loader_staging.nr_requirements = native::direct_runtime_requirements;
+    native::PublishNgxLoaderSymbols();
     native::parameter_runtime_ready = true;
     native::parameter_runtime_via_core = false;
     native::core_allocate_parameters = addon::bridge::AllocateOwnedParameters;

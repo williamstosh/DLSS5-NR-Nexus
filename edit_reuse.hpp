@@ -30,13 +30,17 @@ enum class Phase : uint32_t {
 };
 
 struct Inputs {
+  // Proxy/neural/anchor/Validity working extent.
   uint32_t width = 0;
   uint32_t height = 0;
+  // Original/decoded extent. Zero retains the working extent.
+  uint32_t output_width = 0;
+  uint32_t output_height = 0;
   uint32_t motion_width = 0;
   uint32_t motion_height = 0;
   float motion_scale_x = 1.f;
   float motion_scale_y = 1.f;
-  // Guide content's raster displacement from the unjittered output grid,
+  // Guide content's raster displacement from the unjittered image grid,
   // in render pixels. Motion values themselves exclude jitter.
   float raster_offset_x = 0.f;
   float raster_offset_y = 0.f;
@@ -69,6 +73,8 @@ struct State {
   std::array<uint64_t, 38> contract{};
   uint32_t width = 0;
   uint32_t height = 0;
+  uint32_t output_width = 0;
+  uint32_t output_height = 0;
   uint32_t motion_width = 0;
   uint32_t motion_height = 0;
   uint64_t anchor_generation = 0;
@@ -85,7 +91,7 @@ struct State {
 // composed_motion rests in UAV between model calls. CAPTURE reads shader-
 // readable neural; APPLY writes UAV neural; SELECT_ORIGINAL writes UAV decoded
 // and reads the still-unmodified game output in original. Other targets are
-// not accessed by that phase. validity contains one uint (0/1) per output pixel.
+// not accessed by that phase. validity contains one uint (0/1) per working pixel.
 // All passes use the same descriptor contract and root-UAV buffers. Each
 // texture tuple has five immutable phase slices. Inactive views are typed null
 // so one PSO's static resource declarations never bind conflicting SRV/UAV
@@ -94,6 +100,8 @@ inline bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                    State* state, const Inputs& inputs, Phase phase) {
   if (device == nullptr || list == nullptr || state == nullptr
       || inputs.width == 0 || inputs.height == 0 || inputs.motion_width == 0 || inputs.motion_height == 0) return false;
+  const uint32_t output_width = (inputs.output_width != 0 ? inputs.output_width : inputs.width);
+  const uint32_t output_height = (inputs.output_height != 0 ? inputs.output_height : inputs.height);
   if (state->root == nullptr) {
     D3D12_DESCRIPTOR_RANGE ranges[3]{};
     ranges[0] = {.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV, .NumDescriptors = 5};
@@ -109,7 +117,7 @@ inline bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list,
       parameters[3 + buffer].Descriptor.ShaderRegister = 1 + buffer;
     }
     parameters[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    parameters[6].Constants = {0, 0, 12};
+    parameters[6].Constants = {0, 0, 16};
     const D3D12_ROOT_SIGNATURE_DESC desc{.NumParameters = 7, .pParameters = parameters};
     Microsoft::WRL::ComPtr<ID3DBlob> serialized, errors;
     if (FAILED(renodx::utils::directx::pD3D12SerializeRootSignature(
@@ -148,11 +156,14 @@ inline bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     state->allocated_bytes += allocation.SizeInBytes;
     state->width = inputs.width;
     state->height = inputs.height;
+    state->output_width = output_width;
+    state->output_height = output_height;
     state->motion_width = inputs.motion_width;
     state->motion_height = inputs.motion_height;
   }
   if (state->previous_motion == nullptr || state->validity == nullptr || state->composed_motion == nullptr
       || state->width != inputs.width || state->height != inputs.height
+      || state->output_width != output_width || state->output_height != output_height
       || state->motion_width != inputs.motion_width || state->motion_height != inputs.motion_height) return false;
   const std::array<ID3D12Resource*, 6> resources{
       inputs.proxy, inputs.neural, inputs.motion, inputs.depth, inputs.original, inputs.decoded};
@@ -236,15 +247,19 @@ inline bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list,
   list->SetComputeRootUnorderedAccessView(3, state->anchor->GetGPUVirtualAddress());
   list->SetComputeRootUnorderedAccessView(4, state->previous_motion->GetGPUVirtualAddress());
   list->SetComputeRootUnorderedAccessView(5, state->validity->GetGPUVirtualAddress());
-  const std::array<uint32_t, 12> constants{inputs.width, inputs.height, inputs.motion_width, inputs.motion_height,
+  const std::array<uint32_t, 16> constants{inputs.width, inputs.height, inputs.motion_width, inputs.motion_height,
       std::bit_cast<uint32_t>(inputs.motion_scale_x), std::bit_cast<uint32_t>(inputs.motion_scale_y),
       static_cast<uint32_t>(phase), 0,
       std::bit_cast<uint32_t>(inputs.raster_offset_x), std::bit_cast<uint32_t>(inputs.raster_offset_y),
-      std::bit_cast<uint32_t>(inputs.previous_motion_offset_x), std::bit_cast<uint32_t>(inputs.previous_motion_offset_y)};
-  list->SetComputeRoot32BitConstants(6, 12, constants.data(), 0);
+      std::bit_cast<uint32_t>(inputs.previous_motion_offset_x), std::bit_cast<uint32_t>(inputs.previous_motion_offset_y),
+      output_width, output_height, 0, 0};
+  list->SetComputeRoot32BitConstants(6, 16, constants.data(), 0);
   const bool motion_phase = phase == Phase::MOTION || phase == Phase::SNAPSHOT_MOTION;
-  list->Dispatch(((motion_phase ? inputs.motion_width : inputs.width) + 7) / 8,
-                ((motion_phase ? inputs.motion_height : inputs.height) + 7) / 8, 1);
+  const uint32_t dispatch_width = (motion_phase ? inputs.motion_width
+      : (phase == Phase::SELECT_ORIGINAL ? output_width : inputs.width));
+  const uint32_t dispatch_height = (motion_phase ? inputs.motion_height
+      : (phase == Phase::SELECT_ORIGINAL ? output_height : inputs.height));
+  list->Dispatch((dispatch_width + 7) / 8, (dispatch_height + 7) / 8, 1);
   list->ResourceBarrier(1, &barrier);
   return true;
 }

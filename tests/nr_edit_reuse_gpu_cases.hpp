@@ -236,16 +236,18 @@ int Run() {
           "RG32 composed motion retains finite 80000 raw units for an in-bounds 0.8-pixel displacement");
     std::cout << "PASS edit reuse WARP shader: untouched refresh validity, full sentinel overwrite, known edit, scaled reprojection, edge/depth/color rejection, neutral exact RGBA\n";
 
-    {
+    for (const bool low_grid : {false, true}) {
       constexpr uint32_t code_width = 1024, alpha_count = 4;
+      const uint32_t work_width = (low_grid ? 768u : code_width);
+      const uint32_t work_height = (low_grid ? 3u : alpha_count);
       auto code_original = gpu.Texture(code_width, alpha_count, DXGI_FORMAT_R10G10B10A2_UNORM);
       auto code_decoded = uav_texture(code_width, alpha_count, DXGI_FORMAT_R10G10B10A2_UNORM);
-      auto code_proxy = gpu.Texture(code_width, alpha_count, DXGI_FORMAT_R32G32B32A32_FLOAT);
-      auto code_neural = uav_texture(code_width, alpha_count, DXGI_FORMAT_R32G32B32A32_FLOAT);
+      auto code_proxy = gpu.Texture(work_width, work_height, DXGI_FORMAT_R32G32B32A32_FLOAT);
+      auto code_neural = uav_texture(work_width, work_height, DXGI_FORMAT_R32G32B32A32_FLOAT);
       auto code_motion = gpu.Texture(1, 1, DXGI_FORMAT_R32G32_FLOAT);
       auto code_depth = gpu.Texture(1, 1, DXGI_FORMAT_R32_FLOAT);
       std::vector<uint32_t> codes(code_width * alpha_count);
-      std::vector<float> neutral(code_width * alpha_count * 4, .375f);
+      std::vector<float> neutral(work_width * work_height * 4, .375f);
       for (uint32_t alpha = 0; alpha < alpha_count; ++alpha) {
         for (uint32_t code = 0; code < code_width; ++code) {
           codes[alpha * code_width + code] = code | ((1023u - code) << 10)
@@ -255,12 +257,13 @@ int Run() {
       upload(code_original.Get(), codes, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, code_width * 4);
       upload(code_decoded.Get(), std::vector<uint32_t>(codes.size(), 0), D3D12_RESOURCE_STATE_COMMON,
              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, code_width * 4);
-      upload(code_proxy.Get(), neutral, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, code_width * 16);
-      upload(code_neural.Get(), neutral, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, code_width * 16);
+      upload(code_proxy.Get(), neutral, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, work_width * 16);
+      upload(code_neural.Get(), neutral, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, work_width * 16);
       upload(code_motion.Get(), std::vector<float>(2, 0.f), D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, 8);
       upload(code_depth.Get(), std::vector<float>(1, .5f), D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, 4);
       reuse::State code_state;
-      const reuse::Inputs code_inputs{.width = code_width, .height = alpha_count, .motion_width = 1, .motion_height = 1,
+      const reuse::Inputs code_inputs{.width = work_width, .height = work_height,
+          .output_width = code_width, .output_height = alpha_count, .motion_width = 1, .motion_height = 1,
           .proxy = code_proxy.Get(), .neural = code_neural.Get(), .motion = code_motion.Get(), .depth = code_depth.Get(),
           .original = code_original.Get(), .decoded = code_decoded.Get()};
       Check(reuse::Record(gpu.device.Get(), gpu.list.Get(), &code_state, code_inputs, reuse::Phase::PREPARE),
@@ -283,6 +286,124 @@ int Run() {
       const auto code_validity = read_buffer(code_state.validity.Get());
       Check(std::all_of(code_validity.begin(), code_validity.end(), [](uint8_t value) { return value == 0; }),
             "neutral HDR10 APPLY overwrites every nonzero validity sentinel with invalid");
+    }
+
+    {
+      constexpr uint32_t work_width = 6, work_height = 4, output_width = 10, output_height = 7;
+      constexpr uint32_t motion_width = 4, motion_height = 3;
+      auto low_proxy = gpu.Texture(work_width, work_height, DXGI_FORMAT_R32G32B32A32_FLOAT);
+      auto low_neural = uav_texture(work_width, work_height, DXGI_FORMAT_R32G32B32A32_FLOAT);
+      auto low_motion = gpu.Texture(motion_width, motion_height, DXGI_FORMAT_R32G32_FLOAT);
+      auto low_depth = gpu.Texture(motion_width, motion_height, DXGI_FORMAT_R32_FLOAT);
+      auto low_original = gpu.Texture(output_width, output_height, DXGI_FORMAT_R32G32B32A32_FLOAT);
+      auto low_decoded = uav_texture(output_width, output_height, DXGI_FORMAT_R32G32B32A32_FLOAT);
+      std::vector<float> low_proxy_values(work_width * work_height * 4);
+      std::vector<float> low_neural_values(work_width * work_height * 4);
+      std::vector<float> low_original_values(output_width * output_height * 4);
+      std::vector<float> low_decoded_values(output_width * output_height * 4);
+      std::vector<float> low_motion_values(motion_width * motion_height * 2, 0.f);
+      const std::array<float, 4> processed{.625f, .5f, .375f, .875f};
+      for (uint32_t y = 0; y < work_height; ++y) {
+        for (uint32_t x = 0; x < work_width; ++x) {
+          const size_t pixel = y * work_width + x;
+          const float edit = .25f + .125f * x + .0625f * y;
+          for (uint32_t channel = 0; channel < 3; ++channel) {
+            const float reference = .125f + .0625f * channel;
+            low_proxy_values[pixel * 4 + channel] = encode(reference);
+            low_neural_values[pixel * 4 + channel] = encode(reference * std::exp2(edit));
+          }
+          low_proxy_values[pixel * 4 + 3] = .375f;
+          low_neural_values[pixel * 4 + 3] = .875f;
+        }
+      }
+      for (uint32_t pixel = 0; pixel < output_width * output_height; ++pixel) {
+        for (uint32_t channel = 0; channel < 4; ++channel) {
+          low_original_values[pixel * 4 + channel] = .015625f * (channel + 1) + pixel / 1024.f;
+          // Post-Resolve/Commit sentinel; this primitive case does not run Resolve.
+          low_decoded_values[pixel * 4 + channel] = processed[channel];
+        }
+      }
+      for (uint32_t y = 0; y < motion_height; ++y) {
+        low_motion_values[(y * motion_width + 2) * 2] = 1.f;
+      }
+      upload(low_proxy.Get(), low_proxy_values, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, work_width * 16);
+      upload(low_neural.Get(), low_neural_values, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, work_width * 16);
+      upload(low_motion.Get(), low_motion_values, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, motion_width * 8);
+      upload(low_depth.Get(), std::vector<float>(motion_width * motion_height, .5f),
+          D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, motion_width * 4);
+      upload(low_original.Get(), low_original_values, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, output_width * 16);
+      upload(low_decoded.Get(), low_decoded_values, D3D12_RESOURCE_STATE_COMMON,
+          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, output_width * 16);
+      reuse::State low_state;
+      reuse::Inputs low_inputs{.width = work_width, .height = work_height,
+          .output_width = output_width, .output_height = output_height,
+          .motion_width = motion_width, .motion_height = motion_height,
+          .proxy = low_proxy.Get(), .neural = low_neural.Get(), .motion = low_motion.Get(),
+          .depth = low_depth.Get(), .original = low_original.Get(), .decoded = low_decoded.Get()};
+      Check(reuse::Record(gpu.device.Get(), gpu.list.Get(), &low_state, low_inputs, reuse::Phase::PREPARE),
+            "prepare separate work/output/guide grids");
+      fill_validity(&low_state);
+      Check(reuse::Record(gpu.device.Get(), gpu.list.Get(), &low_state, low_inputs, reuse::Phase::CAPTURE),
+            "capture non-neutral edit on the low working grid");
+      const auto low_anchor = read_buffer(low_state.anchor.Get());
+      const auto low_sentinel = read_buffer(low_state.validity.Get());
+      Check(low_sentinel.size() == work_width * work_height * sizeof(uint32_t)
+                && std::all_of(low_sentinel.begin(), low_sentinel.end(), [](uint8_t value) { return value == 0xA5; }),
+            "low-grid CAPTURE leaves every working validity sentinel untouched");
+      auto changed_extent = low_inputs;
+      ++changed_extent.output_width;
+      Check(!reuse::Record(gpu.device.Get(), gpu.list.Get(), &low_state, changed_extent, reuse::Phase::PREPARE),
+            "an existing anchor cannot be rebound to a different output extent");
+
+      // Jitter moves work x=2 into guide column 2, whose one-pixel motion
+      // becomes 1.5 WORK pixels. Scaling by the output width would give 2.5.
+      low_inputs.raster_offset_x = .4f;
+      low_inputs.raster_offset_y = -.25f;
+      for (uint32_t y = 0; y < work_height; ++y) {
+        for (uint32_t channel = 0; channel < 3; ++channel) {
+          low_proxy_values[(y * work_width + 1) * 4 + channel] = encode(.75f);
+        }
+      }
+      upload(low_proxy.Get(), low_proxy_values, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, work_width * 16);
+      gpu.Transition(low_neural.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      Check(reuse::Record(gpu.device.Get(), gpu.list.Get(), &low_state, low_inputs, reuse::Phase::APPLY),
+            "apply low-grid edit with nonzero raster jitter and physical guide motion");
+      gpu.Transition(low_neural.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NATIVE_INPUT_STATE);
+      Check(reuse::Record(gpu.device.Get(), gpu.list.Get(), &low_state, low_inputs, reuse::Phase::SELECT_ORIGINAL),
+            "select original RGBA across the complete output grid");
+      auto low_model = stage_execution_cases::Capture(gpu, low_neural.Get(), NATIVE_INPUT_STATE);
+      auto low_final = stage_execution_cases::Capture(gpu, low_decoded.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      const auto low_validity_bytes = read_buffer(low_state.validity.Get());
+      const auto low_model_bytes = low_model.Pixels();
+      const auto low_final_bytes = low_final.Pixels();
+      std::vector<uint32_t> low_validity(work_width * work_height);
+      std::memcpy(low_validity.data(), low_validity_bytes.data(), low_validity_bytes.size());
+      for (uint32_t y = 0; y < work_height; ++y) {
+        for (uint32_t x = 0; x < work_width; ++x) {
+          Check(low_validity[y * work_width + x] == (x == 1 || x == 5 ? 0u : 1u),
+                "low-grid APPLY overwrites every sentinel with its known valid or rejected edit");
+        }
+      }
+      std::array<float, 4> moved_edit;
+      std::memcpy(moved_edit.data(), low_model_bytes.data() + (work_width + 2) * 16, 16);
+      for (uint32_t channel = 0; channel < 3; ++channel) {
+        Check(std::fabs(moved_edit[channel] - encode((.125f + .0625f * channel) * std::exp2(.75f))) < 3e-5f,
+              "work (2,1) samples anchor x=3.5 with edit .75 stops, independent of output size and jitter delta");
+      }
+      Check(moved_edit[3] == .375f, "low-grid APPLY retains current encoded proxy alpha");
+      for (const size_t pixel : {size_t{0}, size_t{7}, size_t{3 * output_width + 4}}) {
+        Check(std::memcmp(low_final_bytes.data() + pixel * 16, processed.data(), 16) == 0,
+              "clamped edge, exact work center and four valid nonzero taps preserve processed RGBA");
+      }
+      // Output (0,0) clamps to work (0,0); invalid work x=1 has zero
+      // weight. Output (7,0) lands exactly on valid x=4, not invalid x=5.
+      for (const size_t pixel : {size_t{1}, size_t{8}, size_t{output_width * output_height - 1}}) {
+        Check(std::memcmp(low_final_bytes.data() + pixel * 16, low_original_values.data() + pixel * 4, 16) == 0,
+              "any invalid nonzero tap, including the output tail beyond both work extents, selects exact original RGBA");
+      }
+      Check(read_buffer(low_state.anchor.Get()) == low_anchor,
+            "low-grid APPLY and output selection never recursively rewrite the refresh anchor");
+      std::cout << "PASS edit reuse low-grid footprint: work=6x4 output=10x7 guides=4x3, jitter/MV, full validity, zero/nonzero taps, exact RGBA and immutable anchor\n";
     }
 
     {
