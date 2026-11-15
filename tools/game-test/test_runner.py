@@ -1025,29 +1025,57 @@ class ScriptBackendTests(unittest.TestCase):
             self.assertEqual(run.call_count, 2)
 
     def test_script_backend_ocr_is_limited_to_intro_and_title_before_bridge(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            session = runner.Session(dict(executable=str(root / 'game.exe'), logs=[],
-                                          control_backend='script', startup_timeout=10), root)
-            session.window = dict(pid=123, created=1, hwnd=456, path='game.exe')
-            observations = iter((dict(text='跳过'), dict(text='读取游戏 新游戏 退出游戏')))
-            with mock.patch.object(runner.desktop, 'same_process', return_value=True):
-                with mock.patch.object(runner.desktop, 'window_alive', return_value=True):
-                    with mock.patch.object(session, 'observe', side_effect=lambda *a, **k: next(observations)) as observe:
-                        with mock.patch.object(session, 'activate') as activate:
-                            with mock.patch.object(session, 'bridge_call', return_value=['ready', '1']) as bridge:
-                                with mock.patch.object(session, 'evidence'), \
-                                        mock.patch.object(session, 'event'), \
-                                        mock.patch.object(runner.desktop, 'key') as key, \
-                                        mock.patch.object(runner.time, 'sleep'):
-                                    session.main_menu(timeout=10)
-            self.assertEqual(observe.call_count, 2)
-            self.assertTrue(all(call.kwargs['script_startup'] for call in observe.call_args_list))
-            activate.assert_called_once_with()
-            key.assert_called_once_with(session.window, 'SPACE', .2, activate=True)
-            bridge.assert_called_once_with('NRNX_TestBridgeReady')
-            self.assertEqual(session.status['startup'], 'script_start_screen_confirmed')
-            self.assertEqual(session.status['script_mod_reload'], 'not_requested_predeployed_mod')
+        for title in ('读取游戏 新游戏 退出游戏',
+                      '读 取 游 戏 退 出 游 戏 游 戏 模 组 更 新 亮 点',
+                      '读取游戏 设置 游戏模组 制作人员 退出游戏'):
+            with self.subTest(title=title), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                session = runner.Session(dict(executable=str(root / 'game.exe'), logs=[],
+                                              control_backend='script', startup_timeout=10), root)
+                session.window = dict(pid=123, created=1, hwnd=456, path='game.exe')
+                observations = iter((dict(text='跳过'), dict(text=title)))
+                with mock.patch.object(runner.desktop, 'same_process', return_value=True):
+                    with mock.patch.object(runner.desktop, 'window_alive', return_value=True):
+                        with mock.patch.object(session, 'observe', side_effect=lambda *a, **k: next(observations)) as observe:
+                            with mock.patch.object(session, 'activate') as activate:
+                                with mock.patch.object(session, 'bridge_call', return_value=['ready', '1']) as bridge:
+                                    with mock.patch.object(session, 'evidence'), \
+                                            mock.patch.object(session, 'event'), \
+                                            mock.patch.object(runner.desktop, 'key') as key, \
+                                            mock.patch.object(runner.time, 'sleep'):
+                                        session.main_menu(timeout=10)
+                self.assertEqual(observe.call_count, 2)
+                self.assertTrue(all(call.kwargs['script_startup'] for call in observe.call_args_list))
+                activate.assert_called_once_with()
+                key.assert_called_once_with(session.window, 'SPACE', .2, activate=True)
+                bridge.assert_called_once_with('NRNX_TestBridgeReady')
+                self.assertEqual(session.status['startup'], 'script_start_screen_confirmed')
+                self.assertEqual(session.status['script_mod_reload'], 'not_requested_predeployed_mod')
+
+    def test_startup_title_alternatives_reject_unknown_pause_and_desktop_screens(self):
+        for backend, text in (
+                ('script', '读取游戏 设置 退出游戏'),
+                ('script', ' '.join(runner.PAUSE_MENU)),
+                ('script', '读取游戏 游戏模组 退出游戏'),
+                ('script', '读取游戏 更新亮点 制作人员 退出游戏'),
+                ('desktop', '读取游戏 游戏模组 更新亮点 退出游戏'),
+                ('desktop', '读取游戏 游戏模组 制作人员 退出游戏')):
+            with self.subTest(backend=backend, text=text), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                session = runner.Session(dict(executable=str(root / 'game.exe'), logs=[],
+                                              control_backend=backend, startup_timeout=1), root)
+                session.window = dict(pid=123, created=1, hwnd=456, path='game.exe')
+                with mock.patch.object(runner.desktop, 'same_process', return_value=True), \
+                        mock.patch.object(runner.desktop, 'window_alive', return_value=True), \
+                        mock.patch.object(session, 'observe', return_value=dict(text=text)), \
+                        mock.patch.object(session, 'bridge_call') as bridge, \
+                        mock.patch.object(session, 'evidence') as evidence, \
+                        mock.patch.object(runner.time, 'sleep'), \
+                        mock.patch.object(runner.time, 'monotonic', side_effect=[0, 0, 2]):
+                    with self.assertRaisesRegex(TimeoutError, 'main_menu_timeout'):
+                        session.main_menu(timeout=1)
+                bridge.assert_not_called()
+                evidence.assert_not_called()
 
     def test_startup_script_compilation_error_fails_immediately(self):
         with tempfile.TemporaryDirectory() as directory:

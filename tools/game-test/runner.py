@@ -571,7 +571,9 @@ class Session:
             if 'unexpected' in normalized_text and 'token_' in normalized_text:
                 self.event('script_compilation_error', ocr_text=text)
                 raise RuntimeError('script_compilation_error')
-            if '读取游戏' in text and '退出游戏' in text and '新游戏' in text:
+            if ('读取游戏' in text and '退出游戏' in text
+                    and ('新游戏' in text or (script_startup and '游戏模组' in text
+                                             and ('更新亮点' in text or '制作人员' in text)))):
                 self.ui_state = 'main_menu'
                 self.status['startup'] = ('ocr_title_confirmed_for_script_bridge' if script_startup
                                           else 'main_menu_confirmed')

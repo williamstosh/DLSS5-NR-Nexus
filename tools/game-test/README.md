@@ -1,12 +1,14 @@
 # 巫师3本地测试入口
 
-本入口支持 Steam／巫师3 DX12。默认用游戏脚本桥操作标题菜单、精确加载存档及正常退出；runner 在受保护会话中临时部署本仓库的 source-only bridge Mod，使用 -net -debugscripts 与本机 loopback 调试端口通信。现有存档／配置保护、进程归属、崩溃检查、恢复流程继续复用。它不是通用游戏驱动，不包含悟空无人选档。
+本入口支持 Steam／巫师3 DX12。自动启动先用 OCR 确认片头／标题主菜单，再通过游戏脚本桥精确加载存档及正常退出；runner 在受保护会话中临时部署本仓库的 source-only bridge Mod，使用 -net -debugscripts 与本机 loopback 调试端口通信。现有存档／配置保护、进程归属、崩溃检查、恢复流程继续复用。它不是通用游戏驱动，不包含悟空无人选档。
 
 客户端连接 `127.0.0.1:37001`；已验证的游戏调试服务监听 `0.0.0.0:37001`，外部可达范围取决于现有防火墙设置。调试服务随本次所属游戏进程退出而结束。
 
-默认 smoke／menu／calibrate 不建 OCR，也不以鼠标或键盘导航游戏菜单。Smoke 必须每轮传 -Save 和当前存档文件名；游戏通过 ListSavedGames 按唯一完整文件名载入，runner 先核对该存档 SHA-256，再连续两次确认 GetLoadGameProgress 非错误且玩家对象有效，才记为游戏态就绪。菜单退出调用游戏 API 并等待所属进程退出。需要 CaptureScript 捕获桌面时，采集边界仍核对 HWND、PID、创建时间、路径和真实前台；只在采集要求下激活窗口。确定性脚本错误立即失败，不拖到整段超时；默认自动重试为 0。
+默认 smoke／menu／calibrate 在启动阶段构建并使用 OCR，选档和退出不以鼠标或键盘导航。标题确认保留“读取游戏／退出游戏／新游戏”组合；脚本后端遇到浮层遮挡“新游戏”时，也接受“读取游戏／退出游戏／游戏模组”及“更新亮点”或“制作人员”的组合，随后仍核对脚本桥回执。未知界面和普通暂停菜单不会仅凭桥能响应就算标题就绪。
 
-代码桥接会等待游戏标题菜单可用，但不会跳过启动片头。与本机 Witcher 3 5.00 匹配的 Skip Intro Movies - Remastered 尚未在本机安装或实测；没有该验证时，不能把片头已跳过作为测试能力。
+Smoke 必须每轮传 -Save 和当前存档文件名；游戏通过 ListSavedGames 按唯一完整文件名载入，runner 先核对该存档 SHA-256，再连续两次确认 GetLoadGameProgress 非错误且玩家对象有效，才记为游戏态就绪。菜单退出调用游戏 API 并等待所属进程退出。首次启动观察／输入及 CaptureScript 采集边界均核对 HWND、PID、创建时间、路径和真实前台。确定性脚本错误立即失败，不拖到整段超时；默认自动重试为 0。
+
+片头跳过只使用实际识别到的“跳过”提示及现有 Space 输入；没有提示时继续在原预算内等待，不安装或依赖强制跳过片头的 Mod。
 
 两个 PowerShell 入口接受 `-CaptureScript 指向 tools/ 或 tmp/ 下的 Python 脚本`，同时指定非零 `-CaptureHoldSeconds`。入口在安装前校验参数，普通桌面上下文重启保留该绝对路径。runner 预检记录脚本 SHA256，在 `CAPTURE_READY` 后复核并仅启动一次，调用形式为同一 Python 的 `-B <脚本> <本次运行目录>`，输出写 `automatic-capture.log`。该选项不能与 `ManualImeSession` 或 `InstallOnly` 搭配。
 
@@ -138,7 +140,7 @@ with (run / 'actions.jsonl').open('a', encoding='utf-8') as journal:
 
 多显示环境可同时配置 `expected_hdr_adapter_luid`（查询返回的16位十六进制字符串）和 `expected_hdr_target_id`（JSON uint32 整数）。入口只接受唯一匹配该身份的 active 对象，并继续核对 `expected_hdr_monitor` 精确名称与 HDR enabled；不按同名对象的顺序猜测。仅配置一个字段、身份缺失／不匹配、重复身份或 HDR 未启用均在安装前拒绝。两字段省略或均为 null 时，保留原有“恰好一个 active 输出”的检查。先只读确认物理输出映射，再填写本地配置；该选择不会改变系统显示设置。
 
-需要 Python 3（含 Pillow）、PowerShell 7、已登录的 Steam；桌面采集另需可交互的 Windows 桌面。通过 -Python 明确传入解释器，不依赖 WindowsApps 占位命令。默认脚本后端不需要 OCR；HDR 查询工具使用 MSVC 14.44／SDK 26100，不随源码分发其生成 EXE。
+需要 Python 3（含 Pillow）、PowerShell 7、已登录的 Steam，以及供启动识别和采集使用的可交互 Windows 桌面。通过 -Python 明确传入解释器，不依赖 WindowsApps 占位命令。自动启动使用入口构建的 OCR 工具；HDR 查询工具使用 MSVC 14.44／SDK 26100，不随源码分发其生成 EXE。
 
 Windows 入口会在替换安装文件前，通过合成文件的最终句柄路径检查 AppData 是否被应用环境重定向。发生重定向时，整个入口从当前用户的普通桌面上下文重新运行；备份、游戏启动、存档保护和恢复继续处于同一上下文。验证失败会拒绝安装，不以包身份查询或日志中的逻辑路径代替实际落点检查。该流程不改变插件保存路径、系统配置或宿主，启动输出仍实时转发给原采集流程。
 
