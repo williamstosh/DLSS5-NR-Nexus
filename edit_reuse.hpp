@@ -70,7 +70,7 @@ struct State {
   Microsoft::WRL::ComPtr<ID3D12Resource> validity;
   Microsoft::WRL::ComPtr<ID3D12Resource> composed_motion;
   std::vector<Binding> bindings;
-  std::array<uint64_t, 38> contract{};
+  std::array<uint64_t, 40> contract{};
   uint32_t width = 0;
   uint32_t height = 0;
   uint32_t output_width = 0;

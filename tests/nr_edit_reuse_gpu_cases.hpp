@@ -51,6 +51,29 @@ NVSDK_NGX_Result NVSDK_CONV NeutralModel(ID3D12GraphicsCommandList* list, const 
   return result;
 }
 
+NVSDK_NGX_Result NVSDK_CONV ConstantModel(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle,
+    const NVSDK_NGX_Parameter* parameters, PFN_NVSDK_NGX_ProgressCallback callback) {
+  const auto result = EvaluateModel(list, handle, parameters, callback);
+  if (NVSDK_NGX_FAILED(result)) return result;
+  auto* output = native::GetD3D12Resource(parameters, "DLSSNR.Output");
+  const auto desc = output->GetDesc();
+  Check(list == model_gpu->list.Get() && desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT,
+        "constant model records encoded FP16 pixels into the current fixture list");
+  const std::array<uint16_t, 4> encoded{
+      DirectX::PackedVector::XMConvertFloatToHalf(.85f), DirectX::PackedVector::XMConvertFloatToHalf(.75f),
+      DirectX::PackedVector::XMConvertFloatToHalf(.9f), DirectX::PackedVector::XMConvertFloatToHalf(.875f)};
+  std::vector<uint16_t> pixels(static_cast<size_t>(desc.Width) * desc.Height * 4);
+  for (size_t pixel = 0; pixel < pixels.size() / 4; ++pixel) {
+    std::copy(encoded.begin(), encoded.end(), pixels.begin() + pixel * 4);
+  }
+  auto transfer = model_gpu->CreateTextureTransfer(output);
+  native::Transition(list, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+  model_gpu->UploadTexture(output, transfer, reinterpret_cast<const uint8_t*>(pixels.data()),
+      pixels.size() * sizeof(uint16_t), static_cast<UINT>(desc.Width) * 8);
+  native::Transition(list, output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  return result;
+}
+
 int Run() {
   ComPtr<ID3D12InfoQueue> info;
   try {
@@ -755,6 +778,152 @@ int Run() {
                 && native::features.at(owner).slots[0].edit_reuse == fresh_anchor
                 && fresh_anchor->anchor_generation == fresh_generation,
             "the retained disabled Session permits one reuse with zero model calls and no recursive recapture");
+    }
+    {
+      Check(!native::edit_reuse_adaptive_experiment.load(), "two-tier edit reuse experiment defaults to disabled");
+      const auto saved_levels = native::nr_adaptive_selected_levels.load();
+      const auto saved_minimum = native::nr_adaptive_min_scale.load();
+      native::nr_adaptive_selected_levels = 2;
+      native::nr_adaptive_min_scale = .75f;
+      native::edit_reuse_adaptive_experiment = true;
+      native::nr_adaptive_enabled = true;
+      native::direct_api.evaluate = ConstantModel;
+      native::intensity = 1.f;
+      for (size_t pixel = 0; pixel < source_values.size() / 4; ++pixel) {
+        source_values[pixel * 4] = DirectX::PackedVector::XMConvertFloatToHalf(.25f);
+      }
+      upload(source.Get(), source_values, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 8);
+      submit_commands("two-tier source upload");
+      uint64_t active_calls = 0, preparation_calls = 0;
+      model_parameter_observer = [&](const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter*) {
+        if (native::preparing_adaptive_frame != nullptr) {
+          ++preparation_calls;
+          Check(native::features.at(owner).slots[0].edit_reuse == nullptr,
+                "standby model preparation never captures or consumes an edit anchor");
+        } else {
+          ++active_calls;
+        }
+      };
+      const auto before_preparing_reuses = native::edit_reuse_reuses.load();
+      auto& feature = native::features.at(owner);
+      for (uint32_t attempt = 0; attempt < 32; ++attempt) {
+        const auto successes = native::SourceSuccessfulEvaluations();
+        const auto active_before = active_calls;
+        frame(0);
+        Check(native::SourceSuccessfulEvaluations() - successes == active_calls - active_before,
+              "standby preparation contributes no successful source frames");
+        if (feature.adaptive_session != nullptr && feature.adaptive_session->prepared) break;
+      }
+      model_parameter_observer = {};
+      auto tiers = feature.adaptive_cache;
+      Check(tiers != nullptr && tiers->count == 2 && tiers->active == 0 && feature.adaptive_session->prepared
+                && tiers->tiers[0].ready && tiers->tiers[1].ready && preparation_calls > 0,
+            "the real adaptive path prepares exactly two independent model histories");
+      Check(tiers->ladder.sizes[1][0].width == 12 && tiers->ladder.sizes[1][0].height == 12,
+            "the prepared low tier uses a noninteger 12-to-16 Resolve ratio");
+      Check(native::edit_reuse_reuses.load() == before_preparing_reuses,
+            "the bounded preparation interval never reuses an edit before both tiers are ready");
+      const auto models = native::nr_features_created;
+      const auto allocations = native::worksets_created;
+      const auto upper_model = feature.slots[0].handle;
+      const auto lower_model = tiers->tiers[1].state.slots[0].handle;
+      Check(upper_model != lower_model, "ready tiers retain distinct model histories");
+      parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, .25f);
+      parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, -.375f);
+      uint32_t checked_frames = 0;
+      const auto checked_frame = [&](int reset, uint32_t calls) {
+        const auto successes = native::SourceSuccessfulEvaluations();
+        const auto actual_calls = frame(reset);
+        ++checked_frames;
+        if (actual_calls != calls || native::SourceSuccessfulEvaluations() != successes + 1) {
+          std::cerr << "Two-tier frame=" << checked_frames << " slot=" << tiers->active
+              << " reset=" << reset << " model_calls=" << actual_calls << " expected=" << calls
+              << " source_successes=" << native::SourceSuccessfulEvaluations() - successes
+              << " models=" << native::nr_features_created - models
+              << " worksets=" << native::worksets_created - allocations << '\n';
+        }
+        Check(actual_calls == calls && native::SourceSuccessfulEvaluations() == successes + 1,
+              "each prepared source frame succeeds once, including zero-model-call reuse");
+      };
+      const auto capture_output = [&] {
+        auto capture = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        submit_commands("two-tier final output readback");
+        return capture.Pixels();
+      };
+      checked_frame(1, 1);
+      std::weak_ptr<reuse::State> upper_anchor = feature.slots[0].edit_reuse;
+      checked_frame(0, 0);
+      feature.adaptive_session->Request(1, native::SteadyNowNs());
+      checked_frame(0, 1);
+      Check(tiers->active == 1 && feature.slots[0].handle == lower_model && model_resets.back() == 1
+                && upper_anchor.expired() && tiers->tiers[0].state.slots[0].edit_reuse == nullptr,
+            "upper-to-lower activation resets the existing model and retires the departed anchor");
+      auto low_anchor = feature.slots[0].edit_reuse;
+      Check(low_anchor != nullptr && low_anchor->width == 12 && low_anchor->height == 12
+                && low_anchor->output_width == 16 && low_anchor->output_height == 16,
+            "production recording uses working N and output O for the low-grid edit cache");
+      const auto lower_refresh = capture_output();
+      const auto lower_anchor_bytes = read_buffer(low_anchor->anchor.Get());
+      std::vector<float> occluded_depth(16 * 16, .5f);
+      for (uint32_t y = 0; y < 16; ++y) {
+        for (uint32_t x = 12; x < 16; ++x) occluded_depth[y * 16 + x] = .9f;
+      }
+      upload(wrapper_depth.Get(), occluded_depth, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 4);
+      submit_commands("two-tier occlusion upload");
+      checked_frame(0, 0);
+      const auto lower_reuse = capture_output();
+      Check(read_buffer(low_anchor->anchor.Get()) == lower_anchor_bytes,
+            "the low-grid full Resolve path never recaptures its reused anchor");
+      constexpr size_t stable_pixel = 7 * 16 + 7;
+      bool nonneutral = false;
+      for (uint32_t channel = 0; channel < 4; ++channel) {
+        uint16_t refreshed, reused;
+        std::memcpy(&refreshed, lower_refresh.data() + (stable_pixel * 4 + channel) * 2, 2);
+        std::memcpy(&reused, lower_reuse.data() + (stable_pixel * 4 + channel) * 2, 2);
+        const float reference = DirectX::PackedVector::XMConvertHalfToFloat(refreshed);
+        const float actual = DirectX::PackedVector::XMConvertHalfToFloat(reused);
+        Check(std::fabs(reference - actual) < .003f,
+              "actual low-grid Resolve/Commit/writeback preserves the refreshed edit in the valid interior");
+        if (channel < 3) nonneutral |= std::fabs(reference
+            - DirectX::PackedVector::XMConvertHalfToFloat(source_values[stable_pixel * 4 + channel])) > .05f;
+      }
+      Check(nonneutral, "the full-chain low-grid witness contains a visible non-neutral edit");
+      for (uint32_t y = 0; y < 16; ++y) {
+        for (uint32_t x = 12; x < 16; ++x) {
+          const size_t pixel = y * 16 + x;
+          Check(std::memcmp(lower_reuse.data() + pixel * 8, source_values.data() + pixel * 4, 8) == 0,
+                "the full output occlusion strip restores original source RGBA exactly after Resolve and Commit");
+        }
+      }
+      checked_frame(0, 1);
+      checked_frame(0, 0);
+      std::weak_ptr<reuse::State> retired_lower = low_anchor;
+      low_anchor.reset();
+      feature.adaptive_session->Request(0, native::SteadyNowNs());
+      checked_frame(0, 1);
+      Check(tiers->active == 0 && feature.slots[0].handle == upper_model && model_resets.back() == 1
+                && retired_lower.expired() && tiers->tiers[1].state.slots[0].edit_reuse == nullptr,
+            "returning to the upper ready tier resets history and cannot resurrect the old low-grid edit");
+      checked_frame(0, 0);
+      Check(native::nr_features_created == models && native::worksets_created == allocations,
+            "upper/lower/upper reuse creates no additional model or adaptive workset");
+      native::edit_reuse_adaptive_experiment = false;
+      const auto reuses = native::edit_reuse_reuses.load();
+      checked_frame(0, 1);
+      checked_frame(0, 1);
+      Check(feature.slots[0].edit_reuse == nullptr && native::edit_reuse_reuses.load() == reuses,
+            "disabling the private experiment restores the unchanged per-frame adaptive admission");
+      native::nr_adaptive_enabled = false;
+      native::nr_adaptive_selected_levels = saved_levels;
+      native::nr_adaptive_min_scale = saved_minimum;
+      native::direct_api.evaluate = NeutralModel;
+      parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, 0.f);
+      parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, 0.f);
+      upload(wrapper_depth.Get(), std::vector<float>(16 * 16, .5f), NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 4);
+      submit_commands("restore normal guide input");
+      Check(frame(1) == 1, "leaving the two-tier experiment returns to the existing fixed-size refresh");
+      std::cout << "PASS edit reuse two ready tiers: actual low-grid Resolve/Commit/writeback, nonzero jitter, exact occlusion RGBA,"
+                   " one reuse, source clock, separate preparation counts and retired anchors; evidence=WARP+MOCK\n";
     }
     Check(frame(1, false) == 1, "record a refresh without submitting its GPU commands");
     const auto discarded = submission::ObserveRecording(gpu.list.Get());

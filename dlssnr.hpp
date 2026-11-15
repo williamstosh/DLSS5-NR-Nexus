@@ -2644,6 +2644,8 @@ inline std::atomic_bool edit_trace_enabled = defaults::kEditTrace;
 // look (and the trace) stay off for the session, NR runs on without them.
 inline std::atomic_bool look_unavailable = false;
 inline std::atomic_bool edit_reuse_enabled{false};
+// Internal two-ready-tier contract probe; no settings or runtime-control entry.
+inline std::atomic_bool edit_reuse_adaptive_experiment{false};
 inline std::atomic_bool xefg_gpu_capture_enabled{false};
 inline std::atomic_uint64_t edit_reuse_refreshes{0};
 inline std::atomic_uint64_t edit_reuse_reuses{0};
@@ -11721,6 +11723,20 @@ inline uint32_t AdaptiveOutputCount(FeatureState* feature, const NVSDK_NGX_Handl
 inline void ActivateAdaptiveTier(FeatureState* feature, size_t slot, bool reset_history = true) {
   const auto cache = feature->adaptive_cache;
   if (cache == nullptr || cache->active == slot) return;
+  const uint64_t sr_sequence = feature->sr_sequence;
+  // A parked tier cannot retain an edit from an earlier source frame. This
+  // also closes an edit-bearing tier during temporary preparation switches;
+  // ordinary model histories keep reset_history=false's existing behavior.
+  for (auto* state : {feature, &cache->tiers[slot].state}) {
+    for (auto& model : state->slots) {
+      if (model.edit_reuse == nullptr) continue;
+      retired_nr_features.push_back(RetiredNrFeature{
+          .generation = present_generation, .tracker_proof = true, .edit_reuse = std::move(model.edit_reuse)});
+      nr_retirement_pending.store(true, std::memory_order_relaxed);
+      model.pending_reset = true;
+      model.pending_reset_reasons |= kResetDimensions;
+    }
+  }
   const auto session = feature->adaptive_session;
   const auto outputs = feature->adaptive_outputs;
   const auto output_geometry = feature->adaptive_output_geometry;
@@ -11731,6 +11747,7 @@ inline void ActivateAdaptiveTier(FeatureState* feature, size_t slot, bool reset_
   std::swap(*feature, cache->tiers[cache->active].state);
   std::swap(*feature, cache->tiers[slot].state);
   cache->active = slot;
+  feature->sr_sequence = sr_sequence;
   feature->adaptive_cache = cache;
   feature->adaptive_session = session;
   feature->adaptive_outputs = outputs;
@@ -12036,6 +12053,7 @@ inline void SelectAdaptiveTier(FeatureState* feature, const NVSDK_NGX_Handle* ha
     cache.ladder = session->ladder;
     cache.active = 0;
     std::swap(*feature, cache.tiers[0].state);
+    feature->sr_sequence = source.sr_sequence;
     feature->adaptive_cache = cache_owner;
     feature->adaptive_session = session;
     feature->adaptive_outputs = source.adaptive_outputs;
@@ -13575,14 +13593,11 @@ inline bool RecordInline(
       && output_desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM
       && present->units.encoding == codec::Encoding::Pq && present->units.absolute
       && present->units.unit_nits == 10000.f && present->units.bt2020 && present->hdr_encoding == 4u;
-  const uint64_t edit_reuse_sequence = (present != nullptr ? present->xefg_edit_reuse_frame : feature.sr_sequence);
-  const bool edit_reuse_route_eligible = edit_reuse_requested && (edit_reuse_inline_route || edit_reuse_xefg_route)
+  const bool edit_reuse_contract_eligible = edit_reuse_requested && (edit_reuse_inline_route || edit_reuse_xefg_route)
       && !plan.mixed && group.begin == 0 && requested_stack == 1
-      && !nr_adaptive_enabled.load() && !adaptive.enabled && !adaptive.preparing
       && !D3D11OnlySession() && !direct_api.borrowed_core_context
       && !control_mask_requested && !look_mode.load() && detail_stability.load() == 1u
-      && preset.load() == 2u
-      && !nr_follow_input_res.load() && nr_input_width == width && nr_input_height == height
+      && preset.load() == 2u && !nr_follow_input_res.load()
       && ((hdr_mode == 1 && output_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) || edit_reuse_hdr10)
       && (output_desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0
       && output_rect.x == 0 && output_rect.y == 0 && width == output_desc.Width && height == output_desc.Height
@@ -13603,6 +13618,30 @@ inline bool RecordInline(
       && current.motion_scale_x != 0.f && current.motion_scale_y != 0.f
       && motion_scale_x_multiplier.load() == 1.f && motion_scale_y_multiplier.load() == 1.f
       && nr_model::SupportsControlMask(direct_runtime_requirements.file_version);
+  const auto& edit_tiers = feature.adaptive_cache;
+  // Establish the same ordered-history provenance while both tiers prepare.
+  // Otherwise the first x2 frame must discard their unguarded ready objects.
+  const bool edit_reuse_adaptive_contract = edit_reuse_contract_eligible
+      && edit_reuse_adaptive_experiment.load(std::memory_order_relaxed)
+      && edit_reuse_inline_route && bridge_source == nullptr && execution_stage == stage_plan::Stage::UPSCALED
+      && nr_adaptive_enabled.load() && adaptive.enabled
+      && adaptive.session != nullptr && adaptive.session == feature.adaptive_session && !adaptive.session->failed
+      && !nr_adaptive_limited_residency.load() && !adaptive.session->settings.limited_residency
+      && !adaptive.session->settings.legacy_preparation && adaptive_feature_mode.load() == AdaptiveFeatureMode::OFF
+      && nr_adaptive_selected_levels.load() == 2 && adaptive.session->settings.selected_levels == 2
+      && adaptive.session->ladder.count == 2 && adaptive.output_count == 1
+      && edit_tiers != nullptr && edit_tiers->count == 2 && edit_tiers->ladder.count == 2
+      && edit_tiers->output_count == 1 && !edit_tiers->pre_sr
+      && !edit_tiers->failed && !edit_tiers->budget_blocked && !edit_tiers->standby_retired
+      && edit_tiers->identity == adaptive.layout_identity && edit_tiers->preparation_epoch == adaptive.preparation_epoch
+      && edit_tiers->active == adaptive.slot && nr_input_width <= width && nr_input_height <= height;
+  const bool edit_reuse_adaptive_route = edit_reuse_adaptive_contract && adaptive.session->prepared
+      && edit_tiers->tiers[0].ready && edit_tiers->tiers[1].ready
+      && AdaptiveTierUsable(*edit_tiers, *adaptive.session, 0) && AdaptiveTierUsable(*edit_tiers, *adaptive.session, 1);
+  const uint64_t edit_reuse_sequence = (present != nullptr ? present->xefg_edit_reuse_frame : feature.sr_sequence);
+  const bool edit_reuse_route_eligible = edit_reuse_contract_eligible && !adaptive.preparing && !prepare_models_only
+      && ((!nr_adaptive_enabled.load() && !adaptive.enabled && nr_input_width == width && nr_input_height == height)
+          || edit_reuse_adaptive_route);
   if (edit_reuse_requested && !edit_reuse_route_eligible) ++edit_reuse_fallbacks;
   const auto retire_edit_reuse = [&] {
     auto& slot = feature.slots[0];
@@ -13618,7 +13657,7 @@ inline bool RecordInline(
   if (!edit_reuse_route_eligible) retire_edit_reuse();
   const uint32_t history_slot = (feature.adaptive_cache != nullptr
       ? static_cast<uint32_t>(feature.adaptive_cache->active) : 0u);
-  const bool track_control_mask_history = control_mask_eligible || edit_reuse_route_eligible
+  const bool track_control_mask_history = control_mask_eligible || edit_reuse_route_eligible || edit_reuse_adaptive_contract
       || feature.control_mask_recording != nullptr || feature.control_mask_stream != nullptr;
   if (track_control_mask_history) {
     const auto current_recording = submission::RecordingIdentity(command_list);
@@ -13700,7 +13739,7 @@ inline bool RecordInline(
       // is established on the actual submitting queues, without waiting for Reset.
       ready &= ordered_source
           && control_mask_execution::BeginRecording(feature.control_mask_stream, command_list);
-    } else if (ready && ordered_source && (control_mask_eligible || edit_reuse_route_eligible)) {
+    } else if (ready && ordered_source && (control_mask_eligible || edit_reuse_route_eligible || edit_reuse_adaptive_contract)) {
       // Adopt only after the old path's exact provenance has settled. This
       // also prevents enabling the mask from borrowing untracked old History.
       feature.control_mask_stream = control_mask_execution::CreateStream(device);
@@ -14433,7 +14472,7 @@ inline bool RecordInline(
   // chain's resets across two epochs.
   const uint64_t chain_reset_epoch =
       history_reset_epoch.load(std::memory_order_relaxed);
-  std::array<uint64_t, 38> edit_contract{};
+  std::array<uint64_t, 40> edit_contract{};
   if (edit_reuse_route_eligible) {
     edit_contract = {configuration_generation.load(), chain_reset_epoch, feature.source_generation,
         width, height, frame.motion_width, frame.motion_height, frame.create_flags, preset.load(), style.load(),
@@ -14449,9 +14488,10 @@ inline bool RecordInline(
         (present != nullptr ? present->restore_config_epoch : 0u),
         (present != nullptr ? std::bit_cast<uint32_t>(frame_divisor) : 0u),
         (present != nullptr ? static_cast<uint32_t>(frame.ui_correction) : 0u),
-        static_cast<uint32_t>(output_desc.Format), hdr_mode, v6_encoding};
+        static_cast<uint32_t>(output_desc.Format), hdr_mode, v6_encoding, nr_input_width, nr_input_height};
     if (auto& cache = feature.slots[0].edit_reuse; cache != nullptr) {
-      if (cache->width != width || cache->height != height || cache->motion_width != frame.motion_width
+      if (cache->width != nr_input_width || cache->height != nr_input_height
+          || cache->output_width != width || cache->output_height != height || cache->motion_width != frame.motion_width
           || cache->motion_height != frame.motion_height) {
         retire_edit_reuse();
       } else if (cache->contract != edit_contract || cache->source_sequence + 1 != edit_reuse_sequence
@@ -14714,7 +14754,7 @@ inline bool RecordInline(
       // Real SR edge calibration maps pixelCenter - API jitter to the
       // unjittered output: guide lookup therefore adds the API jitter.
       // Motion values remain physical displacements, with no jitter term.
-      edit_inputs = {.width = width, .height = height,
+      edit_inputs = {.width = nr_input_width, .height = nr_input_height, .output_width = width, .output_height = height,
           .motion_width = frame.motion_width, .motion_height = frame.motion_height,
           .motion_scale_x = frame.motion_scale_x, .motion_scale_y = frame.motion_scale_y,
           .raster_offset_x = frame.jitter_x, .raster_offset_y = frame.jitter_y,
