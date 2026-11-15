@@ -314,7 +314,7 @@ SDK 动态计数、固定倍率失效和来源切换。配置保存／方案另�
 
 `adaptive-fg-service` 使用 WARP、模型替身和实际 Service／提交路径，覆盖双颜色双 Pass 的完整所选集合、5 档切回默认、缺输入暂停／恢复及真实合同变化。`adaptive-inline` 使用生产 Render／Upscaled 入口，覆盖 64×64 输入的 15 档／两输出、真实尺寸及写回、准备完成后的切档零新增分配、旧 Stage 工作集归属和清锁恢复。两者还核对临时容量占用、ControlMask 未提交、Off／On、兼容设置复用及失败停止。未提交旧录制阻止槽位复用，额外准备 Evaluate 不计入活动角色成功累计；角色计数与完整 Pass／颜色组完成分开。均为 WARP＋MOCK，不调用硬件 NR Runtime 或游戏。
 
-默认 `-Suite fg-native` 会复用同一编译产物，分别在独立进程执行这两个自适应用例；默认 `-Suite ui` 也会复用菜单二进制，在独立进程执行自适应真实 ImGui 交互，包括三种介入点连续往返与配置保存。CI 的 `-Suite all -SoftwareOnly` 沿用这些入口；`NR_NEXUS_ADAPTIVE_UI_ONLY=1` 仍可单独运行自适应 UI，快照模式不额外运行回归。
+默认 `-Suite fg-native` 会复用同一编译产物，分别在独立进程执行这两个自适应用例；默认 `-Suite ui` 也会复用菜单二进制，在独立进程执行自适应真实 ImGui 交互，包括三种介入点连续往返与配置保存。本地完整发布预检保留这些入口；远端核心回归保留 FG 默认组，UI 全量检查由本地初审承担。`NR_NEXUS_ADAPTIVE_UI_ONLY=1` 仍可单独运行自适应 UI，快照模式不额外运行回归。
 
 真实 NR 尺寸往返复用公开 SDK 预初始化入口：
 
@@ -460,6 +460,10 @@ Feature18 Create／Evaluate 并发安全；结束后恢复环境变量。
 其余五阶段、参考输入和测量方法不变，用于单独核对物理资源布局的兼容性。
 
 ## 自动回归与证据保存
+
+GitHub 分支 CI 使用 [`ci-core.ps1`](../ci-core.ps1)：保留核心 CPU／配置／生命周期检查、FG 的五个默认组，以及复用同一 EXE、在独立进程执行的 pre-FG 异尺寸与复制链回归。完整本地发布初审继续使用 `run-release-preflight.ps1`，不因远端精简删减。远端产物为 `core-regression-<attempt>`（检查结果与失败日志）和 `windows-x64-<attempt>`（安装包及 SHA-256）。
+
+`main` 的 [`ci-evidence.ps1`](../ci-evidence.ps1) 仅复用完整 Git 根 tree 相同的成功核心记录，依赖锁、工具锁和 workflow 均包含在 tree 中；找不到或状态不符则执行核心验证。Tag 必须先取得同身份成功核心证据，再重新构建 Publishing 并通过 [`check-publishing.ps1`](../check-publishing.ps1) 核对 DEV-OFF 编译命令、诊断标记、版本、包白名单与哈希，不重跑完整测试。原始 run／源码／tree 及复用来源显示在 Actions summary。
 
 ~~~powershell
 python -m unittest discover -s tests -p 'test_offline_*.py' -v

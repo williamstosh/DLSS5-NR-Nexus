@@ -3,6 +3,11 @@ name: Build Windows x64
 on:
   workflow_call:
     inputs:
+      run_core:
+        description: Run independent CPU and WARP core regression
+        required: false
+        default: true
+        type: boolean
       expected_tag:
         description: Exact release tag; empty for build-only validation
         required: false
@@ -46,45 +51,30 @@ jobs:
         run: ./tools/setup-build-tools.ps1
       - name: Prepare pinned RenoDX host and dependencies
         run: ./tools/setup-host.ps1
-      - name: Prepare pinned offline CPython 3.12.14 x64
-        id: offline-python
+      - name: Build clean Publishing Release x64
         run: |
-          $python = ./tools/offline/setup-python.ps1
-          "python=$python" >> $env:GITHUB_OUTPUT
-      - name: Build Release x64
-        run: ./tools/build.ps1 -ToolRoot .local/shader-tools -Configuration Release
-      - name: Build E0 Replay backend
-        run: ./tools/offline/build.ps1 -Backend replay -OutputDirectory tmp/offline/ci-replay-build
-      - name: Run offline Python contracts and real WARP Replay tests
-        env:
-          NR_NEXUS_PYTHON: ${{ steps.offline-python.outputs.python }}
+          if (Test-Path -LiteralPath build) { throw 'Publishing requires a fresh build directory.' }
+          ./tools/build.ps1 -ToolRoot .local/shader-tools -Configuration Release
+      - name: Run independent core regression
+        if: ${{ inputs.run_core }}
         run: |
-          pwsh -NoProfile -File tools/offline/test.ps1 -PythonPath "$env:NR_NEXUS_PYTHON" -TestSet all -ReplayBackendExe tmp/offline/ci-replay-build/offline_replay_tests.exe -Adapter warp *>&1 | Tee-Object -FilePath tmp/offline/ci-python-tests.log
-          exit $LASTEXITCODE
-      - name: Upload offline WARP results and failure logs
-        if: ${{ always() }}
+          ./tests/run-ci-evidence-tests.ps1
+          ./tests/run-ci-publishing-tests.ps1
+          ./tools/ci-core.ps1 -OutputDirectory tmp/ci-tests/core
+      - name: Upload core results and failure logs
+        if: ${{ always() && inputs.run_core }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: offline-warp-${{ github.run_attempt }}
-          path: tmp/offline/
+          name: core-regression-${{ github.run_attempt }}
+          path: tmp/ci-tests/
           if-no-files-found: warn
           retention-days: 14
-      - name: Check repeated compiler environment initialization
-        run: ./tests/run-build-environment-tests.ps1
-      - name: Run focused tests with WARP
-        run: ./tools/run-tests.ps1 -Suite all -SoftwareOnly -OutputDirectory tmp/ci-tests
-      - name: Validate packaging gates
-        run: ./tests/run-package-tests.ps1
-      - name: Validate publication failure and retry boundaries without publishing
-        run: |
-          ./tests/run-release-notes-tests.ps1
-          ./tests/run-release-tests.ps1
-      - name: Package and verify versioned plugin archive
+      - name: Verify Publishing isolation and package
         id: package
         env:
           EXPECTED_TAG: ${{ inputs.expected_tag }}
         run: |
-          $package = ./tools/package.ps1 -ExpectedTag $env:EXPECTED_TAG
+          $package = ./tools/check-publishing.ps1 -ExpectedTag $env:EXPECTED_TAG
           "artifact_name=windows-x64-$env:GITHUB_RUN_ATTEMPT" >> $env:GITHUB_OUTPUT
           "archive_name=$([IO.Path]::GetFileName($package.ArchivePath))" >> $env:GITHUB_OUTPUT
       - name: Upload installable archive and checksum

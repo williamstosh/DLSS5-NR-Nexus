@@ -212,7 +212,7 @@ Runtime DLL、模型和游戏资源另行获取。
 
 [version.h](version.h) 定义插件版本，Git Commit 标识源码。`dev.N` 和可选的 `rc.N` 为预发布版本；
 安装以[最新正式版](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/latest)为准；较早正式版与预发布的功能变化统一查阅 [Release Notes](https://github.com/williamstosh/RenoDX-DLSSNR-Nexus/releases)。
-[CI](.github/workflows/ci.yml) 构建源码，版本 Tag 触发[发布工作流](.github/workflows/release.yml)。
+[CI](.github/workflows/ci.yml) 对开发分支执行干净构建和核心回归；`main` 仅在完整源码树（含依赖锁和工作流）一致且已有成功核心记录时复用结果。版本 Tag 触发[发布工作流](.github/workflows/release.yml)，核验同身份核心证据后重新构建，并检查版本、开发诊断隔离、安装包及 SHA-256。
 日常提交和 Actions artifacts 是开发构建。从 v0.2.1 起，Windows ZIP 附带 **NR-Nexus-Guide.html 离线玩家手册**：解压后双击，即可在浏览器阅读完整中英文 README 与指南，无需联网或 Markdown 阅读器。手册内嵌配图，游戏画面采用已审核的 SDR 静态预览；在线交互对比、下载和外部参考链接需要网络。原 README、玩家指南、配图和许可文件仍保留。已发布的 v0.2.0 安装包不变。
 
 <a id="zh-sources"></a>
@@ -457,8 +457,8 @@ DLLs, models and game assets are obtained separately.
 [version.h](version.h) defines the add-on version; Git commits identify the source.
 `dev.N` and optional `rc.N` identify pre-releases. Use the [latest stable release](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/latest) for installation;
 see [Release Notes](https://github.com/williamstosh/RenoDX-DLSSNR-Nexus/releases) for earlier stable and pre-release feature changes.
-[CI](.github/workflows/ci.yml) builds the source, and version tags trigger the
-[release workflow](.github/workflows/release.yml). Daily commits and Actions artifacts are development builds.
+[CI](.github/workflows/ci.yml) performs a clean build and core regression checks for development branches. `main` reuses successful core evidence only when the complete source tree, including dependency locks and workflows, matches. Version tags trigger the
+[release workflow](.github/workflows/release.yml), which verifies matching core evidence, rebuilds the source, and checks the version, development-diagnostic isolation, package and SHA-256. Daily commits and Actions artifacts are development builds.
 Starting with v0.2.1, Windows ZIPs include an automatically generated **NR-Nexus-Guide.html offline player guide**. Extract it and double-click to read the complete Chinese and English README and User Guide in a browser, without a connection or Markdown reader. Images are embedded, with approved static SDR previews for game scenes; online interactive comparisons, downloads and external references require a connection. The original README, User Guide, images and licenses remain included. The published v0.2.0 package is unchanged.
 
 <a id="en-sources"></a>
