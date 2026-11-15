@@ -808,8 +808,13 @@ int main(int argc, char** argv) {
       } else
 #endif
       {
-        const params::ParameterView create_view(&parameters, nullptr);
-        native::RegisterCreatedFeatureLocked(handle, native::kFeatureDlss, &create_view);
+        const auto saved_create = native::ngx11_slot_real[0].create;
+        native::ngx11_slot_real[0].create = reinterpret_cast<void*>(&MotionCreateSource);
+        source_create_result = handle;
+        const auto created = native::HookedCreateFeature11Slot<0>(context.Get(), native::kFeatureDlss, &parameters, &handle);
+        native::ngx11_slot_real[0].create = saved_create;
+        Check(NVSDK_NGX_SUCCEED(created) && native::create_contracts.contains(handle),
+            "mock SDK uses the production D3D11 Create hook to capture the source device identity");
       }
       const auto frame = [&](bool wait_gpu = true, const char* phase = "preparing") {
         ++native::present_generation;
@@ -908,7 +913,91 @@ int main(int argc, char** argv) {
           }
         }
       };
-      mature();
+      if (adaptive_hardware) {
+        mature();
+      } else {
+        namespace receipt_adapter = xefg::internal;
+        // Real WARP COM identities and production source observer, with only
+        // the XeFG SDK calls/proxy-hook installation boundary mocked.
+        ComPtr<IDXGISwapChain1> receipt_swapchain;
+        const DXGI_SWAP_CHAIN_DESC1 description{.Width = 8, .Height = 8, .Format = DXGI_FORMAT_R8G8B8A8_UNORM,
+            .SampleDesc = {1, 0}, .BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT, .BufferCount = 2,
+            .SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, .AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED};
+        Check(SUCCEEDED(factory->CreateSwapChainForComposition(device.Get(), &description, nullptr, &receipt_swapchain)),
+            "WARP creates the D3D11 application/proxy swapchain used for identity observation");
+        ComPtr<IDXGISwapChain3> receipt_swapchain3;
+        Check(SUCCEEDED(receipt_swapchain.As(&receipt_swapchain3)), "WARP proxy supports the existing SDK boundary");
+        struct ReceiptCleanup {
+          std::array<void*, receipt_adapter::EXPORTS.size()> real = receipt_adapter::modules[0].real;
+          bool complete = receipt_adapter::modules[0].complete;
+          receipt_adapter::ProxySlot proxy = receipt_adapter::proxies[0];
+          xefg::BridgeSourceObserver observer = receipt_adapter::bridge_source_observer.load();
+          bool native_off = native::native_fg_public_off.load();
+          void* handle = reinterpret_cast<void*>(uintptr_t{0xEFAD});
+          ~ReceiptCleanup() {
+            {
+              std::unique_lock lock(receipt_adapter::state.mutex);
+              receipt_adapter::state.contexts.erase(handle);
+            }
+            receipt_adapter::modules[0].real = real;
+            receipt_adapter::modules[0].complete = complete;
+            receipt_adapter::proxies[0] = proxy;
+            xefg::ConfigureBridgeSource(observer);
+            native::native_fg_public_off.store(native_off);
+            receipt_proxy = nullptr;
+            receipt_context_handle = nullptr;
+            receipt_source = {};
+            receipt_during_sdk = nullptr;
+            receipt_adapter::RefreshOwnership();
+          }
+        } receipt_cleanup;
+        receipt_adapter::modules[0].complete = true;
+        receipt_adapter::modules[0].real[0] = reinterpret_cast<void*>(&FakeReceiptInit);
+        receipt_adapter::modules[0].real[2] = reinterpret_cast<void*>(&FakeReceiptGetSwapchain);
+        receipt_adapter::modules[0].real[6] = reinterpret_cast<void*>(&FakeReceiptEnable);
+        receipt_adapter::proxies[0].installed = receipt_adapter::proxies[0].complete = true;
+        receipt_adapter::proxies[0].records[0].target = static_cast<uint8_t*>(
+            (*reinterpret_cast<void***>(receipt_swapchain3.Get()))[8]);
+        xefg::ConfigureBridgeSource(&native::ObserveBridgeSourceForXefg);
+        native::native_fg_public_off.store(false);
+        receipt_sdk_status = 0;
+        receipt_source_available = true;
+        receipt_proxy = receipt_swapchain.Get();
+        receipt_context_handle = receipt_cleanup.handle;
+        const auto identity11 = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(device.Get()));
+        receipt_source = native::ObserveBridgeSourceForXefg(identity11);
+        Check(receipt_source.handle == reinterpret_cast<uintptr_t>(handle)
+                  && receipt_source.generation == native::create_contracts.at(handle).source_generation,
+            "the production observer uniquely matches the live D3D11 Create source rather than the private D3D12 device");
+        const xefg::abi::Init init{.application_swapchain = receipt_swapchain.Get()};
+        Check(Hooks::Init(receipt_cleanup.handle, native::bridge.queue, &init) == 0,
+            "mock SDK Init uses the real application-swapchain callback identity capture");
+        const auto receipt_context = receipt_adapter::state.contexts.at(receipt_cleanup.handle);
+        Check(receipt_context->bridge_application_device11.Get()
+                  == native::create_contracts.at(handle).source_device11_identity.Get(),
+            "the Init callback holds the exact normalized D3D11 device identity captured at source Create");
+        receipt_during_sdk = +[] {
+          receipt_during_sdk = nullptr;
+          Hooks::Enable(receipt_context_handle, 0);
+        };
+        ComPtr<IDXGISwapChain3> observed_proxy;
+        Check(Hooks::GetSwapchain(receipt_cleanup.handle, IID_PPV_ARGS(&observed_proxy)) == 0
+                  && receipt_context->proxy_identity == receipt_adapter::Identity(receipt_swapchain.Get())
+                  && !receipt_context->bridge_proxy_ready && !xefg::QueryBridgeOff(receipt_source).available,
+            "concurrent Enable cannot discard the successful public proxy registration or accept the stale experiment declaration");
+        observed_proxy.Reset();
+        Check(Hooks::GetSwapchain(receipt_cleanup.handle, IID_PPV_ARGS(&observed_proxy)) == 0
+                  && receipt_context->bridge_proxy_device11.Get() == receipt_context->bridge_application_device11.Get(),
+            "fresh GetSwapchain captures the matching proxy D3D11 identity within the SDK callback");
+        frame();
+        Check(native::features.at(handle).adaptive_cache == nullptr && !xefg::QueryBridgeOff(receipt_source).available,
+            "default enabled=false and the stale in-flight Disable cannot activate Bridge Adaptive");
+        Check(Hooks::Enable(receipt_cleanup.handle, 0) == 0 && xefg::QueryBridgeOff(receipt_source).available,
+            "a fresh successful Disable binds the unique source before and after the actual mock SDK call");
+        mature();
+        Check(!native::native_fg_public_off.load() && native::features.at(handle).adaptive_session->prepared,
+            "the real Bridge source reaches full two-tier readiness via XeFG receipt without fabricating native SetOptions Off");
+      }
       auto& feature = native::features.at(handle);
 #if defined(NR_NEXUS_TEST_NATIVE_NGX)
       if (adaptive_native_snippet) {

@@ -1580,6 +1580,7 @@ inline bool RunBridge(ID3D11DeviceContext* context,
     const BridgeAdaptiveSource bridge_source{
         .api = capability::Api::DX11, .backend = capability::Backend::DX11_BRIDGE,
         .handle = handle, .device = bridge.device12, .list = slot.list,
+        .device11_identity = bridge_device11_identity.load(std::memory_order_acquire),
         .device_generation = bridge_adaptive_device_generation.load(std::memory_order_relaxed),
         .source_generation = (created != create_contracts.end() ? created->second.source_generation : 0),
         .shared_layout = set->layout_generation, .stage = stage_plan::Stage::UPSCALED};
@@ -2146,8 +2147,11 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedCreateFeature11Slot(
   // The create block holds D3D11 pointers; the pipeline reads it through a
   // view with no resources at all.
   const bridge::ParameterView view(parameters, nullptr);
+  Microsoft::WRL::ComPtr<ID3D11Device> device11;
+  context->GetDevice(&device11);
+  Microsoft::WRL::ComPtr<IUnknown> device11_identity = renodx::utils::directx::NativeIdentity(device11.Get());
   RuntimeLock lock(runtime_mutex);
-  RegisterCreatedFeatureLocked(*output_handle, feature, &view);
+  RegisterCreatedFeatureLocked(*output_handle, feature, &view, device11_identity.Get());
   return result;
 }
 

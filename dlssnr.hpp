@@ -467,6 +467,7 @@ struct FeatureState {
   std::shared_ptr<submission::RecordingStatus> control_mask_recording;
   std::shared_ptr<control_mask_execution::Stream> control_mask_stream;
   uint64_t source_generation = 0;
+  Microsoft::WRL::ComPtr<IUnknown> source_device11_identity;
   uint64_t sr_sequence = 0;
   bool mixed_recording_discarded = false;
   // Stage-local dimensions, normalization and slots must not alternate
@@ -1032,6 +1033,7 @@ struct BridgeAdaptiveSource {
   const NVSDK_NGX_Handle* handle = nullptr;
   ID3D12Device* device = nullptr;
   ID3D12GraphicsCommandList* list = nullptr;
+  IUnknown* device11_identity = nullptr;
   uint64_t device_generation = 0;
   uint64_t source_generation = 0;
   uint64_t shared_layout = 0;
@@ -11050,12 +11052,70 @@ inline void ResolveCreateFlags(
 // guide (render) resolution, or a 33-100% fraction of the reference
 // resolution (the DLSS output for the after path, the NGX color for pre-SR;
 // 1.0 = native).  Shared by both insertion points.
+// Caller holds runtime_mutex. A device shared by more than one live source is
+// deliberately ambiguous; a later source cannot claim an earlier SDK Disable.
+inline fg::xefg::BridgeSourceIdentity UniqueBridgeSourceLocked(uintptr_t device11) {
+  fg::xefg::BridgeSourceIdentity source{.device11 = device11};
+  if (device11 == 0) return source;
+  for (const auto& [handle, contract] : create_contracts) {
+    if (reinterpret_cast<uintptr_t>(contract.source_device11_identity.Get()) != device11) continue;
+    if (!contract.source_type_confirmed || contract.source_generation == 0 || source.handle != 0) {
+      return {.device11 = device11};
+    }
+    source.handle = reinterpret_cast<uintptr_t>(handle);
+    source.generation = contract.source_generation;
+  }
+  return source;
+}
+
+// SDK observers never hold XeFG state.mutex while taking this short snapshot.
+inline fg::xefg::BridgeSourceIdentity ObserveBridgeSourceForXefg(uintptr_t device11) noexcept {
+  RuntimeTryLock lock(runtime_mutex);
+  if (!lock.owns_lock() || shutting_down.load(std::memory_order_acquire)) return {};
+  return UniqueBridgeSourceLocked(device11);
+}
+
 inline bool BridgeAdaptiveEligible(const BridgeAdaptiveSource& source,
     ID3D12GraphicsCommandList* list, ID3D12Device* device, const NVSDK_NGX_Handle* handle,
     const stage_plan::Plan& plan) {
+  if (!bridge_adaptive_experiment.load(std::memory_order_relaxed)) return false;
   const auto created = create_contracts.find(handle);
-  return bridge_adaptive_experiment.load(std::memory_order_relaxed)
-      && source.api == capability::Api::DX11 && source.backend == capability::Backend::DX11_BRIDGE
+  bool fg_off = native_fg_public_off.load();
+  if (!fg_off) {
+    const auto unique = UniqueBridgeSourceLocked(reinterpret_cast<uintptr_t>(source.device11_identity));
+    auto evidence = fg::xefg::QueryBridgeOff(unique);
+    const bool source_matches = unique.handle == reinterpret_cast<uintptr_t>(handle)
+        && unique.generation == source.source_generation && created != create_contracts.end()
+        && created->second.source_device11_identity.Get() == source.device11_identity;
+    if (evidence.available && !source_matches) {
+      evidence.available = false;
+      evidence.reason = "bridge_source_does_not_match_disable";
+    }
+    // Bounded experiment-only evidence distinguishes missing identities from a
+    // missing SDK receipt. It is never a substitute for successful SetEnabled.
+    static fg::xefg::BridgeOffEvidence previous;
+    static fg::xefg::BridgeSourceIdentity previous_source;
+    static uint32_t logs = 0;
+    if (logs < 12 && (!(previous == evidence) || previous_source != unique)) {
+      ++logs;
+      previous = evidence;
+      previous_source = unique;
+      std::ostringstream text;
+      text << "Bridge Adaptive XeFG Off receipt available=" << evidence.available << " reason=" << evidence.reason
+           << " source=" << reinterpret_cast<const void*>(unique.handle) << " source_generation=" << unique.generation
+           << " source_device11=" << reinterpret_cast<const void*>(unique.device11)
+           << " context=" << reinterpret_cast<const void*>(evidence.context)
+           << " proxy=" << reinterpret_cast<const void*>(evidence.proxy)
+           << " application_device11=" << reinterpret_cast<const void*>(evidence.application_device11)
+           << " proxy_device11=" << reinterpret_cast<const void*>(evidence.proxy_device11)
+           << " receipt_source=" << reinterpret_cast<const void*>(evidence.source.handle)
+           << " receipt_source_generation=" << evidence.source.generation
+           << " declaration=" << evidence.declaration << " epoch=" << evidence.epoch;
+      Log(reshade::log::level::info, text.str());
+    }
+    fg_off = evidence.available;
+  }
+  return source.api == capability::Api::DX11 && source.backend == capability::Backend::DX11_BRIDGE
       && source.handle == handle && source.list == list && source.device == device
       && source.device_generation != 0 && source.device_generation == bridge_adaptive_device_generation.load()
       && source.shared_layout != 0 && source.source_generation != 0
@@ -11065,7 +11125,7 @@ inline bool BridgeAdaptiveEligible(const BridgeAdaptiveSource& source,
       && plan.At(stage_plan::Stage::UPSCALED).begin == 0 && plan.At(stage_plan::Stage::UPSCALED).count == 1
       && nr_adaptive_selected_levels.load() == 2 && !nr_adaptive_limited_residency.load()
       && adaptive_feature_mode.load() == AdaptiveFeatureMode::OFF && !edit_reuse_enabled.load()
-      && native_fg_public_off.load() && !native_fg_owns.load() && !fg::xefg::Enabled()
+      && fg_off && !native_fg_owns.load() && !fg::xefg::Enabled()
       && !auto_fg_fallback_active.load();
 }
 
@@ -17624,7 +17684,8 @@ inline std::string ArgGateTelemetry() {
 inline bool ForgetSourceHandleLocked(const NVSDK_NGX_Handle* handle);
 inline void RegisterCreatedFeatureLocked(const NVSDK_NGX_Handle* handle,
                                          NVSDK_NGX_Feature feature,
-                                         const NVSDK_NGX_Parameter* parameters) {
+                                         const NVSDK_NGX_Parameter* parameters,
+                                         IUnknown* device11_identity = nullptr) {
   if (feature == kFeatureDlssNr) {
     NoteForeignNr(true, "a feature-18 (DLSSNR) create that is not this"
                         " addon's succeeded");
@@ -17674,6 +17735,7 @@ inline void RegisterCreatedFeatureLocked(const NVSDK_NGX_Handle* handle,
   FeatureState state = DeriveFeatureState(parameters);
   static uint64_t source_generation = 0;
   state.source_generation = ++source_generation;
+  state.source_device11_identity = device11_identity;
   state.source_feature = feature;
   state.source_type_confirmed = true;
   if (const auto stale = features.find(handle); stale != features.end()) {
@@ -32844,6 +32906,7 @@ inline void Use(DWORD reason, HMODULE module, LPVOID reserved) {
       internal::LoadConfiguration();
       gpu_timers::comparison_settings = internal::comparison_ui::CaptureSettings;
       internal::adaptive_configuration_settings = internal::comparison_ui::CaptureAdaptiveSettings;
+      fg::xefg::ConfigureBridgeSource(internal::ObserveBridgeSourceForXefg);
       debug::Mark("attach:config-loaded");
       internal::Log(
           reshade::log::level::info,

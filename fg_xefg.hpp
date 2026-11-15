@@ -6,6 +6,7 @@
 
 #include <windows.h>
 #include <psapi.h>
+#include <d3d11.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
@@ -27,12 +28,34 @@
 #include <utility>
 #include <vector>
 
+#include "../../utils/directx.hpp"
+
 #include "detour_guard.hpp"
 #include "fg_frame.hpp"
 #include "output_framerate.hpp"
 #include "submission_tracker.hpp"
 
 namespace renodx::addons::dlss5::fg::xefg {
+
+struct BridgeSourceIdentity {
+  uintptr_t device11 = 0;
+  uintptr_t handle = 0;
+  uint64_t generation = 0;
+  bool operator==(const BridgeSourceIdentity&) const = default;
+};
+using BridgeSourceObserver = BridgeSourceIdentity (*)(uintptr_t device11) noexcept;
+struct BridgeOffEvidence {
+  bool available = false;
+  const char* reason = "unobserved";
+  uintptr_t context = 0;
+  uintptr_t proxy = 0;
+  uintptr_t application_device11 = 0;
+  uintptr_t proxy_device11 = 0;
+  uint64_t declaration = 0;
+  uint64_t epoch = 0;
+  BridgeSourceIdentity source;
+  bool operator==(const BridgeOffEvidence&) const = default;
+};
 
 // Public x64 XeSS-FG ABI, fixed Intel 8fe81bdb/de0fb9c1 headers. No SDK
 // object layout is inspected. BACKBUFFER tags describe a region only.
@@ -93,6 +116,7 @@ inline std::atomic_bool block_optional_hudless{false};
 inline std::atomic_bool sdk_detours_enabled{true};
 inline std::atomic_bool stopped{false};
 inline std::atomic_bool owns_stream{false};
+inline std::atomic<BridgeSourceObserver> bridge_source_observer{nullptr};
 inline std::atomic<Result> result{Result::NOT_SERVED};
 inline std::atomic<Result> display_result{Result::NOT_SERVED};
 inline std::atomic_uint64_t submitted_frames{0};
@@ -192,6 +216,16 @@ struct Context {
   bool fresh_id = false;
   bool last_id_known = false;
   bool enabled = false;
+  ComPtr<IUnknown> bridge_application_device11;
+  ComPtr<IUnknown> bridge_proxy_device11;
+  bool bridge_context_ready = false;
+  bool bridge_proxy_ready = false;
+  bool bridge_off_observed = false;
+  uint32_t bridge_enable_inflight = 0;
+  uint64_t bridge_declaration = 0;
+  uint64_t bridge_off_epoch = 0;
+  BridgeSourceIdentity bridge_off_source;
+  const char* bridge_off_reason = "disable_unobserved";
   uint32_t requested_interpolated = 0;
   bool requested_interpolated_known = false;
   uint64_t framerate_configuration = 0;
@@ -232,6 +266,7 @@ struct State {
   std::shared_mutex mutex;
   std::map<void*, std::shared_ptr<Context>> contexts;
   std::vector<std::shared_ptr<Context>> retired_contexts;
+  uint64_t bridge_declaration = 0;
 };
 inline State state;
 inline std::shared_mutex install_mutex;
@@ -343,6 +378,34 @@ inline uintptr_t Identity(IUnknown* object) {
   ComPtr<IUnknown> identity;
   if (object == nullptr || FAILED(object->QueryInterface(IID_PPV_ARGS(&identity)))) return 0;
   return reinterpret_cast<uintptr_t>(identity.Get());
+}
+
+// Called only while the SDK callback still owns a valid swapchain argument.
+inline ComPtr<IUnknown> BridgeDeviceIdentity(IUnknown* object) {
+  ComPtr<IDXGISwapChain> swapchain;
+  ComPtr<ID3D11Device> device;
+  if (object == nullptr || FAILED(object->QueryInterface(IID_PPV_ARGS(&swapchain)))
+      || FAILED(swapchain->GetDevice(IID_PPV_ARGS(&device)))) return {};
+  return ComPtr<IUnknown>(renodx::utils::directx::NativeIdentity(device.Get()));
+}
+
+inline uint64_t InvalidateBridgeOff(void* handle, const char* reason,
+    bool invalidate_context = false, bool invalidate_proxy = false) {
+  std::unique_lock lock(state.mutex);
+  if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
+    auto& context = *it->second;
+    context.bridge_off_observed = false;
+    context.bridge_off_reason = reason;
+    context.bridge_declaration = ++state.bridge_declaration;
+    if (invalidate_context) {
+      context.bridge_context_ready = false;
+    }
+    if (invalidate_proxy) {
+      context.bridge_proxy_ready = false;
+    }
+    return context.bridge_declaration;
+  }
+  return 0;
 }
 
 inline std::shared_ptr<Frame> GetFrame(Context* context, uint32_t id) {
@@ -461,6 +524,7 @@ inline void Initialize(void* handle, ID3D12CommandQueue* queue, const abi::Init*
   auto context = std::make_shared<Context>();
   context->queue = queue;
   context->init = *parameters;
+  context->bridge_application_device11 = BridgeDeviceIdentity(parameters->application_swapchain);
   output_framerate::ObserveXeFGMetadata(reinterpret_cast<uintptr_t>(context.get()), parameters->max_interpolated + 1);
   context->omit_optional_hudless = block_optional_hudless.load(std::memory_order_acquire)
       && parameters->ui_mode == kUiModeAuto;
@@ -471,6 +535,8 @@ inline void Initialize(void* handle, ID3D12CommandQueue* queue, const abi::Init*
   if (FAILED(queue->GetDevice(IID_PPV_ARGS(&context->device)))
       || FAILED(context->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&context->fence)))) return;
   std::unique_lock lock(state.mutex);
+  context->bridge_context_ready = true;
+  context->bridge_declaration = ++state.bridge_declaration;
   if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
     state.retired_contexts.push_back(it->second);
   }
@@ -917,6 +983,7 @@ template <size_t Index>
 struct SdkHooks {
   static int32_t Init(void* handle, ID3D12CommandQueue* queue, const abi::Init* parameters) {
     if (!stopped.load()) PinRuntimeCallback();
+    InvalidateBridgeOff(handle, "context_initializing", true);
     const auto status = reinterpret_cast<int32_t (*)(void*, ID3D12CommandQueue*, const abi::Init*)>(modules[Index].real[0])(
         handle, queue, parameters);
     if (status == 0 && modules[Index].complete && !stopped.load()) {
@@ -930,6 +997,7 @@ struct SdkHooks {
                           const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen, ID3D12CommandQueue* queue,
                           IDXGIFactory2* factory, const abi::Init* parameters) {
     if (!stopped.load()) PinRuntimeCallback();
+    InvalidateBridgeOff(handle, "context_initializing", true);
     const auto status = reinterpret_cast<int32_t (*)(void*, HWND, const DXGI_SWAP_CHAIN_DESC1*,
         const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, ID3D12CommandQueue*, IDXGIFactory2*, const abi::Init*)>(modules[Index].real[1])(
         handle, window, description, fullscreen, queue, factory, parameters);
@@ -942,6 +1010,7 @@ struct SdkHooks {
   }
   static int32_t GetSwapchain(void* handle, REFIID iid, void** output) {
     if (!stopped.load()) PinRuntimeCallback();
+    const auto declaration = InvalidateBridgeOff(handle, "proxy_observation_changed", false, true);
     const auto status = reinterpret_cast<int32_t (*)(void*, REFIID, void**)>(modules[Index].real[2])(handle, iid, output);
     if (status == 0 && output != nullptr && *output != nullptr && !stopped.load()) {
       try {
@@ -951,9 +1020,21 @@ struct SdkHooks {
           return status;
         }
         const auto identity = Identity(static_cast<IUnknown*>(*output));
+        auto device11 = BridgeDeviceIdentity(static_cast<IUnknown*>(*output));
         {
           std::unique_lock lock(state.mutex);
-          if (const auto it = state.contexts.find(handle); it != state.contexts.end()) it->second->proxy_identity = identity;
+          if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
+            it->second->proxy_identity = identity;
+            if (it->second->bridge_declaration == declaration) {
+              it->second->bridge_proxy_device11 = std::move(device11);
+              it->second->bridge_proxy_ready = true;
+            } else {
+              it->second->bridge_off_observed = false;
+              it->second->bridge_proxy_ready = false;
+              it->second->bridge_off_reason = "proxy_changed_during_observation";
+              it->second->bridge_declaration = ++state.bridge_declaration;
+            }
+          }
         }
         RefreshOwnership();
       } catch (...) { PublishResult(Result::FAILED); }
@@ -1130,15 +1211,73 @@ struct SdkHooks {
   }
   static int32_t Enable(void* handle, uint32_t enabled) {
     if (!stopped.load()) PinRuntimeCallback();
-    const auto status = reinterpret_cast<int32_t (*)(void*, uint32_t)>(modules[Index].real[6])(handle, enabled);
-    if (status == 0) {
-      {
-        std::unique_lock lock(state.mutex);
-        if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
-          if (it->second->enabled != (enabled != 0)) ReleaseFrames(it->second.get());
-          it->second->enabled = enabled != 0;
+    std::shared_ptr<Context> attempt;
+    uint64_t declaration = 0;
+    uint64_t epoch = 0;
+    uintptr_t device11 = 0;
+    uintptr_t proxy = 0;
+    {
+      std::unique_lock lock(state.mutex);
+      if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
+        attempt = it->second;
+        attempt->bridge_off_observed = false;
+        attempt->bridge_off_reason = "set_enabled_in_flight";
+        declaration = attempt->bridge_declaration = ++state.bridge_declaration;
+        epoch = attempt->epoch;
+        proxy = attempt->proxy_identity;
+        ++attempt->bridge_enable_inflight;
+        auto* application_device = attempt->bridge_application_device11.Get();
+        auto* proxy_device = attempt->bridge_proxy_device11.Get();
+        if (application_device == nullptr || proxy_device == nullptr || application_device == proxy_device) {
+          device11 = reinterpret_cast<uintptr_t>(application_device != nullptr ? application_device : proxy_device);
         }
       }
+    }
+    const auto observer = bridge_source_observer.load(std::memory_order_acquire);
+    // The observer may try runtime_mutex; no XeFG state lock crosses it or the SDK.
+    const auto before = (observer != nullptr && device11 != 0 && !stopped.load()
+        ? observer(device11) : BridgeSourceIdentity{});
+    const auto status = reinterpret_cast<int32_t (*)(void*, uint32_t)>(modules[Index].real[6])(handle, enabled);
+    const auto after = (status == 0 && enabled == 0 && observer != nullptr && device11 != 0 && !stopped.load()
+        ? observer(device11) : BridgeSourceIdentity{});
+    {
+      std::unique_lock lock(state.mutex);
+      if (attempt != nullptr && attempt->bridge_enable_inflight != 0) {
+        --attempt->bridge_enable_inflight;
+      }
+      const auto it = state.contexts.find(handle);
+      const bool same_context = it != state.contexts.end() && it->second == attempt;
+      const bool current = same_context && attempt->bridge_context_ready && attempt->bridge_proxy_ready
+          && attempt->bridge_declaration == declaration
+          && attempt->bridge_enable_inflight == 0 && attempt->epoch == epoch && attempt->proxy_identity == proxy;
+      if (status == 0 && it != state.contexts.end()) {
+        if (it->second->enabled != (enabled != 0)) {
+          ReleaseFrames(it->second.get());
+        }
+        it->second->enabled = enabled != 0;
+      }
+      if (same_context) {
+        if (current) {
+          attempt->bridge_off_reason = (status != 0 ? "set_enabled_failed"
+              : enabled != 0 ? "enabled" : device11 == 0 ? "device11_identity_missing_or_conflicting"
+              : proxy == 0 ? "proxy_identity_missing"
+              : state.contexts.size() != 1 ? "multiple_contexts"
+              : before.handle == 0 || before.generation == 0 || before.device11 != device11 ? "source_missing_before_disable"
+              : before != after ? "source_changed_during_disable" : "observed_disable");
+          attempt->bridge_off_observed = status == 0 && enabled == 0 && device11 != 0 && proxy != 0
+              && before.handle != 0 && before.generation != 0
+              && before.device11 == device11 && before == after && state.contexts.size() == 1 && !stopped.load();
+          if (attempt->bridge_off_observed) {
+            attempt->bridge_off_source = before;
+            attempt->bridge_off_epoch = attempt->epoch;
+          }
+        } else if (attempt->bridge_declaration == declaration && attempt->bridge_enable_inflight == 0) {
+          attempt->bridge_off_reason = (!attempt->bridge_context_ready ? "context_not_initialized"
+              : !attempt->bridge_proxy_ready ? "proxy_contract_unavailable" : "context_changed_during_disable");
+        }
+      }
+    }
+    if (status == 0) {
       RefreshOwnership();
     }
     return status;
@@ -1173,6 +1312,7 @@ struct SdkHooks {
   }
   static int32_t Destroy(void* handle) {
     if (!stopped.load()) PinRuntimeCallback();
+    InvalidateBridgeOff(handle, "context_destroying", true);
     const auto status = reinterpret_cast<int32_t (*)(void*)>(modules[Index].real[8])(handle);
     if (status == 0) {
       std::unique_lock lock(state.mutex);
@@ -1234,6 +1374,47 @@ inline void Configure(Service service, PrepareCapture capture, Retire retire, bo
   internal::prepare_capture.store(capture, std::memory_order_release);
   internal::retire.store(retire, std::memory_order_release);
   internal::requested.store(requested, std::memory_order_release);
+}
+
+inline void ConfigureBridgeSource(BridgeSourceObserver observer) noexcept {
+  internal::bridge_source_observer.store(observer, std::memory_order_release);
+}
+
+// runtime_mutex may already be held. This query reads the captured contract
+// only: it never calls COM, the source observer, or an SDK entrypoint.
+inline BridgeOffEvidence QueryBridgeOff(const BridgeSourceIdentity& source) {
+  BridgeOffEvidence evidence;
+  if (internal::stopped.load(std::memory_order_acquire)
+      || !internal::sdk_detours_enabled.load(std::memory_order_acquire)) {
+    evidence.reason = "sdk_observation_unavailable";
+    return evidence;
+  }
+  std::shared_lock lock(internal::state.mutex);
+  if (internal::state.contexts.size() != 1) {
+    evidence.reason = internal::state.contexts.empty() ? "context_unobserved" : "multiple_contexts";
+    return evidence;
+  }
+  const auto& [handle, context] = *internal::state.contexts.begin();
+  evidence.context = reinterpret_cast<uintptr_t>(handle);
+  evidence.proxy = context->proxy_identity;
+  evidence.application_device11 = reinterpret_cast<uintptr_t>(context->bridge_application_device11.Get());
+  evidence.proxy_device11 = reinterpret_cast<uintptr_t>(context->bridge_proxy_device11.Get());
+  evidence.declaration = context->bridge_declaration;
+  evidence.epoch = context->epoch;
+  evidence.source = context->bridge_off_source;
+  evidence.reason = context->bridge_off_reason;
+  if (!context->bridge_context_ready || !context->bridge_proxy_ready || context->bridge_enable_inflight != 0
+      || !context->bridge_off_observed) return evidence;
+  if (context->bridge_off_epoch != context->epoch || context->enabled) {
+    evidence.reason = "context_changed_after_disable";
+  } else if (source.device11 == 0 || source.handle == 0 || source.generation == 0) {
+    evidence.reason = "source_unobserved_or_ambiguous";
+  } else if (source != context->bridge_off_source) {
+    evidence.reason = "source_does_not_match_disable";
+  } else {
+    evidence.available = true;
+  }
+  return evidence;
 }
 
 // Public SDK enable state, independent of whether NR requested ownership.

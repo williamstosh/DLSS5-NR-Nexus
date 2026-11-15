@@ -97,6 +97,53 @@ int32_t FakeResource(void* context, ID3D12CommandList* list, uint32_t id, const 
 }
 int32_t FakeConstants(void*, uint32_t, const xefg::abi::Constants*) { return sdk_status; }
 int32_t FakeId(void*, uint32_t) { return sdk_status; }
+// CPU receipt tests supply captured identities explicitly; the Bridge WARP
+// fixture separately checks real D3D11 GetDevice capture and source matching.
+struct ReceiptDeviceIdentity : IUnknown {
+  ULONG references = 1;
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** output) override {
+    if (output == nullptr) return E_POINTER;
+    *output = nullptr;
+    if (iid != IID_IUnknown) return E_NOINTERFACE;
+    *output = this;
+    AddRef();
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return ++references; }
+  ULONG STDMETHODCALLTYPE Release() override {
+    const auto remaining = --references;
+    if (remaining == 0) {
+      delete this;
+    }
+    return remaining;
+  }
+};
+xefg::BridgeSourceIdentity receipt_source;
+bool receipt_source_available = true;
+int32_t receipt_sdk_status = 0;
+void (*receipt_during_sdk)() = nullptr;
+IUnknown* receipt_proxy = nullptr;  // Borrowed only across the mock SDK callback.
+void* receipt_context_handle = nullptr;
+xefg::BridgeSourceIdentity ObserveReceiptSource(uintptr_t device11) noexcept {
+  return receipt_source_available && receipt_source.device11 == device11 ? receipt_source : xefg::BridgeSourceIdentity{};
+}
+int32_t ReceiptSdkCall() {
+  Check(!xefg::QueryBridgeOff(receipt_source).available, "old Off cannot authorize while the SDK contract call is in flight");
+  if (receipt_during_sdk != nullptr) {
+    receipt_during_sdk();
+  }
+  return receipt_sdk_status;
+}
+int32_t FakeReceiptEnable(void*, uint32_t) { return ReceiptSdkCall(); }
+int32_t FakeReceiptInit(void*, ID3D12CommandQueue*, const xefg::abi::Init*) { return ReceiptSdkCall(); }
+int32_t FakeReceiptInitDesc(void*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*,
+    ID3D12CommandQueue*, IDXGIFactory2*, const xefg::abi::Init*) { return ReceiptSdkCall(); }
+int32_t FakeReceiptGetSwapchain(void*, REFIID iid, void** output) {
+  const auto status = ReceiptSdkCall();
+  if (status != 0 || receipt_proxy == nullptr) return status;
+  return receipt_proxy->QueryInterface(iid, output);
+}
+int32_t FakeReceiptDestroy(void*) { return ReceiptSdkCall(); }
 uint32_t fake_present_calls = 0;
 bool fake_present_owns_stream = false;
 HRESULT STDMETHODCALLTYPE FakePresent(IDXGISwapChain*, UINT, UINT) {
@@ -252,6 +299,125 @@ int main() {
     fg::native_options::internal::HookedSetOptions(viewport, options);
     Check(options_events == 2 && options_calls == 4, "stopped native hook did not pass through");
     std::cout << "PASS native options result, explicit Off/On and stopped pass-through\n";
+    {
+      Check(adapter::state.contexts.empty(), "CPU Off receipt starts without a live XeFG context");
+      const auto saved_real = adapter::modules[0].real;
+      ComPtr<IUnknown> identity;
+      identity.Attach(new ReceiptDeviceIdentity());
+      ComPtr<IUnknown> other_identity;
+      other_identity.Attach(new ReceiptDeviceIdentity());
+      auto* context_handle = reinterpret_cast<void*>(uintptr_t{0xEF001});
+      receipt_source = {.device11 = reinterpret_cast<uintptr_t>(identity.Get()), .handle = 0xD311, .generation = 1};
+      const auto fresh_context = [&] {
+        adapter::state.contexts.clear();
+        auto context = std::make_shared<adapter::Context>();
+        context->bridge_context_ready = context->bridge_proxy_ready = true;
+        context->bridge_application_device11 = identity;
+        context->bridge_proxy_device11 = identity;
+        context->proxy_identity = 0xEF111;
+        context->bridge_declaration = ++adapter::state.bridge_declaration;
+        adapter::state.contexts[context_handle] = context;
+        return context;
+      };
+      adapter::modules[0].real[0] = reinterpret_cast<void*>(&FakeReceiptInit);
+      adapter::modules[0].real[1] = reinterpret_cast<void*>(&FakeReceiptInitDesc);
+      adapter::modules[0].real[2] = reinterpret_cast<void*>(&FakeReceiptGetSwapchain);
+      adapter::modules[0].real[6] = reinterpret_cast<void*>(&FakeReceiptEnable);
+      adapter::modules[0].real[8] = reinterpret_cast<void*>(&FakeReceiptDestroy);
+      xefg::ConfigureBridgeSource(&ObserveReceiptSource);
+      auto context = fresh_context();
+      Check(!xefg::QueryBridgeOff(receipt_source).available, "default enabled=false is not an observed Disable");
+      receipt_sdk_status = -19;
+      Check(Hooks::Enable(context_handle, 0) == -19 && !xefg::QueryBridgeOff(receipt_source).available,
+          "failed SetEnabled(false) cannot publish Off");
+      receipt_sdk_status = 0;
+      receipt_source_available = false;
+      receipt_during_sdk = +[] { receipt_source_available = true; };
+      Hooks::Enable(context_handle, 0);
+      Check(!xefg::QueryBridgeOff(receipt_source).available, "a source arriving during Disable cannot claim that declaration");
+      receipt_during_sdk = nullptr;
+      Hooks::Enable(context_handle, 0);
+      const auto accepted = xefg::QueryBridgeOff(receipt_source);
+      Check(accepted.available && accepted.source == receipt_source && accepted.epoch == context->epoch,
+          "successful false with the same captured context/proxy/source publishes a current receipt");
+      auto wrong_source = receipt_source;
+      ++wrong_source.generation;
+      Check(!xefg::QueryBridgeOff(wrong_source).available, "a rebuilt source cannot inherit an older Disable");
+      wrong_source = receipt_source;
+      ++wrong_source.device11;
+      Check(!xefg::QueryBridgeOff(wrong_source).available, "a different D3D11 device cannot inherit Off");
+      receipt_source_available = false;
+      Hooks::Enable(context_handle, 0);
+      Check(!xefg::QueryBridgeOff(receipt_source).available, "unavailable source snapshot revokes the prior Off receipt");
+      receipt_source_available = true;
+      Hooks::Enable(context_handle, 0);
+      Hooks::Enable(context_handle, 1);
+      Check(context->enabled && !xefg::QueryBridgeOff(receipt_source).available, "reenable immediately revokes Off");
+      Hooks::Enable(context_handle, 0);
+      Check(xefg::QueryBridgeOff(receipt_source).available, "a fresh successful Disable recovers after reenable");
+      receipt_during_sdk = +[] { ++receipt_source.generation; };
+      Hooks::Enable(context_handle, 0);
+      Check(!xefg::QueryBridgeOff(receipt_source).available, "source generation changing inside SDK call rejects the result");
+      receipt_during_sdk = nullptr;
+      Hooks::Enable(context_handle, 0);
+      adapter::ReleaseFrames(context.get());
+      Check(!xefg::QueryBridgeOff(receipt_source).available, "context epoch changes invalidate an existing receipt");
+      Hooks::Enable(context_handle, 0);
+      adapter::state.contexts[reinterpret_cast<void*>(uintptr_t{0xEF002})] = std::make_shared<adapter::Context>();
+      Check(!xefg::QueryBridgeOff(receipt_source).available, "multiple XeFG contexts are ambiguous");
+      context = fresh_context();
+      context->bridge_proxy_device11 = other_identity;
+      Hooks::Enable(context_handle, 0);
+      Check(!xefg::QueryBridgeOff(receipt_source).available, "conflicting original/proxy D3D11 identities reject Off");
+      context = fresh_context();
+      context->bridge_application_device11.Reset();
+      context->bridge_proxy_device11.Reset();
+      Hooks::Enable(context_handle, 0);
+      Check(!xefg::QueryBridgeOff(receipt_source).available, "unknown D3D11 identity cannot infer the source from a private D3D12 context");
+      context = fresh_context();
+      Hooks::Enable(context_handle, 0);
+      receipt_sdk_status = -19;
+      Hooks::Init(context_handle, nullptr, nullptr);
+      Check(!xefg::QueryBridgeOff(receipt_source).available && !context->bridge_context_ready,
+          "failed Init revokes old Off before entering SDK");
+      context = fresh_context();
+      receipt_sdk_status = 0;
+      Hooks::Enable(context_handle, 0);
+      receipt_sdk_status = -19;
+      Hooks::InitDesc(context_handle, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+      Check(!xefg::QueryBridgeOff(receipt_source).available && !context->bridge_context_ready,
+          "failed InitDesc revokes old Off before entering SDK");
+      context = fresh_context();
+      receipt_sdk_status = 0;
+      Hooks::Enable(context_handle, 0);
+      receipt_sdk_status = -19;
+      void* proxy = nullptr;
+      Hooks::GetSwapchain(context_handle, IID_IUnknown, &proxy);
+      Check(!xefg::QueryBridgeOff(receipt_source).available && !context->bridge_proxy_ready,
+          "failed proxy observation revokes old Off before entering SDK");
+      context = fresh_context();
+      receipt_sdk_status = 0;
+      Hooks::Enable(context_handle, 0);
+      receipt_sdk_status = -19;
+      Hooks::Destroy(context_handle);
+      Check(!xefg::QueryBridgeOff(receipt_source).available && !context->bridge_context_ready,
+          "failed Destroy cannot leave an old Off receipt valid");
+      context = fresh_context();
+      receipt_sdk_status = 0;
+      Hooks::Enable(context_handle, 0);
+      adapter::state.contexts.erase(context_handle);
+      Hooks::Enable(context_handle, 0);
+      Check(!xefg::QueryBridgeOff(receipt_source).available, "a missing tracked context is never positive Off evidence");
+      context = fresh_context();
+      Check(!xefg::QueryBridgeOff(receipt_source).available, "replacement context starts without inherited Off");
+      Hooks::Enable(context_handle, 0);
+      Check(xefg::QueryBridgeOff(receipt_source).available, "replacement context can accept its own fresh Disable");
+      adapter::state.contexts.clear();
+      adapter::modules[0].real = saved_real;
+      xefg::ConfigureBridgeSource(nullptr);
+      receipt_source = {};
+      std::cout << "PASS CPU mocked SDK Off receipt: in-flight/failure, source/proxy/context identity, reenable and recovery\n";
+    }
     adapter::modules[0].complete = true;
     adapter::modules[0].real[0] = reinterpret_cast<void*>(&FakeInit);
     adapter::modules[0].real[3] = reinterpret_cast<void*>(&FakeResource);

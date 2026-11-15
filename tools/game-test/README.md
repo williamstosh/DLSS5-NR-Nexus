@@ -62,6 +62,12 @@ Bridge 两档接入使用独立的 DEV 请求：`Client.bridge_adaptive_experime
 释放未完成时保持原请求状态。该通道仅编入 `NR_NEXUS_DEV_CONTROL` 开发候选，普通 Publishing 不含入口，
 不是玩家兼容开关；`status`／原 ID 回执查询及同一 deadline 的规则与其他开发请求相同。
 
+可信 FG Off 可以来自成功的 Streamline `SetOptions(eOff)`，或绑定当前 XeFG context／proxy、
+D3D11 设备和源代次的成功 `SetEnabled(false)`。XeFG 路径要求关闭调用前后均能观察到同一个已创建来源；
+重新启用、重建、来源变化或失败／在途调用撤销旧回执。默认 `enabled=false` 与配置请求不提供此证明。
+`Bridge Adaptive XeFG Off receipt` 日志报告接纳及缺失原因；它不改写 `identity.fg` 中的 Streamline 声明。
+实际游戏返回的身份和回调顺序仍须现场核实，不能以软件 SDK 替身的成功代替。
+
 `set` 一次提交一个现有 INI key 和 JSON 类型值。返回 `confirmation_required` 时默认停止；只有明确使用 `--confirm`，或阶段请求显式写入 `confirmation_required=true`，才将服务返回的完整 `identity` 和 `changes` 原样携带到新请求，由服务复核提案。服务复用菜单的配置缓存／持久化提交语义，受保护 runner 在退出时恢复原文件。不能把接口配置当作临时无副作用事务。`status` 遇到 `available=false` 且原因为 `runtime_busy`／`configuration_changed` 时，只在同一 deadline 内重试读取。连接失败或 `outcome_unknown` 后仅以 `status(query_id=<原请求ID>)` 查询 `receipt`，不会自动重放设置；deadline 内没有明确回执则抛出 `OutcomeUnknown`，可另用 `--query-id <原请求ID> status` 核查。
 
 collector 在每个 active 阶段先读状态，仅在 NR 关闭时请求 `NeuralUplift=true`，再设置 `NRHookPoint`（0 Upscaled／1 Render／2 Present）、所需 `NRPasses` 及第 2–4 层的 `NRPassNStage`（1 Render／2 Upscaled／3 Present，0 为继承）。依赖改动与危险阶段确认由服务生成提案，不在客户端复制菜单规则。接口模式的多层请求须提供从 Pass1 开始连续完整的 `expected_plan`；省略时为单层 Pass1。请求、实际 `changes` 和回执 `state.settings` 写入 `static-events.json`，随后仍等待当前完整计划和新序列的成功 `last_nr_evaluate`，才记录 `stage_observed`。赋值只提供配置证据，API 成功单独记为 API 证据；GPU 完成只读取 snapshot 的 `completion.current`，collector 不由配置或 API 成功推导 GPU 完成或图像质量。
