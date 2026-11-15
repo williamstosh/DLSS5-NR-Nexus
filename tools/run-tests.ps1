@@ -19,7 +19,7 @@ param(
     [string]$NativeNgxSdkLibraryDirectory,
     [string]$NativeNgxRuntimePath = $(if ($env:NR_NEXUS_NGX_RUNTIME_DIR) { Join-Path $env:NR_NEXUS_NGX_RUNTIME_DIR 'nvngx_dlssnr.dll' }),
     [string]$NativeNgxSrRuntimePath,
-    [ValidateSet('dlaa','sr','stage-resolution','same-stage-resolution','render-stage-resolution','present-stage-resolution','adaptive','adaptive-hardware','adaptive-native-ngx')][string[]]$BridgeCase = @(),
+    [ValidateSet('dlaa','sr','stage-resolution','same-stage-resolution','render-stage-resolution','present-stage-resolution','adaptive','adaptive-hardware','adaptive-native-ngx','adaptive-native-snippet')][string[]]$BridgeCase = @(),
     [switch]$BuildOnly,
     [ValidateSet('Standard','Full','Acceptance')][string]$RetentionMode = $(if ($env:NR_NEXUS_TEST_RETENTION) { $env:NR_NEXUS_TEST_RETENTION } else { 'Standard' }),
     [switch]$SoftwareOnly
@@ -68,8 +68,8 @@ if (@($NativeCase | Where-Object { $_ -in @('nr-edit-reuse-history','nr-edit-reu
 }
 if ($VulkanNativeNgx -and $Suite -notcontains 'vulkan-control-mask') { throw '-VulkanNativeNgx requires -Suite vulkan-control-mask (or all).' }
 if ($VulkanNativeNgx -and $SoftwareOnly) { throw '-VulkanNativeNgx requires a native Vulkan GPU.' }
-$bridgeNativeNgx = $BridgeCase -contains 'adaptive-native-ngx'
-if ($SoftwareOnly -and @($BridgeCase | Where-Object { $_ -in @('adaptive-hardware','adaptive-native-ngx') }).Count) {
+$bridgeNativeNgx = @($BridgeCase | Where-Object { $_ -in @('adaptive-native-ngx','adaptive-native-snippet') }).Count -gt 0
+if ($SoftwareOnly -and @($BridgeCase | Where-Object { $_ -in @('adaptive-hardware','adaptive-native-ngx','adaptive-native-snippet') }).Count) {
     throw 'Explicit Bridge hardware cases conflict with -SoftwareOnly; no hardware or WARP fallback is permitted.'
 }
 $usesNativeNgx = $bridgeNativeNgx -or $VulkanNativeNgx -or (@($NativeCase | Where-Object { $_ -in @('control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','control-mask-native-ngx-fg') }).Count -gt 0)
@@ -200,7 +200,7 @@ foreach ($item in $Suite) {
                 $bridgeArguments = @()
                 $suffix = ''
                 if ($case) { $bridgeArguments += "--$case"; $suffix = "-$case" }
-                if ($case -eq 'adaptive-native-ngx') {
+                if ($case -in @('adaptive-native-ngx','adaptive-native-snippet')) {
                     $runtimeLink = Join-Path $directory 'nvngx_dlssnr.dll'
                     $srRuntimeLink = Join-Path $directory 'nvngx_dlss.dll'
                     if ((Test-Path -LiteralPath $runtimeLink) -or (Test-Path -LiteralPath $srRuntimeLink)) {

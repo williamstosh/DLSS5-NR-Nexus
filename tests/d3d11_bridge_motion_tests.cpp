@@ -135,6 +135,11 @@ NVSDK_NGX_Result NVSDK_CONV MotionReleaseSource(NVSDK_NGX_Handle*) {
 native::DirectCreateFn bridge_native_create = nullptr;
 native::DirectEvaluateFn bridge_native_evaluate = nullptr;
 native::DirectReleaseFn bridge_native_release = nullptr;
+native::DirectInitFn bridge_snippet_init = nullptr;
+native::DirectShutdownFn bridge_snippet_shutdown = nullptr;
+ID3D12Device* bridge_snippet_initialized_device = nullptr;  // Borrowed from the still-live private Bridge.
+uint32_t bridge_snippet_init_calls = 0, bridge_snippet_shutdown_calls = 0;
+NVSDK_NGX_Result bridge_snippet_init_result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
 std::unordered_map<const NVSDK_NGX_Handle*, uint32_t> bridge_native_evaluations;
 uint64_t bridge_native_sr_calls = 0;
 std::string bridge_private_project_id;
@@ -148,6 +153,32 @@ void NVSDK_CONV BridgeSdkLog(const char* message, NVSDK_NGX_Logging_Level level,
   }
   std::cerr << "NGX SDK level=" << static_cast<uint32_t>(level) << " feature=" << static_cast<uint32_t>(feature)
       << " " << text << std::endl;
+}
+NVSDK_NGX_Result NVSDK_CONV BridgeSnippetInit(unsigned long long application_id, const wchar_t* data_path,
+    ID3D12Device* device, NVSDK_NGX_Version version, const NVSDK_NGX_Parameter* parameters) {
+  ++bridge_snippet_init_calls;
+  const auto begin = native::SteadyNowNs();
+  const auto result = bridge_snippet_init(application_id, data_path, device, version, parameters);
+  bridge_snippet_init_result = result;
+  if (NVSDK_NGX_SUCCEED(result)) {
+    bridge_snippet_initialized_device = device;
+  }
+  std::cout << nlohmann::json{{"event", "nr_snippet_init_ext"}, {"api_result", static_cast<uint32_t>(result)},
+      {"cpu_ms", (native::SteadyNowNs() - begin) / 1'000'000.}, {"private_device", device == native::bridge.device12},
+      {"production_application_identity", application_id == native::kDirectApplicationId},
+      {"identity_iat_installed", native::get_module_filename_iat != nullptr}}.dump() << '\n';
+  return result;
+}
+NVSDK_NGX_Result NVSDK_CONV BridgeSnippetShutdown(ID3D12Device* device) {
+  ++bridge_snippet_shutdown_calls;
+  const auto begin = native::SteadyNowNs();
+  const auto result = bridge_snippet_shutdown(device);
+  if (NVSDK_NGX_SUCCEED(result) && device == bridge_snippet_initialized_device) {
+    bridge_snippet_initialized_device = nullptr;
+  }
+  std::cout << nlohmann::json{{"event", "nr_snippet_shutdown"}, {"api_result", static_cast<uint32_t>(result)},
+      {"cpu_ms", (native::SteadyNowNs() - begin) / 1'000'000.}, {"private_device", device == native::bridge.device12}}.dump() << '\n';
+  return result;
 }
 NVSDK_NGX_Result NVSDK_CONV BridgeNativeCreate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Feature feature,
     const NVSDK_NGX_Parameter* parameters, NVSDK_NGX_Handle** handle) {
@@ -348,6 +379,7 @@ int main(int argc, char** argv) {
     bool adaptive_case = false;
     bool adaptive_hardware = false;
     bool adaptive_native_ngx = false;
+    bool adaptive_native_snippet = false;
     const char* adaptive_project_id_path = nullptr;
     for (int arg = 1; arg < argc; ++arg) {
       if (std::strcmp(argv[arg], "--warp") == 0) {
@@ -362,9 +394,10 @@ int main(int argc, char** argv) {
       } else if (std::strcmp(argv[arg], "--adaptive-hardware") == 0) {
         Check(!adaptive_case, "one explicit Bridge Adaptive condition per process");
         adaptive_case = adaptive_hardware = true;
-      } else if (std::strcmp(argv[arg], "--adaptive-native-ngx") == 0) {
+      } else if (std::strcmp(argv[arg], "--adaptive-native-ngx") == 0 || std::strcmp(argv[arg], "--adaptive-native-snippet") == 0) {
         Check(!adaptive_case && arg + 1 < argc, "Bridge native NGX requires its existing ProjectID file argument");
         adaptive_case = adaptive_hardware = adaptive_native_ngx = true;
+        adaptive_native_snippet = std::strcmp(argv[arg], "--adaptive-native-snippet") == 0;
         adaptive_project_id_path = argv[++arg];
 #if !defined(NR_NEXUS_TEST_NATIVE_NGX)
         Check(false, "Bridge native NGX requires the SDK-enabled build; no MOCK fallback");
@@ -413,12 +446,14 @@ int main(int argc, char** argv) {
     Check(SUCCEEDED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
         adaptive_case ? D3D11_CREATE_DEVICE_DEBUG : 0, nullptr, 0,
         D3D11_SDK_VERSION, &device, nullptr, &context)), "D3D11 device");
-    native::direct_api.module = GetModuleHandleW(nullptr);
-    native::direct_api.create = MotionCreateModel;
-    native::direct_api.evaluate = MotionEvaluateModel;
-    native::direct_api.release = MotionReleaseModel;
-    native::direct_load_state = native::DirectLoadState::Ready;
-    // Avoid runtime-loader priming: the only substituted component is the NR provider.
+    if (!adaptive_native_snippet) {
+      native::direct_api.module = GetModuleHandleW(nullptr);
+      native::direct_api.create = MotionCreateModel;
+      native::direct_api.evaluate = MotionEvaluateModel;
+      native::direct_api.release = MotionReleaseModel;
+      native::direct_load_state = native::DirectLoadState::Ready;
+    }
+    // Provider setup is explicit below; do not eagerly prime from device callbacks.
     native::hooks_enabled.store(false);
     Check(native::EnsureBridgeUp(context.Get()) == native::kBridgeReady, "production bridge bring-up");
     ComPtr<ID3D11InfoQueue> adaptive_info11;
@@ -429,7 +464,8 @@ int main(int argc, char** argv) {
           "Bridge Adaptive requires both real D3D11 and D3D12 InfoQueues");
       std::cout << "BRIDGE_ADAPTIVE debug11=1 debug12=1 info11=1 info12=1 adapter="
           << (adaptive_hardware ? "NVIDIA_HARDWARE" : "SOFTWARE")
-          << " runtime=" << (adaptive_native_ngx ? "SDK_PREINITIALIZED_NGX" : "MOCK") << '\n';
+          << " runtime=" << (adaptive_native_snippet ? "PRODUCTION_SNIPPET_INIT"
+              : (adaptive_native_ngx ? "SDK_PREINITIALIZED_NGX" : "MOCK")) << '\n';
     }
     DXGI_ADAPTER_DESC1 adapter_desc{};
     adapter->GetDesc1(&adapter_desc);
@@ -438,12 +474,14 @@ int main(int argc, char** argv) {
         "D3D11 and D3D12 adapter LUID must match");
     std::printf("GPU %s adapter=%ls LUID=%08X:%08X same-adapter=PASS\n", warp ? "WARP" : "hardware",
         adapter_desc.Description, unsigned(luid12.HighPart), luid12.LowPart);
-    native::direct_device = native::bridge.device12;
-    native::direct_device->AddRef();
-    native::direct_device_native = native::bridge.device12;
-    native::parameter_runtime_ready = true;
-    native::core_allocate_parameters = params::AllocateOwnedParameters;
-    native::core_destroy_parameters = params::DestroyOwnedParameters;
+    if (!adaptive_native_snippet) {
+      native::direct_device = native::bridge.device12;
+      native::direct_device->AddRef();
+      native::direct_device_native = native::bridge.device12;
+      native::parameter_runtime_ready = true;
+      native::core_allocate_parameters = params::AllocateOwnedParameters;
+      native::core_destroy_parameters = params::DestroyOwnedParameters;
+    }
     native::enabled.store(true);
     native::stack_passes.store(1);
     native::codec_mode.store(0);
@@ -541,6 +579,8 @@ int main(int argc, char** argv) {
       NVSDK_NGX_Parameter* sdk_sr_parameters = nullptr;
       auto* handle = reinterpret_cast<NVSDK_NGX_Handle*>(uintptr_t{0xD5AD});
       bool sr_sdk_initialized = false, nr_sdk_initialized = false, sr_feature_created = false;
+      void** snippet_identity_slot = nullptr;
+      void* snippet_identity_original = nullptr;
       const auto cleanup = [&] {
         if (!native::DrainBridgeQueue()) return false;
         if (adaptive_native_ngx) {
@@ -580,6 +620,18 @@ int main(int argc, char** argv) {
             || !native::retired_final_resources.empty()) return false;
         bool sdk_clean = true;
 #if defined(NR_NEXUS_TEST_NATIVE_NGX)
+        if (adaptive_native_snippet) {
+          if (bridge_snippet_initialized_device != nullptr) {
+            renodx::addons::dlss5::DirectCallScope direct_call;
+            sdk_clean &= NVSDK_NGX_SUCCEED(native::direct_api.shutdown(bridge_snippet_initialized_device));
+          }
+          native::RestoreCallerIdentity();
+          const bool restored = native::get_module_filename_iat == nullptr && native::original_get_module_filename == nullptr
+              && (snippet_identity_slot == nullptr || *snippet_identity_slot == snippet_identity_original);
+          sdk_clean &= restored;
+          std::cout << nlohmann::json{{"event", "nr_snippet_identity_restored"}, {"restored", restored},
+              {"init_calls", bridge_snippet_init_calls}, {"shutdown_calls", bridge_snippet_shutdown_calls}}.dump() << '\n';
+        }
         if (nr_sdk_initialized) {
           const auto result = NVSDK_NGX_D3D12_Shutdown1(native::bridge.device12);
           nr_sdk_initialized = false;
@@ -639,37 +691,74 @@ int main(int argc, char** argv) {
         sr_sdk_initialized = NVSDK_NGX_SUCCEED(sr_init);
         std::cout << nlohmann::json{{"event", "sr_sdk_init"}, {"api_result", static_cast<uint32_t>(sr_init)}}.dump() << '\n';
         Check(sr_sdk_initialized, "SDK initializes the real D3D11 SR device, without fallback");
-        const auto nr_init = NVSDK_NGX_D3D12_Init_with_ProjectID(project_id.c_str(), NVSDK_NGX_ENGINE_TYPE_CUSTOM,
-            "NR-Nexus-Bridge-offline-1", runtime_directory.c_str(), native::bridge.device12, &common_info);
-        nr_sdk_initialized = NVSDK_NGX_SUCCEED(nr_init);
-        std::cout << nlohmann::json{{"event", "nr_sdk_init"}, {"api_result", static_cast<uint32_t>(nr_init)}}.dump() << '\n';
-        Check(nr_sdk_initialized, "SDK independently initializes the private D3D12 NR device, without snippet fallback");
-        native::PrimeNgxLoaderSymbols(native::bridge.device12);
-        const auto& provider = native::NgxLoaderView();
-        Check(provider.nr_ready && !provider.nr_failed && provider.core_ready
-                  && provider.nr_requirements.file_version == "310.9.16.0"
-                  && provider.core_allocate != nullptr && provider.core_destroy != nullptr
-                  && provider.core_create != nullptr && provider.core_evaluate != nullptr && provider.core_release != nullptr,
-            "Bridge SDK provider resolves the pinned real NR Runtime and complete public Core functions");
-        bridge_native_create = provider.core_create;
-        bridge_native_evaluate = provider.core_evaluate;
-        bridge_native_release = provider.core_release;
-        native::direct_api = {.borrowed_core_context = false, .module = provider.nr_module,
-            .allocate = provider.core_allocate, .destroy = provider.core_destroy,
-            .create = BridgeNativeCreate, .evaluate = BridgeNativeEvaluate, .release = BridgeNativeRelease};
-        native::direct_load_state = native::DirectLoadState::Ready;
-        native::direct_runtime_requirements = provider.nr_requirements;
-        native::direct_runtime_sha256 = provider.nr_sha256;
-        native::core_allocate_parameters = provider.core_allocate;
-        native::core_destroy_parameters = provider.core_destroy;
-        native::core_create_feature = nullptr;
-        native::core_evaluate_feature = nullptr;
-        native::core_release_feature = nullptr;
-        native::parameter_runtime_via_core.store(false);
-        native::parameter_runtime_ready = true;
-        Check(native::direct_device == native::bridge.device12 && !native::control_mask_use_core_context.load()
-                  && native::get_module_filename_iat == nullptr && native::original_get_module_filename == nullptr,
-            "SDK-preinitialized NR uses this exact private device and never borrows SR or installs identity hooks");
+        if (adaptive_native_snippet) {
+          Check(native::direct_device == nullptr && !native::parameter_runtime_ready
+                    && !native::control_mask_use_core_context.load() && native::bridge_force_snippet.load(),
+              "the production snippet starts without a prewritten private device or borrowed Core context");
+          native::PrimeNgxLoaderSymbols(nullptr);  // Match the game's D3D11 route; no public D3D12 device identity is supplied.
+          const auto& provider = native::NgxLoaderView();
+          Check(provider.nr_ready && !provider.nr_failed && provider.nr_requirements.file_version == "310.9.16.0",
+              "production prime resolves the pinned real NR Runtime before LoadDirectApi");
+          renodx::addons::dlss5::RuntimeLock lock(native::runtime_mutex);
+          const bool loaded = native::LoadDirectApi();
+          snippet_identity_slot = native::get_module_filename_iat;
+          snippet_identity_original = native::original_get_module_filename;
+          std::cout << nlohmann::json{{"event", "nr_snippet_load"}, {"loaded", loaded},
+              {"last_result", native::last_result.load()},
+              {"identity_iat_installed", snippet_identity_slot != nullptr},
+              {"private_device_initialized", native::direct_device != nullptr}}.dump() << '\n';
+          Check(loaded && !native::direct_api.borrowed_core_context && native::direct_api.module == provider.nr_module
+                    && native::direct_api.init != nullptr && native::direct_api.init == provider.init
+                    && native::direct_api.create != nullptr && native::direct_api.create == provider.create
+                    && native::direct_api.evaluate != nullptr && native::direct_api.evaluate == provider.evaluate
+                    && native::direct_api.release != nullptr && native::direct_api.release == provider.release
+                    && native::direct_api.shutdown != nullptr && native::direct_api.shutdown == provider.shutdown
+                    && snippet_identity_slot != nullptr && snippet_identity_original != nullptr
+                    && *snippet_identity_slot == reinterpret_cast<void*>(native::CallerGetModuleFileNameW),
+              "production LoadDirectApi installs its real caller identity and resolves the signed snippet exports");
+          bridge_snippet_init = native::direct_api.init;
+          bridge_native_create = native::direct_api.create;
+          bridge_native_evaluate = native::direct_api.evaluate;
+          bridge_native_release = native::direct_api.release;
+          bridge_snippet_shutdown = native::direct_api.shutdown;
+          native::direct_api.init = BridgeSnippetInit;
+          native::direct_api.create = BridgeNativeCreate;
+          native::direct_api.evaluate = BridgeNativeEvaluate;
+          native::direct_api.release = BridgeNativeRelease;
+          native::direct_api.shutdown = BridgeSnippetShutdown;
+        } else {
+          const auto nr_init = NVSDK_NGX_D3D12_Init_with_ProjectID(project_id.c_str(), NVSDK_NGX_ENGINE_TYPE_CUSTOM,
+              "NR-Nexus-Bridge-offline-1", runtime_directory.c_str(), native::bridge.device12, &common_info);
+          nr_sdk_initialized = NVSDK_NGX_SUCCEED(nr_init);
+          std::cout << nlohmann::json{{"event", "nr_sdk_init"}, {"api_result", static_cast<uint32_t>(nr_init)}}.dump() << '\n';
+          Check(nr_sdk_initialized, "SDK independently initializes the private D3D12 NR device, without snippet fallback");
+          native::PrimeNgxLoaderSymbols(native::bridge.device12);
+          const auto& provider = native::NgxLoaderView();
+          Check(provider.nr_ready && !provider.nr_failed && provider.core_ready
+                    && provider.nr_requirements.file_version == "310.9.16.0"
+                    && provider.core_allocate != nullptr && provider.core_destroy != nullptr
+                    && provider.core_create != nullptr && provider.core_evaluate != nullptr && provider.core_release != nullptr,
+              "Bridge SDK provider resolves the pinned real NR Runtime and complete public Core functions");
+          bridge_native_create = provider.core_create;
+          bridge_native_evaluate = provider.core_evaluate;
+          bridge_native_release = provider.core_release;
+          native::direct_api = {.borrowed_core_context = false, .module = provider.nr_module,
+              .allocate = provider.core_allocate, .destroy = provider.core_destroy,
+              .create = BridgeNativeCreate, .evaluate = BridgeNativeEvaluate, .release = BridgeNativeRelease};
+          native::direct_load_state = native::DirectLoadState::Ready;
+          native::direct_runtime_requirements = provider.nr_requirements;
+          native::direct_runtime_sha256 = provider.nr_sha256;
+          native::core_allocate_parameters = provider.core_allocate;
+          native::core_destroy_parameters = provider.core_destroy;
+          native::core_create_feature = nullptr;
+          native::core_evaluate_feature = nullptr;
+          native::core_release_feature = nullptr;
+          native::parameter_runtime_via_core.store(false);
+          native::parameter_runtime_ready = true;
+          Check(native::direct_device == native::bridge.device12 && !native::control_mask_use_core_context.load()
+                    && native::get_module_filename_iat == nullptr && native::original_get_module_filename == nullptr,
+              "SDK-preinitialized NR uses this exact private device and never borrows SR or installs identity hooks");
+        }
         const auto allocated = NVSDK_NGX_D3D11_GetCapabilityParameters(&sdk_sr_parameters);
         std::cout << nlohmann::json{{"event", "sr_parameters"}, {"api_result", static_cast<uint32_t>(allocated)}}.dump() << '\n';
         Check(NVSDK_NGX_SUCCEED(allocated) && sdk_sr_parameters != nullptr, "SDK allocates real D3D11 SR parameters");
@@ -744,6 +833,11 @@ int main(int argc, char** argv) {
         }
         const auto source_ns = native::SteadyNowNs() - begin;
         Check(NVSDK_NGX_SUCCEED(result), "Bridge Adaptive preserves the selected SR provider's successful result");
+#if defined(NR_NEXUS_TEST_NATIVE_NGX)
+        if (adaptive_native_snippet && bridge_snippet_init_calls != 0) {
+          Check(NVSDK_NGX_SUCCEED(bridge_snippet_init_result), "production snippet Init_Ext returned failure; no alternate provider is tried");
+        }
+#endif
         if (wait_gpu && native::bridge_submitted_value.load() != 0) {
           WaitForGpu(native::bridge.fence_done12, native::bridge_submitted_value.load());
           const native::BridgeDeviceLock device_lock(context.Get());
@@ -759,6 +853,8 @@ int main(int argc, char** argv) {
           const auto state = native::features.find(handle);
           std::cout << nlohmann::json{{"event", "bridge_source"}, {"phase", phase}, {"source", native::present_generation},
               {"evidence", adaptive_native_ngx ? "NATIVE_GPU+NATIVE_NGX" : "NATIVE_GPU+MOCK"},
+              {"nr_provider", adaptive_native_snippet ? "production snippet Init_Ext"
+                  : (adaptive_native_ngx ? "SDK-preinitialized private D3D12" : "MOCK")},
               {"source_cpu_ms", source_ns / 1'000'000.}, {"api_result", static_cast<uint32_t>(result)},
               {"completion_wait_ms", (native::bridge_completion_wait_ns - completion_before) / 1'000'000.},
               {"bridge_cpu_ms", {{"input", (cpu.input_ns - cpu_before.input_ns) / 1'000'000.},
@@ -814,6 +910,15 @@ int main(int argc, char** argv) {
       };
       mature();
       auto& feature = native::features.at(handle);
+#if defined(NR_NEXUS_TEST_NATIVE_NGX)
+      if (adaptive_native_snippet) {
+        Check(bridge_snippet_init_calls == 1 && bridge_snippet_initialized_device == native::bridge.device12
+                  && native::direct_device == native::bridge.device12 && !nr_sdk_initialized
+                  && !native::parameter_runtime_via_core.load() && native::core_create_feature == nullptr
+                  && native::get_module_filename_iat == snippet_identity_slot,
+            "EnsureDirectRuntime initialized the real private snippet device once, without SDK12 or Core borrowing");
+      }
+#endif
       if (adaptive_hardware) {
         frame(true, "upper");
       }
@@ -907,7 +1012,13 @@ int main(int argc, char** argv) {
         Check(cleaned && model_released.size() == model_created,
             "hardware source release and exact retirement release all private NR models and shared twins");
         Check(native::get_module_filename_iat == nullptr && native::original_get_module_filename == nullptr,
-            "Bridge hardware test never installs a snippet identity IAT bridge");
+            "Bridge hardware cleanup leaves no caller identity IAT bridge");
+#if defined(NR_NEXUS_TEST_NATIVE_NGX)
+        if (adaptive_native_snippet) {
+          Check(bridge_snippet_shutdown_calls == 1 && bridge_snippet_initialized_device == nullptr && !nr_sdk_initialized,
+              "the real snippet device shuts down once after retirement; no SDK12 shutdown is substituted");
+        }
+#endif
       } else {
         native::nr_adaptive_enabled.store(true);
         mature();
@@ -972,8 +1083,9 @@ int main(int argc, char** argv) {
         }
       }
       std::cout << "PASS Bridge Adaptive "
-          << (adaptive_native_ngx ? "NATIVE_GPU+NATIVE_NGX real D3D11 SR + SDK-preinitialized private D3D12 NR"
-              : (adaptive_hardware ? "NATIVE_GPU+MOCK" : "WARP+MOCK"))
+          << (adaptive_native_snippet ? "NATIVE_GPU+NATIVE_NGX real D3D11 SR + production private D3D12 snippet Init_Ext"
+              : (adaptive_native_ngx ? "NATIVE_GPU+NATIVE_NGX real D3D11 SR + SDK-preinitialized private D3D12 NR"
+                  : (adaptive_hardware ? "NATIVE_GPU+MOCK" : "WARP+MOCK")))
           << " two full-prepared tiers, ready roundtrip/Reset/zero creates, Off/source release/retirement"
           << (adaptive_hardware ? "; requested_model=B internal_model=unknown; " : ", standby failure/recovery/watchdog; ")
           << "gpu_segments=" << gpu_samples << '\n';

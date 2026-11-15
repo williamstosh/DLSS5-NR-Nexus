@@ -491,6 +491,12 @@ Create／Evaluate 耗时，嵌套值不能重复加总。源调用计时不含�
 游戏的 snippet 初始化。正式 Bridge 自适应兼容门禁仍关闭；自动帧率闭环、更多档位、
 有限驻留及游戏动态画质需各自证据。
 
+另一个显式入口 `-BridgeCase adaptive-native-snippet` 使用相同的 SDK／Runtime 参数，
+仅 SDK 初始化 D3D11 SR；私有 D3D12 NR 经过生产 loader、caller identity 和
+`EnsureDirectRuntime` 的 `Init_Ext`，不预写设备就绪或降级到 SDK12。它复用两档流程，
+单独记录 Init／Shutdown 结果，并在完成和退休后核验 caller identity 恢复。
+这可隔离生产初始化路径；来源 Hook 安装时机和 FG Off 在夹具中仍是明确前提，需另取游戏证据。
+
 默认 `-Suite fg-native` 会复用同一编译产物，分别在独立进程执行这两个自适应用例；默认 `-Suite ui` 也会复用菜单二进制，在独立进程执行自适应真实 ImGui 交互，包括三种介入点连续往返与配置保存。本地完整发布预检保留这些入口；远端核心回归保留 FG 默认组，UI 全量检查由本地初审承担。`NR_NEXUS_ADAPTIVE_UI_ONLY=1` 仍可单独运行自适应 UI，快照模式不额外运行回归。
 
 真实 NR 尺寸往返复用公开 SDK 预初始化入口：
