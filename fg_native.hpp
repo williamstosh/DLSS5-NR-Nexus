@@ -387,7 +387,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     // Runtime/device adoption can release the old global codec. It must run
     // before this CPU-only gate, while no FeatureState references are held.
     auto decline = NrDeclineReason::kNrRuntimeUnavailable;
-    if (!EnsureDirectRuntime(list, &decline)) {
+    if (!EnsureDirectRuntime(list, &decline, base.private_signed_runtime)) {
       CountNrDecline(decline);
       return fg::Result::NOT_SERVED;
     }
@@ -1097,6 +1097,7 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
       return stream.result;
     }
     PresentTarget target;
+    target.private_signed_runtime = true;
     SnapshotPresentRestoreConfiguration(&target);
     target.swapchain_identity = reinterpret_cast<uintptr_t>(input.swapchain);
     target.swapchain_format = input.backbuffer->GetDesc().Format;

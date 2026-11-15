@@ -140,6 +140,8 @@ int Run() {
     bool verify_limited_commit = false;
     addon::adaptive_resolution::Sizes before_limited_commit;
     model_parameter_observer = [&](const NVSDK_NGX_Handle* model, const NVSDK_NGX_Parameter* parameters) {
+      Check(!native::parameter_runtime_via_core.load(),
+          "both native pre-FG color roles retain the private signed provider through preparation and evaluation");
       Check(native::GetD3D12Resource(parameters, "DLSSNR.ControlMask") != nullptr,
           "every model call receives the production GPU ControlMask");
       ++masked_calls;

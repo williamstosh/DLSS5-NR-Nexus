@@ -154,6 +154,80 @@ inline bool wrapper_adopted = false;
 inline ID3D12GraphicsCommandList* wrapper_list = nullptr;
 inline uint32_t failed_core_creates = 0;
 inline uint32_t forbidden_fallback_creates = 0;
+struct ProviderCalls {
+  uint32_t allocations = 0, destroys = 0, creates = 0, evaluates = 0, releases = 0;
+  std::set<const NVSDK_NGX_Parameter*> parameters;
+  std::set<const NVSDK_NGX_Handle*> handles;
+  std::set<const NVSDK_NGX_Handle*> evaluated_handles;
+};
+inline ProviderCalls provider_core, provider_signed;
+inline bool fail_private_init = false, fail_private_create = false;
+
+NVSDK_NGX_Result NVSDK_CONV ProviderCoreAllocate(NVSDK_NGX_Parameter** parameters) {
+  ++provider_core.allocations;
+  const auto result = renodx::addons::dlss5::bridge::AllocateOwnedParameters(parameters);
+  if (NVSDK_NGX_SUCCEED(result)) provider_core.parameters.insert(*parameters);
+  return result;
+}
+NVSDK_NGX_Result NVSDK_CONV ProviderCoreDestroy(NVSDK_NGX_Parameter* parameters) {
+  Check(provider_core.parameters.erase(parameters) == 1, "old Core destroys only its own parameter block");
+  ++provider_core.destroys;
+  return renodx::addons::dlss5::bridge::DestroyOwnedParameters(parameters);
+}
+NVSDK_NGX_Result NVSDK_CONV ProviderCoreCreate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Feature feature,
+    const NVSDK_NGX_Parameter* parameters, NVSDK_NGX_Handle** handle) {
+  Check(provider_core.parameters.contains(parameters), "Core Create uses Core parameters");
+  ++provider_core.creates;
+  const auto result = CreateModel(list, feature, parameters, handle);
+  provider_core.handles.insert(*handle);
+  return result;
+}
+NVSDK_NGX_Result NVSDK_CONV ProviderCoreEvaluate(ID3D12GraphicsCommandList*, const NVSDK_NGX_Handle* handle,
+    const NVSDK_NGX_Parameter* parameters, PFN_NVSDK_NGX_ProgressCallback) {
+  Check(provider_core.handles.contains(handle) && provider_core.parameters.contains(parameters),
+      "ordinary inline Evaluate keeps its Core handle and parameters");
+  ++provider_core.evaluates;
+  provider_core.evaluated_handles.insert(handle);
+  return NVSDK_NGX_Result_Success;
+}
+NVSDK_NGX_Result NVSDK_CONV ProviderCoreRelease(NVSDK_NGX_Handle* handle) {
+  Check(provider_core.handles.erase(handle) == 1, "old Core releases only its own handle");
+  ++provider_core.releases;
+  return ReleaseModel(handle);
+}
+NVSDK_NGX_Result NVSDK_CONV ProviderSignedInit(unsigned long long, const wchar_t*, ID3D12Device*,
+    NVSDK_NGX_Version, const NVSDK_NGX_Parameter*) {
+  ++runtime_initializations;
+  return fail_private_init ? NVSDK_NGX_Result_FAIL_UnableToInitializeFeature : NVSDK_NGX_Result_Success;
+}
+NVSDK_NGX_Result NVSDK_CONV ProviderSignedCreate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Feature feature,
+    const NVSDK_NGX_Parameter* parameters, NVSDK_NGX_Handle** handle) {
+  Check(!provider_core.parameters.contains(parameters)
+      && addon::core_allocate_parameters == renodx::addons::dlss5::bridge::AllocateOwnedParameters
+      && addon::core_destroy_parameters == renodx::addons::dlss5::bridge::DestroyOwnedParameters,
+      "private signed Create uses the complete OwnedParameters pair, never Core");
+  ++provider_signed.creates;
+  if (fail_private_create) {
+    *handle = nullptr;
+    return NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
+  }
+  const auto result = CreateModel(list, feature, parameters, handle);
+  provider_signed.handles.insert(*handle);
+  return result;
+}
+NVSDK_NGX_Result NVSDK_CONV ProviderSignedEvaluate(ID3D12GraphicsCommandList*, const NVSDK_NGX_Handle* handle,
+    const NVSDK_NGX_Parameter* parameters, PFN_NVSDK_NGX_ProgressCallback) {
+  Check(provider_signed.handles.contains(handle) && !provider_core.parameters.contains(parameters),
+      "private signed Evaluate keeps its direct handle and OwnedParameters");
+  ++provider_signed.evaluates;
+  provider_signed.evaluated_handles.insert(handle);
+  return NVSDK_NGX_Result_Success;
+}
+NVSDK_NGX_Result NVSDK_CONV ProviderSignedRelease(NVSDK_NGX_Handle* handle) {
+  Check(provider_signed.handles.erase(handle) == 1, "signed provider releases only its own handle");
+  ++provider_signed.releases;
+  return ReleaseModel(handle);
+}
 
 struct CredentialParameters : NVSDK_NGX_Parameter {
   renodx::addons::dlss5::bridge::OwnedParameters values;
@@ -306,6 +380,9 @@ void RunBorrowedCore(Gpu& gpu, bool hardware, bool second_adapter) {
               && addon::direct_api.init == nullptr && addon::direct_api.shutdown == nullptr
               && addon::last_result.load() == last,
           "none baseline adopts exact SR device without fabricating Init result");
+    Check(!addon::EnsureDirectRuntime(gpu.list.Get(), nullptr, true)
+        && addon::direct_api.borrowed_core_context && addon::parameter_runtime_via_core,
+        "private native request cannot override the explicit borrowed-Core diagnostic");
     {
       addon::SuccessfulSrCoreScope invalid(nullptr);
       Check(!addon::EnsureDirectRuntime(gpu.list.Get()), "nested empty credential shadows ready device");
@@ -382,6 +459,167 @@ void RunBorrowedCore(Gpu& gpu, bool hardware, bool second_adapter) {
             && addon::get_module_filename_iat == nullptr,
         "full borrowed teardown makes no SDK Init/Shutdown or identity calls");
   addon::control_mask_use_core_context = false;
+  {
+    // The same WARP device/list is sufficient to expose a provider mismatch:
+    // canonical device equality cannot authorize using Core on a private list.
+    symbols.core_allocate = ProviderCoreAllocate;
+    symbols.core_destroy = ProviderCoreDestroy;
+    symbols.core_create = ProviderCoreCreate;
+    symbols.core_evaluate = ProviderCoreEvaluate;
+    symbols.core_release = ProviderCoreRelease;
+    const auto configure_runtime = [&] {
+      addon::ngx_loader_published.store(&symbols);
+      addon::direct_api = {.module = GetModuleHandleW(nullptr), .init = ProviderSignedInit,
+          .create = ProviderSignedCreate, .evaluate = ProviderSignedEvaluate,
+          .release = ProviderSignedRelease, .shutdown = ShutdownRuntime};
+      addon::direct_load_state = addon::DirectLoadState::Ready;
+      addon::direct_runtime_failed = false;
+    };
+    configure_runtime();
+    runtime_initializations = runtime_shutdowns = 0;
+    Check(addon::InstallQueueCompletionHooks(gpu.queue.Get())
+        && addon::InstallCommandListStateHooks(gpu.list.Get()), "private provider production recording hooks");
+    addon::enabled = addon::hooks_enabled = true;
+    addon::hook_point = addon::kHookUpscaled;
+    addon::stack_passes = 2;
+    addon::pass_stage[0] = 0;
+    addon::nr_follow_input_res = false;
+    addon::nr_resolution_scale = 1.f;
+    addon::codec_mode = addon::feed_mode = 0;
+    addon::look_mode = false;
+    addon::intensity = .5f;
+    addon::transfer_strength = addon::color_strength = 1.f;
+    addon::detail_stability = 0;
+    addon::control_mask_enabled = false;
+    addon::dedupe_mode = renodx::addons::dlss5::kDedupePerEvaluate;
+    const auto texture = [&](DXGI_FORMAT format, bool output) {
+      const D3D12_HEAP_PROPERTIES heap{.Type = D3D12_HEAP_TYPE_DEFAULT};
+      const D3D12_RESOURCE_DESC desc{.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+          .Width = 8, .Height = 8, .DepthOrArraySize = 1, .MipLevels = 1, .Format = format,
+          .SampleDesc = {1, 0}, .Flags = (output ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE)};
+      ComPtr<ID3D12Resource> resource;
+      Check(SUCCEEDED(gpu.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+          output ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : NATIVE_INPUT_STATE, nullptr,
+          IID_PPV_ARGS(&resource))), "provider test WARP texture");
+      return resource;
+    };
+    auto color = texture(DXGI_FORMAT_R8G8B8A8_UNORM, false);
+    auto output = texture(DXGI_FORMAT_R8G8B8A8_UNORM, true);
+    auto depth = texture(DXGI_FORMAT_R32_FLOAT, false);
+    auto motion = texture(DXGI_FORMAT_R16G16_FLOAT, false);
+    renodx::addons::dlss5::bridge::OwnedParameters parameters;
+    parameters.Set(NVSDK_NGX_Parameter_Color, color.Get());
+    parameters.Set(NVSDK_NGX_Parameter_Output, output.Get());
+    parameters.Set(NVSDK_NGX_Parameter_Depth, depth.Get());
+    parameters.Set(NVSDK_NGX_Parameter_MotionVectors, motion.Get());
+    parameters.Set(NVSDK_NGX_Parameter_Width, 8u);
+    parameters.Set(NVSDK_NGX_Parameter_Height, 8u);
+    parameters.Set(NVSDK_NGX_Parameter_OutWidth, 8u);
+    parameters.Set(NVSDK_NGX_Parameter_OutHeight, 8u);
+    parameters.Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, 8u);
+    parameters.Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, 8u);
+    parameters.Set(NVSDK_NGX_Parameter_MV_Scale_X, 1.f);
+    parameters.Set(NVSDK_NGX_Parameter_MV_Scale_Y, 1.f);
+    const auto* owner = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xC0BE002});
+    addon::RegisterCreatedFeatureLocked(owner, addon::kFeatureDlss, &parameters);
+    bool touched = false;
+    bool recorded = false;
+    // Preserve production's create-now/evaluate-next-recording boundary for
+    // both Passes. The last recording stays open for the pending-switch check.
+    for (uint32_t frame = 0; frame < 3; ++frame) {
+      recorded = addon::RecordInline(gpu.list.Get(), owner, &parameters, &touched);
+      if (frame != 2) gpu.Submit();
+    }
+    Check(recorded && provider_core.allocations == 2 && provider_core.creates == 2
+        && provider_core.evaluated_handles.size() == 2
+        && provider_signed.creates == 0 && runtime_initializations == 1,
+        "ordinary inline keeps the complete Core Allocate/Create/Evaluate chain");
+    addon::ReleaseNrSlot(addon::features.at(owner), 1, true);
+    const auto old_destroy = addon::core_destroy_parameters;
+    const auto core_evaluates = provider_core.evaluates;
+    const auto device_changes = addon::nr_runtime_device_changes.load();
+    auto decline = renodx::addons::dlss5::NrDeclineReason::kNrRuntimeUnavailable;
+    Check(!addon::EnsureDirectRuntime(gpu.list.Get(), &decline, true)
+        && decline == renodx::addons::dlss5::NrDeclineReason::kRuntimeSwitchPending
+        && addon::core_destroy_parameters == old_destroy && provider_core.releases == 0
+        && provider_core.destroys == 0 && runtime_initializations == 1 && runtime_shutdowns == 0,
+        "same-interface provider switch retains live and retired Core objects while work is pending");
+    Check(SUCCEEDED(gpu.list->Close()), "provider recording Close");
+    Check(!addon::EnsureDirectRuntime(gpu.list.Get(), &decline, true)
+        && provider_core.releases == 0 && addon::core_destroy_parameters == old_destroy,
+        "Close without submission cannot authorize a provider switch");
+    ID3D12CommandList* lists[]{gpu.list.Get()};
+    const auto pending = renodx::addons::dlss5::submission::BeginSubmission(1, lists);
+    gpu.queue->ExecuteCommandLists(1, lists);
+    gpu.submission_pending = true;
+    Check(SUCCEEDED(gpu.queue->Signal(gpu.fence.Get(), ++gpu.serial)), "provider recording completion signal");
+    renodx::addons::dlss5::submission::CompleteSubmission(pending, gpu.fence.Get(), gpu.serial);
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    Check(event != nullptr, "provider recording completion event");
+    const auto signal = gpu.fence->SetEventOnCompletion(gpu.serial, event);
+    const auto wait = (SUCCEEDED(signal) ? WaitForSingleObject(event, 10000) : WAIT_FAILED);
+    CloseHandle(event);
+    Check(wait == WAIT_OBJECT_0 && gpu.fence->GetCompletedValue() != UINT64_MAX,
+        "provider recording completes on WARP");
+    gpu.submission_pending = false;
+    Check(addon::TeardownProof() == renodx::addons::dlss5::submission::RecordedWork::kReplayable
+        && !addon::EnsureDirectRuntime(gpu.list.Get(), &decline, true)
+        && provider_core.releases == 0 && provider_core.destroys == 0
+        && addon::core_destroy_parameters == old_destroy,
+        "completed but replayable Core recording retains the old provider and allocator");
+    Check(SUCCEEDED(gpu.allocator->Reset()) && SUCCEEDED(gpu.list->Reset(gpu.allocator.Get(), nullptr)),
+        "provider recording legitimate Reset");
+    renodx::addons::dlss5::submission::OnCommandListReset(gpu.list.Get());
+    Check(addon::EnsureDirectRuntime(gpu.list.Get(), &decline, true)
+        && !addon::parameter_runtime_via_core && provider_core.releases == 2 && provider_core.destroys == 2
+        && provider_core.handles.empty() && provider_core.parameters.empty()
+        && runtime_initializations == 2 && runtime_shutdowns == 1
+        && addon::nr_runtime_device_changes.load() == device_changes,
+        "same-interface Core-to-signed switch retires every object through its OLD provider before reinitializing");
+    addon::hook_point = addon::kHookPresent;
+    addon::PresentTarget target{.output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        .workset_key = output.Get(), .private_signed_runtime = true};
+    for (uint32_t frame = 0; frame < 3; ++frame) {
+      recorded = addon::RecordInline(gpu.list.Get(), owner, &parameters, &touched, &target);
+      if (frame != 2) gpu.Submit();
+    }
+    Check(recorded && provider_signed.creates == 2 && provider_signed.evaluated_handles.size() == 2
+        && provider_core.allocations == 2 && provider_core.creates == 2 && provider_core.evaluates == core_evaluates
+        && addon::EnsureDirectRuntime(gpu.list.Get()) && runtime_initializations == 2,
+        "private Present and every stacked/nested Ensure remain signed without new Core calls or Init");
+    gpu.Submit();
+    addon::direct_api.module = nullptr;  // The fixture borrowed the EXE, never a loader-owned reference.
+    Check(addon::Shutdown(false) && provider_signed.releases == 2 && provider_signed.handles.empty()
+        && runtime_shutdowns == 2, "private signed teardown releases its own handles and shuts down once");
+    for (const bool fail_init : {true, false}) {
+      configure_runtime();
+      fail_private_init = fail_init;
+      fail_private_create = !fail_init;
+      const auto core_creates = provider_core.creates;
+      const auto creates = provider_signed.creates;
+      const bool initialized = addon::EnsureDirectRuntime(gpu.list.Get(), nullptr, true);
+      if (fail_init) {
+        Check(!initialized && !addon::EnsureDirectRuntime(gpu.list.Get())
+            && provider_signed.creates == creates && provider_core.creates == core_creates,
+            "private signed Init failure never falls back to Core");
+      } else {
+        addon::FeatureState rejected;
+        addon::FinalResources resources;
+        Check(initialized && !addon::EnsureNrFeature(gpu.list.Get(), rejected, 0, resources, 8, 8, 8, 8)
+            && rejected.slots[0].failed && rejected.slots[0].parameters == nullptr
+            && rejected.slots[0].handle == nullptr && provider_signed.creates == creates + 1
+            && provider_core.creates == core_creates && provider_signed.handles.empty(),
+            "private signed Create failure destroys its OwnedParameters and does not call Core");
+      }
+      addon::direct_api.module = nullptr;
+      Check(addon::Shutdown(false), "failed private provider test cleanup");
+    }
+    fail_private_init = fail_private_create = false;
+    runtime_initializations = runtime_shutdowns = 0;
+    addon::stack_passes = 1;
+    addon::hook_point = addon::kHookUpscaled;
+    std::cout << "PASS private signed provider exact-interface Core switch pending/replayable/Reset nested stack failure evidence=WARP+MOCK real_NGX=NOT_RUN\n";
+  }
   addon::ngx_loader_published.store(published);
   std::cout << "PASS borrowed Core credential/exports/backend/teardown evidence=MOCK+GPU no real NGX\n";
 }

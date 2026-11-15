@@ -1127,6 +1127,9 @@ struct PresentTarget {
   bool d3d11_bridge = false;
   // Granted only by the ordinary Present caller, never by pre-FG/B1.
   bool independent_resolution_pair = false;
+  // The native pre-FG service owns its command list and must not borrow the
+  // game's Core context, which may have been initialized through a proxy.
+  bool private_signed_runtime = false;
   // Granted only to the validated native single-plane FG transaction.
   bool native_prefg_resolution_pair = false;
   present_hdr_pedestal::Snapshot hdr_pedestal;
@@ -5855,12 +5858,13 @@ inline bool WaitForTrackedQueues() {
 // passes through while it waits to switch device or face (v8, LIFE-12), and
 // left as the caller set it for every other failure.
 inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
-                                NrDeclineReason* decline = nullptr) {
+                                NrDeclineReason* decline = nullptr,
+                                bool private_signed_runtime = false) {
 #if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
   const ColdCpuTraceScope cold_trace("EnsureDirectRuntime");
 #endif
   if (control_mask_use_core_context.load() || direct_api.borrowed_core_context) {
-    if (!control_mask_use_core_context.load()
+    if (private_signed_runtime || !control_mask_use_core_context.load()
         || hook_point.load() != kHookUpscaled || stack_passes.load() != 1
         || successful_sr_device == nullptr || command_list == nullptr || InsideDirectCall()) return false;
     ID3D12Device* device = nullptr;
@@ -5871,77 +5875,16 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
   }
   if (command_list == nullptr || !LoadDirectApi()) return false;
   if (direct_runtime_failed && direct_device == nullptr) return false;
-  if (!parameter_runtime_ready) {
-    // Resolved by PrimeNgxLoaderSymbols outside this lock; the acquire pairs
-    // with its release store.  `core_ready` false means no public NGX core is
-    // loaded (yet) - the same condition the old FindNgxCoreModule() ==
-    // nullptr produced, and the prime keeps retrying it, so a core that
-    // arrives later is still picked up.
-    const NgxLoaderSymbols& symbols = NgxLoaderView();
-    const bool core_ready = symbols.core_ready
-                            && (direct_api.borrowed_core_context
-                                || !bridge_force_snippet.load(std::memory_order_acquire));
-    HMODULE core = core_ready ? symbols.core : nullptr;
-    const auto allocate = core_ready ? symbols.core_allocate : nullptr;
-    const auto destroy = core_ready ? symbols.core_destroy : nullptr;
-    const auto create = core_ready ? symbols.core_create : nullptr;
-    const auto evaluate = core_ready ? symbols.core_evaluate : nullptr;
-    const auto release = core_ready ? symbols.core_release : nullptr;
-    // The signed runtime's own allocator is optional: 310.8.0 exports none
-    // (the allocator lives in the NGX core), and a block the addon owns is
-    // the shape the D0 probe's K1/K2 arms created and evaluated feature 18
-    // through (bridge_params.hpp, OwnedParameters).  Until alpha45 its
-    // absence failed every session without a public core - the bridge's
-    // private device always, and a D3D12 process whose NGX is bundled.
-    const bool runtime_allocator =
-        direct_api.allocate != nullptr && direct_api.destroy != nullptr;
-    const bool direct_ready = direct_api.create != nullptr
-        && direct_api.evaluate != nullptr && direct_api.release != nullptr;
-    if (!core_ready && !direct_ready) {
-      Log(
-          reshade::log::level::error,
-          "NGX/Streamline runtime has no complete parameter or feature export set");
-      last_result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
-      direct_runtime_failed = true;
-      return false;
-    }
-    if (core_ready) {
-      ngx_core_module = core;
-      parameter_runtime_via_core = true;
-      core_allocate_parameters = allocate;
-      core_destroy_parameters = destroy;
-      core_create_feature = create;
-      core_evaluate_feature = evaluate;
-      core_release_feature = release;
-    } else {
-      // Streamline can ship its own NGX bridge.  Keep the same parameter
-      // contract, but source every operation from the signed runtime when no
-      // complete public core is present.
-      ngx_core_module = nullptr;
-      parameter_runtime_via_core = false;
-      core_allocate_parameters = runtime_allocator
-          ? direct_api.allocate : bridge::AllocateOwnedParameters;
-      core_destroy_parameters = runtime_allocator
-          ? direct_api.destroy : bridge::DestroyOwnedParameters;
-      Log(reshade::log::level::info,
-          runtime_allocator
-              ? "NR parameter blocks come from the signed runtime's allocator"
-              : "NR parameter blocks are the addon's own: the signed runtime"
-                " exports no parameter allocator and no public NGX core serves"
-                " this device");
-      core_create_feature = nullptr;
-      core_evaluate_feature = nullptr;
-      core_release_feature = nullptr;
-    }
-    parameter_runtime_ready = true;
-  }
   ID3D12Device* device = nullptr;
   if (FAILED(command_list->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) {
     last_result = NVSDK_NGX_Result_FAIL_InvalidParameter;
     return false;
   }
 
-  if (direct_device == device) {
+  const bool exact_device = direct_device == device;
+  const bool provider_matches = !private_signed_runtime
+      || (parameter_runtime_ready && !parameter_runtime_via_core.load());
+  if (exact_device && provider_matches && parameter_runtime_ready) {
     if (FAILED(device->GetDeviceRemovedReason())) {
       device->Release();
       return false;
@@ -5950,7 +5893,7 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
     device->Release();
     return true;
   }
-  if (direct_device != nullptr) {
+  if (direct_device != nullptr && (!exact_device || !provider_matches)) {
     // The compare above is by raw pointer on purpose: NGX has to run in the
     // world of the list it records into, so a change of FACE - ReShade's
     // device proxy to the native device or back, the evaluate's list having
@@ -5986,11 +5929,12 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
     ID3D12Device* native_face = device;
     const bool proxy_face =
         renodx::utils::directx::NativeFromReShadeProxy(&native_face);
-    const char* const target =
-        !same_device ? "a different D3D12 device"
+    const char* const target = exact_device
+        ? "the signed runtime on the current D3D12 device interface"
+        : !same_device ? "a different D3D12 device"
         : proxy_face ? "ReShade's proxy of its D3D12 device"
                      : "the native face of its D3D12 device";
-    if (same_device) {
+    if (same_device && !exact_device) {
       if (runtime_face_candidate != device) {
         runtime_face_candidate = device;
         runtime_face_run = 0;
@@ -6045,16 +5989,16 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
       device->Release();
       return false;
     }
-    const uint64_t changes =
-        nr_runtime_device_changes.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t changes = (exact_device ? 0
+        : nr_runtime_device_changes.fetch_add(1, std::memory_order_relaxed) + 1);
     if (changes <= kNrRuntimeDeviceChangeLogCap) {
       Log(reshade::log::level::warning,
           std::string("NR's direct runtime re-initializes for ") + target
-              + (same_device
+              + (same_device && !exact_device
                      ? " (the evaluate's command list changed world, and NGX"
                        " records in the world of its list)"
                      : "")
-              + "; change " + std::to_string(changes)
+              + (exact_device ? "; provider change" : "; device/face change " + std::to_string(changes))
               + "; NR's recorded work had completed and every recording was closed"
               + (changes == kNrRuntimeDeviceChangeLogCap
                      ? ", further changes are not logged"
@@ -6081,6 +6025,53 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
     parameter_runtime_ready = false;
     parameter_runtime_via_core = false;
     ngx_core_module = nullptr;
+  }
+  // Old handles and retirements above still use the old allocator/release
+  // pair. Publish a new provider only after their complete, non-replayable proof.
+  if (!parameter_runtime_ready || !provider_matches) {
+    const NgxLoaderSymbols& symbols = NgxLoaderView();
+    const bool core_ready = !private_signed_runtime && symbols.core_ready
+        && (direct_api.borrowed_core_context
+            || !bridge_force_snippet.load(std::memory_order_acquire));
+    const bool runtime_allocator = direct_api.allocate != nullptr && direct_api.destroy != nullptr;
+    const bool direct_ready = direct_api.create != nullptr
+        && direct_api.evaluate != nullptr && direct_api.release != nullptr;
+    if (!core_ready && !direct_ready) {
+      Log(reshade::log::level::error,
+          "NGX/Streamline runtime has no complete parameter or feature export set");
+      last_result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
+      direct_runtime_failed = true;
+      device->Release();
+      return false;
+    }
+    parameter_runtime_via_core = core_ready;
+    ngx_core_module = (core_ready ? symbols.core : nullptr);
+    if (core_ready) {
+      core_allocate_parameters = symbols.core_allocate;
+      core_destroy_parameters = symbols.core_destroy;
+      core_create_feature = symbols.core_create;
+      core_evaluate_feature = symbols.core_evaluate;
+      core_release_feature = symbols.core_release;
+    } else {
+      // 310.9.16 has no parameter allocator exports. Keep the complete runtime
+      // pair when available, otherwise use our OwnedParameters pair throughout.
+      core_allocate_parameters = (runtime_allocator ? direct_api.allocate : bridge::AllocateOwnedParameters);
+      core_destroy_parameters = (runtime_allocator ? direct_api.destroy : bridge::DestroyOwnedParameters);
+      core_create_feature = nullptr;
+      core_evaluate_feature = nullptr;
+      core_release_feature = nullptr;
+      Log(reshade::log::level::info,
+          runtime_allocator
+              ? "NR parameter blocks come from the signed runtime's allocator"
+              : "NR parameter blocks are the addon's own: the signed runtime"
+                " exports no parameter allocator for this device context");
+    }
+    parameter_runtime_ready = true;
+  }
+  if (direct_device == device) {
+    const bool available = SUCCEEDED(device->GetDeviceRemovedReason());
+    device->Release();
+    return available;
   }
   // A new runtime starts a new face count and a new switch.
   runtime_face_candidate = nullptr;
@@ -13037,7 +13028,8 @@ inline bool RecordInline(
   // inside EnsureDirectRuntime releases every feature state, so the
   // FeatureState& bound below must not exist yet (see FindOrRegisterFeature).
   NrDeclineReason runtime_decline = NrDeclineReason::kNrRuntimeUnavailable;
-  if (!EnsureDirectRuntime(command_list, &runtime_decline)) {
+  if (!EnsureDirectRuntime(command_list, &runtime_decline,
+                           present != nullptr && present->private_signed_runtime)) {
     // Named, not silent: with no nvngx_dlssnr.dll on the machine this is
     // where EVERY evaluate ends, and until v6.8.0-alpha23 it ended without
     // counting anything.  The verdict said UNAVAILABLE and was right; the
