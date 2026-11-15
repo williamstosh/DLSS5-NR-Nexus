@@ -513,6 +513,19 @@ PSO 创建，最后一个 PSO 所在源不叠加 NGX Create 或 NR Evaluate，re
 导出与夹具限速开销。SDK/provider、codec 根签名与 ControlMask PSO 的前置准备状态单独
 记录。同步的单个创建仍不可拆分，这项验证不预设总准备时间或单次延迟上限。
 
+有限驻留的原生单例在上述 `SELECTED_LEVELS=15`、`PIPELINE_STEPS=1`、`READY=1`
+条件下再设置 `NR_NEXUS_TEST_RESIZE_LIMITED=1`，不启用旧 `DEMAND_PREPARE` 旁路。
+它保留15个逻辑档位，验证上限→冷档→上限、旧录制仍可重放时拒绝添档、反向取消、
+真实退休后再准备和原有 OFF 收尾；只要求目标整组就绪并实际应用，不把 `Session.prepared`
+伪装为真。档位请求是夹具直接驱动，SR／NR、GPU 完成和资源退休是真实执行。
+此单例同时显式开启内部单 autoscale PSO 实验，玩家的有限驻留选项不自动开启它。
+worker API 时间、线程身份及退出单独记录；主线程嵌套 trace 不包含 worker，不能重复加总。
+前缀沿用 selected 循环的60 Hz节奏，62／180次源界限不变；准备墙时包含该节奏，
+不能直接对比旧零节拍前缀。`selected_collection.limited_residency` 保存目标、应用、
+驻留与退休数量；本模式的旧 `full_preparation_*` 字段仅继承首次上限前缀合计，完整范围
+以 `initial_target` 和 `phase_states` 为准。显存使用 `QueryVideoMemoryInfo` 的进程
+LOCAL CurrentUsage采样，含SR、NR、输入输出、工作集及待退休资源，不是额外档位显存或瞬时峰值。
+
 首调用 CPU 归因另用原生测试编译宏 `NR_NEXUS_TEST_COLD_CPU_TRACE`，配合
 `NR_NEXUS_TEST_RESIZE_COLD_COMPONENTS=1`、`NR_NEXUS_TEST_RESIZE_SELECTED_LEVELS=0`
 和 `NR_NEXUS_TEST_RESIZE_READY=1`，其他专项关闭，仍调用同一 resize 入口。只运行首两次
