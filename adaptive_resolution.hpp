@@ -454,7 +454,8 @@ struct Session {
     } else if (changed) {
       const auto retained = (trial ? ladder.sizes[previous_level] : status.applied);
       const bool defer_legacy = retain_legacy && (defer_preparation || settings.minimum_scale != next.minimum_scale);
-      const bool retry_budget = preparation_reason == Reason::BUDGET && selection_edited;
+      const bool retry_budget = preparation_reason == Reason::BUDGET
+          && (selection_edited || settings.limited_residency != next.limited_residency);
       if (selection_changed || toggled || preparation_mode_changed || retry_budget) {
         ++preparation_epoch;
         prepared = false;

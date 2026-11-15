@@ -2340,6 +2340,11 @@ inline constexpr Translation kSl[] = {
     {"Default (by capacity)", "Privzeto (glede na zmogljivost)"},
     {"Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.", "Najprej se pripravijo izbrane ravni. Več ravni porabi več pomnilnika in omogoča manjše korake. Priprava lahko povzroči kratek zastoj."},
     {"No working-resolution range to adjust", "Ni razpona delovne ločljivosti za prilagajanje"},
+    {"Preparation mode", "Način priprave"},
+    {"Prepare all levels", "Pripravi vse ravni"},
+    {"On-demand (experimental)", "Na zahtevo (poskusno)"},
+    {"All levels use more VRAM for smooth switching once ready. On-demand keeps fewer levels resident, but cold preparation may stutter.", "Vse ravni porabijo več videopomnilnika za gladko preklapljanje po pripravi. Način na zahtevo hrani manj ravni v pomnilniku, vendar lahko začetna priprava povzroči zatikanje."},
+    {"More levels give smaller steps. On-demand keeps fewer levels resident; preparing a missing level may stutter.", "Več ravni omogoča manjše korake. Način na zahtevo hrani manj ravni v pomnilniku; priprava manjkajoče ravni lahko povzroči zatikanje."},
 };
 
 }  // namespace renodx::addons::dlss5::ui::lang

@@ -1357,6 +1357,44 @@ int Run() {
       }
       Check(native::nr_features_created == steady_models && native::worksets_created == steady_worksets,
           "all-level and immediate fifteen-level round trips perform no new Feature or workset allocations");
+      const auto* mode_upper = wide.slots[0].handle;
+      // This GPU host has no ReShade configuration exports. The separate real
+      // configuration/ImGui fixtures cover Commit, persistence and profile undo.
+      native::kSetAdaptiveLimitedResidency.Store(1.f);
+      native::ApplySettingEffect(native::kSetAdaptiveLimitedResidency.effect);
+      for (uint32_t source = 0; source < 16; ++source) {
+        wide_record();
+        if (wide.adaptive_session->TargetReady()
+            && native::AdaptiveResidentWorksetCount(wide.adaptive_session) == 2) break;
+      }
+      std::cerr << "ADAPTIVE_MODE to_limited cache_same=" << (wide.adaptive_cache == collection)
+          << " requested_mode=" << native::nr_adaptive_limited_residency.load()
+          << " session_mode=" << wide.adaptive_session->settings.limited_residency
+          << " logical=" << collection->count << " active=" << collection->active
+          << " ready=" << wide.adaptive_session->TargetReady() << " full=" << wide.adaptive_session->prepared
+          << " failed=" << wide.adaptive_session->failed << " budget=" << collection->budget_blocked
+          << " epoch=" << wide.adaptive_session->preparation_epoch << '/' << collection->preparation_epoch
+          << " resident=" << native::AdaptiveResidentWorksetCount(wide.adaptive_session)
+          << " retiring=" << native::AdaptiveSessionRetirementPending(wide.adaptive_session)
+          << " upper_same=" << (wide.slots[0].handle == mode_upper)
+          << " models=" << native::nr_features_created << '/' << steady_models
+          << " reason=" << addon::adaptive_resolution::ReasonText(wide.adaptive_session->status.reason) << '\n';
+      Check(wide.adaptive_cache == collection && collection->active == 0 && collection->count == 15
+          && wide.adaptive_session->TargetReady() && !wide.adaptive_session->prepared
+          && wide.slots[0].handle == mode_upper && native::nr_features_created == steady_models
+          && native::AdaptiveResidentWorksetCount(wide.adaptive_session) == 2,
+          "the registered on-demand mode retires optional allocations in the same cache without reducing its logical ladder");
+      native::kSetAdaptiveLimitedResidency.Store(0.f);
+      native::ApplySettingEffect(native::kSetAdaptiveLimitedResidency.effect);
+      wide_record();
+      Check(wide.adaptive_cache == collection && !wide.adaptive_session->prepared && collection->active == 0
+          && wide.slots[0].handle == mode_upper,
+          "switching back to full preparation closes the ready gate and retains the compatible actual upper");
+      for (uint32_t source = 0; source < 128 && !wide.adaptive_session->prepared; ++source) wide_record();
+      Check(wide.adaptive_cache == collection && wide.adaptive_session->prepared && collection->count == 15
+          && wide.slots[0].handle == mode_upper && native::AdaptiveResidentWorksetCount(wide.adaptive_session) == 30
+          && native::nr_features_created == steady_models + 14,
+          "full preparation rebuilds only the fourteen evicted models and requires both outputs of all fifteen levels");
       native::nr_adaptive_enabled = false;
       wide_record();
       wide_record();

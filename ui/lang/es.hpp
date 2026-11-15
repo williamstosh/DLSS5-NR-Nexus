@@ -2340,6 +2340,11 @@ inline constexpr Translation kEs[] = {
     {"Default (by capacity)", "Predeterminado (según capacidad)"},
     {"Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.", "Primero se preparan los niveles elegidos. Más niveles usan más memoria y ofrecen pasos más pequeños. La preparación puede causar una pausa breve."},
     {"No working-resolution range to adjust", "No hay un rango de resolución de trabajo que ajustar"},
+    {"Preparation mode", "Modo de preparación"},
+    {"Prepare all levels", "Preparar todos los niveles"},
+    {"On-demand (experimental)", "A demanda (experimental)"},
+    {"All levels use more VRAM for smooth switching once ready. On-demand keeps fewer levels resident, but cold preparation may stutter.", "Todos los niveles usan más VRAM para cambiar con fluidez una vez preparados. El modo a demanda mantiene menos niveles en memoria, pero la preparación inicial puede causar tirones."},
+    {"More levels give smaller steps. On-demand keeps fewer levels resident; preparing a missing level may stutter.", "Más niveles ofrecen pasos más pequeños. El modo a demanda mantiene menos niveles en memoria; preparar un nivel que falta puede causar tirones."},
 };
 
 }  // namespace renodx::addons::dlss5::ui::lang

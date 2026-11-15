@@ -357,6 +357,7 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
     const float saved_adaptive_target = runtime::nr_adaptive_target_fps.load();
     const float saved_adaptive_minimum = runtime::nr_adaptive_min_scale.load();
     const uint32_t saved_adaptive_levels = runtime::nr_adaptive_selected_levels.load();
+    const bool saved_adaptive_limited = runtime::nr_adaptive_limited_residency.load();
     const bool motion_snapshot = scenario.action == "r7-depth-fine";
     const bool saved_motion_enabled = runtime::control_mask_motion_enabled.load();
     const float saved_motion_start = runtime::control_mask_motion_start.load();
@@ -537,6 +538,7 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
       runtime::nr_adaptive_target_fps = 120.f;
       runtime::nr_adaptive_min_scale = .67f;
       runtime::nr_adaptive_selected_levels = 6;
+      runtime::nr_adaptive_limited_residency = false;
     }
     const bool render_stage_resolution = scenario.action == "render-stage-resolution";
     const bool present_stage_resolution = scenario.action == "present-stage-resolution";
@@ -744,6 +746,10 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
       check(runtime::nr_adaptive_selected_levels.load() == 6
                 && runtime::nr_adaptive_target_fps.load() == 120.f,
             "changing the selected count preserves the independent FPS target");
+      click(find(ui::Tr("On-demand (experimental)")));
+      check(runtime::nr_adaptive_limited_residency.load() && runtime::nr_adaptive_selected_levels.load() == 6
+                && runtime::nr_adaptive_target_fps.load() == 120.f,
+            "the real preparation-mode choice preserves the six logical levels and target in both snapshot languages");
     }
     ImGuiWindow* settings = nullptr;
     if (long_page) {
@@ -1577,6 +1583,7 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
     runtime::nr_adaptive_target_fps = saved_adaptive_target;
     runtime::nr_adaptive_min_scale = saved_adaptive_minimum;
     runtime::nr_adaptive_selected_levels = saved_adaptive_levels;
+    runtime::nr_adaptive_limited_residency = saved_adaptive_limited;
     if (motion_snapshot) {
       runtime::control_mask_motion_enabled = saved_motion_enabled;
       runtime::control_mask_motion_start = saved_motion_start;

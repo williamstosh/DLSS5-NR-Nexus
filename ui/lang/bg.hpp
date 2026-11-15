@@ -2340,6 +2340,11 @@ inline constexpr Translation kBg[] = {
     {"Default (by capacity)", "По подразбиране (според капацитета)"},
     {"Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.", "Първо се подготвят избраните нива. Повече нива използват повече памет и дават по-малки стъпки. Подготовката може да причини кратко забавяне."},
     {"No working-resolution range to adjust", "Няма диапазон на работната резолюция за регулиране"},
+    {"Preparation mode", "Режим на подготовка"},
+    {"Prepare all levels", "Подготви всички нива"},
+    {"On-demand (experimental)", "При нужда (експериментално)"},
+    {"All levels use more VRAM for smooth switching once ready. On-demand keeps fewer levels resident, but cold preparation may stutter.", "Всички нива използват повече видеопамет за плавно превключване след подготовката. Подготовката при нужда държи по-малко нива в паметта, но първоначалната им подготовка може да причини засичане."},
+    {"More levels give smaller steps. On-demand keeps fewer levels resident; preparing a missing level may stutter.", "Повече нива дават по-малки стъпки. Подготовката при нужда държи по-малко нива в паметта; подготовката на липсващо ниво може да причини засичане."},
 };
 
 }  // namespace renodx::addons::dlss5::ui::lang

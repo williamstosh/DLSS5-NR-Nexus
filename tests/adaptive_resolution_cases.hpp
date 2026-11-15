@@ -576,6 +576,37 @@ inline bool Run() {
   }
   check(deepest_applied >= 3 && !limited_curve.prepared && !limited_curve.settings.legacy_preparation,
       "delayed cold targets still explore useful fine steps through the normal cumulative controller");
+
+  adaptive::Session mode_switch;
+  auto mode_settings = limited_settings;
+  mode_settings.selected_levels = mode_settings.prepared_levels = 15;
+  mode_settings.limited_residency = false;
+  mode_switch.Prepare(mode_settings, full_upper, full_floor, 1, limited_output, start, true, false, 72);
+  mode_switch.UpdatePreparation(mode_switch.preparation_epoch, 15, 15, adaptive::Reason::PREPARING, start);
+  mode_switch.Applied(mode_switch.status.generation, full_upper, start);
+  mode_switch.UpdatePreparation(mode_switch.preparation_epoch, 1, 15, adaptive::Reason::BUDGET, start + 1);
+  const auto denied_epoch = mode_switch.preparation_epoch;
+  mode_settings.limited_residency = true;
+  mode_switch.Prepare(mode_settings, full_upper, full_floor, 1, limited_output, start + 2, true, false, 72);
+  check(mode_switch.preparation_epoch == denied_epoch + 1 && mode_switch.ladder.count == 15
+      && mode_switch.preparation_reason == adaptive::Reason::PREPARING && !mode_switch.failed
+      && !mode_switch.TargetReady() && mode_switch.status.applied == full_upper,
+      "changing residency mode explicitly retries a denied budget while preserving all logical levels and actual output");
+  mode_switch.UpdateTargetPreparation(mode_switch.preparation_epoch, mode_switch.status.generation, 1, 15,
+      true, adaptive::Reason::PREPARING, start + 3);
+  mode_switch.Applied(mode_switch.status.generation, full_upper, start + 3);
+  mode_settings.limited_residency = false;
+  mode_switch.Prepare(mode_settings, full_upper, full_floor, 1, limited_output, start + 4, true, false, 72);
+  mode_switch.UpdatePreparation(mode_switch.preparation_epoch, 1, 15, adaptive::Reason::PREPARING, start + 5);
+  check(!mode_switch.prepared && !mode_switch.TargetReady() && mode_switch.ladder.count == 15,
+      "returning to full preparation closes automatic decisions until the complete logical collection is ready");
+  mode_switch.UpdatePreparation(mode_switch.preparation_epoch, 15, 15, adaptive::Reason::PREPARING, start + 6);
+  check(mode_switch.prepared && mode_switch.TargetReady(), "full preparation reopens only after the complete collection receipt");
+  mode_switch.Fail(mode_switch.status.generation);
+  mode_settings.limited_residency = true;
+  mode_switch.Prepare(mode_settings, full_upper, full_floor, 1, limited_output, start + 7, true, false, 72);
+  check(mode_switch.failed && mode_switch.status.reason == adaptive::Reason::FAILED && !mode_switch.TargetReady(),
+      "a mode edit does not retry an actual execution failure through the budget recovery path");
   return passed;
 }
 }  // namespace adaptive_resolution_cases

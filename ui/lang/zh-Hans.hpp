@@ -2349,6 +2349,11 @@ inline constexpr Translation kZhHans[] = {
     {"Default (by capacity)", "默认（按可用容量）"},
     {"Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.", "先准备全部所选档位。档位越多，显存占用越高、步距越细；准备时可能短暂卡顿。"},
     {"No working-resolution range to adjust", "工作分辨率无需调节"},
+    {"Preparation mode", "预备方式"},
+    {"Prepare all levels", "全档预备"},
+    {"On-demand (experimental)", "按需备档（实验）"},
+    {"All levels use more VRAM for smooth switching once ready. On-demand keeps fewer levels resident, but cold preparation may stutter.", "全档预备用更多显存换取就绪后的顺畅切换；按需备档减少驻留档位，但冷准备仍可能卡顿。"},
+    {"More levels give smaller steps. On-demand keeps fewer levels resident; preparing a missing level may stutter.", "档位越多，步距越细。按需备档减少驻留档位；准备尚未就绪的档位时可能卡顿。"},
 };
 
 }  // namespace renodx::addons::dlss5::ui::lang

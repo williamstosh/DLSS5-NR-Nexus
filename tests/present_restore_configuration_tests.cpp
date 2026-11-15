@@ -315,27 +315,33 @@ int main(int argc, char** argv) {
     runtime::LoadConfiguration();
     if (test_case == "nr-resolution-adaptive") {
       Check(!runtime::nr_adaptive_enabled.load() && runtime::nr_adaptive_target_fps.load() == 60.f
-                && runtime::nr_adaptive_min_scale.load() == .67f && runtime::nr_adaptive_selected_levels.load() == 0,
+                && runtime::nr_adaptive_min_scale.load() == .67f && runtime::nr_adaptive_selected_levels.load() == 0
+                && !runtime::nr_adaptive_limited_residency.load(),
             "adaptive resolution defaults to Off, 60 output FPS and 67 percent relative minimum");
       const auto original = runtime::profile_ui::Snapshot();
       runtime::kSetAdaptiveEnabled.Commit(1.f);
       runtime::kSetAdaptiveTargetFps.Commit(120.f);
       runtime::kSetAdaptiveMinScale.Commit(.5f);
       runtime::kSetAdaptiveLevelCount.Commit(15.f);
+      runtime::kSetAdaptiveLimitedResidency.Commit(1.f);
       runtime::LoadConfiguration();
       Check(runtime::nr_adaptive_enabled.load() && runtime::nr_adaptive_target_fps.load() == 120.f
-                && runtime::nr_adaptive_min_scale.load() == .5f && runtime::nr_adaptive_selected_levels.load() == 15,
+                && runtime::nr_adaptive_min_scale.load() == .5f && runtime::nr_adaptive_selected_levels.load() == 15
+                && runtime::nr_adaptive_limited_residency.load(),
             "adaptive preferences persist and reload through production settings");
       const auto saved = runtime::profile_ui::Snapshot();
       Check(saved.at("NRAdaptiveEnabled") == true && saved.at("NRAdaptiveTargetFPS") == 120.f
-                && saved.at("NRAdaptiveMinScale") == .5f && saved.at("NRAdaptiveLevelCount") == 15,
+                && saved.at("NRAdaptiveMinScale") == .5f && saved.at("NRAdaptiveLevelCount") == 15
+                && saved.at("NRAdaptiveLimitedResidency") == true,
             "profiles include adaptive preferences without transient levels or statistics");
       std::string error;
       Check(runtime::profile_ui::ApplySnapshot(original, &error), "profile undo restores adaptive preferences");
       Check(!runtime::nr_adaptive_enabled.load() && runtime::nr_adaptive_target_fps.load() == 60.f
-                && runtime::nr_adaptive_selected_levels.load() == 0,
+                && runtime::nr_adaptive_selected_levels.load() == 0 && !runtime::nr_adaptive_limited_residency.load(),
             "profile undo restores the original adaptive toggle and target");
       Check(runtime::profile_ui::ApplySnapshot(saved, &error), "profile redo restores adaptive preferences");
+      Check(runtime::nr_adaptive_limited_residency.load() && runtime::nr_adaptive_selected_levels.load() == 15,
+            "profile redo restores preparation mode without reducing the logical level count");
       Check(WritePrivateProfileStringA(runtime::kConfigSection, "NRAdaptiveTargetFPS", "nan", ini_path.c_str())
                 && WritePrivateProfileStringA(runtime::kConfigSection, "NRAdaptiveMinScale", "2", ini_path.c_str()),
             "write invalid adaptive preference fixture");
@@ -352,9 +358,13 @@ int main(int argc, char** argv) {
       auto invalid_count = saved;
       invalid_count["NRAdaptiveLevelCount"] = 16;
       Check(!runtime::profile_ui::ApplySnapshot(invalid_count, &error), "preset count outside the offered range is rejected");
+      auto invalid_mode = saved;
+      invalid_mode["NRAdaptiveLimitedResidency"] = 2;
+      Check(!runtime::profile_ui::ApplySnapshot(invalid_mode, &error), "preparation mode requires a boolean preset value");
       runtime::ResetSettings({runtime::kPerformanceSettings});
       Check(!runtime::nr_adaptive_enabled.load() && runtime::nr_adaptive_target_fps.load() == 60.f
-                && runtime::nr_adaptive_min_scale.load() == .67f && runtime::nr_adaptive_selected_levels.load() == 0,
+                && runtime::nr_adaptive_min_scale.load() == .67f && runtime::nr_adaptive_selected_levels.load() == 0
+                && !runtime::nr_adaptive_limited_residency.load(),
             "performance reset restores all adaptive defaults");
       // This CPU-only fixture has no active graphics API for a new manual
       // resolution capability decision. Restore its original stored inputs.

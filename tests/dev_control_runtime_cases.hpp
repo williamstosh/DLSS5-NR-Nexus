@@ -171,6 +171,19 @@
   check(set("NRAdaptiveLevelCount", 15u)["ok"] && runtime::nr_adaptive_selected_levels == 15u,
       "selected level count uses the registered setting without activating an experimental mode");
   check(!set("NRAdaptiveLevelCount", 16u)["ok"].get<bool>(), "unsupported level count is rejected");
+  const auto before_preparation_mode = control::Identity();
+  const auto mode_configuration_generation = runtime::configuration_generation.load();
+  reply = set("NRAdaptiveLimitedResidency", true);
+  check(reply["ok"] && runtime::nr_adaptive_limited_residency.load()
+          && reply["state"]["settings"]["NRAdaptiveLimitedResidency"] == true
+          && runtime::nr_adaptive_selected_levels == 15u
+          && control::Identity()["config_epoch"] != before_preparation_mode["config_epoch"]
+          && control::Identity()["settings_hash"] != before_preparation_mode["settings_hash"]
+          && runtime::configuration_generation == mode_configuration_generation,
+      "preparation mode uses the registered transaction and identity without recreating compatible features or reducing levels");
+  check(!set("NRAdaptiveLimitedResidency", 2u)["ok"].get<bool>(), "preparation mode rejects a non-boolean interface value");
+  check(set("NRAdaptiveLimitedResidency", false)["ok"] && !runtime::nr_adaptive_limited_residency.load(),
+      "the live interface can restore full preparation through the same committed setting");
   check(set("NRControlMaskEnabled", true)["ok"], "region mask activation uses the production setting");
   check(set("NRPass2ControlMaskFollowPass1", false)["ok"], "a pass can select its existing independent mask settings");
   reply = set("NRPass2ControlMaskBlue", .25f);

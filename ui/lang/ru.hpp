@@ -2340,6 +2340,11 @@ inline constexpr Translation kRu[] = {
     {"Default (by capacity)", "По умолчанию (по доступной ёмкости)"},
     {"Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.", "Сначала подготавливаются выбранные уровни. Больше уровней требуют больше памяти и дают более мелкий шаг. Подготовка может вызвать короткую задержку."},
     {"No working-resolution range to adjust", "Нет диапазона рабочего разрешения для регулировки"},
+    {"Preparation mode", "Режим подготовки"},
+    {"Prepare all levels", "Подготовить все уровни"},
+    {"On-demand (experimental)", "По запросу (экспериментально)"},
+    {"All levels use more VRAM for smooth switching once ready. On-demand keeps fewer levels resident, but cold preparation may stutter.", "Все уровни занимают больше видеопамяти, обеспечивая плавное переключение после подготовки. Режим по запросу хранит меньше уровней в памяти, но первоначальная подготовка может вызывать рывки."},
+    {"More levels give smaller steps. On-demand keeps fewer levels resident; preparing a missing level may stutter.", "Больше уровней дают меньший шаг. Режим по запросу хранит меньше уровней в памяти; подготовка отсутствующего уровня может вызывать рывки."},
 };
 
 }  // namespace renodx::addons::dlss5::ui::lang

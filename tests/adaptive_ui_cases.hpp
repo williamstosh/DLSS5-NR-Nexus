@@ -6,6 +6,7 @@
   runtime::nr_follow_input_res = false;
   runtime::nr_resolution_scale = .75f;
   runtime::nr_adaptive_enabled = true;
+  runtime::nr_adaptive_limited_residency = false;
   ui::MonitorInputs actual;
   actual.pass_count = 2;
   actual.passes[0].execution_confirmed = true;
@@ -17,6 +18,28 @@
   resolution_observed_fixture = &actual;
   adaptive_editor_fixture = true;
   frame(); frame();
+  renodx::addons::dlss5::gpu_comparison::Identity preparation_before, allocation_before;
+  runtime::comparison_ui::CaptureSettings(&preparation_before);
+  runtime::comparison_ui::CaptureAdaptiveSettings(&allocation_before);
+  const auto preparation_generation = runtime::configuration_generation.load();
+  const auto preparation_level_count = runtime::nr_adaptive_selected_levels.load();
+  click(find("On-demand (experimental)"));
+  bool stored_limited = false;
+  reshade::get_config_value(nullptr, runtime::kConfigSection, runtime::kSetAdaptiveLimitedResidency.key, stored_limited);
+  renodx::addons::dlss5::gpu_comparison::Identity preparation_after, allocation_after;
+  runtime::comparison_ui::CaptureSettings(&preparation_after);
+  runtime::comparison_ui::CaptureAdaptiveSettings(&allocation_after);
+  check(runtime::nr_adaptive_limited_residency.load() && stored_limited
+      && runtime::nr_adaptive_selected_levels.load() == preparation_level_count
+      && preparation_after.config_epoch != preparation_before.config_epoch
+      && preparation_after.settings_hash != preparation_before.settings_hash
+      && allocation_after.settings_hash == allocation_before.settings_hash
+      && runtime::configuration_generation == preparation_generation,
+      "the real preparation choice commits and persists without reducing levels or recreating compatible resources");
+  click(find("Prepare all levels"));
+  reshade::get_config_value(nullptr, runtime::kConfigSection, runtime::kSetAdaptiveLimitedResidency.key, stored_limited);
+  check(!runtime::nr_adaptive_limited_residency.load() && !stored_limited,
+      "the real full-preparation choice restores the persisted default residency policy");
   check(find("##actual_resolution_scale").disabled, "adaptive actual scale cannot be edited");
   check(std::none_of(items.begin(), items.end(), [](const auto& entry) {
     return entry.second.label == "##resolution_scale" || entry.second.label.ends_with("###nr_resolution_quality")

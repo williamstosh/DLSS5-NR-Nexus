@@ -2714,9 +2714,7 @@ inline bool IsAdaptiveResidentWorkset(const WorksetKey& key, const FinalResource
       && resources.adaptive_recording_token == cache.tiers[key.adaptive_slot].recording_token;
 }
 inline uint32_t AdaptiveWorksetReservation(const std::shared_ptr<adaptive_resolution::Session>& session,
-    uint32_t levels, uint32_t required_roles, uint32_t output_count) {
-  const bool limited = session->settings.limited_residency
-      || (nr_adaptive_limited_residency.load() && !session->settings.legacy_preparation);
+    uint32_t levels, uint32_t required_roles, uint32_t output_count, bool limited) {
   uint32_t protected_levels = 0;
   for (size_t slot = 0; slot < levels; ++slot) {
     protected_levels += !limited || AdaptiveProtectedLevel(*session, slot);
@@ -11086,7 +11084,7 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
       && adaptive_feature_mode.load() == AdaptiveFeatureMode::OFF;
   const uint32_t requested_worksets = (explicit_reservation
       ? AdaptiveWorksetReservation(*owner, std::min(selected_levels, adaptive_resolution::MAX_PREPARED_LEVELS),
-          required_roles, source_outputs) : 0);
+          required_roles, source_outputs, limited_residency) : 0);
   const uint32_t selection_limit = EffectiveAdaptiveWorksetLimit(*owner, requested_worksets, true);
   // Residency changes with the request; logical selection metadata must not.
   // Otherwise a cold request edits Settings and Prepare restores the old tier.
@@ -11153,6 +11151,27 @@ inline bool AdaptiveTierUsable(const AdaptiveFeatureCache& cache, const adaptive
                                size_t slot) {
   return slot < cache.count && cache.ladder.sizes[slot] == session.ladder.sizes[slot]
       && session.IsLegal(cache.ladder.sizes[slot]) && (slot == cache.active || cache.tiers[slot].ready);
+}
+
+inline uint32_t AdaptiveReadyLevelCount(const std::shared_ptr<adaptive_resolution::Session>& session,
+    uint64_t layout_identity, uint32_t required_roles) {
+  std::array<bool, adaptive_resolution::MAX_PREPARED_LEVELS> ready;
+  ready.fill(true);
+  uint32_t observed_roles = 0;
+  for (const auto& [handle, source] : features) {
+    for (const auto* feature : std::array<const FeatureState*, 2>{&source, source.render_session.get()}) {
+      if (feature == nullptr || feature->adaptive_session != session || feature->adaptive_cache == nullptr) continue;
+      const auto& cache = *feature->adaptive_cache;
+      if (cache.identity != layout_identity || (cache.role & required_roles) == 0) continue;
+      observed_roles |= cache.role;
+      for (size_t index = 0; index < session->ladder.count; ++index) {
+        ready[index] &= index < cache.count && cache.tiers[index].ready
+            && AdaptiveTierUsable(cache, *session, index);
+      }
+    }
+  }
+  if ((observed_roles & required_roles) != required_roles) return 0;
+  return static_cast<uint32_t>(std::count(ready.begin(), ready.begin() + session->ladder.count, true));
 }
 
 inline uint32_t AdaptiveOutputCount(FeatureState* feature, const NVSDK_NGX_Handle* owner,
@@ -11722,7 +11741,8 @@ inline void SelectAdaptiveTier(FeatureState* feature, const NVSDK_NGX_Handle* ha
   }
   if (adaptive_resident_session.lock() == session) {
     adaptive_resident_worksets = (session->settings.selected_levels != 0 && !session->settings.legacy_preparation
-        ? AdaptiveWorksetReservation(session, static_cast<uint32_t>(cache.count), frame->required_roles, frame->output_count) : 0);
+        ? AdaptiveWorksetReservation(session, static_cast<uint32_t>(cache.count), frame->required_roles, frame->output_count,
+            session->settings.limited_residency) : 0);
   }
   cache.output_identities.clear();
   if (feature->adaptive_outputs != nullptr) {
@@ -11785,7 +11805,8 @@ inline void SelectAdaptiveTier(FeatureState* feature, const NVSDK_NGX_Handle* ha
     const auto reason = (cache.failed ? adaptive_resolution::Reason::FAILED
         : (cache.budget_blocked ? adaptive_resolution::Reason::BUDGET : adaptive_resolution::Reason::PREPARING));
     if (session->settings.limited_residency) {
-      session->UpdateTargetPreparation(frame->preparation_epoch, frame->generation, ready_levels,
+      session->UpdateTargetPreparation(frame->preparation_epoch, frame->generation,
+          AdaptiveReadyLevelCount(session, frame->layout_identity, frame->required_roles),
           static_cast<uint32_t>(session->ladder.count),
           !cache.failed && !cache.budget_blocked && cache.tiers[session->level].ready
               && AdaptiveTierUsable(cache, *session, session->level), reason, SteadyNowNs());
@@ -11836,6 +11857,7 @@ inline void PrepareAdaptiveTier(FeatureState* feature, const adaptive_resolution
     // still be applied or rolled back keep GPU allocations. One ordinary
     // eviction batch is admitted at a time across every color in the Session.
     auto& pending = adaptive_retiring_collections.at(cache->owner);
+    bool evicted = false;
     for (size_t index = 0; index < cache->count; ++index) {
       if (index == cache->active || AdaptiveProtectedLevel(*frame.session, index)) continue;
       auto& tier = cache->tiers[index];
@@ -11847,6 +11869,7 @@ inline void PrepareAdaptiveTier(FeatureState* feature, const adaptive_resolution
                    && AdaptiveCacheOwnsWorkset(*cache, workset.first, workset.second);
              });
       if (!allocated) continue;
+      evicted = true;
       pending[adaptive_resolution::MAX_PREPARED_LEVELS + index] = tier.recording_token;
       ReleaseAllNrSlots(tier.state, true);
       ReleaseCom(tier.state.norm.commit);
@@ -11871,12 +11894,17 @@ inline void PrepareAdaptiveTier(FeatureState* feature, const adaptive_resolution
         it = worksets.erase(it);
       }
     }
+    if (evicted) {
+      frame.session->prepared = false;
+      frame.session->status.ready_levels = AdaptiveReadyLevelCount(frame.session, frame.layout_identity, frame.required_roles);
+      PublishAdaptiveStatus(frame.session->status);
+    }
     DrainRetiredResources(true);
     if (AdaptiveSessionRetirementPending(frame.session)) return;
     if (frame.session->TargetReady()) return;
   }
   const uint32_t required_worksets = AdaptiveWorksetReservation(frame.session,
-      static_cast<uint32_t>(frame.session->ladder.count), frame.required_roles, frame.output_count);
+      static_cast<uint32_t>(frame.session->ladder.count), frame.required_roles, frame.output_count, limited);
   adaptive_resident_worksets = (!legacy && frame.session->settings.selected_levels != 0 ? required_worksets : 0);
   // A running selected collection never pays cold preparation costs. A new
   // resource binding or committed selection must first close the ready gate.
@@ -25678,6 +25706,8 @@ inline constexpr Setting kSetAdaptiveMinScale{
     "NRAdaptiveMinScale", &nr_adaptive_min_scale, 0.67f, SettingEffect::kNone};
 inline constexpr Setting kSetAdaptiveLevelCount{
     "NRAdaptiveLevelCount", &nr_adaptive_selected_levels, 0u, SettingEffect::kNone};
+inline constexpr Setting kSetAdaptiveLimitedResidency{
+    "NRAdaptiveLimitedResidency", &nr_adaptive_limited_residency, false, SettingEffect::kNone};
 inline constexpr Setting kSetPassResolutionMode[] = {
     {"NRPass2ResolutionMode", &pass_resolution_mode[0], 0u, SettingEffect::kNone},
     {"NRPass3ResolutionMode", &pass_resolution_mode[1], 0u, SettingEffect::kNone},
@@ -26175,7 +26205,8 @@ inline constexpr const Setting* kHookPointSettings[] = {
     &kSetPresentSdrRestorePolicy, &kSetPresentBlockHudless};
 inline constexpr const Setting* kPerformanceSettings[] = {
     &kSetFollowInputRes, &kSetResolutionScale, &kSetLookUpsample,
-    &kSetAdaptiveEnabled, &kSetAdaptiveTargetFps, &kSetAdaptiveMinScale, &kSetAdaptiveLevelCount};
+    &kSetAdaptiveEnabled, &kSetAdaptiveTargetFps, &kSetAdaptiveMinScale, &kSetAdaptiveLevelCount,
+    &kSetAdaptiveLimitedResidency};
 inline constexpr const Setting* kStackingSettings[] = {
     &kSetPassResolutionMode[0], &kSetPassResolutionMode[1], &kSetPassResolutionMode[2],
     &kSetPassResolutionScale[0], &kSetPassResolutionScale[1], &kSetPassResolutionScale[2],
@@ -27718,8 +27749,13 @@ inline void DrawResolutionControls(const ui::PanelText& text) {
       "Adjust NR working resolution toward your target output FPS, including generated frames. Manual resolutions are the upper limits. No extra program is required.");
   if (nr_adaptive_enabled.load()) {
     ImGui::Indent();
-    ui::RowLabel("Resolution levels",
-        "Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.");
+    constexpr const char* preparation_modes[] = {"Prepare all levels", "On-demand (experimental)"};
+    ChoiceSetting(text, kSetAdaptiveLimitedResidency, "Preparation mode", preparation_modes,
+        "All levels use more VRAM for smooth switching once ready. On-demand keeps fewer levels resident, but cold preparation may stutter.");
+    const char* levels_tip = (nr_adaptive_limited_residency.load()
+        ? "More levels give smaller steps. On-demand keeps fewer levels resident; preparing a missing level may stutter."
+        : "Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.");
+    ui::RowLabel("Resolution levels", levels_tip);
     const auto selected_levels = nr_adaptive_selected_levels.load();
     const auto levels_preview = (selected_levels == 0
         ? std::string(text.Tr("Default (by capacity)")) : std::to_string(selected_levels));
@@ -27742,7 +27778,7 @@ inline void DrawResolutionControls(const ui::PanelText& text) {
       kSetAdaptiveLevelCount.Commit(0.f);
     }
     if (CopyAdaptiveStatus().reason == adaptive_resolution::Reason::PREPARING) {
-      ImGui::TextWrapped("%s", text.Tr("Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter."));
+      ImGui::TextWrapped("%s", text.Tr(levels_tip));
     }
     SliderSetting(text, kSetAdaptiveTargetFps, "Target output FPS", 30.f, 360.f, "%.0f FPS",
         "The target includes generated frames. If lowering NR brings no FPS benefit, the previous quality is restored.");
@@ -30933,6 +30969,7 @@ inline void LoadConfiguration() {
   float saved_adaptive_target_fps = 60.f;
   float saved_adaptive_min_scale = 0.67f;
   uint32_t saved_adaptive_selected_levels = 0u;
+  bool saved_adaptive_limited_residency = false;
   bool saved_gpu_timers = defaults::kGpuTimers;
   bool saved_crash_dump = defaults::kCrashDump;
   bool saved_cost_meter = defaults::kCostMeter;
@@ -31245,6 +31282,7 @@ inline void LoadConfiguration() {
   reshade::get_config_value(nullptr, kConfigSection, "NRAdaptiveTargetFPS", saved_adaptive_target_fps);
   reshade::get_config_value(nullptr, kConfigSection, "NRAdaptiveMinScale", saved_adaptive_min_scale);
   reshade::get_config_value(nullptr, kConfigSection, "NRAdaptiveLevelCount", saved_adaptive_selected_levels);
+  reshade::get_config_value(nullptr, kConfigSection, "NRAdaptiveLimitedResidency", saved_adaptive_limited_residency);
   reshade::get_config_value(
       nullptr, kConfigSection, "NRGpuTimers", saved_gpu_timers);
   reshade::get_config_value(nullptr, kConfigSection, "NRCrashDump", saved_crash_dump);
@@ -31747,6 +31785,7 @@ inline void LoadConfiguration() {
       "NRAdaptiveMinScale");
   nr_adaptive_selected_levels = SanitizeEnumKey(saved_adaptive_selected_levels, 0u, 0u, adaptive_resolution::MAX_PREPARED_LEVELS,
       "NRAdaptiveLevelCount");
+  nr_adaptive_limited_residency = saved_adaptive_limited_residency;
   gpu_timers_enabled = saved_gpu_timers;
   lastgasp::dumps_on = saved_crash_dump;
   cost_meter_enabled = saved_cost_meter;
