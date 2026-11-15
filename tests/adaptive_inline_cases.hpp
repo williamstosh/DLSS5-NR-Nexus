@@ -720,6 +720,11 @@ int Run() {
 
       native::kSetAdaptiveMinScale.Store(.33f);
       for (uint32_t warmup = 0; warmup < 24; ++warmup) record();
+      // Start at the unchanged output: B/A/B/A completes the replacement standby
+      // on the fourth call, before the next source can consume its ready receipt.
+      if (frame % 2 == 0) {
+        record();
+      }
       auto binding_cache = feature.adaptive_cache;
       const auto binding_models = native::nr_features_created;
       const auto binding_worksets = native::worksets_created;
@@ -745,6 +750,10 @@ int Run() {
             "same-address replacement invalidates source-view pointer shortcuts before the next descriptor bind");
       }
       for (uint32_t step = 0; step < 4; ++step) record();
+      Check(!feature.adaptive_session->prepared && native::nr_features_created == binding_models
+          && native::worksets_created == binding_worksets,
+          "B/A/B/A completes replacement work without allocating while owner readiness awaits the next source");
+      Check(record(), "the next source consumes the replacement standby completion");
       Check(feature.adaptive_session->prepared && native::nr_features_created == binding_models
           && native::worksets_created == binding_worksets,
           "MOCK identity replacement reacquires real WARP readiness without allocating a new tier");

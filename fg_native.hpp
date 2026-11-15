@@ -274,8 +274,17 @@ inline bool PrepareNativeColorInputs(Stream* stream, Slot* slot, const fg::Frame
   }
   if (slot->color_heap == nullptr) {
     const D3D12_DESCRIPTOR_HEAP_DESC desc{.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-        .NumDescriptors = 6, .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+        .NumDescriptors = 8, .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
     if (FAILED(stream->device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&slot->color_heap)))) return false;
+    const auto cpu = slot->color_heap->GetCPUDescriptorHandleForHeapStart();
+    const auto stride = stream->device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_SHADER_RESOURCE_VIEW_DESC null_srv{
+        .Format = DXGI_FORMAT_R32_FLOAT,
+        .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+        .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture2D = {.MipLevels = 1}};
+    stream->device->CreateShaderResourceView(nullptr, &null_srv, DescriptorHeapSlot(cpu, 6, stride));
+    null_srv.Format = DXGI_FORMAT_R16G16_FLOAT;
+    stream->device->CreateShaderResourceView(nullptr, &null_srv, DescriptorHeapSlot(cpu, 7, stride));
   }
   return true;
 }
@@ -310,6 +319,10 @@ inline void RecordNativeColorInputs(Stream* stream, Slot* slot, ID3D12GraphicsCo
   const auto gpu = slot->color_heap->GetGPUDescriptorHandleForHeapStart();
   list->SetComputeRootDescriptorTable(0, gpu);
   list->SetComputeRootDescriptorTable(1, {gpu.ptr + static_cast<uint64_t>(4) * stride});
+  // The shared codec root signature also retains depth/motion tables across
+  // heap switches, even though this color shader does not read them.
+  list->SetComputeRootDescriptorTable(3, {gpu.ptr + static_cast<uint64_t>(6) * stride});
+  list->SetComputeRootDescriptorTable(4, {gpu.ptr + static_cast<uint64_t>(7) * stride});
   const uint32_t size[4]{input.color_width, input.color_height};
   list->SetComputeRoot32BitConstants(2, 4, size, 0);
   list->Dispatch((input.color_width + 15) / 16, (input.color_height + 15) / 16, 1);
