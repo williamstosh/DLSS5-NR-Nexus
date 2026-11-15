@@ -4143,6 +4143,12 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
     adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakePresent);
     adapter::proxies[0].real[1] = reinterpret_cast<void*>(&FakePresent1);
     xefg::Configure(&native::fg_service::Service, &Prepare, nullptr, &Requested);
+    // Session::Tag declares COMMON. Finish these transitions before its
+    // private queue consumes the same guide and HUDless resources.
+    for (auto* resource : {hudless.Get(), guides[2].Get(), guides[3].Get()}) {
+      gpu.Transition(resource, NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
+    }
+    submit();
     uintptr_t xefg_context = 0;
     fg::Result xefg_result = fg::Result::NOT_SERVED;
     {
@@ -4317,6 +4323,10 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
       native::fg_service::Release(&stream->second);
       native::fg_service::streams.erase(stream);
     }
+    for (auto* resource : {hudless.Get(), guides[2].Get(), guides[3].Get()}) {
+      gpu.Transition(resource, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
+    }
+    submit();
     std::cout << "CASE path=XeFG-service roles=Backbuffer+HUDLess evidence="
               << (native_ngx ? "NATIVE_GPU+NATIVE_NGX+MOCK_XeFG" : "WARP+MOCK")
               << " mask=bound+distinct" << std::endl;

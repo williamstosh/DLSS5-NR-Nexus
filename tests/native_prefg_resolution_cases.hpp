@@ -649,10 +649,52 @@ int Run(bool hardware) {
       native::adaptive_configuration_settings = native::comparison_ui::CaptureAdaptiveSettings;
       ++native::nr_resolution_commit_epochs[0];
       ++native::configuration_generation;
-      for (uint32_t frame = 0; frame < 12; ++frame) {
+      bool group_prepared = false;
+      uint32_t preparation_frames = 0;
+      for (; preparation_frames < native::kContractDebounceFrames + 40 && !group_prepared; ++preparation_frames) {
         record();
         submit();
+        auto& preparing = native::fg_service::streams.at({true, reinterpret_cast<uintptr_t>(&owner)});
+        if (preparing.adaptive_session == nullptr) continue;
+        Check(!preparing.adaptive_session->failed, "dual-color preparation does not fail");
+        group_prepared = preparing.adaptive_session->prepared;
+        for (const auto& role : preparing.roles) {
+          const auto feature = native::features.find(role.Handle());
+          if (feature == native::features.end() || feature->second.adaptive_cache == nullptr) {
+            group_prepared = false;
+            continue;
+          }
+          auto& cache = *feature->second.adaptive_cache;
+          native::PollAdaptiveCache(&cache);
+          if (cache.failed || cache.budget_blocked) {
+            std::cerr << "PreFG preparation failed=" << cache.failed << " budget=" << cache.budget_blocked
+                      << " cached_tiers=" << cache.count << " live_worksets=" << native::worksets.size() << '\n';
+          }
+          Check(!cache.failed && !cache.budget_blocked, "dual-color preparation retains its resource budget");
+          group_prepared &= cache.identity == preparing.adaptive_frame.layout_identity && cache.count == 2;
+          for (size_t tier = 0; tier < cache.count; ++tier) {
+            group_prepared &= cache.tiers[tier].ready;
+          }
+        }
       }
+      if (!group_prepared) {
+        const auto& pending = native::fg_service::streams.at({true, reinterpret_cast<uintptr_t>(&owner)});
+        for (size_t role = 0; role < std::size(pending.roles); ++role) {
+          const auto feature = native::features.find(pending.roles[role].Handle());
+          if (feature == native::features.end() || feature->second.adaptive_cache == nullptr) continue;
+          const auto& cache = *feature->second.adaptive_cache;
+          for (size_t tier = 0; tier < cache.count; ++tier) {
+            std::cerr << "PreFG preparation role=" << role << " tier=" << tier
+                      << " ready=" << cache.tiers[tier].ready << " failed=" << cache.failed
+                      << " budget=" << cache.budget_blocked << '\n';
+          }
+        }
+      }
+      Check(group_prepared, "dual-color complete preparation is consumed by its owner within the bounded fixture");
+      Check(native::nr_adaptive_selected_levels.load() == 0 && native::max_worksets.load() == 4
+                && native::worksets.size() <= 4,
+          "Default dual-color preparation stays inside the original four-workset pool");
+      std::cout << "PASS dual-color full preparation source_calls=" << preparation_frames << '\n';
       auto& stream = native::fg_service::streams.at({true, reinterpret_cast<uintptr_t>(&owner)});
       Check(stream.adaptive_session != nullptr && stream.adaptive_session->ladder.count == 2,
           "dual-color automatic sizing reserves two complete tiers in the four-workset pool");
@@ -1033,6 +1075,8 @@ int Run(bool hardware) {
       Check(ordinary_record(&ordinary, source_a.Get(), ordinary_key), "ordinary Present activates its original lower tier");
       submit();
       const auto creates_before_drag = native::nr_features_created;
+      const auto* upper_before_edit = first_cache->tiers[0].state.slots[0].handle;
+      const auto* lower_before_edit = native::features.at(ordinary_handle).slots[0].handle;
       native::nr_adaptive_editing.store(true);
       for (const float minimum : {.6f, .5f}) {
         native::kSetAdaptiveMinScale.Store(minimum);
@@ -1048,8 +1092,10 @@ int Run(bool hardware) {
         submit();
       }
       auto revised_cache = native::features.at(ordinary_handle).adaptive_cache;
-      Check(revised_cache != first_cache && revised_cache->ladder.sizes[2][0].width == 8,
-          "changing the relative minimum replaces incompatible cached ladder tuples");
+      Check(revised_cache == first_cache && revised_cache->ladder.sizes[2][0].width == 8
+                && native::features.at(ordinary_handle).slots[0].handle == upper_before_edit
+                && revised_cache->tiers[2].state.slots[0].handle != lower_before_edit,
+          "minimum edits retain the compatible upper model and replace the incompatible lower tuple");
       native::PollAdaptiveCache(revised_cache.get());
       Check(revised_cache->tiers[2].ready, "new minimum is not ready until its own first-evaluate completion");
       const auto creates_before_new_tier = native::nr_features_created;

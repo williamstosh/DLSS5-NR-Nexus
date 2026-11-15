@@ -496,8 +496,12 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     bool selection_pending = false;
     for (uint32_t i = 0; i < 2; ++i) {
       const auto feature = features.find(stream->roles[i].Handle());
-      if (feature == features.end() || feature->second.adaptive_cache == nullptr
-          || !feature->second.adaptive_cache->resident) continue;
+      if (feature == features.end()) continue;
+      if (feature->second.adaptive_cache == nullptr) {
+        selection_pending |= (required_model_roles & (1u << i)) != 0;
+        continue;
+      }
+      if (!feature->second.adaptive_cache->resident) continue;
       auto& cache = *feature->second.adaptive_cache;
       if ((required_model_roles & (1u << i)) == 0) {
         if (stream->adaptive_session->settings.selected_levels == 0) {
@@ -528,13 +532,14 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     }
     if (selection_pending) {
       // A role's normal ProcessInline advances preparation before Record
-      // reaches the next role. Reconcile the shared selection first, so an
-      // intermediate old/new count can never latch a false budget failure.
+      // reaches the next role. Adopt existing manual roles and reconcile the
+      // shared selection first, so their old scratch is not counted outside
+      // the group and an intermediate count cannot latch a false budget failure.
       for (uint32_t i = 0; i < 2; ++i) {
         if ((required_model_roles & (1u << i)) == 0) continue;
         const auto feature = features.find(stream->roles[i].Handle());
-        if (feature == features.end() || feature->second.adaptive_cache == nullptr
-            || !feature->second.adaptive_cache->resident) continue;
+        if (feature == features.end() || (feature->second.adaptive_cache != nullptr
+            && !feature->second.adaptive_cache->resident)) continue;
         auto selected = stream->adaptive_frame;
         selected.role = 1u << i;
         selected.slot = 0;
