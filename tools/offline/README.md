@@ -76,6 +76,22 @@ Python 只需标准库，可用 `-PythonExecutable` 指定；编译器及固定�
 完整 codec 输出、动态稳定性或游戏视觉通过。恢复参考为送入模型的 proxy；floor 及逐通道
 下限附近的残留沿生产保护保留。
 
+## 低档编辑量重建核验
+
+~~~powershell
+& ./tests/run-look-transport-tests.ps1
+~~~
+
+该定向入口复用 D3D12 软件夹具和生产 Look 根签名，编译、派发当前 `look_upsample`。
+只使用 WARP，要求 Debug Layer 和 InfoQueue 可用；检查 SDR 输入采样与亮度指引一致、
+无匹配输入时保留原图、正常匹配区的颜色编辑，以及 HDR 原路径和 tile 边界。
+可用 `-BaselineShaderPath` 加入旧 shader 负对照；它的预期失败不计为修后通过。
+
+可选 `-RoiFixture` 接受保留完整坐标的原码裁剪数据及 CPU 预期输出，按原格式重新量化，
+在原尺寸纹理上执行后只比较已覆盖的 ROI。缺少预期输出时只记数值捕获，不能计为像素回归通过。
+原码读回文件在比较和哈希登记后自动收尾；确需继续离线分析时，显式设置 `NR_NEXUS_TEST_KEEP_RAW=1`。
+真实游戏数据留本地；WARP 数值一致不代替 NGX、游戏后处理或动态视觉验收。
+
 ## Fixture、合成序列与原始数据
 
 nr-nexus-offline-fixture/1 的 ControlMask case 规范化及验证以 control_mask_contracts.py 为准；
