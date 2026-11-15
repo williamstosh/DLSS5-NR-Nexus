@@ -38,7 +38,7 @@ HostRoot、ShaderIncludeDirectory、Fxc、EmbedFile 参数可显式指定已有�
 ~~~
 
 软件入口先原样执行 `Suite all -SoftwareOnly`（包括默认五组 FG），再复用编译产物执行
-16 个独立 FG 阶段、分辨率、生命周期及 pre-FG 入口和 4 个 Bridge 分辨率入口。
+18 个独立 FG 阶段、分辨率、生命周期、pre-FG 及隔帧复用入口和 4 个 Bridge 分辨率入口。
 `result.json` 逐项记录 Passed、Failed 或 NotRun；Vulkan 在软件模式只编译，执行记为 NotRun。
 这些是 CPU／WARP 与模型替身证据，包含有限的隐藏窗口夹具，不提供游戏或动态视觉验收。
 

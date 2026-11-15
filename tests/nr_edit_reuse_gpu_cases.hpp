@@ -10,6 +10,7 @@
 #include <cstring>
 #include <DirectXPackedVector.h>
 #include <iostream>
+#include <memory>
 #include <vector>
 
 #include <edit_reuse.hpp>
@@ -594,6 +595,46 @@ int Run() {
           "feature Off preserves the normal per-frame model path");
     native::edit_reuse_enabled = true;
     for (uint32_t prefix = 0; prefix < 4; ++prefix) frame(1);
+    {
+      std::weak_ptr<reuse::State> old_anchor = native::features.at(owner).slots[0].edit_reuse;
+      Check(!old_anchor.expired(), "adaptive transition begins with a real completed edit anchor");
+      const auto reuses_before_adaptive = native::edit_reuse_reuses.load();
+      const auto fallbacks_before_adaptive = native::edit_reuse_fallbacks.load();
+      // Mock another source's live reservation. The production selector then
+      // disables this frame's adaptive route while the user's request stays On.
+      auto reservation = std::make_shared<addon::adaptive_resolution::Session>();
+      native::adaptive_resident_session = reservation;
+      native::nr_adaptive_enabled = true;
+      Check(frame(0) == 1 && native::edit_reuse_reuses.load() == reuses_before_adaptive
+                && native::edit_reuse_fallbacks.load() == fallbacks_before_adaptive + 1,
+            "requested adaptive On retains per-frame NR even when its current route cannot be admitted");
+      const auto session = native::features.at(owner).adaptive_session;
+      Check(session != nullptr && native::features.at(owner).adaptive_cache == nullptr
+                && session->status.reason == addon::adaptive_resolution::Reason::PREPARING
+                && native::features.at(owner).slots[0].edit_reuse == nullptr && old_anchor.expired(),
+            "unavailable adaptive admission retires the completed old anchor without treating the request as Off");
+      reservation.reset();
+      native::adaptive_resident_session.reset();
+      Check(native::EnsureLookPipeline(gpu.device.Get()), "warm existing Look programs before admitted adaptive recording");
+      Check(frame(0) >= 1 && native::edit_reuse_reuses.load() == reuses_before_adaptive
+                && native::features.at(owner).adaptive_cache != nullptr
+                && native::features.at(owner).slots[0].edit_reuse == nullptr,
+            "an admitted adaptive On frame evaluates the model without edit reuse");
+      native::PollAdaptiveCache(native::features.at(owner).adaptive_cache.get());
+      native::nr_adaptive_enabled = false;
+      Check(frame(0) == 1
+                && native::features.at(owner).adaptive_session == session
+                && native::features.at(owner).adaptive_cache == nullptr
+                && native::features.at(owner).slots[0].edit_reuse != nullptr
+                && native::features.at(owner).slots[0].edit_reuse->valid,
+            "adaptive Off retains its Session, retires standby slots and refreshes a new edit anchor");
+      const auto fresh_anchor = native::features.at(owner).slots[0].edit_reuse;
+      const auto fresh_generation = fresh_anchor->anchor_generation;
+      Check(frame(0) == 0 && native::edit_reuse_reuses.load() == reuses_before_adaptive + 1
+                && native::features.at(owner).slots[0].edit_reuse == fresh_anchor
+                && fresh_anchor->anchor_generation == fresh_generation,
+            "the retained disabled Session permits one reuse with zero model calls and no recursive recapture");
+    }
     Check(frame(1, false) == 1, "record a refresh without submitting its GPU commands");
     const auto discarded = submission::ObserveRecording(gpu.list.Get());
     Check(!discarded->submitted.load(), "discard probe has no submission proof");
@@ -639,7 +680,7 @@ int Run() {
         Check(message->Severity > D3D12_MESSAGE_SEVERITY_ERROR, message->pDescription);
       }
     }
-    std::cout << "PASS edit reuse evidence=WARP+MOCK wrapper cadence, Reset/settings/gap/jitter/failure/discard/lifecycle; NVIDIA runtime not exercised\n";
+    std::cout << "PASS edit reuse evidence=WARP+MOCK wrapper cadence, Reset/settings/gap/jitter/adaptive-On-Off/failure/discard/lifecycle; NVIDIA runtime not exercised\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "FAIL edit reuse contracts: " << error.what() << '\n';

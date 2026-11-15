@@ -12674,7 +12674,8 @@ inline bool RecordInline(
       && present->units.unit_nits == 10000.f && present->units.bt2020 && present->hdr_encoding == 4u;
   const uint64_t edit_reuse_sequence = (present != nullptr ? present->xefg_edit_reuse_frame : feature.sr_sequence);
   const bool edit_reuse_route_eligible = edit_reuse_requested && (edit_reuse_inline_route || edit_reuse_xefg_route)
-      && !plan.mixed && group.begin == 0 && requested_stack == 1 && !adaptive.enabled && !adaptive.preparing
+      && !plan.mixed && group.begin == 0 && requested_stack == 1
+      && !nr_adaptive_enabled.load() && !adaptive.enabled && !adaptive.preparing
       && !D3D11OnlySession() && !direct_api.borrowed_core_context
       && !control_mask_requested && !look_mode.load() && detail_stability.load() == 1u
       && preset.load() == 2u
