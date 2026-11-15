@@ -31,6 +31,32 @@ HostRoot、ShaderIncludeDirectory、Fxc、EmbedFile 参数可显式指定已有�
 专项确需完整原始数据集时，在启动前显式设置 `$env:NR_NEXUS_TEST_KEEP_RAW='1'`。
 工具将选择写入本次生命周期标记，后续维护继续尊重该选择；Full／Acceptance 本身不会开启它。
 
+## 本地发布预检
+
+~~~powershell
+./tools/run-release-preflight.ps1 -Mode Software -OutputDirectory tmp/release-preflight/software
+~~~
+
+软件入口先原样执行 `Suite all -SoftwareOnly`（包括默认五组 FG），再复用编译产物执行
+16 个独立 FG 阶段、分辨率、生命周期及 pre-FG 入口和 4 个 Bridge 分辨率入口。
+`result.json` 逐项记录 Passed、Failed 或 NotRun；Vulkan 在软件模式只编译，执行记为 NotRun。
+这些是 CPU／WARP 与模型替身证据，包含有限的隐藏窗口夹具，不提供游戏或动态视觉验收。
+
+已有完整 `all` 结果可通过 `-ReuseAllOutputDirectory` 复用，入口校验每项实际编译输入；
+仅 FG 夹具有修正时可加 `-RefreshFg` 重编并重跑默认五组，其他结果仍须通过输入校验。
+显式 `run-tests -NativeCase` 会替换默认 FG 组，因此不能用单个专项结果充当默认组已通过。
+
+原生检查使用独立的本地分支，需先取得空闲设备窗口：`-Mode NativeGpu` 运行现有
+`native-full-hardware`、`native-prefg-resolution-hardware` 和 `present-chain-hardware`
+（真实 D3D12、模型替身，一次编译后串行执行）；`-Mode NativeNgx` 运行
+`control-mask-native-ngx-fg`，并须提供 `NativeNgxProjectIdPath`、
+`NativeNgxSdkLibraryDirectory`、`NativeNgxRuntimePath`。后者实际执行 NGX
+Init／Create／Evaluate；`ngx_probe` 仅检查能力，不能替代此结果。缺依赖或未获窗口时记为 NotRun。
+原生分支不重跑软件默认组，也不加入 GitHub CI。
+
+入口要求默认 FG 的 Debug Layer／InfoQueue 检查存在；部分独立夹具的检查范围仍较窄，
+详见结果中的 `limits`。统一入口固定复用已有用例，名称不表示所有格式、初始相位和平台组合均已覆盖。
+
 ## 阴影调整复用核验
 
 ~~~powershell
