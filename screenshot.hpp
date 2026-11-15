@@ -1203,7 +1203,9 @@ inline bool StageSubmissionCompleted(PendingCapture* capture) {
   if (!capture->inline_restore && capture->pre_recorded) {
     completed = observe(capture->pre_nr_readback, &capture->pre_submission_proof) && completed;
   }
-  if (!capture->inline_restore && capture->ready) {
+  // Bridge stages establish this optional only after the primary post copy.
+  // Preserve its receipt before Reset/prune even while bridge Seal keeps ready false.
+  if (!capture->inline_restore && (capture->ready || capture->bridge_model_stages.has_value())) {
     completed = observe(capture->nr_output_readback, &capture->post_submission_proof) && completed;
   }
   for (auto& plane : capture->planes) {
@@ -2286,6 +2288,10 @@ inline void ProcessJob(std::optional<PendingCapture> work) noexcept {
           + "\nreset_sent=" + std::to_string(context.reset_sent) + "\nreset_reasons=" + std::to_string(context.reset_reasons)
           + "\nrecording_list=" + std::to_string(frame.recording.first)
           + "\nrecording_generation=" + std::to_string(frame.recording.second)
+          + "\nrecording_submitted=" + std::to_string(frame.recording_status && frame.recording_status->submitted.load())
+          + "\nrecording_retired=" + std::to_string(frame.recording_status && frame.recording_status->closed.load())
+          + "\nprimary_pre_receipt_observed=" + std::to_string(!work->pre_submission_proof.empty())
+          + "\nprimary_post_receipt_observed=" + std::to_string(!work->post_submission_proof.empty())
           + "\nbridge_submission_value=" + std::to_string(frame.bridge_submission)
           + "\nbridge_submitted=" + std::to_string(frame.bridge_submitted)
           + "\nd3d11_copyback_queued=" + std::to_string(frame.copyback_queued)

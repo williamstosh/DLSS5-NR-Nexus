@@ -622,11 +622,26 @@ inline int Run() {
         && stage_frame.context.work_width == 65 && stage_frame.context.work_height == 44
         && stage_frame.context.output_width == 97 && stage_frame.context.output_height == 65,
         "noninteger ratio keeps model grid, output grid and primary preview pair distinct");
-    shot::SealInlineRestoreBridge(stage_recording.inline_restore_serial, true, 211, true, true);
     Check(!shot::internal::StageSubmissionCompleted(&stages), "recorded stages cannot publish before real software submission");
+    // The real Bridge completes and retires its recording before copyback and Seal.
     submit();
+    Check(!stages.ready && !stages.bridge_model_stages->sealed
+        && !stages.pre_submission_proof.empty() && addon::GpuLeaseCompleted(stages.pre_submission_proof)
+        && !stages.post_submission_proof.empty() && addon::GpuLeaseCompleted(stages.post_submission_proof)
+        && std::all_of(stages.planes.begin(), stages.planes.end(), [](const auto& plane) {
+             return !plane.submission_proof.empty() && addon::GpuLeaseCompleted(plane.submission_proof);
+           }), "primary pair and seven plane receipts survive completion Reset and prune before bridge Seal");
+    Check(shot::internal::ReadbacksReleasable(stages) && !shot::internal::StageSubmissionCompleted(&stages),
+        "completed retired copies still cannot publish until bridge copyback is sealed");
+    shot::SealInlineRestoreBridge(stage_recording.inline_restore_serial, true, 211, true, true);
     Check(shot::internal::BridgeModelStagesComplete(stages) && shot::internal::StageSubmissionCompleted(&stages),
         "all seven stages require submitted, completed and retired recording plus queued bridge copyback");
+    {
+      auto lost_post_receipt = stages;
+      lost_post_receipt.post_submission_proof = {};
+      Check(!shot::internal::StageSubmissionCompleted(&lost_post_receipt),
+          "a post receipt skipped before prune cannot be reconstructed from elapsed time or other planes");
+    }
     for (const char* failure : {"missing", "recording", "uncompleted", "copyback"}) {
       auto rejected = stages;
       if (std::string_view(failure) == "missing") rejected.planes.pop_back();
@@ -702,6 +717,10 @@ inline int Run() {
     const std::string stage_meta{std::istreambuf_iterator<char>(stage_meta_file), std::istreambuf_iterator<char>()};
     stage_meta_file.close();
     Check(stage_meta.find("bridge_model_stage_capture_valid=1") != std::string::npos
+        && stage_meta.find("recording_submitted=1") != std::string::npos
+        && stage_meta.find("recording_retired=1") != std::string::npos
+        && stage_meta.find("primary_pre_receipt_observed=1") != std::string::npos
+        && stage_meta.find("primary_post_receipt_observed=1") != std::string::npos
         && stage_meta.find("evaluation_sequence=" + std::to_string(stage_frame.context.evaluation_sequence)) != std::string::npos
         && stage_meta.find("plane.post_compose.space=model_work_grid") != std::string::npos
         && stage_meta.find("plane.post_look.space=output_grid") != std::string::npos,
