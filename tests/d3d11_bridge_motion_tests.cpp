@@ -625,7 +625,7 @@ int main(int argc, char** argv) {
             renodx::addons::dlss5::DirectCallScope direct_call;
             sdk_clean &= NVSDK_NGX_SUCCEED(native::direct_api.shutdown(bridge_snippet_initialized_device));
           }
-          native::RestoreCallerIdentity();
+          sdk_clean &= native::RestoreCallerIdentity();
           const bool restored = native::get_module_filename_iat == nullptr && native::original_get_module_filename == nullptr
               && (snippet_identity_slot == nullptr || *snippet_identity_slot == snippet_identity_original);
           sdk_clean &= restored;

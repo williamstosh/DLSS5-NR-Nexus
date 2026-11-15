@@ -394,6 +394,62 @@
         "aborting an unclaimed ROI request releases its slot and records failure");
     screenshot::internal::worker_started = worker_started;
   }
+  {
+    // Synthetic IAT ownership with a real Win32 protection failure; no SDK or Shutdown is invoked.
+    struct CallerIdentityFixture {
+      void** previous_slot = runtime::get_module_filename_iat;
+      void* previous_original = runtime::original_get_module_filename;
+      decltype(runtime::real_get_module_filename) previous_real = runtime::real_get_module_filename;
+      void* page = nullptr;
+      ~CallerIdentityFixture() {
+        runtime::get_module_filename_iat = previous_slot;
+        runtime::original_get_module_filename = previous_original;
+        runtime::real_get_module_filename = previous_real;
+        if (page != nullptr) {
+          VirtualFree(page, 0, MEM_RELEASE);
+        }
+      }
+    } identity_fixture;
+    SYSTEM_INFO system_info{};
+    GetSystemInfo(&system_info);
+    identity_fixture.page = VirtualAlloc(nullptr, system_info.dwPageSize, MEM_RESERVE, PAGE_NOACCESS);
+    check(identity_fixture.page != nullptr, "reserve an uncommitted synthetic IAT page without creating a device");
+    auto** synthetic_slot = static_cast<void**>(identity_fixture.page);
+    auto* original = reinterpret_cast<void*>(GetModuleFileNameW);
+    auto* stub = reinterpret_cast<void*>(runtime::CallerGetModuleFileNameW);
+    runtime::get_module_filename_iat = synthetic_slot;
+    runtime::original_get_module_filename = original;
+    runtime::real_get_module_filename = GetModuleFileNameW;
+    check(!runtime::RestoreCallerIdentity() && runtime::get_module_filename_iat == synthetic_slot
+            && runtime::original_get_module_filename == original && runtime::real_get_module_filename == GetModuleFileNameW,
+        "real VirtualProtect failure on an uncommitted page retains all three caller identity references");
+    const auto kernel_module = GetModuleHandleW(L"kernel32.dll");
+    check(kernel_module != nullptr && kernel_module != runtime::addon_module, "the fallback probe names a real non-addon module");
+    std::array<wchar_t, MAX_PATH> expected{}, actual{};
+    const auto length = GetModuleFileNameW(kernel_module, expected.data(), static_cast<DWORD>(expected.size()));
+    check(length > 0 && length < expected.size()
+            && runtime::CallerGetModuleFileNameW(kernel_module, actual.data(), static_cast<DWORD>(actual.size())) == length
+            && std::equal(expected.begin(), expected.begin() + length, actual.begin()),
+        "failed restoration leaves the real GetModuleFileNameW fallback callable");
+    check(VirtualAlloc(identity_fixture.page, system_info.dwPageSize, MEM_COMMIT, PAGE_READWRITE) == identity_fixture.page,
+        "commit the same synthetic IAT page before retrying restoration");
+    *synthetic_slot = stub;
+    DWORD previous_protection = 0;
+    check(VirtualProtect(identity_fixture.page, system_info.dwPageSize, PAGE_READONLY, &previous_protection) != FALSE,
+        "the committed synthetic IAT has its original read-only protection");
+    check(runtime::InstallCallerIdentity() && *synthetic_slot == stub
+            && runtime::original_get_module_filename == original && runtime::real_get_module_filename == GetModuleFileNameW,
+        "reinstalling the tracked patch cannot wrap its own stub as the original function");
+    check(runtime::RestoreCallerIdentity() && *synthetic_slot == original
+            && runtime::get_module_filename_iat == nullptr && runtime::original_get_module_filename == nullptr
+            && runtime::real_get_module_filename == nullptr,
+        "a successful retry restores the original slot before clearing caller identity tracking");
+    MEMORY_BASIC_INFORMATION memory{};
+    check(VirtualQuery(identity_fixture.page, &memory, sizeof(memory)) == sizeof(memory) && memory.Protect == PAGE_READONLY,
+        "successful restoration preserves the IAT page's read-only protection");
+    check(runtime::RestoreCallerIdentity() && *synthetic_slot == original,
+        "restoring an already restored caller identity is an idempotent success");
+  }
   Json receipt{{"scope", "CPU production configuration and status adapters with synthetic ReShade cache; no GPU, NGX or game"},
       {"checks", checks}, {"configuration_writes", configuration_writes}, {"final", control::Snapshot()}};
   std::ofstream("dev-control-runtime.json") << receipt.dump(2);

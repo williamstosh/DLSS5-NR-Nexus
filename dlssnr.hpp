@@ -4125,27 +4125,32 @@ inline bool InstallCallerIdentity() {
   return true;
 }
 
-inline void RestoreCallerIdentity() {
-  if (get_module_filename_iat == nullptr) return;
+inline bool RestoreCallerIdentity() {
+  if (get_module_filename_iat == nullptr) return true;
   DWORD old_protection = 0;
-  if (VirtualProtect(
+  if (!VirtualProtect(
           get_module_filename_iat,
           sizeof(*get_module_filename_iat),
           PAGE_READWRITE,
           &old_protection)) {
-    *get_module_filename_iat = original_get_module_filename;
-    FlushInstructionCache(
-        GetCurrentProcess(), get_module_filename_iat, sizeof(*get_module_filename_iat));
-    DWORD ignored = 0;
-    VirtualProtect(
-        get_module_filename_iat,
-        sizeof(*get_module_filename_iat),
-        old_protection,
-        &ignored);
+    Log(reshade::log::level::error,
+        "caller identity restore failed: VirtualProtect could not make the signed-feature IAT writable;"
+        " the patch and original function remain tracked for retry");
+    return false;
   }
+  *get_module_filename_iat = original_get_module_filename;
+  FlushInstructionCache(
+      GetCurrentProcess(), get_module_filename_iat, sizeof(*get_module_filename_iat));
+  DWORD ignored = 0;
+  VirtualProtect(
+      get_module_filename_iat,
+      sizeof(*get_module_filename_iat),
+      old_protection,
+      &ignored);
   get_module_filename_iat = nullptr;
   original_get_module_filename = nullptr;
   real_get_module_filename = nullptr;
+  return true;
 }
 
 // The addon directory never changes for the life of the process, and the
@@ -32714,9 +32719,16 @@ inline bool Shutdown(bool proof_gated) {
       direct_device = nullptr;
       direct_device_native = nullptr;
     }
-    if (!direct_api.borrowed_core_context) RestoreCallerIdentity();
+    bool identity_restored = true;
+    if (!direct_api.borrowed_core_context) {
+      identity_restored = RestoreCallerIdentity();
+    }
     if (direct_api.module != nullptr) {
-      if (runtime_was_initialized && !direct_api.borrowed_core_context) {
+      if (!identity_restored) {
+        Log(reshade::log::level::warning,
+            "caller identity was not restored; this nvngx_dlssnr.dll reference remains mapped until process exit"
+            " so its tracked IAT stays valid");
+      } else if (runtime_was_initialized && !direct_api.borrowed_core_context) {
         unload = direct_api.module;
       } else {
         // The runtime was loaded but never initialized: boot probe devices can
