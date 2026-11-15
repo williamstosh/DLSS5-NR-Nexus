@@ -14703,6 +14703,41 @@ inline bool RecordInline(
         ++edit_reuse_refreshes;
       }
     }
+#if defined(NR_NEXUS_DEV_CONTROL)
+    const auto claim_inline_roi = [&](bool tail_only) -> uint64_t {
+      if (reuse_this_pass || !inline_restore_bridge
+          || !screenshot::internal::inline_restore_active.load(std::memory_order_acquire)) return 0;
+      const auto& observed = stage_stats.last_evaluate;
+      return screenshot::ClaimInlineRestoreRoi(command_list, {
+          .d3d11_bridge = true, .mixed = plan.mixed, .present = present != nullptr,
+          .preparing = adaptive.preparing || prepare_models_only, .warmup = !nr_returned,
+          .reset_sent = observed.reset_sent, .upscaled = execution_stage == stage_plan::Stage::UPSCALED,
+          .api_returned = observed.api_returned, .ngx_succeeded = nr_returned && NVSDK_NGX_SUCCEED(nr_result),
+          .group_begin = group.begin, .stack = requested_stack, .pass = pass,
+          .work_width = nr_input_width, .work_height = nr_input_height,
+          .output_width = resource_width, .output_height = resource_height,
+          .output_rect = {.x = output_rect.x, .y = output_rect.y, .width = output_rect.width, .height = output_rect.height},
+          .hdr_mode = res.hdr_mode, .codec = codec_mode.load(), .ngx_result = static_cast<uint32_t>(nr_result),
+          .reset_reasons = observed.reset_reasons, .format = res.format,
+          .evaluation_sequence = observed.sequence, .source_generation = observed.source_generation,
+          .present_generation = present_generation,
+          .tail_inputs_aligned = pass_color == 1.f && frame.depth_x == 0 && frame.depth_y == 0
+              && frame.input_width == width && frame.input_height == height,
+          .model_evaluation_index = stage_stats.evaluates,
+          .source_feature = static_cast<uint64_t>(observed.source_feature)},
+          tail_only);
+    };
+    inline_restore_serial = claim_inline_roi(true);
+    const bool tail_roi = inline_restore_serial != 0;
+    const uint64_t stability_before = (tail_roi ? look_stability_passes.load(std::memory_order_relaxed) : 0);
+    if (tail_roi) {
+      if (recording != nullptr) recording->inline_restore_serial = inline_restore_serial;
+      screenshot::CaptureInlineRestorePlane(device, command_list, inline_restore_serial, "nr_model",
+          res.nr_output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      screenshot::CaptureInlineRestorePlane(device, command_list, inline_restore_serial, "depth",
+          frame.depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+#endif
     // The look stage reshapes the model's edit (or measures it) before the
     // resolve, which then reads the route it returns.
     LookRoute route{srv_table_start, nr_input_width, nr_input_height, nr_input_width, nr_input_height};
@@ -14768,29 +14803,17 @@ inline bool RecordInline(
     command_list->Dispatch((width + 15) / 16, (height + 15) / 16, 1);
     UavBarrier(command_list, write_surface);
 #if defined(NR_NEXUS_DEV_CONTROL)
-    if (!reuse_this_pass && inline_restore_bridge
-        && screenshot::internal::inline_restore_active.load(std::memory_order_acquire)) {
-      const auto& observed = stage_stats.last_evaluate;
-      inline_restore_serial = screenshot::ClaimInlineRestoreRoi(command_list, {
-          .d3d11_bridge = true, .mixed = plan.mixed, .present = present != nullptr,
-          .preparing = adaptive.preparing || prepare_models_only, .warmup = !nr_returned,
-          .reset_sent = observed.reset_sent, .upscaled = execution_stage == stage_plan::Stage::UPSCALED,
-          .api_returned = observed.api_returned, .ngx_succeeded = nr_returned && NVSDK_NGX_SUCCEED(nr_result),
-          .group_begin = group.begin, .stack = requested_stack, .pass = pass,
-          .work_width = nr_input_width, .work_height = nr_input_height,
-          .output_width = resource_width, .output_height = resource_height,
-          .output_rect = {.x = output_rect.x, .y = output_rect.y, .width = output_rect.width, .height = output_rect.height},
-          .hdr_mode = res.hdr_mode, .codec = codec_mode.load(), .ngx_result = static_cast<uint32_t>(nr_result),
-          .reset_reasons = observed.reset_reasons, .format = res.format,
-          .evaluation_sequence = observed.sequence, .source_generation = observed.source_generation,
-          .present_generation = present_generation});
-      if (inline_restore_serial != 0) {
-        if (recording != nullptr) recording->inline_restore_serial = inline_restore_serial;
-        screenshot::CaptureInlineRestorePlane(device, command_list, inline_restore_serial, "original",
-            res.original, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        screenshot::CaptureInlineRestorePlane(device, command_list, inline_restore_serial, "post_resolve",
-            write_surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-      }
+    if (!tail_roi) {
+      inline_restore_serial = claim_inline_roi(false);
+    }
+    if (inline_restore_serial != 0) {
+      if (recording != nullptr) recording->inline_restore_serial = inline_restore_serial;
+      screenshot::CaptureInlineRestorePlane(device, command_list, inline_restore_serial, "original",
+          res.original, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      screenshot::CaptureInlineRestorePlane(device, command_list, inline_restore_serial, "post_resolve",
+          write_surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+          screenshot::InlineRestoreExecution{.look_shaped = route.shaped,
+              .look_stability_recorded = tail_roi && look_stability_passes.load(std::memory_order_relaxed) > stability_before});
     }
 #endif
     capture_stage("post_resolve", write_surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,

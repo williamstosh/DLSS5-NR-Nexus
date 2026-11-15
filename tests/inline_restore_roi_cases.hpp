@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -240,9 +241,11 @@ inline int Run() {
         && pending.allocated_bytes < 200'000, "four ROI-only readbacks allocate no full-image pair");
     shot::SealInlineRestoreBridge(recorded.inline_restore_serial, true, 123, true, true);
     Check(!shot::internal::StageSubmissionCompleted(&pending), "unsubmitted recording has no success evidence");
-    auto wrong_recording = pending;
-    wrong_recording.planes.back().recording.second++;
-    Check(!shot::internal::StageSubmissionCompleted(&wrong_recording), "different recording cannot complete a missing plane");
+    {
+      auto wrong_recording = pending;
+      wrong_recording.planes.back().recording.second++;
+      Check(!shot::internal::StageSubmissionCompleted(&wrong_recording), "different recording cannot complete a missing plane");
+    }
     ComPtr<ID3D12Fence> blocked;
     Check(SUCCEEDED(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&blocked))), "ROI pending-GPU gate");
     struct GateRelease {
@@ -346,12 +349,138 @@ inline int Run() {
         Check(entry.path().filename() == L"capture.meta.txt", "failed export contains only redacted failure metadata");
       }
     }
+    // Tail capture uses the same production path, with independently submitted and retired evaluations.
+    const auto tail_directory = directory("tail-two");
+    Check(shot::RequestInlineRestoreRoi(tail_directory, &reason, 2), "arm two-evaluation tail ROI");
+    constexpr std::array tail_names{"original", "nr_model", "post_resolve", "post_restore", "depth"};
+    constexpr std::array tail_formats{DXGI_FORMAT_R16G16B16A16_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+        DXGI_FORMAT_R16G16B16A16_UNORM, DXGI_FORMAT_R16G16B16A16_UNORM, DXGI_FORMAT_R32_FLOAT};
+    std::array<shot::InlineRestoreContext, 2> tail_contexts{};
+    std::array<std::vector<uint8_t>, 10> tail_expected;
+    const auto tail_name = [&](size_t frame, size_t role) {
+      return "f" + std::to_string(tail_contexts[frame].evaluation_sequence) + "_" + tail_names[role];
+    };
+    const auto tail_file = [&](size_t frame, size_t role) {
+      return tail_directory / (tail_name(frame, role) + ".raw");
+    };
+    uint64_t tail_serial = 0;
+    for (size_t frame = 0; frame < 2; ++frame) {
+      // Change the ROI's first pixel so each frame has an independent coordinate oracle.
+      Check(SUCCEEDED(original_upload->Map(0, nullptr, &original_mapped)), "tail source pattern map");
+      const uint16_t marker[]{static_cast<uint16_t>(original_code(960, 768, 0) + frame * 997),
+          original_code(960, 768, 1), original_code(960, 768, 2), original_code(960, 768, 3)};
+      std::memcpy(static_cast<uint8_t*>(original_mapped) + original_footprint.Offset
+          + 768 * original_footprint.Footprint.RowPitch + 960 * 8, marker, sizeof(marker));
+      original_upload->Unmap(0, nullptr);
+      gpu.Transition(output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+      const D3D12_BOX tail_box{960, 768, 0, 1280, 896, 1};
+      gpu.list->CopyTextureRegion(&original_destination, 960, 768, 0, &original_source, &tail_box);
+      gpu.Transition(output.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      gpu.uploads.push_back(original_upload);
+      recorded = evaluate();
+      Check(recorded.inline_restore_serial != 0 && recorded.model_pass_mask == 1 && recorded.output_ready
+          && recorded.group_complete && shot::internal::pending, "qualified production evaluation joins tail");
+      if (frame == 0) tail_serial = recorded.inline_restore_serial;
+      shot::SealInlineRestoreBridge(recorded.inline_restore_serial, true, 124 + frame, true, true);
+      auto& tail = *shot::internal::pending;
+      Check(recorded.inline_restore_serial == tail_serial && tail.inline_restore && tail.inline_restore->tail_frame_count == 2
+          && tail.inline_restore->context.tail_inputs_aligned && tail.inline_restore->frames.size() == frame + 1
+          && tail.planes.size() == (frame + 1) * 5
+          && tail.pre_nr_readback == nullptr && tail.nr_output_readback == nullptr,
+          "one pending serial accumulates five native ROI planes per aligned evaluation without full-image pair");
+      const auto& captured = tail.inline_restore->frames.back();
+      const auto& context = captured.context;
+      tail_contexts[frame] = context;
+      Check(context.present_generation == native::present_generation, "tail keeps exact qualified present ID");
+      Check(captured.look_shaped && captured.look_stability_recorded, "tail records the executed filter for this evaluation");
+      if (frame == 1) {
+        const auto& first = tail_contexts.front();
+        // The shared observation sequence also counts plan events; evaluates counts only this stage.
+        Check(context.evaluation_sequence > first.evaluation_sequence
+            && context.model_evaluation_index == first.model_evaluation_index + 1
+            && context.present_generation > first.present_generation
+            && context.source_feature == first.source_feature && context.source_generation == first.source_generation
+            && captured.recording != tail.inline_restore->frames.front().recording,
+            "tail preserves consecutive actual evaluations on one source with independent recordings");
+      }
+      Check(!shot::internal::StageSubmissionCompleted(&tail), "unsubmitted tail evaluation cannot borrow prior completion");
+      submit();
+      for (size_t role = 0; role < 5; ++role) {
+        const auto index = frame * 5 + role;
+        const auto name = tail_name(frame, role);
+        const auto found = std::find_if(tail.planes.begin(), tail.planes.end(),
+            [&](const auto& candidate) { return candidate.name == name; });
+        Check(found != tail.planes.end(), "tail includes each sequence-named plane");
+        const auto& plane = *found;
+        Check(plane.width == 320 && plane.height == 128 && plane.format == tail_formats[role]
+            && plane.recording == captured.recording && plane.readback != nullptr && !plane.submission_proof.empty(),
+            "tail planes retain native formats, fixed ROI dimensions and exact receipts");
+        const size_t row_bytes = 320 * shot::internal::DiagnosticPixelBytes(plane.format);
+        tail_expected[index].resize(row_bytes * 128);
+        void* mapped = nullptr;
+        Check(SUCCEEDED(plane.readback->Map(0, nullptr, &mapped)), "read retired tail plane");
+        for (uint32_t y = 0; y < 128; ++y) {
+          std::memcpy(tail_expected[index].data() + y * row_bytes,
+              static_cast<uint8_t*>(mapped) + plane.footprint.Offset + y * plane.footprint.Footprint.RowPitch, row_bytes);
+        }
+        plane.readback->Unmap(0, nullptr);
+        if (role == 0) Check(std::memcmp(tail_expected[index].data(), marker, sizeof(marker)) == 0,
+            "tail original starts at the fixed crop and belongs to this evaluation");
+      }
+      if (frame == 0) {
+        shot::OnPresent(++native::present_generation, true);
+        Check(shot::HasPending() && !shot::internal::job, "first sealed retired frame cannot hand off a two-frame tail");
+      }
+    }
+    auto& tail = *shot::internal::pending;
+    Check(shot::internal::StageSubmissionCompleted(&tail) && shot::internal::ReadbacksReleasable(tail),
+        "both frames retain independent exact completion after Reset and retirement");
+    shot::OnPresent(++native::present_generation, true);
+    Check(!shot::HasPending() && shot::internal::job, "both sealed retired frames hand off one tail job");
+    auto tail_work = std::move(shot::internal::job);
+    shot::internal::job.reset();
+    shot::internal::ProcessJob(std::move(tail_work));
+    Check(std::strcmp(shot::GetInlineRestoreStatus().status, "written") == 0, "two-frame tail publishes written");
+    size_t tail_files = 0, tail_bytes = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(tail_directory)) ++tail_files;
+    for (size_t frame = 0; frame < 2; ++frame) {
+      for (size_t role = 0; role < 5; ++role) {
+        std::ifstream input(tail_file(frame, role), std::ios::binary);
+        const std::vector<uint8_t> actual{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+        Check(actual == tail_expected[frame * 5 + role], "sequence-named tail file has native bytes with no row gaps");
+        tail_bytes += actual.size();
+      }
+    }
+    Check(tail_files == 11 && tail_bytes == 2'949'120, "exactly ten native ROI files and one tail sidecar");
+    std::ifstream tail_meta_file(tail_directory / L"capture.meta.txt", std::ios::binary);
+    const std::string tail_meta{std::istreambuf_iterator<char>(tail_meta_file), std::istreambuf_iterator<char>()};
+    tail_meta_file.close();
+    const auto tail_field = [&](const std::string& field) {
+      return tail_meta.starts_with(field + "\n") || tail_meta.starts_with(field + "\r\n")
+          || tail_meta.find("\n" + field + "\n") != std::string::npos
+          || tail_meta.find("\n" + field + "\r\n") != std::string::npos;
+    };
+    Check(tail_field("capture_schema=inline_tail_roi_v1") && tail_field("frame_count=2") && tail_field("capture_valid=1"),
+        "tail sidecar declares the two-frame schema");
+    for (size_t frame = 0; frame < 2; ++frame) {
+      const auto prefix = "frame." + std::to_string(frame) + ".";
+      const auto& context = tail_contexts[frame];
+      Check(tail_field(prefix + "evaluation_sequence=" + std::to_string(context.evaluation_sequence))
+          && tail_field(prefix + "model_evaluation_index=" + std::to_string(context.model_evaluation_index))
+          && tail_field(prefix + "source_generation=" + std::to_string(context.source_generation))
+          && tail_field(prefix + "present_generation=" + std::to_string(context.present_generation))
+          && tail_field(prefix + "look_stability_recorded=1"),
+          "sidecar preserves each qualified frame's exact IDs");
+    }
     native::ForgetSourceHandleLocked(handle);
     submit();
     native::successful_sr_device = nullptr;
     model_gpu = nullptr;
     const char* keep = std::getenv("NR_NEXUS_TEST_KEEP_RAW");
     if (keep == nullptr || std::strcmp(keep, "1") != 0) {
+      for (size_t frame = 0; frame < 2; ++frame) {
+        for (size_t role = 0; role < tail_names.size(); ++role) std::filesystem::remove(tail_file(frame, role));
+      }
       for (const auto& path : owned_outputs) {
         for (const char* name : names) std::filesystem::remove(path / (std::string(name) + ".raw"));
         std::filesystem::remove(path / L"capture.meta.txt");
@@ -359,6 +488,7 @@ inline int Run() {
       }
     }
     std::cout << "PASS inline-restore-roi evidence=CPU+WARP+MOCK raw_bytes=175392 planes=4 pair=none"
+              << " tail_frames=2 tail_planes=10 tail_raw_bytes=" << tail_bytes
               << " readback_footprint_bytes=" << readback_footprint_bytes
               << " readback_heap_reserved_bytes=" << readback_heap_reserved_bytes
               << " native_ngx=NotRun d3d11_delivery=MOCK cleanup=Standard\n";

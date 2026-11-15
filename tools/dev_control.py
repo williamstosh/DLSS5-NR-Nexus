@@ -301,11 +301,15 @@ class Client:
         request = dict(id=str(uuid.uuid4()), op='bridge_adaptive_experiment', enabled=enabled)
         return self._mutation(request, deadline)
 
-    def inline_restore_roi(self, output_directory, *, deadline=None):
+    def inline_restore_roi(self, output_directory, *, tail_frames=None, deadline=None):
         if not isinstance(output_directory, str) or not output_directory.strip():
             raise ValueError('inline_restore_roi requires an output directory')
         deadline = deadline if deadline is not None else time.monotonic() + self.timeout
         request = dict(id=str(uuid.uuid4()), op='inline_restore_roi', output_directory=output_directory)
+        if tail_frames is not None:
+            if type(tail_frames) is not int or not 2 <= tail_frames <= 48:
+                raise ValueError('tail_frames requires an integer from 2 to 48')
+            request['tail_frames'] = tail_frames
         return self._mutation(request, deadline)
 
 
@@ -316,10 +320,13 @@ def main():
     parser.add_argument('--timeout', type=float, default=3)
     parser.add_argument('--query-id', help='status only: look up an uncertain original request receipt')
     parser.add_argument('--confirm', action='store_true', help='Explicitly approve a returned configuration proposal')
+    parser.add_argument('--tail-frames', type=int, help='inline-restore-roi only: capture 2–48 consecutive evaluations at the character ROI')
     parser.add_argument('op', choices=('status', 'set', 'inline-restore-roi'))
     parser.add_argument('key', nargs='?')
     parser.add_argument('value', nargs='?', help='JSON typed value')
     args = parser.parse_args()
+    if args.tail_frames is not None and (args.op != 'inline-restore-roi' or not 2 <= args.tail_frames <= 48):
+        parser.error('--tail-frames requires inline-restore-roi and a value from 2 to 48')
     client = Client(args.pid, args.process_created, timeout=args.timeout)
     if args.op == 'set':
         if not args.key or args.value is None or args.query_id:
@@ -328,7 +335,7 @@ def main():
     elif args.op == 'inline-restore-roi':
         if not args.key or args.value is not None or args.query_id or args.confirm:
             parser.error('inline-restore-roi requires one output directory and no setting or confirmation')
-        response = client.inline_restore_roi(args.key)
+        response = client.inline_restore_roi(args.key, tail_frames=args.tail_frames)
     else:
         if args.key or args.value or args.confirm:
             parser.error('status accepts no setting or confirmation')

@@ -70,6 +70,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <stdexcept>
@@ -127,6 +128,8 @@ struct InlineRestoreContext {
   uint32_t hdr_mode = 0, codec = 0, ngx_result = 0, reset_reasons = 0;
   DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
   uint64_t evaluation_sequence = 0, source_generation = 0, present_generation = 0;
+  bool tail_inputs_aligned = false;
+  uint64_t model_evaluation_index = 0, source_feature = 0;
 };
 
 inline bool InlineRestoreEligible(const InlineRestoreContext& context) {
@@ -147,6 +150,34 @@ struct InlineRestoreStatus {
   std::string reason;
   uint64_t serial = 0;
 };
+
+inline constexpr uint32_t MAX_INLINE_TAIL_FRAMES = 48;
+inline constexpr CaptureRect INLINE_FLOOR_RECT{.x = 1936, .y = 1106, .width = 152, .height = 48};
+inline constexpr CaptureRect INLINE_TAIL_RECT{.x = 960, .y = 768, .width = 320, .height = 128};
+
+struct InlinePlaneSpec {
+  const char* name;
+  DXGI_FORMAT format;
+  CaptureRect rect;
+  uint32_t source_width = 3840;
+  uint32_t source_height = 2160;
+};
+
+inline std::span<const InlinePlaneSpec> InlinePlanes(bool tail) {
+  static constexpr InlinePlaneSpec floor_planes[]{
+      {"original", DXGI_FORMAT_R16G16B16A16_UNORM, INLINE_FLOOR_RECT},
+      {"post_resolve", DXGI_FORMAT_R16G16B16A16_UNORM, INLINE_FLOOR_RECT},
+      {"restore_blocks", DXGI_FORMAT_R32G32B32A32_FLOAT, {60, 34, 6, 3}, 120, 68},
+      {"post_restore", DXGI_FORMAT_R16G16B16A16_UNORM, INLINE_FLOOR_RECT}};
+  static constexpr InlinePlaneSpec tail_planes[]{
+      {"original", DXGI_FORMAT_R16G16B16A16_UNORM, INLINE_TAIL_RECT},
+      {"nr_model", DXGI_FORMAT_R16G16B16A16_FLOAT, INLINE_TAIL_RECT},
+      {"post_resolve", DXGI_FORMAT_R16G16B16A16_UNORM, INLINE_TAIL_RECT},
+      {"post_restore", DXGI_FORMAT_R16G16B16A16_UNORM, INLINE_TAIL_RECT},
+      {"depth", DXGI_FORMAT_R32_FLOAT, INLINE_TAIL_RECT}};
+  if (tail) return tail_planes;
+  return floor_planes;
+}
 #endif
 struct HdrCapturePlan {
   HdrCaptureMode mode = HdrCaptureMode::MODEL_TRACE;
@@ -312,20 +343,37 @@ struct DiagnosticPlane {
 };
 
 #if defined(NR_NEXUS_DEV_CONTROL)
-struct InlineRestoreCapture {
-  std::filesystem::path output_directory;
-  std::string capture_id;
+struct InlineRestoreFrame {
   InlineRestoreContext context;
   std::pair<uint64_t, uint64_t> recording;
   std::shared_ptr<submission::RecordingStatus> recording_status;
-  uint64_t request_id = 0;
-  uint64_t deadline_ms = 0;
   uint64_t bridge_submission = 0;
   bool bridge_submitted = false, copyback_queued = false, sealed = false;
   bool reduce_recorded = false, apply_recorded = false, reduce_unshaped = false;
   uint32_t restore_mode = 0;
   float gate = 0.f;
+  size_t first_plane = 0;
+  bool look_shaped = false, look_stability_recorded = false;
 };
+
+struct InlineRestoreCapture : InlineRestoreFrame {
+  std::filesystem::path output_directory;
+  std::string capture_id;
+  uint64_t request_id = 0;
+  uint64_t deadline_ms = 0;
+  uint32_t tail_frame_count = 0;
+  std::vector<InlineRestoreFrame> frames;
+};
+
+inline std::span<const InlineRestoreFrame> InlineFrames(const InlineRestoreCapture& capture) {
+  if (capture.tail_frame_count != 0) return capture.frames;
+  return {&static_cast<const InlineRestoreFrame&>(capture), 1};
+}
+
+inline std::string InlinePlaneName(bool tail, const InlineRestoreFrame& frame, const char* name) {
+  if (!tail) return name;
+  return "f" + std::to_string(frame.context.evaluation_sequence) + "_" + name;
+}
 #endif
 
 struct OutputOptions {
@@ -1073,14 +1121,23 @@ inline bool StageSubmissionCompleted(PendingCapture* capture) {
   bool completed = capture->pre_recorded && capture->ready;
   if (capture->inline_restore) {
     const auto& roi = *capture->inline_restore;
-    completed = capture->ready && roi.sealed && roi.bridge_submitted && roi.copyback_queued
-        && roi.reduce_recorded && roi.apply_recorded && capture->planes.size() == 4
-        && roi.recording_status != nullptr && roi.recording_status->submitted.load();
-    for (const char* name : {"original", "post_resolve", "restore_blocks", "post_restore"}) {
-      const auto found = std::find_if(capture->planes.begin(), capture->planes.end(),
-          [name](const auto& plane) { return plane.name == name; });
-      completed = completed && found != capture->planes.end() && found->required
-          && found->recorded && found->error.empty() && found->recording == roi.recording;
+    const bool tail = roi.tail_frame_count != 0;
+    const auto frames = InlineFrames(roi);
+    const auto specs = InlinePlanes(tail);
+    completed = capture->ready && (!tail || frames.size() == roi.tail_frame_count)
+        && capture->planes.size() == frames.size() * specs.size();
+    for (const auto& frame : frames) {
+      if (!completed) break;
+      completed = completed && frame.sealed && frame.bridge_submitted && frame.copyback_queued
+          && frame.apply_recorded && (tail || frame.reduce_recorded)
+          && frame.recording_status != nullptr && frame.recording_status->submitted.load();
+      for (const auto& spec : specs) {
+        const auto name = InlinePlaneName(tail, frame, spec.name);
+        const auto found = std::find_if(capture->planes.begin(), capture->planes.end(),
+            [&](const auto& plane) { return plane.name == name; });
+        completed = completed && found != capture->planes.end() && found->required
+            && found->recorded && found->error.empty() && found->recording == frame.recording;
+      }
     }
   }
   if (!capture->inline_restore && capture->pre_recorded) {
@@ -1950,16 +2007,23 @@ inline void ProcessJob(std::optional<PendingCapture> work) noexcept {
     if (work->inline_restore) {
       const auto& roi = *work->inline_restore;
       const auto& context = roi.context;
+      const bool tail = roi.tail_frame_count != 0;
+      const auto frames = InlineFrames(roi);
+      const auto specs = InlinePlanes(tail);
       bool valid = work->completion_proven && !work->metadata_only && !work->aborted
           && InlineRestoreEligible(context) && CaptureCompletionProven(*work) && StageSubmissionCompleted(&*work)
           && roi.recording_status != nullptr && roi.recording_status->closed.load();
       std::string error = (valid ? "" : "capture_contract_or_exact_completion_incomplete");
-      std::array<std::vector<uint8_t>, 4> raw_data;
-      std::array<uint64_t, 4> hashes{};
-      constexpr std::array names{"original", "post_resolve", "restore_blocks", "post_restore"};
+      std::vector<std::vector<uint8_t>> raw_data(frames.size() * specs.size());
+      std::vector<uint64_t> hashes(raw_data.size());
+      std::vector<std::string> names;
+      for (const auto& frame : frames) {
+        for (const auto& spec : specs) names.push_back(InlinePlaneName(tail, frame, spec.name));
+      }
       std::ostringstream meta;
       meta << std::setprecision(std::numeric_limits<float>::max_digits10);
-      meta << "capture_schema=inline_restore_roi_v1\ncapture_id=" << roi.capture_id
+      meta << "capture_schema=" << (tail ? "inline_tail_roi_v1" : "inline_restore_roi_v1")
+           << "\ncapture_id=" << roi.capture_id
            << "\npid=" << GetCurrentProcessId() << "\nnexus_version=" << NR_NEXUS_VERSION
            << "\nnexus_build=" << NR_NEXUS_VERSION << ' ' << __DATE__ << ' ' << __TIME__
            << "\nrequest_id=" << roi.request_id
@@ -1983,7 +2047,34 @@ inline void ProcessJob(std::optional<PendingCapture> work) noexcept {
            << "\nreduce_variant=" << (roi.reduce_unshaped ? "MEASURE_UNSHAPED" : "regular")
            << "\nreduce_recorded=" << roi.reduce_recorded << "\napply_recorded=" << roi.apply_recorded
            << "\nraw_layout=tight_rows_native_dxgi_little_endian\npair_allocated=0\n" << work->meta;
+      if (tail) {
+        meta << "frame_count=" << frames.size() << "\nrequested_frame_count=" << roi.tail_frame_count
+             << "\nroi=" << INLINE_TAIL_RECT.x << ',' << INLINE_TAIL_RECT.y << ','
+             << INLINE_TAIL_RECT.width << ',' << INLINE_TAIL_RECT.height
+             << "\ncolor_domain=bounded_proxy_code_values;nr_model_is_fp16;other_color_is_unorm16"
+             << "\ndepth_domain=reversed_z_r32_float\ntimings_instrumented=1\n";
+        for (size_t i = 0; i < frames.size(); ++i) {
+          const auto& frame = frames[i];
+          const std::string prefix = "frame." + std::to_string(i) + ".";
+          const bool frame_valid = InlineRestoreEligible(frame.context) && frame.context.tail_inputs_aligned
+              && frame.recording_status != nullptr && frame.recording_status->closed.load();
+          valid = valid && frame_valid;
+          meta << prefix << "evaluation_sequence=" << frame.context.evaluation_sequence
+               << '\n' << prefix << "model_evaluation_index=" << frame.context.model_evaluation_index
+               << '\n' << prefix << "source_feature=" << frame.context.source_feature
+               << '\n' << prefix << "source_generation=" << frame.context.source_generation
+               << '\n' << prefix << "present_generation=" << frame.context.present_generation
+               << '\n' << prefix << "recording_list=" << frame.recording.first
+               << '\n' << prefix << "recording_generation=" << frame.recording.second
+               << '\n' << prefix << "bridge_submission=" << frame.bridge_submission
+               << '\n' << prefix << "look_shaped=" << frame.look_shaped
+               << '\n' << prefix << "look_stability_recorded=" << frame.look_stability_recorded
+               << '\n' << prefix << "valid=" << frame_valid << '\n';
+        }
+      }
       for (size_t index = 0; index < names.size(); ++index) {
+        const auto& spec = specs[index % specs.size()];
+        const auto& frame = frames[index / specs.size()];
         const auto found = std::find_if(work->planes.begin(), work->planes.end(),
             [name = names[index]](const auto& plane) { return plane.name == name; });
         const std::string prefix = "plane." + std::string(names[index]) + ".";
@@ -1993,16 +2084,15 @@ inline void ProcessJob(std::optional<PendingCapture> work) noexcept {
           continue;
         }
         const auto& plane = *found;
-        const bool blocks = index == 2;
-        const CaptureRect expected = (blocks ? CaptureRect{.x = 60, .y = 34, .width = 6, .height = 3}
-                                            : CaptureRect{.x = 1936, .y = 1106, .width = 152, .height = 48});
+        const bool blocks = std::string_view(spec.name) == "restore_blocks";
+        const CaptureRect expected = spec.rect;
         const size_t row_bytes = static_cast<size_t>(plane.width) * DiagnosticPixelBytes(plane.format);
         bool plane_valid = valid && plane.required && plane.recorded && plane.error.empty() && plane.readback != nullptr
-            && plane.recording == roi.recording && DiagnosticFootprintValid(plane)
+            && plane.recording == frame.recording && DiagnosticFootprintValid(plane)
             && plane.width == expected.width && plane.height == expected.height
             && plane.source_rect.x == expected.x && plane.source_rect.y == expected.y
-            && plane.source_width == (blocks ? 120u : 3840u) && plane.source_height == (blocks ? 68u : 2160u)
-            && plane.format == (blocks ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R16G16B16A16_UNORM);
+            && plane.source_width == spec.source_width && plane.source_height == spec.source_height
+            && plane.format == spec.format;
         hashes[index] = 14695981039346656037ull;
         if (plane_valid) {
           raw_data[index].resize(row_bytes * plane.height);
@@ -2095,7 +2185,7 @@ inline void ProcessJob(std::optional<PendingCapture> work) noexcept {
       cleanup.committed = true;
       record.meta = meta_path;
       record.outcome = (valid ? "written" : "incomplete");
-      record.reason = (valid ? "four_raw_planes_written" : error);
+      record.reason = (valid ? (tail ? "tail_stage_frames_written" : "four_raw_planes_written") : error);
       PublishFinished(std::move(record));
       ReleaseReadbacks(*work);
       return;
@@ -2723,11 +2813,15 @@ inline InlineRestoreStatus GetInlineRestoreStatus() {
   return internal::inline_restore_status;
 }
 
-inline bool RequestInlineRestoreRoi(const std::filesystem::path& output_directory, std::string* reason) {
+inline bool RequestInlineRestoreRoi(const std::filesystem::path& output_directory, std::string* reason,
+                                    uint32_t tail_frame_count = 0) {
   const auto reject = [&](const char* why) {
     if (reason != nullptr) *reason = why;
     return false;
   };
+  if (tail_frame_count != 0 && (tail_frame_count < 2 || tail_frame_count > MAX_INLINE_TAIL_FRAMES)) {
+    return reject("invalid_tail_frame_count");
+  }
   const auto directory = output_directory.lexically_normal();
   const auto capture_id = directory.filename().string();
   const auto root = directory.parent_path().parent_path().parent_path();
@@ -2762,7 +2856,8 @@ inline bool RequestInlineRestoreRoi(const std::filesystem::path& output_director
   }
   internal::requested_inline_restore = internal::InlineRestoreCapture{
       .output_directory = directory, .capture_id = capture_id,
-      .request_id = internal::inline_restore_request_id.fetch_add(1) + 1, .deadline_ms = GetTickCount64() + 30'000};
+      .request_id = internal::inline_restore_request_id.fetch_add(1) + 1, .deadline_ms = GetTickCount64() + 30'000,
+      .tail_frame_count = tail_frame_count};
   internal::inline_restore_status = {.capture_id = capture_id, .status = "armed", .reason = "waiting_for_eligible_evaluation"};
   internal::stage_busy.store(true);
   internal::inline_restore_active.store(true, std::memory_order_release);
@@ -2770,15 +2865,41 @@ inline bool RequestInlineRestoreRoi(const std::filesystem::path& output_director
   return true;
 }
 
-inline uint64_t ClaimInlineRestoreRoi(ID3D12GraphicsCommandList* list, const InlineRestoreContext& context) {
+inline uint64_t ClaimInlineRestoreRoi(ID3D12GraphicsCommandList* list, const InlineRestoreContext& context,
+                                     bool tail_only = false) {
   if (!internal::inline_restore_active.load(std::memory_order_acquire) || list == nullptr
       || evaluation_depth == 0 || inline_evaluation_request == 0
       || inline_evaluation_request != internal::inline_restore_request_id.load(std::memory_order_acquire)) return 0;
   if (context.preparing || context.warmup || context.reset_sent || context.reset_reasons != 0
       || !context.api_returned || !context.ngx_succeeded) return 0;
   std::scoped_lock lock(internal::state_mutex);
-  if (!internal::requested_inline_restore || internal::pending) return 0;
-  if (!InlineRestoreEligible(context)) {
+  if (internal::pending) {
+    auto& capture = *internal::pending;
+    if (!tail_only || !capture.inline_restore || capture.inline_restore->tail_frame_count == 0) return 0;
+    auto& roi = *capture.inline_restore;
+    if (capture.aborted || !roi.sealed || roi.frames.size() >= roi.tail_frame_count) return 0;
+    const auto& previous = roi.frames.back();
+    if (!InlineRestoreEligible(context) || !context.tail_inputs_aligned
+        || context.source_generation != previous.context.source_generation
+        || context.source_feature != previous.context.source_feature
+        || context.present_generation <= previous.context.present_generation
+        || context.model_evaluation_index != previous.context.model_evaluation_index + 1) {
+      capture.aborted = true;
+      capture.meta += "capture_error=tail_model_sequence_or_contract_changed\n";
+      internal::inline_restore_status.reason = "tail_model_sequence_or_contract_changed";
+      return 0;
+    }
+    static_cast<internal::InlineRestoreFrame&>(roi) = {
+        .context = context, .recording = submission::RecordingIdentity(list),
+        .recording_status = submission::ObserveRecording(list), .first_plane = capture.planes.size()};
+    capture.model_recording_list = list;
+    capture.lease_generation = context.present_generation;
+    capture.aborted = GetTickCount64() >= roi.deadline_ms || (roi.recording.first >> 63) != 0;
+    return capture.serial;
+  }
+  if (!internal::requested_inline_restore
+      || (internal::requested_inline_restore->tail_frame_count != 0) != tail_only) return 0;
+  if (!InlineRestoreEligible(context) || (tail_only && !context.tail_inputs_aligned)) {
     internal::requested_inline_restore.reset();
     internal::inline_restore_status.status = "failed";
     internal::inline_restore_status.reason = "unsupported_inline_restore_contract";
@@ -2807,7 +2928,7 @@ inline uint64_t ClaimInlineRestoreRoi(ID3D12GraphicsCommandList* list, const Inl
   capture.aborted = GetTickCount64() >= roi.deadline_ms || (roi.recording.first >> 63) != 0;
   if (capture.aborted) capture.meta = "capture_error=claim_expired_or_recording_identity_unavailable\n";
   internal::inline_restore_status.status = "claimed";
-  internal::inline_restore_status.reason = "recording_four_planes";
+  internal::inline_restore_status.reason = (tail_only ? "recording_tail_stage_frames" : "recording_four_planes");
   internal::inline_restore_status.serial = capture.serial;
   internal::pending = std::move(capture);
   internal::has_pending.store(true, std::memory_order_release);
@@ -3594,6 +3715,7 @@ struct InlineRestoreExecution {
   uint32_t mode = 0;
   float gate = 0.f;
   bool reduce_unshaped = false;
+  bool look_shaped = false, look_stability_recorded = false;
 };
 
 inline bool CaptureInlineRestorePlane(
@@ -3601,32 +3723,38 @@ inline bool CaptureInlineRestorePlane(
     ID3D12Resource* source, D3D12_RESOURCE_STATES state,
     std::optional<InlineRestoreExecution> execution = std::nullopt) {
   if (serial == 0 || list == nullptr || name == nullptr) return false;
-  const bool blocks = std::string_view(name) == "restore_blocks";
-  const CaptureRect rect = (blocks ? CaptureRect{.x = 60, .y = 34, .width = 6, .height = 3}
-                                   : CaptureRect{.x = 1936, .y = 1106, .width = 152, .height = 48});
+  CaptureRect rect;
+  std::string plane_name;
   {
     std::scoped_lock lock(internal::state_mutex);
     if (!internal::pending || internal::pending->serial != serial || !internal::pending->inline_restore) return false;
     auto& capture = *internal::pending;
-    const bool named = blocks || std::string_view(name) == "original" || std::string_view(name) == "post_resolve"
-        || std::string_view(name) == "post_restore";
+    const auto& roi = *capture.inline_restore;
+    const bool tail = roi.tail_frame_count != 0;
+    const auto specs = InlinePlanes(tail);
+    const auto spec = std::find_if(specs.begin(), specs.end(),
+        [name](const auto& plane) { return std::string_view(plane.name) == name; });
+    // Tail samples the restore result, not the floor probe's block statistics.
+    if (tail && spec == specs.end() && std::string_view(name) == "restore_blocks") return false;
+    plane_name = internal::InlinePlaneName(tail, roi, name);
     const auto desc = (source != nullptr ? source->GetDesc() : D3D12_RESOURCE_DESC{});
-    if (!named || capture.aborted || capture.inline_restore->sealed
-        || submission::RecordingIdentity(list) != capture.inline_restore->recording
-        || std::any_of(capture.planes.begin(), capture.planes.end(), [name](const auto& plane) { return plane.name == name; })
-        || desc.Width != (blocks ? 120u : 3840u) || desc.Height != (blocks ? 68u : 2160u)
-        || desc.Format != (blocks ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R16G16B16A16_UNORM)) {
+    if (spec == specs.end() || capture.aborted || roi.sealed
+        || submission::RecordingIdentity(list) != roi.recording
+        || std::any_of(capture.planes.begin(), capture.planes.end(),
+                       [&](const auto& plane) { return plane.name == plane_name; })
+        || desc.Width != spec->source_width || desc.Height != spec->source_height || desc.Format != spec->format) {
       capture.aborted = true;
       capture.meta += "capture_error=plane_source_recording_or_name_invalid\n";
       return false;
     }
+    rect = spec->rect;
   }
-  if (!PrepareDiagnosticPlane(device, name, source, rect.width, rect.height, rect, true, serial)) return false;
+  if (!PrepareDiagnosticPlane(device, plane_name.c_str(), source, rect.width, rect.height, rect, true, serial)) return false;
   D3D12_RESOURCE_BARRIER barrier{.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION};
   barrier.Transition = {.pResource = source, .Subresource = 0, .StateBefore = state,
                         .StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE};
   list->ResourceBarrier(1, &barrier);
-  RecordDiagnosticPlaneCopy(list, name, source, serial);
+  RecordDiagnosticPlaneCopy(list, plane_name.c_str(), source, serial);
   std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
   list->ResourceBarrier(1, &barrier);
   std::scoped_lock lock(internal::state_mutex);
@@ -3634,9 +3762,13 @@ inline bool CaptureInlineRestorePlane(
   auto& capture = *internal::pending;
   auto& roi = *capture.inline_restore;
   const auto found = std::find_if(capture.planes.begin(), capture.planes.end(),
-      [name](const auto& plane) { return plane.name == name; });
+      [&](const auto& plane) { return plane.name == plane_name; });
   const bool recorded = found != capture.planes.end() && found->recorded && found->error.empty();
-  if (blocks) roi.reduce_recorded = recorded;
+  if (std::string_view(name) == "restore_blocks") roi.reduce_recorded = recorded;
+  if (std::string_view(name) == "post_resolve" && execution) {
+    roi.look_shaped = execution->look_shaped;
+    roi.look_stability_recorded = execution->look_stability_recorded;
+  }
   if (std::string_view(name) == "post_restore") {
     roi.apply_recorded = recorded && execution.has_value();
     if (execution) {
@@ -3660,14 +3792,22 @@ inline void SealInlineRestoreBridge(uint64_t serial, bool unique_pass_written,
   roi.bridge_submitted = submitted;
   roi.copyback_queued = copyback_queued;
   roi.sealed = true;
-  capture.ready = unique_pass_written && submitted && copyback_queued && roi.reduce_recorded && roi.apply_recorded
-      && capture.planes.size() == 4 && !capture.aborted;
-  if (!capture.ready) {
+  const bool tail = roi.tail_frame_count != 0;
+  const bool frame_ready = unique_pass_written && submitted && copyback_queued
+      && (tail || roi.reduce_recorded) && roi.apply_recorded
+      && capture.planes.size() - roi.first_plane == InlinePlanes(tail).size() && !capture.aborted;
+  if (!frame_ready) {
     capture.aborted = true;
     capture.meta += "capture_error=bridge_output_submission_copyback_or_planes_incomplete\n";
   }
-  internal::inline_restore_status.status = "completing";
-  internal::inline_restore_status.reason = "waiting_for_exact_submission_completion_and_recording_retirement";
+  if (tail) {
+    roi.frames.push_back(static_cast<const internal::InlineRestoreFrame&>(roi));
+  }
+  capture.ready = frame_ready && (!tail || roi.frames.size() == roi.tail_frame_count);
+  if (capture.ready || capture.aborted) {
+    internal::inline_restore_status.status = "completing";
+    internal::inline_restore_status.reason = "waiting_for_exact_submission_completion_and_recording_retirement";
+  }
 }
 #endif
 
@@ -4259,6 +4399,12 @@ inline void OnPresent(uint64_t generation, bool exact_proofs) noexcept {
     if (internal::pending->inline_restore
         && GetTickCount64() >= internal::pending->inline_restore->deadline_ms) {
       cancel("inline_restore_capture_expired_before_exact_completion_and_retirement");
+      return;
+    }
+    if (internal::pending->inline_restore && internal::pending->inline_restore->tail_frame_count != 0
+        && !internal::pending->ready && !internal::pending->aborted) {
+      // Earlier lists may already be retired while the burst is still recording.
+      // Recordings share a job, so completion of that prefix is not completion of the capture.
       return;
     }
 #endif

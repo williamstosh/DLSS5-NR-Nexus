@@ -218,6 +218,14 @@ inline Json Execute(const Json& request) {
     response["reason"] = "invalid_output_directory";
     const auto directory = request.find("output_directory");
     if (directory == request.end() || !directory->is_string()) return finish();
+    uint32_t tail_frames = 0;
+    if (const auto count = request.find("tail_frames"); count != request.end()) {
+      if (!count->is_number_integer() || *count < 2 || *count > screenshot::MAX_INLINE_TAIL_FRAMES) {
+        response["reason"] = "invalid_tail_frame_count";
+        return finish();
+      }
+      tail_frames = count->get<uint32_t>();
+    }
     if (configuration_busy) {
       response["reason"] = "configuration_busy";
       return finish();
@@ -226,7 +234,7 @@ inline Json Execute(const Json& request) {
     try {
       const auto& utf8_directory = directory->get_ref<const std::string&>();
       const bool armed = screenshot::RequestInlineRestoreRoi(
-          std::filesystem::path(std::u8string(utf8_directory.begin(), utf8_directory.end())), &reason);
+          std::filesystem::path(std::u8string(utf8_directory.begin(), utf8_directory.end())), &reason, tail_frames);
       response["ok"] = armed;
       response["status"] = (armed ? "armed" : "rejected");
       response["reason"] = reason;

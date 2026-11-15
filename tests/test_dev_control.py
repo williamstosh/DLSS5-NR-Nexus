@@ -141,9 +141,19 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(request['op'], 'inline_restore_roi')
         self.assertEqual(request['output_directory'], directory)
         self.assertEqual(actual['id'], request['id'])
+        self.assertNotIn('tail_frames', request)
         self.assertNotIn('key', request)
         self.assertNotIn('confirm', request)
         self.assertEqual(self.transport.deadlines, [deadline])
+
+    def test_inline_restore_roi_sends_only_a_bounded_tail_count(self):
+        client = self.client()
+        for invalid_count in (True, 0, 1, 49, 2.5):
+            with self.assertRaises(ValueError):
+                client.inline_restore_roi(r'D:\capture', tail_frames=invalid_count)
+        self.assertEqual(self.transport.requests, [])
+        client.inline_restore_roi(r'D:\capture', tail_frames=48)
+        self.assertEqual(self.transport.requests[0]['tail_frames'], 48)
 
     def test_inline_restore_roi_rejects_missing_directory_before_transport(self):
         client = self.client()
