@@ -450,6 +450,9 @@ inline HRESULT CreateSharedTwin(const D3D11_TEXTURE2D_DESC& source,
                                 DXGI_FORMAT format, UINT bind,
                                 ID3D11Texture2D** twin11,
                                 ID3D12Resource** twin12) {
+  D3D11_FEATURE_DATA_FORMAT_SUPPORT2 support{.InFormat = format};
+  if (SUCCEEDED(bridge.device11->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2, &support, sizeof(support)))
+      && (support.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_SHAREABLE) == 0) return DXGI_ERROR_UNSUPPORTED;
   D3D11_TEXTURE2D_DESC desc = {};
   desc.Width = source.Width;
   desc.Height = source.Height;
@@ -1925,7 +1928,7 @@ inline bool RunBridge(ID3D11DeviceContext* context,
           && bridge_recording.model_reset_mask == 0,
       inline_restore_submission, inline_restore_submitted, delivered);
 #endif
-  if ((independent_present_pair || adaptive_bridge) && !delivered) {
+  if ((independent_present_pair || adaptive_bridge || (!pre && present == nullptr)) && !delivered) {
     const BridgeDeviceLock device_lock(context);
     RuntimeLock lock(runtime_mutex);
     if (auto state = features.find(handle); state != features.end()) {

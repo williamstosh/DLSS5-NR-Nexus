@@ -419,18 +419,24 @@ int main(int argc, char** argv) {
     }
     reshade::internal::get_reshade_module_handle(GetModuleHandleW(nullptr));
     native::addon_module = GetModuleHandleW(nullptr);
+#if defined(NR_NEXUS_TEST_WARP_ONLY)
+    Check(warp, "hardware adapter forbidden in WARP-only Bridge test build");
+#endif
+    const bool strict_debug = adaptive_case || (warp && sr_only);
     ComPtr<ID3D12Debug> adaptive_debug;
     if (adaptive_case) {
       Check(warp != adaptive_hardware && !stage_resolution && !present_stage_resolution && !dlaa_only && !sr_only,
           "Bridge Adaptive explicitly selects WARP or hardware, without other stage variants or fallback");
-      Check(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&adaptive_debug))), "Bridge Adaptive requires D3D12 Debug Layer");
+    }
+    if (strict_debug) {
+      Check(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&adaptive_debug))), "Bridge requires D3D12 Debug Layer");
       adaptive_debug->EnableDebugLayer();
     }
     ComPtr<IDXGIFactory4> factory;
     ComPtr<IDXGIAdapter1> adapter;
     Check(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))), "factory");
     Check(SUCCEEDED(warp ? factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)) : factory->EnumAdapters1(0, &adapter)), "adapter");
-    if (adaptive_case) {
+    if (adaptive_case || warp) {
       DXGI_ADAPTER_DESC1 software{};
       Check(SUCCEEDED(adapter->GetDesc1(&software)), "Bridge Adaptive adapter description");
       if (adaptive_hardware) {
@@ -438,14 +444,21 @@ int main(int argc, char** argv) {
             "Bridge Adaptive hardware resolves an NVIDIA non-SOFTWARE adapter before device creation");
       } else {
         Check((software.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0,
-            "Bridge Adaptive resolves a SOFTWARE adapter before device creation, with no hardware fallback");
+            "Bridge resolves a SOFTWARE adapter before device creation, with no hardware fallback");
       }
     }
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
     Check(SUCCEEDED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
-        adaptive_case ? D3D11_CREATE_DEVICE_DEBUG : 0, nullptr, 0,
+        strict_debug ? D3D11_CREATE_DEVICE_DEBUG : 0, nullptr, 0,
         D3D11_SDK_VERSION, &device, nullptr, &context)), "D3D11 device");
+    if (warp && sr_only) {
+      D3D11_FEATURE_DATA_FORMAT_SUPPORT2 support{.InFormat = DXGI_FORMAT_R32G32_FLOAT};
+      const auto result = device->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2, &support, sizeof(support));
+      std::printf("BRIDGE_SR format=R32G32_FLOAT format_support2_hr=0x%08X support2=0x%X shareable_bit=%u query_valid=%u\n",
+          unsigned(result), support.OutFormatSupport2,
+          unsigned((support.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_SHAREABLE) != 0), unsigned(SUCCEEDED(result)));
+    }
     if (!adaptive_native_snippet) {
       native::direct_api.module = GetModuleHandleW(nullptr);
       native::direct_api.create = MotionCreateModel;
@@ -458,15 +471,49 @@ int main(int argc, char** argv) {
     Check(native::EnsureBridgeUp(context.Get()) == native::kBridgeReady, "production bridge bring-up");
     ComPtr<ID3D11InfoQueue> adaptive_info11;
     ComPtr<ID3D12InfoQueue> adaptive_info12;
-    if (adaptive_case) {
+    if (strict_debug) {
       Check(SUCCEEDED(device.As(&adaptive_info11))
           && SUCCEEDED(native::bridge.device12->QueryInterface(IID_PPV_ARGS(&adaptive_info12))),
-          "Bridge Adaptive requires both real D3D11 and D3D12 InfoQueues");
-      std::cout << "BRIDGE_ADAPTIVE debug11=1 debug12=1 info11=1 info12=1 adapter="
+          "Bridge requires both real D3D11 and D3D12 InfoQueues");
+      std::cout << (adaptive_case ? "BRIDGE_ADAPTIVE" : "BRIDGE_SR")
+          << " debug11=1 debug12=1 info11=1 info12=1 adapter="
           << (adaptive_hardware ? "NVIDIA_HARDWARE" : "SOFTWARE")
           << " runtime=" << (adaptive_native_snippet ? "PRODUCTION_SNIPPET_INIT"
               : (adaptive_native_ngx ? "SDK_PREINITIALIZED_NGX" : "MOCK")) << '\n';
     }
+    const auto check_debug_messages = [&] {
+      if (!strict_debug) return;
+      uint64_t errors11 = 0;
+      uint64_t errors12 = 0;
+      for (UINT64 index = 0; index < adaptive_info11->GetNumStoredMessagesAllowedByRetrievalFilter(); ++index) {
+        SIZE_T bytes = 0;
+        Check(SUCCEEDED(adaptive_info11->GetMessage(index, nullptr, &bytes)), "D3D11 Debug message size read");
+        std::vector<unsigned char> storage(bytes);
+        auto* message = reinterpret_cast<D3D11_MESSAGE*>(storage.data());
+        Check(SUCCEEDED(adaptive_info11->GetMessage(index, message, &bytes)), "D3D11 Debug message read");
+        if (message->Severity == D3D11_MESSAGE_SEVERITY_ERROR || message->Severity == D3D11_MESSAGE_SEVERITY_CORRUPTION) {
+          ++errors11;
+          std::cerr << "Bridge D3D11 Debug id=" << unsigned(message->ID)
+                    << " severity=" << unsigned(message->Severity) << ": " << message->pDescription << '\n';
+        }
+      }
+      for (UINT64 index = 0; index < adaptive_info12->GetNumStoredMessagesAllowedByRetrievalFilter(); ++index) {
+        SIZE_T bytes = 0;
+        Check(SUCCEEDED(adaptive_info12->GetMessage(index, nullptr, &bytes)), "D3D12 Debug message size read");
+        std::vector<unsigned char> storage(bytes);
+        auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+        Check(SUCCEEDED(adaptive_info12->GetMessage(index, message, &bytes)), "D3D12 Debug message read");
+        if (message->Severity == D3D12_MESSAGE_SEVERITY_ERROR || message->Severity == D3D12_MESSAGE_SEVERITY_CORRUPTION) {
+          ++errors12;
+          std::cerr << "Bridge D3D12 Debug id=" << unsigned(message->ID)
+                    << " severity=" << unsigned(message->Severity) << ": " << message->pDescription << '\n';
+        }
+      }
+      std::cout << "Bridge InfoQueue error_or_corruption D3D11=" << errors11 << " D3D12=" << errors12
+                << " total=" << errors11 + errors12 << '\n';
+      Check(errors11 == 0 && errors12 == 0, "Bridge D3D11/D3D12 InfoQueues have no errors/corruption");
+      std::cout << "PASS Bridge Debug/InfoQueue error=0 corruption=0\n";
+    };
     DXGI_ADAPTER_DESC1 adapter_desc{};
     adapter->GetDesc1(&adapter_desc);
     const auto luid12 = native::bridge.device12->GetAdapterLuid();
@@ -1149,28 +1196,7 @@ int main(int argc, char** argv) {
       }
       native::bridge_adaptive_experiment.store(false);
       native::ReleaseBridge();
-      for (UINT64 index = 0; index < adaptive_info11->GetNumStoredMessagesAllowedByRetrievalFilter(); ++index) {
-        SIZE_T bytes = 0;
-        adaptive_info11->GetMessage(index, nullptr, &bytes);
-        std::vector<unsigned char> storage(bytes);
-        auto* message = reinterpret_cast<D3D11_MESSAGE*>(storage.data());
-        Check(SUCCEEDED(adaptive_info11->GetMessage(index, message, &bytes)), "D3D11 Debug message read");
-        if (message->Severity == D3D11_MESSAGE_SEVERITY_ERROR || message->Severity == D3D11_MESSAGE_SEVERITY_CORRUPTION) {
-          std::cerr << message->pDescription << '\n';
-          Check(false, "Bridge Adaptive D3D11 InfoQueue has no errors/corruption");
-        }
-      }
-      for (UINT64 index = 0; index < adaptive_info12->GetNumStoredMessagesAllowedByRetrievalFilter(); ++index) {
-        SIZE_T bytes = 0;
-        adaptive_info12->GetMessage(index, nullptr, &bytes);
-        std::vector<unsigned char> storage(bytes);
-        auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
-        Check(SUCCEEDED(adaptive_info12->GetMessage(index, message, &bytes)), "D3D12 Debug message read");
-        if (message->Severity == D3D12_MESSAGE_SEVERITY_ERROR || message->Severity == D3D12_MESSAGE_SEVERITY_CORRUPTION) {
-          std::cerr << message->pDescription << '\n';
-          Check(false, "Bridge Adaptive D3D12 InfoQueue has no errors/corruption");
-        }
-      }
+      check_debug_messages();
       std::cout << "PASS Bridge Adaptive "
           << (adaptive_native_snippet ? "NATIVE_GPU+NATIVE_NGX real D3D11 SR + production private D3D12 snippet Init_Ext"
               : (adaptive_native_ngx ? "NATIVE_GPU+NATIVE_NGX real D3D11 SR + SDK-preinitialized private D3D12 NR"
@@ -1626,6 +1652,43 @@ int main(int argc, char** argv) {
           native::control_mask_blue.store(saved_blue);
           std::printf("PASS ControlMask motion mode=%s path=%s GPU=real NR=MOCK rgba=102,128,64,255\n",
               pre ? "Render" : "Upscaled", convert ? "RG32-convert" : "RG16-direct");
+        }
+        if (!pre && variant == 2) {
+          const auto after_frame_reset = [&] {
+            ++native::present_generation;
+            const auto calls_before = model_calls;
+            Check(native::RunBridge(context.Get(), handle, &parameters, nullptr),
+                "ordinary after frame delivers through the existing Bridge");
+            WaitForGpu(native::bridge.fence_done12, native::bridge_submitted_value.load());
+            Check(model_calls == calls_before + 1, "ordinary after frame evaluates exactly one model");
+            return model_observations[calls_before].reset;
+          };
+          parameters.Set(NVSDK_NGX_Parameter_Reset, 0);
+          Check(after_frame_reset() == 0, "ordinary after history is steady before the rejected Reset frame");
+          auto& history_slot = native::features.at(handle).slots[0];
+          Check(!history_slot.pending_reset && history_slot.pending_reset_reasons == 0,
+              "ordinary after has no pending reset before the busy gate");
+          // Look is bypassed here; its valid bit is a CPU recovery sentinel.
+          history_slot.look_history.valid = true;
+          auto& busy_slot = native::bridge.ring[(native::bridge_submitted_value.load() + 1) % native::kBridgeRing];
+          const auto old_value = busy_slot.value;
+          busy_slot.value = native::bridge_submitted_value.load() + native::kBridgeRing;
+          parameters.Set(NVSDK_NGX_Parameter_Reset, 1);
+          const auto calls_before_busy = model_calls;
+          ++native::present_generation;
+          const bool delivered_reset = native::RunBridge(context.Get(), handle, &parameters, nullptr);
+          busy_slot.value = old_value;
+          parameters.Set(NVSDK_NGX_Parameter_Reset, 0);
+          Check(!delivered_reset && model_calls == calls_before_busy,
+              "the only source Reset frame is rejected before model evaluation when the ring is busy");
+          Check(history_slot.pending_reset && (history_slot.pending_reset_reasons & native::kResetRecovery) != 0
+                    && !history_slot.look_history.valid,
+              "ordinary after refusal preserves a recovery reset and invalidates the Look history sentinel");
+          Check(after_frame_reset() == 1 && (history_slot.model_reset_reasons & native::kResetRecovery) != 0,
+              "the next source Reset=0 frame resets the model after the rejected Reset=1 frame");
+          Check(after_frame_reset() == 0,
+              "ordinary after resumes steady history after consuming the recovery reset once");
+          std::printf("PASS ordinary after busy Reset=1 recovery/Look invalidation/next Reset=0 NR=MOCK\n");
         }
         // Hold one observer reference: after retirement only that reference may remain.
         ComPtr<ID3D11Texture2D> stage = set.motion_stage;
@@ -2335,6 +2398,7 @@ int main(int argc, char** argv) {
     native::ReleaseBridge();
     Check(native::bridge.motion_cs == nullptr && native::bridge_retired.empty()
               && native::bridge_pending_delivery_value == 0, "drained bridge releases shaders, twins and pending delivery");
+    check_debug_messages();
     std::printf("PASS motion GPU regression model_calls=%u\n", model_calls);
     return 0;
   } catch (const std::exception& error) {
