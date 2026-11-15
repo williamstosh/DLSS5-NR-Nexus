@@ -518,8 +518,11 @@ PSO 创建，最后一个 PSO 所在源不叠加 NGX Create 或 NR Evaluate，re
 它保留15个逻辑档位，验证上限→冷档→上限、旧录制仍可重放时拒绝添档、反向取消、
 真实退休后再准备和原有 OFF 收尾；只要求目标整组就绪并实际应用，不把 `Session.prepared`
 伪装为真。档位请求是夹具直接驱动，SR／NR、GPU 完成和资源退休是真实执行。
-此单例同时显式开启内部单 autoscale PSO 实验，玩家的有限驻留选项不自动开启它。
-worker API 时间、线程身份及退出单独记录；主线程嵌套 trace 不包含 worker，不能重复加总。
+此单例同时显式开启内部私有PSO实验，autoscale与look bands共用单个在途任务；
+玩家的有限驻留选项不自动开启它。当前原生观测器只记录autoscale的worker API时间、
+线程身份及退出；该记录不覆盖look bands的原生成本或线程退出。后者的实际派发、
+取消、失败归属及顺序接纳由`adaptive-inline`严格WARP用例覆盖。
+主线程嵌套trace不包含worker，不能重复加总。
 前缀沿用 selected 循环的60 Hz节奏，62／180次源界限不变；准备墙时包含该节奏，
 不能直接对比旧零节拍前缀。`selected_collection.limited_residency` 保存目标、应用、
 驻留与退休数量；本模式的旧 `full_preparation_*` 字段仅继承首次上限前缀合计，完整范围

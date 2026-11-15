@@ -1162,6 +1162,9 @@ struct AsyncAutoscalePreparation {
   ID3D12Device* device = nullptr;
   ID3D12RootSignature* root = nullptr;
   std::span<const uint8_t> bytecode;
+  ID3D12PipelineState** target_identity = nullptr;
+  const wchar_t* debug_name = L"" NR_NEXUS_NAME " v6 same-frame autoscale";
+  const char* log_name = "v6 same-frame autoscale";
   std::weak_ptr<adaptive_resolution::Session> session;
   uint64_t preparation_epoch = 0;
   bool session_owned = false;
@@ -5737,7 +5740,7 @@ inline bool DiscardAsyncAutoscalePreparation() {
   async_autoscale_task.reset();
   if (FAILED(result) && result != E_PENDING && result != E_ABORT) {
     std::ostringstream message;
-    message << "v6 same-frame autoscale private preparation failed: " << operation
+    message << task->log_name << " private preparation failed: " << operation
             << " hr=0x" << std::hex << static_cast<uint32_t>(result)
             << std::dec << " win32=" << system_error;
     if (exception[0] != '\0') message << " exception=" << exception.data();
@@ -6571,6 +6574,105 @@ inline bool EnsureLegacyCodecPipeline(ID3D12Device* device) {
   return true;
 }
 
+inline bool EnsureAsyncCodecPipelineState(
+    ID3D12Device* device, std::span<const uint8_t> bytecode,
+    ID3D12PipelineState** pipeline, const wchar_t* debug_name, const char* log_name,
+    ID3D12RootSignature* root_signature) {
+  if (async_autoscale_task != nullptr && !codec_pipeline.incremental_preparation
+      && !DiscardAsyncAutoscalePreparation()) return false;
+  if (*pipeline != nullptr) return true;
+  if (!codec_pipeline.incremental_preparation
+      || (!async_autoscale_preparation.load(std::memory_order_relaxed) && async_autoscale_task == nullptr)) {
+    return CreateCodecPipelineState(device, bytecode, pipeline, debug_name, log_name, root_signature);
+  }
+  if (codec_pipeline.preparation_failed || pipeline_preparation_opportunity == nullptr) return false;
+  if (!enabled.load(std::memory_order_acquire) || shutting_down.load(std::memory_order_acquire)
+      || pipeline_preparation_opportunity->created) {
+    pipeline_preparation_opportunity->deferred = true;
+    return false;
+  }
+  if (async_autoscale_task != nullptr) {
+    const auto task = async_autoscale_task;
+    std::unique_lock lock(task->mutex);
+    if (!task->complete) {
+      pipeline_preparation_opportunity->deferred = true;
+      return false;
+    }
+    // The single task can finish while the caller needs the other shader.
+    // Validate and publish its own slot/root, never the caller's empty slot.
+    const bool autoscale = task->target_identity == &codec_pipeline.autoscale
+        && task->bytecode.data() == __v6_autoscale.data() && task->bytecode.size() == __v6_autoscale.size();
+    const bool look_band = task->target_identity == &codec_pipeline.look.band
+        && task->bytecode.data() == __look_band.data() && task->bytecode.size() == __look_band.size();
+    const bool current = (autoscale || look_band)
+        && task->cache_epoch == async_autoscale_cache_epoch
+        && task->cancellation_epoch == async_autoscale_cancellation->load(std::memory_order_acquire)
+        && task->device_identity == device
+        && task->root_identity == (autoscale ? codec_pipeline.root_signature : codec_pipeline.look.root_signature)
+        && *task->target_identity == nullptr;
+    const bool succeeded = current && SUCCEEDED(task->result) && task->pipeline != nullptr;
+    const auto attempt_session = task->session.lock();
+    const auto preparation_session = codec_pipeline.preparation_session.lock();
+    const bool current_attempt = current
+        && (task->session_owned
+                ? attempt_session != nullptr && attempt_session == preparation_session
+                    && attempt_session->preparation_epoch == task->preparation_epoch
+                : preparation_session == nullptr);
+    if (succeeded) {
+      *task->target_identity = std::exchange(task->pipeline, nullptr);
+      pipeline_preparation_opportunity->created = true;
+    } else if (current_attempt) {
+      codec_pipeline.preparation_failed = true;
+      if (attempt_session != nullptr) attempt_session->Fail(attempt_session->status.generation);
+    }
+    lock.unlock();
+    if (succeeded) {
+      (*task->target_identity)->SetName(task->debug_name);
+    }
+    DiscardAsyncAutoscalePreparation();
+    if (succeeded) {
+      if (*pipeline != nullptr) return true;
+      pipeline_preparation_opportunity->deferred = true;
+      return false;
+    }
+    if (current_attempt) return false;
+  }
+  // An old attempt may finish after Session replacement. Discard its failure
+  // without poisoning the current frame, then give the new owner one attempt.
+  const auto preparation_session = codec_pipeline.preparation_session.lock();
+  if (preparation_session != nullptr && preparation_session->failed) {
+    pipeline_preparation_opportunity->deferred = true;
+    return false;
+  }
+  try {
+    auto task = std::make_shared<AsyncAutoscalePreparation>();
+    task->cancellation = async_autoscale_cancellation;
+    task->cancellation_epoch = async_autoscale_cancellation->load(std::memory_order_acquire);
+    task->cache_epoch = async_autoscale_cache_epoch;
+    task->device_identity = device;
+    task->root_identity = root_signature;
+    task->bytecode = bytecode;
+    task->target_identity = pipeline;
+    task->debug_name = debug_name;
+    task->log_name = log_name;
+    task->session = preparation_session;
+    task->session_owned = preparation_session != nullptr;
+    task->preparation_epoch = (preparation_session != nullptr ? preparation_session->preparation_epoch : 0);
+    task->device = device;
+    task->device->AddRef();
+    task->root = root_signature;
+    task->root->AddRef();
+    async_autoscale_task = std::move(task);
+    pipeline_preparation_opportunity->created = true;
+    pipeline_preparation_opportunity->deferred = true;
+  } catch (const std::bad_alloc&) {
+    codec_pipeline.preparation_failed = true;
+    if (const auto session = codec_pipeline.preparation_session.lock()) session->Fail(session->status.generation);
+    Log(reshade::log::level::error, std::string(log_name) + " private task allocation failed (E_OUTOFMEMORY)");
+  }
+  return false;
+}
+
 inline bool EnsureV6CodecPipeline(ID3D12Device* device) {
   if (async_autoscale_task != nullptr && !codec_pipeline.incremental_preparation
       && !DiscardAsyncAutoscalePreparation()) return false;
@@ -6587,84 +6689,6 @@ inline bool EnsureV6CodecPipeline(ID3D12Device* device) {
     return true;
   }
   if (!EnsureCodecRootSignature(device)) return false;
-  const auto ensure_autoscale = [&] {
-    if (codec_pipeline.autoscale != nullptr) return true;
-    if (!codec_pipeline.incremental_preparation
-        || (!async_autoscale_preparation.load(std::memory_order_relaxed) && async_autoscale_task == nullptr)) {
-      return CreateCodecPipelineState(device, __v6_autoscale, &codec_pipeline.autoscale,
-          L"" NR_NEXUS_NAME " v6 same-frame autoscale", "v6 same-frame autoscale");
-    }
-    if (codec_pipeline.preparation_failed || pipeline_preparation_opportunity == nullptr) return false;
-    if (!enabled.load(std::memory_order_acquire) || shutting_down.load(std::memory_order_acquire)
-        || pipeline_preparation_opportunity->created) {
-      pipeline_preparation_opportunity->deferred = true;
-      return false;
-    }
-    if (async_autoscale_task != nullptr) {
-      const auto task = async_autoscale_task;
-      std::unique_lock lock(task->mutex);
-      if (!task->complete) {
-        pipeline_preparation_opportunity->deferred = true;
-        return false;
-      }
-      const bool current = task->cache_epoch == async_autoscale_cache_epoch
-          && task->cancellation_epoch == async_autoscale_cancellation->load(std::memory_order_acquire)
-          && task->device_identity == device && task->root_identity == codec_pipeline.root_signature;
-      const bool succeeded = current && SUCCEEDED(task->result) && task->pipeline != nullptr;
-      const auto attempt_session = task->session.lock();
-      const auto preparation_session = codec_pipeline.preparation_session.lock();
-      const bool current_attempt = current
-          && (task->session_owned
-                  ? attempt_session != nullptr && attempt_session == preparation_session
-                      && attempt_session->preparation_epoch == task->preparation_epoch
-                  : preparation_session == nullptr);
-      if (succeeded) {
-        codec_pipeline.autoscale = std::exchange(task->pipeline, nullptr);
-        pipeline_preparation_opportunity->created = true;
-      } else if (current_attempt) {
-        codec_pipeline.preparation_failed = true;
-        if (attempt_session != nullptr) attempt_session->Fail(attempt_session->status.generation);
-      }
-      lock.unlock();
-      DiscardAsyncAutoscalePreparation();
-      if (succeeded) {
-        codec_pipeline.autoscale->SetName(L"" NR_NEXUS_NAME " v6 same-frame autoscale");
-        return true;
-      }
-      if (current_attempt) return false;
-    }
-    // An old attempt may finish after Session replacement. Discard its failure
-    // without poisoning the current frame, then give the new owner one attempt.
-    const auto preparation_session = codec_pipeline.preparation_session.lock();
-    if (preparation_session != nullptr && preparation_session->failed) {
-      pipeline_preparation_opportunity->deferred = true;
-      return false;
-    }
-    try {
-      auto task = std::make_shared<AsyncAutoscalePreparation>();
-      task->cancellation = async_autoscale_cancellation;
-      task->cancellation_epoch = async_autoscale_cancellation->load(std::memory_order_acquire);
-      task->cache_epoch = async_autoscale_cache_epoch;
-      task->device_identity = device;
-      task->root_identity = codec_pipeline.root_signature;
-      task->bytecode = __v6_autoscale;
-      task->session = preparation_session;
-      task->session_owned = preparation_session != nullptr;
-      task->preparation_epoch = (preparation_session != nullptr ? preparation_session->preparation_epoch : 0);
-      task->device = device;
-      task->device->AddRef();
-      task->root = codec_pipeline.root_signature;
-      task->root->AddRef();
-      async_autoscale_task = std::move(task);
-      pipeline_preparation_opportunity->created = true;
-      pipeline_preparation_opportunity->deferred = true;
-    } catch (const std::bad_alloc&) {
-      codec_pipeline.preparation_failed = true;
-      if (const auto session = codec_pipeline.preparation_session.lock()) session->Fail(session->status.generation);
-      Log(reshade::log::level::error, "v6 same-frame autoscale private task allocation failed (E_OUTOFMEMORY)");
-    }
-    return false;
-  };
   if (!CreateCodecPipelineState(
           device,
           __v6_linearize,
@@ -6695,7 +6719,8 @@ inline bool EnsureV6CodecPipeline(ID3D12Device* device) {
           &codec_pipeline.commit,
           L"" NR_NEXUS_NAME " v6 commit",
           "v6 commit")
-      || !ensure_autoscale()) {
+      || !EnsureAsyncCodecPipelineState(device, __v6_autoscale, &codec_pipeline.autoscale,
+          L"" NR_NEXUS_NAME " v6 same-frame autoscale", "v6 same-frame autoscale", codec_pipeline.root_signature)) {
     if (codec_pipeline.incremental_preparation) return false;
     ReleaseCom(codec_pipeline.linearize);
     ReleaseCom(codec_pipeline.encode_v6);
@@ -6776,7 +6801,7 @@ inline bool EnsureLookPipeline(ID3D12Device* device) {
   if (!CreateCodecPipelineState(
           device, __look_compose, &pipeline.compose, L"" NR_NEXUS_NAME " look compose",
           "look compose", pipeline.root_signature)
-      || !CreateCodecPipelineState(
+      || !EnsureAsyncCodecPipelineState(
           device, __look_band, &pipeline.band, L"" NR_NEXUS_NAME " look bands",
           "look bands", pipeline.root_signature)
       || !CreateCodecPipelineState(

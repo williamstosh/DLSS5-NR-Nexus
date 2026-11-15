@@ -23,6 +23,8 @@ std::atomic<HANDLE> async_entered = nullptr;
 std::atomic<HANDLE> async_release = nullptr;
 std::atomic<HANDLE> async_worker_thread = nullptr;
 std::atomic_uint32_t async_pipeline_calls = 0;
+std::atomic_uint32_t async_band_calls = 0;
+std::atomic<ID3D12RootSignature*> async_pipeline_root = nullptr;
 std::atomic_uint32_t async_threads_started = 0;
 std::atomic_uint32_t async_threads_joined = 0;
 std::atomic_bool fail_async_pipeline = false;
@@ -101,9 +103,16 @@ struct AsyncPipelineGate {
 HRESULT STDMETHODCALLTYPE ObserveCreatePipeline(ID3D12Device* device,
     const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID iid, void** pipeline) {
   const auto call = ++pipeline_calls;
-  if (async_release.load() != nullptr && desc->CS.BytecodeLength == __v6_autoscale.size()
-      && std::memcmp(desc->CS.pShaderBytecode, __v6_autoscale.data(), __v6_autoscale.size()) == 0) {
+  const bool autoscale = desc->CS.BytecodeLength == __v6_autoscale.size()
+      && std::memcmp(desc->CS.pShaderBytecode, __v6_autoscale.data(), __v6_autoscale.size()) == 0;
+  const bool look_band = desc->CS.BytecodeLength == __look_band.size()
+      && std::memcmp(desc->CS.pShaderBytecode, __look_band.data(), __look_band.size()) == 0;
+  if (async_release.load() != nullptr && (autoscale || look_band)) {
     ++async_pipeline_calls;
+    if (look_band) {
+      ++async_band_calls;
+    }
+    async_pipeline_root.store(desc->pRootSignature);
     SetEvent(async_entered.load());
     if (WaitForSingleObject(async_release.load(), 10000) != WAIT_OBJECT_0) {
       async_gate_failed = true;
@@ -522,13 +531,229 @@ int Run() {
         pipeline_source();
         Check(async_pipeline_calls == failed_async_calls && native::async_autoscale_task == nullptr && !async_gate_failed.load(),
             "failed preparation neither requeues every source nor leaves a stuck worker gate");
-        Check(async_threads_started == async_threads_joined, "every real private worker has an OS thread exit proof");
         native::codec_pipeline.preparation_failed = false;
         native::codec_pipeline.preparation_session = original_session;
         Check(SUCCEEDED(synchronous_autoscale.CopyTo(&native::codec_pipeline.autoscale)), "restore the original completed autoscale cache");
+        async_frame.session = original_session;
+        async_frame.preparation_epoch = original_session->preparation_epoch;
+        ComPtr<ID3D12PipelineState> synchronous_band = native::codec_pipeline.look.band;
+        std::array band_inputs{
+            gpu.Texture(16, 16, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST),
+            gpu.Texture(16, 16, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST)};
+        for (uint32_t source = 0; source < band_inputs.size(); ++source) {
+          std::array<uint16_t, 16 * 16 * 4> pixels{};
+          for (uint32_t pixel = 0; pixel < 16 * 16; ++pixel) {
+            for (uint32_t channel = 0; channel < 3; ++channel) {
+              pixels[pixel * 4 + channel] = (source == 0 ? 0x3400u : (pixel % 3 == 0 ? 0x3A00u : 0x3800u));
+            }
+            pixels[pixel * 4 + 3] = 0x3C00u;
+          }
+          auto transfer = gpu.CreateTextureTransfer(band_inputs[source].Get());
+          gpu.UploadTexture(band_inputs[source].Get(), transfer,
+              reinterpret_cast<const uint8_t*>(pixels.data()), sizeof(pixels), 16 * 8);
+          gpu.Transition(band_inputs[source].Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+        std::array band_surfaces{
+            texture(DXGI_FORMAT_R32G32B32A32_FLOAT, true, 8),
+            texture(DXGI_FORMAT_R32G32B32A32_FLOAT, true, 8),
+            texture(DXGI_FORMAT_R32G32_FLOAT, true, 8),
+            texture(DXGI_FORMAT_R32G32_FLOAT, true, 8)};
+        const D3D12_DESCRIPTOR_HEAP_DESC band_heap_desc{
+            .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, .NumDescriptors = 14,
+            .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+        ComPtr<ID3D12DescriptorHeap> band_heap;
+        Check(SUCCEEDED(gpu.device->CreateDescriptorHeap(&band_heap_desc, IID_PPV_ARGS(&band_heap))), "look bands comparison heap");
+        const auto band_stride = gpu.device->GetDescriptorHandleIncrementSize(band_heap_desc.Type);
+        const auto band_cpu = [&](uint32_t slot) {
+          return D3D12_CPU_DESCRIPTOR_HANDLE{band_heap->GetCPUDescriptorHandleForHeapStart().ptr + slot * band_stride};
+        };
+        const auto band_gpu = [&](uint32_t slot) {
+          return D3D12_GPU_DESCRIPTOR_HANDLE{band_heap->GetGPUDescriptorHandleForHeapStart().ptr + slot * band_stride};
+        };
+        const D3D12_SHADER_RESOURCE_VIEW_DESC band_srv{
+            .Format = DXGI_FORMAT_R16G16B16A16_FLOAT, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture2D = {.MipLevels = 1}};
+        for (uint32_t slot = 0; slot < 4; ++slot) {
+          gpu.device->CreateShaderResourceView(band_inputs[slot == 2 ? 1 : 0].Get(), &band_srv, band_cpu(slot));
+        }
+        auto band_motion_srv = band_srv;
+        band_motion_srv.Format = DXGI_FORMAT_R16G16_FLOAT;
+        gpu.device->CreateShaderResourceView(nullptr, &band_motion_srv, band_cpu(13));
+        for (uint32_t slot = 0; slot < addon::look::kUavCount; ++slot) {
+          D3D12_UNORDERED_ACCESS_VIEW_DESC uav{
+              .Format = DXGI_FORMAT_R16G16B16A16_FLOAT, .ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D};
+          ID3D12Resource* surface = nullptr;
+          if (slot >= addon::look::kUavBandA && slot <= addon::look::kUavBandMaxB) {
+            surface = band_surfaces[slot - addon::look::kUavBandA].Get();
+            uav.Format = surface->GetDesc().Format;
+          } else if (slot == addon::look::kUavTraceBlocks) {
+            uav.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+          } else if (slot == addon::look::kUavTraceHistogram) {
+            uav.Format = DXGI_FORMAT_R32_TYPELESS;
+            uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+            uav.Buffer = {.NumElements = addon::look::kTraceWords, .Flags = D3D12_BUFFER_UAV_FLAG_RAW};
+          }
+          gpu.device->CreateUnorderedAccessView(surface, nullptr, &uav, band_cpu(4 + slot));
+        }
+        const addon::look::Bindings band_bindings{
+            .heap = band_heap.Get(), .codec_set = band_gpu(0), .look_set = band_gpu(0),
+            .uav_table = band_gpu(4), .motion = band_gpu(13),
+            .history_in = meter->second.norm_commit->GetGPUVirtualAddress(),
+            .history_out = meter->second.norm_commit->GetGPUVirtualAddress()};
+        const auto sample_band = [&](ID3D12PipelineState* pipeline) {
+          auto constants = addon::look::MakeConstants({.tone = .5f},
+              {.nr_width = 16, .nr_height = 16, .full_width = 16, .full_height = 16});
+          constants.size[0] = constants.size[1] = 8;
+          for (uint32_t mode = 0; mode < 5; ++mode) {
+            constants.mode = mode;
+            addon::look::Bind(gpu.list.Get(), native::codec_pipeline.look, pipeline,
+                band_bindings, band_bindings.codec_set, constants);
+            gpu.list->Dispatch(1, 1, 1);
+            addon::look::UavBarrierAll(gpu.list.Get());
+          }
+          std::array<d3d12_test::TextureTransfer, 4> transfers;
+          for (uint32_t surface = 0; surface < band_surfaces.size(); ++surface) {
+            transfers[surface] = gpu.CreateTextureTransfer(band_surfaces[surface].Get());
+            gpu.Transition(band_surfaces[surface].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            gpu.RecordTextureReadback(band_surfaces[surface].Get(), transfers[surface]);
+            gpu.Transition(band_surfaces[surface].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+          }
+          submit();
+          std::vector<uint8_t> pixels;
+          for (const auto& transfer : transfers) {
+            const auto surface = gpu.ReadTexture(transfer);
+            pixels.insert(pixels.end(), surface.begin(), surface.end());
+          }
+          return pixels;
+        };
+        const auto synchronous_band_pixels = sample_band(synchronous_band.Get());
+        Check(std::any_of(synchronous_band_pixels.begin(), synchronous_band_pixels.end(), [](uint8_t value) { return value != 0; }),
+            "synchronous look bands comparison dispatches all five modes and reads nonzero band/extrema data");
+        gate.Reset();
+        native::ReleaseCom(native::codec_pipeline.look.band);
+        Check(pipeline_source().first == native::PipelinePreparationResult::PENDING
+            && native::async_autoscale_task != nullptr
+            && native::async_autoscale_task->target_identity == &native::codec_pipeline.look.band
+            && native::async_autoscale_task->root_identity == native::codec_pipeline.look.root_signature
+            && native::async_autoscale_task->root_identity != native::codec_pipeline.root_signature,
+            "look bands registers its exact shader slot and distinct Look root in the existing single task");
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        native::async_autoscale_preparation = false;
+        Check(pipeline_source().first == native::PipelinePreparationResult::PENDING
+            && native::codec_pipeline.look.band == nullptr && async_band_calls == 1
+            && async_pipeline_root.load() == native::codec_pipeline.look.root_signature
+            && next_handle == waiting_models && model_calls == waiting_evaluates
+            && native::worksets_created == waiting_worksets,
+            "pending look bands cannot become ready or fall back to synchronous Create when the private flag changes");
+        native::async_autoscale_preparation = true;
+        Check(gate.Finish(), "look bands worker exits before admission");
+        const auto band_accepted = pipeline_source();
+        auto* accepted_band = native::codec_pipeline.look.band;
+        Check(band_accepted.first == native::PipelinePreparationResult::PENDING && band_accepted.second
+            && accepted_band != nullptr && native::async_autoscale_task == nullptr,
+            "look bands accepts once at a source opportunity without starting NGX");
+        Check(pipeline_source().first == native::PipelinePreparationResult::READY
+            && native::codec_pipeline.look.band == accepted_band && async_band_calls == 1
+            && sample_band(accepted_band) == synchronous_band_pixels,
+            "private Look-root bands produces identical nonzero WARP band/extrema pixels with no second admission");
+
+        gate.Reset();
+        native::ReleaseCom(native::codec_pipeline.look.band);
+        pipeline_source();
+        native::CancelAsyncAutoscalePreparation();
+        native::StartAsyncAutoscalePreparation();
+        Check(native::async_autoscale_task == nullptr && async_band_calls == 1, "queued look bands cancels before worker startup");
+        pipeline_source();
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        auto* retained_look_root = native::codec_pipeline.look.root_signature;
+        native::enabled = false;
+        native::ServiceDisabledNr();
+        Check(!native::disabled_resources_released.load() && native::codec_pipeline.look.root_signature == retained_look_root,
+            "NR Off does not release the Look root while its canceled private worker is still running");
+        Check(gate.Finish(), "canceled look bands worker exits");
+        native::ServiceDisabledNr();
+        Check(native::async_autoscale_task == nullptr && native::codec_pipeline.look.band == nullptr
+            && native::codec_pipeline.look.root_signature == retained_look_root, "late canceled look bands cannot populate its retained slot");
+        native::enabled = true;
+
+        gate.Reset();
+        pipeline_source();
+        const auto band_task = native::async_autoscale_task;
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        native::ReleaseCom(native::codec_pipeline.autoscale);
+        const auto other_target_pending = pipeline_source();
+        Check(other_target_pending.first == native::PipelinePreparationResult::PENDING && !other_target_pending.second
+            && native::async_autoscale_task == band_task && native::codec_pipeline.autoscale == nullptr,
+            "a missing autoscale slot cannot replace or synchronously bypass the in-flight Look bands task");
+        Check(gate.Finish(), "re-enabled look bands worker exits");
+        const auto other_target_accepted = pipeline_source();
+        auto* recovered_band = native::codec_pipeline.look.band;
+        Check(other_target_accepted.first == native::PipelinePreparationResult::PENDING && other_target_accepted.second
+            && recovered_band != nullptr && native::codec_pipeline.autoscale == nullptr && native::async_autoscale_task == nullptr,
+            "an autoscale caller admits the healthy Look result only into its own slot and consumes this source");
+        gate.Reset();
+        pipeline_source();
+        Check(native::async_autoscale_task != nullptr
+            && native::async_autoscale_task->target_identity == &native::codec_pipeline.autoscale
+            && native::async_autoscale_task->root_identity == native::codec_pipeline.root_signature,
+            "the second private PSO starts only after the first target was admitted and its worker exited");
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        Check(gate.Finish(), "serial autoscale worker exits");
+        pipeline_source();
+        Check(pipeline_source().first == native::PipelinePreparationResult::READY
+            && native::codec_pipeline.look.band == recovered_band,
+            "serial Look and autoscale preparation recovers both distinct roots without replacing the healthy first target");
+
+        gate.Reset();
+        native::ReleaseCom(native::codec_pipeline.look.band);
+        pipeline_source();
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        async_frame.session = std::make_shared<addon::adaptive_resolution::Session>(*original_session);
+        async_frame.preparation_epoch = async_frame.session->preparation_epoch;
+        pipeline_source();
+        fail_async_pipeline = true;
+        Check(gate.Finish(), "obsolete Look attempt failure worker exits");
+        pipeline_source();
+        Check(!native::codec_pipeline.preparation_failed && !async_frame.session->failed
+            && native::async_autoscale_task != nullptr && !native::async_autoscale_task->started,
+            "an obsolete Look failure cannot poison the new Session or consume its legitimate attempt");
+        gate.Reset();
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        fail_async_pipeline = true;
+        Check(gate.Finish(), "current Look attempt failure worker exits");
+        Check(pipeline_source().first == native::PipelinePreparationResult::FAILED
+            && native::codec_pipeline.preparation_failed && async_frame.session->failed && !original_session->failed,
+            "Look failure belongs only to the matching current preparation Session");
+        const auto failed_band_calls = async_band_calls.load();
+        pipeline_source();
+        pipeline_source();
+        Check(async_band_calls == failed_band_calls && native::async_autoscale_task == nullptr,
+            "a current Look failure cannot requeue each source");
+        gate.Reset();
+        async_frame.session = std::make_shared<addon::adaptive_resolution::Session>(*original_session);
+        async_frame.preparation_epoch = async_frame.session->preparation_epoch;
+        pipeline_source();
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        Check(gate.Finish(), "new valid Look attempt worker exits");
+        pipeline_source();
+        Check(pipeline_source().first == native::PipelinePreparationResult::READY && !async_frame.session->failed
+            && !native::codec_pipeline.preparation_failed && async_band_calls == failed_band_calls + 1,
+            "an explicitly new healthy Session recovers from the bounded Look preparation failure");
+        native::codec_pipeline.preparation_session = original_session;
+        Check(async_threads_started == async_threads_joined && !async_gate_failed.load(),
+            "every autoscale and Look private worker has an OS thread exit proof");
         std::cout << "ADAPTIVE_ASYNC evidence=WARP+MOCK real_threads=" << async_threads_started.load()
             << " thread_exit_proofs=" << async_threads_joined.load()
-            << " pending_zero_NGX=1 admitted_once=1 pixel_equal=1 ownerless_manual=1 off_late_rejected=1 stale_failure_isolated=1 current_failure_bounded=1\n";
+            << " look_band_calls=" << async_band_calls.load()
+            << " pending_zero_NGX=1 admitted_once=1 pixel_equal=1 look_band_modes=5 look_pixel_equal=1 distinct_roots=1 serial_targets=1 ownerless_manual=1 off_late_rejected=1 stale_failure_isolated=1 current_failure_bounded=1\n";
       }
       {
         real_create_resource = reinterpret_cast<CreateResourceFn>((*reinterpret_cast<void***>(gpu.device.Get()))[27]);
