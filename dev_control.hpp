@@ -12,7 +12,7 @@ inline Json last_receipt;
 
 inline bool Allowed(std::string_view key) {
   constexpr std::string_view base[] = {
-      "NeuralUplift", "NRHookPoint", "NRPasses", "NRFollowInputRes", "NRResolutionScale",
+      "NeuralUplift", "NRDisableRelease", "NRHookPoint", "NRPasses", "NRFollowInputRes", "NRResolutionScale",
       "NRAdaptiveEnabled", "NRAdaptiveTargetFPS", "NRAdaptiveMinScale", "NRAdaptiveLevelCount", "NRAdaptiveLimitedResidency",
       "NRControlMaskEnabled",
       "NRControlMaskMode", "NRControlMaskBlendMode", "NRControlMaskRed", "NRControlMaskGreen",
@@ -56,6 +56,9 @@ inline Json Snapshot() {
     for (const auto* setting : group) {
       if (Allowed(setting->key)) settings[setting->key] = preset_ui::ReadSetting(setting->key);
     }
+  }
+  for (const auto& setting : preset_ui::kExtraSettings) {
+    if (Allowed(setting.key)) settings[setting.key] = preset_ui::ReadSetting(setting.key);
   }
   const auto plan = RequestedStagePlan();
   Json passes = Json::array();
@@ -365,7 +368,7 @@ inline Json Execute(const Json& request) {
     resolution_edit::Cancel();
   } else {
     applied = preset_ui::Apply({.metadata = Json::object(), .scope = presets::Scope::FULL, .settings = changes},
-        false, false, &error);
+        key == "NRDisableRelease", false, &error);
   }
   response["ok"] = applied;
   response["status"] = applied ? (unchanged ? "unchanged" : "applied") : "rejected";

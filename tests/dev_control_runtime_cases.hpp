@@ -174,6 +174,28 @@
   check(set("NRAdaptiveLevelCount", 15u)["ok"] && runtime::nr_adaptive_selected_levels == 15u,
       "selected level count uses the registered setting without activating an experimental mode");
   check(!set("NRAdaptiveLevelCount", 16u)["ok"].get<bool>(), "unsupported level count is rejected");
+  const auto saved_release_mode = runtime::disable_release_mode.load();
+  const auto saved_release_proof = runtime::disabled_resources_released.load();
+  const auto before_release_writes = configuration_writes;
+  runtime::disabled_resources_released = false;
+  reply = set("NRDisableRelease", 1u);
+  const bool release_policy_applied = reply["ok"] && runtime::disable_release_mode == 1u
+      && reply["state"]["settings"]["NRDisableRelease"] == 1u;
+  if (!release_policy_applied) std::fprintf(stderr, "DEV_RELEASE_REPLY %s\n", reply.dump().c_str());
+  check(release_policy_applied,
+      "DEV can request the existing OFF release policy through production configuration");
+  check(configuration_writes > before_release_writes,
+      "OFF release policy is saved through the production configuration transaction");
+  check(!runtime::disabled_resources_released.load(), "release policy acceptance does not manufacture completion proof");
+  check(set("NRDisableRelease", 2u)["reason"] == "invalid_value" && runtime::disable_release_mode == 1u,
+      "OFF release policy keeps the registered value range");
+  check(set("NRDisableRelease", saved_release_mode)["ok"] && runtime::disable_release_mode == saved_release_mode,
+      "DEV can restore the original OFF resource retention policy");
+  const auto workset_policy = runtime::workset_free_policy.load();
+  check(set("NRWorksetFreePolicy", 0u)["reason"] == "invalid_setting"
+          && runtime::workset_free_policy == workset_policy,
+      "allowing the OFF release policy does not expose other compatibility settings");
+  runtime::disabled_resources_released = saved_release_proof;
   const auto before_preparation_mode = control::Identity();
   const auto mode_configuration_generation = runtime::configuration_generation.load();
   reply = set("NRAdaptiveLimitedResidency", true);

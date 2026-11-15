@@ -50,7 +50,7 @@ $taskRoiDirectory = [IO.Path]::GetFullPath((Join-Path $PWD 'tmp/mafia-same-frame
 `adaptive_feature_experiment(0|1|2|3)` 专用于默认关闭的容量实验，不是 INI 设置：分别请求关闭、已有容量复用、
 三槽上限容量、上限容量按需准备。模式 3 只准备控制器当前请求的候选；首次请求的冷 Create 仍在前台。
 请求只在 NR OFF、真实资源已释放且配置空闲时接受；实验取证应临时使用现有
-`NRDisableRelease=1` 和 `NRWorksetFreePolicy=0`，结束恢复原值。模式请求不等于实际准入，仍须检查槽、容量和 GPU 完成。
+`NRDisableRelease=1` 和 `NRWorksetFreePolicy=0`，结束恢复原值。DEV 的 `set NRDisableRelease 1` 复用正式配置校验和保存路径；策略接受后仍须等待 `disabled_resources_released=true`，接口不制造资源释放证明。模式请求不等于实际准入，仍须检查槽、容量和 GPU 完成。
 
 Bridge 两档接入使用独立的 DEV 请求：`Client.bridge_adaptive_experiment(True|False)`，
 协议为 `{"id":"bridge-enable-1","op":"bridge_adaptive_experiment","enabled":true}`。
@@ -90,6 +90,12 @@ collector 在每个 active 阶段先读状态，仅在 NR 关闭时请求 `Neura
 在已获授权的原受保护入口同时使用 `-TargetPath "$taskRoot/target.json" -CaptureHoldSeconds 600`。副本按原目标启动／载档预算加退出预留派生 `run_timeout`；启动120＋载档120＋采集600＋退出60秒时为900秒，原默认420秒不足。`static_capture` 专用字段记录本轮预算，collector 拒绝 Hold 与副本不一致或 overall 不足；从 ready 时间扣除已耗时间，以 Hold 减退出预留得到采证截止时间。候选、备份范围和输入／确认路线在启动前备齐，运行中只做约定阶段及进度核验，长日志和源码归因放到退出后；只安排本轮必要的三个阶段，有结果立即收尾。
 
 主代理原子写入本次 `static-control.json`，例如 `{"pid":42,"label":"render","expected_stage":"Render","expected_pass":1,"expected_plan":{"1":"Render","2":"Upscaled"},"confirmation_required":false}`（PID 取本次 ready，Pass 默认1）。等 `static-progress.json` 的 `state=awaiting_stage`、`pending_label=render` 后操作；需要确认的 UI 先实际完成确认，再在同一请求写 `confirmation_completed=true`。`expected_plan` 核对整个当前请求／有效计划；只指定 `expected_pass` 时仅核对该层，其他层不推导。Render＋Upscaled 的双层请求观察Pass1；同阶段双层周期日志常保留最后一层，Present双层应指定 `expected_pass=2`、两层Present及 `confirmation_required=true`。输入由主代理复用 `desktop.click(window,x,y,activate=False)`／`desktop.key(window,name,activate=False)`：window 来自已核对的本次 owner／ready，操作前检查取消／失败凭据和前台，坐标来自刚观察的原图，并把动作与观察时间写入本次 journal。现有 click 按下120ms、key 默认200ms，均在 finally 释放。旧的带 case 路径临时 action 脚本和一次 CUA 点击记录不能充当切换成功。collector 不自动点坐标；只有请求后的完整新增日志、超过请求前基线的序号、按首次观察区间核对的 age_ms，以及当前有效计划和成功 `last_nr_evaluate` 一致才记录 `stage_observed`。规划、旧 Evaluate、点击和未完成确认均不足；API 回执不提供 GPU 完成或视觉验收结论。
+
+实机脚本的键盘输入统一调用 `desktop.key`，默认持键 200 ms，down/up 分开发送，finally 释放，沿用目标窗口身份和前台校验；不以短促桌面按键替代。Mafia 的“继续游戏”仍使用已验证的持续虚拟手柄。Home 输入后必须读取真实 overlay 状态和画面，未出现菜单时保留输入回执并定位，不能仅凭输入调用成功或重复按键记为通过。
+
+键名不区分大小写，按 Windows Scan 1 的物理位置命名：A–Z、0–9、F1–F24、导航键、普通/小键盘 Enter、Tab/Space/Backspace、左右 Ctrl/Alt/Shift/Win、菜单键、锁定键，以及标点和小键盘数字/运算/小数。常用别名包括 `RETURN`、`ESCAPE`、`PGUP/PGDN`、`CTRL/ALT/SHIFT`（左侧）、`ALTGR`（右 Alt）、`KP_0`–`KP_9`、`KP_ENTER` 和 `PRTSC`。标点可用 US 位置名称（如 `SEMICOLON`）或未按 Shift 的符号；这不是任意字符输入，实际字符受布局、IME 和锁定状态影响。
+
+导航区、右 Ctrl/Alt、小键盘 Enter/Divide、Win/菜单与 PrintScreen 使用 E0 扩展标志；小键盘数字、左右 Shift 和锁定键沿用各自普通扫描码。PrintScreen 使用 Windows 定义的 E0 37，不拼接原始 PS/2 序列；Pause/Break 的 E1/组合语义不适用此单键持键入口，明确拒绝。未登记的厂商/Fn/媒体键及组合宏不作支持声明。映射依据 [Microsoft 键盘输入文档](https://learn.microsoft.com/windows/win32/inputdev/about-keyboard-input#scan-codes) 与 [KEYBDINPUT](https://learn.microsoft.com/windows/win32/api/winuser/ns-winuser-keybdinput)。
 
 已获授权的主代理动作可复用同一身份检查；下面的坐标和观察时间来自刚捕获的原图，完成点击后仍等待 collector 的实际阶段回执：
 
