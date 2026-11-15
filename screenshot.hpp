@@ -3535,7 +3535,14 @@ inline bool PrepareDiagnosticPlane(
   UINT64 total_bytes = 0;
   device->GetCopyableFootprints(&footprint_desc, 0, 1, 0, &footprint, nullptr, nullptr,
                                 &total_bytes);
-  if (internal::pending->planes.size() >= internal::MAX_STAGE_PLANES) {
+  size_t plane_limit = internal::MAX_STAGE_PLANES;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (const auto& roi = internal::pending->inline_restore; roi && roi->tail_frame_count != 0) {
+    // A tail retains every evaluation in one batch, each with its own set of planes.
+    plane_limit = roi->tail_frame_count * InlinePlanes(true).size();
+  }
+#endif
+  if (internal::pending->planes.size() >= plane_limit) {
     if (internal::pending->rejected_planes < internal::MAX_STAGE_PLANES) {
       const std::string prefix = "plane." + std::string(name) + ".";
       internal::pending->rejection_meta += prefix + "format_dxgi=" + std::to_string(desc.Format) + "\n"
