@@ -137,6 +137,16 @@ Windows 入口会在替换安装文件前，通过合成文件的最终句柄路
 
 普通桌面上下文可通过 `normal_process.py --run <Python绝对路径> -B <probe_foreground.py绝对路径> --output-root <本仓库tmp绝对路径>` 运行同一探针。核对 result.json 的各场景和 cleanup，不能将请求激活当作实际成功。
 
+NR 编辑复用静态对照使用 PowerShell 入口的 `-NrEditReuse 0|1`（逐帧基线／x2候选）。
+它要求 `-RestoreInstallation -NrPreset 2 -NrPasses 1 -NrHookPoint 2 -BlockOptionalHudless -XeFGUiComposition 0`，
+要求实际输出为 FP16 scRGB 或10位 HDR10/PQ；不能与 ControlMask case、SR-only 或 InstallOnly 混用。
+两组都临时关闭自适应、Look、Detail stability、ControlMask 和 UI 校正，固定100%尺寸并要求真实 guides；
+除缓存开关外设置相同，实际设置写入 receipt，沿原备份和完整恢复流程。
+可用受保护 `-CaptureScript` 采集静态日志／画面；实际 SDK 状态、NR Evaluate 频率和动态画质分别判断。
+先从运行日志核对实际颜色格式与 `hdr` 契约；系统 HDR 开启不能替代实际格式核验。PQ 须为 format24／hdr2，
+且实际颜色合同为 PQ／BT.2020／10000 nit／Encoding4；合同不符回到逐帧 NR。以 `NR edit reuse` 和服务 Evaluate
+频率确认缓存生效，不能把配置开关或 runner 的启动／退出通过当作功能通过。
+
 ## 后续获授权的实机入口
 
 下列步骤会写本地输出；完整入口还会临时替换游戏文件并启动游戏。执行前核对进程、候选 manifest、目标安装和存档，并取得本轮实机授权。
@@ -181,6 +191,8 @@ IME 等交互专项可在 `menu` 场景显式传 `-CaptureHoldSeconds 900`，只
 巫师3的 P0 SR 定向可加 `-SrOnly`，在完整备份的游戏配置中临时请求关闭 RR、DLSS FG、
 XeFG 和 FSR FG；保持 HDR／分辨率。退出后完整恢复，日志须另外确认真实源 Feature 与运行路径。
 `-TelemetrySeconds 1` 可为短场景临时请求逐秒性能／阶段遥测，沿用完整恢复保护；默认不覆盖游戏现有值。
+
+固定场景的 XeFG 编辑复用成本对照可在同一候选下分别使用 `-NrEditReuse 0|1 -StartNrDisabled -XeFgGpuCapture -GpuTimers`，并通过既有 `-ControlMaskGpuSamples/-ControlMaskGpuSeconds/-ControlMaskGpuWarmupSeconds` 限定采样。采集器确认场景后开启 NR，等待 `control-mask-*.json` 的 `xefg_single_backbuffer_service` 终态，再关闭 NR 和退出；有效记录包含原色暂存至最终写回的 GPU 成本、刷新／复用身份及基础帧 Service 入口间隔。后者与 ReShade Present 入口间隔、XeFG SDK 输出帧计数均分别报告，不作为屏幕 scanout 测量。需要排除游戏上限时显式传 `-UncapGameFps`，仅将巫师3 `LimitFPS` 临时设为 unlimited；原文件整体备份并在退出后校验恢复。上述覆盖只允许完整恢复的测试会话，默认均不启用，测量窗口内不截图。
 仅指定的键会临时变化；Runtime 先核对版本和 SHA-256，与已安装文件相同则直接复用，
 不同才备份替换并在退出后恢复。恢复哈希核验完成且游戏／CrashReporter 已退出时自动删除冗余二进制备份，保留版本、哈希及回执；恢复未完成时继续保护备份。必须同时使用 `-RestoreInstallation`，不以创建
 参数日志代替实际网络确认或画质／性能验收。

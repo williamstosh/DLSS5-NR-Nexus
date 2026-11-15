@@ -117,8 +117,9 @@ struct Session {
   uint32_t extent_top = 2;
   uint32_t extent_width = 4;
   uint32_t extent_height = 3;
-  explicit Session(Gpu* value, int32_t ui_mode = 0) : gpu(value), proxy(value->Swapchain()) {
-    xefg::abi::Init init{.application_swapchain = proxy.Get(), .flags = 17, .max_interpolated = 1, .ui_mode = ui_mode};
+  explicit Session(Gpu* value, int32_t ui_mode = 0, uint32_t init_flags = 17,
+                   DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM) : gpu(value), proxy(value->Swapchain(format)) {
+    xefg::abi::Init init{.application_swapchain = proxy.Get(), .flags = init_flags, .max_interpolated = 1, .ui_mode = ui_mode};
     Check(Hooks::Init(handle, gpu->queue.Get(), &init) == 0, "SDK init");
     context = adapter::state.contexts.at(handle);
     context->proxy_identity = adapter::Identity(proxy.Get());
