@@ -454,6 +454,19 @@ SDK 动态计数、固定倍率失效和来源切换。配置保存／方案另�
 
 `adaptive-fg-service` 使用 WARP、模型替身和实际 Service／提交路径，覆盖双颜色双 Pass 的完整所选集合、5 档切回默认、缺输入暂停／恢复及真实合同变化。`adaptive-inline` 使用生产 Render／Upscaled 入口，覆盖 64×64 输入的 15 档／两输出、真实尺寸及写回、准备完成后的切档零新增分配、旧 Stage 工作集归属和清锁恢复。两者还核对临时容量占用、ControlMask 未提交、Off／On、兼容设置复用及失败停止。未提交旧录制阻止槽位复用，额外准备 Evaluate 不计入活动角色成功累计；角色计数与完整 Pass／颜色组完成分开。均为 WARP＋MOCK，不调用硬件 NR Runtime 或游戏。
 
+Bridge 两档自适应使用独立的软件单例：
+
+~~~powershell
+./tools/run-tests.ps1 -Suite bridge-motion -BridgeCase adaptive -SoftwareOnly -UiPreview None
+~~~
+
+该入口强制 WARP、同一软件适配器及 D3D11／D3D12 Debug Layer、InfoQueue，NR 为 MOCK。
+内部默认关闭的实验仅接纳 Upscaled 单组单 Pass、FG Off／x2 Off、显式两档全预备；
+共享 twins 保持完整尺寸，检查私有档位的往返、Reset、就绪后零新增创建、失败重开、Adaptive OFF 及源释放。
+watchdog 救援用例分别核验 `out`、GPU-only `done` 和实际 Reset／不可重放证明，
+防止未完成写回与提前释放。正式 Bridge 自适应兼容门禁仍关闭；此入口不覆盖真实 NGX、
+硬件驱动兼容、自动帧率闭环或游戏画质，也不量化严格完成等待的性能代价。
+
 默认 `-Suite fg-native` 会复用同一编译产物，分别在独立进程执行这两个自适应用例；默认 `-Suite ui` 也会复用菜单二进制，在独立进程执行自适应真实 ImGui 交互，包括三种介入点连续往返与配置保存。本地完整发布预检保留这些入口；远端核心回归保留 FG 默认组，UI 全量检查由本地初审承担。`NR_NEXUS_ADAPTIVE_UI_ONLY=1` 仍可单独运行自适应 UI，快照模式不额外运行回归。
 
 真实 NR 尺寸往返复用公开 SDK 预初始化入口：

@@ -19,7 +19,7 @@ param(
     [string]$NativeNgxSdkLibraryDirectory,
     [string]$NativeNgxRuntimePath = $(if ($env:NR_NEXUS_NGX_RUNTIME_DIR) { Join-Path $env:NR_NEXUS_NGX_RUNTIME_DIR 'nvngx_dlssnr.dll' }),
     [string]$NativeNgxSrRuntimePath,
-    [ValidateSet('dlaa','sr','stage-resolution','same-stage-resolution','render-stage-resolution','present-stage-resolution')][string[]]$BridgeCase = @(),
+    [ValidateSet('dlaa','sr','stage-resolution','same-stage-resolution','render-stage-resolution','present-stage-resolution','adaptive')][string[]]$BridgeCase = @(),
     [switch]$BuildOnly,
     [ValidateSet('Standard','Full','Acceptance')][string]$RetentionMode = $(if ($env:NR_NEXUS_TEST_RETENTION) { $env:NR_NEXUS_TEST_RETENTION } else { 'Standard' }),
     [switch]$SoftwareOnly

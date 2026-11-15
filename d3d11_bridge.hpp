@@ -297,6 +297,7 @@ struct BridgeSurfaceSet {
   ID3D12Resource* exposure12 = nullptr;
   uint64_t bytes = 0;
   uint64_t last_value = 0;
+  uint64_t layout_generation = 0;
 };
 inline std::unordered_map<const NVSDK_NGX_Handle*, std::array<BridgeSurfaceSet, 2>> bridge_sets;
 
@@ -865,6 +866,7 @@ inline BridgeSurfaceSet* EnsureBridgeSet(const NVSDK_NGX_Handle* handle,
   }
   set.usable = true;
   ++bridge_sets_built;
+  set.layout_generation = bridge_sets_built;
   Log(reshade::log::level::info,
       "D3D11 bridge: surface set built: "
           + (pre ? "color " + DescribeSurface(color)
@@ -1268,6 +1270,7 @@ inline NrDeclineReason EnsureBridgeUp(ID3D11DeviceContext* context) {
       std::memory_order_release);
   bridge_device_live.store(true, std::memory_order_release);
   bridge_ever_live.store(true, std::memory_order_relaxed);
+  bridge_adaptive_device_generation.fetch_add(1, std::memory_order_relaxed);
   bridge_state.store(BridgeState::kUp, std::memory_order_release);
   Log(reshade::log::level::info,
       "D3D11 bridge up: a private Direct3D 12 device on "
@@ -1399,8 +1402,9 @@ inline bool RunBridge(ID3D11DeviceContext* context,
   bool touched = false;
   bool issued = false;
   bool independent_present_pair = false;
+  bool adaptive_bridge = false;
+  NrRecording bridge_recording;
 #if defined(NR_NEXUS_DEV_CONTROL)
-  NrRecording inline_restore_recording;
   uint64_t inline_restore_submission = 0;
   bool inline_restore_submitted = false;
 #endif
@@ -1513,7 +1517,7 @@ inline bool RunBridge(ID3D11DeviceContext* context,
     independent_present_pair = present != nullptr && present->d3d11_bridge && !pre
         && !plan.mixed && plan.pass_count == 2 && plan.At(stage_plan::Stage::PRESENT).count == 2
         && textures[at(ResourceKey::kColor)] == output && PresentResolutionPairAllowed(*present);
-    const bool strict_delivery = plan.mixed || independent_present_pair;
+    bool strict_delivery = plan.mixed || independent_present_pair;
     const uint64_t done = bridge.fence_done12->GetCompletedValue();
     if (done == UINT64_MAX
         || bridge_device_removed.load(std::memory_order_acquire)) {
@@ -1572,6 +1576,21 @@ inline bool RunBridge(ID3D11DeviceContext* context,
                     " the step)");
       return;
     }
+    const auto created = create_contracts.find(handle);
+    const BridgeAdaptiveSource bridge_source{
+        .api = capability::Api::DX11, .backend = capability::Backend::DX11_BRIDGE,
+        .handle = handle, .device = bridge.device12, .list = slot.list,
+        .device_generation = bridge_adaptive_device_generation.load(std::memory_order_relaxed),
+        .source_generation = (created != create_contracts.end() ? created->second.source_generation : 0),
+        .shared_layout = set->layout_generation, .stage = stage_plan::Stage::UPSCALED};
+    adaptive_bridge = !pre && present == nullptr
+        && BridgeAdaptiveEligible(bridge_source, slot.list, bridge.device12, handle, plan);
+    if (bridge_adaptive_experiment.load() && nr_adaptive_enabled.load() && !adaptive_bridge) {
+      decline(NrDeclineReason::kBridgeDown,
+          "Bridge Adaptive experiment requires an identified Upscaled source, one Pass, two full-prepared tiers, FG Off and x2 Off; native SR retained");
+      return;
+    }
+    strict_delivery |= adaptive_bridge;
     if (FAILED(slot.allocator->Reset())
         || FAILED(slot.list->Reset(slot.allocator, nullptr))) {
       bridge_skew.fetch_add(1, std::memory_order_relaxed);
@@ -1664,11 +1683,13 @@ inline bool RunBridge(ID3D11DeviceContext* context,
             && screenshot::internal::inline_restore_active.load(std::memory_order_acquire);
         completed = ProcessInline(slot.list, handle, &view, &touched,
                                   present != nullptr ? &at_present : nullptr,
-                                  (capture_inline_restore ? &inline_restore_recording : nullptr),
-                                  false, capture_inline_restore);
+                                  (adaptive_bridge || capture_inline_restore ? &bridge_recording : nullptr), false, capture_inline_restore,
+                                  present == nullptr ? &bridge_source : nullptr);
 #else
         completed = ProcessInline(slot.list, handle, &view, &touched,
-                                  present != nullptr ? &at_present : nullptr);
+                                  present != nullptr ? &at_present : nullptr,
+                                  (adaptive_bridge ? &bridge_recording : nullptr), false,
+                                  present == nullptr ? &bridge_source : nullptr);
 #endif
       }
       RecordInjectionCpu(started_ns);
@@ -1778,7 +1799,7 @@ inline bool RunBridge(ID3D11DeviceContext* context,
       ID3D12CommandList* const lists[] = {slot.list};
       bridge.queue->ExecuteCommandLists(1, lists);
 #if defined(NR_NEXUS_DEV_CONTROL)
-      if (inline_restore_recording.inline_restore_serial != 0) {
+      if (bridge_recording.inline_restore_serial != 0) {
         screenshot::PreserveStageSubmissionProofs();
       }
 #endif
@@ -1788,7 +1809,7 @@ inline bool RunBridge(ID3D11DeviceContext* context,
                   && SUCCEEDED(bridge.queue->Signal(bridge.fence_done12, value));
     }
 #if defined(NR_NEXUS_DEV_CONTROL)
-    if (inline_restore_recording.inline_restore_serial != 0) {
+    if (bridge_recording.inline_restore_serial != 0) {
       inline_restore_submission = value;
       inline_restore_submitted = submitted;
     }
@@ -1841,6 +1862,25 @@ inline bool RunBridge(ID3D11DeviceContext* context,
         return;
       }
       bridge_pending_delivery_value = 0;
+      if (adaptive_bridge) {
+        // Close the recording lifetime only by actually discarding this owned
+        // list after GPU-only done, including preparation-only recordings.
+        if (FAILED(slot.allocator->Reset()) || FAILED(slot.list->Reset(slot.allocator, nullptr))) {
+          MarkBridgeLost("the completed adaptive Bridge recording could not be discarded");
+          return;
+        }
+        submission::OnCommandListReset(slot.list);
+        if (FAILED(slot.list->Close())) {
+          MarkBridgeLost("the discarded adaptive Bridge recording could not be closed");
+          return;
+        }
+        slot.value = 0;
+        PruneCompletedSubmissionUses();
+        gpu_timers::Poll(true, false);
+        if (const auto state = features.find(handle); state != features.end() && state->second.adaptive_cache != nullptr) {
+          PollAdaptiveCache(state->second.adaptive_cache.get());
+        }
+      }
       if (!completed) return;
       if (evaluate_chain.configuration_generation != configuration_generation.load()) {
         CountNrDecline(NrDeclineReason::kStagePredecessorIncomplete);
@@ -1849,6 +1889,9 @@ inline bool RunBridge(ID3D11DeviceContext* context,
       // Options callbacks can revoke public FG Off during the completion
       // wait. The finished private image must not acquire a new output route.
       if (independent_present_pair && !PresentResolutionPairAllowed(*present)) return;
+      if (adaptive_bridge && (!BridgeAdaptiveEligible(bridge_source, slot.list, bridge.device12, handle, plan)
+              || !bridge_recording.output_ready || !bridge_recording.group_complete
+              || bridge_recording.model_evaluate_mask != 1 || bridge_recording.model_pass_mask != 1)) return;
     }
     if (measure_cpu) {
       cpu_start = SteadyNowNs();
@@ -1875,13 +1918,13 @@ inline bool RunBridge(ID3D11DeviceContext* context,
     }
   });
 #if defined(NR_NEXUS_DEV_CONTROL)
-  screenshot::SealInlineRestoreBridge(inline_restore_recording.inline_restore_serial,
-      completed && inline_restore_recording.output_ready && inline_restore_recording.group_complete
-          && inline_restore_recording.model_evaluate_mask == 1 && inline_restore_recording.model_pass_mask == 1
-          && inline_restore_recording.model_reset_mask == 0,
+  screenshot::SealInlineRestoreBridge(bridge_recording.inline_restore_serial,
+      completed && bridge_recording.output_ready && bridge_recording.group_complete
+          && bridge_recording.model_evaluate_mask == 1 && bridge_recording.model_pass_mask == 1
+          && bridge_recording.model_reset_mask == 0,
       inline_restore_submission, inline_restore_submitted, delivered);
 #endif
-  if (independent_present_pair && !delivered) {
+  if ((independent_present_pair || adaptive_bridge) && !delivered) {
     const BridgeDeviceLock device_lock(context);
     RuntimeLock lock(runtime_mutex);
     if (auto state = features.find(handle); state != features.end()) {

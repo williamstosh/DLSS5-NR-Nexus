@@ -1,6 +1,8 @@
 #include <windows.h>
 #include <d3d11_4.h>
+#include <d3d11sdklayers.h>
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #include <array>
@@ -93,6 +95,8 @@ struct MotionModel {
   uint32_t evaluations = 0;
 };
 uint64_t model_created = 0;
+std::vector<uint64_t> model_released;
+uint32_t fail_model_width_once = 0;
 struct ModelObservation {
   int reset;
   float intensity;
@@ -124,6 +128,7 @@ NVSDK_NGX_Result NVSDK_CONV MotionCreateModel(ID3D12GraphicsCommandList*, NVSDK_
   return NVSDK_NGX_Result_Success;
 }
 NVSDK_NGX_Result NVSDK_CONV MotionReleaseModel(NVSDK_NGX_Handle* handle) {
+  model_released.push_back(reinterpret_cast<MotionModel*>(handle)->id);
   delete reinterpret_cast<MotionModel*>(handle);
   return NVSDK_NGX_Result_Success;
 }
@@ -140,6 +145,10 @@ NVSDK_NGX_Result NVSDK_CONV MotionEvaluateModel(ID3D12GraphicsCommandList* list,
       native::GetD3D12Resource(parameters, "DLSSNR.Depth"),
       native::GetD3D12Resource(parameters, "DLSSNR.ControlMask")});
   if (model_calls == fail_model_call) return NVSDK_NGX_Result_Fail;
+  if (fail_model_width_once != 0 && model_observations.back().width == fail_model_width_once) {
+    fail_model_width_once = 0;
+    return NVSDK_NGX_Result_Fail;
+  }
   auto* output = native::GetD3D12Resource(parameters, "DLSSNR.Output");
   Check(output != nullptr, "model output is a real D3D12 resource");
   const auto input_desc = native::GetD3D12Resource(parameters, "DLSSNR.Color")->GetDesc();
@@ -258,6 +267,7 @@ int main(int argc, char** argv) {
     bool same_stage_resolution = false;
     bool render_stage_resolution = false;
     bool present_stage_resolution = false;
+    bool adaptive_case = false;
     for (int arg = 1; arg < argc; ++arg) {
       if (std::strcmp(argv[arg], "--warp") == 0) {
         warp = true;
@@ -265,6 +275,8 @@ int main(int argc, char** argv) {
         dlaa_only = true;
       } else if (std::strcmp(argv[arg], "--sr") == 0) {
         sr_only = true;
+      } else if (std::strcmp(argv[arg], "--adaptive") == 0) {
+        adaptive_case = true;
       } else if (std::strcmp(argv[arg], "--stage-resolution") == 0) {
         stage_resolution = true;
       } else if (std::strcmp(argv[arg], "--same-stage-resolution") == 0) {
@@ -281,13 +293,26 @@ int main(int argc, char** argv) {
       }
     }
     reshade::internal::get_reshade_module_handle(GetModuleHandleW(nullptr));
+    ComPtr<ID3D12Debug> adaptive_debug;
+    if (adaptive_case) {
+      Check(warp && !stage_resolution && !present_stage_resolution && !dlaa_only,
+          "Bridge Adaptive is one strict WARP+MOCK case, without other stage variants");
+      Check(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&adaptive_debug))), "Bridge Adaptive requires D3D12 Debug Layer");
+      adaptive_debug->EnableDebugLayer();
+    }
     ComPtr<IDXGIFactory4> factory;
     ComPtr<IDXGIAdapter1> adapter;
     Check(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))), "factory");
     Check(SUCCEEDED(warp ? factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)) : factory->EnumAdapters1(0, &adapter)), "adapter");
+    if (adaptive_case) {
+      DXGI_ADAPTER_DESC1 software{};
+      Check(SUCCEEDED(adapter->GetDesc1(&software)) && (software.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0,
+          "Bridge Adaptive resolves a SOFTWARE adapter before device creation, with no hardware fallback");
+    }
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
-    Check(SUCCEEDED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0,
+    Check(SUCCEEDED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+        adaptive_case ? D3D11_CREATE_DEVICE_DEBUG : 0, nullptr, 0,
         D3D11_SDK_VERSION, &device, nullptr, &context)), "D3D11 device");
     native::direct_api.module = GetModuleHandleW(nullptr);
     native::direct_api.create = MotionCreateModel;
@@ -297,6 +322,14 @@ int main(int argc, char** argv) {
     // Avoid runtime-loader priming: the only substituted component is the NR provider.
     native::hooks_enabled.store(false);
     Check(native::EnsureBridgeUp(context.Get()) == native::kBridgeReady, "production bridge bring-up");
+    ComPtr<ID3D11InfoQueue> adaptive_info11;
+    ComPtr<ID3D12InfoQueue> adaptive_info12;
+    if (adaptive_case) {
+      Check(SUCCEEDED(device.As(&adaptive_info11))
+          && SUCCEEDED(native::bridge.device12->QueryInterface(IID_PPV_ARGS(&adaptive_info12))),
+          "Bridge Adaptive requires both real D3D11 and D3D12 InfoQueues");
+      std::cout << "BRIDGE_ADAPTIVE debug11=1 debug12=1 info11=1 info12=1 adapter=SOFTWARE runtime=MOCK\n";
+    }
     DXGI_ADAPTER_DESC1 adapter_desc{};
     adapter->GetDesc1(&adapter_desc);
     const auto luid12 = native::bridge.device12->GetAdapterLuid();
@@ -345,6 +378,246 @@ int main(int argc, char** argv) {
     auto rg16 = make_texture(width, height, DXGI_FORMAT_R16G16_FLOAT, D3D11_BIND_SHADER_RESOURCE, rg16_pixels.data(), width * 4);
     std::vector<float> depth_pixels(width * height, 0.375f);
     auto depth_direct = make_texture(width, height, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_SHADER_RESOURCE, depth_pixels.data(), width * 4);
+    if (adaptive_case) {
+      native::d3d11_swapchain_seen.store(true);
+      native::dx11_route.store(native::kDx11RouteNative);
+      native::direct_runtime_requirements.dual_models = true;
+      native::dedupe_mode.store(renodx::addons::dlss5::kDedupePerEvaluate);
+      native::nr_follow_input_res.store(false);
+      native::nr_resolution_scale.store(1.f);
+      native::gpu_timers_enabled.store(true);
+      native::ngx_loader_staging.nr_ready = true;
+      native::ngx_loader_staging.core_ready = true;
+      native::PublishNgxLoaderSymbols();
+      native::OnNativeFgOptions(false);
+      native::adaptive_configuration_settings = native::comparison_ui::CaptureAdaptiveSettings;
+      renodx::addons::dlss5::gpu_timers::comparison_settings = native::comparison_ui::CaptureSettings;
+      native::hook_point.store(native::kHookUpscaled);
+      native::preset.store(1);
+      native::nr_adaptive_enabled.store(true);
+      native::nr_adaptive_selected_levels.store(2);
+      native::nr_adaptive_min_scale.store(.5f);
+      Check(!native::bridge_adaptive_experiment.load() && !native::nr_adaptive_limited_residency.load()
+                && !native::async_autoscale_preparation.load()
+                && native::adaptive_feature_mode.load() == native::AdaptiveFeatureMode::OFF,
+          "Bridge Adaptive and private PSO experiments start disabled; this case selects two full-prepared tiers only");
+      params::OwnedParameters parameters;
+      parameters.Set(NVSDK_NGX_Parameter_Width, width);
+      parameters.Set(NVSDK_NGX_Parameter_Height, height);
+      parameters.Set(NVSDK_NGX_Parameter_OutWidth, 17u);
+      parameters.Set(NVSDK_NGX_Parameter_OutHeight, 11u);
+      parameters.Set(NVSDK_NGX_Parameter_Color, static_cast<ID3D11Resource*>(color.Get()));
+      parameters.Set(NVSDK_NGX_Parameter_Output, static_cast<ID3D11Resource*>(output.Get()));
+      parameters.Set(NVSDK_NGX_Parameter_Depth, static_cast<ID3D11Resource*>(depth_direct.Get()));
+      parameters.Set(NVSDK_NGX_Parameter_MotionVectors, static_cast<ID3D11Resource*>(rg16.Get()));
+      parameters.Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags,
+          int(NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes));
+      parameters.Set(NVSDK_NGX_Parameter_MV_Scale_X, 1.f);
+      parameters.Set(NVSDK_NGX_Parameter_MV_Scale_Y, 1.f);
+      auto* handle = reinterpret_cast<NVSDK_NGX_Handle*>(uintptr_t{0xD5AD});
+      const params::ParameterView create_view(&parameters, nullptr);
+      native::RegisterCreatedFeatureLocked(handle, native::kFeatureDlss, &create_view);
+      const auto cleanup = [&] {
+        if (!native::DrainBridgeQueue()) return false;
+        native::BridgeDeviceLock device_lock(context.Get());
+        const renodx::addons::dlss5::ngx_serial::Call ngx_turn;
+        renodx::addons::dlss5::RuntimeLock lock(native::runtime_mutex);
+        native::ForgetSourceHandleLocked(handle);
+        native::RetireBridgeSetLocked(handle);
+        for (auto& slot : native::bridge.ring) {
+          if (FAILED(slot.allocator->Reset()) || FAILED(slot.list->Reset(slot.allocator, nullptr))) return false;
+          renodx::addons::dlss5::submission::OnCommandListReset(slot.list);
+          if (FAILED(slot.list->Close())) return false;
+          slot.value = 0;
+        }
+        native::PruneCompletedSubmissionUses();
+        native::DrainRetiredResources(true);
+        native::DrainBridgeRetired(native::bridge.fence_done12->GetCompletedValue());
+        renodx::addons::dlss5::gpu_timers::ReleaseAll();
+        native::ReleaseCodecPipeline();
+        model_uploads.clear();
+        native::ReleaseCom(native::direct_device);
+        native::direct_device_native = nullptr;
+        return native::bridge_retired.empty() && native::retired_nr_features.empty()
+            && native::retired_final_resources.empty();
+      };
+      struct AdaptiveCleanup {
+        const decltype(cleanup)* action;
+        ~AdaptiveCleanup() {
+          if (action != nullptr) {
+            const bool drained = (*action)();
+            std::cerr << "BRIDGE_ADAPTIVE exception_cleanup=" << drained << '\n';
+            if (drained) native::ReleaseBridge();
+          }
+        }
+      } cleanup_guard{&cleanup};
+      const auto frame = [&](bool wait_gpu = true) {
+        ++native::present_generation;
+        Check(NVSDK_NGX_SUCCEED(native::Ngx11Evaluate(0, "adaptive Bridge", context.Get(), handle, &parameters, [&] {
+          context->UpdateSubresource(output.Get(), 0, nullptr, output_pixels.data(), 17 * 8, 0);
+          return NVSDK_NGX_Result_Success;
+        })), "Bridge Adaptive preserves the MOCK SR result");
+        if (wait_gpu && native::bridge_submitted_value.load() != 0) {
+          WaitForGpu(native::bridge.fence_done12, native::bridge_submitted_value.load());
+          const native::BridgeDeviceLock device_lock(context.Get());
+          const renodx::addons::dlss5::ngx_serial::Call ngx_turn;
+          renodx::addons::dlss5::RuntimeLock lock(native::runtime_mutex);
+          native::PruneCompletedSubmissionUses();
+          native::DrainRetiredResources(true);
+          renodx::addons::dlss5::gpu_timers::Poll(true, false);
+          model_uploads.clear();
+        }
+        Check(params::GetD3D11Resource(&parameters, NVSDK_NGX_Parameter_Output) == output.Get()
+                  && params::GetD3D11Resource(&parameters, NVSDK_NGX_Parameter_Color) == color.Get(),
+            "Bridge Adaptive restores the game's source parameters");
+      };
+      for (uint32_t source = 0; source < native::kContractDebounceFrames + 2; ++source) frame();
+      Check(native::features.at(handle).adaptive_cache == nullptr,
+          "the default-off Bridge experiment cannot enter the native Adaptive fallback");
+      native::bridge_adaptive_experiment.store(true);
+      const auto mature = [&] {
+        for (uint32_t source = 0; source < native::kContractDebounceFrames + 32; ++source) {
+          frame();
+          const auto& feature = native::features.at(handle);
+          if (feature.adaptive_cache != nullptr && feature.adaptive_session != nullptr
+              && feature.adaptive_session->prepared && feature.adaptive_cache->active == 0
+              && feature.adaptive_session->status.applied == feature.adaptive_session->ladder.sizes[0]) break;
+        }
+        const auto& feature = native::features.at(handle);
+        std::cout << "BRIDGE_ADAPTIVE ready=" << (feature.adaptive_session != nullptr && feature.adaptive_session->prepared)
+            << " tiers=" << (feature.adaptive_cache != nullptr ? feature.adaptive_cache->count : 0)
+            << " failed=" << (feature.adaptive_session != nullptr && feature.adaptive_session->failed)
+            << " done=" << native::bridge.fence_done12->GetCompletedValue()
+            << " submitted=" << native::bridge_submitted_value.load() << '\n';
+        Check(feature.adaptive_cache != nullptr && feature.adaptive_session != nullptr
+                  && feature.adaptive_cache->count == 2 && feature.adaptive_session->prepared
+                  && feature.adaptive_session->TargetReady() && !feature.adaptive_session->failed,
+            "both Bridge tiers become fully prepared from real submitted, completed and discarded recordings");
+        for (size_t tier = 0; tier < 2; ++tier) {
+          Check(feature.adaptive_cache->tiers[tier].ready, "each Bridge tier has GPU-ready output receipt");
+          for (const auto& [resource, receipt] : feature.adaptive_cache->tiers[tier].output_completions) {
+            Check(receipt->closed.load() && receipt->submitted.load() && receipt->completed_healthy,
+                "Bridge readiness retains actual Reset plus healthy GPU completion proof");
+          }
+        }
+      };
+      mature();
+      auto& feature = native::features.at(handle);
+      const auto cache = feature.adaptive_cache;
+      const auto source_generation = native::create_contracts.at(handle).source_generation;
+      auto* shared_output = native::bridge_sets.at(handle)[0].output12;
+      const auto shared_layout = native::bridge_sets.at(handle)[0].layout_generation;
+      const auto creates = native::nr_features_created;
+      const auto allocations = native::worksets_created;
+      const auto twin_builds = native::bridge_sets_built;
+      for (const size_t target : {size_t{1}, size_t{0}}) {
+        feature.adaptive_session->Request(target, native::SteadyNowNs());
+        frame();
+        Check(cache->active == target && feature.adaptive_session->status.applied == cache->ladder.sizes[target]
+                  && model_observations.back().width == cache->ladder.sizes[target][0].width
+                  && model_observations.back().height == cache->ladder.sizes[target][0].height
+                  && model_observations.back().reset == 1,
+            "prepared Bridge upper/lower selection applies real private working dimensions with Reset");
+        const auto pixels = Read11(output.Get(), 8);
+        Check(std::memcmp(pixels.data(), output_pixels.data(), pixels.size()) != 0,
+            "a completed Bridge tier delivers processed pixels to the full-size D3D11 target");
+      }
+      Check(native::nr_features_created == creates && native::worksets_created == allocations
+                && native::bridge_sets_built == twin_builds
+                && native::bridge_sets.at(handle)[0].output12 == shared_output
+                && native::bridge_sets.at(handle)[0].layout_generation == shared_layout
+                && shared_output->GetDesc().Width == 17 && shared_output->GetDesc().Height == 11
+                && native::create_contracts.at(handle).source_generation == source_generation,
+          "ready Bridge switching creates neither models nor worksets/twins and preserves full source identity");
+      // A real mocked standby API failure leaves the healthy active output valid.
+      cache->tiers[1].ready = false;
+      cache->tiers[1].output_completions.clear();
+      fail_model_width_once = cache->ladder.sizes[1][0].width;
+      frame();
+      Check(fail_model_width_once == 0 && cache->failed && feature.adaptive_session->failed,
+          "a real standby Evaluate failure pauses the same Bridge preparation attempt");
+      const auto failed_creates = native::nr_features_created;
+      frame();
+      frame();
+      Check(native::nr_features_created == failed_creates, "a failed Bridge preparation never retries Create each source");
+      const auto before_recreate = native::configuration_generation.load();
+      native::RecreateFeatures();
+      Check(native::configuration_generation.load() == before_recreate + 1 && feature.adaptive_cache == nullptr,
+          "the production clear-failure action advances configuration identity and retires the failed Bridge collection");
+      mature();
+      const auto retained_upper = feature.slots[0].handle;
+      native::nr_adaptive_enabled.store(false);
+      frame();
+      frame();
+      Check(feature.adaptive_cache == nullptr && feature.slots[0].handle == retained_upper
+                && feature.input_width == 17 && feature.input_height == 11
+                && feature.adaptive_session->status.applied[0].width == 17,
+          "Adaptive Off restores the retained legal upper without changing shared Bridge twins");
+      native::nr_adaptive_enabled.store(true);
+      mature();
+      // Reuse the existing bounded watchdog case: out can advance before done.
+      ComPtr<ID3D12Fence> stalled;
+      Check(SUCCEEDED(native::bridge.device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&stalled))),
+          "Bridge Adaptive stall gate");
+      Check(SUCCEEDED(native::bridge.queue->Wait(stalled.Get(), 1)), "Bridge Adaptive stalls its private queue");
+      std::jthread release_stall([stalled] { Sleep(1600); stalled->Signal(1); });
+      const auto signals = native::bridge_signals.load();
+      frame(false);
+      const auto pending = native::bridge_submitted_value.load();
+      const auto pending_model = model_observations.back().id;
+      Check(native::bridge.fence_done12->GetCompletedValue() < pending
+                && native::bridge_pending_delivery_value == pending
+                && native::bridge.fence_out12->GetCompletedValue() >= pending,
+          "watchdog out rescue is not Bridge delivery or GPU completion proof");
+      const auto unmodified = Read11(output.Get(), 8);
+      Check(std::memcmp(unmodified.data(), output_pixels.data(), unmodified.size()) == 0,
+          "unproven Bridge completion preserves the original MOCK SR output");
+      const auto blocked_calls = model_calls;
+      frame(false);
+      Check(model_calls == blocked_calls && native::bridge_signals.load() == signals + 1,
+          "pending real done blocks repeated NR and shared twin writes");
+      native::ngx11_slot_real[0].release = reinterpret_cast<void*>(MotionReleaseSource);
+      Check(NVSDK_NGX_SUCCEED(native::HookedReleaseFeature11Slot<0>(handle)), "real Bridge source-release hook succeeds");
+      native::DrainRetiredResources(true);
+      native::DrainBridgeRetired(native::bridge.fence_done12->GetCompletedValue());
+      Check(!native::bridge_retired.empty()
+                && std::find(model_released.begin(), model_released.end(), pending_model) == model_released.end(),
+          "source release keeps in-flight private NR and shared twins until done and recording discard");
+      release_stall.join();
+      WaitForGpu(native::bridge.fence_done12, pending);
+      const auto gpu_samples = renodx::addons::dlss5::gpu_timers::published_segments;
+      const bool cleaned = cleanup();
+      cleanup_guard.action = nullptr;
+      Check(cleaned && std::find(model_released.begin(), model_released.end(), pending_model) != model_released.end(),
+          "actual done plus owned-list Reset releases the retired model, worksets and shared twins");
+      native::bridge_adaptive_experiment.store(false);
+      native::ReleaseBridge();
+      for (UINT64 index = 0; index < adaptive_info11->GetNumStoredMessagesAllowedByRetrievalFilter(); ++index) {
+        SIZE_T bytes = 0;
+        adaptive_info11->GetMessage(index, nullptr, &bytes);
+        std::vector<unsigned char> storage(bytes);
+        auto* message = reinterpret_cast<D3D11_MESSAGE*>(storage.data());
+        Check(SUCCEEDED(adaptive_info11->GetMessage(index, message, &bytes)), "D3D11 Debug message read");
+        if (message->Severity == D3D11_MESSAGE_SEVERITY_ERROR || message->Severity == D3D11_MESSAGE_SEVERITY_CORRUPTION) {
+          std::cerr << message->pDescription << '\n';
+          Check(false, "Bridge Adaptive D3D11 InfoQueue has no errors/corruption");
+        }
+      }
+      for (UINT64 index = 0; index < adaptive_info12->GetNumStoredMessagesAllowedByRetrievalFilter(); ++index) {
+        SIZE_T bytes = 0;
+        adaptive_info12->GetMessage(index, nullptr, &bytes);
+        std::vector<unsigned char> storage(bytes);
+        auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+        Check(SUCCEEDED(adaptive_info12->GetMessage(index, message, &bytes)), "D3D12 Debug message read");
+        if (message->Severity == D3D12_MESSAGE_SEVERITY_ERROR || message->Severity == D3D12_MESSAGE_SEVERITY_CORRUPTION) {
+          std::cerr << message->pDescription << '\n';
+          Check(false, "Bridge Adaptive D3D12 InfoQueue has no errors/corruption");
+        }
+      }
+      std::cout << "PASS Bridge Adaptive WARP+MOCK two full-prepared tiers, ready roundtrip/Reset/zero creates, "
+                   "standby failure/Off/recovery, watchdog done/retirement; gpu_segments=" << gpu_samples << '\n';
+      return 0;
+    }
     if (stage_resolution) {
       native::d3d11_swapchain_seen.store(true);
       native::dx11_route.store(native::kDx11RouteNative);

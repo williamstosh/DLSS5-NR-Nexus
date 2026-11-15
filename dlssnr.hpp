@@ -1025,6 +1025,21 @@ struct RetiredFinalResources {
   uint8_t late_leases = 0;
 };
 
+// Borrowed only during RunBridge's device/runtime-locked recording and delivery.
+struct BridgeAdaptiveSource {
+  capability::Api api = capability::Api::UNKNOWN;
+  capability::Backend backend = capability::Backend::UNKNOWN;
+  const NVSDK_NGX_Handle* handle = nullptr;
+  ID3D12Device* device = nullptr;
+  ID3D12GraphicsCommandList* list = nullptr;
+  uint64_t device_generation = 0;
+  uint64_t source_generation = 0;
+  uint64_t shared_layout = 0;
+  stage_plan::Stage stage = stage_plan::Stage::UPSCALED;
+};
+static std::atomic_bool bridge_adaptive_experiment{false};
+static std::atomic_uint64_t bridge_adaptive_device_generation{0};
+
 struct EvaluationContract {
   const NVSDK_NGX_Handle* source_handle = nullptr;
   ID3D12Resource* motion = nullptr;
@@ -11030,12 +11045,32 @@ inline void ResolveCreateFlags(
 // guide (render) resolution, or a 33-100% fraction of the reference
 // resolution (the DLSS output for the after path, the NGX color for pre-SR;
 // 1.0 = native).  Shared by both insertion points.
+inline bool BridgeAdaptiveEligible(const BridgeAdaptiveSource& source,
+    ID3D12GraphicsCommandList* list, ID3D12Device* device, const NVSDK_NGX_Handle* handle,
+    const stage_plan::Plan& plan) {
+  const auto created = create_contracts.find(handle);
+  return bridge_adaptive_experiment.load(std::memory_order_relaxed)
+      && source.api == capability::Api::DX11 && source.backend == capability::Backend::DX11_BRIDGE
+      && source.handle == handle && source.list == list && source.device == device
+      && source.device_generation != 0 && source.device_generation == bridge_adaptive_device_generation.load()
+      && source.shared_layout != 0 && source.source_generation != 0
+      && created != create_contracts.end() && created->second.source_generation == source.source_generation
+      && source.stage == stage_plan::Stage::UPSCALED && plan.valid && !plan.mixed
+      && plan.pass_count == 1 && plan.group_count == 1
+      && plan.At(stage_plan::Stage::UPSCALED).begin == 0 && plan.At(stage_plan::Stage::UPSCALED).count == 1
+      && nr_adaptive_selected_levels.load() == 2 && !nr_adaptive_limited_residency.load()
+      && adaptive_feature_mode.load() == AdaptiveFeatureMode::OFF && !edit_reuse_enabled.load()
+      && native_fg_public_off.load() && !native_fg_owns.load() && !fg::xefg::Enabled()
+      && !auto_fg_fallback_active.load();
+}
+
 inline adaptive_resolution::Frame FreezeAdaptiveFrame(
     std::shared_ptr<adaptive_resolution::Session>* owner, const stage_plan::Plan& plan,
     const stage_plan::Group& group, uint32_t reference_width, uint32_t reference_height,
     uint32_t guide_width, uint32_t guide_height, uint64_t source_identity,
     bool supported, uint64_t application_frame = 0, uint32_t required_roles = 1, bool fg_owned = false,
-    uint32_t source_outputs = 1, uint32_t observed_model_roles = 0, bool upper_capacity = false) {
+    uint32_t source_outputs = 1, uint32_t observed_model_roles = 0, bool upper_capacity = false,
+    const BridgeAdaptiveSource* bridge_source = nullptr) {
   if (!nr_adaptive_enabled.load() && *owner == nullptr) return {};
   if (*owner == nullptr) *owner = std::make_shared<adaptive_resolution::Session>();
   adaptive_resolution::Sizes upper{}, floor{};
@@ -11062,6 +11097,14 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
       : nr_adaptive_selected_levels.load());
   const bool limited_residency = (hold_adaptive_settings ? (*owner)->settings.limited_residency
       : nr_adaptive_limited_residency.load() && adaptive_feature_mode.load() == AdaptiveFeatureMode::OFF);
+  if (bridge_source != nullptr) {
+    for (const uint64_t value : {static_cast<uint64_t>(bridge_source->api), static_cast<uint64_t>(bridge_source->backend),
+             bridge_source->device_generation, bridge_source->source_generation, bridge_source->shared_layout,
+             static_cast<uint64_t>(bridge_source->stage)}) {
+      source_identity ^= value;
+      source_identity *= 1099511628211ull;
+    }
+  }
   uint64_t layout_identity = source_identity;
   for (const uint64_t value : {layout.configuration_generation,
            layout.settings_hash,
@@ -11084,8 +11127,8 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
   const int64_t now_ns = SteadyNowNs();
   const auto output = output_framerate::Read(now_ns);
   capability::Input baseline;
-  baseline.api = capability::Api::DX12;
-  baseline.backend = capability::Backend::NATIVE;
+  baseline.api = (bridge_source != nullptr ? bridge_source->api : capability::Api::DX12);
+  baseline.backend = (bridge_source != nullptr ? bridge_source->backend : capability::Backend::NATIVE);
   baseline.runtime = capability::Runtime::AVAILABLE;
   baseline.fg = (native_fg_public_off.load() ? capability::Fg::OFF : capability::Fg::UNKNOWN);
   baseline.fg_owns_input = fg_owned || native_fg_owns.load();
@@ -12797,6 +12840,7 @@ inline bool RecordInline(
 #if defined(NR_NEXUS_DEV_CONTROL)
     , bool inline_restore_bridge = false
 #endif
+    , const BridgeAdaptiveSource* bridge_source = nullptr
 ) {
 #if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
   const ColdCpuTraceScope cold_trace("RecordInline");
@@ -13160,16 +13204,19 @@ inline bool RecordInline(
       && output_format == DXGI_FORMAT_R16G16B16A16_FLOAT && hdr_mode == 1
       && direct_runtime_requirements.file_version == "310.9.16.0"
       && nr_model::ResolvePreset(preset.load(), 0, direct_runtime_requirements.dual_models) == 2;
+  const bool bridge_adaptive = bridge_source != nullptr
+      && BridgeAdaptiveEligible(*bridge_source, command_list, device, handle, plan);
   auto adaptive = (preparing_adaptive_frame != nullptr ? *preparing_adaptive_frame
       : present != nullptr && present->adaptive_frame != nullptr ? *present->adaptive_frame
       : FreezeAdaptiveFrame(&feature.adaptive_session, plan, group, width, height,
           current.input_width, current.input_height,
-           reinterpret_cast<uintptr_t>(handle) ^ reinterpret_cast<uintptr_t>(device) ^ feature.source_generation
+           reinterpret_cast<uintptr_t>(handle) ^ reinterpret_cast<uintptr_t>(device)
+               ^ (bridge_source != nullptr ? bridge_source->source_generation : feature.source_generation)
                ^ (static_cast<uint64_t>(output_desc.Format) * 1099511628211ull) ^ feature.create_flags,
-          !D3D11OnlySession() && (present == nullptr
+          bridge_adaptive || (bridge_source == nullptr && !D3D11OnlySession() && (present == nullptr
               || (!present->d3d11_bridge && present->domain == present_restore_scope::Domain::FINAL_PRESENT
-                  && present->stage_execution_plan == nullptr && !present->native_prefg_resolution_pair)),
-          0, 1, false, adaptive_output_count, 0, upper_capacity));
+                  && present->stage_execution_plan == nullptr && !present->native_prefg_resolution_pair))),
+          0, 1, false, adaptive_output_count, 0, upper_capacity, bridge_source));
   SelectAdaptiveTier(&feature, handle, &adaptive, present != nullptr && present->adaptive_frame != nullptr,
       present != nullptr ? present->workset_key : output);
   if (feature.adaptive_output_blocked || feature.adaptive_retirement_blocked) {
@@ -15359,6 +15406,7 @@ inline bool ProcessInline(ID3D12GraphicsCommandList* command_list, const NVSDK_N
 #if defined(NR_NEXUS_DEV_CONTROL)
                           , bool inline_restore_bridge = false
 #endif
+                          , const BridgeAdaptiveSource* bridge_source = nullptr
 ) {
 #if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
   const ColdCpuTraceScope cold_trace("ProcessInline");
@@ -15370,12 +15418,17 @@ inline bool ProcessInline(ID3D12GraphicsCommandList* command_list, const NVSDK_N
 #if defined(NR_NEXUS_DEV_CONTROL)
       , inline_restore_bridge
 #endif
+      , bridge_source
   );
   if (result && adaptive.feature != nullptr && !prepare_models_only && adaptive.complete) {
     PrepareAdaptiveTier(adaptive.feature, adaptive.frame, command_list, true, [&](bool* complete) {
       NrRecording prepared;
       bool touched = false;
-      const bool accepted = RecordInline(command_list, handle, game_parameters, &touched, present, &prepared);
+      const bool accepted = RecordInline(command_list, handle, game_parameters, &touched, present, &prepared, false, nullptr
+#if defined(NR_NEXUS_DEV_CONTROL)
+          , false
+#endif
+          , bridge_source);
       if (command_list_touched != nullptr) *command_list_touched |= touched;
       uint32_t expected = 0;
       for (uint32_t pass = 0; pass < kMaxNrPasses; ++pass) {
