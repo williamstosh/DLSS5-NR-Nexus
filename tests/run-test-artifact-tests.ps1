@@ -10,6 +10,18 @@ function Assert-ArtifactTest([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
     $script:checks++
 }
+# Ordinary initialization/completion must never inspect historical siblings.
+$maintenanceImplementation = ${function:Invoke-TestOutputMaintenance}
+function Invoke-TestOutputMaintenance { throw 'Unexpected historical scan in a current run' }
+try {
+    $scoped = Initialize-TestOutput (Join-Path $OutputDirectory 'scoped-completion')
+    $scopedObject = Join-Path $scoped 'generated.obj'
+    Register-TestCompilerOutput $scoped -ObjectPath $scopedObject
+    [IO.File]::WriteAllText($scopedObject, 'registered')
+    Complete-TestOutput $scoped
+    Assert-ArtifactTest (-not (Test-Path -LiteralPath $scopedObject)) 'Scoped completion did not clean its registered output'
+    Assert-ArtifactTest ((Get-Content (Join-Path $scoped 'artifact-lifecycle.json') -Raw | ConvertFrom-Json).status -eq 'Passed') 'Scoped completion lost its terminal record'
+} finally { Set-Item Function:Invoke-TestOutputMaintenance -Value $maintenanceImplementation }
 $sizeTree = Join-Path $OutputDirectory 'size-tree'
 $sizeNested = Join-Path $sizeTree 'nested'
 [void][IO.Directory]::CreateDirectory($sizeNested)
@@ -205,6 +217,45 @@ foreach ($capacity in @(0L, 100000L)) {
 foreach ($rootName in @('tmp','artifacts')) {
     Assert-ArtifactTest (Test-Path -LiteralPath (Join-Path $workspace "$rootName/run/backup/runtime.dll")) 'Budget removed a recovery backup'
 }
+# Daily maintenance is automatic, bounded by an attempt record, and exclusive.
+$unmanaged = Join-Path $workspace 'tmp/unmanaged.bin'
+[IO.File]::WriteAllText($unmanaged, 'not a registered run')
+$dailyStatePath = Join-Path $workspace '.local/test-output-maintenance.json'
+try {
+    $s = $workspaceState | ConvertFrom-Json -AsHashtable
+    $s.ownerPid = 2147483647
+    $s | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $workspaceMarker -Encoding utf8
+    $dailyOrphan = Join-Path $workspace 'artifacts/run/daily-orphan.bin'
+    [IO.File]::WriteAllText($dailyOrphan, 'registered orphan')
+    $dailyOrphanMarker = Join-Path $workspace 'artifacts/run/artifact-lifecycle.json'
+    $orphanState = Get-Content $dailyOrphanMarker -Raw | ConvertFrom-Json -AsHashtable
+    $orphanState.status = 'Running'
+    $orphanState.disposables = @(@{path='daily-orphan.bin';kind='raw-readback'})
+    $orphanState | ConvertTo-Json -Depth 8 | Set-Content $dailyOrphanMarker -Encoding utf8
+    Invoke-TestWorkspaceMaintenanceIfDue -RepositoryRoot $workspace -CapacityBudgetBytes 0
+    $dailyState = Get-Content $dailyStatePath -Raw | ConvertFrom-Json -AsHashtable
+    Assert-ArtifactTest ($dailyState.status -eq 'Passed') 'Due automatic maintenance did not complete'
+    Assert-ArtifactTest (-not (Test-Path -LiteralPath $dailyOrphan)) 'Due automatic maintenance did not clean the registered orphan'
+    Assert-ArtifactTest (Test-Path -LiteralPath $unmanaged) 'Automatic maintenance removed unmanaged data'
+    $maintenanceImplementation = ${function:Invoke-TestWorkspaceMaintenance}
+    $script:dailyCalls = 0
+    function Invoke-TestWorkspaceMaintenance { $script:dailyCalls++; throw 'Synthetic maintenance failure' }
+    try {
+        Invoke-TestWorkspaceMaintenanceIfDue -RepositoryRoot $workspace
+        Assert-ArtifactTest ($script:dailyCalls -eq 0) 'Recent maintenance was repeated'
+        $dailyState.lastAttemptUtc = [DateTimeOffset]::UtcNow.AddDays(-2).ToString('o')
+        $dailyState | ConvertTo-Json | Set-Content $dailyStatePath -Encoding utf8
+        $dailyLock = [IO.File]::Open(($dailyStatePath + '.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
+        try { Invoke-TestWorkspaceMaintenanceIfDue -RepositoryRoot $workspace }
+        finally { $dailyLock.Dispose() }
+        Assert-ArtifactTest ($script:dailyCalls -eq 0) 'Concurrent maintenance was not excluded'
+        Invoke-TestWorkspaceMaintenanceIfDue -RepositoryRoot $workspace
+        $failedMaintenance = Get-Content $dailyStatePath -Raw | ConvertFrom-Json
+        Assert-ArtifactTest ($script:dailyCalls -eq 1 -and $failedMaintenance.status -eq 'Failed') 'Maintenance failure was not recorded'
+        Invoke-TestWorkspaceMaintenanceIfDue -RepositoryRoot $workspace
+        Assert-ArtifactTest ($script:dailyCalls -eq 1) 'Failed maintenance was retried on every test'
+    } finally { Set-Item Function:Invoke-TestWorkspaceMaintenance -Value $maintenanceImplementation }
+} finally { [IO.File]::WriteAllText($workspaceMarker, $workspaceState) }
 $target = Join-Path $OutputDirectory 'outside'
 [void][IO.Directory]::CreateDirectory($target)
 $junction = Join-Path $OutputDirectory 'linked-output'

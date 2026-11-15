@@ -228,6 +228,47 @@ function Invoke-TestWorkspaceMaintenance {
     }
 }
 
+function Invoke-TestWorkspaceMaintenanceIfDue {
+    param([string]$RepositoryRoot = (Join-Path $PSScriptRoot '..'), [long]$CapacityBudgetBytes = $(Get-TestOutputBudget))
+    # One attempt per day, after the caller's run has finished. A shared lock
+    # prevents concurrent runners from scanning the same historical outputs.
+    $statePath = Join-Path $RepositoryRoot '.local/test-output-maintenance.json'
+    Assert-TestArtifactPath $statePath
+    [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($statePath))
+    $lockPath = $statePath + '.lock'
+    Assert-TestArtifactPath $lockPath
+    try { $maintenanceLock = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None') }
+    catch [IO.IOException] { Write-Warning "Historical test maintenance lock unavailable: $($_.Exception.Message)"; return }
+    try {
+        $state = @{}
+        if (Test-Path -LiteralPath $statePath) {
+            try { $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable }
+            catch { Write-Warning "Historical test maintenance record unreadable: $($_.Exception.Message)" }
+        }
+        $now = [DateTimeOffset]::UtcNow
+        $lastAttempt = [DateTimeOffset]::MinValue
+        if ($state['lastAttemptUtc']) {
+            try { $lastAttempt = [DateTimeOffset]$state['lastAttemptUtc'] }
+            catch { Write-Warning 'Historical test maintenance timestamp unreadable; scheduling one attempt.' }
+        }
+        if ($now - $lastAttempt -lt [TimeSpan]::FromDays(1)) { return }
+        $state = @{ schema='nr-nexus-test-maintenance/1'; status='Running'; lastAttemptUtc=$now.ToString('o') }
+        $state | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding utf8
+        try {
+            Write-Host 'Running daily historical test-output maintenance after test completion.'
+            Invoke-TestWorkspaceMaintenance -RepositoryRoot $RepositoryRoot -CapacityBudgetBytes $CapacityBudgetBytes
+            $state.status = 'Passed'
+        } catch {
+            $state.status = 'Failed'
+            $state['error'] = $_.Exception.Message
+            Write-Warning "Historical test maintenance failed; retry is deferred for 24 hours: $($_.Exception.Message)"
+        } finally {
+            $state['finishedUtc'] = [DateTimeOffset]::UtcNow.ToString('o')
+            $state | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding utf8
+        }
+    } finally { $maintenanceLock.Dispose() }
+}
+
 function Initialize-TestOutput {
     param([string]$Path, [ValidateSet('Standard','Full','Acceptance')][string]$RetentionMode = $(if ($env:NR_NEXUS_TEST_RETENTION) { $env:NR_NEXUS_TEST_RETENTION } else { 'Standard' }))
     $RetentionMode = @('Standard','Full','Acceptance') | Where-Object { $_ -ieq $RetentionMode } | Select-Object -First 1
@@ -237,7 +278,6 @@ function Initialize-TestOutput {
         $resolved.StartsWith((Join-Path $root $_) + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
     }
     if (-not $allowed) { throw 'Test output must be below this repository tmp/ or artifacts/.' }
-    Invoke-TestOutputMaintenance -Root ([IO.Path]::GetDirectoryName($resolved))
     Assert-TestArtifactPath $resolved
     if ((Test-Path -LiteralPath $resolved) -and (Get-ChildItem -LiteralPath $resolved -Force | Select-Object -First 1)) {
         throw "Refusing nonempty output: $resolved"
@@ -354,7 +394,6 @@ function Complete-TestOutput {
     $state['retained'] = Get-TestOutputSize $directoryPath
     $state['finishedUtc'] = [DateTime]::UtcNow.ToString('o')
     $state | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $directoryPath 'artifact-lifecycle.json') -Encoding utf8
-    Invoke-TestOutputMaintenance -Root ([IO.Path]::GetDirectoryName($directoryPath))
 }
 
 function Get-TestProjectInputs {

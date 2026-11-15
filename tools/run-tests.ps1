@@ -93,7 +93,6 @@ if ($Suite -contains 'vulkan-control-mask') {
     $VulkanIncludeDirectory = [IO.Path]::GetFullPath($VulkanIncludeDirectory)
 }
 $testWorkspaceStarted = $true
-Invoke-TestWorkspaceMaintenance
 $OutputDirectory = Initialize-TestOutput $OutputDirectory
 if (-not $DetoursLibrary) { $DetoursLibrary = Join-Path $HostRoot 'external/Detours/lib.X64/detours.lib' }
 $parameters = @{ SourceRoot=$SourceRoot; HostRoot=$HostRoot; ShaderIncludeDirectory=$ShaderIncludeDirectory
@@ -267,5 +266,8 @@ if ($Suite -contains 'ui' -and -not $BuildOnly -and $UiPreview -ne 'None') {
     throw
 } finally {
     $env:NR_NEXUS_TEST_RETENTION = $previousRetention
-    if ($testWorkspaceStarted) { Invoke-TestWorkspaceMaintenance }
+    if ($testWorkspaceStarted) {
+        try { Invoke-TestWorkspaceMaintenanceIfDue }
+        catch { Write-Warning "Historical test maintenance could not run: $($_.Exception.Message)" }
+    }
 }
