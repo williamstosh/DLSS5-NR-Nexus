@@ -100,6 +100,7 @@
 #include "reset_epoch.hpp"
 #include "root_arguments.hpp"
 #include "runtime_lock.hpp"
+#include "runtime_image.hpp"
 #include "nr_model.hpp"
 #include "stage_plan.hpp"
 #include "capability.hpp"
@@ -280,6 +281,7 @@ using DestroyParametersFn =
 
 struct DirectApi {
   bool borrowed_core_context = false;
+  bool private_instance = false;
   HMODULE module = nullptr;
   AllocateParametersFn allocate = nullptr;
   DestroyParametersFn destroy = nullptr;
@@ -1157,6 +1159,9 @@ struct PresentTarget {
 
 inline HMODULE addon_module = nullptr;
 inline DirectApi direct_api;
+// Only a successful Shutdown of this backend's private context permits unmap.
+inline bool native_runtime_unload_safe = false;
+inline HMODULE native_runtime_failed_instance = nullptr;
 inline DirectLoadState direct_load_state = DirectLoadState::Unknown;
 // Why the runtime is unavailable, for the status card (ui::RuntimeFault):
 // DirectLoadState has one Failed, and "the file is not there" and "the file
@@ -4095,9 +4100,8 @@ inline bool InstallCallerIdentity() {
   if (get_module_filename_iat == nullptr) {
     Log(
         reshade::log::level::error,
-        "signed feature has no GetModuleFileNameW import; the nvngx_dlssnr.dll in"
-        " the addon folder is not a valid signed NGX runtime - replace it with an"
-        " official NVIDIA build and restart");
+        "the selected NR runtime lacks the GetModuleFileNameW import required"
+        " for caller identity; this direct API path is unavailable");
     return false;
   }
 
@@ -4354,6 +4358,10 @@ struct NgxLoaderSymbols {
   std::filesystem::path nr_path;
   std::string nr_sha256;
   NrRuntimeRequirements nr_requirements;
+  bool native_ready = false;
+  bool native_failed = false;
+  DirectApi native_api;
+  runtime_image::PrivateImage native_image;
   // The game's public NGX core, when it has one.
   HMODULE core = nullptr;
   AllocateParametersFn core_allocate = nullptr;
@@ -4708,13 +4716,14 @@ inline void* GatewayLookupSeh(void* (*gateway)(const char*), const char* name,
 // once for the requirements' GPU identity (see ReadNrRuntimeRequirements);
 // null leaves that identity "unknown", which every consumer treats as no
 // verdict.
-inline void PrimeNgxLoaderSymbols(ID3D12Device* device) {
+inline void PrimeNgxLoaderSymbols(ID3D12Device* device, bool prepare_native = false) {
 #if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
   const ColdCpuTraceScope cold_trace("PrimeNgxLoaderSymbols");
 #endif
   {
     const NgxLoaderSymbols& published = NgxLoaderView();
-    if ((published.nr_ready || published.nr_failed) && published.core_ready) {
+    if ((published.nr_ready || published.nr_failed) && published.core_ready
+        && (!prepare_native || published.native_ready || published.native_failed)) {
       return;
     }
   }
@@ -4872,6 +4881,91 @@ inline void PrimeNgxLoaderSymbols(ID3D12Device* device) {
       }
     }
   }
+  if (prepare_native && !symbols.native_ready && !symbols.native_failed) {
+    if (!symbols.nr_ready || symbols.nr_sha256.empty()) {
+      symbols.native_failed = true;
+      Log(reshade::log::level::error,
+          "native pre-FG runtime isolation requires a readable selected runtime and SHA256; no shared-context fallback");
+      PublishNgxLoaderSymbols();
+      return;
+    }
+    const std::array<std::filesystem::path, 2> roots{
+        symbols.nr_path.parent_path() / L"nr-nexus-runtime",
+        ReShadeBaseDirectory() / L"nr-nexus-runtime"};
+    for (uint32_t index = 0; index < roots.size(); ++index) {
+      if (index != 0 && roots[index] == roots[0]) continue;
+      NoteLoaderCall("PrimeNgxLoaderSymbols/private-LoadLibraryW",
+                     LoaderCallSafety::kUnsafeUnderLoaderLock);
+      symbols.native_image = runtime_image::LoadPrivate(
+          symbols.nr_path, roots[index], symbols.nr_module, &LoadLibraryWSeh);
+      if (symbols.native_image.module != nullptr || symbols.native_image.stage == "load"
+          || symbols.native_image.ready) break;
+      runtime_image::RemoveFiles(symbols.native_image);
+    }
+    auto& image = symbols.native_image;
+    if (image.ready && ComputeRuntimeSha256(image.path) != symbols.nr_sha256) {
+      image.ready = false;
+      image.stage = "sha256";
+      image.error = ERROR_INVALID_DATA;
+    }
+    if (image.ready) {
+      NoteLoaderCall("PrimeNgxLoaderSymbols/private-GetProcAddress");
+      DirectApi api{
+          .private_instance = true,
+          .module = image.module,
+          .allocate = reinterpret_cast<AllocateParametersFn>(GetProcAddress(image.module, "NVSDK_NGX_D3D12_AllocateParameters")),
+          .destroy = reinterpret_cast<DestroyParametersFn>(GetProcAddress(image.module, "NVSDK_NGX_D3D12_DestroyParameters")),
+          .init = reinterpret_cast<DirectInitFn>(GetProcAddress(image.module, "NVSDK_NGX_D3D12_Init_Ext")),
+          .create = reinterpret_cast<DirectCreateFn>(GetProcAddress(image.module, "NVSDK_NGX_D3D12_CreateFeature")),
+          .evaluate = reinterpret_cast<DirectEvaluateFn>(GetProcAddress(image.module, "NVSDK_NGX_D3D12_EvaluateFeature")),
+          .release = reinterpret_cast<DirectReleaseFn>(GetProcAddress(image.module, "NVSDK_NGX_D3D12_ReleaseFeature")),
+          .shutdown = reinterpret_cast<DirectShutdownFn>(GetProcAddress(image.module, "NVSDK_NGX_D3D12_Shutdown1")),
+      };
+      if (api.init == nullptr || api.create == nullptr || api.evaluate == nullptr
+          || api.release == nullptr || api.shutdown == nullptr) {
+        image.ready = false;
+        image.stage = "exports";
+        image.error = ERROR_PROC_NOT_FOUND;
+      }
+      if (api.allocate == nullptr || api.destroy == nullptr) {
+        api.allocate = nullptr;
+        api.destroy = nullptr;
+      }
+      const std::array<const void*, 7> exports{
+          reinterpret_cast<const void*>(api.init), reinterpret_cast<const void*>(api.create),
+          reinterpret_cast<const void*>(api.evaluate), reinterpret_cast<const void*>(api.release),
+          reinterpret_cast<const void*>(api.shutdown), reinterpret_cast<const void*>(api.allocate),
+          reinterpret_cast<const void*>(api.destroy)};
+      for (const void* address : exports) {
+        if (!image.ready || address == nullptr) continue;
+        HMODULE owner = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(address), &owner)
+            || owner != image.module) {
+          image.ready = false;
+          image.stage = "forwarded_export";
+          image.error = ERROR_INVALID_ADDRESS;
+        }
+      }
+      if (image.ready) {
+        symbols.native_api = api;
+        symbols.native_ready = true;
+        std::ostringstream message;
+        message << "native pre-FG runtime isolated: shared module=" << symbols.nr_module
+                << ", private module=" << image.module << ", selected " << NarrowPath(symbols.nr_path.c_str())
+                << ", private image " << NarrowPath(image.path.c_str()) << ", sha256 " << symbols.nr_sha256;
+        Log(reshade::log::level::info, message.str());
+      }
+    }
+    if (!image.ready) {
+      symbols.native_failed = true;
+      Log(reshade::log::level::error,
+          "native pre-FG runtime isolation failed at " + image.stage + " (error "
+              + std::to_string(image.error) + "); no shared-context fallback");
+      if (image.module == nullptr) runtime_image::RemoveFiles(image);
+    }
+    PublishNgxLoaderSymbols();
+  }
 }
 
 // Give the loader back what it gave us.  Called with NO addon lock held, for
@@ -4879,8 +4973,10 @@ inline void PrimeNgxLoaderSymbols(ID3D12Device* device) {
 // are cleared BEFORE the unmap, so a thread that arrives in between re-primes
 // from scratch instead of adopting a module that is being unmapped.
 inline void ReleaseNgxLoaderSymbols(HMODULE unload) {
+  runtime_image::PrivateImage native_image;
   {
     std::scoped_lock prime(ngx_loader_prime_mutex);
+    native_image = ngx_loader_staging.native_image;
     ngx_loader_staging = {};
     // A fresh empty snapshot, so a reader mid-copy keeps reading the old
     // one and every reader after this sees "nothing resolved".
@@ -4889,7 +4985,14 @@ inline void ReleaseNgxLoaderSymbols(HMODULE unload) {
   if (unload != nullptr) {
     NoteLoaderCall("ReleaseNgxLoaderSymbols/FreeLibrary",
                    LoaderCallSafety::kUnsafeUnderLoaderLock);
-    FreeLibrary(unload);
+    if (FreeLibrary(unload) && unload == native_image.module) {
+      HMODULE mapped = nullptr;
+      if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             reinterpret_cast<LPCWSTR>(unload), &mapped)
+          && !runtime_image::RemoveFiles(native_image)) {
+        Log(reshade::log::level::warning, "private NR runtime unloaded; its cache file could not be removed");
+      }
+    }
   }
 }
 
@@ -4898,8 +5001,10 @@ inline void ReleaseNgxLoaderSymbols(HMODULE unload) {
 // nothing.  Returns false while the prime has not produced a runtime yet; the
 // callers all prime immediately before taking the lock, so in practice that
 // is only the session where there is no runtime to find.
-inline bool LoadDirectApi() {
-  if (direct_load_state == DirectLoadState::Ready && direct_api.module != nullptr) {
+inline bool LoadDirectApi(std::optional<bool> private_runtime = std::nullopt) {
+  const bool requested_private = private_runtime.value_or(direct_api.private_instance);
+  if (direct_load_state == DirectLoadState::Ready && direct_api.module != nullptr
+      && direct_api.private_instance == requested_private) {
     if (direct_api.borrowed_core_context != control_mask_use_core_context.load()) return false;
     if (direct_api.borrowed_core_context) {
       const auto& symbols = NgxLoaderView();
@@ -4910,18 +5015,20 @@ inline bool LoadDirectApi() {
     }
     return true;
   }
-  if (direct_load_state == DirectLoadState::Failed) return false;
+  if (direct_load_state == DirectLoadState::Failed && direct_api.private_instance == requested_private) return false;
   // One acquire-load, and the block it hands back is immutable: the
   // readiness and the symbols cannot disagree, and nothing rewrites them
   // while this copies them out.
   const NgxLoaderSymbols& symbols = NgxLoaderView();
-  if (symbols.nr_failed) {
+  if (requested_private && symbols.native_api.module == native_runtime_failed_instance
+      && native_runtime_failed_instance != nullptr) return false;
+  if (requested_private ? symbols.native_failed : symbols.nr_failed) {
     last_result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
-    direct_load_state = DirectLoadState::Failed;
     return false;
   }
-  if (!symbols.nr_ready) return false;
+  if (requested_private ? !symbols.native_ready : !symbols.nr_ready) return false;
   const bool borrow_core = control_mask_use_core_context.load();
+  if (requested_private && borrow_core) return false;
   if (borrow_core
       && (successful_sr_device == nullptr || !symbols.core_ready || symbols.core == nullptr
           || !nr_model::SupportsControlMask(symbols.nr_requirements.file_version)
@@ -4930,15 +5037,21 @@ inline bool LoadDirectApi() {
           || symbols.core_release == nullptr)) {
     return false;
   }
-  direct_api.borrowed_core_context = borrow_core;
-  direct_api.module = symbols.nr_module;
-  direct_api.init = symbols.init;
-  direct_api.allocate = symbols.allocate;
-  direct_api.destroy = symbols.destroy;
-  direct_api.create = symbols.create;
-  direct_api.evaluate = symbols.evaluate;
-  direct_api.release = symbols.release;
-  direct_api.shutdown = symbols.shutdown;
+  // A different image cannot replace the functions that still own live or
+  // retiring objects. EnsureDirectRuntime clears them only after its proof.
+  if (direct_device != nullptr || parameter_runtime_ready || !retired_nr_features.empty()) return false;
+  if (!RestoreCallerIdentity()) return false;
+  direct_api = (requested_private ? symbols.native_api : DirectApi{
+      .borrowed_core_context = borrow_core,
+      .module = symbols.nr_module,
+      .allocate = symbols.allocate,
+      .destroy = symbols.destroy,
+      .init = symbols.init,
+      .create = symbols.create,
+      .evaluate = symbols.evaluate,
+      .release = symbols.release,
+      .shutdown = symbols.shutdown,
+  });
   if (borrow_core) {
     direct_api.init = nullptr;
     direct_api.shutdown = nullptr;
@@ -4989,7 +5102,7 @@ inline bool LoadDirectApi() {
   // cheaper of the two mistakes, and the existing "loaded but never
   // initialized; leaving it mapped" path already makes that trade.
   if (!borrow_core && !InstallCallerIdentity()) {
-    direct_api = {};
+    direct_api = {.private_instance = requested_private};
     last_result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
     direct_load_state = DirectLoadState::Failed;
     nr_runtime_fault.store(static_cast<uint8_t>(ui::RuntimeFault::kUnusable),
@@ -5859,10 +5972,11 @@ inline bool WaitForTrackedQueues() {
 // left as the caller set it for every other failure.
 inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
                                 NrDeclineReason* decline = nullptr,
-                                bool private_signed_runtime = false) {
+                                std::optional<bool> private_runtime = std::nullopt) {
 #if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
   const ColdCpuTraceScope cold_trace("EnsureDirectRuntime");
 #endif
+  const bool private_signed_runtime = private_runtime.value_or(direct_api.private_instance);
   if (control_mask_use_core_context.load() || direct_api.borrowed_core_context) {
     if (private_signed_runtime || !control_mask_use_core_context.load()
         || hook_point.load() != kHookUpscaled || stack_passes.load() != 1
@@ -5873,17 +5987,33 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
     ReleaseCom(device);
     if (!matches) return false;
   }
-  if (command_list == nullptr || !LoadDirectApi()) return false;
-  if (direct_runtime_failed && direct_device == nullptr) return false;
+  if (command_list == nullptr) return false;
+  const bool same_instance = direct_api.private_instance == private_signed_runtime;
+  const NgxLoaderSymbols& requested_symbols = NgxLoaderView();
+  if (private_signed_runtime && native_runtime_failed_instance != nullptr
+      && requested_symbols.native_api.module == native_runtime_failed_instance) return false;
+  if (!(same_instance && direct_load_state == DirectLoadState::Ready && direct_api.module != nullptr)
+      && (private_signed_runtime ? !requested_symbols.native_ready : !requested_symbols.nr_ready)) return false;
+  if (same_instance && direct_load_state == DirectLoadState::Ready && direct_api.module != nullptr
+      && !LoadDirectApi(private_signed_runtime)) return false;
+  if (direct_runtime_failed && same_instance && (direct_device == nullptr || private_signed_runtime)) return false;
   ID3D12Device* device = nullptr;
   if (FAILED(command_list->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) {
     last_result = NVSDK_NGX_Result_FAIL_InvalidParameter;
     return false;
   }
+  if (private_signed_runtime) {
+    ID3D12Device* native_device = device;
+    if (renodx::utils::directx::NativeFromReShadeProxy(&native_device) || native_device != device) {
+      last_result = NVSDK_NGX_Result_FAIL_InvalidParameter;
+      device->Release();
+      return false;
+    }
+  }
 
   const bool exact_device = direct_device == device;
-  const bool provider_matches = !private_signed_runtime
-      || (parameter_runtime_ready && !parameter_runtime_via_core.load());
+  const bool provider_matches = same_instance && (!private_signed_runtime
+      || (parameter_runtime_ready && !parameter_runtime_via_core.load()));
   if (exact_device && provider_matches && parameter_runtime_ready) {
     if (FAILED(device->GetDeviceRemovedReason())) {
       device->Release();
@@ -6014,9 +6144,17 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
     // runtime_mutex, and if the signed runtime called back into a detoured
     // NGX export the wrapper would try to re-lock the (non-recursive) mutex
     // on this thread and deadlock.
-    if (!direct_api.borrowed_core_context) {
+    if (direct_api.private_instance && !direct_api.borrowed_core_context) {
       DirectCallScope ngx_direct_call;
-      direct_api.shutdown(direct_device);
+      const auto shutdown_result = direct_api.shutdown(direct_device);
+      native_runtime_unload_safe = NVSDK_NGX_SUCCEED(shutdown_result);
+      if (!native_runtime_unload_safe) {
+        last_result = static_cast<uint32_t>(shutdown_result);
+        direct_runtime_failed = true;
+        Log(reshade::log::level::error, "private NR Shutdown failed; retaining its device, API and caller identity; provider switch declined");
+        device->Release();
+        return false;
+      }
     }
     direct_device->Release();
     direct_device = nullptr;
@@ -6025,6 +6163,17 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
     parameter_runtime_ready = false;
     parameter_runtime_via_core = false;
     ngx_core_module = nullptr;
+  }
+  if (!same_instance && direct_device == nullptr) {
+    // An Init failure may have selected its parameter pair without retaining a
+    // device. Its failure belongs to that image, not to another requested one.
+    parameter_runtime_ready = false;
+    parameter_runtime_via_core = false;
+    direct_runtime_failed = false;
+  }
+  if (!LoadDirectApi(private_signed_runtime)) {
+    device->Release();
+    return false;
   }
   // Old handles and retirements above still use the old allocator/release
   // pair. Publish a new provider only after their complete, non-replayable proof.
@@ -6091,9 +6240,26 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
   }
 
   const auto data_path = AddonDirectory();
+  {
+    ID3D12Device* native_device = device;
+    renodx::utils::directx::NativeFromReShadeProxy(&native_device);
+    IUnknown* device_identity = nullptr;
+    IUnknown* native_identity = nullptr;
+    device->QueryInterface(IID_PPV_ARGS(&device_identity));
+    native_device->QueryInterface(IID_PPV_ARGS(&native_identity));
+    std::ostringstream message;
+    message << "NR Init starting: provider=" << (direct_api.private_instance ? "isolated-pre-FG" : "ordinary")
+            << ", module=" << direct_api.module << ", shared module=" << NgxLoaderView().nr_module
+            << ", list=" << command_list << ", device=" << device << ", device IUnknown=" << device_identity
+            << ", native device=" << native_device << ", native IUnknown=" << native_identity;
+    Log(reshade::log::level::info, message.str());
+    ReleaseCom(device_identity);
+    ReleaseCom(native_identity);
+  }
   NVSDK_NGX_Result result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
   {
     DirectCallScope ngx_direct_call;
+    if (direct_api.private_instance) native_runtime_unload_safe = false;
     try {
       result = direct_api.init(
           kDirectApplicationId,
@@ -6110,6 +6276,7 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
   }
   last_result = static_cast<uint32_t>(result);
   if (NVSDK_NGX_FAILED(result)) {
+    if (direct_api.private_instance) native_runtime_failed_instance = direct_api.module;
     std::ostringstream message;
     message << "direct Init failed with 0x" << std::hex
             << static_cast<uint32_t>(result)
@@ -15770,7 +15937,7 @@ inline bool RecordInlinePreSR(
   // inside EnsureDirectRuntime releases every feature state, so the
   // FeatureState& bound below must not exist yet (see FindOrRegisterFeature).
   NrDeclineReason runtime_decline = NrDeclineReason::kNrRuntimeUnavailable;
-  if (!EnsureDirectRuntime(command_list, &runtime_decline)) {
+  if (!EnsureDirectRuntime(command_list, &runtime_decline, false)) {
     // Named, not silent: with no nvngx_dlssnr.dll on the machine this is
     // where EVERY evaluate ends, and until v6.8.0-alpha23 it ended without
     // counting anything.  The verdict said UNAVAILABLE and was right; the
@@ -17260,7 +17427,7 @@ inline bool ProcessStreamlineInline(
     return false;
   }
   NrDeclineReason runtime_decline = NrDeclineReason::kStreamlineRuntimeUnavailable;
-  if (!EnsureDirectRuntime(command_list, &runtime_decline)
+  if (!EnsureDirectRuntime(command_list, &runtime_decline, false)
       || core_allocate_parameters == nullptr || core_destroy_parameters == nullptr) {
     CountNrDecline(runtime_decline);
     return false;
@@ -32813,8 +32980,6 @@ inline bool Shutdown(bool proof_gated) {
     // After the tracked queues' wait above, which covers the present ring's
     // own submissions.
     ReleasePresentPath();
-    // Captured before the teardown below clears direct_device.
-    const bool runtime_was_initialized = direct_device != nullptr;
     // Device rebuild: the readbacks belong to the dying device, but the
     // encoding worker must survive for the next capture.
     screenshot::AbortPending();
@@ -32829,8 +32994,18 @@ inline bool Shutdown(bool proof_gated) {
     telemetry_probe_lease = GpuLease{};
     telemetry_probe_taken = false;
     if (direct_device != nullptr) {
-      if (!direct_api.borrowed_core_context && direct_api.shutdown != nullptr) {
-        direct_api.shutdown(direct_device);
+      if (direct_api.private_instance && !direct_api.borrowed_core_context && direct_api.shutdown != nullptr) {
+        DirectCallScope ngx_direct_call;
+        const auto shutdown_result = direct_api.shutdown(direct_device);
+        native_runtime_unload_safe = NVSDK_NGX_SUCCEED(shutdown_result);
+        if (!native_runtime_unload_safe) {
+          last_result = static_cast<uint32_t>(shutdown_result);
+          direct_runtime_failed = true;
+          queue_tracking_active.store(true, std::memory_order_release);
+          shutting_down.store(false, std::memory_order_release);
+          Log(reshade::log::level::error, "private NR Shutdown failed; its device, API, image and caller identity remain active");
+          return false;
+        }
       }
       direct_device->Release();
       direct_device = nullptr;
@@ -32840,23 +33015,20 @@ inline bool Shutdown(bool proof_gated) {
     if (!direct_api.borrowed_core_context) {
       identity_restored = RestoreCallerIdentity();
     }
-    if (direct_api.module != nullptr) {
-      if (!identity_restored) {
-        Log(reshade::log::level::warning,
-            "caller identity was not restored; this nvngx_dlssnr.dll reference remains mapped until process exit"
-            " so its tracked IAT stays valid");
-      } else if (runtime_was_initialized && !direct_api.borrowed_core_context) {
-        unload = direct_api.module;
-      } else {
-        // The runtime was loaded but never initialized: boot probe devices can
-        // load and destroy a device within milliseconds (seen on Dead Space
-        // 2023).  Unloading an NVIDIA runtime that young is a known
-        // delayed-crash source when its attach cycle spawned threads, so keep
-        // it mapped for the process lifetime; a later load just bumps the
-        // module refcount.
-        Log(reshade::log::level::info,
-            "nvngx_dlssnr.dll was not initialized by this backend; leaving it mapped");
-      }
+    const auto& symbols = NgxLoaderView();
+    if (identity_restored && native_runtime_unload_safe && symbols.native_image.module != nullptr) {
+      unload = symbols.native_image.module;
+    } else if (symbols.native_image.module != nullptr) {
+      // DllMain alone can start worker threads. An unused image or an image
+      // whose context/IAT could not retire remains mapped until process exit.
+      Log(reshade::log::level::info,
+          "private NR runtime retirement was not proven; leaving its image mapped");
+    }
+    if (symbols.nr_module != nullptr) {
+      // The game's Core can share the same device key and internal context.
+      // Our successful Init is not ownership of that context or its lifetime.
+      Log(reshade::log::level::info,
+          "shared NR runtime retained without Shutdown; the game owns its context lifetime");
     }
     direct_api = {};
     ngx_core_module = nullptr;
@@ -32868,6 +33040,8 @@ inline bool Shutdown(bool proof_gated) {
     core_evaluate_feature = nullptr;
     core_release_feature = nullptr;
     direct_load_state = DirectLoadState::Unknown;
+    native_runtime_unload_safe = false;
+    native_runtime_failed_instance = nullptr;
     processed_outputs.clear();
     processed_render_outputs.clear();
     synthetic_handles.clear();

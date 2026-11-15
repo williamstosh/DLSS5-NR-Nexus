@@ -976,8 +976,8 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     renodx::utils::directx::NativeFromReShadeProxy(&queue);
     if (!InstallQueueCompletionHooks(queue)) return fg::Result::NOT_SERVED;
     ID3D12Device* device = nullptr;
-    if (FAILED(input.queue->GetDevice(IID_PPV_ARGS(&device)))) return fg::Result::FAILED;
-    PrimeNgxLoaderSymbols(device);
+    if (FAILED(queue->GetDevice(IID_PPV_ARGS(&device)))) return fg::Result::FAILED;
+    PrimeNgxLoaderSymbols(device, true);
     auto device_release = std::unique_ptr<ID3D12Device, void (*)(ID3D12Device*)>(device,
         [](ID3D12Device* value) { value->Release(); });
     const ngx_serial::PresentTurn turn(true);

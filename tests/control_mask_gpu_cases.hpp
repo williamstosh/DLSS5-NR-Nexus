@@ -161,7 +161,34 @@ struct ProviderCalls {
   std::set<const NVSDK_NGX_Handle*> evaluated_handles;
 };
 inline ProviderCalls provider_core, provider_signed;
-inline bool fail_private_init = false, fail_private_create = false;
+inline bool fail_private_init = false, fail_private_create = false, fail_private_shutdown = false;
+inline uint32_t provider_shared_shutdowns = 0;
+inline uint64_t provider_next_device_id = 0;
+inline std::map<uint64_t, bool> provider_shared_contexts, provider_private_contexts;
+// Synthetic test key only: the production path never reads or writes NGX keys.
+inline constexpr GUID kProviderDeviceId{0xc2dc4be9, 0x6d82, 0x4c3e, {0x9d, 0x7b, 0x55, 0x1e, 0x13, 0x7f, 0x42, 0x91}};
+
+uint64_t ProviderDeviceId(ID3D12Device* device) {
+  uint64_t id = 0;
+  UINT bytes = sizeof(id);
+  if (FAILED(device->GetPrivateData(kProviderDeviceId, &bytes, &id))) {
+    id = ++provider_next_device_id;
+    Check(SUCCEEDED(device->SetPrivateData(kProviderDeviceId, sizeof(id), &id)), "provider synthetic device ID");
+  }
+  return id;
+}
+
+NVSDK_NGX_Result NVSDK_CONV ProviderSharedInit(unsigned long long, const wchar_t*, ID3D12Device* device,
+    NVSDK_NGX_Version, const NVSDK_NGX_Parameter*) {
+  ++runtime_initializations;
+  provider_shared_contexts.try_emplace(ProviderDeviceId(device), false);
+  return NVSDK_NGX_Result_Success;
+}
+NVSDK_NGX_Result NVSDK_CONV ProviderSharedShutdown(ID3D12Device* device) {
+  ++provider_shared_shutdowns;
+  provider_shared_contexts.erase(ProviderDeviceId(device));
+  return NVSDK_NGX_Result_Success;
+}
 
 NVSDK_NGX_Result NVSDK_CONV ProviderCoreAllocate(NVSDK_NGX_Parameter** parameters) {
   ++provider_core.allocations;
@@ -195,10 +222,18 @@ NVSDK_NGX_Result NVSDK_CONV ProviderCoreRelease(NVSDK_NGX_Handle* handle) {
   ++provider_core.releases;
   return ReleaseModel(handle);
 }
-NVSDK_NGX_Result NVSDK_CONV ProviderSignedInit(unsigned long long, const wchar_t*, ID3D12Device*,
+NVSDK_NGX_Result NVSDK_CONV ProviderSignedInit(unsigned long long, const wchar_t*, ID3D12Device* device,
     NVSDK_NGX_Version, const NVSDK_NGX_Parameter*) {
   ++runtime_initializations;
-  return fail_private_init ? NVSDK_NGX_Result_FAIL_UnableToInitializeFeature : NVSDK_NGX_Result_Success;
+  if (fail_private_init) return NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
+  provider_private_contexts.try_emplace(ProviderDeviceId(device), false);
+  return NVSDK_NGX_Result_Success;
+}
+NVSDK_NGX_Result NVSDK_CONV ProviderSignedShutdown(ID3D12Device* device) {
+  ++runtime_shutdowns;
+  if (fail_private_shutdown) return NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
+  provider_private_contexts.erase(ProviderDeviceId(device));
+  return NVSDK_NGX_Result_Success;
 }
 NVSDK_NGX_Result NVSDK_CONV ProviderSignedCreate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Feature feature,
     const NVSDK_NGX_Parameter* parameters, NVSDK_NGX_Handle** handle) {
@@ -206,6 +241,12 @@ NVSDK_NGX_Result NVSDK_CONV ProviderSignedCreate(ID3D12GraphicsCommandList* list
       && addon::core_allocate_parameters == renodx::addons::dlss5::bridge::AllocateOwnedParameters
       && addon::core_destroy_parameters == renodx::addons::dlss5::bridge::DestroyOwnedParameters,
       "private signed Create uses the complete OwnedParameters pair, never Core");
+  ComPtr<ID3D12Device> device;
+  Check(SUCCEEDED(list->GetDevice(IID_PPV_ARGS(&device))), "private Create obtains its actual list device");
+  const auto device_id = ProviderDeviceId(device.Get());
+  Check(addon::direct_api.private_instance && provider_private_contexts.contains(device_id)
+      && !provider_private_contexts.at(device_id) && provider_shared_contexts.at(device_id),
+      "private Create uses its own native cache while the shared proxy context remains unchanged");
   ++provider_signed.creates;
   if (fail_private_create) {
     *handle = nullptr;
@@ -467,13 +508,27 @@ void RunBorrowedCore(Gpu& gpu, bool hardware, bool second_adapter) {
     symbols.core_create = ProviderCoreCreate;
     symbols.core_evaluate = ProviderCoreEvaluate;
     symbols.core_release = ProviderCoreRelease;
+    symbols.init = ProviderSharedInit;
+    symbols.create = ForbiddenFallbackCreate;
+    symbols.evaluate = ProviderCoreEvaluate;
+    symbols.release = ProviderCoreRelease;
+    symbols.shutdown = ProviderSharedShutdown;
+    symbols.native_ready = true;
+    symbols.native_api = {.private_instance = true, .module = GetModuleHandleW(nullptr),
+        .init = ProviderSignedInit, .create = ProviderSignedCreate, .evaluate = ProviderSignedEvaluate,
+        .release = ProviderSignedRelease, .shutdown = ProviderSignedShutdown};
+    const auto device_id = ProviderDeviceId(gpu.device.Get());
+    provider_shared_contexts[device_id] = true;  // The game initialized its proxy face first.
+    provider_private_contexts.clear();
+    provider_shared_shutdowns = 0;
     const auto configure_runtime = [&] {
       addon::ngx_loader_published.store(&symbols);
-      addon::direct_api = {.module = GetModuleHandleW(nullptr), .init = ProviderSignedInit,
-          .create = ProviderSignedCreate, .evaluate = ProviderSignedEvaluate,
-          .release = ProviderSignedRelease, .shutdown = ShutdownRuntime};
+      addon::direct_api = {.module = GetModuleHandleW(nullptr), .init = ProviderSharedInit,
+          .create = ForbiddenFallbackCreate, .evaluate = ProviderCoreEvaluate,
+          .release = ProviderCoreRelease, .shutdown = ProviderSharedShutdown};
       addon::direct_load_state = addon::DirectLoadState::Ready;
       addon::direct_runtime_failed = false;
+      addon::native_runtime_unload_safe = false;
     };
     configure_runtime();
     runtime_initializations = runtime_shutdowns = 0;
@@ -532,8 +587,9 @@ void RunBorrowedCore(Gpu& gpu, bool hardware, bool second_adapter) {
     }
     Check(recorded && provider_core.allocations == 2 && provider_core.creates == 2
         && provider_core.evaluated_handles.size() == 2
-        && provider_signed.creates == 0 && runtime_initializations == 1,
-        "ordinary inline keeps the complete Core Allocate/Create/Evaluate chain");
+        && provider_signed.creates == 0 && runtime_initializations == 1
+        && provider_shared_contexts.at(device_id) && provider_private_contexts.empty(),
+        "ordinary inline keeps Core calls and repeated native Init preserves the shared proxy cache");
     addon::ReleaseNrSlot(addon::features.at(owner), 1, true);
     const auto old_destroy = addon::core_destroy_parameters;
     const auto core_evaluates = provider_core.evaluates;
@@ -573,9 +629,11 @@ void RunBorrowedCore(Gpu& gpu, bool hardware, bool second_adapter) {
     Check(addon::EnsureDirectRuntime(gpu.list.Get(), &decline, true)
         && !addon::parameter_runtime_via_core && provider_core.releases == 2 && provider_core.destroys == 2
         && provider_core.handles.empty() && provider_core.parameters.empty()
-        && runtime_initializations == 2 && runtime_shutdowns == 1
+        && runtime_initializations == 2 && runtime_shutdowns == 0 && provider_shared_shutdowns == 0
+        && addon::direct_api.private_instance && provider_shared_contexts.at(device_id)
+        && provider_private_contexts.contains(device_id) && !provider_private_contexts.at(device_id)
         && addon::nr_runtime_device_changes.load() == device_changes,
-        "same-interface Core-to-signed switch retires every object through its OLD provider before reinitializing");
+        "Core-to-private switch retires OLD objects, initializes its own cache, and never shuts down the game context");
     addon::hook_point = addon::kHookPresent;
     addon::PresentTarget target{.output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         .workset_key = output.Get(), .private_signed_runtime = true};
@@ -588,9 +646,38 @@ void RunBorrowedCore(Gpu& gpu, bool hardware, bool second_adapter) {
         && addon::EnsureDirectRuntime(gpu.list.Get()) && runtime_initializations == 2,
         "private Present and every stacked/nested Ensure remain signed without new Core calls or Init");
     gpu.Submit();
+    fail_private_shutdown = true;
+    const auto private_shutdowns_before = runtime_shutdowns;
+    const auto private_api_before = addon::direct_api;
+    auto** private_iat_before = addon::get_module_filename_iat;
+    Check(!addon::EnsureDirectRuntime(gpu.list.Get(), nullptr, false)
+        && addon::direct_api.module == private_api_before.module && addon::direct_api.private_instance
+        && addon::direct_device == gpu.device.Get() && addon::get_module_filename_iat == private_iat_before
+        && runtime_shutdowns == private_shutdowns_before + 1 && provider_private_contexts.contains(device_id)
+        && provider_shared_shutdowns == 0,
+        "failed private Shutdown retains its API, device, context and IAT instead of switching providers");
+    Check(!addon::EnsureDirectRuntime(gpu.list.Get()) && runtime_shutdowns == private_shutdowns_before + 1,
+        "a context with failed Shutdown cannot resume private evaluations");
+    Check(!addon::Shutdown(false) && !addon::shutting_down.load()
+        && addon::direct_api.module == private_api_before.module && addon::direct_api.private_instance
+        && addon::direct_device == gpu.device.Get() && addon::get_module_filename_iat == private_iat_before
+        && runtime_shutdowns == private_shutdowns_before + 2 && provider_private_contexts.contains(device_id),
+        "failed full Shutdown retains the private context and cannot claim teardown success");
+    fail_private_shutdown = false;
+    Check(addon::EnsureDirectRuntime(gpu.list.Get(), nullptr, false)
+        && !addon::direct_api.private_instance && addon::parameter_runtime_via_core
+        && provider_signed.releases == 2 && provider_signed.handles.empty()
+        && provider_private_contexts.empty() && provider_shared_contexts.at(device_id)
+        && runtime_shutdowns == private_shutdowns_before + 3 && provider_shared_shutdowns == 0,
+        "explicit ordinary selection retires private objects with their provider and preserves the game cache");
+    Check(addon::EnsureDirectRuntime(gpu.list.Get(), nullptr, true)
+        && addon::direct_api.private_instance && provider_private_contexts.contains(device_id)
+        && provider_shared_contexts.at(device_id) && provider_shared_shutdowns == 0,
+        "private OFF-to-ON starts only its own native context again");
     addon::direct_api.module = nullptr;  // The fixture borrowed the EXE, never a loader-owned reference.
     Check(addon::Shutdown(false) && provider_signed.releases == 2 && provider_signed.handles.empty()
-        && runtime_shutdowns == 2, "private signed teardown releases its own handles and shuts down once");
+        && runtime_shutdowns == private_shutdowns_before + 4 && provider_private_contexts.empty() && provider_shared_shutdowns == 0
+        && provider_shared_contexts.at(device_id), "private teardown shuts down only its own context");
     for (const bool fail_init : {true, false}) {
       configure_runtime();
       fail_private_init = fail_init;
@@ -602,6 +689,14 @@ void RunBorrowedCore(Gpu& gpu, bool hardware, bool second_adapter) {
         Check(!initialized && !addon::EnsureDirectRuntime(gpu.list.Get())
             && provider_signed.creates == creates && provider_core.creates == core_creates,
             "private signed Init failure never falls back to Core");
+        Check(addon::EnsureDirectRuntime(gpu.list.Get(), nullptr, false)
+            && !addon::direct_api.private_instance && !addon::direct_runtime_failed,
+            "a private Init failure does not poison an explicitly selected ordinary provider");
+        const auto initializations = runtime_initializations;
+        Check(!addon::EnsureDirectRuntime(gpu.list.Get(), nullptr, true)
+            && !addon::direct_api.private_instance && runtime_initializations == initializations
+            && addon::native_runtime_failed_instance == symbols.native_api.module,
+            "ordinary-to-private routing cannot retry a failed private context in the same image generation");
       } else {
         addon::FeatureState rejected;
         addon::FinalResources resources;
@@ -614,6 +709,19 @@ void RunBorrowedCore(Gpu& gpu, bool hardware, bool second_adapter) {
       addon::direct_api.module = nullptr;
       Check(addon::Shutdown(false), "failed private provider test cleanup");
     }
+    configure_runtime();
+    symbols.native_ready = false;
+    symbols.native_failed = true;
+    const auto ordinary_module = addon::direct_api.module;
+    Check(!addon::EnsureDirectRuntime(gpu.list.Get(), nullptr, true)
+        && addon::direct_api.module == ordinary_module && !addon::direct_api.private_instance
+        && addon::EnsureDirectRuntime(gpu.list.Get(), nullptr, false) && provider_shared_shutdowns == 0,
+        "failed private image preparation retains the ordinary API without an implicit shared fallback");
+    addon::direct_api.module = nullptr;
+    Check(addon::Shutdown(false) && provider_shared_shutdowns == 0
+        && provider_shared_contexts.at(device_id), "ordinary teardown retains the game's shared context");
+    symbols.native_ready = true;
+    symbols.native_failed = false;
     fail_private_init = fail_private_create = false;
     runtime_initializations = runtime_shutdowns = 0;
     addon::stack_passes = 1;
@@ -1898,7 +2006,7 @@ void RunInline(Gpu& gpu, bool hardware, bool safety) {
               && addon::TeardownProof() == submission::RecordedWork::kComplete,
           "production removal retires dead-device resources without requiring old-list Reset");
     Check(addon::EnsureDirectRuntime(recovered.list.Get()) && addon::direct_device == recovered.device.Get()
-              && runtime_initializations == 1 && runtime_shutdowns == 1,
+               && runtime_initializations == 1 && runtime_shutdowns == 0,
           "production runtime switch initializes a distinct legal device generation");
     removed_fence = nullptr;
     removed_device = nullptr;

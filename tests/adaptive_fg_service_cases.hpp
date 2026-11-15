@@ -116,16 +116,27 @@ int Run() {
     native::max_worksets.store(4);
     native::adaptive_configuration_settings = native::comparison_ui::CaptureAdaptiveSettings;
     addon::gpu_timers::comparison_settings = native::comparison_ui::CaptureSettings;
+    native::direct_api.private_instance = true;
     native::direct_api.module = GetModuleHandleW(nullptr);
+    native::direct_api.init = control_mask_gpu_cases::InitializeRuntime;
     native::direct_api.create = CreateModel;
     native::direct_api.evaluate = EvaluateModel;
     native::direct_api.release = ReleaseModel;
+    native::direct_api.shutdown = control_mask_gpu_cases::ShutdownRuntime;
     native::direct_load_state = native::DirectLoadState::Ready;
     native::direct_device = gpu.device.Get();
     native::direct_device->AddRef();
     native::direct_device_native = gpu.device.Get();
     native::direct_runtime_requirements.dual_models = true;
     native::direct_runtime_requirements.file_version = "310.9.16.0";
+    // This fixture supplies a model substitute, not a loader-owned DLL. The
+    // real pre-FG service must still select an explicitly private API.
+    native::ngx_loader_staging = {};
+    native::ngx_loader_staging.nr_ready = true;
+    native::ngx_loader_staging.native_ready = true;
+    native::ngx_loader_staging.native_api = native::direct_api;
+    native::ngx_loader_staging.nr_requirements = native::direct_runtime_requirements;
+    native::PublishNgxLoaderSymbols();
     native::parameter_runtime_ready = true;
     native::core_allocate_parameters = addon::bridge::AllocateOwnedParameters;
     native::core_destroy_parameters = addon::bridge::DestroyOwnedParameters;
@@ -356,6 +367,7 @@ int Run() {
         addon::bridge::OwnedParameters composition;
         composition.Set(NVSDK_NGX_DLSSG_Parameter_UI, ui.Get());
         native::PresentTarget target;
+        target.private_signed_runtime = true;
         bool output_ready = false;
         std::array<native::NrRecording, 2> recordings;
         fail_next_pipeline = true;
