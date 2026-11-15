@@ -386,7 +386,7 @@ MV flags/scale 已按 Service 后的 NGX 契约提供。两条件使用独立 Fe
 `nr-edit-reuse-cost` 固定真实 SR 输入 2560×1440、输出 3840×2160、RGBA16F scRGB、
 单 Pass／请求 B、零 jitter／运动，并关闭自适应分辨率、ControlMask 和时域 Look。
 它复用生产 `fg_service::Record` 的原色暂存、缓存／模型、codec 及私有颜色写回；
-不调用 XeFG SDK、Service 准入或插帧。该入口固定路线与格式，不读取其他缓存实验的路线／场景选项。
+不调用 XeFG SDK、Service 准入或插帧。默认固定这一路线与格式，不读取其他缓存实验的路线／场景选项。
 
 ~~~powershell
 pwsh -File tools/run-tests.ps1 -Suite fg-native -NativeCase nr-edit-reuse-cost `
@@ -407,6 +407,15 @@ Reset、Fence、稳定模型／工作集身份及完整收尾。测量结束只�
 缓存组再读取末帧 Validity，记录 0／1 像素数并要求存在有效复用像素，均不保存全图。
 失败保留状态及错误 JSON。相邻调用间隔包含夹具等待与管理开销，结果用于静态成本比较，
 不作为游戏／显示 FPS、动态画质或真实 XeFG 帧节奏验收。
+
+设置测试进程环境变量 `NR_NEXUS_TEST_NR_CACHE_TWO_TIERS=1` 后，同一入口改为内部两档实验：
+原生 D3D12 Upscaled／FG Off、100% 与 75% 两个完整预备档，其余输入、格式和单 Pass 保持固定。
+两组独立进程先用相同设置准备真实 NR Feature／历史，再执行上档→低档→上档；
+低档单独运行 32 帧暖机和 128 帧计量，比较逐帧 NR 与 x2 的完整两帧成本，并分别保留刷新与复用时间。
+准备、切档及返回上档的记录独立于低档稳态窗口，检查实际调用、Reset、源帧计数、模型／工作集身份和收尾。
+该模式使用公开 SDK 预初始化的真实 Core provider；未覆盖游戏 snippet 启动、私有 Runtime 或自动 FPS 调档。
+GPU 计时和静态有限输出检查仍沿用上述口径，动态转镜、遮挡、光照和帧节奏须另行验收。
+使用新输出目录，运行后恢复该环境变量；不改变插件的默认设置或正式兼容范围。
 
 ## ControlMask 原生成本
 
