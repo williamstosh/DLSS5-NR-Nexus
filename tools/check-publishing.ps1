@@ -23,10 +23,10 @@ function Assert-PublishingIsolation {
     }
     $bytes = [IO.File]::ReadAllBytes($BinaryPath)
     $text = [Text.Encoding]::ASCII.GetString($bytes)
-    foreach ($marker in @('inline_restore_roi','inline_restore_roi_v1','mafia-same-frame-roi','unsupported_inline_restore_contract')) {
+    foreach ($marker in @('inline_restore_roi','inline_restore_roi_v1','mafia-same-frame-roi','unsupported_inline_restore_contract','bridge_adaptive_experiment')) {
         # Match UTF-16LE bytes at either alignment as well as plain ASCII.
         $wide = [Text.Encoding]::ASCII.GetString([Text.Encoding]::Unicode.GetBytes($marker))
-        if ($text.Contains($marker) -or $text.Contains($wide)) { throw "Publishing binary contains development ROI marker: $marker" }
+        if ($text.Contains($marker) -or $text.Contains($wide)) { throw "Publishing binary contains development-only marker: $marker" }
     }
     [pscustomobject]@{ DllSha256=(Get-FileHash -LiteralPath $BinaryPath).Hash.ToLowerInvariant()
         CompilerCommandSha256=(Get-FileHash -LiteralPath $commandPath).Hash.ToLowerInvariant() }

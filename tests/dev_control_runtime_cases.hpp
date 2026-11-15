@@ -78,6 +78,9 @@
       "successful Evaluate API observation remains separate from GPU completion");
   check(status["state"]["experiments"]["adaptive_feature_mode"] == 0
           && status["identity"]["experiments"]["adaptive_feature_mode"] == 0
+          && !status["state"]["experiments"]["bridge_adaptive_experiment"].get<bool>()
+          && !status["identity"]["experiments"]["bridge_adaptive_experiment"].get<bool>()
+          && status["state"]["experiments"]["bridge_adaptive_evidence"] == "requested_enabled_not_activation"
           && status["state"]["experiments"]["evidence"] == "requested_mode_not_activation"
           && status["state"]["adaptive_caches"].is_array(),
       "the experiment defaults to OFF and reports its request separately from execution");
@@ -264,6 +267,97 @@
           && runtime::nr_features_created == experiment_features,
       "experiment requests write no INI settings, recreate no features and leave ordinary configuration generation unchanged");
   runtime::disabled_resources_released = released_before;
+  {
+    const auto bridge_experiment = [&](Json enabled) {
+      return control::Execute({{"id", "bridge-experiment-" + std::to_string(++serial)},
+          {"op", "bridge_adaptive_experiment"}, {"enabled", std::move(enabled)}});
+    };
+    const auto bridge_identity = control::Identity();
+    const auto bridge_settings = runtime::profile_ui::Snapshot(true);
+    const auto bridge_adaptive = runtime::CopyAdaptiveStatus();
+    const auto bridge_sources = runtime::features.size();
+    const auto bridge_fg = std::tuple{runtime::native_fg_public_off.load(), runtime::native_fg_declaration.load(),
+        runtime::native_fg_owns.load(), runtime::native_fg_options_generation.load()};
+    check(bridge_experiment(1)["reason"] == "invalid_enabled" && bridge_experiment(0)["reason"] == "invalid_enabled"
+            && bridge_experiment(1.0)["reason"] == "invalid_enabled" && bridge_experiment("true")["reason"] == "invalid_enabled"
+            && bridge_experiment(nullptr)["reason"] == "invalid_enabled"
+            && control::Execute({{"id", "bridge-missing-enabled"}, {"op", "bridge_adaptive_experiment"}})["reason"] == "invalid_enabled",
+        "Bridge experiment requires an explicit Boolean instead of a legacy mode or setting value");
+    // No GPU exists in this CPU fixture; only its release-proof input is mocked.
+    runtime::disabled_resources_released = false;
+    check(bridge_experiment(true)["reason"] == "resources_not_released"
+            && bridge_experiment(false)["reason"] == "resources_not_released"
+            && !runtime::disabled_resources_released.load(),
+        "neither Bridge experiment direction accepts NR OFF without the existing release proof");
+    runtime::disabled_resources_released = true;
+    runtime::enabled = true;
+    check(bridge_experiment(true)["reason"] == "nr_running" && bridge_experiment(false)["reason"] == "nr_running",
+        "both Bridge experiment directions reject a running NR chain even with a stale release flag");
+    runtime::enabled = false;
+    runtime::slider_pending = &runtime::kSetAdaptiveTargetFps;
+    check(bridge_experiment(true)["reason"] == "configuration_busy", "Bridge requests respect the existing UI transaction owner");
+    runtime::slider_pending = nullptr;
+    {
+      std::atomic_bool held{false};
+      std::jthread owner([&](std::stop_token stop) {
+        renodx::addons::dlss5::RuntimeLock lock(runtime::runtime_mutex);
+        held.store(true, std::memory_order_release);
+        while (!stop.stop_requested()) {
+          Sleep(1);
+        }
+      });
+      const auto deadline = runtime::SteadyNowNs() + 1'000'000'000LL;
+      while (!held.load(std::memory_order_acquire) && runtime::SteadyNowNs() < deadline) {
+        Sleep(1);
+      }
+      check(held.load(std::memory_order_acquire), "the CPU fixture owns the actual runtime mutex on another thread");
+      check(bridge_experiment(true)["reason"] == "runtime_busy" && bridge_experiment(false)["reason"] == "runtime_busy",
+          "Bridge experiment mutation never waits on another runtime owner");
+    }
+    check(!runtime::bridge_adaptive_experiment.load(), "rejected Bridge requests cannot enable the experiment");
+    const Json bridge_request{{"id", "bridge-idempotent"}, {"op", "bridge_adaptive_experiment"}, {"enabled", true}};
+    const auto bridge_enabled = control::Execute(bridge_request);
+    auto enabled_identity = bridge_identity;
+    enabled_identity["experiments"]["bridge_adaptive_experiment"] = true;
+    check(bridge_enabled["ok"] && bridge_enabled["state"]["available"]
+            && bridge_enabled["identity"] == enabled_identity && runtime::bridge_adaptive_experiment.load()
+            && bridge_enabled["state"]["experiments"]["bridge_adaptive_evidence"] == "requested_enabled_not_activation",
+        "Bridge enable publishes only the independent requested flag and its confirmation identity");
+    check(control::Execute(bridge_request) == bridge_enabled, "same-id Bridge enable returns the original receipt");
+    status = control::Execute({{"id", "query-bridge"}, {"op", "status"}, {"query_id", "bridge-idempotent"}});
+    check(status["receipt"] == bridge_enabled, "lost Bridge enable receipts use the existing status lookup");
+    auto reused_bridge = bridge_request;
+    reused_bridge["enabled"] = false;
+    check(control::Execute(reused_bridge)["reason"] == "request_id_reused", "reused Bridge ids cannot change the requested Boolean");
+    check(set("NRAdaptiveTargetFPS", runtime::nr_adaptive_target_fps.load(),
+              {{"identity", bridge_identity}, {"changes", {{"NRAdaptiveTargetFPS", runtime::nr_adaptive_target_fps.load()}}}})["reason"]
+            == "configuration_changed",
+        "a pre-experiment confirmation cannot commit after the Bridge identity changes");
+    runtime::enabled = true;
+    check(bridge_experiment(false)["reason"] == "nr_running" && runtime::bridge_adaptive_experiment.load(),
+        "disabling an enabled Bridge experiment also requires NR OFF");
+    runtime::enabled = false;
+    runtime::disabled_resources_released = false;
+    check(bridge_experiment(false)["reason"] == "resources_not_released" && runtime::bridge_adaptive_experiment.load(),
+        "disabling an enabled Bridge experiment never bypasses resource retirement");
+    runtime::disabled_resources_released = true;
+    check(bridge_experiment(false)["ok"] && !runtime::bridge_adaptive_experiment.load()
+            && bridge_experiment(true)["ok"] && runtime::bridge_adaptive_experiment.load()
+            && bridge_experiment(false)["ok"] && bridge_experiment(false)["status"] == "unchanged",
+        "Bridge requested state can turn off, reopen and return to its default without changing ordinary settings");
+    const auto after_bridge = runtime::CopyAdaptiveStatus();
+    check(control::Identity() == bridge_identity && runtime::profile_ui::Snapshot(true) == bridge_settings
+            && configuration_writes == experiment_writes && runtime::configuration_generation == experiment_generation
+            && runtime::nr_features_created == experiment_features && runtime::features.size() == bridge_sources
+            && runtime::disabled_resources_released.load(),
+        "Bridge requests neither persist settings, create sources/models nor manufacture a release proof");
+    check(bridge_fg == std::tuple{runtime::native_fg_public_off.load(), runtime::native_fg_declaration.load(),
+              runtime::native_fg_owns.load(), runtime::native_fg_options_generation.load()}
+            && after_bridge.generation == bridge_adaptive.generation && after_bridge.reason == bridge_adaptive.reason
+            && after_bridge.requested == bridge_adaptive.requested && after_bridge.applied == bridge_adaptive.applied,
+        "request acceptance cannot manufacture FG Off, an eligible Bridge source or an actual applied tier");
+    runtime::disabled_resources_released = released_before;
+  }
   {
     namespace screenshot = renodx::addons::dlss5::screenshot;
     const auto before_identity = control::Identity();

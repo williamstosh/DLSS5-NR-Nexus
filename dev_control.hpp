@@ -34,7 +34,8 @@ inline Json Identity() {
   return {{"configuration_generation", identity.configuration_generation}, {"config_epoch", identity.config_epoch},
       {"settings_hash", identity.settings_hash}, {"resolution_hash", identity.resolution_hash},
       {"route", identity.route}, {"fg", identity.fg},
-      {"experiments", {{"adaptive_feature_mode", static_cast<uint32_t>(adaptive_feature_mode.load())}}}};
+      {"experiments", {{"adaptive_feature_mode", static_cast<uint32_t>(adaptive_feature_mode.load())},
+          {"bridge_adaptive_experiment", bridge_adaptive_experiment.load()}}}};
 }
 
 inline Json Snapshot() {
@@ -144,6 +145,8 @@ inline Json Snapshot() {
       {"successful_source_frames", SourceSuccessfulEvaluations()},
       {"nr_features_created", nr_features_created},
       {"experiments", {{"adaptive_feature_mode", identity["experiments"]["adaptive_feature_mode"]},
+          {"bridge_adaptive_experiment", identity["experiments"]["bridge_adaptive_experiment"]},
+          {"bridge_adaptive_evidence", "requested_enabled_not_activation"},
           {"evidence", "requested_mode_not_activation"}}},
       {"adaptive_caches", std::move(caches)},
       {"output_framerate", {{"available", output.available}, {"reason", output_framerate::ReasonText(output.reason)},
@@ -189,7 +192,8 @@ inline Json Execute(const Json& request) {
         {"receipt", request.contains("query_id") && last_request.is_object()
                 && request["query_id"] == last_request["id"] ? last_receipt : Json(nullptr)}};
   }
-  if (*operation != "set" && *operation != "adaptive_feature_experiment" && *operation != "inline_restore_roi") {
+  if (*operation != "set" && *operation != "adaptive_feature_experiment"
+      && *operation != "bridge_adaptive_experiment" && *operation != "inline_restore_roi") {
     return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "invalid_operation"}};
   }
   if (last_request.is_object() && last_request["id"] == *id) {
@@ -231,11 +235,16 @@ inline Json Execute(const Json& request) {
     }
     return finish();
   }
-  if (*operation == "adaptive_feature_experiment") {
-    response["reason"] = "invalid_mode";
-    const auto mode = request.find("mode");
-    if (mode == request.end() || !mode->is_number_integer() || *mode < 0 || *mode > 3) return finish();
-    response["requested"] = {{"mode", *mode}};
+  const bool bridge_experiment = *operation == "bridge_adaptive_experiment";
+  if (*operation == "adaptive_feature_experiment" || bridge_experiment) {
+    const auto value = request.find(bridge_experiment ? "enabled" : "mode");
+    response["reason"] = (bridge_experiment ? "invalid_enabled" : "invalid_mode");
+    if (bridge_experiment) {
+      if (value == request.end() || !value->is_boolean()) return finish();
+    } else if (value == request.end() || !value->is_number_integer() || *value < 0 || *value > 3) {
+      return finish();
+    }
+    response["requested"] = {{bridge_experiment ? "enabled" : "mode", *value}};
     if (configuration_busy) {
       response["reason"] = "configuration_busy";
       return finish();
@@ -249,9 +258,16 @@ inline Json Execute(const Json& request) {
       } else if (!disabled_resources_released.load()) {
         response["reason"] = "resources_not_released";
       } else {
-        const auto requested = static_cast<AdaptiveFeatureMode>(mode->get<uint32_t>());
-        const bool unchanged = adaptive_feature_mode.load() == requested;
-        adaptive_feature_mode.store(requested);
+        bool unchanged = false;
+        if (bridge_experiment) {
+          const bool requested = value->get<bool>();
+          unchanged = bridge_adaptive_experiment.load() == requested;
+          bridge_adaptive_experiment.store(requested);
+        } else {
+          const auto requested = static_cast<AdaptiveFeatureMode>(value->get<uint32_t>());
+          unchanged = adaptive_feature_mode.load() == requested;
+          adaptive_feature_mode.store(requested);
+        }
         response["ok"] = true;
         response["status"] = unchanged ? "unchanged" : "applied";
         response["reason"] = "experiment_requested";

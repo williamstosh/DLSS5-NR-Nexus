@@ -52,6 +52,16 @@ $taskRoiDirectory = [IO.Path]::GetFullPath((Join-Path $PWD 'tmp/mafia-same-frame
 请求只在 NR OFF、真实资源已释放且配置空闲时接受；实验取证应临时使用现有
 `NRDisableRelease=1` 和 `NRWorksetFreePolicy=0`，结束恢复原值。模式请求不等于实际准入，仍须检查槽、容量和 GPU 完成。
 
+Bridge 两档接入使用独立的 DEV 请求：`Client.bridge_adaptive_experiment(True|False)`，
+协议为 `{"id":"bridge-enable-1","op":"bridge_adaptive_experiment","enabled":true}`。
+开启和关闭都要求 NR OFF、资源已释放、配置空闲；它不写 INI，也不替用户改动其他设置。
+`state.experiments.bridge_adaptive_experiment` 与 `identity.experiments` 返回请求开关，
+`bridge_adaptive_evidence=requested_enabled_not_activation` 标明尚不能据此判断执行。
+实际每源仍只接纳两档全预备、Upscaled 单 Pass、可信 FG Off、x2 Off 和有效来源代际；
+接口不会制造 FG Off 或 snippet 初始化成功。关闭流程先沿现有 NR OFF 收尾，待释放凭据成立后请求 false；
+释放未完成时保持原请求状态。该通道仅编入 `NR_NEXUS_DEV_CONTROL` 开发候选，普通 Publishing 不含入口，
+不是玩家兼容开关；`status`／原 ID 回执查询及同一 deadline 的规则与其他开发请求相同。
+
 `set` 一次提交一个现有 INI key 和 JSON 类型值。返回 `confirmation_required` 时默认停止；只有明确使用 `--confirm`，或阶段请求显式写入 `confirmation_required=true`，才将服务返回的完整 `identity` 和 `changes` 原样携带到新请求，由服务复核提案。服务复用菜单的配置缓存／持久化提交语义，受保护 runner 在退出时恢复原文件。不能把接口配置当作临时无副作用事务。`status` 遇到 `available=false` 且原因为 `runtime_busy`／`configuration_changed` 时，只在同一 deadline 内重试读取。连接失败或 `outcome_unknown` 后仅以 `status(query_id=<原请求ID>)` 查询 `receipt`，不会自动重放设置；deadline 内没有明确回执则抛出 `OutcomeUnknown`，可另用 `--query-id <原请求ID> status` 核查。
 
 collector 在每个 active 阶段先读状态，仅在 NR 关闭时请求 `NeuralUplift=true`，再设置 `NRHookPoint`（0 Upscaled／1 Render／2 Present）、所需 `NRPasses` 及第 2–4 层的 `NRPassNStage`（1 Render／2 Upscaled／3 Present，0 为继承）。依赖改动与危险阶段确认由服务生成提案，不在客户端复制菜单规则。接口模式的多层请求须提供从 Pass1 开始连续完整的 `expected_plan`；省略时为单层 Pass1。请求、实际 `changes` 和回执 `state.settings` 写入 `static-events.json`，随后仍等待当前完整计划和新序列的成功 `last_nr_evaluate`，才记录 `stage_observed`。赋值只提供配置证据，API 成功单独记为 API 证据；GPU 完成只读取 snapshot 的 `completion.current`，collector 不由配置或 API 成功推导 GPU 完成或图像质量。
