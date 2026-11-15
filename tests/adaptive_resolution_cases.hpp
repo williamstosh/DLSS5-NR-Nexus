@@ -62,16 +62,33 @@ inline bool Run() {
   for (int i = 1; i <= 13; ++i) tick(start + i * adaptive::SAMPLE_INTERVAL_NS, 50., 3000.);
   check(session.level == 1 && session.trial, "sustained low FPS probes the next prepared size without a prior NR cost increase");
   const auto lower_generation = session.status.generation;
-  for (int i = 14; i <= 27; ++i) tick(start + i * adaptive::SAMPLE_INTERVAL_NS, 50., 2400.);
+  for (int i = 14; i <= 100; ++i) tick(start + i * adaptive::SAMPLE_INTERVAL_NS, 50., 2400.);
   check(session.level == 0 && session.blocked && !session.trial,
-        "lower NR cost without output FPS benefit restores quality and stops probing");
-  for (int i = 28; i <= 60; ++i) tick(start + i * adaptive::SAMPLE_INTERVAL_NS, 50., 3000.);
-  check(session.level == 0 && session.blocked, "a steady cap does not trigger repeated downscaling");
+        "a bounded descent without output FPS benefit restores quality and stops probing");
+  for (int i = 101; i <= 140; ++i) tick(start + i * adaptive::SAMPLE_INTERVAL_NS, 50., 3000.);
+  check(session.level == 0 && session.blocked, "a steady cap does not trigger downscaling during the cooldown");
   const size_t samples = session.gpu_count;
   session.ObserveGpu({.generation = lower_generation, .frame = ++sequence, .sequence = sequence,
       .recorded_ns = start, .completed_ns = start, .total_us = 1., .valid = true, .stable = true},
       start + 20'000'000'000);
   check(session.gpu_count == samples, "old generation completions cannot drive the new size");
+
+  const int64_t blocked_deadline = session.blocked_until_ns;
+  int retry_step = 141;
+  for (; start + retry_step * adaptive::SAMPLE_INTERVAL_NS < blocked_deadline; ++retry_step) {
+    tick(start + retry_step * adaptive::SAMPLE_INTERVAL_NS, 50., 3000.);
+  }
+  check(session.blocked && !session.trial && session.level == 0,
+        "an unchanged workload remains at the accepted anchor until the bounded cooldown ends");
+  const int64_t retry_ns = start + retry_step * adaptive::SAMPLE_INTERVAL_NS;
+  tick(retry_ns, 50., 3000.);
+  check(!session.blocked && !session.trial && session.gpu_count == 0 && session.stable_after_ns == retry_ns,
+        "cooldown expiry discards prior measurements instead of immediately retrying with old windows");
+  for (int i = 1; i < 8; ++i) tick(retry_ns + i * adaptive::SAMPLE_INTERVAL_NS, 50., 3000.);
+  check(!session.trial && session.level == 0, "pre-expiry output windows cannot launch the retry");
+  tick(retry_ns + 8 * adaptive::SAMPLE_INTERVAL_NS, 50., 3000.);
+  check(session.trial && session.level == 1,
+        "a fresh output and GPU window reopens a bounded trial after the cooldown");
 
   session = {};
   sequence = 0;
@@ -164,6 +181,73 @@ inline bool Run() {
   check(default_range.count == 8 && full_range.count == 15 && full_range.count == adaptive::MAX_PREPARED_LEVELS
       && full_range.sizes[0] == full_upper && full_range.sizes[full_range.count - 1] == full_floor,
       "the unchanged five-percent grid provides eight default-range sizes and fifteen at the legal minimum");
+  for (const uint32_t count : {9u, 4u}) {
+    const adaptive::Settings curve_settings{.enabled = true, .target_fps = 360.f, .minimum_scale = .33f,
+        .prepared_levels = count, .selected_levels = count};
+    adaptive::Session cumulative;
+    adaptive::Output measured{.available = true, .source = 1, .generation = 1, .configuration = 1,
+        .observed_multiplier = 4.};
+    const auto advance = [&](adaptive::Session* controller, adaptive::Output* observation,
+                             uint64_t step, double fps, double gpu_us) {
+      const int64_t now = start + static_cast<int64_t>(step) * adaptive::SAMPLE_INTERVAL_NS;
+      const uint64_t sequence = ++observation->serial;
+      controller->ObserveGpu({.generation = controller->status.generation, .frame = sequence,
+          .sequence = sequence, .context = 1, .recorded_ns = now, .completed_ns = now,
+          .total_us = gpu_us, .valid = true, .stable = true}, now);
+      observation->begin_ns = now - 2'000'000'000;
+      observation->end_ns = now;
+      observation->fps = fps;
+      controller->Prepare(curve_settings, full_upper, full_floor, 1, *observation, now, true, false);
+      controller->UpdatePreparation(controller->preparation_epoch, static_cast<uint32_t>(controller->ladder.count),
+          static_cast<uint32_t>(controller->ladder.count), adaptive::Reason::PREPARING, now);
+      controller->Applied(controller->status.generation, controller->status.requested, now);
+    };
+    bool retained_anchor = false, checked_boundaries = false;
+    size_t deepest = 0;
+    for (uint64_t step = 0; step <= 480; ++step) {
+      const double coefficient = (cumulative.ladder.count == 0 ? 1. : cumulative.ladder.coefficients[cumulative.level]);
+      advance(&cumulative, &measured, step, 100. + 30. * (1. - coefficient), 4000. * coefficient);
+      deepest = std::max(deepest, cumulative.level);
+      if (count == 9 && cumulative.trial && cumulative.level > 1 && cumulative.previous_level == 0) {
+        retained_anchor |= cumulative.baseline_fps == 100. && cumulative.baseline_gpu_us == 4000.;
+        if (!checked_boundaries) {
+          checked_boundaries = true;
+          auto worsening = cumulative;
+          auto worse_output = measured;
+          for (uint64_t offset = 1; offset <= 13; ++offset) {
+            advance(&worsening, &worse_output, step + offset, 80., 1000.);
+          }
+          check(worsening.level == 0 && worsening.blocked && !worsening.trial,
+                "a clearly worse cumulative trial returns to the accepted anchor without descending further");
+          auto changed = cumulative;
+          auto changed_output = measured;
+          ++changed_output.configuration;
+          changed.Prepare(curve_settings, full_upper, full_floor, 1, changed_output,
+              measured.end_ns + 1, true, false);
+          check(changed.level == 0 && !changed.trial && changed.gpu_count == 0,
+                "an output contract change abandons the cumulative trial and its old measurements");
+          auto unready = cumulative;
+          unready.UpdatePreparation(unready.preparation_epoch, count - 1, count,
+              adaptive::Reason::PREPARING, measured.end_ns + 1);
+          const auto unready_generation = unready.status.generation;
+          unready.Prepare(curve_settings, full_upper, full_floor, 1, measured,
+              measured.end_ns + 2, true, false);
+          check(!unready.prepared && !unready.trial && unready.status.generation == unready_generation
+              && unready.status.reason == adaptive::Reason::PREPARING,
+                "partial readiness cannot advance a cumulative trial into another tier");
+        }
+      }
+    }
+    check(deepest == cumulative.ladder.count - 1 && cumulative.status.coefficient <= .4001f,
+          "the recorded fine/coarse synthetic curve explores the low end instead of sticking at 95 percent");
+    if (count == 9) {
+      check(retained_anchor && checked_boundaries,
+            "two individually small steps compare their cumulative benefit with the same accepted anchor");
+    } else {
+      check(cumulative.level == cumulative.ladder.count - 1 && !cumulative.blocked,
+            "the existing coarse-step curve still accepts its useful exact minimum");
+    }
+  }
   for (const uint32_t count : {9u, adaptive::MAX_PREPARED_LEVELS}) {
     adaptive::Settings extended_settings{
         .enabled = true, .minimum_scale = .33f, .prepared_levels = adaptive::MAX_PREPARED_LEVELS, .selected_levels = count};

@@ -16,6 +16,7 @@ namespace renodx::addons::dlss5::adaptive_resolution {
 constexpr int64_t SAMPLE_INTERVAL_NS = 250'000'000;
 constexpr int64_t SAMPLE_MAX_AGE_NS = 2'000'000'000;
 constexpr int64_t WARMUP_NS = 1'000'000'000;
+constexpr int64_t RETRY_COOLDOWN_NS = 30'000'000'000;
 constexpr size_t MAX_PASSES = 4, MAX_LEVELS = 16;
 constexpr uint32_t MINIMUM_SCALE_PERCENT = 33, SCALE_STEP_PERCENT = 5;
 constexpr float MINIMUM_SCALE = static_cast<float>(MINIMUM_SCALE_PERCENT) / 100.f;
@@ -147,6 +148,7 @@ struct Session {
   int64_t applied_ns = 0, stable_after_ns = 0, last_switch_ns = 0, at_target_since_ns = 0;
   int64_t next_measure_ns = 0;
   int64_t failed_raise_until_ns = 0;
+  int64_t blocked_until_ns = 0;
   size_t failed_raise_level = MAX_LEVELS;
   bool trial = false, raising = false, extra_window = false, blocked = false, failed = false;
   bool defer_preparation = false;
@@ -423,6 +425,7 @@ struct Session {
       raising = false;
       extra_window = false;
       blocked = false;
+      blocked_until_ns = 0;
       minimum_pending = false;
       defer_preparation = defer_legacy;
       failed_raise_level = MAX_LEVELS;
@@ -465,6 +468,7 @@ struct Session {
       if (trial) Request(previous_level, now_ns);
       trial = false;
       blocked = false;
+      blocked_until_ns = 0;
       minimum_pending = false;
       ResetMeasurements();
       output_source = output.source;
@@ -483,6 +487,14 @@ struct Session {
       status.reason = Reason::COLLECTING;
       return;
     }
+    if (blocked && now_ns >= blocked_until_ns) {
+      blocked = false;
+      blocked_until_ns = 0;
+      ResetMeasurements();
+      stable_after_ns = now_ns;
+      status.reason = Reason::COLLECTING;
+      return;
+    }
     if (applied_ns == 0 || now_ns < stable_after_ns) {
       status.reason = Reason::WARMING;
       return;
@@ -496,6 +508,24 @@ struct Session {
     status.gpu_ms = gpu / 1000.;
     if (last_output_serial == output.serial) return;
     last_output_serial = output.serial;
+    const auto adjacent = [&](bool higher, size_t steps) {
+      size_t result = level;
+      for (size_t step = 0; step < steps; ++step) {
+        size_t nearest = result;
+        for (size_t slot = 0; slot < ladder.count; ++slot) {
+          if (!IsLegal(ladder.sizes[slot])) continue;
+          if (higher ? ladder.coefficients[slot] <= ladder.coefficients[result]
+                     : ladder.coefficients[slot] >= ladder.coefficients[result]) continue;
+          if (nearest == result || (higher ? ladder.coefficients[slot] < ladder.coefficients[nearest]
+                                          : ladder.coefficients[slot] > ladder.coefficients[nearest])) {
+            nearest = slot;
+          }
+        }
+        if (nearest == result) break;
+        result = nearest;
+      }
+      return result;
+    };
     if (trial) {
       const bool multiplier_changed = baseline_multiplier > 0. && output.observed_multiplier > 0.
           && std::abs(output.observed_multiplier / baseline_multiplier - 1.) > 0.10;
@@ -519,11 +549,26 @@ struct Session {
           stable_after_ns = output.end_ns;
           return;
         }
+        if (!settings.legacy_preparation && prepared && !raising && !multiplier_changed && cheaper
+            && output.fps >= baseline_fps - fps_margin) {
+          const size_t candidate = adjacent(false, 1);
+          if (candidate != level) {
+            // Compare cumulative savings with the accepted anchor. A small
+            // adjacent step cannot establish that every lower ready tier is useless.
+            if (now_ns - last_switch_ns >= 3'000'000'000) {
+              extra_window = false;
+              Request(candidate, now_ns);
+            }
+            status.reason = Reason::LOWERING;
+            return;
+          }
+        }
         if (raising) {
           failed_raise_level = level;
-          failed_raise_until_ns = now_ns + 30'000'000'000;
+          failed_raise_until_ns = now_ns + RETRY_COOLDOWN_NS;
         } else {
           blocked = true;
+          blocked_until_ns = now_ns + RETRY_COOLDOWN_NS;
           blocked_fps = (multiplier_changed ? output.fps : baseline_fps);
           blocked_gpu_us = baseline_gpu_us;
         }
@@ -534,31 +579,16 @@ struct Session {
       }
     }
     if (blocked && (std::abs(output.fps - blocked_fps) > std::max(3., blocked_fps * 0.15)
-        || std::abs(gpu - blocked_gpu_us) > std::max(100., blocked_gpu_us * 0.2))) blocked = false;
+        || std::abs(gpu - blocked_gpu_us) > std::max(100., blocked_gpu_us * 0.2))) {
+      blocked = false;
+      blocked_until_ns = 0;
+    }
     if (output.fps >= settings.target_fps * 0.99) {
       if (at_target_since_ns == 0) at_target_since_ns = output.begin_ns;
     } else {
       at_target_since_ns = 0;
     }
     size_t candidate = level;
-    const auto adjacent = [&](bool higher, size_t steps) {
-      size_t result = level;
-      for (size_t step = 0; step < steps; ++step) {
-        size_t nearest = result;
-        for (size_t slot = 0; slot < ladder.count; ++slot) {
-          if (!IsLegal(ladder.sizes[slot])) continue;
-          if (higher ? ladder.coefficients[slot] <= ladder.coefficients[result]
-                     : ladder.coefficients[slot] >= ladder.coefficients[result]) continue;
-          if (nearest == result || (higher ? ladder.coefficients[slot] < ladder.coefficients[nearest]
-                                          : ladder.coefficients[slot] > ladder.coefficients[nearest])) {
-            nearest = slot;
-          }
-        }
-        if (nearest == result) break;
-        result = nearest;
-      }
-      return result;
-    };
     if (output.fps < settings.target_fps * 0.95 && !blocked && now_ns - last_switch_ns >= 3'000'000'000) {
       candidate = (settings.legacy_preparation && minimum_pending ? MAX_LEVELS
           : adjacent(false, settings.legacy_preparation && settings.prepared_levels == 0 ? 2 : 1));

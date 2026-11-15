@@ -311,6 +311,8 @@ Present 显示以下选项。兼容的 Pre-FG 先增强游戏帧再交给 FG；�
 
 首次准备分步进行，尚不能处理的帧保留游戏原画。开启、修改档数或尺寸范围后，复用兼容档位并准备缺少的尺寸，所选档位全部就绪后再自动调节；单次准备仍可能短暂卡顿。容量不足时保留选择并暂停，可减少档数后重新准备。调整目标 FPS、风格、混合强度或已有遮罩阈值会保留兼容分配。短时暂停不因闲置五秒而丢弃已接纳的档位；真实换源或资源合同变化仍可能需要重新准备。
 
+**开发版修正（尚未发布）**：自动降档会累计比较连续细档的收益；收益仍不明确时恢复较高画质，并在冷却后重新采样。准备中的资源分配失败会停止新增档位，保留安全可用的画面并回收未使用的备用资源；重新开启须等这次失败遗留的资源可以安全释放后再准备。「关闭 NR 时保留资源」仍控制正常关闭时的行为。
+
 | 上采样选项 | NR 低于输出尺寸时的行为 |
 | --- | --- |
 | **Auto**（默认） | 自动按边缘重建 NR 改变量，保留下层全分辨率细节。 |
@@ -861,6 +863,8 @@ Adaptive sizing supports one processing stage on native DX12, including compatib
 **Level count and preparation**: Choose Default or 2–15 levels, including the manual upper limit. Default retains the original cache capacity: up to four levels for one color and one output, usually two for two colors; rotating outputs consume corresponding capacity. An explicit count prepares the complete collection for the required colors and outputs, subject to available video memory. The number of distinct sizes depends on the minimum scale and rounding: a 67% minimum allows up to eight levels, while 33% allows up to fifteen. A higher selection never duplicates identical sizes. More levels give smaller steps and increase initial preparation time and video-memory use.
 
 Initial preparation proceeds in several steps; frames that NR cannot process yet keep the game's image. Enabling automatic sizing or changing the count or size range reuses compatible levels and prepares missing sizes before automatic adjustment begins. Individual preparation steps can still briefly stall. If capacity is insufficient, the selection is kept and adjustment pauses; reduce the count to prepare again. Target FPS, style, blend strength and existing mask thresholds retain compatible allocations. A temporary pause no longer discards admitted levels merely because they have been idle for five seconds. A genuinely replaced source or changed resource contract can still require preparation.
+
+**Development fixes (not yet released)**: Downscaling compares the cumulative benefit of successive fine steps. If the benefit remains unclear, it restores higher quality and collects fresh samples after a cooldown. An allocation failure during preparation stops new levels, retains a safe available image and reclaims unused standby resources. Re-enabling waits until resources left by that failed preparation can be safely released before preparing again. The option to retain resources when NR is turned off still controls normal shutdown behavior.
 
 | Upsampling choice | Behaviour below output size |
 | --- | --- |

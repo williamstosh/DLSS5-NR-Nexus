@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -40,6 +41,20 @@ HRESULT STDMETHODCALLTYPE ObserveCreatePipeline(ID3D12Device* device,
   return real_create_pipeline(device, desc, iid, pipeline);
 }
 
+uint32_t fail_preparation_create = 0;
+uint32_t preparation_create_failures = 0;
+NVSDK_NGX_Result NVSDK_CONV ObserveCreateModel(ID3D12GraphicsCommandList* list, NVSDK_NGX_Feature feature,
+    const NVSDK_NGX_Parameter* parameters, NVSDK_NGX_Handle** handle) {
+  if (native::preparing_adaptive_frame != nullptr && fail_preparation_create != 0) {
+    const auto failure = std::exchange(fail_preparation_create, 0u);
+    ++preparation_create_failures;
+    *handle = nullptr;
+    if (failure == 1) throw std::bad_alloc{};
+    return NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
+  }
+  return CreateModel(list, feature, parameters, handle);
+}
+
 HRESULT STDMETHODCALLTYPE ObserveClose(ID3D12GraphicsCommandList* list) {
   const auto result = real_close(list);
   list_calls.push_back({.list = list, .reset = false, .result = result});
@@ -65,6 +80,7 @@ int Run() {
     model_gpu = &gpu;
     ComPtr<ID3D12InfoQueue> info;
     gpu.device.As(&info);
+    Check(debug != nullptr && info != nullptr, "adaptive Service requires the D3D12 debug layer and InfoQueue");
     std::cout << "ADAPTIVE_SERVICE debug_layer=" << (debug != nullptr)
         << " debug_hresult=0x" << std::hex << static_cast<uint32_t>(debug_result) << std::dec
         << " info_queue=" << (info != nullptr) << '\n';
@@ -489,6 +505,32 @@ int Run() {
         && std::all_of(recovered_cache->tiers.begin(), recovered_cache->tiers.begin() + recovered_cache->count,
             [](const auto& tier) { return tier.ready; }),
         "explicit clear-failure rebuilds real Features and successfully resumes the existing Service");
+    native::direct_api.create = ObserveCreateModel;
+    for (const auto failure : {1u, 2u}) {
+      native::nr_adaptive_selected_levels = 3;
+      fail_preparation_create = failure;
+      const auto failures_before = preparation_create_failures;
+      for (uint32_t frame = 0; frame < 16 && fail_preparation_create != 0; ++frame) service();
+      auto& source = native::features.at(stream.roles[0].Handle());
+      auto failed_cache = source.adaptive_cache;
+      Check(fail_preparation_create == 0 && preparation_create_failures == failures_before + 1
+          && failed_cache->standby_retired && !stream.adaptive_session->prepared
+          && (failure == 1 ? failed_cache->budget_blocked : failed_cache->failed)
+          && native::AdaptiveFallbackReady(source, *failed_cache, 0),
+          "a real two-Pass Service Create throw/return failure pauses the entire collection and retains only a GPU-ready upper");
+      const auto models_after_failure = next_handle;
+      for (uint32_t frame = 0; frame < 8; ++frame) service();
+      Check(next_handle == models_after_failure && preparation_create_failures == failures_before + 1
+          && !stream.adaptive_session->prepared,
+          "subsequent Service frames neither retry failed Create nor falsely complete the selected collection");
+      native::nr_adaptive_selected_levels = 0;
+      native::RecreateFeatures();
+      for (uint32_t frame = 0; frame < 32; ++frame) service();
+      Check(stream.adaptive_session->prepared && !stream.adaptive_session->failed
+          && service() == fg::Result::SUBMITTED,
+          "explicit Service recovery waits for its own retirements and restores complete two-Pass output");
+    }
+    native::direct_api.create = CreateModel;
     native::fg_service::Retire();
     gpu.Submit();
     native::DrainRetiredResources(true);

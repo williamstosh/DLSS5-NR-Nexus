@@ -28,6 +28,25 @@ HRESULT STDMETHODCALLTYPE ObserveCreatePipeline(ID3D12Device* device,
   return real_create_pipeline(device, desc, iid, pipeline);
 }
 
+using CreateResourceFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
+    const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
+CreateResourceFn real_create_resource = nullptr;
+uint32_t fail_resource_phase = 0;
+
+HRESULT STDMETHODCALLTYPE ObserveCreateResource(ID3D12Device* device, const D3D12_HEAP_PROPERTIES* heap,
+    D3D12_HEAP_FLAGS flags, const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
+    const D3D12_CLEAR_VALUE* clear, REFIID iid, void** resource) {
+  if (native::AdaptivePreparationActive()
+      && ((fail_resource_phase == 1 && native::preparing_adaptive_frame == nullptr)
+          || (fail_resource_phase == 2 && native::preparing_adaptive_frame != nullptr
+              && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER))) {
+    fail_resource_phase = 0;
+    *resource = nullptr;
+    return E_OUTOFMEMORY;
+  }
+  return real_create_resource(device, heap, flags, desc, state, clear, iid, resource);
+}
+
 int Run() {
   try {
     reshade::internal::get_reshade_module_handle(GetModuleHandleW(nullptr));
@@ -37,6 +56,8 @@ int Run() {
     model_gpu = &gpu;
     ComPtr<ID3D12InfoQueue> info;
     gpu.device.As(&info);
+    Check(debug != nullptr && info != nullptr, "adaptive inline requires the D3D12 debug layer and InfoQueue");
+    std::cout << "ADAPTIVE_INLINE debug_layer=1 info_queue=1\n";
     native::enabled = true;
     native::hooks_enabled = true;
     Check(native::dedupe_mode.load() == native::defaults::kDedupeMode,
@@ -235,6 +256,98 @@ int Run() {
       for (uint32_t step = 0; step < 32; ++step) cold_record();
       Check(native::features.at(cold_handle).adaptive_session->prepared && model_calls > evaluates_before
           && pipeline_calls == 15, "ready two-Pass operation reuses every prepared pipeline");
+      {
+        real_create_resource = reinterpret_cast<CreateResourceFn>((*reinterpret_cast<void***>(gpu.device.Get()))[27]);
+        Check(DetourTransactionBegin() == NO_ERROR && DetourUpdateThread(GetCurrentThread()) == NO_ERROR
+            && DetourAttach(reinterpret_cast<PVOID*>(&real_create_resource), reinterpret_cast<PVOID>(ObserveCreateResource)) == NO_ERROR
+            && DetourTransactionCommit() == NO_ERROR, "adaptive allocation-failure observer attach");
+        const auto pressure_record = [&](bool reset = true) {
+          ++native::present_generation;
+          bool accepted = false;
+          {
+            const addon::EvaluateChainScope chain;
+            const addon::SourceStageScope source(cold_handle, true);
+            accepted = native::ProcessInline(gpu.list.Get(), cold_handle, &parameters);
+          }
+          submit(reset);
+          return accepted;
+        };
+        native::nr_adaptive_selected_levels = 2;
+        native::RecreateFeatures();
+        submit();
+        const auto before_upper_oom = next_handle;
+        const bool look_before = native::look_unavailable;
+        fail_resource_phase = 1;
+        for (uint32_t step = 0; step < 8; ++step) pressure_record();
+        Check(fail_resource_phase == 0 && next_handle == before_upper_oom
+            && !native::features.at(cold_handle).adaptive_session->prepared
+            && native::features.at(cold_handle).adaptive_session->status.reason == addon::adaptive_resolution::Reason::BUDGET
+            && native::look_unavailable == look_before,
+            "first-upper resource OOM pauses every subsequent source without creating any model or disabling the ordinary Look stage");
+        native::RecreateFeatures();
+        submit();
+        for (uint32_t step = 0; step < 32; ++step) pressure_record();
+        auto cache = native::features.at(cold_handle).adaptive_cache;
+        Check(native::features.at(cold_handle).adaptive_session->prepared && cache->count == 2,
+            "explicit recovery after first-upper OOM prepares a complete two-Pass collection");
+        const auto* upper = native::features.at(cold_handle).slots[0].handle;
+        const auto* standby = cache->tiers[1].state.slots[0].handle;
+        const auto released_before = std::count(model_released_handles.begin(), model_released_handles.end(), standby);
+        addon::submission::TrackUse(gpu.list.Get(), standby);
+        addon::submission::TrackUse(gpu.list.Get(), cache->tiers[1].recording_token.get());
+        pressure_record(false);
+        auto parked_list = gpu.list;
+        auto parked_allocator = gpu.allocator;
+        Check(!addon::submission::ResourceReleasable(standby),
+            "the completed parked recording genuinely retains the standby before allocation failure");
+        ComPtr<ID3D12CommandAllocator> next_allocator;
+        ComPtr<ID3D12GraphicsCommandList> next_list;
+        Check(SUCCEEDED(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(&next_allocator))), "resource-pressure recovery allocator");
+        Check(SUCCEEDED(gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            next_allocator.Get(), nullptr, IID_PPV_ARGS(&next_list))), "resource-pressure recovery list");
+        gpu.allocator = next_allocator;
+        gpu.list = next_list;
+        Check(native::InstallCommandListStateHooks(gpu.list.Get()), "resource-pressure recovery list hooks");
+        native::kSetAdaptiveLevelCount.Store(3.f);
+        const auto before_standby_oom = next_handle;
+        fail_resource_phase = 2;
+        for (uint32_t step = 0; step < 12 && fail_resource_phase != 0; ++step) pressure_record();
+        Check(fail_resource_phase == 0 && next_handle == before_standby_oom && cache->budget_blocked
+            && cache->standby_retired && !native::features.at(cold_handle).adaptive_session->prepared
+            && native::features.at(cold_handle).slots[0].handle == upper
+            && native::AdaptiveRetirementPending(cold_handle),
+            "standby Look allocation OOM stops before NGX Create and retires the unused collection while retaining the healthy upper");
+        Check(std::count(model_released_handles.begin(), model_released_handles.end(), standby) == released_before,
+            "a GPU-complete but replayable recording still protects the failed collection's standby model");
+        native::disable_release_mode = 0;
+        native::enabled = false;
+        native::ServiceDisabledNr();
+        Check(native::features.at(cold_handle).slots[0].handle == upper,
+            "NRDisableRelease=0 still retains the healthy upper while NR is Off");
+        native::enabled = true;
+        native::RecreateFeatures();
+        const auto before_retry = next_handle;
+        for (uint32_t step = 0; step < 4; ++step) {
+          Check(!pressure_record(), "re-enable keeps the host output while its failed collection is still replayable");
+        }
+        Check(next_handle == before_retry && native::AdaptiveRetirementPending(cold_handle),
+            "re-enable never overlaps new models with the failed collection's necessary retirements");
+        Check(SUCCEEDED(parked_allocator->Reset()) && SUCCEEDED(parked_list->Reset(parked_allocator.Get(), nullptr))
+            && SUCCEEDED(parked_list->Close()), "discard only the already completed parked recording");
+        native::DrainRetiredResources(true);
+        Check(!native::AdaptiveRetirementPending(cold_handle)
+            && std::count(model_released_handles.begin(), model_released_handles.end(), standby) == released_before + 1,
+            "the failed standby releases after its exact recording closes");
+        for (uint32_t step = 0; step < 40; ++step) pressure_record();
+        Check(native::features.at(cold_handle).adaptive_session->prepared
+            && !native::features.at(cold_handle).adaptive_retirement_blocked,
+            "ordinary inline re-enable clears its retirement gate and fully recovers without weakening the proof");
+        Check(DetourTransactionBegin() == NO_ERROR && DetourUpdateThread(GetCurrentThread()) == NO_ERROR
+            && DetourDetach(reinterpret_cast<PVOID*>(&real_create_resource), reinterpret_cast<PVOID>(ObserveCreateResource)) == NO_ERROR
+            && DetourTransactionCommit() == NO_ERROR, "adaptive allocation-failure observer detach");
+        native::nr_adaptive_selected_levels = 0;
+      }
       Check(DetourTransactionBegin() == NO_ERROR && DetourUpdateThread(GetCurrentThread()) == NO_ERROR
           && DetourDetach(reinterpret_cast<PVOID*>(&real_create_pipeline), reinterpret_cast<PVOID>(ObserveCreatePipeline)) == NO_ERROR
           && DetourTransactionCommit() == NO_ERROR, "cold inline PSO observer detach");
@@ -385,6 +498,41 @@ int Run() {
           << " reason=" << addon::adaptive_resolution::ReasonText(feature.adaptive_session->status.reason) << '\n';
       Check(cache != nullptr && cache->count == 2 && cache->output_count == 2,
           "inline A/B rotation shares the original four-workset budget across two tiers");
+      if (hook == native::kHookRender) {
+        for (const auto& [key, resources] : native::worksets) {
+          if (key.handle != handle || !key.pre_sr) continue;
+          Check(resources.adaptive_recording_token != nullptr
+              && resources.adaptive_recording_token == cache->tiers[key.adaptive_slot].recording_token,
+              "the actual Render workset owns the selected Render tier's recording token");
+        }
+        auto nested_color = texture(DXGI_FORMAT_R8G8B8A8_UNORM, false);
+        auto nested = std::make_shared<native::FeatureState>();
+        nested->adaptive_session = feature.adaptive_session;
+        nested->adaptive_cache = std::make_shared<native::AdaptiveFeatureCache>();
+        auto& nested_cache = *nested->adaptive_cache;
+        nested_cache.owner = handle;
+        nested_cache.pre_sr = true;
+        nested_cache.count = 1;
+        nested_cache.tiers[0].recording_token = std::make_shared<uint8_t>(0);
+        const auto nested_token = nested_cache.tiers[0].recording_token;
+        auto previous_render = std::exchange(feature.render_session, nested);
+        native::max_worksets = 5;
+        auto* nested_workset = native::EnsureWorkset(gpu.device.Get(), handle, nested_color.Get(),
+            16, 16, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 1, 0, true);
+        Check(nested_workset != nullptr && nested_workset->adaptive_recording_token == nested_token
+            && nested_workset->adaptive_recording_token != cache->tiers[0].recording_token,
+            "nested Render allocation takes its real owner token instead of the parent's adaptive cache");
+        native::RetireFailedAdaptivePreparation(nested.get());
+        native::max_worksets = 4;
+        Check(native::AdaptiveRetirementPending(handle)
+            && std::count_if(native::worksets.begin(), native::worksets.end(), [&](const auto& workset) {
+                 return native::AdaptiveCacheOwnsWorkset(*cache, workset.first, workset.second);
+               }) == 4,
+            "failed nested Render retirement tracks its actual scratch and preserves the parent's four live worksets");
+        submit();
+        Check(!native::AdaptiveRetirementPending(handle), "nested Render scratch completes its own exact retirement");
+        feature.render_session = std::move(previous_render);
+      }
       {
         const addon::adaptive_resolution::Frame adaptive_frame{.slot = 1, .enabled = true};
         const native::AdaptiveFrameScope scope(&adaptive_frame);
@@ -524,9 +672,12 @@ int Run() {
         native::max_worksets = 4;
         set(native::kSetAdaptiveLevelCount, 2.f);
         set(native::kSetAdaptiveTargetFps, saved_target);
-        Check(record() && record() && feature.adaptive_cache == cache && feature.adaptive_session->prepared
-            && cache->count == 2 && native::nr_features_created == three_models,
-            "an explicit selection rechecks budget once and reuses both retained complete-size tuples");
+        for (uint32_t warmup = 0; warmup < 24; ++warmup) record();
+        Check(feature.adaptive_cache == cache && feature.adaptive_session->prepared
+            && cache->count == 2 && native::nr_features_created == three_models + 1
+            && feature.slots[0].handle == upper_model,
+            "an explicit selection rechecks budget and rebuilds the retired lower tier while retaining its healthy upper");
+        const auto recovered_models = native::nr_features_created;
 
         set(native::kSetAdaptiveMinScale, .5f);
         record();
@@ -535,7 +686,7 @@ int Run() {
         for (uint32_t warmup = 0; warmup < 24; ++warmup) record();
         Check(feature.adaptive_cache == cache && feature.adaptive_session->prepared && cache->tiers[1].ready
             && cache->ladder.sizes[1][0].width == 8 && feature.slots[0].handle == upper_model
-            && native::nr_features_created == three_models + 1,
+            && native::nr_features_created == recovered_models + 1,
             "editing the minimum prepares the missing endpoint while retaining the complete upper allocation");
         feature.adaptive_session->Request(1, native::SteadyNowNs());
         Check(record() && record() && cache->active == 1 && feature.input_width == 8,
