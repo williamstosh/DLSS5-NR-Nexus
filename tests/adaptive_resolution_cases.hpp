@@ -461,6 +461,121 @@ inline bool Run() {
   check(legacy_automatic.trial && legacy_automatic.level == 1 && legacy_automatic.ladder.count == 2
       && legacy_automatic.status.requested == legacy_automatic.minimum && !legacy_automatic.prepared,
       "the default-off experiment still starts its automatic on-demand endpoint request without a full-set gate");
+
+  adaptive::Settings limited_settings{.enabled = true, .target_fps = 360.f, .minimum_scale = .33f,
+      .prepared_levels = 2, .selected_levels = 15, .limited_residency = true};
+  adaptive::Session limited;
+  adaptive::Output limited_output{.available = true, .source = 1, .generation = 1, .configuration = 1,
+      .fps = 100., .observed_multiplier = 4.};
+  limited.Prepare(limited_settings, full_upper, full_floor, 1, limited_output, start, true, false, 70);
+  limited.UpdateTargetPreparation(limited.preparation_epoch, limited.status.generation, 1, 15,
+      true, adaptive::Reason::PREPARING, start);
+  limited.Applied(limited.status.generation, full_upper, start);
+  check(limited.ladder.count == 15 && !limited.prepared && limited.TargetReady()
+      && limited.status.ready_levels == 1 && limited.status.applied == full_upper,
+      "limited residency retains the full logical ladder while reporting only the ready target");
+  limited.trial = true;
+  limited.previous_level = 0;
+  limited.baseline_fps = 100.;
+  limited.baseline_gpu_us = 4000.;
+  limited.Request(1, start + 1);
+  const auto cold_generation = limited.status.generation;
+  const auto cold_target = limited.status.requested;
+  for (uint64_t index = 1; index <= 24; ++index) {
+    const int64_t now = start + static_cast<int64_t>(index) * adaptive::SAMPLE_INTERVAL_NS;
+    limited.ObserveGpu({.generation = cold_generation, .frame = index, .sequence = index,
+        .context = 1, .recorded_ns = now, .completed_ns = now, .total_us = 100.,
+        .valid = true, .stable = true}, now);
+    limited_output.serial++;
+    limited_output.begin_ns = now - adaptive::WARMUP_NS;
+    limited_output.end_ns = now;
+    limited.Prepare(limited_settings, full_upper, full_floor, 1, limited_output, now, true, false, 70);
+    limited.UpdateTargetPreparation(limited.preparation_epoch, cold_generation, 1, 15,
+        false, adaptive::Reason::PREPARING, now);
+    limited.Applied(cold_generation, cold_target, now);
+  }
+  check(limited.level == 1 && limited.trial && limited.previous_level == 0 && limited.baseline_fps == 100.
+      && limited.status.applied == full_upper && limited.active_level == 0 && limited.status.coefficient == 1.f
+      && limited.applied_ns == 0 && limited.gpu_count == 0 && !limited.TargetReady(),
+      "a cold target keeps the actual output and cumulative anchor without measuring fallback work as benefit");
+  const int64_t target_ready_ns = start + 7'000'000'000;
+  limited.UpdateTargetPreparation(limited.preparation_epoch, cold_generation - 1, 2, 15,
+      true, adaptive::Reason::PREPARING, target_ready_ns);
+  limited.UpdateTargetPreparation(limited.preparation_epoch, cold_generation, 1, 1,
+      true, adaptive::Reason::PREPARING, target_ready_ns);
+  check(!limited.TargetReady(), "stale targets and partial logical contracts cannot publish target readiness");
+  limited.UpdateTargetPreparation(limited.preparation_epoch, cold_generation, 2, 15,
+      true, adaptive::Reason::PREPARING, target_ready_ns);
+  check(limited.TargetReady() && !limited.prepared && limited.applied_ns == 0,
+      "a complete target receipt is distinct from actual application and full-ladder readiness");
+  const int64_t applied_now = target_ready_ns + adaptive::WARMUP_NS;
+  limited.Applied(cold_generation, cold_target, applied_now);
+  check(limited.active_level == 1 && limited.status.applied == cold_target
+      && limited.stable_after_ns == applied_now + adaptive::WARMUP_NS && limited.last_switch_ns == applied_now,
+      "cold waiting does not consume the actual application's warmup or minimum switch spacing");
+  limited.Request(2, applied_now + 1);
+  const auto superseded = limited.status.generation;
+  limited.Request(0, applied_now + 2);
+  limited.UpdateTargetPreparation(limited.preparation_epoch, superseded, 3, 15,
+      true, adaptive::Reason::PREPARING, applied_now + 3);
+  limited.Applied(superseded, limited.ladder.sizes[2], applied_now + 3);
+  check(!limited.TargetReady() && limited.status.applied == cold_target && limited.active_level == 1,
+      "a superseded cold completion cannot apply after a reverse request");
+  limited.UpdateTargetPreparation(limited.preparation_epoch, limited.status.generation, 2, 15,
+      true, adaptive::Reason::PREPARING, applied_now + 4);
+  limited.Applied(limited.status.generation, full_upper, applied_now + 5);
+  check(limited.status.applied == full_upper && limited.active_level == 0 && !limited.prepared,
+      "a reverse request can reuse its ready rollback tier without claiming the full ladder is resident");
+  limited.Request(3, applied_now + 6);
+  limited.UpdateTargetPreparation(limited.preparation_epoch, limited.status.generation, 2, 15,
+      false, adaptive::Reason::BUDGET, applied_now + 7);
+  check(limited.status.reason == adaptive::Reason::BUDGET && limited.level == 3
+      && limited.status.applied == full_upper && !limited.TargetReady(),
+      "capacity failure leaves actual fallback ownership to the runtime without inventing an applied upper");
+  auto disabled_limited = limited;
+  disabled_limited.status.applied = cold_target;
+  disabled_limited.active_level = 1;
+  auto disabled_settings = limited_settings;
+  disabled_settings.enabled = false;
+  disabled_limited.Prepare(disabled_settings, full_upper, full_floor, 2, limited_output,
+      applied_now + 8, true, false, 70);
+  disabled_limited.Applied(disabled_limited.status.generation, full_upper, applied_now + 9);
+  check(disabled_limited.status.reason == adaptive::Reason::DISABLED
+      && disabled_limited.status.applied == full_upper && disabled_limited.active_level == 0,
+      "disabling automatic sizing records the successful return to its retained manual upper");
+
+  adaptive::Session limited_curve;
+  limited_settings.selected_levels = 9;
+  limited_output = {.available = true, .source = 1, .generation = 1, .configuration = 1,
+      .fps = 100., .observed_multiplier = 4.};
+  uint64_t pending_generation = 0;
+  int pending_ticks = 0;
+  size_t deepest_applied = 0;
+  for (uint64_t index = 0; index <= 220; ++index) {
+    const int64_t now = start + static_cast<int64_t>(index) * adaptive::SAMPLE_INTERVAL_NS;
+    const double coefficient = limited_curve.status.coefficient;
+    limited_curve.ObserveGpu({.generation = limited_curve.status.generation, .frame = index + 1,
+        .sequence = index + 1, .context = 1, .recorded_ns = now, .completed_ns = now,
+        .total_us = 4000. * coefficient, .valid = true, .stable = true}, now);
+    limited_output.serial++;
+    limited_output.begin_ns = now - 2'000'000'000;
+    limited_output.end_ns = now;
+    limited_output.fps = 100. + 30. * (1. - coefficient);
+    limited_curve.Prepare(limited_settings, full_upper, full_floor, 1, limited_output, now, true, false, 71);
+    if (pending_generation != limited_curve.status.generation) {
+      pending_generation = limited_curve.status.generation;
+      pending_ticks = 0;
+    }
+    const bool complete = ++pending_ticks >= 8;
+    limited_curve.UpdateTargetPreparation(limited_curve.preparation_epoch, pending_generation, 2, 9,
+        complete, adaptive::Reason::PREPARING, now);
+    if (complete) {
+      limited_curve.Applied(pending_generation, limited_curve.status.requested, now);
+      deepest_applied = std::max(deepest_applied, limited_curve.active_level);
+    }
+  }
+  check(deepest_applied >= 3 && !limited_curve.prepared && !limited_curve.settings.legacy_preparation,
+      "delayed cold targets still explore useful fine steps through the normal cumulative controller");
   return passed;
 }
 }  // namespace adaptive_resolution_cases

@@ -137,6 +137,8 @@ int Run() {
     uint64_t observing_context = 0;
     std::array<uint32_t, 2> active_pass_masks{}, failed_pass_masks{}, reset_pass_masks{};
     uint32_t partial_role_recordings = 0;
+    bool verify_limited_commit = false;
+    addon::adaptive_resolution::Sizes before_limited_commit;
     model_parameter_observer = [&](const NVSDK_NGX_Handle* model, const NVSDK_NGX_Parameter* parameters) {
       Check(native::GetD3D12Resource(parameters, "DLSSNR.ControlMask") != nullptr,
           "every model call receives the production GPU ControlMask");
@@ -148,6 +150,12 @@ int Run() {
       } else {
         const auto stream = native::fg_service::streams.find({false, observing_context});
         Check(stream != native::fg_service::streams.end(), "active model Evaluate belongs to the observed Service context");
+        if (verify_limited_commit && stream->second.adaptive_session->settings.limited_residency
+            && stream->second.adaptive_frame.slot == stream->second.adaptive_session->level) {
+          Check(stream->second.adaptive_session->status.applied == before_limited_commit
+              && stream->second.adaptive_session->applied_ns == 0,
+              "neither color nor an earlier Pass can commit the requested target before the complete Service output group");
+        }
         bool identified = false;
         for (size_t role = 0; role < active_pass_masks.size(); ++role) {
           const auto feature = native::features.find(stream->second.roles[role].Handle());
@@ -901,6 +909,67 @@ int Run() {
           && native::present_retired.empty(), "a subsequent Off also completes without another Service or Resize");
       std::cout << "ADAPTIVE_OFF evidence=WARP+MOCK private_replay_closed=1 external_replay_retained=1 released=1 reenabled=1\n";
     }
+    list_calls.clear();
+    native::enabled = true;
+    native::ServiceDisabledNr();
+    native::nr_adaptive_limited_residency = true;
+    native::nr_adaptive_enabled = true;
+    native::nr_adaptive_selected_levels = 5;
+    input.context = 0xADAFB;
+    input.application_frame = 0;
+    input.color_width = input.color_height = 16;
+    input.hudless = hudless.Get();
+    const auto before_limited_models = native::nr_features_created;
+    for (uint32_t source = 0; source < 32; ++source) {
+      service();
+      const auto& preparing = native::fg_service::streams.at({false, input.context});
+      if (preparing.adaptive_session != nullptr && preparing.adaptive_session->TargetReady()) break;
+    }
+    auto& limited = native::fg_service::streams.at({false, input.context});
+    auto limited_primary = native::features.at(limited.roles[0].Handle()).adaptive_cache;
+    auto limited_auxiliary = native::features.at(limited.roles[1].Handle()).adaptive_cache;
+    Check(limited.adaptive_session->TargetReady() && !limited.adaptive_session->prepared
+        && limited.adaptive_session->ladder.count == 5 && limited_primary->count == 5 && limited_auxiliary->count == 5
+        && limited_primary->active == 0 && limited_auxiliary->active == 0
+        && native::nr_features_created == before_limited_models + 4
+        && native::AdaptiveResidentWorksetCount(limited.adaptive_session) == 2,
+        "limited paired Service initially prepares only the two-Pass upper for both colors while retaining five logical levels");
+    before_limited_commit = limited.adaptive_session->status.applied;
+    limited.adaptive_session->Request(3, native::SteadyNowNs());
+    verify_limited_commit = true;
+    service();
+    Check(!limited.adaptive_session->TargetReady() && limited_primary->active == 0 && limited_auxiliary->active == 0
+        && limited.adaptive_session->status.applied == before_limited_commit,
+        "a cold two-Pass color pair keeps both actual active tiers until the whole requested group is ready");
+    for (uint32_t source = 0; source < 32 && limited_primary->active != 3; ++source) service();
+    verify_limited_commit = false;
+    Check(limited_primary->active == 3 && limited_auxiliary->active == 3 && limited.adaptive_session->TargetReady()
+        && limited.adaptive_session->status.applied == limited.adaptive_session->ladder.sizes[3]
+        && limited.adaptive_session->applied_ns != 0 && !limited.adaptive_session->prepared
+        && native::nr_features_created == before_limited_models + 8,
+        "only complete successful output for both colors commits a cold target and starts its measurement warmup");
+    limited.adaptive_session->Request(2, native::SteadyNowNs());
+    service();
+    limited.adaptive_session->Request(0, native::SteadyNowNs());
+    for (uint32_t source = 0; source < 16; ++source) service();
+    Check(limited_primary->active == 0 && limited_auxiliary->active == 0 && limited.adaptive_session->TargetReady()
+        && limited.adaptive_session->status.applied == limited.adaptive_session->status.upper
+        && !limited.adaptive_session->failed && !limited_primary->standby_retired && !limited_auxiliary->standby_retired,
+        "reversing a pending request preserves the upper pair and treats unused candidates as ordinary retirement");
+    const auto after_limited_reverse = native::nr_features_created;
+    for (uint32_t source = 0; source < 4; ++source) service();
+    Check(native::nr_features_created == after_limited_reverse
+        && !native::AdaptiveSessionRetirementPending(limited.adaptive_session)
+        && native::AdaptiveResidentWorksetCount(limited.adaptive_session) == 2,
+        "canceled candidates finish exact retirement without background rebuilding the remaining logical levels");
+    native::nr_adaptive_enabled = false;
+    service();
+    Check(limited.adaptive_session->status.applied == limited.adaptive_session->status.upper
+        && native::features.at(limited.roles[0].Handle()).adaptive_cache == nullptr
+        && native::features.at(limited.roles[1].Handle()).adaptive_cache == nullptr,
+        "limited paired Adaptive Off retains the actual manual upper behavior");
+    native::nr_adaptive_limited_residency = false;
+    native::nr_adaptive_selected_levels = 0;
     model_parameter_observer = {};
     native::fg_service::Retire();
     gpu.Submit();

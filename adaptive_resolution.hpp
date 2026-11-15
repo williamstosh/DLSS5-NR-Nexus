@@ -64,6 +64,7 @@ struct Settings {
   uint32_t selected_levels = 0;
   // The default-off preparation experiments retain their original on-demand ladder.
   bool legacy_preparation = false;
+  bool limited_residency = false;
   bool operator==(const Settings&) const = default;
 };
 struct Output {
@@ -141,6 +142,7 @@ struct Session {
   uint64_t configuration_epoch = 0;
   uint64_t preparation_epoch = 0;
   bool prepared = false;
+  bool target_ready = false;
   Reason preparation_reason = Reason::PREPARING;
   Sizes minimum{};
   uint64_t last_output_serial = 0, last_sequence = 0, gpu_context = 0;
@@ -179,6 +181,10 @@ struct Session {
     return true;
   }
 
+  bool TargetReady() const {
+    return (settings.limited_residency ? target_ready : prepared);
+  }
+
   void Request(size_t candidate, int64_t now_ns) {
     if (candidate >= ladder.count) return;
     if (!IsLegal(ladder.sizes[candidate])) {
@@ -186,7 +192,11 @@ struct Session {
     }
     level = candidate;
     ++status.generation;
-    status.coefficient = ladder.coefficients[level];
+    if (settings.limited_residency) {
+      target_ready = false;
+    } else {
+      status.coefficient = ladder.coefficients[level];
+    }
     status.requested = ladder.sizes[level];
     applied_ns = 0;
     stable_after_ns = now_ns + WARMUP_NS;
@@ -239,24 +249,74 @@ struct Session {
 
   void Applied(uint64_t generation, const Sizes& actual, int64_t now_ns) {
     if (generation != status.generation || actual != status.requested) return;
+    if (settings.enabled && settings.limited_residency && !target_ready) return;
     status.applied = actual;
     active_level = level;
     if (applied_ns != 0) return;
     applied_ns = now_ns;
     stable_after_ns = now_ns + WARMUP_NS;
+    if (settings.limited_residency) {
+      status.coefficient = ladder.coefficients[level];
+      last_switch_ns = now_ns;
+    }
   }
 
   void Fail(uint64_t generation) {
     if (generation != status.generation) return;
     failed = true;
     prepared = false;
+    target_ready = false;
     preparation_reason = Reason::FAILED;
     trial = false;
     status.reason = Reason::FAILED;
     ResetMeasurements();
   }
 
+  void UpdateTargetPreparation(uint64_t epoch, uint64_t generation, uint32_t ready, uint32_t required,
+                               bool target_complete, Reason reason, int64_t now_ns) {
+    if (!settings.limited_residency || epoch != preparation_epoch || generation != status.generation
+        || !settings.enabled) return;
+    status.ready_levels = std::min(ready, required);
+    status.prepared_levels = required;
+    prepared = required == ladder.count && required != 0 && ready == required;
+    if (failed || preparation_reason == Reason::FAILED || reason == Reason::FAILED) {
+      Fail(generation);
+      return;
+    }
+    if (reason == Reason::BUDGET || preparation_reason == Reason::BUDGET) {
+      target_ready = false;
+      prepared = false;
+      trial = false;
+      preparation_reason = Reason::BUDGET;
+      status.reason = Reason::BUDGET;
+      ResetMeasurements();
+      return;
+    }
+    const bool complete = required == ladder.count && required != 0 && ready != 0 && target_complete;
+    if (!complete) {
+      if (target_ready) {
+        ResetMeasurements();
+        applied_ns = 0;
+      }
+      target_ready = false;
+      preparation_reason = Reason::PREPARING;
+      status.reason = Reason::PREPARING;
+      return;
+    }
+    if (!target_ready) {
+      target_ready = true;
+      ResetMeasurements();
+      stable_after_ns = now_ns + WARMUP_NS;
+      preparation_reason = Reason::PREPARING;
+      status.reason = Reason::WARMING;
+    }
+  }
+
   void UpdatePreparation(uint64_t epoch, uint32_t ready, uint32_t required, Reason reason, int64_t now_ns) {
+    if (settings.limited_residency) {
+      UpdateTargetPreparation(epoch, status.generation, ready, required, false, reason, now_ns);
+      return;
+    }
     if (epoch != preparation_epoch || !settings.enabled) return;
     status.ready_levels = std::min(ready, required);
     status.prepared_levels = required;
@@ -299,7 +359,7 @@ struct Session {
   }
 
   void ObserveGpu(const GpuSample& sample, int64_t now_ns) {
-    if ((!prepared && !settings.legacy_preparation) || sample.generation != status.generation
+    if ((!TargetReady() && !settings.legacy_preparation) || sample.generation != status.generation
         || (sample.sequence <= last_sequence && (pending_roles == 0 || sample.frame != pending.frame))) return;
     last_sequence = std::max(last_sequence, sample.sequence);
     if (!sample.valid || !sample.stable || sample.recorded_ns < stable_after_ns || applied_ns == 0
@@ -374,7 +434,8 @@ struct Session {
     const bool selection_changed = ladder.count != selected.count || ladder.sizes != selected.sizes;
     const bool selection_edited = settings.selected_levels != next.selected_levels || settings.minimum_scale != next.minimum_scale;
     const bool toggled = settings.enabled != next.enabled;
-    const bool preparation_mode_changed = settings.legacy_preparation != next.legacy_preparation;
+    const bool preparation_mode_changed = settings.legacy_preparation != next.legacy_preparation
+        || settings.limited_residency != next.limited_residency;
     const bool changed = identity != source_identity || settings != next || status.upper != upper || selection_changed;
     if (resources_changed) {
       const uint64_t generation = status.generation + 1;
@@ -397,6 +458,7 @@ struct Session {
       if (selection_changed || toggled || preparation_mode_changed || retry_budget) {
         ++preparation_epoch;
         prepared = false;
+        target_ready = false;
         status.ready_levels = 0;
         status.prepared_levels = static_cast<uint32_t>(selected.count);
       }
@@ -450,11 +512,12 @@ struct Session {
       status.reason = Reason::FROZEN;
       return;
     }
-    if (!settings.legacy_preparation && (preparation_reason == Reason::BUDGET || ladder.count > settings.prepared_levels)) {
+    if (!settings.legacy_preparation && (preparation_reason == Reason::BUDGET
+        || (!settings.limited_residency && ladder.count > settings.prepared_levels))) {
       UpdatePreparation(preparation_epoch, status.ready_levels, static_cast<uint32_t>(ladder.count), Reason::BUDGET, now_ns);
       return;
     }
-    if (!settings.legacy_preparation && !prepared) {
+    if (!settings.legacy_preparation && !settings.limited_residency && !prepared) {
       status.reason = Reason::PREPARING;
       return;
     }
@@ -485,6 +548,10 @@ struct Session {
       trial = false;
       ResetMeasurements();
       status.reason = Reason::COLLECTING;
+      return;
+    }
+    if (settings.limited_residency && !target_ready) {
+      status.reason = Reason::PREPARING;
       return;
     }
     if (blocked && now_ns >= blocked_until_ns) {
@@ -549,7 +616,7 @@ struct Session {
           stable_after_ns = output.end_ns;
           return;
         }
-        if (!settings.legacy_preparation && prepared && !raising && !multiplier_changed && cheaper
+        if (!settings.legacy_preparation && TargetReady() && !raising && !multiplier_changed && cheaper
             && output.fps >= baseline_fps - fps_margin) {
           const size_t candidate = adjacent(false, 1);
           if (candidate != level) {

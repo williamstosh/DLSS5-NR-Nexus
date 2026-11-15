@@ -79,6 +79,7 @@ int Run() {
     native::nr_adaptive_min_scale = .33f;
     native::nr_adaptive_target_fps = 116.f;
     Check(native::adaptive_feature_mode.load() == native::AdaptiveFeatureMode::OFF, "Feature capacity experiment defaults to disabled");
+    Check(!native::nr_adaptive_limited_residency.load(), "limited residency experiment defaults to disabled");
     native::max_worksets = 4;
     native::OnNativeFgOptions(false);
     native::adaptive_configuration_settings = native::comparison_ui::CaptureAdaptiveSettings;
@@ -989,7 +990,7 @@ int Run() {
       native::RegisterCreatedFeatureLocked(wide_handle, native::kFeatureDlss, &wide_parameters);
       const auto before_wide_models = native::nr_features_created;
       uint32_t wide_frame = 0;
-      const auto wide_record = [&](bool verify_writeback = false) {
+      const auto wide_record = [&](bool verify_writeback = false, bool reset = true) {
         ++native::present_generation;
         const uint32_t output = wide_frame++ % 2;
         if (verify_writeback) {
@@ -1020,7 +1021,7 @@ int Run() {
           gpu.Transition(wide_outputs[output].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
-        submit();
+        submit(reset);
         Check(SUCCEEDED(gpu.device->GetDeviceRemovedReason())
             && gpu.fence->GetCompletedValue() != UINT64_MAX && gpu.fence->GetCompletedValue() >= gpu.serial,
             "every selected-level step finishes on a healthy WARP Fence");
@@ -1119,6 +1120,91 @@ int Run() {
           && std::none_of(native::worksets.begin(), native::worksets.end(), [&](const auto& workset) {
                return workset.first.handle == wide_handle && !workset.first.pre_sr;
              }), "the pool can recycle old PostSR scratch while every selected Render workset stays resident");
+
+      native::RecreateFeatures();
+      submit();
+      native::nr_adaptive_limited_residency = true;
+      native::nr_adaptive_selected_levels = 15;
+      const auto before_limited_models = native::nr_features_created;
+      for (uint32_t source = 0; source < 32; ++source) {
+        wide_record();
+        if (wide.adaptive_session->TargetReady()) break;
+      }
+      auto limited = wide.adaptive_cache;
+      std::cout << "ADAPTIVE_LIMITED initial logical=" << (limited != nullptr ? limited->count : 0)
+          << " ready=" << wide.adaptive_session->TargetReady() << " failed=" << wide.adaptive_session->failed
+          << " active=" << (limited != nullptr ? limited->active : 0)
+          << " reserved=" << native::adaptive_resident_worksets
+          << " resident=" << native::AdaptiveResidentWorksetCount(wide.adaptive_session)
+          << " pool=" << native::worksets.size() << '/' << native::EffectiveAdaptiveWorksetLimit()
+          << " new_models=" << native::nr_features_created - before_limited_models
+          << " reason=" << addon::adaptive_resolution::ReasonText(wide.adaptive_session->status.reason) << '\n';
+      Check(limited != nullptr && limited->count == 15 && wide.adaptive_session->TargetReady()
+          && !wide.adaptive_session->prepared && limited->active == 0
+          && native::nr_features_created == before_limited_models + 1
+          && native::AdaptiveResidentWorksetCount(wide.adaptive_session) == 2,
+          "limited residency retains fifteen logical sizes but initially creates only the complete upper on both outputs");
+      const auto upper_applied = wide.adaptive_session->status.applied;
+      wide.adaptive_session->Request(6, native::SteadyNowNs());
+      wide_record();
+      Check(wide.adaptive_session->settings.prepared_levels == 15 && wide.adaptive_session->level == 6
+          && !wide.adaptive_session->TargetReady() && limited->active == 0
+          && wide.adaptive_session->status.applied == upper_applied && wide.adaptive_session->applied_ns == 0,
+          "a cold target preserves the actually applied upper until both output receipts are healthy");
+      for (uint32_t source = 0; source < 32 && limited->active != 6; ++source) wide_record();
+      Check(limited->active == 6 && wide.adaptive_session->TargetReady()
+          && wide.adaptive_session->status.applied == limited->ladder.sizes[6]
+          && native::nr_features_created == before_limited_models + 2,
+          "the requested cold Render tier applies only after its complete output group is ready");
+
+      wide_record(false, false);
+      auto retained_allocator = gpu.allocator;
+      auto retained_list = gpu.list;
+      const auto* retained_model = wide.slots[0].handle;
+      Check(!addon::submission::ResourceReleasable(retained_model),
+          "the limited active tier is still protected by its completed replayable host recording");
+      Check(SUCCEEDED(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(&gpu.allocator)))
+          && SUCCEEDED(gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                gpu.allocator.Get(), nullptr, IID_PPV_ARGS(&gpu.list)))
+          && native::InstallCommandListStateHooks(gpu.list.Get()), "limited residency replacement recording");
+      wide.adaptive_session->Request(0, native::SteadyNowNs());
+      wide_record();
+      wide_record();
+      Check(limited->active == 0 && native::AdaptiveRetirementPending(wide_handle)
+          && !wide.adaptive_session->failed && !limited->standby_retired,
+          "ordinary eviction leaves the healthy upper running while the old host recording remains replayable");
+      const auto waiting_models = native::nr_features_created;
+      wide.adaptive_session->Request(10, native::SteadyNowNs());
+      wide_record();
+      wide_record();
+      Check(limited->active == 0 && !wide.adaptive_session->TargetReady()
+          && native::nr_features_created == waiting_models && native::AdaptiveRetirementPending(wide_handle),
+          "a later cold request cannot allocate over an unretired ordinary eviction");
+      wide.adaptive_session->Request(0, native::SteadyNowNs());
+      wide_record();
+      wide_record();
+      Check(limited->active == 0 && wide.adaptive_session->TargetReady()
+          && native::nr_features_created == waiting_models,
+          "a reverse request can use the protected upper without waiting for or creating the canceled target");
+      Check(SUCCEEDED(retained_allocator->Reset())
+          && SUCCEEDED(retained_list->Reset(retained_allocator.Get(), nullptr)),
+          "only the legitimate host Reset ends the retired tier's replay eligibility");
+      native::DrainRetiredResources(true);
+      Check(!native::AdaptiveRetirementPending(wide_handle)
+          && addon::submission::ResourceReleasable(retained_model), "exact retirement completes before the next cold admission");
+      wide.adaptive_session->Request(10, native::SteadyNowNs());
+      for (uint32_t source = 0; source < 32 && limited->active != 10; ++source) wide_record();
+      Check(limited->active == 10 && wide.adaptive_session->TargetReady()
+          && wide.adaptive_session->status.applied == limited->ladder.sizes[10]
+          && native::nr_features_created == waiting_models + 1 && !wide.adaptive_session->prepared,
+          "a retired slot can be reused for one new complete target without claiming full-ladder preparedness");
+      native::nr_adaptive_enabled = false;
+      wide_record();
+      wide_record();
+      Check(wide.adaptive_cache == nullptr && wide.adaptive_session->status.applied == wide.adaptive_session->status.upper,
+          "limited adaptive Off restores the retained manual upper and retires optional tiers");
+      native::nr_adaptive_limited_residency = false;
       native::ForgetSourceHandleLocked(wide_handle);
       for (uint32_t stream = 0; stream < 4; ++stream) {
         const auto* ordinary = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xADA810} + stream);

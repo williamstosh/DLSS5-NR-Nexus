@@ -625,11 +625,17 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     if (!stream->adaptive_session->settings.legacy_preparation) {
       uint32_t ready = 0;
       for (size_t tier = 0; tier < stream->adaptive_session->ladder.count; ++tier) ready += selected_ready[tier];
-      stream->adaptive_session->UpdatePreparation(stream->adaptive_frame.preparation_epoch, ready,
-          static_cast<uint32_t>(stream->adaptive_session->ladder.count),
-          group_failed ? adaptive_resolution::Reason::FAILED
-              : (group_budget ? adaptive_resolution::Reason::BUDGET : adaptive_resolution::Reason::PREPARING), SteadyNowNs());
-      group_ready &= stream->adaptive_session->prepared;
+      const auto reason = (group_failed ? adaptive_resolution::Reason::FAILED
+          : (group_budget ? adaptive_resolution::Reason::BUDGET : adaptive_resolution::Reason::PREPARING));
+      if (stream->adaptive_session->settings.limited_residency) {
+        stream->adaptive_session->UpdateTargetPreparation(stream->adaptive_frame.preparation_epoch,
+            stream->adaptive_frame.generation, ready, static_cast<uint32_t>(stream->adaptive_session->ladder.count),
+            group_ready, reason, SteadyNowNs());
+      } else {
+        stream->adaptive_session->UpdatePreparation(stream->adaptive_frame.preparation_epoch, ready,
+            static_cast<uint32_t>(stream->adaptive_session->ladder.count), reason, SteadyNowNs());
+      }
+      group_ready &= stream->adaptive_session->TargetReady();
       PublishAdaptiveStatus(stream->adaptive_session->status);
     }
     const bool return_upper = upper_ready && (group_failed || group_budget
@@ -944,6 +950,12 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
         stream->last_output_frame[i] = input.application_frame;
       }
     }
+  }
+  if (stream->adaptive_session != nullptr && stream->adaptive_session->settings.limited_residency
+      && (stream->adaptive_frame.enabled || !stream->adaptive_session->settings.enabled)) {
+    // A role's ProcessInline success cannot commit the whole color group.
+    stream->adaptive_session->Applied(stream->adaptive_frame.generation, stream->adaptive_frame.sizes, SteadyNowNs());
+    PublishAdaptiveStatus(stream->adaptive_session->status);
   }
   *output_ready = true;
   return fg::Result::PREPARED;
