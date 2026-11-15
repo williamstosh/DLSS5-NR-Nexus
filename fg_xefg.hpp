@@ -77,6 +77,12 @@ struct BridgeDeviceObservation {
   HRESULT swapchain_result = E_PENDING;
   HRESULT device11_result = E_PENDING;
   HRESULT device12_result = E_PENDING;
+  // These probes inspect the object returned by GetDevice(ID3D11Device).
+  uintptr_t returned_device_identity = 0;
+  HRESULT device11_interface_result = E_PENDING;
+  HRESULT device12_interface_result = E_PENDING;
+  uintptr_t device11_interface_identity = 0;
+  uintptr_t device12_interface_identity = 0;
   bool operator==(const BridgeDeviceObservation&) const = default;
 };
 struct BridgeOffEvidence {
@@ -532,6 +538,19 @@ inline ComPtr<IUnknown> BridgeDeviceIdentity(IUnknown* object, BridgeDeviceObser
     observation->device11_result = device11_result;
     ComPtr<ID3D12Device> device12;
     observation->device12_result = swapchain->GetDevice(IID_PPV_ARGS(&device12));
+    if (SUCCEEDED(device11_result) && device != nullptr) {
+      observation->returned_device_identity = Identity(device.Get());
+      ComPtr<ID3D11Device> device11_interface;
+      observation->device11_interface_result = device->QueryInterface(IID_PPV_ARGS(&device11_interface));
+      if (SUCCEEDED(observation->device11_interface_result)) {
+        observation->device11_interface_identity = Identity(device11_interface.Get());
+      }
+      ComPtr<ID3D12Device> device12_interface;
+      observation->device12_interface_result = device->QueryInterface(IID_PPV_ARGS(&device12_interface));
+      if (SUCCEEDED(observation->device12_interface_result)) {
+        observation->device12_interface_identity = Identity(device12_interface.Get());
+      }
+    }
   }
   if (FAILED(device11_result)) return {};
   return ComPtr<IUnknown>(renodx::utils::directx::NativeIdentity(device.Get()));

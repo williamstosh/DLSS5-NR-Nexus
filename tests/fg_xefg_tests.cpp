@@ -106,11 +106,22 @@ std::atomic_bool receipt_device_release_unlocked{false};
 // fixture separately checks real D3D11 GetDevice capture and source matching.
 struct ReceiptDeviceIdentity : IUnknown {
   ULONG references = 1;
+  bool supports_device11 = false;
+  bool supports_device12 = false;
+  uint32_t device11_queries = 0;
+  uint32_t device12_queries = 0;
   void (*on_destroy)() = nullptr;
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** output) override {
     if (output == nullptr) return E_POINTER;
     *output = nullptr;
-    if (iid != IID_IUnknown) return E_NOINTERFACE;
+    if (iid == __uuidof(ID3D11Device)) {
+      ++device11_queries;
+    }
+    if (iid == __uuidof(ID3D12Device)) {
+      ++device12_queries;
+    }
+    if (iid != IID_IUnknown && !(iid == __uuidof(ID3D11Device) && supports_device11)
+        && !(iid == __uuidof(ID3D12Device) && supports_device12)) return E_NOINTERFACE;
     *output = this;
     AddRef();
     return S_OK;
@@ -498,6 +509,47 @@ int main(int argc, char** argv) {
                   && device12_observation.device11_result == E_NOINTERFACE && device12_observation.device12_result == S_OK,
             "a D3D12-only application chain is observable without inventing a D3D11 source identity");
         context = fresh_context();
+        for (const auto& [supports_device11, supports_device12] : std::array<std::pair<bool, bool>, 4>{
+                 {{false, false}, {false, true}, {true, false}, {true, true}}}) {
+          ComPtr<ReceiptDeviceIdentity> returned_device;
+          returned_device.Attach(new ReceiptDeviceIdentity());
+          returned_device->supports_device11 = supports_device11;
+          returned_device->supports_device12 = supports_device12;
+          ComPtr<ReceiptSwapchain> reported_swapchain;
+          reported_swapchain.Attach(new ReceiptSwapchain(returned_device.Get()));
+          if (supports_device12) {
+            reported_swapchain->reported_device12 = returned_device.Get();
+          }
+          const auto device_refs = returned_device->references;
+          const auto swapchain_refs = reported_swapchain->references;
+          xefg::BridgeDeviceObservation typed_observation;
+          auto captured_device = adapter::BridgeDeviceIdentity(reported_swapchain.Get(), &typed_observation);
+          const auto expected_identity = reinterpret_cast<uintptr_t>(static_cast<IUnknown*>(returned_device.Get()));
+          Check(typed_observation.device11_result == S_OK
+                    && typed_observation.device12_result == (supports_device12 ? S_OK : E_NOINTERFACE)
+                    && typed_observation.returned_device_identity == expected_identity
+                    && typed_observation.device11_interface_result == (supports_device11 ? S_OK : E_NOINTERFACE)
+                    && typed_observation.device12_interface_result == (supports_device12 ? S_OK : E_NOINTERFACE)
+                    && typed_observation.device11_interface_identity == (supports_device11 ? expected_identity : 0)
+                    && typed_observation.device12_interface_identity == (supports_device12 ? expected_identity : 0),
+              "returned-device diagnostics separate getter success, explicit interface capability and canonical identity");
+          Check(captured_device.Get() == returned_device.Get(),
+              "diagnostic interface queries preserve the existing getter-based classification for all four capabilities");
+          context->bridge_proxy_observation = typed_observation;
+          const auto typed_evidence = xefg::QueryBridgeOff(receipt_source);
+          Check(!typed_evidence.available && typed_evidence.proxy_device == typed_observation,
+              "returned-device interface metadata cannot independently grant an Off receipt");
+          captured_device.Reset();
+          const auto query11_before = returned_device->device11_queries;
+          const auto query12_before = returned_device->device12_queries;
+          auto identity_only = adapter::BridgeDeviceIdentity(reported_swapchain.Get());
+          Check(returned_device->device11_queries == query11_before && returned_device->device12_queries == query12_before,
+              "captures without an observation do not add per-Present device-interface queries");
+          identity_only.Reset();
+          Check(returned_device->references == device_refs && reported_swapchain->references == swapchain_refs,
+              "successful and rejected interface probes balance device and swapchain references");
+        }
+        std::cout << "PASS CPU MOCK returned-device diagnostics: IUnknown/D3D12/D3D11/dual, unchanged admission and balanced references; GPU=NotRun\n";
       }
       Check(!xefg::QueryBridgeOff(receipt_source).available, "default enabled=false is not an observed Disable");
       receipt_sdk_status = -19;
