@@ -47,14 +47,20 @@ int Run() {
     const auto finish = [&](uint32_t submissions = 1, bool preserve = true, bool poll = true) {
       Check(SUCCEEDED(gpu.list->Close()), "timer close");
       ID3D12CommandList* lists[]{gpu.list.Get()};
-      for (uint32_t i = 0; i < submissions; ++i) gpu.queue->ExecuteCommandLists(1, lists);
-      Check(SUCCEEDED(gpu.queue->Signal(gpu.fence.Get(), ++gpu.serial)), "timer completion signal");
-      HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-      Check(event != nullptr, "timer completion event");
-      const auto signal = gpu.fence->SetEventOnCompletion(gpu.serial, event);
-      const auto wait = (SUCCEEDED(signal) ? WaitForSingleObject(event, 10000) : WAIT_FAILED);
-      CloseHandle(event);
-      Check(wait == WAIT_OBJECT_0, "timer bounded GPU completion");
+      // Replay keeps the recording generation, but D3D12 requires the prior
+      // execution to finish first. Zero-submission discard probes still drain.
+      for (uint32_t i = 0; i < std::max(1u, submissions); ++i) {
+        if (i < submissions) {
+          gpu.queue->ExecuteCommandLists(1, lists);
+        }
+        Check(SUCCEEDED(gpu.queue->Signal(gpu.fence.Get(), ++gpu.serial)), "timer completion signal");
+        HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        Check(event != nullptr, "timer completion event");
+        const auto signal = gpu.fence->SetEventOnCompletion(gpu.serial, event);
+        const auto wait = (SUCCEEDED(signal) ? WaitForSingleObject(event, 10000) : WAIT_FAILED);
+        CloseHandle(event);
+        Check(wait == WAIT_OBJECT_0, "timer bounded GPU completion");
+      }
       if (poll) {
         const auto before_close = timers::published_segments;
         timers::Poll(true, false);
