@@ -144,6 +144,23 @@ inline bool InlineRestoreEligible(const InlineRestoreContext& context) {
       && context.hdr_mode == 0 && context.codec == 2 && context.format == DXGI_FORMAT_R16G16B16A16_UNORM;
 }
 
+inline bool BridgeModelStagesEligible(const InlineRestoreContext& context) {
+  return context.d3d11_bridge && !context.mixed && !context.present && !context.preparing
+      && !context.warmup && !context.reset_sent && context.reset_reasons == 0
+      && context.upscaled && context.api_returned && context.ngx_succeeded
+      && context.group_begin == 0 && context.stack == 1 && context.pass == 0
+      && context.work_width != 0 && context.work_height != 0
+      && context.work_width <= context.output_width && context.work_height <= context.output_height
+      && (context.work_width != context.output_width || context.work_height != context.output_height)
+      && context.output_rect.x == 0 && context.output_rect.y == 0
+      && context.output_rect.width == context.output_width && context.output_rect.height == context.output_height
+      && context.evaluation_sequence != 0 && context.source_generation != 0 && context.source_feature != 0
+      && context.hdr_mode == 0 && context.codec == 2 && context.format == DXGI_FORMAT_R16G16B16A16_UNORM;
+}
+
+inline constexpr std::array<const char*, 7> kBridgeModelStageNames{
+    "original", "proxy", "neural", "post_compose", "post_look", "post_resolve", "post_restore"};
+
 struct InlineRestoreStatus {
   std::string capture_id;
   const char* status = "idle";
@@ -354,6 +371,7 @@ struct InlineRestoreFrame {
   float gate = 0.f;
   size_t first_plane = 0;
   bool look_shaped = false, look_stability_recorded = false;
+  uint32_t look_width = 0, look_height = 0;
 };
 
 struct InlineRestoreCapture : InlineRestoreFrame {
@@ -429,6 +447,7 @@ struct PendingCapture {
   RequestKind request_kind = RequestKind::FINAL_PRESENTATION;
 #if defined(NR_NEXUS_DEV_CONTROL)
   std::optional<InlineRestoreCapture> inline_restore;
+  std::optional<InlineRestoreFrame> bridge_model_stages;
 #endif
   uint64_t service_serial = 0;
   uint64_t restore_config_epoch = 0;
@@ -973,6 +992,16 @@ inline bool DecodeDiagnosticRow(const uint8_t* source, uint32_t width,
         output[3] = (packed >> 30) / 3.f;
         break;
       }
+#if defined(NR_NEXUS_DEV_CONTROL)
+      case DXGI_FORMAT_R16G16B16A16_UNORM: {
+        uint16_t channels[4];
+        std::memcpy(channels, pixel, sizeof(channels));
+        for (size_t channel = 0; channel < 4; ++channel) {
+          output[channel] = channels[channel] / 65535.f;
+        }
+        break;
+      }
+#endif
       case DXGI_FORMAT_R16G16B16A16_FLOAT: {
         uint16_t channels[4];
         std::memcpy(channels, pixel, sizeof(channels));
@@ -1094,6 +1123,36 @@ inline bool VerifyPreFgReceivers(const PendingCapture& capture) {
   return recorded_role;
 }
 
+#if defined(NR_NEXUS_DEV_CONTROL)
+inline bool BridgeModelStagesComplete(const PendingCapture& capture) {
+  if (!capture.bridge_model_stages) return false;
+  const auto& frame = *capture.bridge_model_stages;
+  const auto& context = frame.context;
+  if (!BridgeModelStagesEligible(context) || !frame.sealed || !frame.bridge_submitted
+      || !frame.copyback_queued || frame.bridge_submission == 0 || frame.recording_status == nullptr
+      || !frame.recording_status->submitted.load() || !frame.recording_status->closed.load()
+      || capture.planes.size() != kBridgeModelStageNames.size()
+      || !((frame.look_width == context.work_width && frame.look_height == context.work_height)
+           || (frame.look_width == context.output_width && frame.look_height == context.output_height))) return false;
+  for (const char* name : kBridgeModelStageNames) {
+    const auto plane = std::find_if(capture.planes.begin(), capture.planes.end(),
+        [name](const auto& candidate) { return candidate.name == name; });
+    if (plane == capture.planes.end()) return false;
+    const std::string_view stage(name);
+    const bool output = stage == "original" || stage == "post_resolve" || stage == "post_restore";
+    const uint32_t width = (stage == "post_look" ? frame.look_width
+        : (output ? context.output_width : context.work_width));
+    const uint32_t height = (stage == "post_look" ? frame.look_height
+        : (output ? context.output_height : context.work_height));
+    if (!plane->required || !plane->recorded || plane->readback == nullptr || !plane->error.empty()
+        || plane->recording != frame.recording || plane->width != width || plane->height != height
+        || plane->source_width != width || plane->source_height != height || plane->region_copy
+        || plane->format != (output ? context.format : DXGI_FORMAT_R16G16B16A16_FLOAT)) return false;
+  }
+  return true;
+}
+#endif
+
 // Retain the exact recording's fence receipts before the tracker prunes them.
 // Without a stamp or an observed receipt, a reset-only recording is ambiguous.
 inline bool StageSubmissionCompleted(PendingCapture* capture) {
@@ -1140,6 +1199,7 @@ inline bool StageSubmissionCompleted(PendingCapture* capture) {
       }
     }
   }
+  if (capture->bridge_model_stages) completed = BridgeModelStagesComplete(*capture) && completed;
   if (!capture->inline_restore && capture->pre_recorded) {
     completed = observe(capture->pre_nr_readback, &capture->pre_submission_proof) && completed;
   }
@@ -2207,6 +2267,41 @@ inline void ProcessJob(std::optional<PendingCapture> work) noexcept {
 
     // All filesystem work happens here on the worker, never on the render or
     // present thread. Wide paths only: narrowing to ANSI can throw.
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (work->bridge_model_stages) {
+      const auto& frame = *work->bridge_model_stages;
+      const auto& context = frame.context;
+      const bool complete = !work->metadata_only && !work->aborted && work->completion_proven
+          && CaptureCompletionProven(*work) && StageSubmissionCompleted(&*work)
+          && BridgeModelStagesComplete(*work);
+      work->required_planes_complete = complete;
+      if (!complete) work->aborted = true;
+      work->meta += "capture_schema=bridge_model_stages_v1\nbridge_stage_recording_complete=" + std::to_string(complete)
+          + "\nevaluation_sequence=" + std::to_string(context.evaluation_sequence)
+          + "\nsource_generation=" + std::to_string(context.source_generation)
+          + "\nsource_feature=" + std::to_string(context.source_feature)
+          + "\nwork_width=" + std::to_string(context.work_width) + "\nwork_height=" + std::to_string(context.work_height)
+          + "\noutput_width=" + std::to_string(context.output_width) + "\noutput_height=" + std::to_string(context.output_height)
+          + "\nngx_api_returned=" + std::to_string(context.api_returned) + "\nngx_result=" + std::to_string(context.ngx_result)
+          + "\nreset_sent=" + std::to_string(context.reset_sent) + "\nreset_reasons=" + std::to_string(context.reset_reasons)
+          + "\nrecording_list=" + std::to_string(frame.recording.first)
+          + "\nrecording_generation=" + std::to_string(frame.recording.second)
+          + "\nbridge_submission_value=" + std::to_string(frame.bridge_submission)
+          + "\nbridge_submitted=" + std::to_string(frame.bridge_submitted)
+          + "\nd3d11_copyback_queued=" + std::to_string(frame.copyback_queued)
+          + "\nlook_shaped=" + std::to_string(frame.look_shaped)
+          + "\nlook_stability_recorded=" + std::to_string(frame.look_stability_recorded)
+          + "\nnative_receiver_byte_verified=0\nraw_neural_stage=before_host_look_and_host_history;model_history_included\n";
+      for (const auto& plane : work->planes) {
+        const bool output_grid = plane.name == "original" || plane.name == "post_resolve" || plane.name == "post_restore"
+            || (plane.name == "post_look" && plane.width == context.output_width && plane.height == context.output_height);
+        work->meta += "plane." + plane.name + ".space=" + (output_grid ? "output_grid" : "model_work_grid")
+            + "\nplane." + plane.name + ".evaluation_sequence=" + std::to_string(context.evaluation_sequence)
+            + "\nplane." + plane.name + ".recording_list=" + std::to_string(plane.recording.first)
+            + "\nplane." + plane.name + ".recording_generation=" + std::to_string(plane.recording.second) + "\n";
+      }
+    }
+#endif
     std::filesystem::path directory;
     try {
       directory =
@@ -2565,6 +2660,12 @@ inline void ProcessJob(std::optional<PendingCapture> work) noexcept {
     if (work->model_diagnostic && work->model_recording_list != nullptr) {
       meta += "required_planes_complete=" + std::to_string(work->required_planes_complete) + "\n";
       if (!work->required_planes_complete) record.outcome = "incomplete";
+#if defined(NR_NEXUS_DEV_CONTROL)
+      if (work->bridge_model_stages) {
+        meta += "bridge_model_stage_capture_valid="
+            + std::to_string(work->required_planes_complete && work->completion_proven && !work->aborted) + "\n";
+      }
+#endif
     }
     if (!meta.empty()) {
       std::filesystem::path meta_path = base;
@@ -3689,6 +3790,14 @@ inline void RecordDiagnosticPlaneCopy(
         internal::pending->aborted = true;
         return;
       }
+    } else if (internal::pending->bridge_model_stages) {
+      const auto& frame = *internal::pending->bridge_model_stages;
+      plane.recording = submission::RecordingIdentity(command_list);
+      if (plane.recording != frame.recording || frame.sealed || internal::pending->aborted) {
+        plane.error = "bridge_stage_recording_mismatch_or_sealed";
+        internal::pending->aborted = true;
+        return;
+      }
     }
 #endif
     const auto desc = texture->GetDesc();
@@ -3787,12 +3896,103 @@ inline bool CaptureInlineRestorePlane(
   return recorded;
 }
 
+inline bool CaptureBridgeModelStagePlane(
+    ID3D12Device* device, ID3D12GraphicsCommandList* list, uint64_t serial, const char* name,
+    ID3D12Resource* source, D3D12_RESOURCE_STATES state,
+    std::optional<InlineRestoreExecution> execution = std::nullopt) noexcept {
+  try {
+    if (serial == 0 || list == nullptr || name == nullptr) return false;
+    const auto desc = (source != nullptr ? source->GetDesc() : D3D12_RESOURCE_DESC{});
+    {
+      std::scoped_lock lock(internal::state_mutex);
+      if (!internal::pending || internal::pending->serial != serial || !internal::pending->bridge_model_stages) return false;
+      auto& capture = *internal::pending;
+      auto& frame = *capture.bridge_model_stages;
+      const auto& context = frame.context;
+      const std::string_view stage(name);
+      const bool output = stage == "original" || stage == "post_resolve" || stage == "post_restore";
+      const bool transported = stage == "post_look" && desc.Width == context.output_width && desc.Height == context.output_height;
+      const uint32_t width = (output || transported ? context.output_width : context.work_width);
+      const uint32_t height = (output || transported ? context.output_height : context.work_height);
+      if (capture.aborted || frame.sealed || submission::RecordingIdentity(list) != frame.recording
+          || std::find(kBridgeModelStageNames.begin(), kBridgeModelStageNames.end(), stage) == kBridgeModelStageNames.end()
+          || std::any_of(capture.planes.begin(), capture.planes.end(),
+              [name](const auto& plane) { return plane.name == name; })
+          || desc.Width != width || desc.Height != height
+          || desc.Format != (output ? context.format : DXGI_FORMAT_R16G16B16A16_FLOAT)) {
+        capture.aborted = true;
+        capture.required_planes_complete = false;
+        return false;
+      }
+      if (stage == "post_look") {
+        frame.look_width = width;
+        frame.look_height = height;
+        if (execution) {
+          frame.look_shaped = execution->look_shaped;
+          frame.look_stability_recorded = execution->look_stability_recorded;
+        }
+      }
+    }
+    if (!PrepareDiagnosticPlane(device, name, source, static_cast<uint32_t>(desc.Width), desc.Height,
+                                 std::nullopt, true, serial)) return false;
+    D3D12_RESOURCE_BARRIER barrier{.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION};
+    barrier.Transition = {.pResource = source, .Subresource = 0, .StateBefore = state,
+                          .StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE};
+    if (state != D3D12_RESOURCE_STATE_COPY_SOURCE) list->ResourceBarrier(1, &barrier);
+    try {
+      RecordDiagnosticPlaneCopy(list, name, source, serial);
+    } catch (...) {
+      if (state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+        list->ResourceBarrier(1, &barrier);
+      }
+      throw;
+    }
+    if (state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+      std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+      list->ResourceBarrier(1, &barrier);
+    }
+    std::scoped_lock lock(internal::state_mutex);
+    if (!internal::pending || internal::pending->serial != serial) return false;
+    const auto& planes = internal::pending->planes;
+    const auto plane = std::find_if(planes.begin(), planes.end(),
+        [name](const auto& candidate) { return candidate.name == name; });
+    return plane != planes.end() && plane->recorded && plane->error.empty();
+  } catch (...) {
+    std::scoped_lock lock(internal::state_mutex);
+    if (internal::pending && internal::pending->serial == serial) {
+      internal::pending->aborted = true;
+      internal::pending->required_planes_complete = false;
+    }
+    return false;
+  }
+}
+
 inline void SealInlineRestoreBridge(uint64_t serial, bool unique_pass_written,
                                     uint64_t bridge_submission, bool submitted, bool copyback_queued) {
   if (serial == 0) return;
   std::scoped_lock lock(internal::state_mutex);
-  if (!internal::pending || internal::pending->serial != serial || !internal::pending->inline_restore) return;
+  if (!internal::pending || internal::pending->serial != serial) return;
   auto& capture = *internal::pending;
+  if (capture.bridge_model_stages) {
+    auto& frame = *capture.bridge_model_stages;
+    if (frame.sealed) return;
+    frame.bridge_submission = bridge_submission;
+    frame.bridge_submitted = submitted;
+    frame.copyback_queued = copyback_queued;
+    frame.sealed = true;
+    capture.ready = unique_pass_written && submitted && copyback_queued && !capture.aborted
+        && capture.planes.size() == kBridgeModelStageNames.size()
+        && std::all_of(capture.planes.begin(), capture.planes.end(), [&](const auto& plane) {
+             return plane.required && plane.recorded && plane.error.empty() && plane.recording == frame.recording;
+           });
+    if (!capture.ready) {
+      capture.aborted = true;
+      capture.required_planes_complete = false;
+    }
+    return;
+  }
+  if (!capture.inline_restore) return;
   auto& roi = *capture.inline_restore;
   if (roi.sealed) return;
   roi.bridge_submission = bridge_submission;
@@ -4166,7 +4366,11 @@ inline void CaptureModelPair(
     ID3D12Device* device, ID3D12GraphicsCommandList* command_list,
     ID3D12Resource* proxy, D3D12_RESOURCE_STATES proxy_state,
     ID3D12Resource* neural, D3D12_RESOURCE_STATES neural_state,
-    uint64_t generation, const char* path, uint32_t pass, uint32_t stack) {
+    uint64_t generation, const char* path, uint32_t pass, uint32_t stack
+#if defined(NR_NEXUS_DEV_CONTROL)
+    , bool restore_state_on_failure = false
+#endif
+) {
   if (!WantsEvaluatedBuffer() || HasPending()) return;
   const D3D12_RESOURCE_DESC desc = proxy->GetDesc();
   const D3D12_RESOURCE_DESC neural_desc = neural->GetDesc();
@@ -4211,13 +4415,101 @@ inline void CaptureModelPair(
   barriers[1].Transition.pResource = neural;
   barriers[1].Transition.StateBefore = neural_state;
   command_list->ResourceBarrier(2, barriers);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  try {
+#endif
   RecordPreCopy(command_list, proxy);
   RecordPostCopy(command_list, neural);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  } catch (...) {
+    if (restore_state_on_failure) {
+      for (auto& barrier : barriers) {
+        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+      }
+      command_list->ResourceBarrier(2, barriers);
+    }
+    throw;
+  }
+#endif
   for (auto& barrier : barriers) {
     std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
   }
   command_list->ResourceBarrier(2, barriers);
 }
+
+#if defined(NR_NEXUS_DEV_CONTROL)
+inline uint64_t BeginBridgeModelStages(
+    ID3D12Device* device, ID3D12GraphicsCommandList* list, const InlineRestoreContext& context,
+    ID3D12Resource* proxy, D3D12_RESOURCE_STATES proxy_state,
+    ID3D12Resource* neural, D3D12_RESOURCE_STATES neural_state, const char* path) noexcept {
+  try {
+    if (device == nullptr || list == nullptr || proxy == nullptr || neural == nullptr
+        || !stage_planes_enabled.load(std::memory_order_relaxed) || !WantsEvaluatedBuffer()
+        || HasPending() || !BridgeModelStagesEligible(context)) return 0;
+    auto desc = proxy->GetDesc();
+    const auto neural_desc = neural->GetDesc();
+    if (desc.Width != context.work_width || desc.Height != context.work_height
+        || neural_desc.Width != desc.Width || neural_desc.Height != desc.Height
+        || desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || neural_desc.Format != desc.Format) {
+      FailRequest("unsupported_diagnostic", "bridge stage model grids or formats do not match");
+      return 0;
+    }
+    // Two primary preview buffers and all seven independent numerical planes.
+    // post_look may use the output grid; reserve that larger case before copying.
+    uint64_t readback_bytes = 0;
+    for (const auto& grid : std::array<std::array<uint32_t, 3>, 2>{{
+             {context.work_width, context.work_height, 5},
+             {context.output_width, context.output_height, 4}}}) {
+      desc.Width = grid[0];
+      desc.Height = grid[1];
+      uint64_t bytes = 0;
+      device->GetCopyableFootprints(&desc, 0, 1, 0, nullptr, nullptr, nullptr, &bytes);
+      if (bytes == 0 || bytes > internal::MAX_STAGE_READBACK_BYTES / grid[2]
+          || readback_bytes > internal::MAX_STAGE_READBACK_BYTES - bytes * grid[2]) {
+        FailRequest("allocation_failed", "bridge_stage_readback_budget_exceeded");
+        return 0;
+      }
+      readback_bytes += bytes * grid[2];
+    }
+    CaptureModelPair(device, list, proxy, proxy_state, neural, neural_state,
+                     context.present_generation, path, 0, 1, true);
+    uint64_t serial = 0;
+    {
+      std::scoped_lock lock(internal::state_mutex);
+      if (!internal::pending || !internal::pending->model_diagnostic
+          || internal::pending->model_recording_list != list) return 0;
+      auto& capture = *internal::pending;
+      capture.bridge_model_stages = internal::InlineRestoreFrame{
+          .context = context, .recording = submission::RecordingIdentity(list),
+          .recording_status = submission::ObserveRecording(list)};
+      capture.full_width = context.output_width;
+      capture.full_height = context.output_height;
+      capture.lease_generation = context.present_generation;
+      capture.lease_taken = true;
+      capture.exact = true;
+      capture.ready = false;
+      capture.aborted = (capture.bridge_model_stages->recording.first >> 63) != 0
+          || capture.bridge_model_stages->recording_status == nullptr;
+      capture.meta += "bridge_stage_readback_preflight_bytes=" + std::to_string(readback_bytes) + "\n";
+      serial = capture.serial;
+    }
+    CaptureBridgeModelStagePlane(device, list, serial, "proxy", proxy, proxy_state);
+    CaptureBridgeModelStagePlane(device, list, serial, "neural", neural, neural_state);
+    return serial;
+  } catch (...) {
+    std::scoped_lock lock(internal::state_mutex);
+    internal::capture_requested.store(false, std::memory_order_release);
+    if (internal::pending && internal::pending->model_diagnostic
+        && internal::pending->creation_generation == context.present_generation) {
+      internal::pending->aborted = true;
+      internal::pending->required_planes_complete = false;
+    } else if (!internal::pending) {
+      internal::stage_busy.store(false, std::memory_order_release);
+    }
+    return 0;
+  }
+}
+#endif
 
 // Marks an armed or in-flight capture as dead (device loss, NR evaluate
 // failure, new device). The buffers are released by the worker after the

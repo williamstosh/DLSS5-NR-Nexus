@@ -10345,7 +10345,11 @@ inline LookRoute RunLookStage(
     uint32_t pass,
     const LookChain& chain,
     const EvaluationContract& frame,
-    uint32_t pass_offset = 0) {
+    uint32_t pass_offset = 0
+#if defined(NR_NEXUS_DEV_CONTROL)
+    , uint64_t bridge_model_capture_serial = 0
+#endif
+) {
   const uint32_t codec_set = pass * kCodecSrvSetStride;
   const LookRoute unchanged{
       codec_set, res.input_width, res.input_height, res.input_width, res.input_height};
@@ -10367,7 +10371,13 @@ inline LookRoute RunLookStage(
     nr_retirement_pending.store(true, std::memory_order_relaxed);
     history = {};
   }
-  if (live == 0 || codec_pipeline.look.compose == nullptr) return unchanged;
+  if (live == 0 || codec_pipeline.look.compose == nullptr) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+    screenshot::CaptureBridgeModelStagePlane(device, command_list, bridge_model_capture_serial, "post_compose",
+        res.nr_output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+#endif
+    return unchanged;
+  }
 
   const D3D12_GPU_DESCRIPTOR_HANDLE heap_gpu =
       res.descriptors->GetGPUDescriptorHandleForHeapStart();
@@ -10407,6 +10417,10 @@ inline LookRoute RunLookStage(
     look_traced_passes.fetch_add(1, std::memory_order_relaxed);
   }
   if (!shape) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+    screenshot::CaptureBridgeModelStagePlane(device, command_list, bridge_model_capture_serial, "post_compose",
+        res.nr_output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+#endif
     if ((live & kLookSurfaceTrace) != 0) {
       gpu_timers::Mark(command_list, gpu_timers::PassLookEnd(pass));
     }
@@ -10499,6 +10513,10 @@ inline LookRoute RunLookStage(
       command_list, res.look_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   res.look_output_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  screenshot::CaptureBridgeModelStagePlane(device, command_list, bridge_model_capture_serial, "post_compose",
+      res.look_output, res.look_output_state);
+#endif
   FinishLookPass(&history, temporal, whole_edit, now_ns, constants, res.id, pass,
                  res.input_width, res.input_height);
   if (!transport) {
@@ -14098,6 +14116,13 @@ inline bool RecordInline(
     }
   }
   bool capture_this_eval = false;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  const bool bridge_model_stage_request = recording != nullptr && bridge_source != nullptr && present == nullptr
+      && !plan.mixed && group.begin == 0 && requested_stack == 1
+      && nr_input_width <= width && nr_input_height <= height
+      && (nr_input_width != width || nr_input_height != height)
+      && screenshot::stage_planes_enabled.load(std::memory_order_relaxed);
+#endif
   if (setup_ok && present != nullptr && present->capture_display
       && screenshot::WantsFinalPresent()) {
     // F5 copies the same completed game presentation image on either side
@@ -15008,32 +15033,41 @@ inline bool RecordInline(
       }
     }
 #if defined(NR_NEXUS_DEV_CONTROL)
+    const auto& observed = stage_stats.last_evaluate;
+    const screenshot::InlineRestoreContext inline_capture_context{
+        .d3d11_bridge = true, .mixed = plan.mixed, .present = present != nullptr,
+        .preparing = adaptive.preparing || prepare_models_only, .warmup = !nr_returned,
+        .reset_sent = observed.reset_sent, .upscaled = execution_stage == stage_plan::Stage::UPSCALED,
+        .api_returned = observed.api_returned, .ngx_succeeded = nr_returned && NVSDK_NGX_SUCCEED(nr_result),
+        .group_begin = group.begin, .stack = requested_stack, .pass = pass,
+        .work_width = nr_input_width, .work_height = nr_input_height,
+        .output_width = resource_width, .output_height = resource_height,
+        .output_rect = {.x = output_rect.x, .y = output_rect.y, .width = output_rect.width, .height = output_rect.height},
+        .hdr_mode = res.hdr_mode, .codec = codec_mode.load(), .ngx_result = static_cast<uint32_t>(nr_result),
+        .reset_reasons = observed.reset_reasons, .format = res.format,
+        .evaluation_sequence = observed.sequence, .source_generation = observed.source_generation,
+        .present_generation = present_generation,
+        .tail_inputs_aligned = pass_color == 1.f && frame.depth_x == 0 && frame.depth_y == 0
+            && frame.input_width == width && frame.input_height == height,
+        .model_evaluation_index = stage_stats.evaluates,
+        .source_feature = static_cast<uint64_t>(observed.source_feature)};
     const auto claim_inline_roi = [&](bool tail_only) -> uint64_t {
       if (reuse_this_pass || !inline_restore_bridge
           || !screenshot::internal::inline_restore_active.load(std::memory_order_acquire)) return 0;
-      const auto& observed = stage_stats.last_evaluate;
-      return screenshot::ClaimInlineRestoreRoi(command_list, {
-          .d3d11_bridge = true, .mixed = plan.mixed, .present = present != nullptr,
-          .preparing = adaptive.preparing || prepare_models_only, .warmup = !nr_returned,
-          .reset_sent = observed.reset_sent, .upscaled = execution_stage == stage_plan::Stage::UPSCALED,
-          .api_returned = observed.api_returned, .ngx_succeeded = nr_returned && NVSDK_NGX_SUCCEED(nr_result),
-          .group_begin = group.begin, .stack = requested_stack, .pass = pass,
-          .work_width = nr_input_width, .work_height = nr_input_height,
-          .output_width = resource_width, .output_height = resource_height,
-          .output_rect = {.x = output_rect.x, .y = output_rect.y, .width = output_rect.width, .height = output_rect.height},
-          .hdr_mode = res.hdr_mode, .codec = codec_mode.load(), .ngx_result = static_cast<uint32_t>(nr_result),
-          .reset_reasons = observed.reset_reasons, .format = res.format,
-          .evaluation_sequence = observed.sequence, .source_generation = observed.source_generation,
-          .present_generation = present_generation,
-          .tail_inputs_aligned = pass_color == 1.f && frame.depth_x == 0 && frame.depth_y == 0
-              && frame.input_width == width && frame.input_height == height,
-          .model_evaluation_index = stage_stats.evaluates,
-          .source_feature = static_cast<uint64_t>(observed.source_feature)},
-          tail_only);
+      return screenshot::ClaimInlineRestoreRoi(command_list, inline_capture_context, tail_only);
     };
     inline_restore_serial = claim_inline_roi(true);
     const bool tail_roi = inline_restore_serial != 0;
-    const uint64_t stability_before = (tail_roi ? look_stability_passes.load(std::memory_order_relaxed) : 0);
+    const uint64_t bridge_model_serial = (bridge_model_stage_request && !reuse_this_pass
+        ? screenshot::BeginBridgeModelStages(device, command_list, inline_capture_context,
+            res.proxy, res.proxy_state, res.nr_output, res.nr_output_state, path_name) : 0);
+    if (bridge_model_serial != 0) {
+      recording->inline_restore_serial = bridge_model_serial;
+      screenshot::CaptureBridgeModelStagePlane(device, command_list, bridge_model_serial, "original",
+          res.original, res.original_state);
+    }
+    const uint64_t stability_before = (tail_roi || bridge_model_serial != 0
+        ? look_stability_passes.load(std::memory_order_relaxed) : 0);
     if (tail_roi) {
       if (recording != nullptr) recording->inline_restore_serial = inline_restore_serial;
       screenshot::CaptureInlineRestorePlane(device, command_list, inline_restore_serial, "nr_model",
@@ -15046,13 +15080,24 @@ inline bool RecordInline(
     // resolve, which then reads the route it returns.
     LookRoute route{srv_table_start, nr_input_width, nr_input_height, nr_input_width, nr_input_height};
     if (!reuse_this_pass) {
-      route = RunLookStage(command_list, device, res, feature.slots[pass], pass, look_chain, frame, group.begin);
+      route = RunLookStage(command_list, device, res, feature.slots[pass], pass, look_chain, frame, group.begin
+#if defined(NR_NEXUS_DEV_CONTROL)
+          , bridge_model_serial
+#endif
+      );
     }
     ID3D12Resource* const looked_neural =
         (route.shaped ? (route.srv_set == kDescriptorTransportSet + srv_table_start
                             ? res.look_up_neural : res.look_output) : res.nr_output);
     capture_stage("post_look", looked_neural, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                   route.neural_width, route.neural_height, pass, requested_stack);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    screenshot::CaptureBridgeModelStagePlane(device, command_list, bridge_model_serial, "post_look",
+        looked_neural, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        screenshot::InlineRestoreExecution{.look_shaped = route.shaped,
+            .look_stability_recorded = bridge_model_serial != 0
+                && look_stability_passes.load(std::memory_order_relaxed) > stability_before});
+#endif
     Transition(
         command_list, write_surface,
         *write_state,
@@ -15122,6 +15167,10 @@ inline bool RecordInline(
 #endif
     capture_stage("post_resolve", write_surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                   width, height, pass, requested_stack);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    screenshot::CaptureBridgeModelStagePlane(device, command_list, bridge_model_serial, "post_resolve",
+        write_surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+#endif
     if (present == nullptr
         || present_sdr_restore::ShouldRestore(present->sdr_restore_policy, res.hdr_mode,
                                              present->diagnostic.bypass_sdr_restore)) {
@@ -15145,6 +15194,10 @@ inline bool RecordInline(
     }
     capture_stage("post_restore", write_surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                   width, height, pass, requested_stack);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    screenshot::CaptureBridgeModelStagePlane(device, command_list, bridge_model_serial, "post_restore",
+        write_surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+#endif
     if (timers_active) {
       gpu_timers::Mark(command_list, gpu_timers::PassResolveEnd(pass));
     }
@@ -15170,10 +15223,16 @@ inline bool RecordInline(
       const auto& model_resources = (last_model_pass == 1 && second_workset != nullptr ? *second_workset : res);
       const uint64_t previous_capture_serial = (last_model_used_control_mask
           ? screenshot::PendingModelCaptureSerial(command_list) : 0);
+#if defined(NR_NEXUS_DEV_CONTROL)
+      if (!bridge_model_stage_request) {
+#endif
       screenshot::CaptureModelPair(
           device, command_list, model_resources.proxy, model_resources.proxy_state, model_resources.nr_output,
           model_resources.nr_output_state, present_generation, path_name,
           static_cast<uint32_t>(last_model_pass), requested_stack);
+#if defined(NR_NEXUS_DEV_CONTROL)
+      }
+#endif
       if (last_model_used_control_mask) {
         const uint64_t capture_serial = screenshot::PendingModelCaptureSerial(command_list);
         if (capture_serial != 0 && capture_serial != previous_capture_serial
