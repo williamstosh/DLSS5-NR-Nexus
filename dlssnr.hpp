@@ -11060,10 +11060,29 @@ inline fg::xefg::BridgeSourceIdentity UniqueBridgeSourceLocked(uintptr_t device1
 }
 
 // SDK observers never hold XeFG state.mutex while taking this short snapshot.
-inline fg::xefg::BridgeSourceIdentity ObserveBridgeSourceForXefg(uintptr_t device11) noexcept {
+inline fg::xefg::BridgeSourceObservation ObserveBridgeSourceForXefg(uintptr_t device11) noexcept {
+  fg::xefg::BridgeSourceObservation observation{
+      .queried_device11 = device11, .state = fg::xefg::BridgeSnapshotState::RUNTIME_BUSY};
   RuntimeTryLock lock(runtime_mutex);
-  if (!lock.owns_lock() || shutting_down.load(std::memory_order_acquire)) return {};
-  return UniqueBridgeSourceLocked(device11);
+  if (!lock.owns_lock()) return observation;
+  if (shutting_down.load(std::memory_order_acquire)) {
+    observation.state = fg::xefg::BridgeSnapshotState::SHUTTING_DOWN;
+    return observation;
+  }
+  observation.state = fg::xefg::BridgeSnapshotState::LOCKED;
+  // Diagnostic counts include only confirmed, nonzero-generation D3D11
+  // contracts; native D3D12 and unconfirmed records are not usable candidates.
+  for (const auto& [handle, contract] : create_contracts) {
+    if (handle == nullptr || !contract.source_type_confirmed || contract.source_generation == 0
+        || contract.source_device11_identity == nullptr) continue;
+    ++observation.candidates;
+    if (reinterpret_cast<uintptr_t>(contract.source_device11_identity.Get()) == device11) {
+      ++observation.matches;
+    }
+  }
+  // Keep the original rejection/early-return logic separate from diagnostics.
+  observation.identity = UniqueBridgeSourceLocked(device11);
+  return observation;
 }
 
 inline bool BridgeAdaptiveEligible(const BridgeAdaptiveSource& source,
@@ -11101,7 +11120,28 @@ inline bool BridgeAdaptiveEligible(const BridgeAdaptiveSource& source,
            << " proxy_device11=" << reinterpret_cast<const void*>(evidence.proxy_device11)
            << " receipt_source=" << reinterpret_cast<const void*>(evidence.source.handle)
            << " receipt_source_generation=" << evidence.source.generation
-           << " declaration=" << evidence.declaration << " epoch=" << evidence.epoch;
+           << " declaration=" << evidence.declaration << " epoch=" << evidence.epoch
+           << " last_successful_init=" << evidence.init_kind;
+      const auto append_source = [&](const char* phase, const fg::xefg::BridgeSourceObservation& observation) {
+        text << ' ' << phase << "_result=" << fg::xefg::BridgeSourceReason(observation)
+             << ' ' << phase << "_query_device11=" << reinterpret_cast<const void*>(observation.queried_device11)
+             << ' ' << phase << "_source=" << reinterpret_cast<const void*>(observation.identity.handle)
+             << ' ' << phase << "_source_generation=" << observation.identity.generation
+             << ' ' << phase << "_counts_available=" << (observation.state == fg::xefg::BridgeSnapshotState::LOCKED)
+             << ' ' << phase << "_candidates=" << observation.candidates
+             << ' ' << phase << "_matches=" << observation.matches;
+      };
+      append_source("before", evidence.before);
+      append_source("after", evidence.after);
+      const auto append_device = [&](const char* role, const fg::xefg::BridgeDeviceObservation& observation) {
+        text << ' ' << role << "_present=" << observation.object_present
+             << ' ' << role << "_swapchain_unwrapped=" << observation.swapchain_unwrapped
+             << ' ' << role << "_swapchain_qi_hr=0x" << std::hex << static_cast<uint32_t>(observation.swapchain_result)
+             << ' ' << role << "_device11_hr=0x" << static_cast<uint32_t>(observation.device11_result)
+             << ' ' << role << "_device12_hr=0x" << static_cast<uint32_t>(observation.device12_result) << std::dec;
+      };
+      append_device("application", evidence.application);
+      append_device("proxy", evidence.proxy_device);
       Log(reshade::log::level::info, text.str());
     }
     fg_off = evidence.available;

@@ -43,7 +43,36 @@ struct BridgeSourceIdentity {
   uint64_t generation = 0;
   bool operator==(const BridgeSourceIdentity&) const = default;
 };
-using BridgeSourceObserver = BridgeSourceIdentity (*)(uintptr_t device11) noexcept;
+enum class BridgeSnapshotState : uint8_t { UNOBSERVED, RUNTIME_BUSY, SHUTTING_DOWN, LOCKED };
+struct BridgeSourceObservation {
+  BridgeSourceIdentity identity;
+  uintptr_t queried_device11 = 0;
+  BridgeSnapshotState state = BridgeSnapshotState::UNOBSERVED;
+  uint32_t candidates = 0;
+  uint32_t matches = 0;
+  bool operator==(const BridgeSourceObservation&) const = default;
+};
+using BridgeSourceObserver = BridgeSourceObservation (*)(uintptr_t device11) noexcept;
+inline const char* BridgeSourceReason(const BridgeSourceObservation& observation) noexcept {
+  switch (observation.state) {
+    case BridgeSnapshotState::UNOBSERVED: return "unobserved";
+    case BridgeSnapshotState::RUNTIME_BUSY: return "runtime_busy";
+    case BridgeSnapshotState::SHUTTING_DOWN: return "shutting_down";
+    case BridgeSnapshotState::LOCKED: break;
+  }
+  if (observation.candidates == 0) return "no_live_source";
+  if (observation.matches == 0 || observation.identity.device11 != observation.queried_device11) return "device_mismatch";
+  if (observation.matches != 1 || observation.identity.handle == 0 || observation.identity.generation == 0) return "ambiguous";
+  return "matched";
+}
+struct BridgeDeviceObservation {
+  bool object_present = false;
+  bool swapchain_unwrapped = false;
+  HRESULT swapchain_result = E_PENDING;
+  HRESULT device11_result = E_PENDING;
+  HRESULT device12_result = E_PENDING;
+  bool operator==(const BridgeDeviceObservation&) const = default;
+};
 struct BridgeOffEvidence {
   bool available = false;
   const char* reason = "unobserved";
@@ -54,6 +83,11 @@ struct BridgeOffEvidence {
   uint64_t declaration = 0;
   uint64_t epoch = 0;
   BridgeSourceIdentity source;
+  BridgeSourceObservation before;
+  BridgeSourceObservation after;
+  const char* init_kind = "unobserved";
+  BridgeDeviceObservation application;
+  BridgeDeviceObservation proxy_device;
   bool operator==(const BridgeOffEvidence&) const = default;
 };
 
@@ -218,6 +252,9 @@ struct Context {
   bool enabled = false;
   ComPtr<IUnknown> bridge_application_device11;
   ComPtr<IUnknown> bridge_proxy_device11;
+  const char* bridge_init_kind = "unobserved";
+  BridgeDeviceObservation bridge_application_observation;
+  BridgeDeviceObservation bridge_proxy_observation;
   bool bridge_context_ready = false;
   bool bridge_proxy_ready = false;
   bool bridge_off_observed = false;
@@ -225,6 +262,8 @@ struct Context {
   uint64_t bridge_declaration = 0;
   uint64_t bridge_off_epoch = 0;
   BridgeSourceIdentity bridge_off_source;
+  BridgeSourceObservation bridge_before_observation;
+  BridgeSourceObservation bridge_after_observation;
   const char* bridge_off_reason = "disable_unobserved";
   uint32_t requested_interpolated = 0;
   bool requested_interpolated_known = false;
@@ -381,17 +420,34 @@ inline uintptr_t Identity(IUnknown* object) {
 }
 
 // Called only while the SDK callback still owns a valid swapchain argument.
-inline ComPtr<IUnknown> BridgeDeviceIdentity(IUnknown* object) {
+inline ComPtr<IUnknown> BridgeDeviceIdentity(IUnknown* object, BridgeDeviceObservation* observation = nullptr) {
+  if (observation != nullptr) {
+    *observation = {.object_present = object != nullptr};
+  }
   ComPtr<IDXGISwapChain> swapchain;
   ComPtr<ID3D11Device> device;
-  if (object == nullptr || FAILED(object->QueryInterface(IID_PPV_ARGS(&swapchain)))) return {};
+  if (object == nullptr) return {};
+  const auto swapchain_result = object->QueryInterface(IID_PPV_ARGS(&swapchain));
+  if (observation != nullptr) {
+    observation->swapchain_result = swapchain_result;
+  }
+  if (FAILED(swapchain_result)) return {};
   auto* native_swapchain = swapchain.Get();
   if (renodx::utils::directx::NativeFromReShadeProxy(&native_swapchain)) {
     // Own the borrowed base before releasing the outer interface, then query
     // the known base's device rather than the wrapper's reported interface.
     swapchain = native_swapchain;
+    if (observation != nullptr) {
+      observation->swapchain_unwrapped = true;
+    }
   }
-  if (FAILED(swapchain->GetDevice(IID_PPV_ARGS(&device)))) return {};
+  const auto device11_result = swapchain->GetDevice(IID_PPV_ARGS(&device));
+  if (observation != nullptr) {
+    observation->device11_result = device11_result;
+    ComPtr<ID3D12Device> device12;
+    observation->device12_result = swapchain->GetDevice(IID_PPV_ARGS(&device12));
+  }
+  if (FAILED(device11_result)) return {};
   return ComPtr<IUnknown>(renodx::utils::directx::NativeIdentity(device.Get()));
 }
 
@@ -401,6 +457,8 @@ inline uint64_t InvalidateBridgeOff(void* handle, const char* reason,
   if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
     auto& context = *it->second;
     context.bridge_off_observed = false;
+    context.bridge_before_observation = {};
+    context.bridge_after_observation = {};
     context.bridge_off_reason = reason;
     context.bridge_declaration = ++state.bridge_declaration;
     if (invalidate_context) {
@@ -525,12 +583,14 @@ inline bool OrderCopies(const std::shared_ptr<Frame>& frame, ID3D12CommandQueue*
 }
 
 inline void Initialize(void* handle, ID3D12CommandQueue* queue, const abi::Init* parameters,
-                        HMODULE sdk_module = nullptr) {
+                        HMODULE sdk_module = nullptr, const char* init_kind = "Init") {
   if (handle == nullptr || queue == nullptr || parameters == nullptr) return;
   auto context = std::make_shared<Context>();
   context->queue = queue;
   context->init = *parameters;
-  context->bridge_application_device11 = BridgeDeviceIdentity(parameters->application_swapchain);
+  context->bridge_init_kind = init_kind;
+  context->bridge_application_device11 = BridgeDeviceIdentity(parameters->application_swapchain,
+      &context->bridge_application_observation);
   output_framerate::ObserveXeFGMetadata(reinterpret_cast<uintptr_t>(context.get()), parameters->max_interpolated + 1);
   context->omit_optional_hudless = block_optional_hudless.load(std::memory_order_acquire)
       && parameters->ui_mode == kUiModeAuto;
@@ -994,7 +1054,7 @@ struct SdkHooks {
         handle, queue, parameters);
     if (status == 0 && modules[Index].complete && !stopped.load()) {
       try {
-        Initialize(handle, queue, parameters, modules[Index].module);
+        Initialize(handle, queue, parameters, modules[Index].module, "Init");
       } catch (...) { PublishResult(Result::FAILED); }
     }
     return status;
@@ -1009,7 +1069,7 @@ struct SdkHooks {
         handle, window, description, fullscreen, queue, factory, parameters);
     if (status == 0 && modules[Index].complete && !stopped.load()) {
       try {
-        Initialize(handle, queue, parameters, modules[Index].module);
+        Initialize(handle, queue, parameters, modules[Index].module, "InitDesc");
       } catch (...) { PublishResult(Result::FAILED); }
     }
     return status;
@@ -1026,13 +1086,15 @@ struct SdkHooks {
           return status;
         }
         const auto identity = Identity(static_cast<IUnknown*>(*output));
-        auto device11 = BridgeDeviceIdentity(static_cast<IUnknown*>(*output));
+        BridgeDeviceObservation device_observation;
+        auto device11 = BridgeDeviceIdentity(static_cast<IUnknown*>(*output), &device_observation);
         {
           std::unique_lock lock(state.mutex);
           if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
             it->second->proxy_identity = identity;
             if (it->second->bridge_declaration == declaration) {
               it->second->bridge_proxy_device11 = std::move(device11);
+              it->second->bridge_proxy_observation = device_observation;
               it->second->bridge_proxy_ready = true;
             } else {
               it->second->bridge_off_observed = false;
@@ -1227,6 +1289,8 @@ struct SdkHooks {
       if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
         attempt = it->second;
         attempt->bridge_off_observed = false;
+        attempt->bridge_before_observation = {};
+        attempt->bridge_after_observation = {};
         attempt->bridge_off_reason = "set_enabled_in_flight";
         declaration = attempt->bridge_declaration = ++state.bridge_declaration;
         epoch = attempt->epoch;
@@ -1241,11 +1305,13 @@ struct SdkHooks {
     }
     const auto observer = bridge_source_observer.load(std::memory_order_acquire);
     // The observer may try runtime_mutex; no XeFG state lock crosses it or the SDK.
-    const auto before = (observer != nullptr && device11 != 0 && !stopped.load()
-        ? observer(device11) : BridgeSourceIdentity{});
+    const auto before_observation = (observer != nullptr && device11 != 0 && !stopped.load()
+        ? observer(device11) : BridgeSourceObservation{});
+    const auto before = before_observation.identity;
     const auto status = reinterpret_cast<int32_t (*)(void*, uint32_t)>(modules[Index].real[6])(handle, enabled);
-    const auto after = (status == 0 && enabled == 0 && observer != nullptr && device11 != 0 && !stopped.load()
-        ? observer(device11) : BridgeSourceIdentity{});
+    const auto after_observation = (status == 0 && enabled == 0 && observer != nullptr && device11 != 0 && !stopped.load()
+        ? observer(device11) : BridgeSourceObservation{});
+    const auto after = after_observation.identity;
     {
       std::unique_lock lock(state.mutex);
       if (attempt != nullptr && attempt->bridge_enable_inflight != 0) {
@@ -1263,6 +1329,10 @@ struct SdkHooks {
         it->second->enabled = enabled != 0;
       }
       if (same_context) {
+        if (attempt->bridge_declaration == declaration) {
+          attempt->bridge_before_observation = before_observation;
+          attempt->bridge_after_observation = after_observation;
+        }
         if (current) {
           attempt->bridge_off_reason = (status != 0 ? "set_enabled_failed"
               : enabled != 0 ? "enabled" : device11 == 0 ? "device11_identity_missing_or_conflicting"
@@ -1408,6 +1478,11 @@ inline BridgeOffEvidence QueryBridgeOff(const BridgeSourceIdentity& source) {
   evidence.declaration = context->bridge_declaration;
   evidence.epoch = context->epoch;
   evidence.source = context->bridge_off_source;
+  evidence.before = context->bridge_before_observation;
+  evidence.after = context->bridge_after_observation;
+  evidence.init_kind = context->bridge_init_kind;
+  evidence.application = context->bridge_application_observation;
+  evidence.proxy_device = context->bridge_proxy_observation;
   evidence.reason = context->bridge_off_reason;
   if (!context->bridge_context_ready || !context->bridge_proxy_ready || context->bridge_enable_inflight != 0
       || !context->bridge_off_observed) return evidence;

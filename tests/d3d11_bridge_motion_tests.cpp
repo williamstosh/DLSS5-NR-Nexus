@@ -965,7 +965,7 @@ int main(int argc, char** argv) {
         receipt_proxy = receipt_swapchain.Get();
         receipt_context_handle = receipt_cleanup.handle;
         const auto identity11 = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(device.Get()));
-        receipt_source = native::ObserveBridgeSourceForXefg(identity11);
+        receipt_source = native::ObserveBridgeSourceForXefg(identity11).identity;
         Check(receipt_source.handle == reinterpret_cast<uintptr_t>(handle)
                   && receipt_source.generation == native::create_contracts.at(handle).source_generation,
             "the production observer uniquely matches the live D3D11 Create source rather than the private D3D12 device");

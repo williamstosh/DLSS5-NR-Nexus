@@ -3,10 +3,12 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
+#include <array>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 #include <include/reshade.hpp>
 #include "d3d12_test_gpu.hpp"
@@ -123,6 +125,7 @@ struct ReceiptSwapchain : IDXGISwapChain {
   uint32_t get_device_calls = 0;
   ComPtr<IUnknown> reported_device;
   ComPtr<IDXGISwapChain> native_swapchain;
+  ComPtr<IUnknown> reported_device12;
   explicit ReceiptSwapchain(IUnknown* device, IDXGISwapChain* native = nullptr)
       : reported_device(device), native_swapchain(native) {}
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** output) override {
@@ -149,11 +152,17 @@ struct ReceiptSwapchain : IDXGISwapChain {
     ++get_device_calls;
     if (output == nullptr) return E_POINTER;
     *output = nullptr;
-    if (iid != __uuidof(ID3D11Device) || reported_device == nullptr) return E_NOINTERFACE;
+    IUnknown* device = nullptr;
+    if (iid == __uuidof(ID3D11Device)) {
+      device = reported_device.Get();
+    } else if (iid == __uuidof(ID3D12Device)) {
+      device = reported_device12.Get();
+    }
+    if (device == nullptr) return E_NOINTERFACE;
     // The identity-only MOCK supports the IUnknown methods used by capture;
-    // no D3D11 device method or GPU operation is emulated or executed.
-    *output = reported_device.Get();
-    reported_device->AddRef();
+    // no D3D device method or GPU operation is emulated or executed.
+    *output = device;
+    device->AddRef();
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return E_NOTIMPL; }
@@ -173,12 +182,24 @@ struct ReceiptSwapchain : IDXGISwapChain {
 };
 xefg::BridgeSourceIdentity receipt_source;
 bool receipt_source_available = true;
+uint32_t receipt_candidates = 1;
 int32_t receipt_sdk_status = 0;
 void (*receipt_during_sdk)() = nullptr;
 IUnknown* receipt_proxy = nullptr;  // Borrowed only across the mock SDK callback.
 void* receipt_context_handle = nullptr;
-xefg::BridgeSourceIdentity ObserveReceiptSource(uintptr_t device11) noexcept {
-  return receipt_source_available && receipt_source.device11 == device11 ? receipt_source : xefg::BridgeSourceIdentity{};
+xefg::BridgeSourceObservation ObserveReceiptSource(uintptr_t device11) noexcept {
+  xefg::BridgeSourceObservation observation{.queried_device11 = device11,
+      .state = xefg::BridgeSnapshotState::RUNTIME_BUSY};
+  if (!receipt_source_available) return observation;
+  observation.state = xefg::BridgeSnapshotState::LOCKED;
+  observation.candidates = receipt_candidates;
+  if (receipt_source.device11 == device11) {
+    observation.identity = receipt_source;
+    observation.matches = 1;
+  } else {
+    observation.identity.device11 = device11;
+  }
+  return observation;
 }
 int32_t ReceiptSdkCall() {
   Check(!xefg::QueryBridgeOff(receipt_source).available, "old Off cannot authorize while the SDK contract call is in flight");
@@ -362,6 +383,20 @@ int main(int argc, char** argv) {
       other_identity.Attach(new ReceiptDeviceIdentity());
       auto* context_handle = reinterpret_cast<void*>(uintptr_t{0xEF001});
       receipt_source = {.device11 = reinterpret_cast<uintptr_t>(identity.Get()), .handle = 0xD311, .generation = 1};
+      const std::array<std::pair<xefg::BridgeSourceObservation, const char*>, 6> classifications{{
+          {{.queried_device11 = receipt_source.device11, .state = xefg::BridgeSnapshotState::RUNTIME_BUSY}, "runtime_busy"},
+          {{.queried_device11 = receipt_source.device11, .state = xefg::BridgeSnapshotState::SHUTTING_DOWN}, "shutting_down"},
+          {{.queried_device11 = receipt_source.device11, .state = xefg::BridgeSnapshotState::LOCKED}, "no_live_source"},
+          {{.queried_device11 = receipt_source.device11, .state = xefg::BridgeSnapshotState::LOCKED, .candidates = 1}, "device_mismatch"},
+          {{.identity = {.device11 = receipt_source.device11}, .queried_device11 = receipt_source.device11,
+               .state = xefg::BridgeSnapshotState::LOCKED, .candidates = 2, .matches = 2}, "ambiguous"},
+          {{.identity = receipt_source, .queried_device11 = receipt_source.device11,
+               .state = xefg::BridgeSnapshotState::LOCKED, .candidates = 1, .matches = 1}, "matched"},
+      }};
+      for (const auto& [observation, expected] : classifications) {
+        Check(std::strcmp(xefg::BridgeSourceReason(observation), expected) == 0,
+            "source observation classifies unavailable locks, usable D3D11 candidates and exact matches");
+      }
       const auto fresh_context = [&] {
         adapter::state.contexts.clear();
         auto context = std::make_shared<adapter::Context>();
@@ -392,8 +427,25 @@ int main(int argc, char** argv) {
             "known ReShade swapchain base supplies the canonical source device before proxy GetDevice can select another face");
         Check(wrapper->references == wrapper_refs && native_swapchain->references == native_refs,
             "Bridge identity capture balances outer and borrowed-base swapchain references");
+        xefg::BridgeDeviceObservation application_observation;
+        Check(adapter::BridgeDeviceIdentity(nullptr, &application_observation) == nullptr
+                  && !application_observation.object_present && application_observation.swapchain_result == E_PENDING,
+            "missing application swapchain records unattempted queries rather than a D3D11 failure result");
+        xefg::BridgeDeviceObservation proxy_observation;
+        Check(adapter::BridgeDeviceIdentity(wrapper.Get(), &proxy_observation).Get() == identity.Get()
+                  && proxy_observation.object_present && proxy_observation.swapchain_unwrapped
+                  && proxy_observation.swapchain_result == S_OK && proxy_observation.device11_result == S_OK
+                  && proxy_observation.device12_result == E_NOINTERFACE,
+            "lock-free capture preserves the known ReShade unwrap and separate D3D11/D3D12 GetDevice results");
         context->bridge_application_device11.Reset();
         context->bridge_proxy_device11 = captured;
+        context->bridge_init_kind = "InitDesc";
+        context->bridge_application_observation = application_observation;
+        context->bridge_proxy_observation = proxy_observation;
+        const auto metadata_only = xefg::QueryBridgeOff(receipt_source);
+        Check(!metadata_only.available && metadata_only.application == application_observation
+                  && metadata_only.proxy_device == proxy_observation && std::strcmp(metadata_only.init_kind, "InitDesc") == 0,
+            "captured host API metadata is visible but cannot itself authorize Off");
         Hooks::Enable(context_handle, 0);
         Check(xefg::QueryBridgeOff(receipt_source).available,
             "the captured matching native device still requires and accepts a successful same-source SDK Disable");
@@ -405,6 +457,13 @@ int main(int argc, char** argv) {
         Hooks::Enable(context_handle, 0);
         Check(!xefg::QueryBridgeOff(receipt_source).available,
             "an unwrapped but genuinely different device cannot claim the source's Disable receipt");
+        ComPtr<ReceiptSwapchain> device12_swapchain;
+        device12_swapchain.Attach(new ReceiptSwapchain(nullptr));
+        device12_swapchain->reported_device12 = other_identity;
+        xefg::BridgeDeviceObservation device12_observation;
+        Check(adapter::BridgeDeviceIdentity(device12_swapchain.Get(), &device12_observation) == nullptr
+                  && device12_observation.device11_result == E_NOINTERFACE && device12_observation.device12_result == S_OK,
+            "a D3D12-only application chain is observable without inventing a D3D11 source identity");
         context = fresh_context();
       }
       Check(!xefg::QueryBridgeOff(receipt_source).available, "default enabled=false is not an observed Disable");
@@ -421,6 +480,15 @@ int main(int argc, char** argv) {
       const auto accepted = xefg::QueryBridgeOff(receipt_source);
       Check(accepted.available && accepted.source == receipt_source && accepted.epoch == context->epoch,
           "successful false with the same captured context/proxy/source publishes a current receipt");
+      receipt_during_sdk = +[] { receipt_candidates = 2; };
+      Hooks::Enable(context_handle, 0);
+      const auto metadata_changed = xefg::QueryBridgeOff(receipt_source);
+      Check(metadata_changed.available && metadata_changed.before.identity == metadata_changed.after.identity
+                && metadata_changed.before.candidates == 1 && metadata_changed.after.candidates == 2
+                && metadata_changed.before != metadata_changed.after,
+          "diagnostic candidate changes do not alter the original before/after identity-only admission comparison");
+      receipt_during_sdk = nullptr;
+      receipt_candidates = 1;
       auto wrong_source = receipt_source;
       ++wrong_source.generation;
       Check(!xefg::QueryBridgeOff(wrong_source).available, "a rebuilt source cannot inherit an older Disable");
@@ -430,6 +498,8 @@ int main(int argc, char** argv) {
       receipt_source_available = false;
       Hooks::Enable(context_handle, 0);
       Check(!xefg::QueryBridgeOff(receipt_source).available, "unavailable source snapshot revokes the prior Off receipt");
+      Check(std::strcmp(xefg::BridgeSourceReason(xefg::QueryBridgeOff(receipt_source).before), "runtime_busy") == 0,
+          "a busy observer is diagnosed and its empty identity still revokes Off immediately");
       receipt_source_available = true;
       Hooks::Enable(context_handle, 0);
       Hooks::Enable(context_handle, 1);
