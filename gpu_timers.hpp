@@ -383,7 +383,9 @@ inline void Reject(const Segment& s, SampleState state) {
     s.adaptive.session->ObserveGpu({.generation = s.adaptive.generation,
         .frame = s.adaptive.application_frame, .sequence = s.sequence,
         .recorded_ns = static_cast<int64_t>(s.comparison.recorded_ns), .completed_ns = NowNs(),
-        .role = s.adaptive.role, .required_roles = s.adaptive.required_roles}, NowNs());
+        .role = s.adaptive.role, .required_roles = s.adaptive.required_roles,
+        .paired = s.adaptive.paired, .pair_first_frame = s.adaptive.pair_first_frame,
+        .sampling_generation = s.adaptive.sampling_generation}, NowNs());
   }
   if (s.measure && s.diagnostic_token != 0 && raw_observer != nullptr && state != SampleState::PENDING) {
     Stats rejected{.width = s.width, .height = s.height, .passes = s.passes,
@@ -536,7 +538,8 @@ inline bool Publish(const Segment& s, bool log, const void* queue) {
         .recorded_ns = next.recorded_ns, .completed_ns = next.measured_ns,
         .total_us = static_cast<double>(next.total_us), .role = s.adaptive.role,
         .required_roles = s.adaptive.required_roles, .valid = complete,
-        .stable = s.comparison.stable}, next.measured_ns);
+        .stable = s.comparison.stable, .paired = s.adaptive.paired,
+        .pair_first_frame = s.adaptive.pair_first_frame, .sampling_generation = s.adaptive.sampling_generation}, next.measured_ns);
   }
   if (s.diagnostic_token != 0 && raw_observer != nullptr) {
     raw_observer(next, s.diagnostic_token);

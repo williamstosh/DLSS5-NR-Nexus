@@ -11100,6 +11100,10 @@ inline void ObserveNrEvaluation(stage_plan::Stage stage, const NVSDK_NGX_Handle*
     PublishAdaptiveStatus(active_adaptive_frame->session->status);
   }
   if (slot.model_reset || !api_returned || !NVSDK_NGX_SUCCEED(result)) {
+    if (active_adaptive_frame != nullptr && active_adaptive_frame->paired && !active_adaptive_frame->preparing
+        && active_adaptive_frame->session != nullptr) {
+      active_adaptive_frame->session->InvalidateSampling();
+    }
     comparison_stable_after_ns[static_cast<size_t>(stage)] = SteadyNowNs() + gpu_comparison::STABILITY_NS;
     ++comparison_stable_epochs[static_cast<size_t>(stage)];
     if (gpu_timers::internal::current.active) {
@@ -13660,6 +13664,19 @@ inline bool RecordInline(
   const bool edit_reuse_route_eligible = edit_reuse_contract_eligible && !adaptive.preparing && !prepare_models_only
       && ((!nr_adaptive_enabled.load() && !adaptive.enabled && nr_input_width == width && nr_input_height == height)
           || edit_reuse_adaptive_route);
+  if (adaptive.session != nullptr && !adaptive.preparing) {
+    adaptive.session->SetPairedSampling(edit_reuse_adaptive_route && edit_reuse_route_eligible);
+    adaptive.paired = adaptive.session->paired_sampling;
+    adaptive.sampling_generation = adaptive.session->sampling_generation;
+    if (adaptive.paired) {
+      adaptive.application_frame = feature.sr_sequence;
+      adaptive.pair_first_frame = adaptive.session->SelectMeasurementPair(feature.sr_sequence, adaptive.measure);
+      adaptive.measure = adaptive.pair_first_frame != 0;
+    }
+  }
+  if (adaptive_recording != nullptr) {
+    adaptive_recording->frame = adaptive;
+  }
   if (edit_reuse_requested && !edit_reuse_route_eligible) ++edit_reuse_fallbacks;
   const auto retire_edit_reuse = [&] {
     auto& slot = feature.slots[0];
@@ -16174,6 +16191,10 @@ inline bool RecordInlinePreSR(
   if (feature.adaptive_output_blocked || feature.adaptive_retirement_blocked) {
     device->Release();
     return false;
+  }
+  if (adaptive.session != nullptr && !adaptive.preparing) {
+    adaptive.session->SetPairedSampling(false);
+    adaptive.sampling_generation = adaptive.session->sampling_generation;
   }
   if (adaptive_recording != nullptr) {
     adaptive_recording->feature = &feature;

@@ -10,7 +10,9 @@
 #include <cstring>
 #include <DirectXPackedVector.h>
 #include <iostream>
+#include <iterator>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include <edit_reuse.hpp>
@@ -897,9 +899,99 @@ int Run() {
       }
       checked_frame(0, 1);
       checked_frame(0, 0);
+      {
+        namespace timers = addon::gpu_timers;
+        const auto session = feature.adaptive_session;
+        const auto saved_stability = session->stable_after_ns;
+        const auto saved_comparison_stability = native::comparison_stable_after_ns[1];
+        const auto saved_measure = session->next_measure_ns;
+        const auto saved_output = [] {
+          std::unique_lock lock(addon::output_framerate::internal::state.mutex);
+          return addon::output_framerate::internal::state.stream;
+        }();
+        Check(!native::gpu_timers_enabled.load() && !native::cost_meter_enabled.load(),
+              "paired WARP recording is driven by adaptive sampling without profiling");
+        timers::Poll(true, false);
+        session->InvalidateSampling();
+        session->stable_after_ns = native::comparison_stable_after_ns[1] = 0;
+        session->next_measure_ns = 0;
+        const auto timed_source = [&](uint32_t calls) {
+          // With no Present provider, Prepare intentionally clears its samples
+          // every frame. Supply the existing synthetic output-FPS contract.
+          const auto now = native::SteadyNowNs();
+          {
+            std::unique_lock lock(addon::output_framerate::internal::state.mutex);
+            auto& estimate = addon::output_framerate::internal::state.stream;
+            estimate.previous_ns = now;
+            estimate.snapshot = {.available = true, .source = addon::output_framerate::Source::PRESENT,
+                .source_generation = 1, .configuration_generation = native::configuration_generation.load(),
+                .window_serial = 1, .window_begin_ns = now - 500'000'000, .window_end_ns = now,
+                .fps = 60., .fg_off = true};
+          }
+          const auto sequence = timers::internal::next_sequence;
+          const auto successes = native::SourceSuccessfulEvaluations();
+          Check(frame(0, false) == calls && native::SourceSuccessfulEvaluations() == successes + 1,
+                "paired timer source retains the actual refresh/reuse calls");
+          const auto found = std::find_if(std::begin(timers::internal::segments), std::end(timers::internal::segments),
+              [&](const auto& segment) { return segment.recorded && segment.sequence == sequence + 1; });
+          Check(found != std::end(timers::internal::segments) && found->measure && found->adaptive.paired
+                    && found->adaptive.pair_first_frame != 0
+                    && found->adaptive.application_frame == feature.sr_sequence,
+                "production timer captures the selected true source ID and paired tag");
+          const auto tag = found->adaptive;
+          const auto measured_sequence = found->sequence;
+          // Preserve the real completion receipt before Poll; Gpu::Submit's
+          // unconditional prune intentionally does not preserve timer receipts.
+          Check(SUCCEEDED(gpu.list->Close()), "paired recording close");
+          ID3D12CommandList* lists[]{gpu.list.Get()};
+          gpu.queue->ExecuteCommandLists(1, lists);
+          gpu.submission_pending = true;
+          Check(SUCCEEDED(gpu.queue->Signal(gpu.fence.Get(), ++gpu.serial)), "paired completion signal");
+          HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+          Check(event != nullptr, "paired completion event");
+          const auto armed = gpu.fence->SetEventOnCompletion(gpu.serial, event);
+          const auto wait = (SUCCEEDED(armed) ? WaitForSingleObject(event, 10000) : WAIT_FAILED);
+          CloseHandle(event);
+          Check(wait == WAIT_OBJECT_0 && SUCCEEDED(gpu.device->GetDeviceRemovedReason()), "paired healthy bounded completion");
+          gpu.submission_pending = false;
+          Check(SUCCEEDED(gpu.allocator->Reset()) && SUCCEEDED(gpu.list->Reset(gpu.allocator.Get(), nullptr)),
+                "paired completed recording reset");
+          native::DrainRetiredResources(true);
+          timers::Poll(true, false);
+          gpu.uploads.clear();
+          gpu.retained_resources.clear();
+          Check(timers::stage_stats[1].valid && timers::stage_stats[1].sequence == measured_sequence,
+                "both real WARP chains publish complete production timestamps");
+          return std::pair{tag, timers::stage_stats[1].total_us};
+        };
+        const auto first = timed_source(1);
+        Check(session->gpu_count == 0 && session->pending_pair.frame == first.first.application_frame,
+              "one completed production chain does not publish a two-source cost");
+        session->next_measure_ns = native::SteadyNowNs() + 10'000'000'000;
+        const auto second = timed_source(0);
+        Check(second.first.application_frame == first.first.application_frame + 1
+                  && second.first.pair_first_frame == first.first.pair_first_frame
+                  && session->gpu_count == 1
+                  && std::abs(session->gpu_us[0] - (static_cast<double>(first.second) + second.second) / 2.) < .001,
+              "the adjacent reuse is measured before the next 250ms opportunity and publishes the complete chain mean");
+        session->next_measure_ns = 0;
+        const auto unmatched = timed_source(1);
+        Check(session->pending_pair.frame == unmatched.first.application_frame,
+              "a new first source waits for its adjacent completion");
+        session->stable_after_ns = saved_stability;
+        native::comparison_stable_after_ns[1] = saved_comparison_stability;
+        session->next_measure_ns = saved_measure;
+        {
+          std::unique_lock lock(addon::output_framerate::internal::state.mutex);
+          addon::output_framerate::internal::state.stream = saved_output;
+        }
+      }
       std::weak_ptr<reuse::State> retired_lower = low_anchor;
       low_anchor.reset();
       feature.adaptive_session->Request(0, native::SteadyNowNs());
+      Check(feature.adaptive_session->pending_pair.pair_first_frame == 0
+                && feature.adaptive_session->measure_pair_first_frame == 0,
+            "the real tier request clears the unfinished old measurement pair");
       checked_frame(0, 1);
       Check(tiers->active == 0 && feature.slots[0].handle == upper_model && model_resets.back() == 1
                 && retired_lower.expired() && tiers->tiers[1].state.slots[0].edit_reuse == nullptr,

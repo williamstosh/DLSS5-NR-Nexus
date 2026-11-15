@@ -134,6 +134,119 @@ inline bool Run() {
         && profiling.gpu_recorded_ns.back() - profiling.gpu_recorded_ns.front() >= 1'000'000'000,
         "profiling is downsampled by recording time at 60/120/240 Hz");
   }
+  // Two-phase NR costs must be averaged before the 250 ms / five-point filter.
+  // At 120 Hz that cadence can otherwise stay on either phase with zero MAD.
+  constexpr double paired_refresh_us = 3390.9725, paired_reuse_us = 533.0355;
+  constexpr double paired_mean_us = (paired_refresh_us + paired_reuse_us) / 2.;
+  const auto paired_sample = [](adaptive::Session& target, uint64_t frame, uint64_t first,
+                                int64_t now, double cost, bool valid = true, uint64_t context = 1) {
+    adaptive::GpuSample sample{.generation = target.status.generation, .frame = frame, .sequence = frame,
+        .context = context, .recorded_ns = now, .completed_ns = now, .total_us = cost, .valid = valid, .stable = true};
+    sample.paired = true;
+    sample.pair_first_frame = first;
+    sample.sampling_generation = target.sampling_generation;
+    return sample;
+  };
+  for (uint32_t phase = 0; phase < 2; ++phase) {
+    adaptive::Session profiling;
+    profiling.prepared = true;
+    profiling.status.generation = 1;
+    profiling.applied_ns = profiling.stable_after_ns = start;
+    profiling.SetPairedSampling(true);
+    uint32_t measured_sources = 0;
+    int64_t now = start;
+    for (uint64_t frame = 1; frame <= 240; ++frame) {
+      now = start + static_cast<int64_t>(frame - 1) * 1'000'000'000 / 120;
+      const auto first = profiling.SelectMeasurementPair(frame, (frame - 1) % 30 == 0);
+      measured_sources += first != 0;
+      const double cost = ((frame - 1 + phase) % 2 == 0 ? paired_refresh_us : paired_reuse_us);
+      // Include profiling's extra completions; they must not enter as single samples.
+      profiling.ObserveGpu(paired_sample(profiling, frame, first, now, cost), now);
+    }
+    double median = 0., mad = 0.;
+    check(measured_sources == 16 && profiling.GpuStatistics(now, &median, &mad)
+              && std::abs(median - paired_mean_us) < .0001 && mad < .0001,
+          "either 120 Hz phase selects only adjacent pairs and reports their complete per-source mean");
+  }
+  {
+    adaptive::Session pairing;
+    pairing.prepared = true;
+    pairing.status.generation = 1;
+    pairing.applied_ns = pairing.stable_after_ns = start;
+    pairing.SetPairedSampling(true);
+    const auto feed = [&](uint64_t frame, uint64_t first, bool valid = true, uint64_t context = 1) {
+      const int64_t now = start + static_cast<int64_t>(frame) * 10'000'000;
+      pairing.ObserveGpu(paired_sample(pairing, frame, first, now, 2000., valid, context), now);
+    };
+    check(pairing.SelectMeasurementPair(1, true) == 1 && pairing.SelectMeasurementPair(3, false) == 0,
+          "a missing adjacent source does not extend a measurement pair to a later source");
+    feed(1, 1);
+    check(pairing.gpu_count == 0, "one completed source cannot publish a paired cost");
+    feed(2, 1, false);
+    feed(3, 3);
+    feed(5, 3);
+    check(pairing.gpu_count == 0, "invalid or nonadjacent completions never form a GPU cost pair");
+    feed(6, 6);
+    auto old_completion = paired_sample(pairing, 7, 6, start + 70'000'000, 2000.);
+    pairing.InvalidateSampling();
+    pairing.ObserveGpu(old_completion, old_completion.completed_ns);
+    check(pairing.gpu_count == 0, "Reset invalidation rejects a late second source in the same adaptive generation");
+    feed(8, 8);
+    feed(9, 8, true, 2);
+    check(pairing.gpu_count == 0, "different queue contexts cannot supply opposite halves of one pair");
+    feed(10, 10, true, 2);
+    feed(11, 10, true, 2);
+    check(pairing.gpu_count == 1 && pairing.gpu_us[0] == 2000., "a fresh complete pair resumes after rejected halves");
+    feed(12, 12, true, 2);
+    old_completion = paired_sample(pairing, 13, 12, start + 130'000'000, 2000., true, 2);
+    pairing.SetPairedSampling(false);
+    pairing.ObserveGpu(old_completion, old_completion.completed_ns);
+    check(pairing.gpu_count == 0, "leaving paired sampling rejects old-mode completions");
+    auto ordinary = paired_sample(pairing, 14, 0, start + 140'000'000, 3000., true, 2);
+    ordinary.paired = false;
+    pairing.ObserveGpu(ordinary, ordinary.completed_ns);
+    check(pairing.gpu_count == 1 && pairing.gpu_us[0] == 3000., "ordinary single-source sampling resumes after paired mode");
+  }
+  for (const bool fps_benefit : {true, false}) {
+    adaptive::Sizes paired_upper{}, paired_floor{};
+    paired_upper[0] = {.width = 3840, .height = 2160};
+    paired_floor[0] = {.width = 2880, .height = 1620};
+    const adaptive::Settings paired_settings{.enabled = true, .target_fps = 60.f, .minimum_scale = .75f,
+        .prepared_levels = 2, .selected_levels = 2};
+    adaptive::Session controller;
+    adaptive::Output paired_output{.available = true, .source = 1, .generation = 1, .configuration = 1};
+    controller.Prepare(paired_settings, paired_upper, paired_floor, 1, paired_output, start, true, false);
+    controller.UpdatePreparation(controller.preparation_epoch, 2, 2, adaptive::Reason::PREPARING, start);
+    controller.Applied(controller.status.generation, controller.status.requested, start);
+    controller.SetPairedSampling(true);
+    const uint32_t steps = (fps_benefit ? 40u : 72u);
+    uint32_t changes = 0;
+    for (uint32_t step = 1; step <= steps; ++step) {
+      const auto now = start + step * adaptive::SAMPLE_INTERVAL_NS;
+      const auto next = now + 8'333'333;
+      const uint64_t first = static_cast<uint64_t>(step) * 30 + 1;
+      const double refresh = (controller.level == 0 ? 5150. : paired_refresh_us);
+      const double reuse = (controller.level == 0 ? 737. : paired_reuse_us);
+      const auto selected = controller.SelectMeasurementPair(first, true);
+      controller.ObserveGpu(paired_sample(controller, first, selected, now, step % 2 == 0 ? refresh : reuse), now);
+      const auto adjacent = controller.SelectMeasurementPair(first + 1, false);
+      controller.ObserveGpu(paired_sample(controller, first + 1, adjacent, next, step % 2 == 0 ? reuse : refresh), next);
+      ++paired_output.serial;
+      paired_output.begin_ns = next - 2'000'000'000;
+      paired_output.end_ns = next;
+      paired_output.fps = (controller.level == 1 && fps_benefit ? 60. : 50.);
+      const auto previous = controller.level;
+      controller.Prepare(paired_settings, paired_upper, paired_floor, 1, paired_output, next, true, false);
+      controller.UpdatePreparation(controller.preparation_epoch, 2, 2, adaptive::Reason::PREPARING, next);
+      controller.Applied(controller.status.generation, controller.status.requested, next);
+      changes += previous != controller.level;
+    }
+    check(fps_benefit ? controller.level == 1 && !controller.trial && !controller.blocked && changes == 1
+                      : controller.level == 0 && !controller.trial && controller.blocked && changes == 2,
+          fps_benefit ? "phase-independent paired costs accept a useful lower tier under the unchanged FPS policy"
+                      : "an unchanged FPS cap rolls back once and changing pair phase cannot reopen its cooldown");
+  }
+
   adaptive::Session dual;
   dual.prepared = true;
   dual.status.generation = 1;

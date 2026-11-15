@@ -131,6 +131,8 @@ struct GpuSample {
   double total_us = 0.;
   uint32_t role = 1, required_roles = 1;
   bool valid = false, stable = false;
+  bool paired = false;
+  uint64_t pair_first_frame = 0, sampling_generation = 0;
 };
 
 struct Session {
@@ -163,6 +165,9 @@ struct Session {
   size_t gpu_count = 0;
   GpuSample pending;
   uint32_t pending_roles = 0;
+  bool paired_sampling = false;
+  uint64_t sampling_generation = 0, measure_pair_first_frame = 0;
+  GpuSample pending_pair;
 
   void ResetMeasurements() {
     gpu_count = 0;
@@ -170,8 +175,38 @@ struct Session {
     gpu_recorded_ns = {};
     pending = {};
     pending_roles = 0;
+    measure_pair_first_frame = 0;
+    pending_pair = {};
     last_output_serial = 0;
     at_target_since_ns = 0;
+  }
+
+  void InvalidateSampling() {
+    ++sampling_generation;
+    ResetMeasurements();
+  }
+
+  void SetPairedSampling(bool enabled) {
+    if (paired_sampling == enabled) return;
+    paired_sampling = enabled;
+    InvalidateSampling();
+    trial = false;
+  }
+
+  uint64_t SelectMeasurementPair(uint64_t source_frame, bool first_due) {
+    if (!paired_sampling || source_frame == 0) {
+      measure_pair_first_frame = 0;
+      return 0;
+    }
+    if (measure_pair_first_frame != 0) {
+      const uint64_t first = measure_pair_first_frame;
+      if (source_frame == first) return 0;
+      measure_pair_first_frame = 0;
+      if (source_frame == first + 1) return first;
+    }
+    if (!first_due) return 0;
+    measure_pair_first_frame = source_frame;
+    return source_frame;
   }
 
   bool IsLegal(const Sizes& sizes) const {
@@ -359,14 +394,21 @@ struct Session {
   }
 
   void ObserveGpu(const GpuSample& sample, int64_t now_ns) {
+    if (sample.paired != paired_sampling || sample.sampling_generation != sampling_generation
+        || (sample.paired && sample.pair_first_frame == 0)) return;
     if ((!TargetReady() && !settings.legacy_preparation) || sample.generation != status.generation
         || (sample.sequence <= last_sequence && (pending_roles == 0 || sample.frame != pending.frame))) return;
     last_sequence = std::max(last_sequence, sample.sequence);
     if (!sample.valid || !sample.stable || sample.recorded_ns < stable_after_ns || applied_ns == 0
         || sample.recorded_ns > sample.completed_ns || sample.completed_ns > now_ns
         || now_ns - sample.recorded_ns > SAMPLE_MAX_AGE_NS
-        || now_ns - sample.completed_ns > SAMPLE_MAX_AGE_NS) {
+        || now_ns - sample.completed_ns > SAMPLE_MAX_AGE_NS
+        || (sample.paired && (!std::isfinite(sample.total_us) || sample.total_us <= 0.))) {
       pending_roles = 0;
+      pending_pair = {};
+      if (sample.paired && measure_pair_first_frame == sample.pair_first_frame) {
+        measure_pair_first_frame = 0;
+      }
       return;
     }
     if (gpu_context != 0 && gpu_context != sample.context) {
@@ -374,17 +416,42 @@ struct Session {
       trial = false;
     }
     gpu_context = sample.context;
-    if (pending_roles == 0 || pending.frame != sample.frame || pending.generation != sample.generation
-        || pending.required_roles != sample.required_roles || pending.context != sample.context) {
-      pending = sample;
+    auto complete = sample;
+    if (sample.paired) {
+      if (sample.role != 1 || sample.required_roles != 1) {
+        pending_pair = {};
+        return;
+      }
+      if (sample.frame == sample.pair_first_frame) {
+        pending_pair = sample;
+        return;
+      }
+      if (pending_pair.pair_first_frame != sample.pair_first_frame
+          || pending_pair.frame + 1 != sample.frame || pending_pair.generation != sample.generation
+          || pending_pair.context != sample.context || pending_pair.sampling_generation != sample.sampling_generation
+          || sample.recorded_ns <= pending_pair.recorded_ns
+          || now_ns - pending_pair.recorded_ns > SAMPLE_MAX_AGE_NS
+          || now_ns - pending_pair.completed_ns > SAMPLE_MAX_AGE_NS) {
+        pending_pair = {};
+        return;
+      }
+      complete.total_us = (pending_pair.total_us + sample.total_us) / 2.;
+      complete.recorded_ns = pending_pair.recorded_ns;
+      complete.completed_ns = std::max(pending_pair.completed_ns, sample.completed_ns);
+      complete.frame = pending_pair.frame;
+      pending_pair = {};
+    }
+    if (pending_roles == 0 || pending.frame != complete.frame || pending.generation != complete.generation
+        || pending.required_roles != complete.required_roles || pending.context != complete.context) {
+      pending = complete;
       pending.total_us = 0.;
       pending_roles = 0;
     }
-    if ((pending_roles & sample.role) != 0) return;
-    pending_roles |= sample.role;
-    pending.total_us += sample.total_us;
-    pending.recorded_ns = std::min(pending.recorded_ns, sample.recorded_ns);
-    if (pending_roles != sample.required_roles) return;
+    if ((pending_roles & complete.role) != 0) return;
+    pending_roles |= complete.role;
+    pending.total_us += complete.total_us;
+    pending.recorded_ns = std::min(pending.recorded_ns, complete.recorded_ns);
+    if (pending_roles != complete.required_roles) return;
     pending_roles = 0;
     if (gpu_count != 0 && pending.recorded_ns - gpu_recorded_ns[gpu_count - 1] < SAMPLE_INTERVAL_NS) return;
     if (gpu_count == gpu_us.size()) {
@@ -706,6 +773,8 @@ struct Frame {
   uintptr_t output_identity = 0;
   bool enabled = false, measure = false, preparing = false, immediate = true;
   bool upper_capacity = false;
+  bool paired = false;
+  uint64_t pair_first_frame = 0, sampling_generation = 0;
 };
 
 }  // namespace renodx::addons::dlss5::adaptive_resolution
