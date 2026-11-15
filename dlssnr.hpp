@@ -11285,6 +11285,11 @@ inline bool BridgeAdaptiveEligible(const BridgeAdaptiveSource& source,
            << " proxy=" << reinterpret_cast<const void*>(evidence.proxy)
            << " application_device11=" << reinterpret_cast<const void*>(evidence.application_device11)
            << " proxy_device11=" << reinterpret_cast<const void*>(evidence.proxy_device11)
+           << " source_link_reason=" << evidence.source_link_reason
+           << " source_swapchain=" << reinterpret_cast<const void*>(evidence.source_swapchain)
+           << " source_swapchain_generation=" << evidence.source_swapchain_generation
+           << " source_link_generation=" << evidence.source_link_generation
+           << " uses_source_link=" << evidence.uses_source_link
            << " receipt_source=" << reinterpret_cast<const void*>(evidence.source.handle)
            << " receipt_source_generation=" << evidence.source.generation
            << " declaration=" << evidence.declaration << " epoch=" << evidence.epoch
@@ -22302,6 +22307,11 @@ inline void OnInitSwapchain(reshade::api::swapchain* swapchain, bool /*resize*/)
     // detours installed: before the game's first frame and, in most games,
     // before its DLSS create.
     InstallHooks();
+#if defined(NR_NEXUS_DEV_CONTROL)
+    fg::xefg::RegisterBridgeSourceSwapchain(
+        reinterpret_cast<uintptr_t>(swapchain),
+        reinterpret_cast<IDXGISwapChain*>(swapchain->get_native()));
+#endif
     return;
   }
   if (device->get_api() != reshade::api::device_api::d3d12) {
@@ -32635,6 +32645,9 @@ inline void OnDestroyDevice(reshade::api::device* device) {
 // session.  `swapchains=` / `swapchains_ours=` in the telemetry line are what
 // a field log would show it by.
 inline void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+  fg::xefg::ForgetBridgeSourceSwapchain(reinterpret_cast<uintptr_t>(swapchain));
+#endif
   if (swapchain != nullptr) {
     RuntimeLock lock(runtime_mutex);
     if (auto stream = present_streams.find(swapchain); stream != present_streams.end()) {

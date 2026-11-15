@@ -8,6 +8,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 #include <include/reshade.hpp>
@@ -99,10 +100,13 @@ int32_t FakeResource(void* context, ID3D12CommandList* list, uint32_t id, const 
 }
 int32_t FakeConstants(void*, uint32_t, const xefg::abi::Constants*) { return sdk_status; }
 int32_t FakeId(void*, uint32_t) { return sdk_status; }
+std::atomic_bool receipt_device_destroyed{false};
+std::atomic_bool receipt_device_release_unlocked{false};
 // CPU receipt tests supply captured identities explicitly; the Bridge WARP
 // fixture separately checks real D3D11 GetDevice capture and source matching.
 struct ReceiptDeviceIdentity : IUnknown {
   ULONG references = 1;
+  void (*on_destroy)() = nullptr;
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** output) override {
     if (output == nullptr) return E_POINTER;
     *output = nullptr;
@@ -115,6 +119,7 @@ struct ReceiptDeviceIdentity : IUnknown {
   ULONG STDMETHODCALLTYPE Release() override {
     const auto remaining = --references;
     if (remaining == 0) {
+      if (on_destroy != nullptr) on_destroy();
       delete this;
     }
     return remaining;
@@ -126,6 +131,7 @@ struct ReceiptSwapchain : IDXGISwapChain {
   ComPtr<IUnknown> reported_device;
   ComPtr<IDXGISwapChain> native_swapchain;
   ComPtr<IUnknown> reported_device12;
+  HRESULT (*present_callback)(ReceiptSwapchain*, UINT, UINT) = nullptr;
   explicit ReceiptSwapchain(IUnknown* device, IDXGISwapChain* native = nullptr)
       : reported_device(device), native_swapchain(native) {}
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** output) override {
@@ -169,7 +175,9 @@ struct ReceiptSwapchain : IDXGISwapChain {
   HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return E_NOTIMPL; }
   HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return E_NOTIMPL; }
   HRESULT STDMETHODCALLTYPE GetParent(REFIID, void**) override { return E_NOTIMPL; }
-  HRESULT STDMETHODCALLTYPE Present(UINT, UINT) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE Present(UINT interval, UINT flags) override {
+    return (present_callback != nullptr ? present_callback(this, interval, flags) : E_NOTIMPL);
+  }
   HRESULT STDMETHODCALLTYPE GetBuffer(UINT, REFIID, void**) override { return E_NOTIMPL; }
   HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL, IDXGIOutput*) override { return E_NOTIMPL; }
   HRESULT STDMETHODCALLTYPE GetFullscreenState(BOOL*, IDXGIOutput**) override { return E_NOTIMPL; }
@@ -186,6 +194,7 @@ uint32_t receipt_candidates = 1;
 int32_t receipt_sdk_status = 0;
 void (*receipt_during_sdk)() = nullptr;
 IUnknown* receipt_proxy = nullptr;  // Borrowed only across the mock SDK callback.
+IUnknown* receipt_secondary_proxy = nullptr;
 void* receipt_context_handle = nullptr;
 xefg::BridgeSourceObservation ObserveReceiptSource(uintptr_t device11) noexcept {
   xefg::BridgeSourceObservation observation{.queried_device11 = device11,
@@ -225,6 +234,11 @@ HRESULT STDMETHODCALLTYPE FakePresent(IDXGISwapChain*, UINT, UINT) {
   fake_present_owns_stream = xefg::OwnsStream();
   return S_OK;
 }
+HRESULT STDMETHODCALLTYPE FakeSourcePresent(IDXGISwapChain* swapchain, UINT interval, UINT flags) {
+  return swapchain->Present(interval, flags);
+}
+HRESULT STDMETHODCALLTYPE FailedReceiptPresent(IDXGISwapChain*, UINT, UINT) { return E_FAIL; }
+HRESULT STDMETHODCALLTYPE OccludedReceiptPresent(IDXGISwapChain*, UINT, UINT) { return DXGI_STATUS_OCCLUDED; }
 HRESULT STDMETHODCALLTYPE FakePresent1(IDXGISwapChain1* swapchain, UINT interval, UINT flags,
                                       const DXGI_PRESENT_PARAMETERS*) {
   return adapter::ProxyHooks<0>::Present(swapchain, interval, flags);
@@ -563,6 +577,209 @@ int main(int argc, char** argv) {
       Check(!xefg::QueryBridgeOff(receipt_source).available, "replacement context starts without inherited Off");
       Hooks::Enable(context_handle, 0);
       Check(xefg::QueryBridgeOff(receipt_source).available, "replacement context can accept its own fresh Disable");
+      {
+        context = fresh_context();
+        ComPtr<ReceiptSwapchain> source_swapchain;
+        source_swapchain.Attach(new ReceiptSwapchain(identity.Get()));
+        ComPtr<ReceiptSwapchain> sdk_proxy;
+        sdk_proxy.Attach(new ReceiptSwapchain(other_identity.Get()));
+        receipt_proxy = sdk_proxy.Get();
+        receipt_context_handle = context_handle;
+        context->bridge_application_device11.Reset();
+        context->bridge_proxy_device11 = other_identity;
+        context->proxy_identity = adapter::Identity(sdk_proxy.Get());
+        const auto saved_proxy_real = adapter::proxies[0].real;
+        const auto saved_source_real = adapter::source_present_slots[0].real;
+        adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakePresent);
+        adapter::source_present_slots[0].real[0] = reinterpret_cast<void*>(&FakeSourcePresent);
+        const auto register_source = [&](ReceiptSwapchain* swapchain, uintptr_t owner) {
+          auto source = std::make_shared<adapter::BridgeSourceSwapchain>();
+          source->owner = owner;
+          source->identity = adapter::Identity(swapchain);
+          source->device11 = adapter::BridgeDeviceIdentity(swapchain);
+          source->generation = ++adapter::state.bridge_source_generation;
+          source->hook_ready = true;  // MOCK registration; no code detour or GPU is installed.
+          adapter::state.bridge_swapchains[owner] = source;
+          return source;
+        };
+        constexpr uintptr_t SOURCE_OWNER = 0xED001;
+        auto registration = register_source(source_swapchain.Get(), SOURCE_OWNER);
+        const auto source_refs = source_swapchain->references;
+        const auto normal_present = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+          return adapter::ProxyHooks<0>::Present(static_cast<IDXGISwapChain*>(receipt_proxy), interval, flags);
+        };
+        source_swapchain->present_callback = normal_present;
+        const auto run_source = [&](UINT flags = 0) {
+          return adapter::SourcePresentHooks<0>::Present(source_swapchain.Get(), 0, flags);
+        };
+        const auto accept_link = [&] {
+          Check(run_source() == S_OK, "source wrapper forwards its exact successful SDK proxy call");
+          Hooks::Enable(context_handle, 0);
+          Check(xefg::QueryBridgeOff(receipt_source).available, "a proven host link still requires a fresh successful Disable");
+        };
+        Hooks::Enable(context_handle, 0);
+        Check(!xefg::QueryBridgeOff(receipt_source).available,
+            "different device identities cannot infer a host link from the sole registered source");
+        adapter::ProxyHooks<0>::Present(sdk_proxy.Get(), 0, 0);
+        Check(context->bridge_source_swapchain == 0, "an SDK proxy outside the source call stack does not establish a link");
+        Check(run_source(DXGI_PRESENT_TEST) == S_OK && context->bridge_source_swapchain == 0,
+            "test Presents do not establish a source link");
+        accept_link();
+        const auto linked = xefg::QueryBridgeOff(receipt_source);
+        Check(linked.uses_source_link && linked.source_swapchain == SOURCE_OWNER
+                  && linked.source_swapchain_generation == registration->generation
+                  && linked.proxy_device11 == reinterpret_cast<uintptr_t>(other_identity.Get())
+                  && source_swapchain->references == source_refs,
+            "host mapping preserves the different raw SDK device and never retains the source swapchain");
+        Check(run_source() == S_OK && xefg::QueryBridgeOff(receipt_source).available
+                  && context->bridge_link_generation == linked.source_link_generation,
+            "repeated identical successful calls do not churn an existing link or Disable receipt");
+        adapter::proxies[0].real[0] = reinterpret_cast<void*>(&OccludedReceiptPresent);
+        Check(run_source() == DXGI_STATUS_OCCLUDED && xefg::QueryBridgeOff(receipt_source).available
+                  && context->bridge_link_generation == linked.source_link_generation,
+            "a normal positive Present status preserves the call relation without claiming image delivery");
+        adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakePresent);
+        source_swapchain->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+          const auto status = adapter::ProxyHooks<0>::Present(static_cast<IDXGISwapChain*>(receipt_proxy), interval, flags);
+          Hooks::Enable(receipt_context_handle, 1);
+          Hooks::Enable(receipt_context_handle, 0);
+          return status;
+        };
+        Check(run_source() == S_OK && xefg::QueryBridgeOff(receipt_source).available
+                  && context->bridge_link_generation == linked.source_link_generation,
+            "an interleaved Enable/Disable owns its new receipt without an old Present candidate revoking the stable link");
+        source_swapchain->present_callback = normal_present;
+        receipt_source_available = false;
+        Check(run_source() == S_OK && xefg::QueryBridgeOff(receipt_source).available,
+            "a busy nonblocking observer cannot grant a link or revoke an unchanged proven one");
+        receipt_source_available = true;
+        {
+          adapter::BridgeSourcePresent present1(source_swapchain.Get(), 0);
+          Check(run_source() == S_OK, "same-wrapper nested Present forwarding");
+          present1.Finish(S_OK);
+        }
+        Check(context->bridge_link_generation == linked.source_link_generation,
+            "the same wrapper's Present1-to-Present nesting counts one exact SDK call");
+        adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FailedReceiptPresent);
+        Check(run_source() == E_FAIL && !xefg::QueryBridgeOff(receipt_source).available
+                  && std::strcmp(xefg::QueryBridgeOff(receipt_source).source_link_reason, "proxy_present_failed") == 0,
+            "a failed inner SDK Present revokes the source link with a distinct reason");
+        adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakePresent);
+        accept_link();
+        source_swapchain->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) -> HRESULT {
+          adapter::ProxyHooks<0>::Present(static_cast<IDXGISwapChain*>(receipt_proxy), interval, flags);
+          throw std::runtime_error("MOCK source Present exception");
+        };
+        bool caught = false;
+        try { run_source(); } catch (const std::runtime_error&) { caught = true; }
+        Check(caught && adapter::BridgeSourcePresent::current == nullptr && !xefg::QueryBridgeOff(receipt_source).available,
+            "an exceptional outer return restores TLS and cannot preserve a mapped Disable receipt");
+        source_swapchain->present_callback = normal_present;
+        accept_link();
+        source_swapchain->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+          HRESULT status = E_FAIL;
+          std::thread worker([&] {
+            status = adapter::ProxyHooks<0>::Present(static_cast<IDXGISwapChain*>(receipt_proxy), interval, flags);
+          });
+          worker.join();
+          return status;
+        };
+        Check(run_source() == S_OK && !xefg::QueryBridgeOff(receipt_source).available,
+            "another thread's SDK Present cannot establish the caller's source association");
+        source_swapchain->present_callback = normal_present;
+        accept_link();
+        ComPtr<ReceiptSwapchain> other_proxy;
+        other_proxy.Attach(new ReceiptSwapchain(other_identity.Get()));
+        receipt_secondary_proxy = other_proxy.Get();
+        auto second_context = std::make_shared<adapter::Context>();
+        second_context->bridge_context_ready = second_context->bridge_proxy_ready = true;
+        second_context->proxy_identity = adapter::Identity(other_proxy.Get());
+        second_context->bridge_declaration = ++adapter::state.bridge_declaration;
+        adapter::state.contexts[reinterpret_cast<void*>(uintptr_t{0xEF002})] = second_context;
+        source_swapchain->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+          adapter::ProxyHooks<0>::Present(static_cast<IDXGISwapChain*>(receipt_proxy), interval, flags);
+          return adapter::ProxyHooks<0>::Present(static_cast<IDXGISwapChain*>(receipt_secondary_proxy), interval, flags);
+        };
+        Check(run_source() == S_OK && context->bridge_source_swapchain == 0,
+            "two exact SDK proxies in one source call are ambiguous rather than last-write-wins");
+        adapter::state.contexts.erase(reinterpret_cast<void*>(uintptr_t{0xEF002}));
+        Check(!xefg::QueryBridgeOff(receipt_source).available, "removing a second context cannot revive the revoked receipt");
+        source_swapchain->present_callback = normal_present;
+        accept_link();
+        ComPtr<ReceiptSwapchain> second_source;
+        second_source.Attach(new ReceiptSwapchain(identity.Get()));
+        second_source->present_callback = normal_present;
+        register_source(second_source.Get(), SOURCE_OWNER + 1);
+        Check(adapter::SourcePresentHooks<0>::Present(second_source.Get(), 0, 0) == S_OK
+                  && context->bridge_source_swapchain == 0,
+            "two different source wrappers calling one proxy revoke the previous association");
+        Check(run_source() == S_OK && context->bridge_source_swapchain == 0,
+            "subsequent calls cannot overwrite an unresolved multiple-source association");
+        xefg::ForgetBridgeSourceSwapchain(SOURCE_OWNER + 1);
+        accept_link();
+        source_swapchain->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+          const auto status = adapter::ProxyHooks<0>::Present(static_cast<IDXGISwapChain*>(receipt_proxy), interval, flags);
+          ++receipt_source.generation;
+          return status;
+        };
+        Check(run_source() == S_OK && !xefg::QueryBridgeOff(receipt_source).available,
+            "a source rebuilt inside Present cannot receive the old source generation's link");
+        source_swapchain->present_callback = normal_present;
+        accept_link();
+        receipt_during_sdk = +[] { ++receipt_source.generation; };
+        Hooks::Enable(context_handle, 0);
+        Check(!xefg::QueryBridgeOff(receipt_source).available,
+            "mapped devices retain the original before/after source-generation Disable requirement");
+        receipt_during_sdk = nullptr;
+        accept_link();
+        {
+          adapter::BridgeSourcePresent pending(source_swapchain.Get(), 0);
+          adapter::ProxyHooks<0>::Present(sdk_proxy.Get(), 0, 0);
+          xefg::ForgetBridgeSourceSwapchain(SOURCE_OWNER);
+          registration = register_source(source_swapchain.Get(), SOURCE_OWNER);
+          pending.Finish(S_OK);
+        }
+        Check(context->bridge_source_swapchain == 0 && !xefg::QueryBridgeOff(receipt_source).available,
+            "resize/re-registration during Present cannot grant to a replacement registration at the same address");
+        accept_link();
+        Hooks::Enable(context_handle, 1);
+        Check(!xefg::QueryBridgeOff(receipt_source).available, "reenabling revokes a mapped Off receipt");
+        Hooks::Enable(context_handle, 0);
+        Check(xefg::QueryBridgeOff(receipt_source).available, "a current link can receive its own fresh Disable after reenable");
+        xefg::ForgetBridgeSourceSwapchain(SOURCE_OWNER);
+        Check(!xefg::QueryBridgeOff(receipt_source).available && source_swapchain->references == source_refs,
+            "source destroy revokes its mapped Off and leaves the source swapchain's COM ownership unchanged");
+        adapter::proxies[0].real = saved_proxy_real;
+        adapter::source_present_slots[0].real = saved_source_real;
+        receipt_proxy = receipt_secondary_proxy = nullptr;
+        const auto register_release_probe = [&](uintptr_t owner) {
+          receipt_device_destroyed = receipt_device_release_unlocked = false;
+          ComPtr<ReceiptDeviceIdentity> device;
+          device.Attach(new ReceiptDeviceIdentity());
+          device->on_destroy = +[] {
+            std::thread probe([] {
+              std::unique_lock lock(adapter::state.mutex, std::try_to_lock);
+              receipt_device_destroyed.store(true);
+              receipt_device_release_unlocked.store(lock.owns_lock());
+            });
+            probe.join();
+          };
+          auto source = std::make_shared<adapter::BridgeSourceSwapchain>();
+          source->owner = owner;
+          source->device11 = device;
+          adapter::state.bridge_swapchains[owner] = std::move(source);
+        };
+        register_release_probe(SOURCE_OWNER);
+        xefg::ForgetBridgeSourceSwapchain(SOURCE_OWNER);
+        Check(receipt_device_destroyed && receipt_device_release_unlocked,
+            "source unregister releases the last device reference after unlocking XeFG state");
+        register_release_probe(SOURCE_OWNER);
+        xefg::Stop();
+        Check(receipt_device_destroyed && receipt_device_release_unlocked && adapter::state.bridge_swapchains.empty(),
+            "Stop retires registered devices outside the state lock");
+        adapter::stopped.store(false);
+        std::cout << "PASS CPU MOCK source Present association: nested SDK boundary, identity, failure, ambiguity and teardown\n";
+      }
       adapter::state.contexts.clear();
       adapter::modules[0].real = saved_real;
       xefg::ConfigureBridgeSource(nullptr);
