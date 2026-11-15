@@ -464,8 +464,32 @@ Bridge 两档自适应使用独立的软件单例：
 内部默认关闭的实验仅接纳 Upscaled 单组单 Pass、FG Off／x2 Off、显式两档全预备；
 共享 twins 保持完整尺寸，检查私有档位的往返、Reset、就绪后零新增创建、失败重开、Adaptive OFF 及源释放。
 watchdog 救援用例分别核验 `out`、GPU-only `done` 和实际 Reset／不可重放证明，
-防止未完成写回与提前释放。正式 Bridge 自适应兼容门禁仍关闭；此入口不覆盖真实 NGX、
-硬件驱动兼容、自动帧率闭环或游戏画质，也不量化严格完成等待的性能代价。
+防止未完成写回与提前释放。这个软件入口不覆盖真实 NGX 或硬件性能。
+
+同一两档流程另有两个显式硬件入口，不自动追加到软件组或 CI：
+
+~~~powershell
+./tools/run-tests.ps1 -Suite bridge-motion -BridgeCase adaptive-hardware -UiPreview None
+./tools/run-tests.ps1 -Suite bridge-motion -BridgeCase adaptive-native-ngx -UiPreview None `
+  -NativeNgxProjectIdPath <已有ProjectID文件> `
+  -NativeNgxSdkLibraryDirectory <同版SDK静态库目录> `
+  -NativeNgxRuntimePath <已有nvngx_dlssnr.dll> `
+  -NativeNgxSrRuntimePath <已有nvngx_dlss.dll>
+~~~
+
+两者要求同一 NVIDIA 硬件适配器及双 API Debug Layer／InfoQueue，拒绝与
+`-SoftwareOnly` 合用。输入为固定的 1280×720 合成画面、1920×1080 输出，
+私有 NR 仅准备 1920×1080 与 960×540；执行就绪往返、Adaptive OFF、NR OFF 和源释放，
+不重复软件失败注入与 watchdog 场景。`adaptive-hardware` 为 NATIVE_GPU＋MOCK；
+`adaptive-native-ngx` 分别通过 SDK 初始化真实 D3D11 SR 与私有 D3D12 NR，
+使用实际 Create／Evaluate／Release 和 D3D11 读回，失败不会改用 MOCK。
+临时 Runtime 链接只在本次输出目录创建，进程结束后移除，不修改原 Runtime。
+
+逐源 JSON 分开记录源调用 CPU、其中的严格 `done` 等待和 Bridge 分段；模型 API 另记
+Create／Evaluate 耗时，嵌套值不能重复加总。源调用计时不含夹具尾部读回或 SDK 初始化。
+真实模式验证完成及有效像素，不以像素变化宣称模型画质。该 SDK 预初始化路径也未覆盖
+游戏的 snippet 初始化。正式 Bridge 自适应兼容门禁仍关闭；自动帧率闭环、更多档位、
+有限驻留及游戏动态画质需各自证据。
 
 默认 `-Suite fg-native` 会复用同一编译产物，分别在独立进程执行这两个自适应用例；默认 `-Suite ui` 也会复用菜单二进制，在独立进程执行自适应真实 ImGui 交互，包括三种介入点连续往返与配置保存。本地完整发布预检保留这些入口；远端核心回归保留 FG 默认组，UI 全量检查由本地初审承担。`NR_NEXUS_ADAPTIVE_UI_ONLY=1` 仍可单独运行自适应 UI，快照模式不额外运行回归。
 

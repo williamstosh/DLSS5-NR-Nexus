@@ -19,7 +19,7 @@ param(
     [string]$NativeNgxSdkLibraryDirectory,
     [string]$NativeNgxRuntimePath = $(if ($env:NR_NEXUS_NGX_RUNTIME_DIR) { Join-Path $env:NR_NEXUS_NGX_RUNTIME_DIR 'nvngx_dlssnr.dll' }),
     [string]$NativeNgxSrRuntimePath,
-    [ValidateSet('dlaa','sr','stage-resolution','same-stage-resolution','render-stage-resolution','present-stage-resolution','adaptive')][string[]]$BridgeCase = @(),
+    [ValidateSet('dlaa','sr','stage-resolution','same-stage-resolution','render-stage-resolution','present-stage-resolution','adaptive','adaptive-hardware','adaptive-native-ngx')][string[]]$BridgeCase = @(),
     [switch]$BuildOnly,
     [ValidateSet('Standard','Full','Acceptance')][string]$RetentionMode = $(if ($env:NR_NEXUS_TEST_RETENTION) { $env:NR_NEXUS_TEST_RETENTION } else { 'Standard' }),
     [switch]$SoftwareOnly
@@ -68,8 +68,12 @@ if (@($NativeCase | Where-Object { $_ -in @('nr-edit-reuse-history','nr-edit-reu
 }
 if ($VulkanNativeNgx -and $Suite -notcontains 'vulkan-control-mask') { throw '-VulkanNativeNgx requires -Suite vulkan-control-mask (or all).' }
 if ($VulkanNativeNgx -and $SoftwareOnly) { throw '-VulkanNativeNgx requires a native Vulkan GPU.' }
-$usesNativeNgx = $VulkanNativeNgx -or (@($NativeCase | Where-Object { $_ -in @('control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','control-mask-native-ngx-fg') }).Count -gt 0)
-if (@($Suite | Where-Object { $_ -in @('fg-native','vulkan-control-mask') }).Count -gt 0 -and ($usesNativeNgx -or $NativeNgxSdkLibraryDirectory)) {
+$bridgeNativeNgx = $BridgeCase -contains 'adaptive-native-ngx'
+if ($SoftwareOnly -and @($BridgeCase | Where-Object { $_ -in @('adaptive-hardware','adaptive-native-ngx') }).Count) {
+    throw 'Explicit Bridge hardware cases conflict with -SoftwareOnly; no hardware or WARP fallback is permitted.'
+}
+$usesNativeNgx = $bridgeNativeNgx -or $VulkanNativeNgx -or (@($NativeCase | Where-Object { $_ -in @('control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','control-mask-native-ngx-fg') }).Count -gt 0)
+if (@($Suite | Where-Object { $_ -in @('fg-native','vulkan-control-mask','bridge-motion') }).Count -gt 0 -and ($usesNativeNgx -or $NativeNgxSdkLibraryDirectory)) {
     if (-not $NativeNgxSdkLibraryDirectory -or
         -not (Test-Path -LiteralPath (Join-Path $NativeNgxSdkLibraryDirectory 'nvsdk_ngx_s.lib') -PathType Leaf)) {
         throw 'Native NGX support requires -NativeNgxSdkLibraryDirectory containing nvsdk_ngx_s.lib; omit it for WARP+MOCK cases.'
@@ -87,6 +91,9 @@ if ($usesNativeNgx) {
     $NativeNgxRuntimePath = (Resolve-Path -LiteralPath $NativeNgxRuntimePath).Path
     if ($NativeNgxSrRuntimePath) {
         $NativeNgxSrRuntimePath = (Resolve-Path -LiteralPath $NativeNgxSrRuntimePath).Path
+    }
+    if ($bridgeNativeNgx -and (-not $NativeNgxSrRuntimePath -or -not (Test-Path -LiteralPath $NativeNgxSrRuntimePath -PathType Leaf))) {
+        throw 'Bridge native NGX requires the existing SR Runtime via -NativeNgxSrRuntimePath.'
     }
 }
 if ($BridgeCase -and $Suite -notcontains 'bridge-motion') { throw '-BridgeCase requires -Suite bridge-motion (or all).' }
@@ -164,7 +171,7 @@ foreach ($item in $Suite) {
         }
         if ($item -eq 'vulkan-control-mask') { $arguments += "/I$VulkanIncludeDirectory" }
         $link += @('user32.lib','gdi32.lib','ole32.lib','psapi.lib')
-        if ($item -in @('fg-native','vulkan-control-mask') -and $NativeNgxSdkLibraryDirectory) {
+        if (($item -in @('fg-native','vulkan-control-mask') -or ($item -eq 'bridge-motion' -and $bridgeNativeNgx)) -and $NativeNgxSdkLibraryDirectory) {
             $arguments += '/DNR_NEXUS_TEST_NATIVE_NGX'
             $link += (Join-Path $NativeNgxSdkLibraryDirectory 'nvsdk_ngx_s.lib')
         }
@@ -193,6 +200,37 @@ foreach ($item in $Suite) {
                 $bridgeArguments = @()
                 $suffix = ''
                 if ($case) { $bridgeArguments += "--$case"; $suffix = "-$case" }
+                if ($case -eq 'adaptive-native-ngx') {
+                    $runtimeLink = Join-Path $directory 'nvngx_dlssnr.dll'
+                    $srRuntimeLink = Join-Path $directory 'nvngx_dlss.dll'
+                    if ((Test-Path -LiteralPath $runtimeLink) -or (Test-Path -LiteralPath $srRuntimeLink)) {
+                        throw 'Bridge native NGX Runtime link target already exists; no existing file is replaced.'
+                    }
+                    $nrLinked = $false
+                    $srLinked = $false
+                    try {
+                        New-Item -ItemType HardLink -Path $runtimeLink -Target $NativeNgxRuntimePath | Out-Null
+                        $nrLinked = $true
+                        New-Item -ItemType HardLink -Path $srRuntimeLink -Target $NativeNgxSrRuntimePath | Out-Null
+                        $srLinked = $true
+                        @($NativeNgxRuntimePath, $NativeNgxSrRuntimePath) | ForEach-Object {
+                            @{ path=$_; sha256=(Get-FileHash -LiteralPath $_).Hash }
+                        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $directory 'native-ngx-runtime-inputs.json') -Encoding utf8
+                        Invoke-TestProcess $exe $directory $case (@($bridgeArguments) + $NativeNgxProjectIdPath) -TimeoutMilliseconds 90000
+                    } finally {
+                        if ($srLinked -and (Test-Path -LiteralPath $srRuntimeLink)) { Remove-Item -LiteralPath $srRuntimeLink -Force }
+                        if ($nrLinked -and (Test-Path -LiteralPath $runtimeLink)) { Remove-Item -LiteralPath $runtimeLink -Force }
+                    }
+                    continue
+                }
+                if ($case -eq 'adaptive-hardware') {
+                    Invoke-TestProcess $exe $directory $case $bridgeArguments -TimeoutMilliseconds 90000
+                    continue
+                }
+                if ($case -eq 'adaptive') {
+                    Invoke-TestProcess $exe $directory "warp$suffix" (@('--warp') + $bridgeArguments)
+                    continue
+                }
                 if (-not $SoftwareOnly) { Invoke-TestProcess $exe $directory "hardware$suffix" $bridgeArguments }
                 Invoke-TestProcess $exe $directory "warp$suffix" (@('--warp') + $bridgeArguments)
             }

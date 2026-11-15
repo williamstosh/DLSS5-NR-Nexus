@@ -5,12 +5,20 @@
 #include <d3d12sdklayers.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
+#include <algorithm>
 #include <array>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <fstream>
 #include <initializer_list>
+#include <string>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
+#include <utility>
 using Microsoft::WRL::ComPtr;
 int ProbeFormats() {
   ComPtr<IDXGIFactory4> factory;
@@ -66,6 +74,8 @@ int main() { return ProbeFormats(); }
 #ifndef MOTION_FORMAT_PROBE_ONLY
 #define DEBUG_LEVEL_0
 #include <d3dcompiler.h>
+#include <DirectXPackedVector.h>
+#include <nlohmann/json.hpp>
 #include <dlssnr.hpp>
 // Reuse the established host types and checks, without executing its matrix.
 #define main UnusedXeFgMotionHostMain
@@ -121,6 +131,74 @@ NVSDK_NGX_Result NVSDK_CONV MotionCreateSource(ID3D11DeviceContext*, NVSDK_NGX_F
 NVSDK_NGX_Result NVSDK_CONV MotionReleaseSource(NVSDK_NGX_Handle*) {
   return NVSDK_NGX_Result_Success;
 }
+#if defined(NR_NEXUS_TEST_NATIVE_NGX)
+native::DirectCreateFn bridge_native_create = nullptr;
+native::DirectEvaluateFn bridge_native_evaluate = nullptr;
+native::DirectReleaseFn bridge_native_release = nullptr;
+std::unordered_map<const NVSDK_NGX_Handle*, uint32_t> bridge_native_evaluations;
+uint64_t bridge_native_sr_calls = 0;
+std::string bridge_private_project_id;
+void NVSDK_CONV BridgeSdkLog(const char* message, NVSDK_NGX_Logging_Level level, NVSDK_NGX_Feature feature) {
+  std::string text = (message != nullptr ? message : "");
+  if (!bridge_private_project_id.empty()) {
+    for (size_t offset = 0; (offset = text.find(bridge_private_project_id, offset)) != std::string::npos;) {
+      text.replace(offset, bridge_private_project_id.size(), "[ProjectID]");
+      offset += std::strlen("[ProjectID]");
+    }
+  }
+  std::cerr << "NGX SDK level=" << static_cast<uint32_t>(level) << " feature=" << static_cast<uint32_t>(feature)
+      << " " << text << std::endl;
+}
+NVSDK_NGX_Result NVSDK_CONV BridgeNativeCreate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Feature feature,
+    const NVSDK_NGX_Parameter* parameters, NVSDK_NGX_Handle** handle) {
+  const auto begin = native::SteadyNowNs();
+  const auto result = bridge_native_create(list, feature, parameters, handle);
+  if (NVSDK_NGX_SUCCEED(result) && handle != nullptr && *handle != nullptr) {
+    ++model_created;
+  }
+  std::cout << nlohmann::json{{"event", "nr_create"}, {"api_result", static_cast<uint32_t>(result)},
+      {"feature", static_cast<uint32_t>(feature)}, {"requested_preset", native::GetUInt(parameters, "DLSSNR.Hint.Render.Preset")},
+      {"cpu_ms", (native::SteadyNowNs() - begin) / 1'000'000.},
+      {"handle", reinterpret_cast<uintptr_t>(handle != nullptr ? *handle : nullptr)}}.dump() << '\n';
+  return result;
+}
+NVSDK_NGX_Result NVSDK_CONV BridgeNativeEvaluate(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle,
+    const NVSDK_NGX_Parameter* parameters, PFN_NVSDK_NGX_ProgressCallback progress) {
+  ++model_calls;
+  auto* color = native::GetD3D12Resource(parameters, "DLSSNR.Color");
+  model_observations.push_back({native::GetInt(parameters, "DLSSNR.Reset"), native::GetFloat(parameters, "DLSSNR.Intensity"),
+      native::GetUInt(parameters, "DLSSNR.Style"), native::GetFloat(parameters, "DLSSNR.LocalToneStrength"),
+      reinterpret_cast<uintptr_t>(handle), ++bridge_native_evaluations[handle],
+      static_cast<uint32_t>(color->GetDesc().Width), color->GetDesc().Height,
+      native::GetD3D12Resource(parameters, "DLSSNR.Depth"), native::GetD3D12Resource(parameters, "DLSSNR.ControlMask")});
+  const auto begin = native::SteadyNowNs();
+  const auto result = bridge_native_evaluate(list, handle, parameters, progress);
+  std::cout << nlohmann::json{{"event", "nr_evaluate"}, {"api_result", static_cast<uint32_t>(result)},
+      {"width", model_observations.back().width}, {"height", model_observations.back().height},
+      {"reset", model_observations.back().reset}, {"cpu_ms", (native::SteadyNowNs() - begin) / 1'000'000.},
+      {"handle", reinterpret_cast<uintptr_t>(handle)}}.dump() << '\n';
+  return result;
+}
+NVSDK_NGX_Result NVSDK_CONV BridgeNativeRelease(NVSDK_NGX_Handle* handle) {
+  const auto result = bridge_native_release(handle);
+  if (NVSDK_NGX_SUCCEED(result)) {
+    model_released.push_back(reinterpret_cast<uintptr_t>(handle));
+    bridge_native_evaluations.erase(handle);
+  }
+  std::cout << nlohmann::json{{"event", "nr_release"}, {"api_result", static_cast<uint32_t>(result)},
+      {"handle", reinterpret_cast<uintptr_t>(handle)}}.dump() << '\n';
+  return result;
+}
+NVSDK_NGX_Result NVSDK_CONV BridgeNativeSrEvaluate(ID3D11DeviceContext* context, const NVSDK_NGX_Handle* handle,
+    const NVSDK_NGX_Parameter* parameters, PFN_NVSDK_NGX_ProgressCallback progress) {
+  ++bridge_native_sr_calls;
+  const auto begin = native::SteadyNowNs();
+  const auto result = NVSDK_NGX_D3D11_EvaluateFeature(context, handle, parameters, progress);
+  std::cout << nlohmann::json{{"event", "sr_evaluate"}, {"api_result", static_cast<uint32_t>(result)},
+      {"cpu_ms", (native::SteadyNowNs() - begin) / 1'000'000.}}.dump() << '\n';
+  return result;
+}
+#endif
 NVSDK_NGX_Result NVSDK_CONV MotionCreateModel(ID3D12GraphicsCommandList*, NVSDK_NGX_Feature,
     const NVSDK_NGX_Parameter* parameters, NVSDK_NGX_Handle** handle) {
   *handle = reinterpret_cast<NVSDK_NGX_Handle*>(new MotionModel{
@@ -268,6 +346,9 @@ int main(int argc, char** argv) {
     bool render_stage_resolution = false;
     bool present_stage_resolution = false;
     bool adaptive_case = false;
+    bool adaptive_hardware = false;
+    bool adaptive_native_ngx = false;
+    const char* adaptive_project_id_path = nullptr;
     for (int arg = 1; arg < argc; ++arg) {
       if (std::strcmp(argv[arg], "--warp") == 0) {
         warp = true;
@@ -276,7 +357,18 @@ int main(int argc, char** argv) {
       } else if (std::strcmp(argv[arg], "--sr") == 0) {
         sr_only = true;
       } else if (std::strcmp(argv[arg], "--adaptive") == 0) {
+        Check(!adaptive_case, "one explicit Bridge Adaptive condition per process");
         adaptive_case = true;
+      } else if (std::strcmp(argv[arg], "--adaptive-hardware") == 0) {
+        Check(!adaptive_case, "one explicit Bridge Adaptive condition per process");
+        adaptive_case = adaptive_hardware = true;
+      } else if (std::strcmp(argv[arg], "--adaptive-native-ngx") == 0) {
+        Check(!adaptive_case && arg + 1 < argc, "Bridge native NGX requires its existing ProjectID file argument");
+        adaptive_case = adaptive_hardware = adaptive_native_ngx = true;
+        adaptive_project_id_path = argv[++arg];
+#if !defined(NR_NEXUS_TEST_NATIVE_NGX)
+        Check(false, "Bridge native NGX requires the SDK-enabled build; no MOCK fallback");
+#endif
       } else if (std::strcmp(argv[arg], "--stage-resolution") == 0) {
         stage_resolution = true;
       } else if (std::strcmp(argv[arg], "--same-stage-resolution") == 0) {
@@ -293,10 +385,11 @@ int main(int argc, char** argv) {
       }
     }
     reshade::internal::get_reshade_module_handle(GetModuleHandleW(nullptr));
+    native::addon_module = GetModuleHandleW(nullptr);
     ComPtr<ID3D12Debug> adaptive_debug;
     if (adaptive_case) {
-      Check(warp && !stage_resolution && !present_stage_resolution && !dlaa_only,
-          "Bridge Adaptive is one strict WARP+MOCK case, without other stage variants");
+      Check(warp != adaptive_hardware && !stage_resolution && !present_stage_resolution && !dlaa_only && !sr_only,
+          "Bridge Adaptive explicitly selects WARP or hardware, without other stage variants or fallback");
       Check(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&adaptive_debug))), "Bridge Adaptive requires D3D12 Debug Layer");
       adaptive_debug->EnableDebugLayer();
     }
@@ -306,8 +399,14 @@ int main(int argc, char** argv) {
     Check(SUCCEEDED(warp ? factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)) : factory->EnumAdapters1(0, &adapter)), "adapter");
     if (adaptive_case) {
       DXGI_ADAPTER_DESC1 software{};
-      Check(SUCCEEDED(adapter->GetDesc1(&software)) && (software.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0,
-          "Bridge Adaptive resolves a SOFTWARE adapter before device creation, with no hardware fallback");
+      Check(SUCCEEDED(adapter->GetDesc1(&software)), "Bridge Adaptive adapter description");
+      if (adaptive_hardware) {
+        Check((software.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0 && software.VendorId == 0x10de,
+            "Bridge Adaptive hardware resolves an NVIDIA non-SOFTWARE adapter before device creation");
+      } else {
+        Check((software.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0,
+            "Bridge Adaptive resolves a SOFTWARE adapter before device creation, with no hardware fallback");
+      }
     }
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
@@ -328,7 +427,9 @@ int main(int argc, char** argv) {
       Check(SUCCEEDED(device.As(&adaptive_info11))
           && SUCCEEDED(native::bridge.device12->QueryInterface(IID_PPV_ARGS(&adaptive_info12))),
           "Bridge Adaptive requires both real D3D11 and D3D12 InfoQueues");
-      std::cout << "BRIDGE_ADAPTIVE debug11=1 debug12=1 info11=1 info12=1 adapter=SOFTWARE runtime=MOCK\n";
+      std::cout << "BRIDGE_ADAPTIVE debug11=1 debug12=1 info11=1 info12=1 adapter="
+          << (adaptive_hardware ? "NVIDIA_HARDWARE" : "SOFTWARE")
+          << " runtime=" << (adaptive_native_ngx ? "SDK_PREINITIALIZED_NGX" : "MOCK") << '\n';
     }
     DXGI_ADAPTER_DESC1 adapter_desc{};
     adapter->GetDesc1(&adapter_desc);
@@ -364,36 +465,71 @@ int main(int argc, char** argv) {
       return d3d11_present_stage_resolution_cases::Run(context.Get(), make_texture);
     }
     // Non-multiples of eight exercise dispatch edges; selected values cannot survive a float16 detour.
-    constexpr UINT width = 13, height = 9;
+    const UINT width = (adaptive_hardware ? 1280u : 13u), height = (adaptive_hardware ? 720u : 9u);
+    const UINT adaptive_output_width = (adaptive_hardware ? 1920u : 17u);
+    const UINT adaptive_output_height = (adaptive_hardware ? 1080u : 11u);
     const float values[]{0.f, -0.f, 0.1f, -0.375f, 65537.f, -131071.25f, 1.234567f, -8388607.f};
     std::vector<float> motion_pixels(width * height * 2);
     for (size_t i = 0; i < motion_pixels.size(); ++i) motion_pixels[i] = values[i % std::size(values)];
     std::vector<unsigned short> rg16_pixels(width * height * 2, 0x3400);
     std::vector<unsigned short> color_pixels(width * height * 4, 0x3800);
+    if (adaptive_hardware) {
+      std::fill(rg16_pixels.begin(), rg16_pixels.end(), 0);
+      for (UINT y = 0; y < height; ++y) {
+        for (UINT x = 0; x < width; ++x) {
+          const auto pixel = size_t(y) * width + x;
+          const float u = static_cast<float>(x) / (width - 1), v = static_cast<float>(y) / (height - 1);
+          color_pixels[pixel * 4] = DirectX::PackedVector::XMConvertFloatToHalf(.12f + .65f * u);
+          color_pixels[pixel * 4 + 1] = DirectX::PackedVector::XMConvertFloatToHalf(.1f + .65f * v);
+          color_pixels[pixel * 4 + 2] = DirectX::PackedVector::XMConvertFloatToHalf(.15f + .5f * (1.f - u * v));
+          color_pixels[pixel * 4 + 3] = DirectX::PackedVector::XMConvertFloatToHalf(1.f);
+        }
+      }
+    }
     auto color = make_texture(width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_SHADER_RESOURCE, color_pixels.data(), width * 8);
-    std::vector<unsigned short> output_pixels(17 * 11 * 4, 0x3800);
-    auto output = make_texture(17, 11, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
-        output_pixels.data(), 17 * 8);
+    std::vector<unsigned short> output_pixels(adaptive_output_width * adaptive_output_height * 4, 0x3800);
+    if (adaptive_hardware) {
+      for (UINT y = 0; y < adaptive_output_height; ++y) {
+        for (UINT x = 0; x < adaptive_output_width; ++x) {
+          const auto pixel = size_t(y) * adaptive_output_width + x;
+          output_pixels[pixel * 4] = DirectX::PackedVector::XMConvertFloatToHalf(.12f + .65f * x / (adaptive_output_width - 1));
+          output_pixels[pixel * 4 + 1] = DirectX::PackedVector::XMConvertFloatToHalf(.1f + .65f * y / (adaptive_output_height - 1));
+          output_pixels[pixel * 4 + 2] = 0x3400;
+          output_pixels[pixel * 4 + 3] = 0x3c00;
+        }
+      }
+    }
+    auto output = make_texture(adaptive_output_width, adaptive_output_height, DXGI_FORMAT_R16G16B16A16_FLOAT,
+        D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, output_pixels.data(), adaptive_output_width * 8);
     auto motion = make_texture(width, height, DXGI_FORMAT_R32G32_FLOAT, D3D11_BIND_SHADER_RESOURCE, motion_pixels.data(), width * 8);
     auto rg16 = make_texture(width, height, DXGI_FORMAT_R16G16_FLOAT, D3D11_BIND_SHADER_RESOURCE, rg16_pixels.data(), width * 4);
     std::vector<float> depth_pixels(width * height, 0.375f);
+    if (adaptive_hardware) {
+      for (UINT y = 0; y < height; ++y) {
+        for (UINT x = 0; x < width; ++x) depth_pixels[size_t(y) * width + x] = .2f + .6f * y / (height - 1);
+      }
+    }
     auto depth_direct = make_texture(width, height, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_SHADER_RESOURCE, depth_pixels.data(), width * 4);
     if (adaptive_case) {
       native::d3d11_swapchain_seen.store(true);
       native::dx11_route.store(native::kDx11RouteNative);
-      native::direct_runtime_requirements.dual_models = true;
+      if (!adaptive_native_ngx) {
+        native::direct_runtime_requirements.dual_models = true;
+      }
       native::dedupe_mode.store(renodx::addons::dlss5::kDedupePerEvaluate);
       native::nr_follow_input_res.store(false);
       native::nr_resolution_scale.store(1.f);
       native::gpu_timers_enabled.store(true);
-      native::ngx_loader_staging.nr_ready = true;
-      native::ngx_loader_staging.core_ready = true;
-      native::PublishNgxLoaderSymbols();
+      if (!adaptive_native_ngx) {
+        native::ngx_loader_staging.nr_ready = true;
+        native::ngx_loader_staging.core_ready = true;
+        native::PublishNgxLoaderSymbols();
+      }
       native::OnNativeFgOptions(false);
       native::adaptive_configuration_settings = native::comparison_ui::CaptureAdaptiveSettings;
       renodx::addons::dlss5::gpu_timers::comparison_settings = native::comparison_ui::CaptureSettings;
       native::hook_point.store(native::kHookUpscaled);
-      native::preset.store(1);
+      native::preset.store(adaptive_hardware ? 2u : 1u);
       native::nr_adaptive_enabled.store(true);
       native::nr_adaptive_selected_levels.store(2);
       native::nr_adaptive_min_scale.store(.5f);
@@ -401,24 +537,28 @@ int main(int argc, char** argv) {
                 && !native::async_autoscale_preparation.load()
                 && native::adaptive_feature_mode.load() == native::AdaptiveFeatureMode::OFF,
           "Bridge Adaptive and private PSO experiments start disabled; this case selects two full-prepared tiers only");
-      params::OwnedParameters parameters;
-      parameters.Set(NVSDK_NGX_Parameter_Width, width);
-      parameters.Set(NVSDK_NGX_Parameter_Height, height);
-      parameters.Set(NVSDK_NGX_Parameter_OutWidth, 17u);
-      parameters.Set(NVSDK_NGX_Parameter_OutHeight, 11u);
-      parameters.Set(NVSDK_NGX_Parameter_Color, static_cast<ID3D11Resource*>(color.Get()));
-      parameters.Set(NVSDK_NGX_Parameter_Output, static_cast<ID3D11Resource*>(output.Get()));
-      parameters.Set(NVSDK_NGX_Parameter_Depth, static_cast<ID3D11Resource*>(depth_direct.Get()));
-      parameters.Set(NVSDK_NGX_Parameter_MotionVectors, static_cast<ID3D11Resource*>(rg16.Get()));
-      parameters.Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags,
-          int(NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes));
-      parameters.Set(NVSDK_NGX_Parameter_MV_Scale_X, 1.f);
-      parameters.Set(NVSDK_NGX_Parameter_MV_Scale_Y, 1.f);
+      params::OwnedParameters mock_parameters;
+      NVSDK_NGX_Parameter* sdk_sr_parameters = nullptr;
       auto* handle = reinterpret_cast<NVSDK_NGX_Handle*>(uintptr_t{0xD5AD});
-      const params::ParameterView create_view(&parameters, nullptr);
-      native::RegisterCreatedFeatureLocked(handle, native::kFeatureDlss, &create_view);
+      bool sr_sdk_initialized = false, nr_sdk_initialized = false, sr_feature_created = false;
       const auto cleanup = [&] {
         if (!native::DrainBridgeQueue()) return false;
+        if (adaptive_native_ngx) {
+          // This is after the final readback on success; also bound the last
+          // D3D11 consumer on exceptional exits before destroying either SDK.
+          const auto tail = native::bridge_submitted_value.load() + 1;
+          if (FAILED(native::bridge.context11->Signal(native::bridge.fence_in11, tail))) return false;
+          native::bridge.context11->Flush();
+          WaitForGpu(native::bridge.fence_in12, tail);
+        }
+#if defined(NR_NEXUS_TEST_NATIVE_NGX)
+        if (sr_feature_created) {
+          const auto result = native::HookedReleaseFeature11Slot<0>(handle);
+          sr_feature_created = false;
+          std::cout << nlohmann::json{{"event", "sr_release"}, {"api_result", static_cast<uint32_t>(result)}}.dump() << '\n';
+          if (!NVSDK_NGX_SUCCEED(result)) return false;
+        }
+#endif
         native::BridgeDeviceLock device_lock(context.Get());
         const renodx::addons::dlss5::ngx_serial::Call ngx_turn;
         renodx::addons::dlss5::RuntimeLock lock(native::runtime_mutex);
@@ -436,27 +576,174 @@ int main(int argc, char** argv) {
         renodx::addons::dlss5::gpu_timers::ReleaseAll();
         native::ReleaseCodecPipeline();
         model_uploads.clear();
+        if (!native::bridge_retired.empty() || !native::retired_nr_features.empty()
+            || !native::retired_final_resources.empty()) return false;
+        bool sdk_clean = true;
+#if defined(NR_NEXUS_TEST_NATIVE_NGX)
+        if (nr_sdk_initialized) {
+          const auto result = NVSDK_NGX_D3D12_Shutdown1(native::bridge.device12);
+          nr_sdk_initialized = false;
+          sdk_clean &= NVSDK_NGX_SUCCEED(result);
+          std::cout << nlohmann::json{{"event", "nr_sdk_shutdown"}, {"api_result", static_cast<uint32_t>(result)}}.dump() << '\n';
+        }
+        if (sdk_sr_parameters != nullptr) {
+          const auto result = NVSDK_NGX_D3D11_DestroyParameters(std::exchange(sdk_sr_parameters, nullptr));
+          sdk_clean &= NVSDK_NGX_SUCCEED(result);
+          std::cout << nlohmann::json{{"event", "sr_destroy_parameters"}, {"api_result", static_cast<uint32_t>(result)}}.dump() << '\n';
+        }
+        if (sr_sdk_initialized) {
+          const auto result = NVSDK_NGX_D3D11_Shutdown1(device.Get());
+          sr_sdk_initialized = false;
+          sdk_clean &= NVSDK_NGX_SUCCEED(result);
+          std::cout << nlohmann::json{{"event", "sr_sdk_shutdown"}, {"api_result", static_cast<uint32_t>(result)}}.dump() << '\n';
+        }
+#endif
         native::ReleaseCom(native::direct_device);
         native::direct_device_native = nullptr;
-        return native::bridge_retired.empty() && native::retired_nr_features.empty()
-            && native::retired_final_resources.empty();
+        return sdk_clean;
       };
       struct AdaptiveCleanup {
         const decltype(cleanup)* action;
         ~AdaptiveCleanup() {
           if (action != nullptr) {
-            const bool drained = (*action)();
-            std::cerr << "BRIDGE_ADAPTIVE exception_cleanup=" << drained << '\n';
-            if (drained) native::ReleaseBridge();
+            try {
+              const bool drained = (*action)();
+              std::cerr << "BRIDGE_ADAPTIVE exception_cleanup=" << drained << '\n';
+              if (drained) native::ReleaseBridge();
+            } catch (const std::exception& error) {
+              std::cerr << "BRIDGE_ADAPTIVE exception_cleanup_failed=" << error.what() << '\n';
+            }
           }
         }
       } cleanup_guard{&cleanup};
-      const auto frame = [&](bool wait_gpu = true) {
+#if defined(NR_NEXUS_TEST_NATIVE_NGX)
+      if (adaptive_native_ngx) {
+        native::shutdown_quiesce_enabled.store(false);
+        native::direct_api = {};
+        native::direct_load_state = native::DirectLoadState::Unknown;
+        native::parameter_runtime_ready = false;
+        Check(native::get_module_filename_iat == nullptr && native::original_get_module_filename == nullptr,
+            "Bridge SDK test starts without an identity IAT bridge");
+        std::ifstream project_id_file(adaptive_project_id_path);
+        std::string project_id;
+        Check(project_id_file.is_open() && std::getline(project_id_file, project_id) && project_id.size() == 36,
+            "read only the existing private test ProjectID, without logging it");
+        bridge_private_project_id = project_id;
+        const auto runtime_directory = native::AddonDirectory().wstring();
+        const wchar_t* runtime_paths[]{runtime_directory.c_str()};
+        NVSDK_NGX_FeatureCommonInfo common_info{};
+        common_info.PathListInfo = {runtime_paths, 1};
+        common_info.LoggingInfo = {BridgeSdkLog, NVSDK_NGX_LOGGING_LEVEL_ON, true};
+        const auto sr_init = NVSDK_NGX_D3D11_Init_with_ProjectID(project_id.c_str(), NVSDK_NGX_ENGINE_TYPE_CUSTOM,
+            "NR-Nexus-Bridge-offline-1", runtime_directory.c_str(), device.Get(), &common_info);
+        sr_sdk_initialized = NVSDK_NGX_SUCCEED(sr_init);
+        std::cout << nlohmann::json{{"event", "sr_sdk_init"}, {"api_result", static_cast<uint32_t>(sr_init)}}.dump() << '\n';
+        Check(sr_sdk_initialized, "SDK initializes the real D3D11 SR device, without fallback");
+        const auto nr_init = NVSDK_NGX_D3D12_Init_with_ProjectID(project_id.c_str(), NVSDK_NGX_ENGINE_TYPE_CUSTOM,
+            "NR-Nexus-Bridge-offline-1", runtime_directory.c_str(), native::bridge.device12, &common_info);
+        nr_sdk_initialized = NVSDK_NGX_SUCCEED(nr_init);
+        std::cout << nlohmann::json{{"event", "nr_sdk_init"}, {"api_result", static_cast<uint32_t>(nr_init)}}.dump() << '\n';
+        Check(nr_sdk_initialized, "SDK independently initializes the private D3D12 NR device, without snippet fallback");
+        native::PrimeNgxLoaderSymbols(native::bridge.device12);
+        const auto& provider = native::NgxLoaderView();
+        Check(provider.nr_ready && !provider.nr_failed && provider.core_ready
+                  && provider.nr_requirements.file_version == "310.9.16.0"
+                  && provider.core_allocate != nullptr && provider.core_destroy != nullptr
+                  && provider.core_create != nullptr && provider.core_evaluate != nullptr && provider.core_release != nullptr,
+            "Bridge SDK provider resolves the pinned real NR Runtime and complete public Core functions");
+        bridge_native_create = provider.core_create;
+        bridge_native_evaluate = provider.core_evaluate;
+        bridge_native_release = provider.core_release;
+        native::direct_api = {.borrowed_core_context = false, .module = provider.nr_module,
+            .allocate = provider.core_allocate, .destroy = provider.core_destroy,
+            .create = BridgeNativeCreate, .evaluate = BridgeNativeEvaluate, .release = BridgeNativeRelease};
+        native::direct_load_state = native::DirectLoadState::Ready;
+        native::direct_runtime_requirements = provider.nr_requirements;
+        native::direct_runtime_sha256 = provider.nr_sha256;
+        native::core_allocate_parameters = provider.core_allocate;
+        native::core_destroy_parameters = provider.core_destroy;
+        native::core_create_feature = nullptr;
+        native::core_evaluate_feature = nullptr;
+        native::core_release_feature = nullptr;
+        native::parameter_runtime_via_core.store(false);
+        native::parameter_runtime_ready = true;
+        Check(native::direct_device == native::bridge.device12 && !native::control_mask_use_core_context.load()
+                  && native::get_module_filename_iat == nullptr && native::original_get_module_filename == nullptr,
+            "SDK-preinitialized NR uses this exact private device and never borrows SR or installs identity hooks");
+        const auto allocated = NVSDK_NGX_D3D11_GetCapabilityParameters(&sdk_sr_parameters);
+        std::cout << nlohmann::json{{"event", "sr_parameters"}, {"api_result", static_cast<uint32_t>(allocated)}}.dump() << '\n';
+        Check(NVSDK_NGX_SUCCEED(allocated) && sdk_sr_parameters != nullptr, "SDK allocates real D3D11 SR parameters");
+        native::ngx11_slot_real[0].create = reinterpret_cast<void*>(NVSDK_NGX_D3D11_CreateFeature);
+        native::ngx11_slot_real[0].evaluate = reinterpret_cast<void*>(BridgeNativeSrEvaluate);
+        native::ngx11_slot_real[0].release = reinterpret_cast<void*>(NVSDK_NGX_D3D11_ReleaseFeature);
+      }
+#endif
+      auto& parameters = (adaptive_native_ngx ? *sdk_sr_parameters : static_cast<NVSDK_NGX_Parameter&>(mock_parameters));
+      parameters.Set(NVSDK_NGX_Parameter_Width, width);
+      parameters.Set(NVSDK_NGX_Parameter_Height, height);
+      parameters.Set(NVSDK_NGX_Parameter_OutWidth, adaptive_output_width);
+      parameters.Set(NVSDK_NGX_Parameter_OutHeight, adaptive_output_height);
+      parameters.Set(NVSDK_NGX_Parameter_Color, static_cast<ID3D11Resource*>(color.Get()));
+      parameters.Set(NVSDK_NGX_Parameter_Output, static_cast<ID3D11Resource*>(output.Get()));
+      parameters.Set(NVSDK_NGX_Parameter_Depth, static_cast<ID3D11Resource*>(depth_direct.Get()));
+      parameters.Set(NVSDK_NGX_Parameter_MotionVectors, static_cast<ID3D11Resource*>(rg16.Get()));
+      parameters.Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags,
+          int(NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes
+              | (adaptive_native_ngx ? NVSDK_NGX_DLSS_Feature_Flags_AutoExposure : 0)));
+      parameters.Set(NVSDK_NGX_Parameter_MV_Scale_X, 1.f);
+      parameters.Set(NVSDK_NGX_Parameter_MV_Scale_Y, 1.f);
+#if defined(NR_NEXUS_TEST_NATIVE_NGX)
+      if (adaptive_native_ngx) {
+        parameters.Set(NVSDK_NGX_Parameter_PerfQualityValue, static_cast<int>(NVSDK_NGX_PerfQuality_Value_MaxQuality));
+        parameters.Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
+        parameters.Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
+        parameters.Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, width);
+        parameters.Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, height);
+        for (const auto* key : {NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_X, NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_Y,
+                 NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X, NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y,
+                 NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X, NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y,
+                 NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_X, NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_Y}) {
+          parameters.Set(key, 0u);
+        }
+        parameters.Set(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, 1.f);
+        parameters.Set(NVSDK_NGX_Parameter_DLSS_Exposure_Scale, 1.f);
+        parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, 0.f);
+        parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, 0.f);
+        parameters.Set(NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, 1000.f / 60.f);
+        parameters.Set(NVSDK_NGX_Parameter_Reset, 1);
+        handle = nullptr;
+        const auto created = native::HookedCreateFeature11Slot<0>(context.Get(), native::kFeatureDlss, &parameters, &handle);
+        sr_feature_created = NVSDK_NGX_SUCCEED(created) && handle != nullptr;
+        std::cout << nlohmann::json{{"event", "sr_create"}, {"api_result", static_cast<uint32_t>(created)}}.dump() << '\n';
+        Check(sr_feature_created && native::features.contains(handle), "production D3D11 Create wrapper registers real SR source identity");
+      } else
+#endif
+      {
+        const params::ParameterView create_view(&parameters, nullptr);
+        native::RegisterCreatedFeatureLocked(handle, native::kFeatureDlss, &create_view);
+      }
+      const auto frame = [&](bool wait_gpu = true, const char* phase = "preparing") {
         ++native::present_generation;
-        Check(NVSDK_NGX_SUCCEED(native::Ngx11Evaluate(0, "adaptive Bridge", context.Get(), handle, &parameters, [&] {
-          context->UpdateSubresource(output.Get(), 0, nullptr, output_pixels.data(), 17 * 8, 0);
-          return NVSDK_NGX_Result_Success;
-        })), "Bridge Adaptive preserves the MOCK SR result");
+        const auto cpu_before = native::bridge_cpu_timing[0];
+        const auto completion_before = native::bridge_completion_wait_ns;
+        const auto samples_before = renodx::addons::dlss5::gpu_timers::published_segments;
+        const auto gpu_before = renodx::addons::dlss5::gpu_timers::measured_total_us;
+        const auto begin = native::SteadyNowNs();
+        NVSDK_NGX_Result result;
+#if defined(NR_NEXUS_TEST_NATIVE_NGX)
+        if (adaptive_native_ngx) {
+          parameters.Set(NVSDK_NGX_Parameter_Reset, bridge_native_sr_calls == 0 ? 1 : 0);
+          result = native::HookedEvaluateFeature11Slot<0>(context.Get(), handle, &parameters, nullptr);
+        } else
+#endif
+        {
+          result = native::Ngx11Evaluate(0, "adaptive Bridge", context.Get(), handle, &parameters, [&] {
+            context->UpdateSubresource(output.Get(), 0, nullptr, output_pixels.data(), adaptive_output_width * 8, 0);
+            return NVSDK_NGX_Result_Success;
+          });
+        }
+        const auto source_ns = native::SteadyNowNs() - begin;
+        Check(NVSDK_NGX_SUCCEED(result), "Bridge Adaptive preserves the selected SR provider's successful result");
         if (wait_gpu && native::bridge_submitted_value.load() != 0) {
           WaitForGpu(native::bridge.fence_done12, native::bridge_submitted_value.load());
           const native::BridgeDeviceLock device_lock(context.Get());
@@ -467,13 +754,37 @@ int main(int argc, char** argv) {
           renodx::addons::dlss5::gpu_timers::Poll(true, false);
           model_uploads.clear();
         }
+        if (adaptive_hardware) {
+          const auto& cpu = native::bridge_cpu_timing[0];
+          const auto state = native::features.find(handle);
+          std::cout << nlohmann::json{{"event", "bridge_source"}, {"phase", phase}, {"source", native::present_generation},
+              {"evidence", adaptive_native_ngx ? "NATIVE_GPU+NATIVE_NGX" : "NATIVE_GPU+MOCK"},
+              {"source_cpu_ms", source_ns / 1'000'000.}, {"api_result", static_cast<uint32_t>(result)},
+              {"completion_wait_ms", (native::bridge_completion_wait_ns - completion_before) / 1'000'000.},
+              {"bridge_cpu_ms", {{"input", (cpu.input_ns - cpu_before.input_ns) / 1'000'000.},
+                  {"submit", (cpu.submit_ns - cpu_before.submit_ns) / 1'000'000.},
+                  {"completion", (cpu.completion_ns - cpu_before.completion_ns) / 1'000'000.},
+                  {"return", (cpu.return_ns - cpu_before.return_ns) / 1'000'000.}}},
+              {"gpu_segments", renodx::addons::dlss5::gpu_timers::published_segments - samples_before},
+              {"gpu_measured_us", renodx::addons::dlss5::gpu_timers::measured_total_us - gpu_before},
+              {"gpu_sampling", "production sparse NR timestamps, excludes D3D11 SR and bridge completion wait"},
+              {"cpu_scope", adaptive_native_ngx ? "SR SDK + production Bridge/NR, excludes fixture tail wait/readback"
+                  : "MOCK SR upload + production Bridge + MOCK NR upload/CPU, excludes fixture tail wait/readback"},
+              {"nr_creates", native::nr_features_created}, {"nr_calls", model_calls},
+              {"full_ready", state != native::features.end() && state->second.adaptive_session != nullptr
+                  && state->second.adaptive_session->prepared},
+              {"done", native::bridge.fence_done12->GetCompletedValue()},
+              {"submitted", native::bridge_submitted_value.load()}}.dump() << '\n';
+        }
         Check(params::GetD3D11Resource(&parameters, NVSDK_NGX_Parameter_Output) == output.Get()
                   && params::GetD3D11Resource(&parameters, NVSDK_NGX_Parameter_Color) == color.Get(),
             "Bridge Adaptive restores the game's source parameters");
       };
-      for (uint32_t source = 0; source < native::kContractDebounceFrames + 2; ++source) frame();
-      Check(native::features.at(handle).adaptive_cache == nullptr,
-          "the default-off Bridge experiment cannot enter the native Adaptive fallback");
+      if (!adaptive_hardware) {
+        for (uint32_t source = 0; source < native::kContractDebounceFrames + 2; ++source) frame();
+        Check(native::features.at(handle).adaptive_cache == nullptr,
+            "the default-off Bridge experiment cannot enter the native Adaptive fallback");
+      }
       native::bridge_adaptive_experiment.store(true);
       const auto mature = [&] {
         for (uint32_t source = 0; source < native::kContractDebounceFrames + 32; ++source) {
@@ -503,6 +814,9 @@ int main(int argc, char** argv) {
       };
       mature();
       auto& feature = native::features.at(handle);
+      if (adaptive_hardware) {
+        frame(true, "upper");
+      }
       const auto cache = feature.adaptive_cache;
       const auto source_generation = native::create_contracts.at(handle).source_generation;
       auto* shared_output = native::bridge_sets.at(handle)[0].output12;
@@ -512,84 +826,127 @@ int main(int argc, char** argv) {
       const auto twin_builds = native::bridge_sets_built;
       for (const size_t target : {size_t{1}, size_t{0}}) {
         feature.adaptive_session->Request(target, native::SteadyNowNs());
-        frame();
+        const auto delivered_before = native::bridge_waits11.load();
+        frame(true, target == 1 ? "lower" : "back-upper");
         Check(cache->active == target && feature.adaptive_session->status.applied == cache->ladder.sizes[target]
                   && model_observations.back().width == cache->ladder.sizes[target][0].width
                   && model_observations.back().height == cache->ladder.sizes[target][0].height
                   && model_observations.back().reset == 1,
             "prepared Bridge upper/lower selection applies real private working dimensions with Reset");
         const auto pixels = Read11(output.Get(), 8);
-        Check(std::memcmp(pixels.data(), output_pixels.data(), pixels.size()) != 0,
-            "a completed Bridge tier delivers processed pixels to the full-size D3D11 target");
+        if (adaptive_native_ngx) {
+          Check(native::bridge_waits11.load() == delivered_before + 1
+                    && pixels.size() == size_t(adaptive_output_width) * adaptive_output_height * 8,
+              "real SDK Bridge completes the return Wait/copy and full-size D3D11 GPU readback");
+          size_t nonzero = 0;
+          for (size_t offset = 0; offset < pixels.size(); offset += sizeof(uint16_t)) {
+            uint16_t value;
+            std::memcpy(&value, pixels.data() + offset, sizeof(value));
+            Check(std::isfinite(DirectX::PackedVector::XMConvertHalfToFloat(value)), "real Bridge output contains finite FP16 values");
+            nonzero += (value & 0x7fff) != 0;
+          }
+          Check(nonzero != 0, "real Bridge output has valid nonzero GPU pixels; no image quality conclusion");
+        } else {
+          Check(std::memcmp(pixels.data(), output_pixels.data(), pixels.size()) != 0,
+              "a completed Bridge tier delivers processed pixels to the full-size D3D11 target");
+        }
       }
       Check(native::nr_features_created == creates && native::worksets_created == allocations
                 && native::bridge_sets_built == twin_builds
                 && native::bridge_sets.at(handle)[0].output12 == shared_output
                 && native::bridge_sets.at(handle)[0].layout_generation == shared_layout
-                && shared_output->GetDesc().Width == 17 && shared_output->GetDesc().Height == 11
+                && shared_output->GetDesc().Width == adaptive_output_width && shared_output->GetDesc().Height == adaptive_output_height
                 && native::create_contracts.at(handle).source_generation == source_generation,
           "ready Bridge switching creates neither models nor worksets/twins and preserves full source identity");
-      // A real mocked standby API failure leaves the healthy active output valid.
-      cache->tiers[1].ready = false;
-      cache->tiers[1].output_completions.clear();
-      fail_model_width_once = cache->ladder.sizes[1][0].width;
-      frame();
-      Check(fail_model_width_once == 0 && cache->failed && feature.adaptive_session->failed,
-          "a real standby Evaluate failure pauses the same Bridge preparation attempt");
-      const auto failed_creates = native::nr_features_created;
-      frame();
-      frame();
-      Check(native::nr_features_created == failed_creates, "a failed Bridge preparation never retries Create each source");
-      const auto before_recreate = native::configuration_generation.load();
-      native::RecreateFeatures();
-      Check(native::configuration_generation.load() == before_recreate + 1 && feature.adaptive_cache == nullptr,
-          "the production clear-failure action advances configuration identity and retires the failed Bridge collection");
-      mature();
+      if (!adaptive_hardware) {
+        // A real mocked standby API failure leaves the healthy active output valid.
+        cache->tiers[1].ready = false;
+        cache->tiers[1].output_completions.clear();
+        fail_model_width_once = cache->ladder.sizes[1][0].width;
+        frame();
+        Check(fail_model_width_once == 0 && cache->failed && feature.adaptive_session->failed,
+            "a real standby Evaluate failure pauses the same Bridge preparation attempt");
+        const auto failed_creates = native::nr_features_created;
+        frame();
+        frame();
+        Check(native::nr_features_created == failed_creates, "a failed Bridge preparation never retries Create each source");
+        const auto before_recreate = native::configuration_generation.load();
+        native::RecreateFeatures();
+        Check(native::configuration_generation.load() == before_recreate + 1 && feature.adaptive_cache == nullptr,
+            "the production clear-failure action advances configuration identity and retires the failed Bridge collection");
+        mature();
+      }
       const auto retained_upper = feature.slots[0].handle;
       native::nr_adaptive_enabled.store(false);
-      frame();
-      frame();
+      frame(true, "off");
+      frame(true, "off");
       Check(feature.adaptive_cache == nullptr && feature.slots[0].handle == retained_upper
-                && feature.input_width == 17 && feature.input_height == 11
-                && feature.adaptive_session->status.applied[0].width == 17,
+                && feature.input_width == adaptive_output_width && feature.input_height == adaptive_output_height
+                && feature.adaptive_session->status.applied[0].width == adaptive_output_width,
           "Adaptive Off restores the retained legal upper without changing shared Bridge twins");
-      native::nr_adaptive_enabled.store(true);
-      mature();
-      // Reuse the existing bounded watchdog case: out can advance before done.
-      ComPtr<ID3D12Fence> stalled;
-      Check(SUCCEEDED(native::bridge.device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&stalled))),
-          "Bridge Adaptive stall gate");
-      Check(SUCCEEDED(native::bridge.queue->Wait(stalled.Get(), 1)), "Bridge Adaptive stalls its private queue");
-      std::jthread release_stall([stalled] { Sleep(1600); stalled->Signal(1); });
-      const auto signals = native::bridge_signals.load();
-      frame(false);
-      const auto pending = native::bridge_submitted_value.load();
-      const auto pending_model = model_observations.back().id;
-      Check(native::bridge.fence_done12->GetCompletedValue() < pending
-                && native::bridge_pending_delivery_value == pending
-                && native::bridge.fence_out12->GetCompletedValue() >= pending,
-          "watchdog out rescue is not Bridge delivery or GPU completion proof");
-      const auto unmodified = Read11(output.Get(), 8);
-      Check(std::memcmp(unmodified.data(), output_pixels.data(), unmodified.size()) == 0,
-          "unproven Bridge completion preserves the original MOCK SR output");
-      const auto blocked_calls = model_calls;
-      frame(false);
-      Check(model_calls == blocked_calls && native::bridge_signals.load() == signals + 1,
-          "pending real done blocks repeated NR and shared twin writes");
-      native::ngx11_slot_real[0].release = reinterpret_cast<void*>(MotionReleaseSource);
-      Check(NVSDK_NGX_SUCCEED(native::HookedReleaseFeature11Slot<0>(handle)), "real Bridge source-release hook succeeds");
-      native::DrainRetiredResources(true);
-      native::DrainBridgeRetired(native::bridge.fence_done12->GetCompletedValue());
-      Check(!native::bridge_retired.empty()
-                && std::find(model_released.begin(), model_released.end(), pending_model) == model_released.end(),
-          "source release keeps in-flight private NR and shared twins until done and recording discard");
-      release_stall.join();
-      WaitForGpu(native::bridge.fence_done12, pending);
-      const auto gpu_samples = renodx::addons::dlss5::gpu_timers::published_segments;
-      const bool cleaned = cleanup();
-      cleanup_guard.action = nullptr;
-      Check(cleaned && std::find(model_released.begin(), model_released.end(), pending_model) != model_released.end(),
-          "actual done plus owned-list Reset releases the retired model, worksets and shared twins");
+      uint64_t gpu_samples = 0;
+      if (adaptive_hardware) {
+        native::enabled.store(false);
+        const auto off_calls = model_calls;
+        const auto off_creates = native::nr_features_created;
+#if defined(NR_NEXUS_TEST_NATIVE_NGX)
+        const auto off_sr_calls = bridge_native_sr_calls;
+#endif
+        frame(true, "off");
+        Check(model_calls == off_calls && native::nr_features_created == off_creates,
+            "NR Off continues SR without NR Evaluate or Create");
+#if defined(NR_NEXUS_TEST_NATIVE_NGX)
+        if (adaptive_native_ngx) {
+          Check(bridge_native_sr_calls == off_sr_calls + 1, "NR Off executes the real D3D11 SR provider once");
+        }
+#endif
+        Check(!Read11(output.Get(), 8).empty(), "final D3D11 consumer completes before source release and SDK shutdown");
+        gpu_samples = renodx::addons::dlss5::gpu_timers::published_segments;
+        const bool cleaned = cleanup();
+        cleanup_guard.action = nullptr;
+        Check(cleaned && model_released.size() == model_created,
+            "hardware source release and exact retirement release all private NR models and shared twins");
+        Check(native::get_module_filename_iat == nullptr && native::original_get_module_filename == nullptr,
+            "Bridge hardware test never installs a snippet identity IAT bridge");
+      } else {
+        native::nr_adaptive_enabled.store(true);
+        mature();
+        // Reuse the existing bounded watchdog case: out can advance before done.
+        ComPtr<ID3D12Fence> stalled;
+        Check(SUCCEEDED(native::bridge.device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&stalled))),
+            "Bridge Adaptive stall gate");
+        Check(SUCCEEDED(native::bridge.queue->Wait(stalled.Get(), 1)), "Bridge Adaptive stalls its private queue");
+        std::jthread release_stall([stalled] { Sleep(1600); stalled->Signal(1); });
+        const auto signals = native::bridge_signals.load();
+        frame(false);
+        const auto pending = native::bridge_submitted_value.load();
+        const auto pending_model = model_observations.back().id;
+        Check(native::bridge.fence_done12->GetCompletedValue() < pending
+                  && native::bridge_pending_delivery_value == pending
+                  && native::bridge.fence_out12->GetCompletedValue() >= pending,
+            "watchdog out rescue is not Bridge delivery or GPU completion proof");
+        const auto unmodified = Read11(output.Get(), 8);
+        Check(std::memcmp(unmodified.data(), output_pixels.data(), unmodified.size()) == 0,
+            "unproven Bridge completion preserves the original MOCK SR output");
+        const auto blocked_calls = model_calls;
+        frame(false);
+        Check(model_calls == blocked_calls && native::bridge_signals.load() == signals + 1,
+            "pending real done blocks repeated NR and shared twin writes");
+        native::ngx11_slot_real[0].release = reinterpret_cast<void*>(MotionReleaseSource);
+        Check(NVSDK_NGX_SUCCEED(native::HookedReleaseFeature11Slot<0>(handle)), "real Bridge source-release hook succeeds");
+        native::DrainRetiredResources(true);
+        native::DrainBridgeRetired(native::bridge.fence_done12->GetCompletedValue());
+        Check(!native::bridge_retired.empty()
+                  && std::find(model_released.begin(), model_released.end(), pending_model) == model_released.end(),
+            "source release keeps in-flight private NR and shared twins until done and recording discard");
+        release_stall.join();
+        WaitForGpu(native::bridge.fence_done12, pending);
+        gpu_samples = renodx::addons::dlss5::gpu_timers::published_segments;
+        const bool cleaned = cleanup();
+        cleanup_guard.action = nullptr;
+        Check(cleaned && std::find(model_released.begin(), model_released.end(), pending_model) != model_released.end(),
+            "actual done plus owned-list Reset releases the retired model, worksets and shared twins");
+      }
       native::bridge_adaptive_experiment.store(false);
       native::ReleaseBridge();
       for (UINT64 index = 0; index < adaptive_info11->GetNumStoredMessagesAllowedByRetrievalFilter(); ++index) {
@@ -614,8 +971,12 @@ int main(int argc, char** argv) {
           Check(false, "Bridge Adaptive D3D12 InfoQueue has no errors/corruption");
         }
       }
-      std::cout << "PASS Bridge Adaptive WARP+MOCK two full-prepared tiers, ready roundtrip/Reset/zero creates, "
-                   "standby failure/Off/recovery, watchdog done/retirement; gpu_segments=" << gpu_samples << '\n';
+      std::cout << "PASS Bridge Adaptive "
+          << (adaptive_native_ngx ? "NATIVE_GPU+NATIVE_NGX real D3D11 SR + SDK-preinitialized private D3D12 NR"
+              : (adaptive_hardware ? "NATIVE_GPU+MOCK" : "WARP+MOCK"))
+          << " two full-prepared tiers, ready roundtrip/Reset/zero creates, Off/source release/retirement"
+          << (adaptive_hardware ? "; requested_model=B internal_model=unknown; " : ", standby failure/recovery/watchdog; ")
+          << "gpu_segments=" << gpu_samples << '\n';
       return 0;
     }
     if (stage_resolution) {
