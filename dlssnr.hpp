@@ -6163,7 +6163,7 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
     // would reset NR every frame (LIFE-12).  No lane produces either shape
     // (a host alternating a proxied and a native list crashes bare), so the
     // rules below are read from the code, not measured:
-    //   - the other face of the SAME device switches the runtime only after
+    //   - within one provider, the other face of the SAME device switches the runtime only after
     //     it has been the only face for kRuntimeFaceSwitchEvaluates
     //     evaluates in a row; until then each of its evaluates passes
     //     through (runtime_face_alternation), and an evaluate in the
@@ -6193,7 +6193,10 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
         : !same_device ? "a different D3D12 device"
         : proxy_face ? "ReShade's proxy of its D3D12 device"
                      : "the native face of its D3D12 device";
-    if (same_device && !exact_device) {
+    // An explicit provider handoff selects its required face. The settling
+    // window is for competing faces within one provider; both still need
+    // the closed-and-completed proof below.
+    if (same_instance && same_device && !exact_device) {
       if (runtime_face_candidate != device) {
         runtime_face_candidate = device;
         runtime_face_run = 0;

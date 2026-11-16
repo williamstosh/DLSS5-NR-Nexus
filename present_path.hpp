@@ -1095,6 +1095,9 @@ inline void CapturePresentGuides(
     RecordOutputPass(output, handle);
   }
   if (!mixed_predecessor) CountNrDecline(NrDeclineReason::kPresentHook);
+  // XeFG consumes its SDK tags. Pause ordinary source-list copies through
+  // both provider handoffs so they cannot keep the recorded-work gate busy.
+  if (!mixed_predecessor && (fg::xefg::OwnsStream() || direct_api.private_instance)) return;
   if (diagnostics::GuideMode(debug_guide_mode.load(std::memory_order_relaxed),
                             present_guides.load(std::memory_order_relaxed)) == kPresentGuidesNever
       && !screenshot::WantsFinalPresent() && !mixed_predecessor) return;
@@ -2701,10 +2704,17 @@ inline bool YieldPresentToNativeFg() {
 
 // The stopped XeFG pool no longer rotates its owned lists. End replay
 // eligibility before the ordinary runtime checks the recorded-work proof.
-inline bool ResumeOrdinaryPresentLocked() {
+inline bool ResumeOrdinaryPresentLocked(ID3D12GraphicsCommandList* command_list = nullptr) {
   if (!direct_api.private_instance) return true;
   if (fg::xefg::OwnsStream()) return false;
   fg_service::RetireServiceStreamsLocked();
+  if (command_list != nullptr) {
+    auto decline = NrDeclineReason::kNrRuntimeUnavailable;
+    if (!EnsureDirectRuntime(command_list, &decline, false)) {
+      CountNrDecline(decline);
+      return false;
+    }
+  }
   return true;
 }
 
@@ -2715,7 +2725,7 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     reshade::api::command_queue* queue, PresentSlot* slot, PresentStream& stream,
     bridge::OwnedParameters& block, PresentGuideSet* guides, PresentTarget& target,
     bool neutral_model, const std::vector<std::pair<FenceRef, uint64_t>>& waits) {
-  if (!ResumeOrdinaryPresentLocked()) return false;
+  if (!ResumeOrdinaryPresentLocked(slot->list)) return false;
   if (present_ring.queue != native_queue) {
     if (!PresentRingComplete()) return false;
     native_queue->AddRef();
@@ -3855,6 +3865,9 @@ inline void RunPresentPath(
     CountNrDecline(NrDeclineReason::kPresentBusy);
     return;
   }
+  // Required guides resume on the next source evaluate after adoption.
+  // Waiting for them first would leave the private provider selected forever.
+  if (!d3d11 && !ResumeOrdinaryPresentLocked(present_ring.slots[0].list)) return;
 
   // Direct3D 12 records on the path's own ring; Direct3D 11 on the bridge's.
   // A busy slot is waited for, bounded (kPresentSlotWaitMs), outside
