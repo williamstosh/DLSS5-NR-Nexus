@@ -119,6 +119,103 @@ inline Json Snapshot() {
   }
   const auto output = output_framerate::Read(now);
   const auto fg_environment = ReadEditReuseFgEnvironmentLocked();
+  edit_fg_observation::Snapshot fg_observed;
+  edit_fg_observation::CopySnapshot(&fg_observed);
+  const auto resource_identity = [](const edit_fg_observation::ResourceIdentity& resource) {
+    return Json{{"raw", resource.raw}, {"canonical", resource.canonical},
+        {"canonical_available", resource.canonical != 0}};
+  };
+  const auto recording_identity = [](const edit_fg_observation::RecordingIdentity& recording) {
+    return Json{{"raw", recording.raw}, {"list_id", recording.list_id}, {"generation", recording.generation},
+        {"identity_available", recording.list_id != 0 && recording.generation != 0}};
+  };
+  const auto source_observation = [&](const edit_fg_observation::SrCopyback& source) {
+    return Json{{"handle", source.source_handle}, {"generation", source.source_generation},
+        {"sequence", source.sr_sequence}, {"reused", source.reused},
+        {"output", resource_identity(source.output)}, {"size", {source.width, source.height}}, {"format", source.format},
+        {"recording", recording_identity(source.recording)},
+        {"environment_provider", source.environment_provider}, {"environment_context", source.environment_context},
+        {"environment_generation", source.environment_generation}};
+  };
+  const char* fg_observation_state = "disabled";
+  switch (fg_observed.state) {
+    case edit_fg_observation::State::DISABLED: break;
+    case edit_fg_observation::State::ARMED: fg_observation_state = "armed"; break;
+    case edit_fg_observation::State::CAPTURING: fg_observation_state = "capturing"; break;
+    case edit_fg_observation::State::STOPPED: fg_observation_state = "stopped"; break;
+  }
+  Json fg_observation_events = Json::array();
+  for (uint32_t index = 0; index < fg_observed.count; ++index) {
+    const auto& observed = fg_observed.events[index];
+    Json event{{"sequence", observed.sequence}, {"observed_ns", observed.observed_ns},
+        {"thread_id", observed.thread_id}};
+    switch (observed.kind) {
+      case edit_fg_observation::Kind::SR_COPYBACK:
+        event["kind"] = "sr_copyback_recorded";
+        event["source"] = source_observation(observed.sr);
+        break;
+      case edit_fg_observation::Kind::NATIVE_FG_ENTRY: {
+        const auto& native = observed.native_fg;
+        event["kind"] = "native_fg_entry";
+        event["call_id"] = observed.call_id;
+        event["native"] = {{"handle", native.handle}, {"environment_generation", native.generation},
+            {"slot", native.slot}, {"c_export", native.c_export},
+            {"recording", recording_identity(native.recording)},
+            {"backbuffer", resource_identity(native.backbuffer)}, {"hudless", resource_identity(native.hudless)},
+            {"ui", resource_identity(native.ui)}, {"ui_alpha", resource_identity(native.ui_alpha)},
+            {"ui_mode", native.has_ui_mode ? Json(native.ui_mode) : Json(nullptr)},
+            {"frame_id", native.has_frame_id ? Json(native.frame_id) : Json(nullptr)}};
+        break;
+      }
+      case edit_fg_observation::Kind::XEFG_TAG_ENTRY: {
+        const auto& tag = observed.xefg_tag;
+        event["kind"] = "xefg_tag_entry";
+        event["call_id"] = observed.call_id;
+        event["tag"] = {{"sdk_context", tag.sdk_context}, {"sdk_slot", tag.sdk_slot},
+            {"context_identity", tag.context_identity},
+            {"epoch", tag.epoch}, {"generation", tag.generation}, {"present_id", tag.present_id},
+            {"type", tag.type}, {"validity", tag.validity}, {"resource", resource_identity(tag.resource)},
+            {"recording", recording_identity(tag.recording)}, {"base", {tag.base_x, tag.base_y}},
+            {"size", {tag.width, tag.height}}, {"resource_state", tag.resource_state},
+            {"ui_mode", tag.ui_mode}, {"ui_composition", tag.ui_composition}};
+        break;
+      }
+      case edit_fg_observation::Kind::XEFG_PRESENT_ENTRY: {
+        const auto& present = observed.xefg_present;
+        event["kind"] = "xefg_present_entry";
+        event["call_id"] = observed.call_id;
+        event["present"] = {{"sdk_context", present.sdk_context}, {"context_identity", present.context_identity},
+            {"epoch", present.epoch}, {"generation", present.generation},
+            {"present_id", present.has_present_id ? Json(present.present_id) : Json(nullptr)},
+            {"repeated", present.repeated}, {"proxy", resource_identity(present.proxy)},
+            {"backbuffer", resource_identity(present.backbuffer)}, {"method", present.method},
+            {"interval", present.interval}, {"flags", present.flags}};
+        break;
+      }
+      case edit_fg_observation::Kind::NATIVE_FG_RETURN:
+      case edit_fg_observation::Kind::XEFG_TAG_RETURN:
+      case edit_fg_observation::Kind::XEFG_PRESENT_RETURN:
+        switch (observed.kind) {
+          case edit_fg_observation::Kind::NATIVE_FG_RETURN: event["kind"] = "native_fg_return"; break;
+          case edit_fg_observation::Kind::XEFG_TAG_RETURN: event["kind"] = "xefg_tag_return"; break;
+          default: event["kind"] = "xefg_present_return"; break;
+        }
+        event["call_id"] = observed.call_id;
+        event["api_result"] = observed.api_result;
+        event["api_return_ns"] = observed.api_return_ns;
+        if (observed.kind == edit_fg_observation::Kind::XEFG_PRESENT_RETURN) {
+          const auto& status = observed.present_status;
+          const bool valid = status.queried && status.api_result == 0;
+          event["sdk_present_status"] = {{"queried", status.queried},
+              {"api_result", status.queried ? Json(status.api_result) : Json(nullptr)},
+              {"frames_presented", valid ? Json(status.frames_presented) : Json(nullptr)},
+              {"frame_gen_result", valid ? Json(status.frame_gen_result) : Json(nullptr)},
+              {"enabled", valid ? Json(status.enabled) : Json(nullptr)}};
+        }
+        break;
+    }
+    fg_observation_events.push_back(std::move(event));
+  }
   const auto device_observation = [](const fg::xefg::BridgeDeviceObservation& observed) {
     return Json{{"object_present", observed.object_present}, {"swapchain_unwrapped", observed.swapchain_unwrapped},
         {"swapchain_result", observed.swapchain_result}, {"device11_result", observed.device11_result},
@@ -256,6 +353,14 @@ inline Json Snapshot() {
               {"provider", fg_environment.provider}, {"context", fg_environment.context},
               {"generation", fg_environment.generation},
               {"evidence", "fg_environment_metadata_not_source_handoff"}}},
+          {"fg_observation", {{"enabled", fg_observed.enabled}, {"state", fg_observation_state},
+              {"reason", fg_observed.stop_reason}, {"request_generation", fg_observed.request_generation},
+              {"source_frames", fg_observed.source_frames}, {"event_count", fg_observed.count},
+              {"overflow", fg_observed.overflow},
+              {"source", source_observation(fg_observed.source)}, {"events", std::move(fg_observation_events)},
+              {"evidence", "cpu_call_and_recording_observations_not_gpu_completion_or_pixel_handoff"},
+              {"resource_identity_scope", "IUnknown_after_known_ReShade_unwrap;Streamline_faces_remain_distinct"},
+              {"first_source_prefix_complete", false}}},
           {"xefg_off_sources", std::move(edit_off_sources)},
           {"xefg_device_observation", std::move(edit_device_observation)},
           {"xefg_off_events", std::move(edit_off_events)},
@@ -327,6 +432,14 @@ inline Json Execute(const Json& request) {
       {"message", ""}, {"changes", Json::object()}};
   const auto finish = [&]() {
     response["state"] = Snapshot();
+    if (response["state"].value("available", false)) {
+      // Status can contain both the current state and this cached receipt.
+      // Keep bounded events in the current status, rather than duplicating
+      // them into every mutation receipt under the same 64 KiB pipe limit.
+      auto& observed = response["state"]["edit_reuse"]["fg_observation"];
+      observed["events"] = Json::array();
+      observed["events_in_status_only"] = true;
+    }
     response["identity"] = response["state"].value("identity", Json(nullptr));
     last_request = request;
     last_receipt = response;
@@ -403,6 +516,9 @@ inline Json Execute(const Json& request) {
           const bool requested = value->get<bool>();
           unchanged = requested_flag->load() == requested;
           requested_flag->store(requested);
+          if (fg_experiment && !unchanged) {
+            edit_fg_observation::SetEnabled(requested);
+          }
         } else {
           const auto requested = static_cast<AdaptiveFeatureMode>(value->get<uint32_t>());
           unchanged = adaptive_feature_mode.load() == requested;

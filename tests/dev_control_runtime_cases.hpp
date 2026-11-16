@@ -601,11 +601,23 @@
             && boolean_enabled["state"]["experiments"][evidence_key] == "requested_enabled_not_activation",
         "Boolean enable publishes only the independent requested flag and its confirmation identity");
     check(control::Execute(boolean_request) == boolean_enabled, "same-id Boolean enable returns the original receipt");
+    if (fg) {
+      const auto observed = boolean_enabled["state"]["edit_reuse"]["fg_observation"];
+      check(observed["state"] == "armed" && observed["source_frames"] == 0 && observed["events"].empty()
+              && observed["first_source_prefix_complete"] == false,
+          "FG experiment arms bounded observation without inventing a source frame or complete prefix");
+    }
     status = control::Execute({{"id", "query-" + std::string(operation)}, {"op", "status"}, {"query_id", boolean_request["id"]}});
     check(status["receipt"] == boolean_enabled, "lost Boolean enable receipts use the existing status lookup");
     auto reused_boolean = boolean_request;
     reused_boolean["enabled"] = false;
     check(control::Execute(reused_boolean)["reason"] == "request_id_reused", "reused Boolean ids cannot change the requested flag");
+    if (fg) {
+      check(boolean_experiment(true)["status"] == "unchanged"
+              && control::Snapshot()["edit_reuse"]["fg_observation"]["request_generation"]
+                  == boolean_enabled["state"]["edit_reuse"]["fg_observation"]["request_generation"],
+          "unchanged FG enable preserves the observation request generation");
+    }
     check(set("NRAdaptiveTargetFPS", runtime::nr_adaptive_target_fps.load(),
               {{"identity", boolean_identity}, {"changes", {{"NRAdaptiveTargetFPS", runtime::nr_adaptive_target_fps.load()}}}})["reason"]
             == "configuration_changed",
@@ -637,6 +649,21 @@
             && after_boolean.requested == boolean_adaptive.requested && after_boolean.applied == boolean_adaptive.applied,
         "request acceptance cannot manufacture FG Off, an eligible source or an actual applied tier");
     runtime::disabled_resources_released = released_before;
+  }
+#include "nr_edit_fg_observation_cases.hpp"
+  {
+    const Json request{{"id", "fg-observation-receipt"}, {"op", "edit_reuse_fg_experiment"}, {"enabled", false}};
+    const auto receipt = control::Execute(request);
+    const auto reply = control::Execute({{"id", "fg-observation-receipt-query"}, {"op", "status"},
+        {"query_id", request["id"]}});
+    const auto& summary = receipt["state"]["edit_reuse"]["fg_observation"];
+    check(summary["event_count"] == 64 && summary["events"].empty() && summary["events_in_status_only"] == true
+            && reply["state"]["edit_reuse"]["fg_observation"]["events"].size() == 64,
+        "mutation receipts keep the trace summary while ordinary status retains every observation");
+    check(reply["receipt"] == receipt && control::Execute(request) == receipt
+            && reply.dump().size() < renodx::addons::dlss5::dev_control_pipe::internal::MAX_FRAME_BYTES,
+        "a full observation plus its idempotent cached receipt fits the existing pipe frame limit");
+    std::printf("FG metadata status plus receipt bytes=%zu\n", reply.dump().size());
   }
   {
     namespace screenshot = renodx::addons::dlss5::screenshot;

@@ -80,6 +80,16 @@ x2 先平均相邻两源再统计；未满窗口或过期时为 null。请求、
 不是源到FG的像素交接证明。`state.edit_reuse.sources`按source／pass报告源序号、尺寸、锚点代次及复用状态，
 明确属于录制状态；须与GPU完成、实际FG输出及同帧作用证据分别核验。原XeFG单Backbuffer Present路径与Off两档实验保持各自准入。
 
+从关闭切换到开启该DEV实验时，会同时准备一次`state.edit_reuse.fg_observation`有界观察；相同请求或重复开启不重置它。
+完整`events`通过`status`读取；修改请求的缓存回执只保留`event_count`等摘要，并标记`events_in_status_only=true`，避免查询回执时重复装入整个观察窗口。
+首个合格SR写回才开始记录，最多覆盖4个源帧、64个事件；第5个源帧入口停止，关闭实验保留已有快照，重新关闭／开启才准备新一轮。
+记录区分SR写回、native FG调用与返回、XeFG实际转发Tag及Proxy Present；返回事件用`call_id`关联本轮入口。
+`api_return_ns`采样在实际调用返回后，`observed_ns`是随后记录事件的时刻。native的`environment_generation`仅是已观察的FG环境修订代次。
+资源的规范身份或录制身份不可用时明确标记，未读到的FrameID为`null`；可读FrameID只表示SDK参数读取成功，尚未证明它与SR序号对应。
+native颜色记录包含Backbuffer、HUDLess、UI及UIAlpha的身份。XeFG区域声明和无有效列表契约的Tag不会被当作可解引用的命令列表。
+规范身份沿宿主只解包已知ReShade代理；Streamline接口面保持独立，身份不同本身也不能证明不存在后续数据流。
+这些CPU观察不包含GPU完成或像素交接结论，首个SR帧之前的Tag前缀也未覆盖。源／FG环境代次变化会停止观察；缺少返回或未读到颜色角色时保留缺口，不根据临近时刻关联来源。
+
 DEV 两档 x2 另可接纳与当前 D3D12 源、真实来源链与 XeFG proxy 的嵌套 Present 关联及 context 代次绑定的成功
 `SetEnabled(false)`。它保持原生 FG 声明不变；Unknown 自身不能准入。`state.edit_reuse.xefg_off_sources`
 报告凭据及 provider 匹配情况；`source_link_reason` 独立说明来源关联状态，`reason` 说明关闭凭据状态。

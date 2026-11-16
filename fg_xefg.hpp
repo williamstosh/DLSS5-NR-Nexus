@@ -37,6 +37,9 @@
 #include "fg_frame.hpp"
 #include "output_framerate.hpp"
 #include "submission_tracker.hpp"
+#if defined(NR_NEXUS_DEV_CONTROL)
+#include "nr_edit_fg_observation.hpp"
+#endif
 
 namespace renodx::addons::dlss5::fg::xefg {
 
@@ -732,6 +735,7 @@ inline void ReleaseFrames(Context* context) {
   context->last_submission_frame = 0;
   ++context->epoch;
 #if defined(NR_NEXUS_DEV_CONTROL)
+  edit_fg_observation::StopEnvironment(2, reinterpret_cast<uintptr_t>(context));
   context->fg_environment_generation = ++state.fg_environment_generation;
 #endif
 }
@@ -1390,7 +1394,39 @@ struct PresentFrame {
   uint64_t service_stats_serial = 0;
   Result service_result = Result::NOT_SERVED;
   bool repeated = false;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  edit_fg_observation::Ticket edit_fg_ticket;
+  int64_t edit_fg_return_ns = 0;
+#endif
 };
+
+#if defined(NR_NEXUS_DEV_CONTROL)
+inline void ObserveEditPresent(PresentFrame* present, IDXGISwapChain* swapchain,
+                               uint32_t method, UINT interval, UINT flags) {
+  const auto generation = edit_fg_observation::CaptureGeneration();
+  if (generation == 0 || present->context == nullptr) return;
+  edit_fg_observation::XefgPresentObservation observation{
+      .sdk_context = present->input.context, .context_identity = present->input.diagnostic_context,
+      .epoch = present->input.epoch, .present_id = present->input.present_id,
+      .has_present_id = present->input.has_present_id, .repeated = present->repeated,
+      .proxy = edit_fg_observation::ObserveResource(swapchain),
+      .method = method, .interval = interval, .flags = flags};
+  {
+    std::shared_lock lock(state.mutex);
+    observation.generation = present->context->fg_environment_generation;
+  }
+  // BackbufferRegion carries coordinates, not a resource. Observe the actual
+  // current proxy buffer separately, without recording any GPU commands.
+  ComPtr<IDXGISwapChain3> swapchain3;
+  ComPtr<ID3D12Resource> backbuffer;
+  if (SUCCEEDED(swapchain->QueryInterface(IID_PPV_ARGS(&swapchain3)))
+      && SUCCEEDED(swapchain3->GetBuffer(swapchain3->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&backbuffer)))) {
+    observation.backbuffer = edit_fg_observation::ObserveResource(backbuffer.Get());
+  }
+  present->edit_fg_ticket = edit_fg_observation::Record(generation,
+      {.kind = edit_fg_observation::Kind::XEFG_PRESENT_ENTRY, .xefg_present = observation});
+}
+#endif
 
 inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
   PresentFrame present;
@@ -1541,8 +1577,18 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL) {
   const bool signaled = !needs_consumer_fence
       || SUCCEEDED(present->context->queue->Signal(present->context->fence.Get(), value));
   abi::PresentStatus status{};
+#if defined(NR_NEXUS_DEV_CONTROL)
+  const bool status_queried = present_result == S_OK && present->context->get_status != nullptr;
+  const int32_t status_result = (status_queried
+      ? present->context->get_status(reinterpret_cast<void*>(present->input.context), &status) : 0);
+  const bool has_status = status_queried && status_result == 0;
+  edit_fg_observation::RecordResult(present->edit_fg_ticket, present_result, present->edit_fg_return_ns,
+      {.queried = status_queried, .api_result = status_result, .frames_presented = status.frames_presented,
+          .frame_gen_result = status.frame_gen_result, .enabled = status.enabled});
+#else
   const bool has_status = present_result == S_OK && present->context->get_status != nullptr
       && present->context->get_status(reinterpret_cast<void*>(present->input.context), &status) == 0;
+#endif
   std::unique_lock lock(state.mutex);
   if (present->frame != nullptr) {
     for (const auto& copy : present->frame->captures) {
@@ -1690,8 +1736,17 @@ struct ProxyHooks {
     BridgeProxyPresent bridge_present(swapchain, flags);
     PresentFrame present;
     try { present = BeginPresent(swapchain, flags); } catch (...) { PublishResult(Result::FAILED); }
+#if defined(NR_NEXUS_DEV_CONTROL)
+    try { ObserveEditPresent(&present, swapchain, 1, interval, flags); }
+    catch (...) { edit_fg_observation::Stop("observation_failed"); }
+#endif
     if (present.service_owned) ++proxy_depth;
     const HRESULT status = reinterpret_cast<PresentFn>(proxies[Index].real[0])(swapchain, interval, flags);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (present.edit_fg_ticket.call_id != 0) {
+      present.edit_fg_return_ns = edit_fg_observation::NowNs();
+    }
+#endif
     if (present.service_owned) --proxy_depth;
     try { EndPresent(&present, status); } catch (...) { PublishResult(Result::FAILED); }
     bridge_present.Finish(status);
@@ -1710,8 +1765,17 @@ struct ProxyHooks {
     BridgeProxyPresent bridge_present(swapchain, flags);
     PresentFrame present;
     try { present = BeginPresent(swapchain, flags); } catch (...) { PublishResult(Result::FAILED); }
+#if defined(NR_NEXUS_DEV_CONTROL)
+    try { ObserveEditPresent(&present, swapchain, 2, interval, flags); }
+    catch (...) { edit_fg_observation::Stop("observation_failed"); }
+#endif
     if (present.service_owned) ++proxy_depth;
     const HRESULT status = reinterpret_cast<Present1Fn>(proxies[Index].real[1])(swapchain, interval, flags, parameters);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (present.edit_fg_ticket.call_id != 0) {
+      present.edit_fg_return_ns = edit_fg_observation::NowNs();
+    }
+#endif
     if (present.service_owned) --proxy_depth;
     try { EndPresent(&present, status); } catch (...) { PublishResult(Result::FAILED); }
     bridge_present.Finish(status);
@@ -1995,8 +2059,59 @@ struct SdkHooks {
         }
       }
     } catch (...) { tagged.resource.Reset(); PublishResult(Result::FAILED); }
+#if defined(NR_NEXUS_DEV_CONTROL)
+    edit_fg_observation::Ticket edit_fg_ticket;
+    try {
+      if (const auto generation = edit_fg_observation::CaptureGeneration(); generation != 0) {
+        edit_fg_observation::XefgTagObservation observation{
+            .sdk_slot = static_cast<uint32_t>(Index), .sdk_context = reinterpret_cast<uintptr_t>(handle), .present_id = id,
+            .recording = {.raw = reinterpret_cast<uintptr_t>(list)}};
+        {
+          std::shared_lock lock(state.mutex);
+          if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
+            observation.context_identity = reinterpret_cast<uintptr_t>(it->second.get());
+            observation.epoch = it->second->epoch;
+            observation.generation = it->second->fg_environment_generation;
+            observation.ui_mode = static_cast<uint32_t>(it->second->init.ui_mode);
+            observation.ui_composition = it->second->ui_composition;
+          }
+        }
+        if (forwarded != nullptr) {
+          observation.type = forwarded->type;
+          observation.validity = forwarded->validity;
+          observation.resource.raw = reinterpret_cast<uintptr_t>(forwarded->resource);
+          observation.base_x = forwarded->base.x;
+          observation.base_y = forwarded->base.y;
+          observation.width = forwarded->size.x;
+          observation.height = forwarded->size.y;
+          observation.resource_state = static_cast<uint32_t>(forwarded->state);
+          if ((forwarded->type == 0 || forwarded->type == 3) && forwarded->resource != nullptr
+              && (forwarded->validity == 0 || forwarded->validity == 1)) {
+            observation.resource = edit_fg_observation::ObserveResource(forwarded->resource);
+            if (forwarded->validity == 1 && list != nullptr) {
+              ComPtr<ID3D12GraphicsCommandList> graphics;
+              if (SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&graphics)))) {
+                observation.recording = edit_fg_observation::ObserveRecording(graphics.Get());
+                observation.recording.raw = reinterpret_cast<uintptr_t>(list);
+              }
+            }
+          }
+        }
+        edit_fg_ticket = edit_fg_observation::Record(generation,
+            {.kind = edit_fg_observation::Kind::XEFG_TAG_ENTRY, .xefg_tag = observation});
+      }
+    } catch (...) {
+      edit_fg_observation::Stop("observation_failed");
+    }
+#endif
     const auto status = reinterpret_cast<int32_t (*)(void*, ID3D12CommandList*, uint32_t, const abi::Resource*)>(
         modules[Index].real[3])(handle, list, id, forwarded);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (edit_fg_ticket.call_id != 0) {
+      const auto edit_fg_return_ns = edit_fg_observation::NowNs();
+      edit_fg_observation::RecordResult(edit_fg_ticket, status, edit_fg_return_ns);
+    }
+#endif
     TraceResourceContract(handle, list, id, data, forwarded, true, status);
     if (data != nullptr && data->type == 0) {
       std::shared_lock lock(state.mutex);

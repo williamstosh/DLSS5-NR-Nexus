@@ -2389,6 +2389,7 @@ inline void OnNativeFgOptions(bool mode_enabled) noexcept {
   native_fg_options_generation.fetch_add(1, std::memory_order_release);
 #if defined(NR_NEXUS_DEV_CONTROL)
   edit_reuse_native_fg_generation.fetch_add(1, std::memory_order_release);
+  edit_fg_observation::StopEnvironment(1, 0);
 #endif
   if (mode_enabled) {
     if (was_off) RequestHistoryReset(HistoryResetSource::kRecreate);
@@ -13751,6 +13752,10 @@ inline bool RecordInline(
         && source.handle == reinterpret_cast<uintptr_t>(handle) && source.generation == feature.source_generation) {
       edit_fg_environment = ReadEditReuseFgEnvironmentLocked();
       edit_reuse_fg_inline_route = edit_fg_environment.available;
+      if (!edit_fg_environment.available) {
+        edit_fg_observation::StopEnvironment(1, 0);
+        edit_fg_observation::StopEnvironment(2, 0);
+      }
     }
   }
 #endif
@@ -15925,6 +15930,25 @@ inline bool RecordInline(
     CountNrDecline(NrDeclineReason::kSlotWarmupMaturation);
     return true;
   }
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (edit_reuse_fg_inline_route && edit_reuse_route_eligible && !adaptive.preparing
+      && stage_scope.complete && (edit_reused || model_evaluated)) {
+    if (const auto generation = edit_fg_observation::CaptureGeneration(true); generation != 0) {
+      try {
+        edit_fg_observation::RecordSrCopyback(generation,
+            {.source_handle = reinterpret_cast<uintptr_t>(handle), .source_generation = feature.source_generation,
+              .sr_sequence = feature.sr_sequence, .reused = edit_reused,
+              .output = edit_fg_observation::ObserveResource(output), .width = width, .height = height,
+              .format = static_cast<uint32_t>(output_desc.Format),
+              .recording = edit_fg_observation::ObserveRecording(command_list),
+              .environment_provider = edit_fg_environment.provider, .environment_context = edit_fg_environment.context,
+              .environment_generation = edit_fg_environment.generation});
+      } catch (...) {
+        edit_fg_observation::Stop("observation_failed");
+      }
+    }
+  }
+#endif
   ++captured_guides;
   if (adaptive.session != nullptr && adaptive.session->settings.limited_residency && !adaptive.preparing
       && stage_scope.complete && (present == nullptr || present->adaptive_frame == nullptr)) {
@@ -17987,6 +18011,46 @@ inline ID3D12Resource* PreFgResource(const NVSDK_NGX_Parameter* parameters, cons
              : nullptr;
 }
 
+#if defined(NR_NEXUS_DEV_CONTROL)
+inline edit_fg_observation::Ticket ObserveEditNativeFg(ID3D12GraphicsCommandList* command_list,
+    const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* parameters, uint32_t slot, bool c_export) {
+  const auto generation = edit_fg_observation::CaptureGeneration();
+  if (generation == 0 || parameters == nullptr) return {};
+  try {
+    edit_fg_observation::NativeFgObservation observation{
+        .handle = reinterpret_cast<uintptr_t>(handle),
+        .generation = edit_reuse_native_fg_generation.load(std::memory_order_acquire),
+        .slot = slot, .c_export = c_export,
+        .recording = {.raw = reinterpret_cast<uintptr_t>(command_list)}};
+    {
+      RuntimeLock lock(runtime_mutex);
+      if (const auto it = native_fg_ui_recomposition.find(handle); it != native_fg_ui_recomposition.end()) {
+        observation.ui_mode = static_cast<uint32_t>(it->second);
+        observation.has_ui_mode = true;
+      }
+    }
+    observation.recording = edit_fg_observation::ObserveRecording(command_list);
+    observation.backbuffer = edit_fg_observation::ObserveResource(
+        PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_Backbuffer));
+    observation.hudless = edit_fg_observation::ObserveResource(
+        PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_HUDLess));
+    observation.ui = edit_fg_observation::ObserveResource(
+        PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_UI));
+    observation.ui_alpha = edit_fg_observation::ObserveResource(
+        PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_UIAlpha));
+    unsigned long long frame_id = 0;
+    observation.has_frame_id = NVSDK_NGX_SUCCEED(parameters->Get(
+        NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID, &frame_id));
+    observation.frame_id = frame_id;
+    return edit_fg_observation::Record(generation,
+        {.kind = edit_fg_observation::Kind::NATIVE_FG_ENTRY, .native_fg = observation});
+  } catch (...) {
+    edit_fg_observation::Stop("observation_failed");
+    return {};
+  }
+}
+#endif
+
 // A DLSS-G (feature 11) evaluate.  The handle decides whenever its create was
 // seen.  Games and Streamline reuse ONE parameter block for DLSS/RR and
 // DLSS-G, so after the first DLSS-G evaluate every DLSS/RR evaluate still
@@ -18241,6 +18305,7 @@ inline void RegisterCreatedFeatureLocked(const NVSDK_NGX_Handle* handle,
   if (feature == NVSDK_NGX_Feature_FrameGeneration) {
 #if defined(NR_NEXUS_DEV_CONTROL)
     edit_reuse_native_fg_generation.fetch_add(1, std::memory_order_release);
+    edit_fg_observation::StopEnvironment(1, 0);
 #endif
     const uint32_t ui_recomposition = GetUInt(parameters, NVSDK_NGX_DLSSG_Parameter_UserInterfaceRecompositionEnabled);
     native_fg_ui_recomposition[handle] = ui_recomposition != 0;
@@ -18291,9 +18356,11 @@ inline void RegisterCreatedFeatureLocked(const NVSDK_NGX_Handle* handle,
 // that was the last DLSS feature.  Caller holds runtime_mutex.
 inline bool ForgetSourceHandleLocked(const NVSDK_NGX_Handle* handle) {
 #if defined(NR_NEXUS_DEV_CONTROL)
+  edit_fg_observation::StopSource(reinterpret_cast<uintptr_t>(handle));
   if (const auto created = created_feature_ids.find(handle);
       created != created_feature_ids.end() && created->second == NVSDK_NGX_Feature_FrameGeneration) {
     edit_reuse_native_fg_generation.fetch_add(1, std::memory_order_release);
+    edit_fg_observation::StopEnvironment(1, 0);
   }
 #endif
   OnNativeFgFeatureReleased(handle);
@@ -20746,7 +20813,15 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
     lock_trace.End();
 #endif
     if (source_scope.owner) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+      if (auto source = features.find(handle); source != features.end()) {
+        ++source->second.sr_sequence;
+        edit_fg_observation::ObserveSourceFrame(reinterpret_cast<uintptr_t>(handle),
+            source->second.source_generation, source->second.sr_sequence);
+      }
+#else
       if (auto source = features.find(handle); source != features.end()) ++source->second.sr_sequence;
+#endif
     }
     // NRPresentPreFg (present_path.hpp): a DLSS-G evaluate gets NR on its
     // input frame here, recorded into its list before DLSS-G reads it, and
@@ -20813,11 +20888,21 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
   // injection would double-run are dedup-skipped inside ProcessInline.
   ComputeStateEnvelope state_envelope(
       (!nested_in_c_wrapper && !InsideDirectCall()) ? command_list : nullptr);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  const auto edit_fg_ticket = (frame_generation && source_scope.owner && !nested_in_c_wrapper && !InsideDirectCall()
+      ? ObserveEditNativeFg(command_list, handle, parameters, Slot, false) : edit_fg_observation::Ticket{});
+#endif
   const NVSDK_NGX_Result result = [&] {
     const NgxRuntimeCommandScope runtime_scope;
     const bool outer = inside_game_evaluate_wrapper;
     if (control_mask_use_core_context.load()) inside_game_evaluate_wrapper = true;
     const auto result = real(command_list, handle, parameters, callback);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (edit_fg_ticket.call_id != 0) {
+      const auto edit_fg_return_ns = edit_fg_observation::NowNs();
+      edit_fg_observation::RecordResult(edit_fg_ticket, static_cast<uint32_t>(result), edit_fg_return_ns);
+    }
+#endif
     inside_game_evaluate_wrapper = outer;
     return result;
   }();
@@ -21008,7 +21093,15 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
   if (!InsideDirectCall()) {
     RuntimeLock lock(runtime_mutex);
     if (source_scope.owner) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+      if (auto source = features.find(handle); source != features.end()) {
+        ++source->second.sr_sequence;
+        edit_fg_observation::ObserveSourceFrame(reinterpret_cast<uintptr_t>(handle),
+            source->second.source_generation, source->second.sr_sequence);
+      }
+#else
       if (auto source = features.find(handle); source != features.end()) ++source->second.sr_sequence;
+#endif
     }
     // NRPresentPreFg: NR on DLSS-G's input before DLSS-G reads it (see the
     // C++ wrapper).
@@ -21060,12 +21153,25 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
       }
     }
   }
+#if defined(NR_NEXUS_DEV_CONTROL)
+  const auto edit_fg_ticket = (frame_generation && source_scope.owner && !InsideDirectCall()
+      ? ObserveEditNativeFg(command_list, handle, parameters, Slot, true) : edit_fg_observation::Ticket{});
+#endif
   inside_game_evaluate_wrapper = true;
   ComputeStateEnvelope state_envelope(
       InsideDirectCall() ? nullptr : command_list);
   const NVSDK_NGX_Result result = [&] {
     const NgxRuntimeCommandScope runtime_scope;
+#if defined(NR_NEXUS_DEV_CONTROL)
+    const auto result = real(command_list, handle, parameters, callback);
+    if (edit_fg_ticket.call_id != 0) {
+      const auto edit_fg_return_ns = edit_fg_observation::NowNs();
+      edit_fg_observation::RecordResult(edit_fg_ticket, static_cast<uint32_t>(result), edit_fg_return_ns);
+    }
+    return result;
+#else
     return real(command_list, handle, parameters, callback);
+#endif
   }();
   inside_game_evaluate_wrapper = false;
   state_envelope.StopCapture();
@@ -33189,6 +33295,9 @@ inline bool Shutdown(bool proof_gated) {
   // caller: acquiring runtime_mutex later cannot make a queue-fence snapshot
   // taken while a callback still records cover that callback's later work.
   shutting_down.store(true, std::memory_order_seq_cst);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  edit_fg_observation::Stop("teardown");
+#endif
   CancelAsyncAutoscalePreparation();
   const int64_t drain_deadline_ns = SteadyNowNs() + 500 * 1000000LL;
   while (callbacks_in_flight.load(std::memory_order_seq_cst) != 0
