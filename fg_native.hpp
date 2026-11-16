@@ -1008,9 +1008,14 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     PrimeNgxLoaderSymbols(device, true);
     auto device_release = std::unique_ptr<ID3D12Device, void (*)(ID3D12Device*)>(device,
         [](ID3D12Device* value) { value->Release(); });
+    const BridgeDeviceLock device_lock;
     const ngx_serial::PresentTurn turn(true);
     if (!turn.owns()) return fg::Result::NOT_SERVED;
     RuntimeLock lock(runtime_mutex);
+    // The previous Present route no longer rotates these owned recordings.
+    if ((present_ring.device != nullptr && !ReleasePresentRing()) || !RetireBridgeRecordings()) {
+      return fg::Result::NOT_SERVED;
+    }
     auto& stream = streams[{false, input.context}];
     if (stream.device != nullptr && (stream.device != device || stream.queue != queue || stream.epoch != input.epoch)) {
       Release(&stream);
@@ -1114,6 +1119,13 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
       }
     };
     const std::unique_ptr<Slot, decltype(cancel_recording)> cancellation(slot, cancel_recording);
+    // Switching providers requires closed, completed NR work. Adopt the
+    // private runtime before this frame adds uses to its open recording.
+    auto decline = NrDeclineReason::kNrRuntimeUnavailable;
+    if (!EnsureDirectRuntime(slot->list, &decline, true)) {
+      CountNrDecline(decline);
+      return stream.result;
+    }
     fg::FrameInput nr_input = input;
     const bool exact_ui = nr_input.hudless != nullptr && input.ui_composition && input.ui_mode == 3
         && input.ui != nullptr

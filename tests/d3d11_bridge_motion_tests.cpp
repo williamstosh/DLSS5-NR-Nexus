@@ -2145,7 +2145,14 @@ int main(int argc, char** argv) {
       ComPtr<ID3D12Fence> stalled;
       Check(SUCCEEDED(native::bridge.device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&stalled))), "stall gate");
       Check(SUCCEEDED(native::bridge.queue->Wait(stalled.Get(), 1)), "stall private queue");
-      std::jthread release_stall([stalled] { Sleep(1600); stalled->Signal(1); });
+      struct StallRelease {
+        ID3D12Fence* gate;
+        ~StallRelease() {
+          if (gate != nullptr) {
+            gate->Signal(1);
+          }
+        }
+      } stall_release{.gate = stalled.Get()};
       const auto signals_before_stall = native::bridge_signals.load();
       const auto timed_out = frame(false, false, false, false);
       const auto pending = native::bridge_submitted_value.load();
@@ -2161,13 +2168,90 @@ int main(int argc, char** argv) {
       Check(model_calls == blocked.calls_before && model_calls == blocked_single.calls_before
                 && native::bridge_signals.load() == signals_before_stall + 1,
           "unproven mixed delivery blocks twin writes across a switch to single stage");
-      native::RetireBridgeSetLocked(mixed_handle);
-      const auto retained = native::bridge_retired.size();
-      native::DrainBridgeRetired(native::bridge.fence_done12->GetCompletedValue());
-      Check(!native::bridge_retired.empty() && native::bridge_retired.size() <= retained,
-          "in-flight twins remain retired until actual done");
-      release_stall.join();
-      WaitForGpu(native::bridge.fence_done12, pending);
+      const auto finish_stall = [&] {
+        native::RetireBridgeSetLocked(mixed_handle);
+        const auto retained = native::bridge_retired.size();
+        native::DrainBridgeRetired(native::bridge.fence_done12->GetCompletedValue());
+        Check(!native::bridge_retired.empty() && native::bridge_retired.size() <= retained,
+            "in-flight twins remain retired until actual done");
+        Check(SUCCEEDED(stalled->Signal(1)), "release the stalled Bridge submission");
+        stall_release.gate = nullptr;
+        WaitForGpu(native::bridge.fence_done12, pending);
+      };
+      if (warp && sr_only) {
+        namespace submission = renodx::addons::dlss5::submission;
+        const auto& pending_slot = native::bridge.ring[pending % native::kBridgeRing];
+        auto* const pending_list = pending_slot.list;
+        auto* const pending_allocator = pending_slot.allocator;
+        auto* const bridge_device = native::bridge.device12;
+        Check(pending != 0 && pending_list != nullptr && pending_allocator != nullptr && pending_slot.value == pending
+                  && native::bridge.fence_out12->GetCompletedValue() >= pending
+                  && native::bridge.fence_done12->GetCompletedValue() < pending,
+            "WARP Bridge has a recorded submission stalled after the watchdog advanced out");
+        const auto recording = submission::ObserveRecording(pending_list);
+        Check(recording != nullptr && !recording->closed.load(), "the pending Bridge recording must be observed");
+        const auto recording_identity = submission::RecordingIdentity(pending_list);
+
+        // The Render twins return to COMMON. Keep them alive through the handoff
+        // even after this fixture retires their Bridge source set.
+        const auto& render_set = native::bridge_sets.at(mixed_handle)[1];
+        const ComPtr<ID3D12Resource> color12 = render_set.color12;
+        const ComPtr<ID3D12Resource> motion12 = render_set.motion12;
+        const ComPtr<ID3D12Resource> depth12 = render_set.depth12;
+        fg::FrameInput input{.queue = native::bridge.queue, .backbuffer = color12.Get(),
+            .depth = depth12.Get(), .motion = motion12.Get(),
+            .color_width = width, .color_height = height, .guide_width = width, .guide_height = height,
+            .context = 0xD11F, .epoch = 1, .application_frame = 1,
+            .color_space = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, .fg_enabled = true};
+        // Isolate the Bridge retirement from provider initialization by reusing
+        // the ready fixture model on the same WARP device as a private provider.
+        auto& symbols = native::ngx_loader_staging;
+        native::direct_api.private_instance = true;
+        symbols.native_api = native::direct_api;
+        symbols.native_ready = true;
+        native::PublishNgxLoaderSymbols();
+        const auto saved_hooks = native::hooks_enabled.exchange(true);
+        const auto saved_hook_point = native::hook_point.exchange(native::kHookPresent);
+        Check(native::fg_service::Requested(), "XeFG Service is selected for the Bridge handoff");
+        const auto calls_before_service = model_calls;
+        Check(native::fg_service::Service(input) == fg::Result::NOT_SERVED && model_calls == calls_before_service
+                  && !recording->closed.load() && pending_slot.value == pending && pending_slot.list == pending_list
+                  && submission::RecordingIdentity(pending_list) == recording_identity,
+            "Service refuses before GPU-only done and preserves the same Bridge slot and recording");
+
+        finish_stall();
+        Check(!recording->closed.load() && pending_slot.value == pending,
+            "GPU-only done leaves the old Bridge recording replayable until Reset");
+        auto result = fg::Result::NOT_SERVED;
+        uint64_t service_submitted = 0;
+        for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8 && result != fg::Result::SUBMITTED; ++attempt) {
+          ++input.application_frame;
+          result = native::fg_service::Service(input);
+          Check(recording->closed.load() && pending_slot.value == 0 && pending_slot.list == pending_list
+                    && pending_slot.allocator == pending_allocator && native::bridge.device12 == bridge_device,
+              "Service resets the completed recording and keeps the Bridge allocator, list and device");
+          Check(result != fg::Result::FAILED, "Service can record after Bridge retirement");
+          const auto& stream = native::fg_service::streams.at({false, input.context});
+          service_submitted = stream.submitted;
+          if (service_submitted != 0) {
+            WaitForGpu(stream.fence, service_submitted);
+          }
+        }
+        Check(result == fg::Result::SUBMITTED && service_submitted != 0 && model_calls > calls_before_service,
+            "Service submits real WARP work using the model substitute after Bridge retirement");
+        native::fg_service::Retire();
+        native::DrainRetiredResources(true);
+        native::DrainPresentRetired();
+        native::hooks_enabled.store(saved_hooks);
+        native::hook_point.store(saved_hook_point);
+        native::direct_api.private_instance = false;
+        symbols.native_api = {};
+        symbols.native_ready = false;
+        native::PublishNgxLoaderSymbols();
+        std::printf("PASS Bridge Service handoff WARP+MOCK watchdog out / GPU done / SUBMITTED with completed fence\n");
+      } else {
+        finish_stall();
+      }
       native::DrainBridgeRetired(pending);
       // Three watchdog trips intentionally make the production bridge lost for
       // the rest of this D3D11 session. The fixture starts a fresh bridge to

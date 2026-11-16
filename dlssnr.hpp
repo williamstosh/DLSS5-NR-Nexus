@@ -26009,27 +26009,7 @@ inline void ServiceDisabledNr() {
       || !queue_tracking_active.load(std::memory_order_acquire)) {
     return;
   }
-  // The D3D11 bridge's lists also belong to the addon. Discard their old
-  // recordings only after its private completion fence, while keeping the
-  // ring reusable. A failed bridge queue never licenses an off-time release.
-  if (bridge_device_live.load(std::memory_order_acquire)) {
-    if (bridge_state.load(std::memory_order_acquire) != BridgeState::kUp
-        || bridge.fence_done12 == nullptr
-        || bridge.fence_done12->GetCompletedValue()
-               < bridge_submitted_value.load(std::memory_order_acquire)) {
-      return;
-    }
-    for (BridgeSlot& slot : bridge.ring) {
-      if (slot.list == nullptr || slot.value == 0) continue;
-      if (FAILED(slot.allocator->Reset())
-          || FAILED(slot.list->Reset(slot.allocator, nullptr))) {
-        return;
-      }
-      submission::OnCommandListReset(slot.list);
-      if (FAILED(slot.list->Close())) return;
-      slot.value = 0;
-    }
-  }
+  if (!RetireBridgeRecordings()) return;
   if (!ReleasePresentRing()) return;
   // Switching away from Present stops XeFG Service before its final private
   // lists can be recycled. Close that owned pool before asking the global

@@ -1291,6 +1291,28 @@ inline NrDeclineReason EnsureBridgeUp(ID3D11DeviceContext* context) {
   return kBridgeReady;
 }
 
+// The caller holds the Bridge device section, NGX turn and runtime_mutex.
+// The watchdog can advance out before the GPU is done with these allocators.
+inline bool RetireBridgeRecordings() {
+  if (!bridge_device_live.load(std::memory_order_acquire)) return true;
+  if (std::ranges::none_of(bridge.ring, [](const BridgeSlot& slot) { return slot.value != 0; })) return true;
+  if (bridge_state.load(std::memory_order_acquire) != BridgeState::kUp || bridge.fence_done12 == nullptr) return false;
+
+  const uint64_t done = bridge.fence_done12->GetCompletedValue();
+  if (done == UINT64_MAX || done < bridge_submitted_value.load(std::memory_order_acquire)) return false;
+  for (BridgeSlot& slot : bridge.ring) {
+    if (slot.value == 0) continue;
+    if (slot.allocator == nullptr || slot.list == nullptr
+        || FAILED(slot.allocator->Reset()) || FAILED(slot.list->Reset(slot.allocator, nullptr))) {
+      return false;
+    }
+    submission::OnCommandListReset(slot.list);
+    if (FAILED(slot.list->Close())) return false;
+    slot.value = 0;
+  }
+  return true;
+}
+
 // Shutdown, before NR state is released: every submission must be off the
 // GPU before its worksets and features go.  Bounded, like every teardown
 // wait; a queue that never drains gets its fences CPU-signalled so no D3D11

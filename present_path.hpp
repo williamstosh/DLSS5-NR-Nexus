@@ -2694,6 +2694,20 @@ inline bool YieldPresentToNativeFg() {
   return true;
 }
 
+#if defined(NR_NEXUS_DEV_CONTROL)
+#include "native_fg_tag_source.hpp"
+#endif
+#include "fg_native.hpp"
+
+// The stopped XeFG pool no longer rotates its owned lists. End replay
+// eligibility before the ordinary runtime checks the recorded-work proof.
+inline bool ResumeOrdinaryPresentLocked() {
+  if (!direct_api.private_instance) return true;
+  if (fg::xefg::OwnsStream()) return false;
+  fg_service::RetireServiceStreamsLocked();
+  return true;
+}
+
 // The ordinary route and B1 share the same private Present recording and ring.
 // Caller owns the NGX turn and runtime_mutex. A null API queue is used by the
 // native GPU fixture, which has no earlier ReShade add-on work to flush.
@@ -2701,6 +2715,7 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     reshade::api::command_queue* queue, PresentSlot* slot, PresentStream& stream,
     bridge::OwnedParameters& block, PresentGuideSet* guides, PresentTarget& target,
     bool neutral_model, const std::vector<std::pair<FenceRef, uint64_t>>& waits) {
+  if (!ResumeOrdinaryPresentLocked()) return false;
   if (present_ring.queue != native_queue) {
     if (!PresentRingComplete()) return false;
     native_queue->AddRef();
@@ -2829,9 +2844,6 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
 
 // The observer is declared here because the native copy detours must be
 // installed before the first candidate SR output is handed back to the game.
-#if defined(NR_NEXUS_DEV_CONTROL)
-#include "native_fg_tag_source.hpp"
-#endif
 inline void ObserveMixedPresentCopy(ID3D12GraphicsCommandList* list,
     ID3D12Resource* source, ID3D12Resource* destination, bool full = true);
 using MixedCopyResourceFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12Resource*, ID3D12Resource*);
@@ -4129,6 +4141,7 @@ inline void RunPresentPath(
       && !present_prefg_upscaled_active.load(std::memory_order_relaxed)
       && stack_passes.load(std::memory_order_relaxed) == 2;
   if (d3d11) {
+    if (!ResumeOrdinaryPresentLocked()) return;
     // The bridge's own run path, with this block for the game's: it takes
     // runtime_mutex itself and may bring the bridge up (DLLs, the Detours
     // transaction), so the lock goes first.  The stream and its block stay
@@ -4160,8 +4173,6 @@ inline void RunPresentPath(
   gap.ran = SubmitPresentGroup(native_queue, queue, slot, stream, block,
       guides, target, neutral_model, waits);
 }
-
-#include "fg_native.hpp"
 
 inline void OnNativePresentObserved(IDXGISwapChain* swapchain, UINT flags,
                                     fg::native_options::PresentPhase phase) noexcept {
