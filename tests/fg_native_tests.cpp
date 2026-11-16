@@ -739,6 +739,9 @@ int RunNativeRequiredMenuTest() {
 #include "gpu_timer_cases.hpp"
 #include "control_mask_gpu_cases.hpp"
 #include "nr_edit_reuse_gpu_cases.hpp"
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+#include "nr_fg_output_marker_gpu_cases.hpp"
+#endif
 #include "nr_edit_reuse_xefg_cases.hpp"
 #include "control_mask_capture_cases.hpp"
 #include "adaptive_fg_service_cases.hpp"
@@ -748,6 +751,9 @@ int RunNativeRequiredMenuTest() {
 #endif
 
 int main(int argc, char** argv) {
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+  if (argc == 2 && std::strcmp(argv[1], "--nr-fg-output-marker") == 0) return nr_fg_output_marker_gpu_cases::Run();
+#endif
 #if defined(NR_NEXUS_DEV_CONTROL)
   if (argc == 2 && std::strcmp(argv[1], "--inline-restore-roi") == 0) return inline_restore_roi_cases::Run();
 #endif

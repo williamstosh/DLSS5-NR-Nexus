@@ -90,6 +90,15 @@ native颜色记录包含Backbuffer、HUDLess、UI及UIAlpha的身份。XeFG区�
 规范身份沿宿主只解包已知ReShade代理；Streamline接口面保持独立，身份不同本身也不能证明不存在后续数据流。
 这些CPU观察不包含GPU完成或像素交接结论，首个SR帧之前的Tag前缀也未覆盖。源／FG环境代次变化会停止观察；缺少返回或未读到颜色角色时保留缺口，不根据临近时刻关联来源。
 
+专用输出验证构建同时定义`NR_NEXUS_DEV_CONTROL`与`NR_NEXUS_TEST_FG_OUTPUT_PROBE`时，
+`state.edit_reuse.fg_output_probe`报告实际SDK诊断调用回执：XeFG按真实模块／context调用仅显示生成帧及生成帧标记，
+native在游戏本次已知版本的On选项中加入官方生成帧显示标志，保留调用方对象和其他字段。
+此构建在实验开启后最多128个合格源帧插入局部识别图案，区分刷新／复用；只处理完成Resolve后的线性RGBA16F，保留alpha、ROI外画面及原缓存锚点。
+源或FG环境变化、诊断回执失效和资源准备失败均停止本次标记。它使用工作集的实际提交与退休，普通DEV与正式构建不启用。
+此专用构建的`fg_observation.events`仅序列化前16项并报告`serialized_event_limit`，给SDK回执保留管道空间；完整事件数量仍单独记录。
+SDK成功和标记录制不等于屏幕像素确认，XeFG生成失败还可能显示应用帧。专用软件像素验证沿用
+`tools/run-tests.ps1 -Suite fg-native -NativeCase nr-fg-output-marker -SoftwareOnly -UiPreview None`，使用当前生成的shader；不运行游戏或模型。
+
 DEV 两档 x2 另可接纳与当前 D3D12 源、真实来源链与 XeFG proxy 的嵌套 Present 关联及 context 代次绑定的成功
 `SetEnabled(false)`。它保持原生 FG 声明不变；Unknown 自身不能准入。`state.edit_reuse.xefg_off_sources`
 报告凭据及 provider 匹配情况；`source_link_reason` 独立说明来源关联状态，`reason` 说明关闭凭据状态。

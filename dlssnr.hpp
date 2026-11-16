@@ -120,6 +120,10 @@
 #include "ui/text_input.hpp"
 #include "submission_tracker.hpp"
 #include "edit_reuse.hpp"
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+#include "nr_fg_output_marker.hpp"
+#include "nr_fg_output_probe.hpp"
+#endif
 #include "control_mask_execution.hpp"
 #include "fg_xefg.hpp"
 #include "fg_native_options.hpp"
@@ -885,6 +889,9 @@ struct FinalResources {
   std::shared_ptr<submission::RecordingStatus> control_mask_recording;
   mutable std::shared_ptr<submission::RecordingStatus> recording;
   mutable bool tracked_recording = false;
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+  std::shared_ptr<fg_output_marker::State> fg_output_marker;
+#endif
   // HDR worksets (rc5): `decoded` IS `original` (one reference each), one
   // output-size surface less (31.6-63.3 MiB at 4K).  Safe because nothing
   // reads `original` after the linearize dispatch: the passes, pedestal and
@@ -2673,6 +2680,86 @@ inline std::atomic_bool edit_reuse_enabled{false};
 inline std::atomic_bool edit_reuse_adaptive_experiment{false};
 #if defined(NR_NEXUS_DEV_CONTROL)
 inline std::atomic_bool edit_reuse_fg_experiment{false};
+#endif
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+// A dedicated validation build only. All access is under runtime_mutex, and
+// the normal experiment's OFF/released gate owns rearming this finite window.
+struct FgOutputMarkerWindow {
+  struct Binding {
+    uintptr_t source = 0;
+    uint64_t source_generation = 0;
+    uint64_t provider = 0;
+    uintptr_t context = 0;
+    uint64_t environment_generation = 0;
+    bool operator==(const Binding&) const = default;
+  } binding;
+  static constexpr uint32_t MAX_FRAMES = 128;
+  uint64_t request_generation = 0;
+  uint32_t recorded = 0;
+  uint32_t refreshes = 0;
+  uint32_t reuses = 0;
+  uint64_t first_sequence = 0;
+  uint64_t last_sequence = 0;
+  int64_t last_recorded_ns = 0;
+  bool enabled = false;
+  bool bound = false;
+  bool stopped = false;
+  const char* reason = "disabled";
+
+  void SetEnabled(bool requested) {
+    if (requested == enabled) return;
+    const auto generation = request_generation + 1;
+    if (requested) {
+      *this = {.request_generation = generation, .enabled = true, .reason = "armed"};
+    } else {
+      request_generation = generation;
+      enabled = false;
+      stopped = true;
+      reason = "disabled";
+    }
+  }
+
+  bool Admit(const Binding& current, bool sdk_ready) {
+    if (!enabled || stopped) return false;
+    if (bound && binding != current) {
+      stopped = true;
+      reason = "source_or_environment_changed";
+      return false;
+    }
+    if (!sdk_ready) {
+      stopped = bound;
+      reason = "sdk_display_probe_unavailable";
+      return false;
+    }
+    if (!bound) {
+      binding = current;
+      bound = true;
+    }
+    return true;
+  }
+
+  void Recorded(bool reused, uint64_t sequence, int64_t now) {
+    if (recorded == 0) first_sequence = sequence;
+    ++recorded;
+    if (reused) {
+      ++reuses;
+    } else {
+      ++refreshes;
+    }
+    last_sequence = sequence;
+    last_recorded_ns = now;
+    stopped = recorded == MAX_FRAMES;
+    reason = stopped ? "source_frame_limit" : "recording";
+  }
+
+  void StopSource(uintptr_t source, uint64_t generation, const char* failure) {
+    if (bound && !stopped && binding.source == source && binding.source_generation == generation) {
+      stopped = true;
+      reason = failure;
+    }
+  }
+};
+inline FgOutputMarkerWindow fg_output_marker_window;
 #endif
 inline std::atomic_bool xefg_gpu_capture_enabled{false};
 inline std::atomic_uint64_t edit_reuse_refreshes{0};
@@ -5238,6 +5325,14 @@ inline const std::vector<const void*>& CollectWorksetGpuObjects(const FinalResou
       if (res.norm_scale != nullptr) objects.push_back(res.norm_scale);
     }
     if (res.descriptors != nullptr) objects.push_back(res.descriptors);
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+    if (res.fg_output_marker != nullptr) {
+      objects.push_back(res.fg_output_marker.get());
+      for (auto* object : res.fg_output_marker->Objects()) {
+        if (object != nullptr) objects.push_back(object);
+      }
+    }
+#endif
   }
   return objects;
 }
@@ -15242,6 +15337,10 @@ inline bool RecordInline(
           ++edit_cache->anchor_generation;
         } else {
           ++edit_reuse_fallbacks;
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+          fg_output_marker_window.StopSource(reinterpret_cast<uintptr_t>(handle), feature.source_generation,
+              "source_anchor_capture_failed");
+#endif
         }
       }
       if (edit_reuse_route_eligible) {
@@ -15750,10 +15849,48 @@ inline bool RecordInline(
           feature.slots[0].pending_reset = true;
           feature.slots[0].pending_reset_reasons |= kResetRecovery;
           ++edit_reuse_fallbacks;
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+          fg_output_marker_window.StopSource(reinterpret_cast<uintptr_t>(handle), feature.source_generation,
+              "source_original_selection_failed");
+#endif
         } else {
           Transition(command_list, output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, output_rest, 0u);
         }
       }
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+      if (edit_reuse_fg_inline_route && edit_reuse_route_eligible && !adaptive.preparing
+          && executed + 1 == static_cast<int32_t>(requested_stack) && !NVSDK_NGX_FAILED(stack_failure)
+          && (model_evaluated || edit_reused) && feature.slots[0].edit_reuse != nullptr
+          && feature.slots[0].edit_reuse->valid) {
+        const auto probe = fg_output_probe::CopySnapshot();
+        bool sdk_ready = edit_fg_environment.provider == 1 && probe.native.active;
+        if (edit_fg_environment.provider == 2) {
+          for (const auto& context : probe.xefg) {
+            sdk_ready |= context.registered && context.debug_applied && !context.stopped
+                && context.context_identity == edit_fg_environment.context;
+          }
+        }
+        if (fg_output_marker_window.Admit(
+                {.source = reinterpret_cast<uintptr_t>(handle), .source_generation = feature.source_generation,
+                    .provider = edit_fg_environment.provider, .context = edit_fg_environment.context,
+                    .environment_generation = edit_fg_environment.generation}, sdk_ready)) {
+          if (res.fg_output_marker == nullptr) {
+            res.fg_output_marker = std::make_shared<fg_output_marker::State>();
+          }
+          // This diagnostic runs after cache capture/apply and original-color
+          // selection. Its code never enters the anchor or the model proxy.
+          const auto result = fg_output_marker::Record(device, command_list, res.fg_output_marker.get(),
+              res.decoded, width, height, res.hdr_mode, edit_reused);
+          if (result == fg_output_marker::Result::RECORDED) {
+            fg_output_marker_window.Recorded(edit_reused, feature.sr_sequence, SteadyNowNs());
+          } else {
+            fg_output_marker_window.stopped = true;
+            fg_output_marker_window.reason = result == fg_output_marker::Result::NOT_SUPPORTED
+                ? "marker_contract_not_supported" : "marker_recording_failed";
+          }
+        }
+      }
+#endif
       if (hdr_capture != nullptr) {
         constexpr const char* names[] = {
             "hdr_post_pedestal_linear", "hdr_post_gamut_linear", "hdr_encoded_float", "hdr_pedestal_field"};
@@ -15879,6 +16016,10 @@ inline bool RecordInline(
   }
   device->Release();
   if (NVSDK_NGX_FAILED(stack_failure)) {
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+    fg_output_marker_window.StopSource(reinterpret_cast<uintptr_t>(handle), feature.source_generation,
+        "source_model_failed");
+#endif
     FinalResources& failed_resources = (failed_pass == 1 && second_workset != nullptr ? *second_workset : res);
     // Park the tracked states: the proxy is post-encode (SRV-readable) and
     // returns to its UAV resting state; nr_output is already parked; the

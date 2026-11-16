@@ -146,6 +146,11 @@ inline Json Snapshot() {
   }
   Json fg_observation_events = Json::array();
   for (uint32_t index = 0; index < fg_observed.count; ++index) {
+#if defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+    // The dedicated output probe needs its SDK receipts, not a second full
+    // metadata trace. Keep a labeled prefix within the unchanged pipe limit.
+    if (index == 16) break;
+#endif
     const auto& observed = fg_observed.events[index];
     Json event{{"sequence", observed.sequence}, {"observed_ns", observed.observed_ns},
         {"thread_id", observed.thread_id}};
@@ -396,6 +401,55 @@ inline Json Snapshot() {
           {"preparation_cpu_ms", adaptive.preparation_cpu_ms},
           {"preparation_vram_delta_bytes", adaptive.preparation_vram_delta_bytes},
           {"peak_process_vram_bytes", adaptive.peak_process_vram_bytes}}}});
+#if defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+  const auto probe = fg_output_probe::CopySnapshot();
+  const auto& native_probe = probe.native;
+  Json xefg_probes = Json::array();
+  for (const auto& context : probe.xefg) {
+    if (!context.observed) continue;
+    xefg_probes.push_back({{"sequence", context.observed_sequence}, {"registered", context.registered},
+        {"stopped", context.stopped}, {"reason", context.reason}, {"sdk_slot", context.sdk_slot},
+        {"module_base", context.module_base}, {"sdk_context", context.sdk_context},
+        {"context_identity", context.context_identity}, {"init_epoch", context.init_epoch},
+        {"init_generation", context.init_generation}, {"current_epoch", context.current_epoch},
+        {"current_generation", context.current_generation}, {"debug_export", context.debug_export},
+        {"init_result", context.init_result_available ? Json(context.init_result) : Json(nullptr)},
+        {"show_result", context.show_called ? Json(context.show_result) : Json(nullptr)},
+        {"tag_result", context.tag_called ? Json(context.tag_result) : Json(nullptr)},
+        {"debug_applied", context.debug_applied},
+        {"active", context.registered && !context.stopped && context.debug_applied
+            && fg_environment.available && fg_environment.provider == 2
+            && fg_environment.context == context.context_identity},
+        {"destroy_result", context.destroy_called ? Json(context.destroy_result) : Json(nullptr)}});
+  }
+  const auto& marker = fg_output_marker_window;
+  state["edit_reuse"]["fg_observation"]["serialized_event_limit"] = 16;
+  state["edit_reuse"]["fg_output_probe"] = {
+      {"dedicated_validation_build", true}, {"evidence", "sdk_display_configuration_and_marker_recording_not_output_pixels"},
+      {"sequence", probe.sequence}, {"overflow", probe.overflow}, {"xefg", std::move(xefg_probes)},
+      {"native", {{"observed", native_probe.observed}, {"active", native_probe.active},
+          {"sequence", native_probe.observed_sequence}, {"success_generation", native_probe.after_success_generation},
+          {"reason", native_probe.reason}, {"stopped", native_probe.stopped},
+          {"version_supported", native_probe.version_supported},
+          {"viewport", native_probe.observed ? Json(native_probe.viewport) : Json(nullptr)},
+          {"struct_version", native_probe.observed ? Json(native_probe.struct_version) : Json(nullptr)},
+          {"mode", native_probe.version_supported ? Json(native_probe.mode) : Json(nullptr)},
+          {"num_frames", native_probe.version_supported ? Json(native_probe.num_frames) : Json(nullptr)},
+          {"original_flags", native_probe.version_supported ? Json(native_probe.original_flags) : Json(nullptr)},
+          {"forwarded_flags", native_probe.version_supported ? Json(native_probe.forwarded_flags) : Json(nullptr)},
+          {"flag_forwarded", native_probe.flag_forwarded},
+          {"api_result", native_probe.observed ? Json(native_probe.result) : Json(nullptr)}}},
+      {"marker", {{"request_generation", marker.request_generation}, {"enabled", marker.enabled},
+          {"bound", marker.bound}, {"stopped", marker.stopped}, {"reason", marker.reason},
+          {"frame_limit", marker.MAX_FRAMES}, {"recorded", marker.recorded},
+          {"refreshes", marker.refreshes}, {"reuses", marker.reuses},
+          {"first_sequence", marker.first_sequence}, {"last_sequence", marker.last_sequence},
+          {"last_recorded_ns", marker.last_recorded_ns}, {"source", marker.binding.source},
+          {"source_generation", marker.binding.source_generation}, {"provider", marker.binding.provider},
+          {"context", marker.binding.context}, {"environment_generation", marker.binding.environment_generation},
+          {"roi_position", "source_width/4,source_height/3"}, {"roi_size", {128, 64}},
+          {"encoding", "linear_FP16_after_resolve_alpha_preserved"}}}};
+#endif
   return state;
 }
 
@@ -518,6 +572,9 @@ inline Json Execute(const Json& request) {
           requested_flag->store(requested);
           if (fg_experiment && !unchanged) {
             edit_fg_observation::SetEnabled(requested);
+#if defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+            fg_output_marker_window.SetEnabled(requested);
+#endif
           }
         } else {
           const auto requested = static_cast<AdaptiveFeatureMode>(value->get<uint32_t>());

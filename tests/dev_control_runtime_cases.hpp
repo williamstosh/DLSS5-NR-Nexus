@@ -657,9 +657,15 @@
     const auto reply = control::Execute({{"id", "fg-observation-receipt-query"}, {"op", "status"},
         {"query_id", request["id"]}});
     const auto& summary = receipt["state"]["edit_reuse"]["fg_observation"];
+    constexpr size_t serialized_events =
+#if defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+        16;
+#else
+        64;
+#endif
     check(summary["event_count"] == 64 && summary["events"].empty() && summary["events_in_status_only"] == true
-            && reply["state"]["edit_reuse"]["fg_observation"]["events"].size() == 64,
-        "mutation receipts keep the trace summary while ordinary status retains every observation");
+            && reply["state"]["edit_reuse"]["fg_observation"]["events"].size() == serialized_events,
+        "mutation receipts keep the trace summary while status follows the build's documented event limit");
     check(reply["receipt"] == receipt && control::Execute(request) == receipt
             && reply.dump().size() < renodx::addons::dlss5::dev_control_pipe::internal::MAX_FRAME_BYTES,
         "a full observation plus its idempotent cached receipt fits the existing pipe frame limit");
@@ -757,6 +763,51 @@
     check(runtime::RestoreCallerIdentity() && *synthetic_slot == original,
         "restoring an already restored caller identity is an idempotent success");
   }
+#if defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+#include "nr_fg_output_probe_cases.hpp"
+  {
+    runtime::FgOutputMarkerWindow marker;
+    const runtime::FgOutputMarkerWindow::Binding source{
+        .source = 11, .source_generation = 2, .provider = 2, .context = 33, .environment_generation = 4};
+    check(!marker.Admit(source, true), "output marker is disabled in an unarmed validation build");
+    marker.SetEnabled(true);
+    check(!marker.Admit(source, false) && !marker.bound && !marker.stopped,
+        "unobserved SDK display configuration does not bind or record a source");
+    for (uint32_t frame = 0; frame < marker.MAX_FRAMES; ++frame) {
+      check(marker.Admit(source, true), "bounded marker admits the same proven source and environment");
+      marker.Recorded((frame & 1) != 0, frame + 100, frame + 1);
+    }
+    check(marker.stopped && marker.recorded == 128 && marker.refreshes == 64 && marker.reuses == 64
+            && marker.first_sequence == 100 && marker.last_sequence == 227 && !marker.Admit(source, true),
+        "output marker stops at 128 source writes with distinct refresh and reuse counters");
+    marker.SetEnabled(true);
+    check(!marker.Admit(source, true), "an unchanged experiment request cannot restart an exhausted window");
+    marker.SetEnabled(false);
+    marker.SetEnabled(true);
+    check(marker.recorded == 0 && marker.Admit(source, true), "explicit OFF to ON rearms a fresh marker window");
+    auto successor = source;
+    ++successor.source_generation;
+    check(!marker.Admit(successor, true) && marker.stopped && !marker.Admit(source, true),
+        "source generation changes permanently stop the current window");
+    marker.SetEnabled(false);
+    marker.SetEnabled(true);
+    check(marker.Admit(source, true), "new request admits its first source");
+    ++successor.context;
+    check(!marker.Admit(successor, true), "a different FG context cannot inherit the source marker window");
+    marker.SetEnabled(false);
+    marker.SetEnabled(true);
+    check(marker.Admit(source, true) && !marker.Admit(source, false) && marker.stopped,
+        "loss of the SDK display receipt stops a bound window without retrying");
+    marker.SetEnabled(false);
+    marker.SetEnabled(true);
+    check(marker.Admit(source, true), "failure test binds the actual source");
+    marker.StopSource(source.source + 1, source.source_generation, "unrelated_failure");
+    check(marker.Admit(source, true), "a failure in another source does not stop the bound source");
+    marker.StopSource(source.source, source.source_generation, "source_model_failed");
+    check(marker.stopped && !marker.Admit(source, true),
+        "a bound source failure cannot resume its marker after the model later recovers");
+  }
+#endif
   Json receipt{{"scope", "CPU production configuration and status adapters with synthetic ReShade cache; no GPU, NGX or game"},
       {"checks", checks}, {"configuration_writes", configuration_writes}, {"final", control::Snapshot()}};
   std::ofstream("dev-control-runtime.json") << receipt.dump(2);

@@ -40,6 +40,9 @@
 #if defined(NR_NEXUS_DEV_CONTROL)
 #include "nr_edit_fg_observation.hpp"
 #endif
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+#include "nr_fg_output_probe.hpp"
+#endif
 
 namespace renodx::addons::dlss5::fg::xefg {
 
@@ -737,6 +740,10 @@ inline void ReleaseFrames(Context* context) {
 #if defined(NR_NEXUS_DEV_CONTROL)
   edit_fg_observation::StopEnvironment(2, reinterpret_cast<uintptr_t>(context));
   context->fg_environment_generation = ++state.fg_environment_generation;
+#if defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+  fg_output_probe::UpdateXefg(reinterpret_cast<uintptr_t>(context), context->epoch,
+      context->fg_environment_generation);
+#endif
 #endif
 }
 
@@ -825,7 +832,11 @@ inline bool OrderCopies(const std::shared_ptr<Frame>& frame, ID3D12CommandQueue*
 }
 
 inline void Initialize(void* handle, ID3D12CommandQueue* queue, const abi::Init* parameters,
-                        HMODULE sdk_module = nullptr, const char* init_kind = "Init") {
+                        HMODULE sdk_module = nullptr, const char* init_kind = "Init"
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+                        , uint32_t probe_sdk_slot = UINT32_MAX
+#endif
+                        ) {
   if (handle == nullptr || queue == nullptr || parameters == nullptr) return;
   auto context = std::make_shared<Context>();
   context->queue = queue;
@@ -850,10 +861,26 @@ inline void Initialize(void* handle, ID3D12CommandQueue* queue, const abi::Init*
 #if defined(NR_NEXUS_DEV_CONTROL)
   context->fg_environment_generation = ++state.fg_environment_generation;
 #endif
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+  const fg_output_probe::XefgReceipt probe_context{
+      .sdk_slot = probe_sdk_slot, .module_base = reinterpret_cast<uintptr_t>(sdk_module),
+      .sdk_context = reinterpret_cast<uintptr_t>(handle), .context_identity = reinterpret_cast<uintptr_t>(context.get()),
+      .init_epoch = context->epoch, .init_generation = context->fg_environment_generation,
+      .current_epoch = context->epoch, .current_generation = context->fg_environment_generation};
+#endif
   if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
     state.retired_contexts.push_back(it->second);
   }
   state.contexts[handle] = std::move(context);
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+  lock.unlock();
+  if (probe_sdk_slot < 2) {
+    // The actual Init hook owns the opaque-handle lifecycle turn. This export
+    // is resolved from that exact SDK slot, never from a library basename.
+    fg_output_probe::ApplyXefg(probe_context, reinterpret_cast<fg_output_probe::EnableXefgDebug>(
+        GetProcAddress(sdk_module, "xefgSwapChainEnableDebugFeature")));
+  }
+#endif
 }
 
 using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
@@ -1884,20 +1911,45 @@ inline std::array<SdkSlot, 2> modules;
 template <size_t Index>
 struct SdkHooks {
   static int32_t Init(void* handle, ID3D12CommandQueue* queue, const abi::Init* parameters) {
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+    const std::lock_guard probe_lifecycle(fg_output_probe::xefg_lifecycle_mutex);
+    const fg_output_probe::XefgInitScope probe_init(static_cast<uint32_t>(Index), reinterpret_cast<uintptr_t>(handle));
+    if (probe_init.owner && !stopped.load()) {
+      fg_output_probe::BeginXefg(static_cast<uint32_t>(Index), reinterpret_cast<uintptr_t>(modules[Index].module),
+          reinterpret_cast<uintptr_t>(handle));
+    }
+#endif
     if (!stopped.load()) PinRuntimeCallback();
     InvalidateBridgeOff(handle, "context_initializing", true);
     const auto status = reinterpret_cast<int32_t (*)(void*, ID3D12CommandQueue*, const abi::Init*)>(modules[Index].real[0])(
         handle, queue, parameters);
     if (status == 0 && modules[Index].complete && !stopped.load()) {
       try {
-        Initialize(handle, queue, parameters, modules[Index].module, "Init");
+        Initialize(handle, queue, parameters, modules[Index].module, "Init"
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+                   , (probe_init.owner ? static_cast<uint32_t>(Index) : UINT32_MAX)
+#endif
+                   );
       } catch (...) { PublishResult(Result::FAILED); }
     }
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+    if (probe_init.owner) {
+      fg_output_probe::FinishXefgInit(static_cast<uint32_t>(Index), reinterpret_cast<uintptr_t>(handle), status);
+    }
+#endif
     return status;
   }
   static int32_t InitDesc(void* handle, HWND window, const DXGI_SWAP_CHAIN_DESC1* description,
                           const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen, ID3D12CommandQueue* queue,
                           IDXGIFactory2* factory, const abi::Init* parameters) {
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+    const std::lock_guard probe_lifecycle(fg_output_probe::xefg_lifecycle_mutex);
+    const fg_output_probe::XefgInitScope probe_init(static_cast<uint32_t>(Index), reinterpret_cast<uintptr_t>(handle));
+    if (probe_init.owner && !stopped.load()) {
+      fg_output_probe::BeginXefg(static_cast<uint32_t>(Index), reinterpret_cast<uintptr_t>(modules[Index].module),
+          reinterpret_cast<uintptr_t>(handle));
+    }
+#endif
     if (!stopped.load()) PinRuntimeCallback();
     InvalidateBridgeOff(handle, "context_initializing", true);
     const auto status = reinterpret_cast<int32_t (*)(void*, HWND, const DXGI_SWAP_CHAIN_DESC1*,
@@ -1905,9 +1957,18 @@ struct SdkHooks {
         handle, window, description, fullscreen, queue, factory, parameters);
     if (status == 0 && modules[Index].complete && !stopped.load()) {
       try {
-        Initialize(handle, queue, parameters, modules[Index].module, "InitDesc");
+        Initialize(handle, queue, parameters, modules[Index].module, "InitDesc"
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+                   , (probe_init.owner ? static_cast<uint32_t>(Index) : UINT32_MAX)
+#endif
+                   );
       } catch (...) { PublishResult(Result::FAILED); }
     }
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+    if (probe_init.owner) {
+      fg_output_probe::FinishXefgInit(static_cast<uint32_t>(Index), reinterpret_cast<uintptr_t>(handle), status);
+    }
+#endif
     return status;
   }
   static int32_t GetSwapchain(void* handle, REFIID iid, void** output) {
@@ -2353,9 +2414,15 @@ struct SdkHooks {
     return status;
   }
   static int32_t Destroy(void* handle) {
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+    const std::lock_guard probe_lifecycle(fg_output_probe::xefg_lifecycle_mutex);
+#endif
     if (!stopped.load()) PinRuntimeCallback();
     InvalidateBridgeOff(handle, "context_destroying", true);
     const auto status = reinterpret_cast<int32_t (*)(void*)>(modules[Index].real[8])(handle);
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+    fg_output_probe::DestroyXefg(static_cast<uint32_t>(Index), reinterpret_cast<uintptr_t>(handle), status);
+#endif
     if (status == 0) {
       std::unique_lock lock(state.mutex);
       if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
@@ -2652,6 +2719,9 @@ inline uint64_t SubmittedFrames() noexcept {
 }
 
 inline void Stop() noexcept {
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+  fg_output_probe::StopXefg();
+#endif
   internal::stopped.store(true, std::memory_order_release);
   std::map<uintptr_t, std::shared_ptr<internal::BridgeSourceSwapchain>> removed_sources;
   {

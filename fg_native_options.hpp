@@ -20,6 +20,11 @@
 #include "fg_frame.hpp"
 #include "lastgasp.hpp"
 #include "output_framerate.hpp"
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+#include <cstring>
+
+#include "nr_fg_output_probe.hpp"
+#endif
 
 namespace renodx::addons::dlss5::fg::native_options {
 
@@ -78,9 +83,57 @@ struct PresentDecisionScope {
   ~PresentDecisionScope() { --present_depth; }
 };
 
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+inline size_t ProbeOptionsBytes(uint64_t version) {
+  // sl_dlss_g.h labels the last member added by each version. Copy only
+  // through that member, never sizeof(the current type) from an older object.
+  using Options = sl::DLSSGOptions;
+  switch (version) {
+    case 1: return offsetof(Options, onErrorCallback) + sizeof(Options::onErrorCallback);
+    case 2: return offsetof(Options, bReserved15) + sizeof(Options::bReserved15);
+    case 3: return offsetof(Options, queueParallelismMode) + sizeof(Options::queueParallelismMode);
+    case 4: return offsetof(Options, enableUserInterfaceRecomposition) + sizeof(Options::enableUserInterfaceRecomposition);
+    case 5: return offsetof(Options, dynamicTargetFrameRate) + sizeof(Options::dynamicTargetFrameRate);
+    default: return 0;
+  }
+}
+
+inline sl::Result ProbeSetOptions(PFun_slDLSSGSetOptions* real, const sl::ViewportHandle& viewport,
+                                  const sl::DLSSGOptions& options, bool stopped) {
+  const auto bytes = ProbeOptionsBytes(options.structVersion);
+  fg_output_probe::NativeReceipt receipt{.stopped = stopped, .version_supported = bytes != 0,
+      .viewport = static_cast<uint32_t>(viewport), .struct_version = options.structVersion};
+  sl::DLSSGOptions copy;
+  const auto* forwarded = &options;
+  if (bytes != 0) {
+    receipt.mode = static_cast<uint32_t>(options.mode);
+    receipt.num_frames = options.numFramesToGenerate;
+    receipt.original_flags = static_cast<uint32_t>(options.flags);
+    receipt.forwarded_flags = receipt.original_flags;
+    if (!stopped && options.mode == sl::DLSSGMode::eOn) {
+      std::memcpy(&copy, &options, bytes);
+      copy.flags |= sl::DLSSGFlags::eShowOnlyInterpolatedFrame;
+      forwarded = &copy;
+      receipt.flag_forwarded = true;
+      receipt.forwarded_flags = static_cast<uint32_t>(copy.flags);
+    }
+  }
+  const auto result = real(viewport, *forwarded);
+  receipt.result = static_cast<int32_t>(result);
+  receipt.reason = (stopped ? "stopped" : bytes == 0 ? "struct_version_not_supported"
+      : !receipt.flag_forwarded ? "mode_not_on" : result != sl::Result::eOk ? "sdk_failed" : "show_only_forwarded");
+  fg_output_probe::RecordNative(receipt, result == sl::Result::eOk);
+  return result;
+}
+#endif
+
 static sl::Result HookedSetOptions(const sl::ViewportHandle& viewport, const sl::DLSSGOptions& options) {
   if (!stopped.load(std::memory_order_acquire)) PinRuntimeCallback();
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+  const auto result = ProbeSetOptions(state.real, viewport, options, stopped.load(std::memory_order_acquire));
+#else
   const auto result = state.real(viewport, options);
+#endif
   // Enabled modes clear an explicit Off request; actual NGX evaluation
   // remains the evidence required to acquire native processing ownership.
   if (result == sl::Result::eOk && !stopped.load(std::memory_order_acquire)) {
@@ -139,6 +192,9 @@ inline bool ObservesPresentDecisions() noexcept {
 // Terminal logical disable; it does not drain an already executing callback.
 // Both images remain pinned and the installed hook continues to pass through.
 inline void Stop() noexcept {
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+  fg_output_probe::StopNative();
+#endif
   output_framerate::ReleaseNative();
   internal::stopped.store(true, std::memory_order_release);
   internal::options_changed.store(nullptr, std::memory_order_release);
