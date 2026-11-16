@@ -127,7 +127,15 @@ inline Json Snapshot() {
         {"device12_interface_identity", observed.device12_interface_identity}};
   };
   Json edit_off_sources = Json::array();
+  Json edit_device_observation = nullptr;
   if (edit_reuse_adaptive_experiment.load()) {
+    const auto observed = fg::xefg::QueryBridgeOff({});
+    edit_device_observation = {{"query_reason", observed.reason}, {"sdk_context", observed.context},
+        {"sdk_proxy", observed.proxy}, {"context_identity", observed.context_identity},
+        {"context_epoch", observed.epoch}, {"init_kind", observed.init_kind},
+        {"application_device11", observed.application_device11}, {"proxy_device11", observed.proxy_device11},
+        {"application_device_observation", device_observation(observed.application)},
+        {"proxy_device_observation", device_observation(observed.proxy_device)}};
     for (const auto& [handle, source] : create_contracts) {
       if (source.source_device12_identity == nullptr) continue;
       const auto off = EditReuseXefgOffLocked(handle);
@@ -195,6 +203,7 @@ inline Json Snapshot() {
       {"edit_reuse", {{"requested", edit_reuse_enabled.load()}, {"refreshes", edit_reuse_refreshes.load()},
           {"reuses", edit_reuse_reuses.load()}, {"fallbacks", edit_reuse_fallbacks.load()},
           {"xefg_off_sources", std::move(edit_off_sources)},
+          {"xefg_device_observation", std::move(edit_device_observation)},
           {"evidence", "process_counters_not_activation_or_gpu_completion"}}},
       {"experiments", {{"adaptive_feature_mode", identity["experiments"]["adaptive_feature_mode"]},
           {"bridge_adaptive_experiment", identity["experiments"]["bridge_adaptive_experiment"]},

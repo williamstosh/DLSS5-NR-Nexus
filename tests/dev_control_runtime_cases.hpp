@@ -91,6 +91,87 @@
   check(status["state"]["edit_reuse"]["xefg_off_sources"].is_array()
           && status["state"]["edit_reuse"]["xefg_off_sources"].empty(),
       "status reports an empty XeFG Off source list when this CPU fixture has no recorded D3D12 sources");
+  check(status["state"]["edit_reuse"]["xefg_device_observation"].is_null(),
+      "the disabled experiment leaves independent SDK device diagnostics null");
+  {
+    struct RestoreSdkContexts {
+      decltype(xefg::internal::state.contexts) contexts;
+      bool experiment = runtime::edit_reuse_adaptive_experiment.exchange(true);
+      bool stopped = xefg::internal::stopped.exchange(false);
+      bool sdk_enabled = xefg::internal::sdk_detours_enabled.exchange(true);
+      RestoreSdkContexts() {
+        std::unique_lock lock(xefg::internal::state.mutex);
+        contexts.swap(xefg::internal::state.contexts);
+      }
+      ~RestoreSdkContexts() {
+        {
+          std::unique_lock lock(xefg::internal::state.mutex);
+          contexts.swap(xefg::internal::state.contexts);
+        }
+        runtime::edit_reuse_adaptive_experiment = experiment;
+        xefg::internal::stopped = stopped;
+        xefg::internal::sdk_detours_enabled = sdk_enabled;
+      }
+    } restore;
+    constexpr uintptr_t SDK_HANDLE = 0xD3C100;
+    constexpr uintptr_t SDK_PROXY = 0xD3C200;
+    constexpr uintptr_t DEVICE_IDENTITY = 0xD3C300;
+    auto context = std::make_shared<xefg::internal::Context>();
+    context->proxy_identity = SDK_PROXY;
+    context->epoch = 9;
+    context->bridge_init_kind = "InitDesc";
+    context->bridge_context_ready = context->bridge_proxy_ready = true;
+    context->bridge_proxy_observation = {.object_present = true, .swapchain_result = S_OK,
+        .device11_result = S_OK, .device12_result = S_OK, .returned_device_identity = DEVICE_IDENTITY,
+        .device11_interface_result = E_NOINTERFACE, .device12_interface_result = S_OK,
+        .device12_interface_identity = DEVICE_IDENTITY};
+    {
+      std::unique_lock lock(xefg::internal::state.mutex);
+      xefg::internal::state.contexts.emplace(reinterpret_cast<void*>(SDK_HANDLE), context);
+    }
+    check(runtime::create_contracts.empty(), "SDK device diagnostics are tested without any recorded source contract");
+    const auto observed = control::Snapshot();
+    const auto& device = observed["edit_reuse"]["xefg_device_observation"];
+    check(observed["edit_reuse"]["xefg_off_sources"].empty() && device.is_object() && device.size() == 10
+            && device["sdk_context"] == SDK_HANDLE && device["sdk_proxy"] == SDK_PROXY
+            && device["context_identity"] == reinterpret_cast<uintptr_t>(context.get())
+            && device["context_epoch"] == 9 && device["init_kind"] == "InitDesc"
+            && device["query_reason"] == "disable_unobserved",
+        "a unique SDK context exposes its device metadata independently of missing SR source records");
+    const auto& proxy_device = device["proxy_device_observation"];
+    check(proxy_device["object_present"] && proxy_device["device11_result"] == S_OK
+            && proxy_device["device12_result"] == S_OK && proxy_device["returned_device_identity"] == DEVICE_IDENTITY
+            && proxy_device["device11_interface_result"] == E_NOINTERFACE
+            && proxy_device["device12_interface_result"] == S_OK && proxy_device["device11_interface_identity"] == 0
+            && proxy_device["device12_interface_identity"] == DEVICE_IDENTITY,
+        "source-independent status preserves captured getter results and all five returned-device QI diagnostics");
+    check(!device.contains("available") && !device.contains("uses_source_link") && !device.contains("source")
+            && !device.contains("source_swapchain") && !xefg::QueryBridgeOff({}).available
+            && context->bridge_source_swapchain == 0 && context->bridge_link_generation == 0
+            && runtime::create_contracts.empty(),
+        "context metadata exports neither source authority nor an Off receipt and cannot create a source link");
+    runtime::edit_reuse_adaptive_experiment = false;
+    check(control::Snapshot()["edit_reuse"]["xefg_device_observation"].is_null(),
+        "disabling the experiment hides device diagnostics even while a captured SDK context remains");
+    runtime::edit_reuse_adaptive_experiment = true;
+    auto second_context = std::make_shared<xefg::internal::Context>();
+    {
+      std::unique_lock lock(xefg::internal::state.mutex);
+      xefg::internal::state.contexts.emplace(reinterpret_cast<void*>(SDK_HANDLE + 1), second_context);
+    }
+    const auto ambiguous = control::Snapshot()["edit_reuse"]["xefg_device_observation"];
+    check(ambiguous["query_reason"] == "multiple_contexts" && ambiguous["sdk_context"] == 0
+            && ambiguous["sdk_proxy"] == 0 && ambiguous["context_identity"] == 0,
+        "multiple SDK contexts report ambiguity without guessing a device observation owner");
+    {
+      std::unique_lock lock(xefg::internal::state.mutex);
+      xefg::internal::state.contexts.clear();
+    }
+    const auto missing = control::Snapshot()["edit_reuse"]["xefg_device_observation"];
+    check(missing["query_reason"] == "context_unobserved" && missing["sdk_context"] == 0
+            && missing["sdk_proxy"] == 0 && missing["context_identity"] == 0,
+        "missing SDK contexts retain an explicit reason and zero identities");
+  }
   namespace rate = renodx::addons::dlss5::output_framerate;
   namespace adaptive = renodx::addons::dlss5::adaptive_resolution;
   {
