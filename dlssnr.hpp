@@ -2373,6 +2373,9 @@ inline void RequestHistoryReset(
     history_reset_request_diagnostic.source = source;
   }
 }
+#if defined(NR_NEXUS_DEV_CONTROL)
+inline std::atomic_uint64_t edit_reuse_native_fg_generation{1};
+#endif
 inline void OnNativeFgOptions(bool mode_enabled) noexcept {
   if (!mode_enabled) mixed_present_fg_seen.store(false);
   native_fg_declaration.store(mode_enabled ? NativeFgDeclaration::kOn : NativeFgDeclaration::kOff,
@@ -2384,6 +2387,9 @@ inline void OnNativeFgOptions(bool mode_enabled) noexcept {
           std::chrono::steady_clock::now().time_since_epoch()).count(),
       std::memory_order_release);
   native_fg_options_generation.fetch_add(1, std::memory_order_release);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  edit_reuse_native_fg_generation.fetch_add(1, std::memory_order_release);
+#endif
   if (mode_enabled) {
     if (was_off) RequestHistoryReset(HistoryResetSource::kRecreate);
     return;
@@ -2664,6 +2670,9 @@ inline std::atomic_bool look_unavailable = false;
 inline std::atomic_bool edit_reuse_enabled{false};
 // Internal two-ready-tier contract probe; no settings or runtime-control entry.
 inline std::atomic_bool edit_reuse_adaptive_experiment{false};
+#if defined(NR_NEXUS_DEV_CONTROL)
+inline std::atomic_bool edit_reuse_fg_experiment{false};
+#endif
 inline std::atomic_bool xefg_gpu_capture_enabled{false};
 inline std::atomic_uint64_t edit_reuse_refreshes{0};
 inline std::atomic_uint64_t edit_reuse_reuses{0};
@@ -11423,6 +11432,43 @@ inline fg::xefg::BridgeOffEvidence EditReuseXefgOffLocked(const NVSDK_NGX_Handle
   }
   return evidence;
 }
+
+struct EditReuseFgEnvironment {
+  bool available = false;
+  const char* reason = "unobserved";
+  uint64_t provider = 0;
+  uintptr_t context = 0;
+  uint64_t generation = 0;
+};
+
+// Caller holds runtime_mutex. This metadata is never an SR-to-FG input mapping or an Off receipt.
+inline EditReuseFgEnvironment ReadEditReuseFgEnvironmentLocked() {
+  EditReuseFgEnvironment environment;
+  uintptr_t native_context = 0;
+  uint32_t native_contexts = 0;
+  for (const auto& [handle, feature] : created_feature_ids) {
+    if (feature != NVSDK_NGX_Feature_FrameGeneration) continue;
+    native_context = reinterpret_cast<uintptr_t>(handle);
+    ++native_contexts;
+  }
+  const bool native_on = native_fg_declaration.load() == NativeFgDeclaration::kOn && !native_fg_public_off.load();
+  const auto xefg = fg::xefg::QueryEnabledContext();
+  // OptiScaler can expose DLSSG input while XeFG owns output; that is one XeFG environment.
+  if (xefg.available) {
+    environment = {.available = true, .reason = "xefg_on_environment", .provider = 2,
+        .context = xefg.context_identity, .generation = xefg.generation};
+  } else if (fg::xefg::Enabled()) {
+    environment.reason = xefg.reason;
+  } else if (!native_on) {
+    environment.reason = "fg_on_unobserved";
+  } else if (native_contexts != 1 || native_context == 0) {
+    environment.reason = (native_contexts == 0 ? "native_fg_handle_unobserved" : "multiple_native_fg_handles");
+  } else {
+    environment = {.available = true, .reason = "native_fg_on_environment", .provider = 1,
+        .context = native_context, .generation = edit_reuse_native_fg_generation.load(std::memory_order_acquire)};
+  }
+  return environment;
+}
 #endif
 
 inline adaptive_resolution::Frame FreezeAdaptiveFrame(
@@ -13689,7 +13735,30 @@ inline bool RecordInline(
 #if defined(NR_NEXUS_DEV_CONTROL)
   else if (edit_output_contract != nullptr) edit_off = EditReuseXefgOffLocked(handle, feature.source_generation);
 #endif
-  const bool edit_reuse_inline_route = present == nullptr
+#if defined(NR_NEXUS_DEV_CONTROL)
+  EditReuseFgEnvironment edit_fg_environment;
+  bool edit_reuse_fg_inline_route = false;
+  if (edit_reuse_requested && edit_reuse_fg_experiment.load() && present == nullptr && bridge_source == nullptr
+      && hook_point.load() == kHookUpscaled && successful_sr_device == device
+      && !nr_adaptive_enabled.load() && !adaptive.enabled && nr_input_width == width && nr_input_height == height
+      && !native_fg_owns.load() && !fg::xefg::OwnsStream() && !auto_fg_fallback_active.load()) {
+    const auto created = create_contracts.find(handle);
+    const auto source = UniqueD3D12SourceLocked(created != create_contracts.end()
+        ? reinterpret_cast<uintptr_t>(created->second.source_device12_identity.Get()) : 0);
+    if (created != create_contracts.end() && created->second.source_type_confirmed
+        && feature.source_type_confirmed && feature.source_generation != 0
+        && created->second.source_generation == feature.source_generation
+        && source.handle == reinterpret_cast<uintptr_t>(handle) && source.generation == feature.source_generation) {
+      edit_fg_environment = ReadEditReuseFgEnvironmentLocked();
+      edit_reuse_fg_inline_route = edit_fg_environment.available;
+    }
+  }
+#endif
+  const bool edit_reuse_inline_route =
+#if defined(NR_NEXUS_DEV_CONTROL)
+      edit_reuse_fg_inline_route ||
+#endif
+      present == nullptr
       && hook_point.load() == kHookUpscaled && successful_sr_device == device
       && (edit_reuse_current_native_off || (edit_off.available && nr_adaptive_enabled.load()
           && native_fg_declaration.load() != NativeFgDeclaration::kOn))
@@ -13780,7 +13849,12 @@ inline bool RecordInline(
   const auto retire_edit_reuse = [&] {
     auto& slot = feature.slots[0];
     if (slot.edit_reuse == nullptr) return;
-    if (slot.edit_reuse->reused || slot.edit_reuse->source_sequence + 1 != edit_reuse_sequence) {
+    if (slot.edit_reuse->reused || slot.edit_reuse->source_sequence + 1 != edit_reuse_sequence
+#if defined(NR_NEXUS_DEV_CONTROL)
+        // Inline On keys use provider 1/2; Off uses zero or a captured context pointer.
+        || (present == nullptr && (slot.edit_reuse->contract[32] == 1 || slot.edit_reuse->contract[32] == 2))
+#endif
+    ) {
       slot.pending_reset = true;
       slot.pending_reset_reasons |= kResetRecovery;
     }
@@ -14628,11 +14702,30 @@ inline bool RecordInline(
         std::bit_cast<uint32_t>(proxy_anchor_nits.load()),
         // Inline SDK-Off reuse is also bound to the observed source/proxy
         // lifetime; repeated Disable calls do not change these stable keys.
-        (present != nullptr ? present->restore_config_epoch : edit_off.context_identity),
-        (present != nullptr ? std::bit_cast<uint32_t>(frame_divisor) : edit_off.epoch),
-        (present != nullptr ? static_cast<uint32_t>(frame.ui_correction) : edit_off.source_link_generation),
+        (present != nullptr ? present->restore_config_epoch :
+#if defined(NR_NEXUS_DEV_CONTROL)
+            edit_reuse_fg_inline_route ? edit_fg_environment.provider :
+#endif
+            edit_off.context_identity),
+        (present != nullptr ? std::bit_cast<uint32_t>(frame_divisor) :
+#if defined(NR_NEXUS_DEV_CONTROL)
+            edit_reuse_fg_inline_route ? edit_fg_environment.context :
+#endif
+            edit_off.epoch),
+        (present != nullptr ? static_cast<uint32_t>(frame.ui_correction) :
+#if defined(NR_NEXUS_DEV_CONTROL)
+            edit_reuse_fg_inline_route ? edit_fg_environment.generation :
+#endif
+            edit_off.source_link_generation),
         static_cast<uint32_t>(output_desc.Format), hdr_mode, v6_encoding, nr_input_width, nr_input_height};
     if (auto& cache = feature.slots[0].edit_reuse; cache != nullptr) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+      if (present == nullptr && (edit_reuse_fg_inline_route || cache->contract[32] == 1 || cache->contract[32] == 2)
+          && cache->contract != edit_contract) {
+        feature.slots[0].pending_reset = true;
+        feature.slots[0].pending_reset_reasons |= kResetRecovery;
+      }
+#endif
       if (cache->width != nr_input_width || cache->height != nr_input_height
           || cache->output_width != width || cache->output_height != height || cache->motion_width != frame.motion_width
           || cache->motion_height != frame.motion_height) {
@@ -18146,6 +18239,9 @@ inline void RegisterCreatedFeatureLocked(const NVSDK_NGX_Handle* handle,
   }
   created_feature_ids[handle] = feature;
   if (feature == NVSDK_NGX_Feature_FrameGeneration) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+    edit_reuse_native_fg_generation.fetch_add(1, std::memory_order_release);
+#endif
     const uint32_t ui_recomposition = GetUInt(parameters, NVSDK_NGX_DLSSG_Parameter_UserInterfaceRecompositionEnabled);
     native_fg_ui_recomposition[handle] = ui_recomposition != 0;
     std::ostringstream text;
@@ -18194,6 +18290,12 @@ inline void RegisterCreatedFeatureLocked(const NVSDK_NGX_Handle* handle,
 // a 2-minute session) accumulated orphans up to the cap.  Returns whether
 // that was the last DLSS feature.  Caller holds runtime_mutex.
 inline bool ForgetSourceHandleLocked(const NVSDK_NGX_Handle* handle) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (const auto created = created_feature_ids.find(handle);
+      created != created_feature_ids.end() && created->second == NVSDK_NGX_Feature_FrameGeneration) {
+    edit_reuse_native_fg_generation.fetch_add(1, std::memory_order_release);
+  }
+#endif
   OnNativeFgFeatureReleased(handle);
   if (last_source_plan.source_handle == handle) {
     last_source_plan.source_released = true;

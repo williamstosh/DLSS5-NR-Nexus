@@ -320,6 +320,14 @@ class Client:
             request['tail_frames'] = tail_frames
         return self._mutation(request, deadline)
 
+    def edit_reuse_fg_experiment(self, enabled, *, deadline=None):
+        """Request fixed-size Upscaled x2 with FG On; actual execution is observed separately."""
+        if type(enabled) is not bool:
+            raise ValueError('edit_reuse_fg_experiment requires Boolean enabled')
+        deadline = deadline if deadline is not None else time.monotonic() + self.timeout
+        request = dict(id=str(uuid.uuid4()), op='edit_reuse_fg_experiment', enabled=enabled)
+        return self._mutation(request, deadline)
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

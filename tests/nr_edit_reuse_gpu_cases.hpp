@@ -741,6 +741,7 @@ int Run() {
           "feature Off preserves the normal per-frame model path");
     native::edit_reuse_enabled = true;
     for (uint32_t prefix = 0; prefix < 4; ++prefix) frame(1);
+
     {
       std::weak_ptr<reuse::State> old_anchor = native::features.at(owner).slots[0].edit_reuse;
       Check(!old_anchor.expired(), "adaptive transition begins with a real completed edit anchor");
@@ -1111,6 +1112,213 @@ int Run() {
     Check(!native::features.contains(owner) && submission::ResourceReleasable(anchor_state.get()),
           "source release retires submitted and discarded cache references");
     anchor_state.reset();
+#if defined(NR_NEXUS_DEV_CONTROL)
+    // The original single-output adaptive/discard/failure source is already released above.
+    // Give the rotating-output On scenario a new source lifetime and its own ordinary warmup.
+    native::nr_adaptive_enabled = false;
+    native::nr_follow_input_res = false;
+    native::nr_resolution_scale = 1.f;
+    native::edit_reuse_adaptive_experiment = false;
+    native::edit_reuse_fg_experiment = false;
+    native::edit_reuse_enabled = true;
+    native::native_fg_owns = false;
+    native::native_fg_public_off = true;
+    native::native_fg_declaration = native::NativeFgDeclaration::kOff;
+    native::mixed_present_fg_seen = false;
+    native::direct_api.evaluate = NeutralModel;
+    fail_call = 0;
+    native::RegisterCreatedFeatureLocked(owner, native::kFeatureDlss, &parameters);
+    for (uint32_t prefix = 0; prefix < native::kContractDebounceFrames + 8; ++prefix) frame(1);
+    {
+      // FG environment is MOCK metadata. SR, cache shaders, ordering and copy-back use WARP;
+      // this does not simulate a native/XeFG consumer or prove that FG reads the edited SR output.
+      namespace xefg = addon::fg::xefg;
+      namespace xi = xefg::internal;
+      const auto* fg_handle = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xED180});
+      const auto* second_fg = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xED181});
+      const auto* second_source = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xED182});
+      native::RegisterCreatedFeatureLocked(fg_handle, NVSDK_NGX_Feature_FrameGeneration, &parameters);
+      native::OnNativeFgOptions(true);
+      native::mixed_present_fg_seen = true;
+      const auto native_environment = native::ReadEditReuseFgEnvironmentLocked();
+      Check(native_environment.available && native_environment.provider == 1
+                && native_environment.context == reinterpret_cast<uintptr_t>(fg_handle),
+          "successful On declaration and a unique known FG handle expose environment metadata only");
+      Check(frame(1) == 1 && native::features.at(owner).slots[0].edit_reuse == nullptr,
+          "the default Off admission still declines x2 while the MOCK FG environment is On");
+      native::edit_reuse_fg_experiment = true;
+      const auto first_on_calls = frame(0);
+      const auto first_on_cache = native::features.at(owner).slots[0].edit_reuse;
+      std::cout << "OBS DEV On first anchor: model_calls=" << first_on_calls << " reset=" << model_resets.back()
+                << " cache=" << (first_on_cache != nullptr) << '\n';
+      Check(first_on_calls == 1 && first_on_cache != nullptr && first_on_cache->valid
+                && first_on_cache->contract[32] == 1
+                && first_on_cache->source_sequence == native::features.at(owner).sr_sequence,
+          "DEV On establishes a fresh fixed-size SR anchor while preserving already-continuous NR History");
+      const auto on_reuses = native::edit_reuse_reuses.load();
+      Check(frame(0) == 0 && native::edit_reuse_reuses.load() == on_reuses + 1,
+          "DEV On reuses exactly once despite ordinary observed FG input");
+      const auto on_final = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      submit_commands("DEV On neutral output readback");
+      const auto on_bytes = on_final.Pixels();
+      Check(std::memcmp(on_bytes.data(), source_values.data(), on_bytes.size()) == 0,
+          "DEV On neutral edit preserves the current SR RGB and alpha exactly");
+      Check(frame(0) == 1, "DEV On refreshes on the next base frame after that reuse");
+      {
+        auto other_output = uav_texture(16, 16, DXGI_FORMAT_R16G16B16A16_FLOAT);
+        gpu.Transition(other_output.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        submit_commands("DEV On alternate output upload");
+        native::direct_api.evaluate = ConstantModel;
+        Check(frame(1) == 1, "establish a nonzero edit before rotating the SR Output");
+        const auto edited_first = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        submit_commands("DEV On first edited output readback");
+        const auto edited_first_bytes = edited_first.Pixels();
+        uint16_t first_red = 0;
+        std::memcpy(&first_red, edited_first_bytes.data(), sizeof(first_red));
+        Check(std::fabs(DirectX::PackedVector::XMConvertHalfToFloat(first_red)
+                  - DirectX::PackedVector::XMConvertHalfToFloat(source_values[0])) > .02f,
+            "the existing constant model produces a distinguishable nonzero edit");
+        const auto anchor = native::features.at(owner).slots[0].edit_reuse;
+        const auto anchor_generation = anchor->anchor_generation;
+        const auto reuses_before_output = native::edit_reuse_reuses.load();
+        parameters.Set(NVSDK_NGX_Parameter_Output, other_output.Get());
+        Check(frame(0) == 0 && native::features.at(owner).slots[0].edit_reuse == anchor
+                  && anchor->anchor_generation == anchor_generation
+                  && native::edit_reuse_reuses.load() == reuses_before_output + 1,
+            "the same logical SR source can reuse its anchor into a rotating Output without invoking NR again");
+        const auto edited_second = stage_execution_cases::Capture(gpu, other_output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        const auto untouched_first = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        submit_commands("DEV On rotating target readbacks");
+        const auto edited_second_bytes = edited_second.Pixels();
+        const auto untouched_first_bytes = untouched_first.Pixels();
+        uint16_t second_red = 0;
+        std::memcpy(&second_red, edited_second_bytes.data(), sizeof(second_red));
+        Check(std::fabs(DirectX::PackedVector::XMConvertHalfToFloat(second_red)
+                  - DirectX::PackedVector::XMConvertHalfToFloat(source_values[0])) > .02f
+                  && std::memcmp(untouched_first_bytes.data(), edited_first_bytes.data(), untouched_first_bytes.size()) == 0,
+            "nonzero reuse reaches the current second Output while preserving the previous Output");
+        parameters.Set(NVSDK_NGX_Parameter_Output, output.Get());
+        Check(frame(0) == 1 && anchor->anchor_generation == anchor_generation + 1,
+            "return to the first Output follows the same logical source's normal refresh cadence");
+        std::cout << "OBS DEV On rotating Output: nonzero_reuse=1 return_refresh_reset=" << model_resets.back() << '\n';
+        native::direct_api.evaluate = NeutralModel;
+        Check(frame(1) == 1, "restore the neutral model with an explicit source Reset");
+      }
+
+      native::RegisterCreatedFeatureLocked(second_fg, NVSDK_NGX_Feature_FrameGeneration, &parameters);
+      Check(!native::ReadEditReuseFgEnvironmentLocked().available && frame(0) == 1
+                && native::features.at(owner).slots[0].edit_reuse == nullptr,
+          "multiple native FG objects cannot lend one environment to an old edit anchor");
+      native::ForgetSourceHandleLocked(second_fg);
+      Check(frame(1) == 1 && frame(0) == 0, "a unique native environment restarts from a fresh anchor");
+      const auto before_recreate = native::ReadEditReuseFgEnvironmentLocked().generation;
+      native::RegisterCreatedFeatureLocked(fg_handle, NVSDK_NGX_Feature_FrameGeneration, &parameters);
+      const auto reuses_before_recreate = native::edit_reuse_reuses.load();
+      Check(native::ReadEditReuseFgEnvironmentLocked().generation != before_recreate
+                && frame(0) == 1 && model_resets.back() == 1
+                && native::edit_reuse_reuses.load() == reuses_before_recreate,
+          "recreating the same FG handle address changes environment generation and resets x2 history");
+
+      native::RegisterCreatedFeatureLocked(second_source, native::kFeatureDlss, &parameters);
+      native::create_contracts.at(second_source).source_device12_identity =
+          native::create_contracts.at(owner).source_device12_identity;
+      Check(frame(0) == 1 && native::features.at(owner).slots[0].edit_reuse == nullptr,
+          "DEV On rejects two observed SR sources on the same native device");
+      native::ForgetSourceHandleLocked(second_source);
+      Check(frame(1) == 1, "the remaining source establishes its own fresh anchor");
+      native::create_contracts.at(owner).source_type_confirmed = false;
+      Check(frame(0) == 1 && native::features.at(owner).slots[0].edit_reuse == nullptr,
+          "environment On cannot authorize an unconfirmed SR source");
+      native::create_contracts.at(owner).source_type_confirmed = true;
+      Check(frame(1) == 1, "confirmed source recovers with a refresh");
+      native::native_fg_owns = true;
+      const auto owned_reuses = native::edit_reuse_reuses.load();
+      frame(0);
+      Check(native::edit_reuse_reuses.load() == owned_reuses && native::features.at(owner).slots[0].edit_reuse == nullptr,
+          "DEV On does not cross a native Present-service ownership boundary");
+      native::native_fg_owns = false;
+      Check(frame(1) == 1, "Upscaled ownership recovers with a refresh");
+      const auto before_experiment_exit = native::features.at(owner).slots[0].edit_reuse;
+      native::edit_reuse_fg_experiment = false;
+      Check(frame(0) == 1 && model_resets.back() == 1 && native::features.at(owner).slots[0].edit_reuse == nullptr,
+          "leaving the DEV On experiment retires its cache without changing the public FG declaration");
+      native::edit_reuse_fg_experiment = true;
+      Check(frame(0) == 1 && native::features.at(owner).slots[0].edit_reuse != before_experiment_exit
+                && native::features.at(owner).slots[0].edit_reuse->valid,
+          "re-entering DEV On refreshes a new anchor after the intervening normal NR frame");
+      const auto reset_before_off = native::history_reset_epoch.load();
+      native::OnNativeFgOptions(false);
+      Check(native::history_reset_epoch.load() == reset_before_off && frame(0) == 1 && model_resets.back() == 1
+                && native::features.at(owner).slots[0].edit_reuse->contract[32] == 0,
+          "On-to-Off changes cache identity and resets even when Upscaled owns no FG service or global reset");
+      native::OnNativeFgOptions(true);
+      native::mixed_present_fg_seen = true;
+      Check(frame(1) == 1, "native On recovers its own anchor");
+
+      const bool saved_stopped = xi::stopped.exchange(false);
+      const bool saved_detours = xi::sdk_detours_enabled.exchange(true);
+      const bool saved_enabled = xi::owns_stream.load();
+      Check(xi::state.contexts.empty(), "isolated XeFG On metadata fixture");
+      const auto make_context = [&] {
+        auto context = std::make_shared<xi::Context>();
+        context->queue = gpu.queue;
+        context->device = gpu.device;
+        context->proxy_identity = 0xED190;
+        context->bridge_context_ready = context->bridge_proxy_ready = context->enabled = true;
+        context->fg_environment_generation = ++xi::state.fg_environment_generation;
+        return context;
+      };
+      auto context = make_context();
+      const auto sdk_handle = reinterpret_cast<void*>(uintptr_t{0xED191});
+      xi::state.contexts.emplace(sdk_handle, context);
+      xi::RefreshOwnership();
+      const auto xe_environment = native::ReadEditReuseFgEnvironmentLocked();
+      Check(xe_environment.available && xe_environment.provider == 2
+                && native::native_fg_declaration.load() == native::NativeFgDeclaration::kOn
+                && native::created_feature_ids.at(fg_handle) == NVSDK_NGX_Feature_FrameGeneration
+                && !xefg::OwnsStream() && !xefg::QueryBridgeOff({}).available,
+          "unique enabled XeFG takes environment precedence over OptiScaler-like DLSSG input without granting Off or ownership");
+      Check(frame(0) == 1 && model_resets.back() == 1
+                && native::features.at(owner).slots[0].edit_reuse->contract[32] == 2 && frame(0) == 0,
+          "switching native-input to XeFG environment refreshes, then reuses only its own anchor");
+      const auto before_resize = native::ReadEditReuseFgEnvironmentLocked().generation;
+      {
+        std::unique_lock lock(xi::state.mutex);
+        xi::ReleaseFrames(context.get());
+      }
+      Check(native::ReadEditReuseFgEnvironmentLocked().generation != before_resize
+                && frame(0) == 1 && model_resets.back() == 1,
+          "XeFG frame-lifetime invalidation changes environment generation and forces a fresh x2 history");
+      xi::state.contexts.emplace(reinterpret_cast<void*>(uintptr_t{0xED192}), make_context());
+      xi::RefreshOwnership();
+      Check(!native::ReadEditReuseFgEnvironmentLocked().available && frame(0) == 1
+                && native::features.at(owner).slots[0].edit_reuse == nullptr,
+          "multiple XeFG contexts decline instead of borrowing the native input environment");
+      xi::state.contexts.erase(reinterpret_cast<void*>(uintptr_t{0xED192}));
+      Check(frame(1) == 1, "unique XeFG context restarts with a refresh");
+      const auto before_replace = native::ReadEditReuseFgEnvironmentLocked();
+      context = make_context();
+      xi::state.contexts[sdk_handle] = context;
+      Check(native::ReadEditReuseFgEnvironmentLocked().generation != before_replace.generation
+                && frame(0) == 1 && model_resets.back() == 1,
+          "replacement at the same opaque SDK handle cannot inherit the prior environment or anchor");
+      xi::state.contexts.clear();
+      xi::owns_stream = saved_enabled;
+      xi::sdk_detours_enabled = saved_detours;
+      xi::stopped = saved_stopped;
+      native::edit_reuse_fg_experiment = false;
+      native::OnNativeFgOptions(false);
+      native::ForgetSourceHandleLocked(fg_handle);
+      for (uint32_t prefix = 0; prefix < 4; ++prefix) frame(1);
+      std::cout << "PASS DEV On environment + WARP SR x2: unique source, native/XeFG metadata, precedence, ownership rejection, lifetime/switch Reset and exact neutral output; actual FG handoff=NotRun\n";
+    }
+    native::ForgetSourceHandleLocked(owner);
+    native::DrainRetiredResources(true);
+    Check(!native::features.contains(owner) && !native::created_feature_ids.contains(owner)
+              && std::none_of(native::worksets.begin(), native::worksets.end(),
+                  [&](const auto& entry) { return entry.first.handle == owner; }),
+        "the separate On source lifetime releases its rotating-output worksets through normal retirement");
+#endif
     native::ReleaseFeatureStates();
     native::RetireAllWorksets();
     native::FlushRetiredResources();

@@ -81,7 +81,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(len({request['id'] for request in self.transport.requests}), 4)
 
     def test_boolean_experiments_have_independent_requests_and_shared_deadlines(self):
-        for operation in ('bridge_adaptive_experiment', 'edit_reuse_adaptive_experiment'):
+        for operation in ('bridge_adaptive_experiment', 'edit_reuse_adaptive_experiment', 'edit_reuse_fg_experiment'):
             with self.subTest(operation=operation):
                 client = self.client()
                 deadline = time.monotonic() + 1
@@ -96,7 +96,7 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(len({request['id'] for request in self.transport.requests}), 3)
 
     def test_boolean_experiments_reject_non_boolean_before_transport(self):
-        for operation in ('bridge_adaptive_experiment', 'edit_reuse_adaptive_experiment'):
+        for operation in ('bridge_adaptive_experiment', 'edit_reuse_adaptive_experiment', 'edit_reuse_fg_experiment'):
             client = self.client()
             for enabled in (0, 1, -1, 1.0, 'true', None):
                 with self.subTest(operation=operation, enabled=enabled), self.assertRaises(ValueError):
@@ -104,7 +104,7 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(self.transport.requests, [])
 
     def test_lost_experiment_receipt_queries_without_replaying_or_claiming_activation(self):
-        for operation in ('bridge_adaptive_experiment', 'edit_reuse_adaptive_experiment'):
+        for operation in ('bridge_adaptive_experiment', 'edit_reuse_adaptive_experiment', 'edit_reuse_fg_experiment'):
             with self.subTest(operation=operation):
                 original = {}
                 evidence_key = operation.removesuffix('_experiment') + '_evidence'
@@ -129,7 +129,7 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(self.transport.deadlines[0], self.transport.deadlines[1])
 
     def test_experiment_admission_rejection_is_returned_without_retry(self):
-        for operation in ('bridge_adaptive_experiment', 'edit_reuse_adaptive_experiment'):
+        for operation in ('bridge_adaptive_experiment', 'edit_reuse_adaptive_experiment', 'edit_reuse_fg_experiment'):
             for reason in ('configuration_busy', 'runtime_busy', 'nr_running', 'resources_not_released'):
                 with self.subTest(operation=operation, reason=reason):
                     client = self.client(lambda request: dict(response(request), ok=False, status='rejected', reason=reason))

@@ -37,6 +37,7 @@ inline Json Identity() {
       {"experiments", {{"adaptive_feature_mode", static_cast<uint32_t>(adaptive_feature_mode.load())},
           {"bridge_adaptive_experiment", bridge_adaptive_experiment.load()},
           {"edit_reuse_adaptive_experiment", edit_reuse_adaptive_experiment.load()},
+          {"edit_reuse_fg_experiment", edit_reuse_fg_experiment.load()},
           {"edit_reuse_adaptive_evidence", "requested_enabled_not_activation"}}}};
 }
 
@@ -117,6 +118,7 @@ inline Json Snapshot() {
     }
   }
   const auto output = output_framerate::Read(now);
+  const auto fg_environment = ReadEditReuseFgEnvironmentLocked();
   const auto device_observation = [](const fg::xefg::BridgeDeviceObservation& observed) {
     return Json{{"object_present", observed.object_present}, {"swapchain_unwrapped", observed.swapchain_unwrapped},
         {"swapchain_result", observed.swapchain_result}, {"device11_result", observed.device11_result},
@@ -189,8 +191,21 @@ inline Json Snapshot() {
           {"provider_matches", off.MatchesOutput(output)}});
     }
   }
+  Json edit_sources = Json::array();
   Json caches = Json::array();
   for (const auto& [handle, feature] : features) {
+    for (uint32_t pass = 0; pass < kMaxNrPasses; ++pass) {
+      const auto& edit = feature.slots[pass].edit_reuse;
+      if (edit == nullptr) continue;
+      edit_sources.push_back({{"source_handle", reinterpret_cast<uintptr_t>(handle)},
+          {"source_generation", feature.source_generation}, {"source_frame", feature.sr_sequence},
+          {"source_type_confirmed", feature.source_type_confirmed},
+          {"source_feature", static_cast<uint32_t>(feature.source_feature)}, {"pass", pass + 1},
+          {"working_size", {edit->width, edit->height}}, {"output_size", {edit->output_width, edit->output_height}},
+          {"anchor_generation", edit->anchor_generation}, {"source_sequence", edit->source_sequence},
+          {"reuse_count", edit->reuse_count}, {"valid", edit->valid}, {"reused", edit->reused},
+          {"evidence", "recorded_edit_cache_state_not_gpu_completion"}});
+    }
     const auto& cache = feature.adaptive_cache;
     if (cache == nullptr) continue;
     Json slots = Json::array();
@@ -236,6 +251,11 @@ inline Json Snapshot() {
       {"nr_features_created", nr_features_created},
       {"edit_reuse", {{"requested", edit_reuse_enabled.load()}, {"refreshes", edit_reuse_refreshes.load()},
           {"reuses", edit_reuse_reuses.load()}, {"fallbacks", edit_reuse_fallbacks.load()},
+          {"sources", std::move(edit_sources)},
+          {"fg_environment", {{"available", fg_environment.available}, {"reason", fg_environment.reason},
+              {"provider", fg_environment.provider}, {"context", fg_environment.context},
+              {"generation", fg_environment.generation},
+              {"evidence", "fg_environment_metadata_not_source_handoff"}}},
           {"xefg_off_sources", std::move(edit_off_sources)},
           {"xefg_device_observation", std::move(edit_device_observation)},
           {"xefg_off_events", std::move(edit_off_events)},
@@ -245,6 +265,8 @@ inline Json Snapshot() {
           {"bridge_adaptive_evidence", "requested_enabled_not_activation"},
           {"edit_reuse_adaptive_experiment", identity["experiments"]["edit_reuse_adaptive_experiment"]},
           {"edit_reuse_adaptive_evidence", identity["experiments"]["edit_reuse_adaptive_evidence"]},
+          {"edit_reuse_fg_experiment", identity["experiments"]["edit_reuse_fg_experiment"]},
+          {"edit_reuse_fg_evidence", "requested_enabled_not_activation"},
           {"evidence", "requested_mode_not_activation"}}},
       {"adaptive_caches", std::move(caches)},
       {"output_framerate", {{"available", output.available}, {"reason", output_framerate::ReasonText(output.reason)},
@@ -293,6 +315,7 @@ inline Json Execute(const Json& request) {
   }
   if (*operation != "set" && *operation != "adaptive_feature_experiment"
       && *operation != "bridge_adaptive_experiment" && *operation != "edit_reuse_adaptive_experiment"
+      && *operation != "edit_reuse_fg_experiment"
       && *operation != "inline_restore_roi") {
     return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "invalid_operation"}};
   }
@@ -344,7 +367,8 @@ inline Json Execute(const Json& request) {
     return finish();
   }
   const bool bridge_experiment = *operation == "bridge_adaptive_experiment";
-  const bool boolean_experiment = bridge_experiment || *operation == "edit_reuse_adaptive_experiment";
+  const bool fg_experiment = *operation == "edit_reuse_fg_experiment";
+  const bool boolean_experiment = bridge_experiment || fg_experiment || *operation == "edit_reuse_adaptive_experiment";
   if (*operation == "adaptive_feature_experiment" || boolean_experiment) {
     const auto value = request.find(boolean_experiment ? "enabled" : "mode");
     response["reason"] = (boolean_experiment ? "invalid_enabled" : "invalid_mode");
@@ -369,10 +393,16 @@ inline Json Execute(const Json& request) {
       } else {
         bool unchanged = false;
         if (boolean_experiment) {
-          auto& requested_flag = (bridge_experiment ? bridge_adaptive_experiment : edit_reuse_adaptive_experiment);
+          auto* requested_flag = &edit_reuse_adaptive_experiment;
+          if (bridge_experiment) {
+            requested_flag = &bridge_adaptive_experiment;
+          }
+          if (fg_experiment) {
+            requested_flag = &edit_reuse_fg_experiment;
+          }
           const bool requested = value->get<bool>();
-          unchanged = requested_flag.load() == requested;
-          requested_flag.store(requested);
+          unchanged = requested_flag->load() == requested;
+          requested_flag->store(requested);
         } else {
           const auto requested = static_cast<AdaptiveFeatureMode>(value->get<uint32_t>());
           unchanged = adaptive_feature_mode.load() == requested;

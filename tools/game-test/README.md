@@ -72,6 +72,14 @@ Bridge 两档接入使用独立的 DEV 请求：`Client.bridge_adaptive_experime
 `sampling` 分别反映源序号、试档状态和已完成采样。统计有效时 `median_us`／`mad_us` 是每源完整 NR 链成本，
 x2 先平均相邻两源再统计；未满窗口或过期时为 null。请求、计数、已完成成本和实际档位须分别判断。
 输出 FPS 沿用真实 `Present cadence estimate` 或 `XeFG SDK output estimate`，两者均不报告显示器扫描完成。
+
+固定100% Upscaled与FG On的DEV实验使用`Client.edit_reuse_fg_experiment(True|False)`，协议为
+`{"id":"edit-fg-1","op":"edit_reuse_fg_experiment","enabled":true}`，同样要求NR OFF、资源已释放及配置空闲。
+它默认关闭，不写INI；仅在真实SR成功后的单Pass路径接纳已观察的FG On环境，保持原尺寸、颜色、运动、历史及提交保护。
+`state.edit_reuse.fg_environment`的provider为1（native DLSS FG）、2（XeFG）或0（未观察），context／generation用于缓存切换失效，
+不是源到FG的像素交接证明。`state.edit_reuse.sources`按source／pass报告源序号、尺寸、锚点代次及复用状态，
+明确属于录制状态；须与GPU完成、实际FG输出及同帧作用证据分别核验。原XeFG单Backbuffer Present路径与Off两档实验保持各自准入。
+
 DEV 两档 x2 另可接纳与当前 D3D12 源、真实来源链与 XeFG proxy 的嵌套 Present 关联及 context 代次绑定的成功
 `SetEnabled(false)`。它保持原生 FG 声明不变；Unknown 自身不能准入。`state.edit_reuse.xefg_off_sources`
 报告凭据及 provider 匹配情况；`source_link_reason` 独立说明来源关联状态，`reason` 说明关闭凭据状态。

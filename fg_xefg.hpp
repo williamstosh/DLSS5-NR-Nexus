@@ -88,6 +88,13 @@ struct BridgeEventSnapshot {
   uint64_t last_sequence = 0;
   uint64_t overwritten = 0;
 };
+struct EnabledContextMetadata {
+  bool available = false;
+  const char* reason = "unobserved";
+  uintptr_t context_identity = 0;
+  uint64_t epoch = 0;
+  uint64_t generation = 0;
+};
 #endif
 enum class BridgeSnapshotState : uint8_t { UNOBSERVED, RUNTIME_BUSY, SHUTTING_DOWN, LOCKED };
 struct BridgeSourceObservation {
@@ -314,6 +321,9 @@ struct Context {
   std::map<uint32_t, std::shared_ptr<Frame>> frames;
   std::vector<std::shared_ptr<Surface>> surfaces;
   uint64_t epoch = 1;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  uint64_t fg_environment_generation = 0;
+#endif
   uint64_t application_frame = 0;
   uint64_t last_submission_frame = 0;
   uint64_t next_fence = 0;
@@ -404,6 +414,7 @@ struct State {
 #if defined(NR_NEXUS_DEV_CONTROL)
   std::array<BridgeEvent, 32> bridge_events{};
   uint64_t bridge_event_sequence = 0;
+  uint64_t fg_environment_generation = 0;
 #endif
 };
 inline State state;
@@ -720,6 +731,9 @@ inline void ReleaseFrames(Context* context) {
   context->last_id_known = false;
   context->last_submission_frame = 0;
   ++context->epoch;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  context->fg_environment_generation = ++state.fg_environment_generation;
+#endif
 }
 
 inline std::shared_ptr<Surface> AcquireSurface(const std::shared_ptr<Context>& context,
@@ -829,6 +843,9 @@ inline void Initialize(void* handle, ID3D12CommandQueue* queue, const abi::Init*
   context->bridge_context_ready = BridgeDeviceCaptureReady(
       context->bridge_application_observation, context->bridge_application_device11.Get(), true);
   context->bridge_declaration = ++state.bridge_declaration;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  context->fg_environment_generation = ++state.fg_environment_generation;
+#endif
   if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
     state.retired_contexts.push_back(it->second);
   }
@@ -2284,6 +2301,35 @@ inline BridgeEventSnapshot CopyBridgeEvents() {
     snapshot.events[index] = internal::state.bridge_events[(first_sequence + index - 1) % snapshot.events.size()];
   }
   return snapshot;
+}
+
+// Environment metadata only. It neither proves an SR-to-FG input link nor grants an Off receipt.
+inline EnabledContextMetadata QueryEnabledContext() {
+  EnabledContextMetadata metadata;
+  if (internal::stopped.load(std::memory_order_acquire)
+      || !internal::sdk_detours_enabled.load(std::memory_order_acquire)) {
+    metadata.reason = "sdk_observation_unavailable";
+    return metadata;
+  }
+  std::shared_lock lock(internal::state.mutex);
+  if (internal::state.contexts.size() != 1) {
+    metadata.reason = (internal::state.contexts.empty() ? "context_unobserved" : "multiple_contexts");
+    return metadata;
+  }
+  const auto& [handle, context] = *internal::state.contexts.begin();
+  metadata.context_identity = reinterpret_cast<uintptr_t>(context.get());
+  metadata.epoch = context->epoch;
+  metadata.generation = context->fg_environment_generation;
+  if (!context->enabled) {
+    metadata.reason = "fg_off";
+  } else if (!context->bridge_context_ready || !context->bridge_proxy_ready || context->queue == nullptr
+      || context->proxy_identity == 0 || context->bridge_enable_inflight != 0 || metadata.generation == 0) {
+    metadata.reason = "context_not_ready";
+  } else {
+    metadata.available = true;
+    metadata.reason = "enabled_context_environment";
+  }
+  return metadata;
 }
 #endif
 

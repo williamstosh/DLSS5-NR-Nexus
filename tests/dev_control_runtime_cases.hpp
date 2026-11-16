@@ -82,6 +82,8 @@
           && !status["identity"]["experiments"]["bridge_adaptive_experiment"].get<bool>()
           && !status["state"]["experiments"]["edit_reuse_adaptive_experiment"].get<bool>()
           && !status["identity"]["experiments"]["edit_reuse_adaptive_experiment"].get<bool>()
+          && !status["state"]["experiments"]["edit_reuse_fg_experiment"].get<bool>()
+          && !status["identity"]["experiments"]["edit_reuse_fg_experiment"].get<bool>()
           && status["identity"]["experiments"]["edit_reuse_adaptive_evidence"] == "requested_enabled_not_activation"
           && status["state"]["experiments"]["edit_reuse_adaptive_evidence"] == "requested_enabled_not_activation"
           && status["state"]["experiments"]["bridge_adaptive_evidence"] == "requested_enabled_not_activation"
@@ -95,6 +97,9 @@
       "the disabled experiment leaves independent SDK device diagnostics null");
   check(status["state"]["edit_reuse"]["xefg_off_events"].is_null(),
       "the disabled experiment leaves bounded Off event diagnostics null");
+  check(status["state"]["edit_reuse"]["sources"].is_array()
+          && status["state"]["edit_reuse"]["sources"].empty(),
+      "an empty runtime exposes no invented per-source edit cache");
   {
     struct RestoreSdkContexts {
       decltype(xefg::internal::state.contexts) contexts;
@@ -213,6 +218,29 @@
     auto [source, inserted] = runtime::features.try_emplace(source_handle);
     check(inserted, "the CPU sampling observation owns a distinct synthetic source");
     source->second.sr_sequence = 44;
+    source->second.source_generation = 3;
+    source->second.source_type_confirmed = true;
+    auto& edit = source->second.slots[0].edit_reuse;
+    edit = std::make_shared<renodx::addons::dlss5::edit_reuse::State>();
+    edit->width = edit->output_width = 16;
+    edit->height = edit->output_height = 12;
+    edit->anchor_generation = 7;
+    edit->source_sequence = 44;
+    edit->reuse_count = 8;
+    edit->valid = edit->reused = true;
+    const auto edited = control::Snapshot()["edit_reuse"]["sources"];
+    check(edited.size() == 1 && edited[0]["source_handle"] == reinterpret_cast<uintptr_t>(source_handle)
+            && edited[0]["source_generation"] == 3 && edited[0]["source_frame"] == 44
+            && edited[0]["source_type_confirmed"] && edited[0]["pass"] == 1
+            && edited[0]["anchor_generation"] == 7 && edited[0]["source_sequence"] == 44
+            && edited[0]["reuse_count"] == 8 && edited[0]["valid"] && edited[0]["reused"]
+            && edited[0]["working_size"] == Json::array({16, 12})
+            && edited[0]["output_size"] == Json::array({16, 12})
+            && edited[0]["evidence"] == "recorded_edit_cache_state_not_gpu_completion",
+        "per-source cache status preserves source and anchor generations without claiming GPU completion");
+    edit.reset();
+    check(control::Snapshot()["edit_reuse"]["sources"].empty(),
+        "retiring an edit cache removes it from the current status snapshot");
     source->second.adaptive_cache = std::make_shared<runtime::AdaptiveFeatureCache>();
     source->second.adaptive_cache->count = 1;
     const auto cache_status = [&]() {
@@ -503,10 +531,13 @@
           && runtime::nr_features_created == experiment_features,
       "experiment requests write no INI settings, recreate no features and leave ordinary configuration generation unchanged");
   runtime::disabled_resources_released = released_before;
-  for (const auto* operation : {"bridge_adaptive_experiment", "edit_reuse_adaptive_experiment"}) {
+  for (const auto* operation : {"bridge_adaptive_experiment", "edit_reuse_adaptive_experiment", "edit_reuse_fg_experiment"}) {
     const bool bridge = std::string_view(operation) == "bridge_adaptive_experiment";
-    auto& requested_flag = (bridge ? runtime::bridge_adaptive_experiment : runtime::edit_reuse_adaptive_experiment);
-    const auto* evidence_key = (bridge ? "bridge_adaptive_evidence" : "edit_reuse_adaptive_evidence");
+    const bool fg = std::string_view(operation) == "edit_reuse_fg_experiment";
+    auto& requested_flag = (bridge ? runtime::bridge_adaptive_experiment
+                                  : (fg ? runtime::edit_reuse_fg_experiment : runtime::edit_reuse_adaptive_experiment));
+    const auto* evidence_key = (bridge ? "bridge_adaptive_evidence"
+                                      : (fg ? "edit_reuse_fg_evidence" : "edit_reuse_adaptive_evidence"));
     const auto boolean_experiment = [&](Json enabled) {
       return control::Execute({{"id", std::string(operation) + "-" + std::to_string(++serial)},
           {"op", operation}, {"enabled", std::move(enabled)}});
