@@ -4,7 +4,7 @@
 
 ## 简体中文
 
-本指南对应 **v0.4.0**：从安装、选方案和比较画面开始，再按需组合最多四层 NR、独立尺寸和结果编辑。**实验性**表示有特殊条件且默认关闭的试用路径，**暂不支持**表示不可用组合。下载及版本说明见 [v0.4.0](https://github.com/williamstosh/RenoDX-DLSSNR-Nexus/releases/tag/v0.4.0)。
+本指南对应 **v0.5.0**：从安装、选方案和比较画面开始，再按需组合最多四层 NR、独立尺寸和结果编辑。**实验性**表示有特殊条件且默认关闭的试用路径，**暂不支持**表示不可用组合。下载及版本说明见 [v0.5.0](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.5.0)。
 
 配图来自已审核的开发界面离屏预览，状态和数字为界面示例；各功能的安装包支持范围见正文。
 
@@ -25,7 +25,7 @@
 
 #### 用 RHI 准备 ReShade 和 Runtime
 
-1. 关闭游戏，备份现有插件、ReShade 配置和将替换的 DLL。在 [v0.4.0 版本页面](https://github.com/williamstosh/RenoDX-DLSSNR-Nexus/releases/tag/v0.4.0)下载 Windows x64 ZIP 与对应的 `.zip.sha256` 并校验；从 [RHI 最新版](https://github.com/RankFTW/RHI/releases/latest) 下载 RHI。
+1. 关闭游戏，备份现有插件、ReShade 配置和将替换的 DLL。在 [v0.5.0 版本页面](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.5.0)下载 Windows x64 ZIP 与对应的 `.zip.sha256` 并校验；从 [RHI 最新版](https://github.com/RankFTW/RHI/releases/latest) 下载 RHI。
 2. 在 RHI 选中游戏；未找到时点 **+（Manually add a game）**，选择实际游戏 `.exe` 后点 **Add Game**，或把 `.exe` 拖入窗口。选游戏进程使用的程序，不选启动器；例如实际程序可能在 `Binaries/Win64`。
 3. 在 **Game Overrides → ReShade Channel → Stable** 选择支持完整 Add-on 的渠道，在 **Components → ReShade** 安装；**No Addons 不能加载本插件**。已有 ReShade 时先核对其 Add-on 支持及 API 版本，避免重复安装。
 4. 在 **DLSS / Streamline → Neural Rendering** 列选 **310.9.16 (20/30/40/50)**，点 **Deploy DLL** 单独部署 NR Runtime，无需其他 NR Add-on。**RHI 2.8.8 还会尝试在游戏安装根目录部署最新 `nvngx_dlss.dll`（SR），已有文件先备份为 `.original`；希望保持 SR 版本时使用手动安装。**如果游戏原有 DLSS 但缺此栏，先用 **Settings → Tools & Maintenance → Full refresh**；无 DLSS 或刷新后仍无此栏，使用下方手动安装。
@@ -311,9 +311,9 @@ Present 显示以下选项。兼容的 Pre-FG 先增强游戏帧再交给 FG；�
 
 首次准备分步进行，尚不能处理的帧保留游戏原画。开启、修改档数或尺寸范围后，复用兼容档位并准备缺少的尺寸，所选档位全部就绪后再自动调节；单次准备仍可能短暂卡顿。容量不足时保留选择并暂停，可减少档数后重新准备。调整目标 FPS、风格、混合强度或已有遮罩阈值会保留兼容分配。短时暂停不因闲置五秒而丢弃已接纳的档位；真实换源或资源合同变化仍可能需要重新准备。
 
-**开发版新增与修正（尚未发布）**：「预备方式」可选择默认的「全档预备」或「按需备档（实验）」。全档预备用更多显存换取就绪后的顺畅切换；按需备档只保留当前、请求和回退所需的档位，降低同时驻留的开销，准备新的冷档仍可能卡顿。两种方式保留你选择的档数和最低比例。容量不足而暂停时，改变预备方式会重新检查预算；等待所需档位时继续使用合法的已就绪尺寸。
+**预备方式**：「预备方式」可选择默认的「全档预备」或「按需备档（实验）」。全档预备用更多显存换取就绪后的顺畅切换；按需备档只保留当前、请求和回退所需的档位，降低同时驻留的开销，准备新的冷档仍可能卡顿。两种方式保留你选择的档数和最低比例。容量不足而暂停时，改变预备方式会重新检查预算；等待所需档位时继续使用合法的已就绪尺寸。
 
-该开发版的自动降档会累计比较连续细档的收益；收益仍不明确时恢复较高画质，并在冷却后重新采样。准备中的资源分配失败会停止新增档位，保留安全可用的画面并回收未使用的备用资源；重新开启须等这次失败遗留的资源可以安全释放后再准备。「关闭 NR 时保留资源」仍控制正常关闭时的行为。
+自动降档会累计比较连续细档的收益；收益仍不明确时恢复较高画质，并在冷却后重新采样。准备中的资源分配失败会停止新增档位，保留安全可用的画面并回收未使用的备用资源；重新开启须等这次失败遗留的资源可以安全释放后再准备。「关闭 NR 时保留资源」仍控制正常关闭时的行为。
 
 | 上采样选项 | NR 低于输出尺寸时的行为 |
 | --- | --- |
@@ -440,11 +440,13 @@ Present 显示以下选项。兼容的 Pre-FG 先增强游戏帧再交给 FG；�
 
 遇到具体问题时查本节。修改前记录旧值，一次对比一项；显示不适用时按原因处理。
 
-#### x2 编辑复用（开发实验）
+#### x2 编辑复用（实验）
 
-**尚未发布的开发实验，默认关闭。** 每两帧重新生成一次 NR 编辑，另一帧将编辑跟随运动应用到当前画面；遮挡、颜色变化或越界区域保留当前原色。它用于试验降低 NR 开销，动态画质尚待验收。
+**v0.5.0 提供的配置实验，默认关闭。** 每两帧重新生成一次 NR 编辑，另一帧将编辑跟随运动应用到当前画面；遮挡、颜色变化或越界区域保留当前原色。它用于试验降低 NR 开销，动态画质尚待验收。
 
-关闭游戏后，在 ReShade 配置的 `[RenoDX.DLSS5]` 段加入 `NREditReuse=1`，重启后读取。开发版支持原生 DX12 的两条路径：关闭 FG 的 Upscaled，以及 XeFG 的 Present 单 Backbuffer（不含 HUDless/UI 合成）。均要求模型 B、1 层、固定100% HDR 输出，并关闭调整 NR 外观、细节稳定性、ControlMask 和自适应尺寸。游戏须提供匹配的深度和运动数据，以及完整的 jitter 采样偏移（支持非零值，每轴不超过半个渲染像素）；运动数据须不含 jitter。Upscaled 使用 FP16 scRGB；XeFG 单 Backbuffer 另支持10位 HDR10/PQ。格式或实际颜色契约不符时保持逐帧 NR。光照突然变化时可能短暂回到原色，NR 色调变化也可能延后一帧；《巫师3》HDR10/PQ＋XeFG 的静态场景已确认隔帧调用；动态画质与帧节奏仍待实际场景验收。日志中的 `NR edit reuse` 表示实际发生复用；移除该键或设为 `0` 后重启即可关闭。此实验未加入菜单或方案分享。
+关闭游戏后，在 ReShade 配置的 `[RenoDX.DLSS5]` 段加入 `NREditReuse=1`，重启后读取。普通安装包支持原生 DX12 的两条限定路径：关闭 FG 的 Upscaled，以及 XeFG 的 Present 单 Backbuffer（不含 HUDless/UI 合成）。均要求模型 B、1 层、固定100% HDR 输出，并关闭调整 NR 外观、细节稳定性、ControlMask 和自适应尺寸。游戏须提供匹配的深度和运动数据，以及完整的 jitter 采样偏移（支持非零值，每轴不超过半个渲染像素）；运动数据须不含 jitter。Upscaled 使用 FP16 scRGB；XeFG 单 Backbuffer 另支持10位 HDR10/PQ。格式或实际颜色契约不符时保持逐帧 NR。光照突然变化时可能短暂回到原色，NR 色调变化也可能延后一帧；《巫师3》HDR10/PQ＋XeFG 的静态场景已确认隔帧调用；动态画质与帧节奏仍待实际场景验收。日志中的 `NR edit reuse` 表示实际发生复用；移除该键或设为 `0` 后重启即可关闭。此实验未加入菜单或方案分享。
+
+最新的真实 SR Upscaled＋FG On 准入仍属于默认关闭的 DEV 实验，普通安装包不开放这条路径。它与上文的 XeFG Present 单 Backbuffer 路径分开；当前 XeFG／DLSS FG On 的刷新、复用与 SDK 输出观察尚未验收生成帧的实际编辑像素消费、动态画质或微卡顿。
 
 <a id="zh-paths"></a>
 #### 可用组合
@@ -559,7 +561,7 @@ ROI、单次 HDR、120 次 HDR Present 和 P0 捕获生成额外数据，可能�
 
 ## English
 
-This guide covers **v0.4.0**. Start with installation, profiles and picture comparisons, then combine up to four NR passes, independent sizes and result edits as needed. **Experimental** marks trial paths with special conditions that are off by default; **Not supported yet** marks unavailable combinations. Downloads and release details: [v0.4.0](https://github.com/williamstosh/RenoDX-DLSSNR-Nexus/releases/tag/v0.4.0).
+This guide covers **v0.5.0**. Start with installation, profiles and picture comparisons, then combine up to four NR passes, independent sizes and result edits as needed. **Experimental** marks trial paths with special conditions that are off by default; **Not supported yet** marks unavailable combinations. Downloads and release details: [v0.5.0](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.5.0).
 
 Images are reviewed offscreen previews with example states and numbers. See each feature's text for supported paths and usage.
 
@@ -580,7 +582,7 @@ You need Windows x64, a [compatible NVIDIA RTX GPU/driver](../README.md#en-gpu),
 
 #### Prepare ReShade and the runtime with RHI
 
-1. Close the game and back up existing add-ons, ReShade configuration and DLLs you will replace. Download the Windows x64 ZIP and matching `.zip.sha256` from the [v0.4.0 release page](https://github.com/williamstosh/RenoDX-DLSSNR-Nexus/releases/tag/v0.4.0), then verify the archive. Download [the latest RHI](https://github.com/RankFTW/RHI/releases/latest).
+1. Close the game and back up existing add-ons, ReShade configuration and DLLs you will replace. Download the Windows x64 ZIP and matching `.zip.sha256` from the [v0.5.0 release page](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.5.0), then verify the archive. Download [the latest RHI](https://github.com/RankFTW/RHI/releases/latest).
 2. Select the game in RHI. If missing, click **+ (Manually add a game)**, select the actual game `.exe` and click **Add Game**, or drag the `.exe` onto the window. Select the executable used by the game process rather than its launcher; it may be under `Binaries/Win64`.
 3. Select **Game Overrides → ReShade Channel → Stable** for full Add-on support, then install under **Components → ReShade**. **No Addons cannot load NR Nexus.** For existing ReShade installations, check Add-on support and the API version before installing again.
 4. In the **DLSS / Streamline → Neural Rendering** column, choose **310.9.16 (20/30/40/50)** and click **Deploy DLL** to deploy the NR runtime separately, without another NR Add-on. **RHI 2.8.8 also attempts to deploy the newest `nvngx_dlss.dll` (SR) in the game installation root, backing up an existing file as `.original`. Use manual installation to keep your SR version.** If the game already has DLSS but this column is missing, use **Settings → Tools & Maintenance → Full refresh**. Without game DLSS, or if the column remains missing, follow manual installation below.
@@ -866,9 +868,9 @@ Adaptive sizing supports one processing stage on native DX12, including compatib
 
 Initial preparation proceeds in several steps; frames that NR cannot process yet keep the game's image. Enabling automatic sizing or changing the count or size range reuses compatible levels and prepares missing sizes before automatic adjustment begins. Individual preparation steps can still briefly stall. If capacity is insufficient, the selection is kept and adjustment pauses; reduce the count to prepare again. Target FPS, style, blend strength and existing mask thresholds retain compatible allocations. A temporary pause no longer discards admitted levels merely because they have been idle for five seconds. A genuinely replaced source or changed resource contract can still require preparation.
 
-**Development additions and fixes (not yet released)**: Preparation mode offers Prepare all levels (the default) and On-demand (experimental). Preparing all levels uses more VRAM for smooth switching once ready. On-demand retains the levels needed for current output, the requested target and recovery, reducing simultaneous residency; preparing a cold level can still cause a pause. Both modes retain your selected level count and minimum scale. Changing preparation mode retries the budget check after a capacity pause. While a target is being prepared, a legal ready size remains in use.
+**Preparation mode**: Preparation mode offers Prepare all levels (the default) and On-demand (experimental). Preparing all levels uses more VRAM for smooth switching once ready. On-demand retains the levels needed for current output, the requested target and recovery, reducing simultaneous residency; preparing a cold level can still cause a pause. Both modes retain your selected level count and minimum scale. Changing preparation mode retries the budget check after a capacity pause. While a target is being prepared, a legal ready size remains in use.
 
-In this development build, downscaling compares the cumulative benefit of successive fine steps. If the benefit remains unclear, it restores higher quality and collects fresh samples after a cooldown. An allocation failure during preparation stops new levels, retains a safe available image and reclaims unused standby resources. Re-enabling waits until resources left by that failed preparation can be safely released before preparing again. The option to retain resources when NR is turned off still controls normal shutdown behavior.
+Downscaling compares the cumulative benefit of successive fine steps. If the benefit remains unclear, it restores higher quality and collects fresh samples after a cooldown. An allocation failure during preparation stops new levels, retains a safe available image and reclaims unused standby resources. Re-enabling waits until resources left by that failed preparation can be safely released before preparing again. The option to retain resources when NR is turned off still controls normal shutdown behavior.
 
 | Upsampling choice | Behaviour below output size |
 | --- | --- |
@@ -995,11 +997,13 @@ Reset NR feature rebuilds runtime state; Restore defaults resets saved settings;
 
 Use this for specific issues. Record old values and compare one change at a time; follow unavailable reasons.
 
-#### x2 edit reuse (development experiment)
+#### x2 edit reuse (experimental)
 
-**An unreleased development experiment, off by default.** NR generates a new edit every other frame. The intervening frame applies the motion-reprojected edit to the current image; rejected occlusion, color-change and boundary pixels retain their current color. This experiment targets lower NR cost; dynamic image quality awaits acceptance.
+**A configuration experiment included in v0.5.0, off by default.** NR generates a new edit every other frame. The intervening frame applies the motion-reprojected edit to the current image; rejected occlusion, color-change and boundary pixels retain their current color. This experiment targets lower NR cost; dynamic image quality awaits acceptance.
 
-With the game closed, add `NREditReuse=1` under `[RenoDX.DLSS5]` in the ReShade configuration, then restart. The development build supports two native DX12 paths: Upscaled with FG off, and XeFG Present with a single Backbuffer and no HUDless/UI composition. Both require model B, one pass and fixed 100% HDR output, with Adjust NR's look, Detail stability, ControlMask and adaptive sizing off. The game must provide matching depth and motion plus both jitter sampling offsets; nonzero values up to half a render pixel per axis are supported, with jitter excluded from motion. Upscaled uses FP16 scRGB; XeFG single Backbuffer also supports 10-bit HDR10/PQ. Other formats or mismatched actual color contracts continue running NR every frame. Sudden lighting changes may briefly restore the original color, and changes in NR's tone may lag by one frame. HDR10/PQ x2 reuse has been confirmed in a static The Witcher 3 XeFG scene; dynamic image quality and frame pacing still need acceptance in the intended scene. An `NR edit reuse` log entry confirms actual reuse. Remove the key or set it to `0` and restart to disable it. There is no menu control or preset-sharing field for this experiment.
+With the game closed, add `NREditReuse=1` under `[RenoDX.DLSS5]` in the ReShade configuration, then restart. The ordinary package supports two restricted native DX12 paths: Upscaled with FG off, and XeFG Present with a single Backbuffer and no HUDless/UI composition. Both require model B, one pass and fixed 100% HDR output, with Adjust NR's look, Detail stability, ControlMask and adaptive sizing off. The game must provide matching depth and motion plus both jitter sampling offsets; nonzero values up to half a render pixel per axis are supported, with jitter excluded from motion. Upscaled uses FP16 scRGB; XeFG single Backbuffer also supports 10-bit HDR10/PQ. Other formats or mismatched actual color contracts continue running NR every frame. Sudden lighting changes may briefly restore the original color, and changes in NR's tone may lag by one frame. HDR10/PQ x2 reuse has been confirmed in a static The Witcher 3 XeFG scene; dynamic image quality and frame pacing still need acceptance in the intended scene. An `NR edit reuse` log entry confirms actual reuse. Remove the key or set it to `0` and restart to disable it. There is no menu control or preset-sharing field for this experiment.
+
+The newer real-SR Upscaled + FG On path remains a disabled-by-default DEV experiment and is not enabled in the ordinary package. It is separate from the XeFG single-Backbuffer Present path above. Current XeFG/DLSS FG On refresh, reuse and SDK-output observations do not yet include acceptance of edited-pixel consumption by generated frames, dynamic image quality or microstutter.
 
 <a id="en-paths"></a>
 #### Compatible combinations

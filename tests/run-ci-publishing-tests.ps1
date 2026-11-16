@@ -12,7 +12,7 @@ $binary = Join-Path $OutputDirectory 'synthetic.addon64'
 $checks = [Collections.Generic.List[string]]::new()
 $validCommand = "^C:\fixture\addon.cpp`r`n/c /D NDEBUG /Foobj fixture.cpp`r`n"
 function Reset-Fixture {
-    [IO.File]::WriteAllText($cache, "NR_NEXUS_DEV_CONTROL:BOOL=OFF`n")
+    [IO.File]::WriteAllText($cache, "NR_NEXUS_DEV_CONTROL:BOOL=OFF`nNR_NEXUS_IME_DIAGNOSTICS:BOOL=OFF`n")
     [IO.File]::WriteAllText($command, $validCommand, [Text.Encoding]::Unicode)
     [IO.File]::WriteAllBytes($binary, [byte[]]@(0,1,2,3))
 }
@@ -32,12 +32,20 @@ try {
     $result = Assert-PublishingIsolation -BuildDirectory $OutputDirectory -BinaryPath $binary
     if ($result.DllSha256 -cne (Get-FileHash -LiteralPath $binary).Hash.ToLowerInvariant()) { throw 'DLL hash changed.' }
     $checks.Add('clean Publishing isolation and hash')
-    foreach ($value in @('ON',('OFF' + "`nNR_NEXUS_DEV_CONTROL:BOOL=ON"),'')) {
-        Reset-Fixture
-        [IO.File]::WriteAllText($cache, "NR_NEXUS_DEV_CONTROL:BOOL=$value`n")
-        Assert-Rejected "invalid cache $($checks.Count)" 'requires NR_NEXUS_DEV_CONTROL'
+    foreach ($option in @('NR_NEXUS_DEV_CONTROL','NR_NEXUS_IME_DIAGNOSTICS')) {
+        foreach ($value in @('ON',("OFF`n${option}:BOOL=ON"),'')) {
+            Reset-Fixture
+            $invalid = [IO.File]::ReadAllText($cache).Replace("${option}:BOOL=OFF", "${option}:BOOL=$value")
+            [IO.File]::WriteAllText($cache, $invalid)
+            Assert-Rejected "invalid $option cache $($checks.Count)" "requires $option"
+        }
     }
-    foreach ($define in @('/DNR_NEXUS_DEV_CONTROL','/D NR_NEXUS_DEV_CONTROL=1','/D "NR_NEXUS_DEV_CONTROL=1"')) {
+    $definitions = @('NR_NEXUS_DEV_CONTROL','NR_NEXUS_IME_DIAGNOSTICS','RENODX_DLSS5_DEBUG',
+        'NR_NEXUS_TEST_FG_OUTPUT_PROBE','NR_NEXUS_TEST_NATIVE_NGX','NR_NEXUS_TEST_COLD_CPU_TRACE',
+        'NR_NEXUS_TEST_SUBMISSION_FAILURE','NR_NEXUS_DEV_CONTROL_PIPE_TEST_EXE','NR_NEXUS_TEST_WARP_ONLY')
+    $arguments = @($definitions | ForEach-Object { "/D$_" }) + @('/D NR_NEXUS_DEV_CONTROL=1',
+        '/D "NR_NEXUS_DEV_CONTROL=1"','/DNR_NEXUS_TEST_FG_OUTPUT_PROBE=0','"/DNR_NEXUS_TEST_FG_OUTPUT_PROBE=1"')
+    foreach ($define in $arguments) {
         Reset-Fixture
         [IO.File]::WriteAllText($command, $validCommand + $define, [Text.Encoding]::Unicode)
         Assert-Rejected "compiler definition $define" 'compiler command contains'
@@ -45,11 +53,14 @@ try {
     Reset-Fixture
     [IO.File]::WriteAllText($command, '/c unrelated.cpp', [Text.Encoding]::Unicode)
     Assert-Rejected 'missing actual addon compiler command' 'actual Release addon.cpp'
-    foreach ($marker in @('inline_restore_roi','inline_restore_roi_v1','mafia-same-frame-roi','unsupported_inline_restore_contract')) {
+    foreach ($marker in @('inline_restore_roi','inline_restore_roi_v1','mafia-same-frame-roi',
+        'unsupported_inline_restore_contract','bridge_adaptive_experiment','edit_reuse_adaptive_experiment',
+        'edit_reuse_fg_experiment','fg_output_probe','sdk_display_configuration_and_marker_recording_not_output_pixels',
+        'linear_FP16_after_resolve_alpha_preserved','xefgSwapChainEnableDebugFeature','NR Nexus IME diagnostics')) {
         foreach ($encoding in @([Text.Encoding]::ASCII,[Text.Encoding]::Unicode)) {
             Reset-Fixture
             [IO.File]::WriteAllBytes($binary, ([byte[]]@(7) + $encoding.GetBytes($marker) + [byte[]]@(9)))
-            Assert-Rejected "$marker $($encoding.WebName)" 'development ROI marker'
+            Assert-Rejected "$marker $($encoding.WebName)" 'development-only marker'
         }
     }
     $outcome='Passed'
