@@ -1414,6 +1414,12 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     const PresentStream* owner = nullptr;
     fg_service::Stream* stream = nullptr;
     std::array<NrRecording, 2> recordings{};
+#if defined(NR_NEXUS_DEV_CONTROL)
+    bool tag_input_eligible = false;
+    bool tag_input_claimed = false;
+    fg::native_options::frame_source::Frame tag_input_frame{.reason = "input_not_observed"};
+    const char* tag_input_claim_reason = "not_attempted";
+#endif
     ~ExperimentalDiagnostic() noexcept {
       if (!enabled) return;
       try {
@@ -1529,6 +1535,16 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
              << " frame_id_type=uint64"
              << " guide_mode=" << present_guides.load()
              << " queue_tracking=" << queue_tracking_active.load();
+#if defined(NR_NEXUS_DEV_CONTROL)
+        if (std::string_view(reason) == "owner_missing") {
+          const auto tag_observation = native_tag_source::Snapshot();
+          line << " tag_input=[eligible:" << tag_input_eligible
+               << ",available:" << tag_input_frame.available << ",claimed:" << tag_input_claimed
+               << ",token:" << tag_input_frame.frame << ",epoch:" << tag_input_frame.epoch
+               << ",reason:" << tag_input_frame.reason << ",pending:" << tag_observation.query_pending
+               << ",claim:" << tag_input_claim_reason << ']';
+        }
+#endif
         if (stream != nullptr && stream->native_pair_producer_marker != nullptr) {
           std::vector<std::pair<FenceRef, uint64_t>> proofs;
           const auto state = submission::UseSubmissionTokens(stream->native_pair_producer_marker, &proofs);
@@ -1615,6 +1631,30 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
   auto device_release = std::unique_ptr<ID3D12Device, void (*)(ID3D12Device*)>(device,
       [](ID3D12Device* value) { value->Release(); });
   const auto identity = renodx::utils::directx::NativeIdentity(device);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  uint32_t input_index = 0, input_no_game = 0;
+  const auto input_feature = created_feature_ids.find(handle);
+  if (edit_reuse_enabled.load() && edit_reuse_fg_experiment.load()
+      && hook_point.load() == kHookPresent && !fg::xefg::Enabled()
+      && handle != nullptr && input_feature != created_feature_ids.end()
+      && input_feature->second == NVSDK_NGX_Feature_FrameGeneration
+      && hudless != nullptr && identity != nullptr
+      && GetUIntIfPresent(parameters, NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, &input_index) && input_index == 1
+      && GetUIntIfPresent(parameters, NVSDK_NGX_DLSSG_Parameter_NotRenderingGameFrames, &input_no_game) && input_no_game == 0) {
+    const auto recording = submission::RecordingIdentity(list);
+    diagnostic.tag_input_eligible = recording.first != 0 && (recording.first >> 63) == 0 && recording.second != 0;
+    diagnostic.tag_input_frame.reason = "recording_identity_unavailable";
+    if (diagnostic.tag_input_eligible) {
+      // This is the actual FG input even if NR has no Present owner or is
+      // still warming. Claim identity only; all NR admission stays below.
+      diagnostic.tag_input_frame = native_tag_source::CurrentFrame(hudless, list);
+      if (diagnostic.tag_input_frame.available) {
+        diagnostic.tag_input_claimed = native_tag_source::ClaimFrame(diagnostic.tag_input_frame, hudless, list);
+        diagnostic.tag_input_claim_reason = native_tag_source::Snapshot().claim_reason;
+      }
+    }
+  }
+#endif
   const PresentStream* owner = nullptr;
   for (const auto& [key, candidate] : present_streams) {
     if (!candidate.d3d11 && candidate.prefg_target_valid
@@ -1645,7 +1685,7 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
   unsigned long long frame_id = 0;
   if (NVSDK_NGX_FAILED(parameters->Get(NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID, &frame_id))) frame_id = 0;
 #if defined(NR_NEXUS_DEV_CONTROL)
-  uint64_t claimed_tag_epoch = 0;
+  uint64_t claimed_tag_epoch = (diagnostic.tag_input_claimed ? diagnostic.tag_input_frame.epoch : 0);
   if (index > 1) {
     const auto previous = fg_service::streams.find({true, reinterpret_cast<uintptr_t>(owner)});
     if (previous != fg_service::streams.end() && previous->second.native_edit_reuse
@@ -1676,9 +1716,10 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
       && !native_fg_public_off.load() && current_guides && !fg::xefg::Enabled()
       && !nr_adaptive_enabled.load();
   if (native_edit_route && native_tag_frame && index == 1) {
-    // Claim this actual NGX input even when NR needs a warm-up. Tag return
-    // establishes identity; the SDK consumer list owns its GPU ordering.
-    native_edit_route = native_tag_source::ClaimFrame(native_frame, hudless, list);
+    native_edit_route = diagnostic.tag_input_claimed
+        && tagged_frame.epoch == diagnostic.tag_input_frame.epoch
+        && tagged_frame.frame == diagnostic.tag_input_frame.frame
+        && tagged_frame.generation == diagnostic.tag_input_frame.generation;
   }
   // Preserve the producer's uint32 identity including frame zero. Wrap is a
   // discontinuity to the cache, rather than an invented application clock.

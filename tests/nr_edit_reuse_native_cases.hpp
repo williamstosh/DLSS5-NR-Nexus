@@ -239,6 +239,7 @@ int Run() {
       bool update_source = true;
       bool reject_motion = false;
       TagCopy tag_copy = TagCopy::NONE;
+      bool owner_ready = true;
     };
     struct Observation {
       bool replaced = false;
@@ -294,7 +295,47 @@ int Run() {
         ID3D12Resource* original = nullptr;
         {
           const addon::RuntimeLock lock(native::runtime_mutex);
-          original = native::RunNativePreFg(gpu.list.Get(), &parameters, handle, &observed.replaced);
+          if (request.owner_ready) {
+            original = native::RunNativePreFg(gpu.list.Get(), &parameters, handle, &observed.replaced);
+          } else {
+            const auto streams_before = native::fg_service::streams.size();
+            const auto features_before = native::features.size();
+            const auto creates_before = native::nr_features_created;
+            const auto evaluates_before = model_calls;
+            const auto claims_before = tag_source::Snapshot().claim_count;
+            const auto& existing = native::fg_service::streams.at({true, context});
+            auto* cached_before = existing.cached;
+            const auto serial_before = existing.native_serial;
+            const auto frame_before = existing.application_frame;
+            const bool owner_valid = owner.prefg_target_valid;
+            owner.prefg_target_valid = false;
+            try {
+              original = native::RunNativePreFg(gpu.list.Get(), &parameters, handle, &observed.replaced);
+            } catch (...) {
+              owner.prefg_target_valid = owner_valid;
+              throw;
+            }
+            owner.prefg_target_valid = owner_valid;
+            Check(original == nullptr && !observed.replaced && model_calls == evaluates_before
+                    && native::features.size() == features_before && native::nr_features_created == creates_before
+                    && native::fg_service::streams.size() == streams_before
+                    && native::fg_service::streams.contains({true, context}),
+                "owner-unavailable direct consumption creates neither NR work nor a native service stream");
+            const auto& unchanged = native::fg_service::streams.at({true, context});
+            Check(unchanged.cached == cached_before && unchanged.native_serial == serial_before
+                    && unchanged.application_frame == frame_before,
+                "owner-unavailable consumption cannot create or advance the previous output cache");
+            const auto claimed = tag_source::Snapshot();
+            const auto exact = tag_source::CurrentFrame(input_hudless, gpu.list.Get(), claimed.claim_epoch);
+            Check(claimed.claim_count == claims_before + 1 && claimed.claim_epoch != 0
+                    && std::strcmp(claimed.claim_reason, "direct_claimed") == 0
+                    && exact.available && exact.frame == request.token && exact.epoch == claimed.claim_epoch
+                    && !tag_source::CurrentFrame(input_hudless, gpu.list.Get()).available,
+                "real index-one consumption claims its unique direct tag even before an NR owner is ready");
+            Check(!submission::ResourceReleasable(input_hudless)
+                    && submission::OnlyRecordingUses(input_hudless, submission::RecordingIdentity(gpu.list.Get())),
+                "owner-unavailable direct claim tracks the actual original resource in its consuming recording");
+          }
         }
         auto* bound_hudless = native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_HUDLess);
         if (observed.replaced) {
@@ -632,6 +673,11 @@ int Run() {
       const addon::RuntimeLock lock(native::runtime_mutex);
       tag_source::Reset();
     }
+    const auto owner_unavailable = record({.token = ++token, .tag_copy = TagCopy::DIRECT, .owner_ready = false});
+    Check(!owner_unavailable.replaced && owner_unavailable.evaluates == 0 && owner_unavailable.reuses == 0
+            && matches(owner_unavailable.consumed_back, source_back)
+            && matches(owner_unavailable.restored_back, source_back),
+        "direct FG consumption before owner readiness leaves current color intact without NR or cache output");
     recover(TagCopy::DIRECT);
     Check(direct_warmup_mfg_checked, "direct source completes preparation after an observed warmup MFG turn");
     const auto direct_refresh = record({.token = ++token, .reset = true, .tag_copy = TagCopy::DIRECT});
@@ -700,6 +746,7 @@ int Run() {
                  " direct_UntilPresent_no_clone=checked direct_refresh_reuse_refresh=1/0/1 direct_pending_ambiguity=denied"
                  " direct_warmup_MFG_claim=stable"
                  " direct_unclaimed_recorded_overwrite=invalidated_and_retained"
+                 " direct_owner_unavailable=claimed_and_tracked_without_NR"
                  " refresh_reuse_refresh=1/0/1 repeated_MFG=stable current_color_alpha=checked"
                  " motion_rejection/reset/gap/off/missing_scope/FG_failure/retirement=checked"
                  " production_Execute_and_Fence=real NR=MOCK FG_consumer=readback no_game_or_visual_acceptance\n";
