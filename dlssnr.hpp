@@ -22396,6 +22396,41 @@ inline sl::Result HookedStreamlineSetTag(
   return real_streamline_set_tag(viewport, tags, num_tags, command_buffer);
 }
 
+#if defined(NR_NEXUS_DEV_CONTROL)
+// The common plugin records its volatile-tag copy on the base list, bypassing
+// both known proxy layers. Keep an owned reference while observing that call.
+inline ID3D12GraphicsCommandList* NativeStreamlineTagList(sl::CommandBuffer* command_buffer) {
+  if (command_buffer == nullptr || vulkan_device_seen.load(std::memory_order_relaxed)) return nullptr;
+  ID3D12GraphicsCommandList* list = nullptr;
+  if (FAILED(reinterpret_cast<IUnknown*>(command_buffer)->QueryInterface(IID_PPV_ARGS(&list))) || list == nullptr) {
+    return nullptr;
+  }
+  const auto unwrap_reshade = [&] {
+    auto* native = list;
+    renodx::utils::directx::NativeFromReShadeProxy(&native);
+    if (native != list) {
+      native->AddRef();
+      list->Release();
+      list = native;
+    }
+  };
+  unwrap_reshade();
+  static constexpr GUID kStreamlineRetrieveBaseInterface = {
+      0xADEC44E2, 0x61F0, 0x45C3, {0xAD, 0x9F, 0x1B, 0x37, 0x37, 0x92, 0x84, 0xFF}};
+  IUnknown* base = nullptr;
+  if (SUCCEEDED(list->QueryInterface(kStreamlineRetrieveBaseInterface, reinterpret_cast<void**>(&base))) && base != nullptr) {
+    ID3D12GraphicsCommandList* native = nullptr;
+    if (SUCCEEDED(base->QueryInterface(IID_PPV_ARGS(&native))) && native != nullptr) {
+      list->Release();
+      list = native;
+    }
+    base->Release();
+  }
+  unwrap_reshade();
+  return list;
+}
+#endif
+
 inline sl::Result HookedStreamlineSetTagForFrame(
     const sl::FrameToken& frame,
     const sl::ViewportHandle& viewport,
@@ -22416,8 +22451,31 @@ inline sl::Result HookedStreamlineSetTagForFrame(
         static_cast<uint32_t>(viewport), tags, num_tags,
         static_cast<uint32_t>(frame));
   }
+#if defined(NR_NEXUS_DEV_CONTROL)
+  std::unique_ptr<ID3D12GraphicsCommandList, void (*)(ID3D12GraphicsCommandList*)> tag_list(
+      nullptr, [](ID3D12GraphicsCommandList* list) { if (list != nullptr) list->Release(); });
+  std::optional<native_tag_source::Scope> tag_source;
+  const bool has_hudless_tag = tags != nullptr && std::any_of(tags, tags + num_tags,
+      [](const sl::ResourceTag& tag) { return tag.type == sl::kBufferTypeHUDLessColor; });
+  if (enabled.load() && edit_reuse_enabled.load() && edit_reuse_fg_experiment.load()
+      && hook_point.load() == kHookPresent && !shutting_down.load() && has_hudless_tag && !fg::xefg::Enabled()) {
+    tag_list.reset(NativeStreamlineTagList(command_buffer));
+    bool hooks_ready = false;
+    if (tag_list != nullptr) {
+      RuntimeLock lock(runtime_mutex);
+      hooks_ready = InstallCommandListStateHooks(tag_list.get()) && InstallMixedPresentCopyHooks(tag_list.get());
+    }
+    if (hooks_ready) {
+      tag_source.emplace(tag_list.get(), static_cast<uint32_t>(frame), static_cast<uint32_t>(viewport), tags, num_tags);
+    }
+  }
+  const auto result = real_streamline_set_tag_for_frame(frame, viewport, tags, num_tags, command_buffer);
+  if (tag_source) tag_source->Finish(result == sl::Result::eOk);
+  return result;
+#else
   return real_streamline_set_tag_for_frame(
       frame, viewport, tags, num_tags, command_buffer);
+#endif
 }
 
 // slFreeResources, one detour per feature plugin.  A title frees a
@@ -26383,6 +26441,9 @@ inline void RecreateFeaturesLocked() {
   processed_outputs.clear();
   processed_render_outputs.clear();
   streamline_viewports.clear();
+#if defined(NR_NEXUS_DEV_CONTROL)
+  native_tag_source::Reset();
+#endif
   if (direct_api.module == nullptr) direct_load_state = DirectLoadState::Unknown;
   direct_runtime_failed = false;
   for (auto& [_, feature] : features) {

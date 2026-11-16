@@ -2829,6 +2829,9 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
 
 // The observer is declared here because the native copy detours must be
 // installed before the first candidate SR output is handed back to the game.
+#if defined(NR_NEXUS_DEV_CONTROL)
+#include "native_fg_tag_source.hpp"
+#endif
 inline void ObserveMixedPresentCopy(ID3D12GraphicsCommandList* list,
     ID3D12Resource* source, ID3D12Resource* destination, bool full = true);
 using MixedCopyResourceFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12Resource*, ID3D12Resource*);
@@ -2852,6 +2855,9 @@ inline void STDMETHODCALLTYPE HookedMixedCopyResource(ID3D12GraphicsCommandList*
   const MixedCopyForwardScope copy_scope;
   real_mixed_copy_resource(list, destination, source);
   if (!copy_scope.outermost) return;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  GuardHook([&] { native_tag_source::ObserveCopy(list, source, destination, true); });
+#endif
   GuardHook([&] { ObserveMixedPresentCopy(list, source, destination); });
 }
 inline void STDMETHODCALLTYPE HookedMixedCopyRegion(ID3D12GraphicsCommandList* list,
@@ -2864,6 +2870,9 @@ inline void STDMETHODCALLTYPE HookedMixedCopyRegion(ID3D12GraphicsCommandList* l
   const bool full = x == 0 && y == 0 && z == 0 && box == nullptr
       && source->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && source->SubresourceIndex == 0
       && destination->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && destination->SubresourceIndex == 0;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  GuardHook([&] { native_tag_source::ObserveCopy(list, source->pResource, destination->pResource, full); });
+#endif
   GuardHook([&] { ObserveMixedPresentCopy(list, source->pResource, destination->pResource, full); });
 }
 inline bool InstallMixedPresentCopyHooks(ID3D12GraphicsCommandList* list) {

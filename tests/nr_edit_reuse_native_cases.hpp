@@ -11,6 +11,7 @@
 #include <exception>
 #include <iostream>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #include <DirectXPackedVector.h>
@@ -22,6 +23,7 @@
 namespace nr_edit_reuse_native_cases {
 namespace addon = renodx::addons::dlss5;
 namespace frame_source = addon::fg::native_options::frame_source;
+namespace tag_source = native::native_tag_source;
 using stage_execution_cases::Capture;
 using stage_execution_cases::Snapshot;
 
@@ -119,6 +121,7 @@ int Run() {
     native::core_destroy_parameters = addon::bridge::DestroyOwnedParameters;
     Check(native::InstallQueueCompletionHooks(gpu.queue.Get()), "native edit production Execute hook");
     Check(native::InstallCommandListStateHooks(gpu.list.Get()), "native edit production command-list hooks");
+    Check(native::InstallMixedPresentCopyHooks(gpu.list.Get()), "native tag-copy production CopyResource observer");
     const auto submit = [&] {
       // Let production Execute hooks attach the proof; Gpu::Submit also
       // reserves a synthetic host proof and is deliberately not used here.
@@ -140,10 +143,16 @@ int Run() {
       Check(SUCCEEDED(gpu.list->Reset(gpu.allocator.Get(), nullptr)), "native edit list Reset");
       // Keep the production callback that saves the exact completed native
       // producer receipt before its list generation is pruned.
-      native::PruneCompletedSubmissionUses();
+      {
+        const addon::RuntimeLock lock(native::runtime_mutex);
+        native::PruneCompletedSubmissionUses();
+      }
       gpu.uploads.clear();
       gpu.retained_resources.clear();
-      native::DrainRetiredResources(true);
+      {
+        const addon::RuntimeLock lock(native::runtime_mutex);
+        native::DrainRetiredResources(true);
+      }
     };
     submit();
     const auto upload = [&](ID3D12Resource* resource, const auto& values, D3D12_RESOURCE_STATES before) {
@@ -155,6 +164,7 @@ int Run() {
     };
     auto backbuffer = gpu.Texture(width, height, DXGI_FORMAT_R10G10B10A2_UNORM);
     auto hudless = gpu.Texture(width, height, DXGI_FORMAT_R10G10B10A2_UNORM);
+    auto hudless_clone = gpu.Texture(width, height, DXGI_FORMAT_R10G10B10A2_UNORM);
     auto ui = gpu.Texture(width, height, DXGI_FORMAT_R8G8B8A8_UNORM);
     auto depth = gpu.Texture(width, height, DXGI_FORMAT_R32G8X24_TYPELESS);
     auto motion = gpu.Texture(width, height, DXGI_FORMAT_R16G16_FLOAT);
@@ -207,10 +217,19 @@ int Run() {
     native::native_fg_owns = true;
     const auto context = reinterpret_cast<uintptr_t>(&owner);
     const auto output_identity = reinterpret_cast<uintptr_t>(owner.native_output_identity);
+    ComPtr<ID3D12CommandAllocator> proof_allocator;
+    ComPtr<ID3D12GraphicsCommandList> proof_list;
+    Check(SUCCEEDED(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&proof_allocator)))
+            && SUCCEEDED(gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, proof_allocator.Get(),
+                nullptr, IID_PPV_ARGS(&proof_list)))
+            && native::InstallCommandListStateHooks(proof_list.Get()),
+        "tag-copy proof query uses a separate real recording");
     frame_source::Activate();
     std::vector<uint32_t> source_back(width * height), source_hudless(width * height);
     std::vector<uint8_t> source_ui(width * height * 4);
     bool initialized = false;
+    bool clone_initialized = false;
+    enum class TagCopy { NONE, SUCCESS, FAILED, OVERWRITTEN };
     struct Request {
       uint32_t token = 0;
       bool reset = false;
@@ -219,6 +238,7 @@ int Run() {
       bool fg_success = true;
       bool update_source = true;
       bool reject_motion = false;
+      TagCopy tag_copy = TagCopy::NONE;
     };
     struct Observation {
       bool replaced = false;
@@ -261,6 +281,8 @@ int Run() {
         upload(motion.Get(), motion_values, before);
         initialized = true;
       }
+      auto* input_hudless = (request.tag_copy != TagCopy::NONE ? hudless_clone.Get() : hudless.Get());
+      parameters.Set(NVSDK_NGX_DLSSG_Parameter_HUDLess, input_hudless);
       parameters.Set(NVSDK_NGX_DLSSG_Parameter_Reset, request.reset ? 1u : 0u);
       parameters.Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, request.index);
       Observation observed;
@@ -268,13 +290,17 @@ int Run() {
       const auto before_reuses = native::edit_reuse_reuses.load();
       Snapshot consumed_back, consumed_hudless, restored_back, original_hudless, unchanged_ui;
       const auto consume = [&] {
-        auto* original = native::RunNativePreFg(gpu.list.Get(), &parameters, handle, &observed.replaced);
+        ID3D12Resource* original = nullptr;
+        {
+          const addon::RuntimeLock lock(native::runtime_mutex);
+          original = native::RunNativePreFg(gpu.list.Get(), &parameters, handle, &observed.replaced);
+        }
         auto* bound_hudless = native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_HUDLess);
         if (observed.replaced) {
-          Check(original == hudless.Get() && bound_hudless != hudless.Get() && bound_hudless != backbuffer.Get(),
+          Check(original == input_hudless && bound_hudless != input_hudless && bound_hudless != backbuffer.Get(),
               "native FG consumes a private HUDLess result and returns the borrowed original binding");
         } else {
-          Check(original == nullptr && bound_hudless == hudless.Get(),
+          Check(original == nullptr && bound_hudless == input_hudless,
               "unprepared native input keeps its original HUDLess binding");
         }
         Check(native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_UIAlpha) == ui.Get(),
@@ -282,15 +308,79 @@ int Run() {
         consumed_back = Capture(gpu, backbuffer.Get(), NATIVE_INPUT_STATE);
         consumed_hudless = Capture(gpu, bound_hudless, NATIVE_INPUT_STATE);
         native::RestoreNativePreFg(gpu.list.Get(), &parameters, original, request.fg_success, handle, observed.replaced);
-        Check(native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_HUDLess) == hudless.Get()
+        Check(native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_HUDLess) == input_hudless
                 && native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_UI) == nullptr
                 && native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_UIAlpha) == ui.Get(),
             "native FG success/failure restores original HUDLess/UI/alpha bindings");
         restored_back = Capture(gpu, backbuffer.Get(), NATIVE_INPUT_STATE);
-        original_hudless = Capture(gpu, hudless.Get(), NATIVE_INPUT_STATE);
+        original_hudless = Capture(gpu, input_hudless, NATIVE_INPUT_STATE);
         unchanged_ui = Capture(gpu, ui.Get(), NATIVE_INPUT_STATE);
       };
-      if (request.source_scope) {
+      if (request.tag_copy != TagCopy::NONE) {
+        const auto producer_thread = GetCurrentThreadId();
+        if (request.update_source) {
+          FakeFrameToken frame;
+          frame.frame = request.token;
+          Check(frame_source::ObserveMarker(+[](sl::PCLMarker, const sl::FrameToken&) { return sl::Result::eOk; },
+                    sl::PCLMarker::ePresentStart, frame) == sl::Result::eOk,
+              "tag producer enters the actual successful Reflex marker observer");
+          {
+            const frame_source::SdkScope sdk_scope(output_identity);
+            sl::Resource resource(sl::ResourceType::eTex2d, hudless.Get(), NATIVE_INPUT_STATE);
+            const sl::ResourceTag tag(&resource, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eOnlyValidNow);
+            const sl::ViewportHandle viewport(0u);
+            tag_source::Scope tag_scope(gpu.list.Get(), static_cast<uint32_t>(frame),
+                static_cast<uint32_t>(viewport), &tag, 1);
+            gpu.Transition(hudless.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            gpu.Transition(hudless_clone.Get(), clone_initialized ? NATIVE_INPUT_STATE : D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_DEST);
+            // Only the installed production CopyResource observer may bind
+            // this destination to the tag. Do not call ObserveCopy directly.
+            gpu.list->CopyResource(hudless_clone.Get(), hudless.Get());
+            gpu.Transition(hudless_clone.Get(), D3D12_RESOURCE_STATE_COPY_DEST, NATIVE_INPUT_STATE);
+            gpu.Transition(hudless.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, NATIVE_INPUT_STATE);
+            clone_initialized = true;
+            tag_scope.Finish(request.tag_copy != TagCopy::FAILED);
+          }
+          Check(frame_source::ObserveMarker(+[](sl::PCLMarker, const sl::FrameToken&) { return sl::Result::eOk; },
+                    sl::PCLMarker::ePresentEnd, frame) == sl::Result::eOk,
+              "producer Present and Reflex scopes finish before deferred NGX consumption");
+          {
+            const addon::RuntimeLock lock(native::runtime_mutex);
+            Check(!tag_source::CurrentFrame(hudless_clone.Get(), proof_list.Get()).available,
+                "an unsubmitted or failed tag-copy cannot authorize a foreign recording");
+          }
+          submit();
+          if (request.tag_copy == TagCopy::OVERWRITTEN) {
+            gpu.Transition(backbuffer.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            gpu.Transition(hudless_clone.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_DEST);
+            gpu.list->CopyResource(hudless_clone.Get(), backbuffer.Get());
+            gpu.Transition(hudless_clone.Get(), D3D12_RESOURCE_STATE_COPY_DEST, NATIVE_INPUT_STATE);
+            gpu.Transition(backbuffer.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, NATIVE_INPUT_STATE);
+            submit();
+          }
+        }
+        std::exception_ptr consumer_failure;
+        std::thread consumer([&] {
+          try {
+            Check(GetCurrentThreadId() != producer_thread
+                    && !addon::fg::native_options::CurrentFrame(output_identity).available,
+                "deferred NGX consumes on another thread with no producer TLS ticket");
+            {
+              const addon::RuntimeLock lock(native::runtime_mutex);
+              const auto tagged = tag_source::CurrentFrame(hudless_clone.Get(), gpu.list.Get());
+              const bool expected = request.tag_copy == TagCopy::SUCCESS;
+              Check(tagged.available == expected && (!expected || tagged.frame == request.token),
+                  "only a successful unchanged completed clone retains its actual tagged FrameToken");
+            }
+            consume();
+          } catch (...) {
+            consumer_failure = std::current_exception();
+          }
+        });
+        consumer.join();
+        if (consumer_failure != nullptr) std::rethrow_exception(consumer_failure);
+      } else if (request.source_scope) {
         FakeFrameToken token;
         token.frame = request.token;
         Check(frame_source::ObserveMarker(+[](sl::PCLMarker, const sl::FrameToken&) { return sl::Result::eOk; },
@@ -313,8 +403,9 @@ int Run() {
       observed.consumed_hudless = consumed_hudless.Pixels();
       observed.restored_back = restored_back.Pixels();
       const auto original_hudless_pixels = original_hudless.Pixels();
-      Check(original_hudless_pixels.size() == source_hudless.size() * sizeof(uint32_t)
-              && std::memcmp(original_hudless_pixels.data(), source_hudless.data(), source_hudless.size() * sizeof(uint32_t)) == 0,
+      const auto& current_hudless = (request.tag_copy == TagCopy::OVERWRITTEN ? source_back : source_hudless);
+      Check(original_hudless_pixels.size() == current_hudless.size() * sizeof(uint32_t)
+              && std::memcmp(original_hudless_pixels.data(), current_hudless.data(), current_hudless.size() * sizeof(uint32_t)) == 0,
           "FG never mutates the game's original HUDLess pixels");
       Check(unchanged_ui.Pixels() == source_ui, "FG never mutates original UI/alpha pixels");
       return observed;
@@ -324,9 +415,9 @@ int Run() {
           && std::memcmp(pixels.data(), source.data(), pixels.size()) == 0;
     };
     uint32_t token = 100;
-    const auto recover = [&] {
+    const auto recover = [&](TagCopy tag_copy = TagCopy::NONE) {
       for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 12; ++attempt) {
-        const auto observed = record({.token = ++token, .reset = true});
+        const auto observed = record({.token = ++token, .reset = true, .tag_copy = tag_copy});
         Check(observed.reuses == 0, "native recovery cannot reuse an invalidated edit anchor");
         if (observed.replaced && observed.evaluates == 1) return;
       }
@@ -424,24 +515,68 @@ int Run() {
         "explicit native FG Off retains the original safe path without cached edits");
     native::OnNativeFgOptions(true);
     recover();
+    {
+      const addon::RuntimeLock lock(native::runtime_mutex);
+      tag_source::Reset();
+    }
+    recover(TagCopy::SUCCESS);
+    const auto tagged_refresh = record({.token = ++token, .reset = true, .tag_copy = TagCopy::SUCCESS});
+    Check(tagged_refresh.replaced && tagged_refresh.evaluates == 1 && tagged_refresh.reuses == 0
+            && tagged_refresh.reset == 1,
+        "deferred native tag-copy produces one actual-model refresh after producer scopes end");
+    auto tagged_anchor = native::features.at(role_handle).slots[0].edit_reuse;
+    Check(tagged_anchor != nullptr && tagged_anchor->valid, "deferred native tag-copy establishes a private edit anchor");
+    const auto tagged_anchor_generation = tagged_anchor->anchor_generation;
+    const auto tagged_reuse = record({.token = ++token, .tag_copy = TagCopy::SUCCESS});
+    Check(tagged_reuse.replaced && tagged_reuse.evaluates == 0 && tagged_reuse.reuses == 1
+            && matches(tagged_reuse.consumed_back, source_back)
+            && matches(tagged_reuse.consumed_hudless, source_hudless),
+        "a subsequent completed tag-copy reuses edits on another thread with current PQ colors and alpha");
+    const auto tagged_application_frame = stream.application_frame;
+    const auto tagged_native_frame = stream.native_edit_frame;
+    const auto tagged_mfg = record({.token = token, .index = 2, .update_source = false, .tag_copy = TagCopy::SUCCESS});
+    Check(tagged_mfg.replaced && tagged_mfg.evaluates == 0 && tagged_mfg.reuses == 0
+            && stream.application_frame == tagged_application_frame && stream.native_edit_frame == tagged_native_frame
+            && tagged_anchor->anchor_generation == tagged_anchor_generation,
+        "deferred MFG reconsumes the same tagged clone without advancing NR or cache cadence");
+    const auto tagged_next = record({.token = ++token, .tag_copy = TagCopy::SUCCESS});
+    Check(tagged_next.replaced && tagged_next.evaluates == 1 && tagged_next.reuses == 0 && tagged_next.reset == 0,
+        "next real tagged token refreshes after deferred reuse without a false history Reset");
+    tagged_anchor.reset();
+    for (const auto denied : {TagCopy::FAILED, TagCopy::OVERWRITTEN}) {
+      const auto fallback = record({.token = ++token, .tag_copy = denied});
+      Check(!fallback.replaced && fallback.evaluates == 0 && fallback.reuses == 0
+              && matches(fallback.restored_back, source_back),
+          "failed or overwritten tag-copy rejects the old edit cache and preserves the current original BB");
+      recover(TagCopy::SUCCESS);
+    }
     auto final_anchor = native::features.at(role_handle).slots[0].edit_reuse;
     Check(final_anchor != nullptr, "recovered native output owns its final private cache");
     std::weak_ptr<addon::edit_reuse::State> retired_anchor = final_anchor;
     final_anchor.reset();
     frame_source::Stop();
-    native::RetirePresentStream(nullptr);
-    native::ForgetSourceHandleLocked(handle);
+    {
+      const addon::RuntimeLock lock(native::runtime_mutex);
+      tag_source::Reset();
+      Check(!tag_source::CurrentFrame(hudless_clone.Get(), gpu.list.Get()).available,
+          "tag-source retirement cannot expose a completed old clone ticket");
+      native::RetirePresentStream(nullptr);
+      native::ForgetSourceHandleLocked(handle);
+    }
     submit();
     Check(!native::fg_service::streams.contains({true, context}) && !native::features.contains(role_handle)
             && retired_anchor.expired() && native::retired_nr_features.empty()
             && native::retired_final_resources.empty(),
         "native source retirement releases all edit caches, models and worksets after actual Fence completion");
     native::edit_reuse_fg_experiment = false;
+    Check(SUCCEEDED(proof_list->Close()), "close the unsubmitted foreign proof-query list");
     nr_edit_reuse_xefg_cases::model_pixels.clear();
     model_gpu = nullptr;
     check_debug();
     std::cout << "PASS native Pre-FG x2 evidence=WARP+MOCK format=HDR10-PQ roles=BB+HUDLess+UIAlpha"
                  " frame_source=Reflex_PresentStart_and_SDK_scope numeric_NGX_FrameID=absent"
+                 " deferred_frame_source=tag_scope_MOCK_CopyResource_real cross_thread_after_PresentEnd=checked"
+                 " deferred_refresh_reuse_refresh=1/0/1 tag_unsubmitted/failed/overwritten=denied"
                  " refresh_reuse_refresh=1/0/1 repeated_MFG=stable current_color_alpha=checked"
                  " motion_rejection/reset/gap/off/missing_scope/FG_failure/retirement=checked"
                  " production_Execute_and_Fence=real NR=MOCK FG_consumer=readback no_game_or_visual_acceptance\n";
@@ -449,6 +584,10 @@ int Run() {
   } catch (const std::exception& error) {
     fail_call = 0;
     frame_source::Stop();
+    {
+      const addon::RuntimeLock lock(native::runtime_mutex);
+      tag_source::Reset();
+    }
     native::edit_reuse_fg_experiment = false;
     std::cerr << "nr-edit-reuse-native-contracts: " << error.what() << '\n';
     return 1;
