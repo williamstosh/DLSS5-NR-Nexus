@@ -1659,13 +1659,33 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     const auto now = SteadyNowNs();
     if (observations < 32 && now - last_observation_ns >= 1'000'000'000) {
       last_observation_ns = now;
+      const auto observation = fg::native_options::frame_source::Snapshot();
       std::ostringstream line;
       line << "NR native edit source: available=" << native_frame.available
            << " reason=" << native_frame.reason << " token=" << native_frame.frame
            << " epoch=" << native_frame.epoch << " generation=" << native_frame.generation
            << " parameters=" << frame_parameters << " index=" << declared_index
            << " real_guides=" << current_guides << " route=" << native_edit_route
-           << " log_budget=" << ++observations << "/32";
+           << " hook_facts=" << fg::native_options::FrameHookFacts()
+           << " sdk_ready=" << fg::native_options::ObservesPresentDecisions()
+           << " current_thread=" << observation.current_thread << " tls_depth=" << observation.tls_depth
+           << " binding_active=" << observation.binding_active << " binding_available=" << observation.binding_available
+           << " marker_published=" << observation.marker_published << " marker_thread=" << observation.marker_thread
+           << " sampled_epoch=" << observation.marker_epoch << " marker_reason=" << observation.marker_reason
+           << " sdk_enters=" << observation.events.sdk_enters << " sdk_exits=" << observation.events.sdk_exits
+           << " sdk_active=" << observation.events.sdk_active
+           << " event_sequence=" << observation.events.sequence << " sampled_qpc=" << observation.qpc
+           << " feature=" << handle << " output=" << owner->native_output_identity << " list=" << list;
+      const auto append_event = [&](const char* name, const fg::native_options::frame_source::Event& event) {
+        line << ' ' << name << "=[seq:" << event.sequence << ",qpc:" << event.qpc
+             << ",thread:" << event.thread << ",marker:" << event.marker << ",frame:" << event.frame
+             << ",output:" << event.output << ",depth:" << event.depth << ",ok:" << event.success << ']';
+      };
+      append_event("marker_enter", observation.events.marker_enter);
+      append_event("marker_return", observation.events.marker_return);
+      append_event("sdk_enter", observation.events.sdk_enter);
+      append_event("sdk_exit", observation.events.sdk_exit);
+      line << " log_budget=" << ++observations << "/32";
       LogPresent(reshade::log::level::info, line.str());
     }
   }

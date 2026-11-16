@@ -23,6 +23,28 @@ struct Frame {
   const char* reason = "reflex_marker_unobserved";
 };
 
+struct Event {
+  uint64_t sequence = 0;
+  int64_t qpc = 0;
+  DWORD thread = 0;
+  uint32_t marker = 0;
+  uint32_t frame = 0;
+  uintptr_t output = 0;
+  uint32_t depth = 0;
+  // A real marker return only; SDK scope events do not report SDK success.
+  bool success = false;
+};
+struct Events {
+  uint64_t sequence = 0;
+  Event marker_enter;
+  Event marker_return;
+  Event sdk_enter;
+  Event sdk_exit;
+  uint64_t sdk_enters = 0;
+  uint64_t sdk_exits = 0;
+  uint64_t sdk_active = 0;
+};
+
 struct Metadata {
   uint64_t generation = 1;
   uint64_t epoch = 0;
@@ -33,6 +55,7 @@ struct Metadata {
   bool claimed = false;
   bool stopped = false;
   const char* reason = "reflex_marker_unobserved";
+  Events events;
 };
 struct State {
   std::shared_mutex mutex;
@@ -46,6 +69,50 @@ struct Binding {
   bool active = false;
 };
 static thread_local Binding sdk_binding;
+static thread_local uint32_t sdk_depth = 0;
+
+inline int64_t Qpc() {
+  LARGE_INTEGER value{};
+  QueryPerformanceCounter(&value);
+  return value.QuadPart;
+}
+
+// This sequence describes CPU observations only, never source-frame or GPU progress.
+inline Event NextEvent(Metadata* metadata) {
+  return {.sequence = ++metadata->events.sequence, .qpc = Qpc(), .thread = GetCurrentThreadId()};
+}
+
+struct ObservationSnapshot {
+  Events events;
+  bool marker_published = false;
+  bool marker_claimed = false;
+  uint32_t marker_frame = 0;
+  DWORD marker_thread = 0;
+  uint32_t marker_in_flight = 0;
+  uint64_t marker_epoch = 0;
+  uint64_t generation = 0;
+  const char* marker_reason = "reflex_marker_unobserved";
+  DWORD current_thread = 0;
+  uint32_t tls_depth = 0;
+  uintptr_t current_output = 0;
+  bool binding_active = false;
+  // Captured grant only. CurrentFrame still revalidates the current epoch.
+  bool binding_available = false;
+  uint32_t binding_frame = 0;
+  uint64_t binding_epoch = 0;
+  int64_t qpc = 0;
+};
+
+inline ObservationSnapshot Snapshot() {
+  std::shared_lock lock(state.mutex);
+  const auto& metadata = state.metadata;
+  return {.events = metadata.events, .marker_published = metadata.published, .marker_claimed = metadata.claimed,
+      .marker_frame = metadata.frame, .marker_thread = metadata.thread, .marker_in_flight = metadata.in_flight,
+      .marker_epoch = metadata.epoch, .generation = metadata.generation, .marker_reason = metadata.reason,
+      .current_thread = GetCurrentThreadId(), .tls_depth = sdk_depth, .current_output = sdk_binding.output,
+      .binding_active = sdk_binding.active, .binding_available = sdk_binding.source.available,
+      .binding_frame = sdk_binding.source.frame, .binding_epoch = sdk_binding.source.epoch, .qpc = Qpc()};
+}
 
 inline void Activate() {
   std::unique_lock lock(state.mutex);
@@ -84,9 +151,12 @@ struct MarkerCall {
     tracked = marker == sl::PCLMarker::ePresentStart || marker == sl::PCLMarker::ePresentEnd
         || marker == sl::PCLMarker::eRenderSubmitEnd
         || marker == sl::PCLMarker::eOutOfBandPresentStart || marker == sl::PCLMarker::eOutOfBandPresentEnd;
-    if (!tracked) return;
     std::unique_lock lock(state.mutex);
     auto& metadata = state.metadata;
+    metadata.events.marker_enter = NextEvent(&metadata);
+    metadata.events.marker_enter.marker = static_cast<uint32_t>(marker);
+    metadata.events.marker_enter.frame = frame;
+    if (!tracked) return;
     if (metadata.stopped) return;
     ticket = ++metadata.epoch;
     generation = metadata.generation;
@@ -101,6 +171,10 @@ struct MarkerCall {
     finished = true;
     std::unique_lock lock(state.mutex);
     auto& metadata = state.metadata;
+    metadata.events.marker_return = NextEvent(&metadata);
+    metadata.events.marker_return.marker = static_cast<uint32_t>(marker);
+    metadata.events.marker_return.frame = frame;
+    metadata.events.marker_return.success = success;
     if (!tracked) {
       if (!success && !metadata.stopped) {
         ++metadata.epoch;
@@ -151,8 +225,19 @@ inline sl::Result ObserveMarker(SetMarker real, sl::PCLMarker marker, const sl::
 
 struct SdkScope {
   Binding previous;
+  uintptr_t diagnostic_output;
 
-  explicit SdkScope(uintptr_t output, bool enabled = true) : previous(sdk_binding) {
+  explicit SdkScope(uintptr_t output, bool enabled = true) : previous(sdk_binding), diagnostic_output(output) {
+    ++sdk_depth;
+    {
+      std::unique_lock lock(state.mutex);
+      auto& metadata = state.metadata;
+      ++metadata.events.sdk_enters;
+      ++metadata.events.sdk_active;
+      metadata.events.sdk_enter = NextEvent(&metadata);
+      metadata.events.sdk_enter.output = output;
+      metadata.events.sdk_enter.depth = sdk_depth;
+    }
     if (previous.active && enabled && previous.output == output) return;
     sdk_binding = {.source = {.reason = "sdk_present_scope_unavailable"}, .output = output, .active = true};
     if (!enabled || output == 0) return;
@@ -184,7 +269,19 @@ struct SdkScope {
     sdk_binding.source.available = true;
   }
 
-  ~SdkScope() { sdk_binding = previous; }
+  ~SdkScope() {
+    {
+      std::unique_lock lock(state.mutex);
+      auto& metadata = state.metadata;
+      ++metadata.events.sdk_exits;
+      --metadata.events.sdk_active;
+      metadata.events.sdk_exit = NextEvent(&metadata);
+      metadata.events.sdk_exit.output = diagnostic_output;
+      metadata.events.sdk_exit.depth = sdk_depth;
+    }
+    --sdk_depth;
+    sdk_binding = previous;
+  }
   SdkScope(const SdkScope&) = delete;
   SdkScope& operator=(const SdkScope&) = delete;
 };

@@ -61,6 +61,18 @@ struct State {
 static State state;
 
 #if defined(NR_NEXUS_DEV_CONTROL)
+// Installation facts are separate from observed calls. These bits never grant
+// a frame; the existing bounded source log uses them to explain a missing scope.
+enum FrameHook : uint32_t {
+  OPTIONS_ATTACHED = 1u << 0,
+  REFLEX_ATTACHED = 1u << 1,
+  PRESENT_RESOLVED = 1u << 2,
+  PRESENT1_RESOLVED = 1u << 3,
+  PRESENT_ATTACHED = 1u << 4,
+  PRESENT1_ATTACHED = 1u << 5,
+};
+static std::atomic_uint32_t frame_hooks{0};
+
 struct ReflexMarkerHook {
   HMODULE module = nullptr;
   frame_source::SetMarker real = nullptr;
@@ -221,6 +233,10 @@ inline bool ObservesPresentDecisions() noexcept {
 inline frame_source::Frame CurrentFrame(uintptr_t output_identity) {
   return frame_source::CurrentFrame(output_identity);
 }
+
+inline uint32_t FrameHookFacts() {
+  return internal::frame_hooks.load(std::memory_order_acquire);
+}
 #endif
 
 // Terminal logical disable; it does not drain an already executing callback.
@@ -318,6 +334,7 @@ inline void Poll() {
           size_t failed = 0;
           internal::reflex_marker.installed = detour_guard::AttachAll(hooks, &failed) == 1;
           if (internal::reflex_marker.installed) {
+            internal::frame_hooks.fetch_or(internal::REFLEX_ATTACHED, std::memory_order_release);
             frame_source::Activate();
             if (internal::stopped.load(std::memory_order_acquire)) {
               detour_guard::Neutralize(reinterpret_cast<void* const*>(&internal::reflex_marker.real),
@@ -344,6 +361,14 @@ inline void Poll() {
   }
   void* const present = resolve(gateway, "slHookPresent");
   void* const present1 = resolve(gateway, "slHookPresent1");
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (present != nullptr && reinterpret_cast<uintptr_t>(present) - reinterpret_cast<uintptr_t>(plugin) < image_size) {
+    internal::frame_hooks.fetch_or(internal::PRESENT_RESOLVED, std::memory_order_release);
+  }
+  if (present1 != nullptr && reinterpret_cast<uintptr_t>(present1) - reinterpret_cast<uintptr_t>(plugin) < image_size) {
+    internal::frame_hooks.fetch_or(internal::PRESENT1_RESOLVED, std::memory_order_release);
+  }
+#endif
   const bool has_decisions = present != nullptr && present1 != nullptr
       && reinterpret_cast<uintptr_t>(present) - reinterpret_cast<uintptr_t>(plugin) < image_size
       && reinterpret_cast<uintptr_t>(present1) - reinterpret_cast<uintptr_t>(plugin) < image_size;
@@ -359,6 +384,11 @@ inline void Poll() {
   }};
   size_t failed = 0;
   internal::state.installed = detour_guard::AttachAll(hooks, &failed) == 1;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (internal::state.installed) {
+    internal::frame_hooks.fetch_or(internal::OPTIONS_ATTACHED, std::memory_order_release);
+  }
+#endif
   if (internal::state.installed && internal::state.get_state != nullptr) {
     const detour_guard::Hook state_hooks[] = {{
         .name = "slDLSSGGetState", .real = reinterpret_cast<void**>(&internal::state.get_state),
@@ -375,6 +405,14 @@ inline void Poll() {
     };
     internal::decisions_ready.store(detour_guard::AttachAll(present_hooks, &failed) == 2,
                                     std::memory_order_release);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (internal::state.present != nullptr) {
+      internal::frame_hooks.fetch_or(internal::PRESENT_ATTACHED, std::memory_order_release);
+    }
+    if (internal::state.present1 != nullptr) {
+      internal::frame_hooks.fetch_or(internal::PRESENT1_ATTACHED, std::memory_order_release);
+    }
+#endif
   }
 }
 

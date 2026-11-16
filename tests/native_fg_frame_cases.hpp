@@ -64,16 +64,19 @@ inline int Run() {
   struct Restore {
     source::Metadata metadata;
     source::Binding binding = source::sdk_binding;
+    uint32_t depth = source::sdk_depth;
     Restore() {
       std::unique_lock lock(source::state.mutex);
       metadata = source::state.metadata;
       source::state.metadata = {};
       source::sdk_binding = {};
+      source::sdk_depth = 0;
     }
     ~Restore() {
       std::unique_lock lock(source::state.mutex);
       source::state.metadata = metadata;
       source::sdk_binding = binding;
+      source::sdk_depth = depth;
       mock_entered = mock_release = nullptr;
       mock_token.store(nullptr);
     }
@@ -225,6 +228,63 @@ inline int Run() {
       SetEvent(events.release);
       owner.join();
       check(owner_available.load(), "a rejected foreign thread cannot steal the writer thread's fresh SDK scope");
+    }
+    {
+      const auto before = source::Snapshot();
+      const auto thread = GetCurrentThreadId();
+      check(before.current_thread == thread && before.tls_depth == 0 && !before.binding_active
+              && before.events.sdk_active == 0 && before.events.sdk_enters == before.events.sdk_exits,
+          "a pre-Present snapshot distinguishes the caller thread with no current SDK scope");
+      const FakeFrameToken frame(450);
+      source::ObserveMarker(MockMarker, sl::PCLMarker::ePresentStart, frame);
+      const auto marked = source::Snapshot();
+      check(marked.events.marker_enter.sequence > before.events.sequence
+              && marked.events.marker_return.sequence > marked.events.marker_enter.sequence
+              && marked.events.marker_enter.thread == thread && marked.events.marker_return.thread == thread
+              && marked.events.marker_enter.marker == static_cast<uint32_t>(sl::PCLMarker::ePresentStart)
+              && marked.events.marker_return.frame == 450 && marked.events.marker_return.success
+              && marked.events.marker_return.qpc >= marked.events.marker_enter.qpc && marked.marker_published,
+          "marker entry and real return have distinct ordered CPU events, QPC ticks and actual token fields");
+      uint64_t sdk_enter_sequence = 0;
+      {
+        const source::SdkScope sdk(output);
+        const auto entered = source::Snapshot();
+        sdk_enter_sequence = entered.events.sdk_enter.sequence;
+        check(entered.events.sdk_enters == before.events.sdk_enters + 1
+                && entered.events.sdk_exits == before.events.sdk_exits && entered.events.sdk_active == 1
+                && entered.events.sdk_enter.thread == thread && entered.events.sdk_enter.output == output
+                && entered.events.sdk_enter.sequence > marked.events.marker_return.sequence
+                && entered.tls_depth == 1 && entered.current_output == output
+                && entered.binding_active && entered.binding_available && entered.binding_frame == 450,
+            "the current SDK entry is distinguishable from the preceding marker and later NGX caller");
+        const auto admitted = options::CurrentFrame(output);
+        source::ObservationSnapshot foreign;
+        std::jthread reader([&] { foreign = source::Snapshot(); });
+        reader.join();
+        check(foreign.current_thread != thread && foreign.tls_depth == 0 && !foreign.binding_active
+                && foreign.events.sdk_active == 1 && foreign.events.sdk_enter.thread == thread
+                && foreign.events.sdk_enter.output == output,
+            "another NGX thread sees global active SDK work without inheriting its thread-local binding");
+        const auto after_read = options::CurrentFrame(output);
+        check(after_read.available && admitted.frame == after_read.frame && admitted.epoch == after_read.epoch
+                && source::Snapshot().events.sequence == entered.events.sequence,
+            "read-only diagnostic snapshots neither publish an event nor change frame admission");
+        {
+          const source::SdkScope nested(output);
+          const auto nested_snapshot = source::Snapshot();
+          check(nested_snapshot.tls_depth == 2 && nested_snapshot.events.sdk_active == 2
+                  && nested_snapshot.binding_available && options::CurrentFrame(output).available,
+              "SDK diagnostic depth counts same-output nesting without changing its authorization");
+        }
+      }
+      const auto returned = source::Snapshot();
+      check(returned.events.sdk_enter.sequence > sdk_enter_sequence
+              && returned.events.sdk_exit.sequence > returned.events.sdk_enter.sequence
+              && returned.events.sdk_exit.thread == thread && returned.events.sdk_exit.output == output
+              && returned.events.sdk_exit.qpc >= returned.events.sdk_enter.qpc
+              && returned.events.sdk_active == 0 && returned.events.sdk_enters == returned.events.sdk_exits
+              && returned.tls_depth == 0 && !returned.binding_active && !options::CurrentFrame(output).available,
+          "post-SDK observations expose exit ordering while preserving the original outside-scope rejection");
     }
     {
       Events events;
