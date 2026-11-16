@@ -12,6 +12,11 @@
 namespace renodx::addons::dlss5::ui::lang {
 
 inline constexpr Translation kTr[] = {
+    {"x2 edit reuse (experimental)", "x2 düzenleme yeniden kullanımı (deneysel)"},
+    {"Refresh NR once per two base frames and reproject its edit onto the next frame to reduce GPU work. Upscaling still runs every frame; x2 is separate from the FG multiplier. Turn off if motion, lighting or frame pacing looks worse.", "GPU işini azaltmak için NR'yi iki temel karede bir yeniler ve düzenlemeyi sonraki kareye yeniden yansıtır. Yükseltme her karede çalışmaya devam eder; x2, FG çarpanından bağımsızdır. Hareket, aydınlatma veya kare düzeni kötüleşirse kapatın."},
+    {"D3D12: Upscaled with FG off, or Present with XeFG single Backbuffer and UI Composition off. Native DLSS FG edit reuse is still in development.", "D3D12: FG kapalıyken Upscaled veya tek XeFG Backbuffer ile UI Composition kapalıyken Present. Yerel DLSS FG ile düzenleme yeniden kullanımı hâlâ geliştiriliyor."},
+    {"Requires NR 310.9.16.0, model B, one Pass, fixed 100%, HDR FP16 (XeFG also supports HDR10/PQ), and compatible depth and motion. Turn off Adjust NR's look, Detail stability, Region mask and Adaptive resolution.", "NR 310.9.16.0, B modeli, tek geçiş, sabit 100%, HDR FP16 (XeFG ayrıca HDR10/PQ destekler) ve uyumlu derinlik ile hareket verileri gerektirir. NR'nin görünümünü ayarla, Detay kararlılığı, Bölge maskesi ve Uyarlanabilir çözünürlük kapatın."},
+    {"When reuse conditions are unmet, NR keeps its per-frame path. Invalid reprojected pixels keep the current picture.", "Yeniden kullanım koşulları sağlanmazsa NR her kareyi işlemeye devam eder. Geçersiz yeniden yansıtılan pikseller mevcut görüntüyü korur."},
     {"Motion attenuation", "Hareket azaltma"},
     {"Reduce R in moving areas, including camera motion. Disabled or unavailable motion leaves the other region-mask settings active.", "Kamera hareketi dahil hareketli alanlarda R değerini azaltır. Hareket devre dışıysa veya kullanılamıyorsa diğer bölge maskesi ayarları etkin kalır."},
     {"Motion fade start", "Hareket azaltma başlangıcı"},

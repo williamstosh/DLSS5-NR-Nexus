@@ -12,6 +12,11 @@
 namespace renodx::addons::dlss5::ui::lang {
 
 inline constexpr Translation kJa[] = {
+    {"x2 edit reuse (experimental)", "編集の隔フレーム再利用 x2（実験的）"},
+    {"Refresh NR once per two base frames and reproject its edit onto the next frame to reduce GPU work. Upscaling still runs every frame; x2 is separate from the FG multiplier. Turn off if motion, lighting or frame pacing looks worse.", "ベースフレーム2枚につき1回NRを更新し、編集を次のフレームに再投影してGPU負荷を抑えます。アップスケーリングは毎フレーム実行されます。x2はFGの倍率とは別です。動き、照明、フレーム間隔が悪化する場合はオフにしてください。"},
+    {"D3D12: Upscaled with FG off, or Present with XeFG single Backbuffer and UI Composition off. Native DLSS FG edit reuse is still in development.", "D3D12：FGオフのUpscaled、またはXeFGの単一BackbufferかつUI CompositionをオフにしたPresentが対象です。ネイティブDLSS FGでの編集の隔フレーム再利用は開発中です。"},
+    {"Requires NR 310.9.16.0, model B, one Pass, fixed 100%, HDR FP16 (XeFG also supports HDR10/PQ), and compatible depth and motion. Turn off Adjust NR's look, Detail stability, Region mask and Adaptive resolution.", "NR 310.9.16.0、モデルB、1パス、固定100%、HDR FP16（XeFGはHDR10/PQにも対応）、互換性のある深度とモーションが必要です。NRの見た目を調整、ディテール安定化、領域マスク、適応解像度をオフにしてください。"},
+    {"When reuse conditions are unmet, NR keeps its per-frame path. Invalid reprojected pixels keep the current picture.", "再利用条件を満たさない場合、NRは毎フレーム処理を続けます。再投影が無効なピクセルは現在の映像を保持します。"},
     {"Motion attenuation", "動きによる減衰"},
     {"Reduce R in moving areas, including camera motion. Disabled or unavailable motion leaves the other region-mask settings active.", "カメラの動きを含む、動きのある領域の R を減らします。動きが無効または利用できない場合も、領域マスクの他の設定は有効です。"},
     {"Motion fade start", "動きの減衰開始"},

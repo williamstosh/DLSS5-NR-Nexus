@@ -4,7 +4,7 @@
 
 ## 简体中文
 
-本指南对应 **v0.5.0**：从安装、选方案和比较画面开始，再按需组合最多四层 NR、独立尺寸和结果编辑。**实验性**表示有特殊条件且默认关闭的试用路径，**暂不支持**表示不可用组合。下载及版本说明见 [v0.5.0](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.5.0)。
+本指南对应 **v0.5.1**：从安装、选方案和比较画面开始，再按需组合最多四层 NR、独立尺寸和结果编辑。**实验性**表示有特殊条件且默认关闭的试用路径，**暂不支持**表示不可用组合。下载及版本说明见 [v0.5.1](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.5.1)。
 
 配图来自已审核的开发界面离屏预览，状态和数字为界面示例；各功能的安装包支持范围见正文。
 
@@ -25,7 +25,7 @@
 
 #### 用 RHI 准备 ReShade 和 Runtime
 
-1. 关闭游戏，备份现有插件、ReShade 配置和将替换的 DLL。在 [v0.5.0 版本页面](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.5.0)下载 Windows x64 ZIP 与对应的 `.zip.sha256` 并校验；从 [RHI 最新版](https://github.com/RankFTW/RHI/releases/latest) 下载 RHI。
+1. 关闭游戏，备份现有插件、ReShade 配置和将替换的 DLL。在 [v0.5.1 版本页面](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.5.1)下载 Windows x64 ZIP 与对应的 `.zip.sha256` 并校验；从 [RHI 最新版](https://github.com/RankFTW/RHI/releases/latest) 下载 RHI。
 2. 在 RHI 选中游戏；未找到时点 **+（Manually add a game）**，选择实际游戏 `.exe` 后点 **Add Game**，或把 `.exe` 拖入窗口。选游戏进程使用的程序，不选启动器；例如实际程序可能在 `Binaries/Win64`。
 3. 在 **Game Overrides → ReShade Channel → Stable** 选择支持完整 Add-on 的渠道，在 **Components → ReShade** 安装；**No Addons 不能加载本插件**。已有 ReShade 时先核对其 Add-on 支持及 API 版本，避免重复安装。
 4. 在 **DLSS / Streamline → Neural Rendering** 列选 **310.9.16 (20/30/40/50)**，点 **Deploy DLL** 单独部署 NR Runtime，无需其他 NR Add-on。**RHI 2.8.8 还会尝试在游戏安装根目录部署最新 `nvngx_dlss.dll`（SR），已有文件先备份为 `.original`；希望保持 SR 版本时使用手动安装。**如果游戏原有 DLSS 但缺此栏，先用 **Settings → Tools & Maintenance → Full refresh**；无 DLSS 或刷新后仍无此栏，使用下方手动安装。
@@ -70,7 +70,7 @@
 
 ![画质页的核心画质与处理入口](images/ui/quality-zh.webp)
 
-*界面示意；自适应分辨率见[工作分辨率](#zh-resolution)。*
+*界面示意；详见[自适应分辨率](#zh-resolution)和[隔帧编辑复用](#zh-edit-reuse)。*
 
 用 **Neural Rendering／F6** 比较关／开。**Auto** 是未应用方案时的基础模型默认值；兼容的 **310.9.16.0** 运行时支持 **A（Legacy）／B（Small FP8）**，可比较两者外观和成本。
 
@@ -440,11 +440,16 @@ Present 显示以下选项。兼容的 Pre-FG 先增强游戏帧再交给 FG；�
 
 遇到具体问题时查本节。修改前记录旧值，一次对比一项；显示不适用时按原因处理。
 
-#### x2 编辑复用（实验）
+<a id="zh-edit-reuse"></a>
+#### 隔帧编辑复用 x2（实验）
 
-**v0.5.0 提供的配置实验，默认关闭。** 每两帧重新生成一次 NR 编辑，另一帧将编辑跟随运动应用到当前画面；遮挡、颜色变化或越界区域保留当前原色。它用于试验降低 NR 开销，动态画质尚待验收。
+每两个基础帧重新生成一次 NR 编辑，中间帧将编辑跟随运动应用到当前画面，用于试验降低 NR 开销；遮挡、颜色变化或越界区域保留当前原色。**x2 是 NR 编辑的刷新间隔，与 FG 的输出倍率分别设置。** 此功能默认关闭。
 
-关闭游戏后，在 ReShade 配置的 `[RenoDX.DLSS5]` 段加入 `NREditReuse=1`，重启后读取。普通安装包支持原生 DX12 的两条限定路径：关闭 FG 的 Upscaled，以及 XeFG 的 Present 单 Backbuffer（不含 HUDless/UI 合成）。均要求模型 B、1 层、固定100% HDR 输出，并关闭调整 NR 外观、细节稳定性、ControlMask 和自适应尺寸。游戏须提供匹配的深度和运动数据，以及完整的 jitter 采样偏移（支持非零值，每轴不超过半个渲染像素）；运动数据须不含 jitter。Upscaled 使用 FP16 scRGB；XeFG 单 Backbuffer 另支持10位 HDR10/PQ。格式或实际颜色契约不符时保持逐帧 NR。光照突然变化时可能短暂回到原色，NR 色调变化也可能延后一帧；《巫师3》HDR10/PQ＋XeFG 的静态场景已确认隔帧调用；动态画质与帧节奏仍待实际场景验收。日志中的 `NR edit reuse` 表示实际发生复用；移除该键或设为 `0` 后重启即可关闭。此实验未加入菜单或方案分享。
+在**画质 → 核心画质**的工作分辨率设置下方，打开**隔帧编辑复用 x2（实验）**，无需重启；再次关闭即可恢复逐帧 NR。开关随画质方案和共享预设保存。已有 `[RenoDX.DLSS5]` 配置键 `NREditReuse` 继续有效。
+
+普通安装包支持原生 DX12 的两条限定路径：关闭 FG 的 Upscaled，以及 XeFG 的 Present 单 Backbuffer（不含 HUDless/UI 合成）。均要求模型 B、1 层、固定100% HDR 输出，并关闭调整 NR 的外观、细节稳定、区域遮罩和自适应分辨率。游戏须提供匹配的深度和运动数据，以及完整的 jitter 采样偏移（支持非零值，每轴不超过半个渲染像素）；运动数据须不含 jitter。Upscaled 使用 FP16 scRGB；XeFG 单 Backbuffer 另支持10位 HDR10/PQ。不满足条件时继续逐帧 NR，打开开关不会自动改变其他设置。
+
+《巫师3》HDR10/PQ＋XeFG 的静态场景已确认隔帧调用；动态画质与帧节奏仍待实际场景验收。光照突然变化时可能短暂回到原色，NR 色调变化也可能延后一帧。出现拖影、明暗跳变或微卡顿时关闭此项。日志中的 `NR edit reuse` 表示实际发生复用。
 
 后续开发版还包含默认关闭的 FG On 实验：真实 SR 的 Upscaled 路径，以及原生 DLSS FG 的 Present 路径。原生 Present 限定模型 B、单层、固定100%，已接入 HDR10/PQ 的去 HUD 画面与精确透明度合成输入，以保留游戏 HUD。这两条 DEV 路径尚未进入普通安装包；生成帧画面、动态画质与微卡顿仍待验收。
 
@@ -561,7 +566,7 @@ ROI、单次 HDR、120 次 HDR Present 和 P0 捕获生成额外数据，可能�
 
 ## English
 
-This guide covers **v0.5.0**. Start with installation, profiles and picture comparisons, then combine up to four NR passes, independent sizes and result edits as needed. **Experimental** marks trial paths with special conditions that are off by default; **Not supported yet** marks unavailable combinations. Downloads and release details: [v0.5.0](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.5.0).
+This guide covers **v0.5.1**. Start with installation, profiles and picture comparisons, then combine up to four NR passes, independent sizes and result edits as needed. **Experimental** marks trial paths with special conditions that are off by default; **Not supported yet** marks unavailable combinations. Downloads and release details: [v0.5.1](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.5.1).
 
 Images are reviewed offscreen previews with example states and numbers. See each feature's text for supported paths and usage.
 
@@ -582,7 +587,7 @@ You need Windows x64, a [compatible NVIDIA RTX GPU/driver](../README.md#en-gpu),
 
 #### Prepare ReShade and the runtime with RHI
 
-1. Close the game and back up existing add-ons, ReShade configuration and DLLs you will replace. Download the Windows x64 ZIP and matching `.zip.sha256` from the [v0.5.0 release page](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.5.0), then verify the archive. Download [the latest RHI](https://github.com/RankFTW/RHI/releases/latest).
+1. Close the game and back up existing add-ons, ReShade configuration and DLLs you will replace. Download the Windows x64 ZIP and matching `.zip.sha256` from the [v0.5.1 release page](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.5.1), then verify the archive. Download [the latest RHI](https://github.com/RankFTW/RHI/releases/latest).
 2. Select the game in RHI. If missing, click **+ (Manually add a game)**, select the actual game `.exe` and click **Add Game**, or drag the `.exe` onto the window. Select the executable used by the game process rather than its launcher; it may be under `Binaries/Win64`.
 3. Select **Game Overrides → ReShade Channel → Stable** for full Add-on support, then install under **Components → ReShade**. **No Addons cannot load NR Nexus.** For existing ReShade installations, check Add-on support and the API version before installing again.
 4. In the **DLSS / Streamline → Neural Rendering** column, choose **310.9.16 (20/30/40/50)** and click **Deploy DLL** to deploy the NR runtime separately, without another NR Add-on. **RHI 2.8.8 also attempts to deploy the newest `nvngx_dlss.dll` (SR) in the game installation root, backing up an existing file as `.original`. Use manual installation to keep your SR version.** If the game already has DLSS but this column is missing, use **Settings → Tools & Maintenance → Full refresh**. Without game DLSS, or if the column remains missing, follow manual installation below.
@@ -627,7 +632,7 @@ There are four main tabs: **Quality, Multi-Pass, Diagnostics and Advanced**. **M
 
 ![Quality page: core quality and processing](images/ui/quality.webp)
 
-*Interface example; see [working resolution](#en-resolution) for automatic sizing.*
+*Interface example; see [adaptive resolution](#en-resolution) and [x2 edit reuse](#en-edit-reuse).*
 
 Compare off/on with **Neural Rendering/F6**. **Auto** is the base model default before applying a profile. Compatible runtime **310.9.16.0** supports **A (Legacy)/B (Small FP8)** for comparing appearance and cost.
 
@@ -997,11 +1002,16 @@ Reset NR feature rebuilds runtime state; Restore defaults resets saved settings;
 
 Use this for specific issues. Record old values and compare one change at a time; follow unavailable reasons.
 
+<a id="en-edit-reuse"></a>
 #### x2 edit reuse (experimental)
 
-**A configuration experiment included in v0.5.0, off by default.** NR generates a new edit every other frame. The intervening frame applies the motion-reprojected edit to the current image; rejected occlusion, color-change and boundary pixels retain their current color. This experiment targets lower NR cost; dynamic image quality awaits acceptance.
+NR generates a new edit every two base frames and applies its motion-reprojected edit to the current image between refreshes, aiming to lower NR cost. Rejected occlusion, color-change and boundary pixels retain their current color. **x2 is the NR edit refresh interval, separate from the FG output multiplier.** This feature is off by default.
 
-With the game closed, add `NREditReuse=1` under `[RenoDX.DLSS5]` in the ReShade configuration, then restart. The ordinary package supports two restricted native DX12 paths: Upscaled with FG off, and XeFG Present with a single Backbuffer and no HUDless/UI composition. Both require model B, one pass and fixed 100% HDR output, with Adjust NR's look, Detail stability, ControlMask and adaptive sizing off. The game must provide matching depth and motion plus both jitter sampling offsets; nonzero values up to half a render pixel per axis are supported, with jitter excluded from motion. Upscaled uses FP16 scRGB; XeFG single Backbuffer also supports 10-bit HDR10/PQ. Other formats or mismatched actual color contracts continue running NR every frame. Sudden lighting changes may briefly restore the original color, and changes in NR's tone may lag by one frame. HDR10/PQ x2 reuse has been confirmed in a static The Witcher 3 XeFG scene; dynamic image quality and frame pacing still need acceptance in the intended scene. An `NR edit reuse` log entry confirms actual reuse. Remove the key or set it to `0` and restart to disable it. There is no menu control or preset-sharing field for this experiment.
+Under the working-resolution controls in **Quality → Core quality**, enable **x2 edit reuse (experimental)** without restarting. Turn it off to restore per-frame NR. The toggle is saved with quality profiles and shared presets. The existing `NREditReuse` key under `[RenoDX.DLSS5]` remains supported.
+
+The ordinary package supports two restricted native DX12 paths: Upscaled with FG off, and XeFG Present with a single Backbuffer and no HUDless/UI composition. Both require model B, one pass and fixed 100% HDR output, with Adjust NR's look, Detail stability, Region mask and Adaptive resolution off. The game must provide matching depth and motion plus both jitter sampling offsets; nonzero values up to half a render pixel per axis are supported, with jitter excluded from motion. Upscaled uses FP16 scRGB; XeFG single Backbuffer also supports 10-bit HDR10/PQ. When requirements are unmet, NR continues every frame. Enabling the toggle leaves other settings unchanged.
+
+HDR10/PQ x2 reuse has been confirmed in a static The Witcher 3 XeFG scene; dynamic image quality and frame pacing still need acceptance in the intended scene. Sudden lighting changes may briefly restore the original color, and changes in NR's tone may lag by one frame. Disable this option if you see ghosting, brightness shifts or microstutter. An `NR edit reuse` log entry confirms actual reuse.
 
 The development branch also includes disabled-by-default FG On experiments for real-SR Upscaled and native DLSS FG Present. Native Present requires model B, one pass and fixed 100% resolution; it handles HDR10/PQ HUD-less color and exact alpha composition inputs to preserve the game's HUD. These two DEV paths are not included in the ordinary package. Generated-frame appearance, dynamic image quality and microstutter still await acceptance.
 

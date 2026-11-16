@@ -12,6 +12,11 @@
 namespace renodx::addons::dlss5::ui::lang {
 
 inline constexpr Translation kIt[] = {
+    {"x2 edit reuse (experimental)", "Riutilizzo modifica x2 (sperimentale)"},
+    {"Refresh NR once per two base frames and reproject its edit onto the next frame to reduce GPU work. Upscaling still runs every frame; x2 is separate from the FG multiplier. Turn off if motion, lighting or frame pacing looks worse.", "Aggiorna NR una volta ogni due fotogrammi base e riproietta la modifica sul successivo per ridurre il lavoro della GPU. L’upscaling continua a ogni fotogramma; x2 è indipendente dal moltiplicatore FG. Disattiva se movimento, illuminazione o regolarità dei fotogrammi peggiorano."},
+    {"D3D12: Upscaled with FG off, or Present with XeFG single Backbuffer and UI Composition off. Native DLSS FG edit reuse is still in development.", "D3D12: Upscaled con FG disattivato, oppure Present con un singolo Backbuffer XeFG e UI Composition disattivata. Il riutilizzo delle modifiche con DLSS FG nativo è ancora in sviluppo."},
+    {"Requires NR 310.9.16.0, model B, one Pass, fixed 100%, HDR FP16 (XeFG also supports HDR10/PQ), and compatible depth and motion. Turn off Adjust NR's look, Detail stability, Region mask and Adaptive resolution.", "Richiede NR 310.9.16.0, modello B, un passaggio, 100% fisso, HDR FP16 (XeFG supporta anche HDR10/PQ), profondità e movimento compatibili. Disattiva Modifica l'aspetto di NR, Stabilità dei dettagli, Maschera regione e Risoluzione adattiva."},
+    {"When reuse conditions are unmet, NR keeps its per-frame path. Invalid reprojected pixels keep the current picture.", "Se mancano le condizioni per il riutilizzo, NR mantiene l’elaborazione di ogni fotogramma. I pixel riproiettati non validi conservano l’immagine corrente."},
     {"Motion attenuation", "Attenuazione del movimento"},
     {"Reduce R in moving areas, including camera motion. Disabled or unavailable motion leaves the other region-mask settings active.", "Riduce R nelle aree in movimento, incluso il movimento della telecamera. Se il movimento è disattivato o non disponibile, le altre impostazioni della maschera regionale rimangono attive."},
     {"Motion fade start", "Inizio attenuazione movimento"},

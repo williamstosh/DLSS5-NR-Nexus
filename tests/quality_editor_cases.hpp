@@ -53,6 +53,56 @@
     }
     throw std::runtime_error("r7 production settings scroller missing");
   };
+  runtime::edit_reuse_enabled = false;
+  runtime::nr_adaptive_enabled = false;
+  panel_width = 600.f;
+  frame(); frame();
+  const auto before_reuse = profile::Snapshot();
+  const auto reuse_writes = configuration_writes;
+  const auto reuse_history = runtime::history_reset_epoch.load();
+  // The ID survives clipping and stacked labels; click scrolls it into view.
+  const auto reuse_scope = ImHashStr("NREditReuse", 0, ImHashStr("##quality_columns", 0, settings_window()->ID));
+  const auto reuse_id = ImHashStr("##value", 0, reuse_scope);
+  check(items.contains(reuse_id), "x2 request switch is registered in the production quality table");
+  const Item initial_reuse_switch = items.at(reuse_id);
+  float reuse_label_y = -1.f;
+  for (const auto& text : rendered_text) {
+    if (text.text == ui::text::kEditReuse || (text.text.ends_with("...")
+        && std::string_view(ui::text::kEditReuse).starts_with(std::string_view(text.text).substr(0, text.text.size() - 3)))) {
+      reuse_label_y = text.rect.GetCenter().y;
+    }
+  }
+  std::printf("x2 locator id=%08x item_label='%s' label_y=%.1f switch_y=%.1f clip=%.1f..%.1f scroll=%.1f\n",
+              reuse_id, initial_reuse_switch.label.c_str(), reuse_label_y, initial_reuse_switch.rect.GetCenter().y,
+              initial_reuse_switch.window->InnerClipRect.Min.y, initial_reuse_switch.window->InnerClipRect.Max.y,
+              initial_reuse_switch.window->Scroll.y);
+  click(initial_reuse_switch);
+  auto requested_reuse = before_reuse;
+  requested_reuse["NREditReuse"] = true;
+  check(profile::Snapshot() == requested_reuse && configuration_writes == reuse_writes + 1
+            && runtime::history_reset_epoch.load() == reuse_history + 1,
+        "x2 switch saves the request and resets history without changing incompatible settings");
+  bool persisted_reuse = false;
+  check(reshade::get_config_value(nullptr, runtime::kConfigSection, "NREditReuse", persisted_reuse)
+            && persisted_reuse && has_text(ui::text::kEditReuseCompatibility)
+            && has_text(ui::text::kEditReuseRequirements) && has_text(ui::text::kEditReuseFallback),
+        "requested x2 exposes its production boundaries and persists a boolean setting");
+  const Item reuse_switch = items.at(reuse_id);
+  Item reuse_reset;
+  for (const auto& [id, item] : items) {
+    if (item.window == reuse_switch.window && item.label == ui::icons::kUndo
+        && std::abs(item.rect.Min.y - reuse_switch.rect.Min.y) < 1.f) {
+      reuse_reset = item;
+      break;
+    }
+  }
+  check(reuse_reset.id != 0, "x2 request has the ordinary per-row reset control");
+  click(reuse_reset);
+  persisted_reuse = true;
+  check(profile::Snapshot() == before_reuse
+            && reshade::get_config_value(nullptr, runtime::kConfigSection, "NREditReuse", persisted_reuse)
+            && !persisted_reuse && !has_text(ui::text::kEditReuseRequirements),
+        "x2 row reset restores and saves Off while keeping the other quality settings");
   for (float width : {450.f, 600.f}) {
     panel_width = width;
     frame(); frame();

@@ -12,6 +12,11 @@
 namespace renodx::addons::dlss5::ui::lang {
 
 inline constexpr Translation kRu[] = {
+    {"x2 edit reuse (experimental)", "Повторное использование изменений x2 (экспериментально)"},
+    {"Refresh NR once per two base frames and reproject its edit onto the next frame to reduce GPU work. Upscaling still runs every frame; x2 is separate from the FG multiplier. Turn off if motion, lighting or frame pacing looks worse.", "Обновляет NR один раз на два базовых кадра и перепроецирует изменения на следующий кадр, снижая нагрузку на GPU. Масштабирование по-прежнему выполняется для каждого кадра; x2 не связан с множителем FG. Отключите, если движение, освещение или равномерность кадров ухудшаются."},
+    {"D3D12: Upscaled with FG off, or Present with XeFG single Backbuffer and UI Composition off. Native DLSS FG edit reuse is still in development.", "D3D12: Upscaled с выключенным FG либо Present с одним Backbuffer XeFG и выключенным UI Composition. Повторное использование изменений с нативным DLSS FG ещё разрабатывается."},
+    {"Requires NR 310.9.16.0, model B, one Pass, fixed 100%, HDR FP16 (XeFG also supports HDR10/PQ), and compatible depth and motion. Turn off Adjust NR's look, Detail stability, Region mask and Adaptive resolution.", "Требуются NR 310.9.16.0, модель B, один проход, фиксированные 100%, HDR FP16 (XeFG также поддерживает HDR10/PQ), совместимые данные глубины и движения. Отключите Настроить вид NR, Стабильность деталей, Маска области и Адаптивное разрешение."},
+    {"When reuse conditions are unmet, NR keeps its per-frame path. Invalid reprojected pixels keep the current picture.", "Если условия повторного использования не выполнены, NR продолжает обработку каждого кадра. Некорректно перепроецированные пиксели сохраняют текущее изображение."},
     {"Motion attenuation", "Ослабление движения"},
     {"Reduce R in moving areas, including camera motion. Disabled or unavailable motion leaves the other region-mask settings active.", "Уменьшает R в движущихся областях, включая движение камеры. Если движение отключено или недоступно, остальные настройки маски области продолжают действовать."},
     {"Motion fade start", "Начало затухания движения"},

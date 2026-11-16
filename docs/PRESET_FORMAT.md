@@ -43,7 +43,7 @@ JSON 与插件内部文本使用 UTF-8，Windows 文件操作使用宽路径；�
 | `NRIntensity`、`NRLocalTone`、`NRLocalStructure` | 数值 `0..2` |
 | `NRTransferStrength`、`NRColorStrength` | 数值 `0..1` |
 | `NRSkinStructure` | 数值 `-1..1`，包括 UI 滑条不显示的负值语义 |
-| `NRSkinIndependent`、`NRAutoMask`、`NRUICorrection`、`NRControlMaskEnabled` | boolean |
+| `NRSkinIndependent`、`NRAutoMask`、`NRUICorrection`、`NRControlMaskEnabled`、`NREditReuse` | boolean |
 | `NRControlMaskMode` | 整数 `0..5` |
 | `NRControlMaskBlendMode` | 整数 `0..3` |
 | `NRControlMaskRed`、`NRControlMaskGreen`、`NRControlMaskBlue`、`NRControlMaskDepthNear`、`NRControlMaskDepthFar` | 数值 `0..1`；Depth Far 必须大于 Depth Near |
@@ -54,6 +54,8 @@ JSON 与插件内部文本使用 UTF-8，Windows 文件操作使用宽路径；�
 | `NRLookDetailRadius` | 数值 `0.25..4` |
 | `NRLookStabilize`、`NRDetailStability` | 整数 `0..2` |
 | `NRLookStabilizeMs` | 数值 `10..250`，毫秒 |
+
+`NREditReuse` 是全局画质选项，保存实验性 x2 编辑复用请求，默认关闭；不按层重复。旧共享预设缺少该键时保留当前值，实际运行仍须满足[隔帧条件](USER_GUIDE.md#zh-edit-reuse)。
 
 `NRPasses` 是整数 `1..4`。每个 `NRPass{2,3,4}` 均展开同一组字段：
 

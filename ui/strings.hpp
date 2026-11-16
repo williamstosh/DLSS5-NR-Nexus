@@ -165,6 +165,15 @@ inline constexpr const char* kFgFallbackShort = "Pre-FG fallback observed";
 inline constexpr const char* kFgUpscaledShort = "NR fallback to Upscaled";
 inline constexpr const char* kFgMixedShort = "Mixed Pre-FG and fallback";
 inline constexpr const char* kStackCost = "Additional passes increase NR GPU work.";
+inline constexpr const char* kEditReuse = "x2 edit reuse (experimental)";
+inline constexpr const char* kEditReuseTip =
+    "Refresh NR once per two base frames and reproject its edit onto the next frame to reduce GPU work. Upscaling still runs every frame; x2 is separate from the FG multiplier. Turn off if motion, lighting or frame pacing looks worse.";
+inline constexpr const char* kEditReuseCompatibility =
+    "D3D12: Upscaled with FG off, or Present with XeFG single Backbuffer and UI Composition off. Native DLSS FG edit reuse is still in development.";
+inline constexpr const char* kEditReuseRequirements =
+    "Requires NR 310.9.16.0, model B, one Pass, fixed 100%, HDR FP16 (XeFG also supports HDR10/PQ), and compatible depth and motion. Turn off Adjust NR's look, Detail stability, Region mask and Adaptive resolution.";
+inline constexpr const char* kEditReuseFallback =
+    "When reuse conditions are unmet, NR keeps its per-frame path. Invalid reprojected pixels keep the current picture.";
 inline constexpr const char* kFgUnknownMultiplierTip = "FG activity and multiplier are separate observations. Native FG/XeFG can bypass Present cadence sampling; an unknown multiplier does not mean FG is off.";
 
 inline constexpr const char* kHookTips[] = {kHookRenderTip, kHookUpscaledTip, kHookPresentTip};

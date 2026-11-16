@@ -2129,6 +2129,7 @@ inline constexpr uint32_t kDetailStability = 0;
 // 1.5x at half NR resolution 0.9 points above DLSS alone, 0.15 puts every
 // shape below it; full resolution gives back about a point at 0.15.
 inline constexpr float kDetailStabilityAlpha = 0.15f;
+inline constexpr bool kEditReuse = false;
 // NREditTrace: observe-only statistics of the model's edit, off.
 inline constexpr bool kEditTrace = false;
 // Per-pass model steering (group G): passes 2+ follow pass 1.
@@ -2679,7 +2680,7 @@ inline std::atomic_bool edit_trace_enabled = defaults::kEditTrace;
 // Latched when the look's programs or surfaces could not be created: the
 // look (and the trace) stay off for the session, NR runs on without them.
 inline std::atomic_bool look_unavailable = false;
-inline std::atomic_bool edit_reuse_enabled{false};
+inline std::atomic_bool edit_reuse_enabled{defaults::kEditReuse};
 // Internal two-ready-tier contract probe; no settings or runtime-control entry.
 inline std::atomic_bool edit_reuse_adaptive_experiment{false};
 #if defined(NR_NEXUS_DEV_CONTROL)
@@ -26757,6 +26758,8 @@ inline constexpr Setting kSetAdaptiveLevelCount{
     "NRAdaptiveLevelCount", &nr_adaptive_selected_levels, 0u, SettingEffect::kNone};
 inline constexpr Setting kSetAdaptiveLimitedResidency{
     "NRAdaptiveLimitedResidency", &nr_adaptive_limited_residency, false, SettingEffect::kNone};
+inline constexpr Setting kSetEditReuse{
+    "NREditReuse", &edit_reuse_enabled, defaults::kEditReuse, SettingEffect::kHistory};
 inline constexpr Setting kSetPassResolutionMode[] = {
     {"NRPass2ResolutionMode", &pass_resolution_mode[0], 0u, SettingEffect::kNone},
     {"NRPass3ResolutionMode", &pass_resolution_mode[1], 0u, SettingEffect::kNone},
@@ -27255,7 +27258,7 @@ inline constexpr const Setting* kHookPointSettings[] = {
 inline constexpr const Setting* kPerformanceSettings[] = {
     &kSetFollowInputRes, &kSetResolutionScale, &kSetLookUpsample,
     &kSetAdaptiveEnabled, &kSetAdaptiveTargetFps, &kSetAdaptiveMinScale, &kSetAdaptiveLevelCount,
-    &kSetAdaptiveLimitedResidency};
+    &kSetAdaptiveLimitedResidency, &kSetEditReuse};
 inline constexpr const Setting* kStackingSettings[] = {
     &kSetPassResolutionMode[0], &kSetPassResolutionMode[1], &kSetPassResolutionMode[2],
     &kSetPassResolutionScale[0], &kSetPassResolutionScale[1], &kSetPassResolutionScale[2],
@@ -28884,6 +28887,12 @@ inline void DrawResolutionControls(const ui::PanelText& text) {
       " averages SDR pixels before NR; this can change NR's look.  Classic shows NR's own"
       " lower-resolution pixels, which look blocky.",
       ui::text::kUpsampleTips);
+  ToggleSetting(text, kSetEditReuse, ui::text::kEditReuse, ui::text::kEditReuseTip);
+  if (edit_reuse_enabled.load()) {
+    ImGui::TextWrapped("%s", text.Tr(ui::text::kEditReuseCompatibility));
+    ImGui::TextWrapped("%s", text.Tr(ui::text::kEditReuseRequirements));
+    ImGui::TextWrapped("%s", text.Tr(ui::text::kEditReuseFallback));
+  }
   DrawResolutionObserved(text);
 }
 
@@ -32369,7 +32378,7 @@ inline void LoadConfiguration() {
   reshade::get_config_value(nullptr, kConfigSection, "NRLookUpsample", saved_look.upsample);
   reshade::get_config_value(
       nullptr, kConfigSection, "NRDetailStability", saved_detail_stability);
-  bool saved_edit_reuse = false;
+  bool saved_edit_reuse = defaults::kEditReuse;
   reshade::get_config_value(nullptr, kConfigSection, "NREditReuse", saved_edit_reuse);
   edit_reuse_enabled = saved_edit_reuse;
   // Diagnostics, read-only from the ini (never persisted): the telemetry line

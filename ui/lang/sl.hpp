@@ -12,6 +12,11 @@
 namespace renodx::addons::dlss5::ui::lang {
 
 inline constexpr Translation kSl[] = {
+    {"x2 edit reuse (experimental)", "Ponovna uporaba sprememb x2 (poskusno)"},
+    {"Refresh NR once per two base frames and reproject its edit onto the next frame to reduce GPU work. Upscaling still runs every frame; x2 is separate from the FG multiplier. Turn off if motion, lighting or frame pacing looks worse.", "Osveži NR enkrat na dva osnovna okvirja in njegovo spremembo ponovno projicira na naslednji okvir, da zmanjša delo GPU. Povečevanje ločljivosti še vedno poteka za vsak okvir; x2 je neodvisen od množilnika FG. Izklopite, če se gibanje, osvetlitev ali enakomernost okvirjev poslabša."},
+    {"D3D12: Upscaled with FG off, or Present with XeFG single Backbuffer and UI Composition off. Native DLSS FG edit reuse is still in development.", "D3D12: Upscaled z izklopljenim FG ali Present z enim Backbufferjem XeFG in izklopljenim UI Composition. Ponovna uporaba sprememb z izvornim DLSS FG je še v razvoju."},
+    {"Requires NR 310.9.16.0, model B, one Pass, fixed 100%, HDR FP16 (XeFG also supports HDR10/PQ), and compatible depth and motion. Turn off Adjust NR's look, Detail stability, Region mask and Adaptive resolution.", "Zahteva NR 310.9.16.0, model B, en prehod, fiksnih 100%, HDR FP16 (XeFG podpira tudi HDR10/PQ) ter združljive podatke globine in gibanja. Izklopite Prilagodi izgled NR, Stabilnost podrobnosti, Maska območja in Prilagodljiva ločljivost."},
+    {"When reuse conditions are unmet, NR keeps its per-frame path. Invalid reprojected pixels keep the current picture.", "Če pogoji za ponovno uporabo niso izpolnjeni, NR ohrani obdelavo vsakega okvirja. Neveljavno ponovno projicirane slikovne točke ohranijo trenutno sliko."},
     {"Motion attenuation", "Slabljenje gibanja"},
     {"Reduce R in moving areas, including camera motion. Disabled or unavailable motion leaves the other region-mask settings active.", "Zmanjša R na gibajočih se območjih, vključno z gibanjem kamere. Če je gibanje onemogočeno ali ni na voljo, druge nastavitve maske območja ostanejo aktivne."},
     {"Motion fade start", "Začetek pojemanja gibanja"},

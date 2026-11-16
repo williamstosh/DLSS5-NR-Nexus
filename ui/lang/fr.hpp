@@ -12,6 +12,11 @@
 namespace renodx::addons::dlss5::ui::lang {
 
 inline constexpr Translation kFr[] = {
+    {"x2 edit reuse (experimental)", "Réutilisation des modifications x2 (expérimental)"},
+    {"Refresh NR once per two base frames and reproject its edit onto the next frame to reduce GPU work. Upscaling still runs every frame; x2 is separate from the FG multiplier. Turn off if motion, lighting or frame pacing looks worse.", "Actualise NR une fois toutes les deux images de base et reprojette sa modification sur l’image suivante pour réduire le travail du GPU. La mise à l’échelle continue à chaque image ; x2 est indépendant du multiplicateur FG. Désactivez si le mouvement, l’éclairage ou la régularité des images se dégradent."},
+    {"D3D12: Upscaled with FG off, or Present with XeFG single Backbuffer and UI Composition off. Native DLSS FG edit reuse is still in development.", "D3D12 : Upscaled avec FG désactivé, ou Present avec un seul Backbuffer XeFG et UI Composition désactivée. La réutilisation des modifications avec DLSS FG natif est encore en développement."},
+    {"Requires NR 310.9.16.0, model B, one Pass, fixed 100%, HDR FP16 (XeFG also supports HDR10/PQ), and compatible depth and motion. Turn off Adjust NR's look, Detail stability, Region mask and Adaptive resolution.", "Nécessite NR 310.9.16.0, le modèle B, une passe, 100% fixe, HDR FP16 (XeFG prend aussi en charge HDR10/PQ) et des données de profondeur et de mouvement compatibles. Désactivez Ajuster le rendu de NR, Stabilité des détails, Masque de région et Résolution adaptative."},
+    {"When reuse conditions are unmet, NR keeps its per-frame path. Invalid reprojected pixels keep the current picture.", "Si les conditions de réutilisation ne sont pas réunies, NR conserve son traitement à chaque image. Les pixels reprojetés invalides conservent l’image actuelle."},
     {"Motion attenuation", "Atténuation du mouvement"},
     {"Reduce R in moving areas, including camera motion. Disabled or unavailable motion leaves the other region-mask settings active.", "Réduit R dans les zones en mouvement, y compris lors des mouvements de caméra. Si le mouvement est désactivé ou indisponible, les autres réglages du masque de région restent actifs."},
     {"Motion fade start", "Début de l'atténuation du mouvement"},

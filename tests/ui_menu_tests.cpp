@@ -381,6 +381,13 @@ int main() {
     load_theme_case("", ui::ThemeId::CYBER_NEON);
     load_theme_case("[OTHER]\nValue=1\n", ui::ThemeId::CYBER_NEON);
     const std::string section = std::string("[") + runtime::kConfigSection + "]\n";
+    load_theme_case((section + "UiTheme=cyber_neon\nNREditReuse=1\n").c_str(), ui::ThemeId::CYBER_NEON);
+    check(runtime::edit_reuse_enabled.load(), "explicit x2 edit reuse survives production INI loading");
+    load_theme_case((section + "UiTheme=cyber_neon\nNREditReuse=0\n").c_str(), ui::ThemeId::CYBER_NEON);
+    check(!runtime::edit_reuse_enabled.load(), "explicit x2 Off survives production INI loading");
+    runtime::edit_reuse_enabled = true;
+    load_theme_case((section + "UiTheme=cyber_neon\n").c_str(), ui::ThemeId::CYBER_NEON);
+    check(!runtime::edit_reuse_enabled.load(), "an older INI without x2 starts with reuse disabled");
     const auto load_monitor_session = [&](const std::string& values) {
       runtime::monitor_visibility_initialized = false;
       load_theme_case((section + "UiTheme=cyber_neon\n" + values).c_str(), ui::ThemeId::CYBER_NEON);
