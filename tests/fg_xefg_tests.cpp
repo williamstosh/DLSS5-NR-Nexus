@@ -1164,6 +1164,65 @@ int main(int argc, char** argv) {
                     && source_swapchain->references == source_refs,
               "repeated reverse Presents retain the link generation without owning the source swapchain");
           {
+            const auto worker_source_present = +[] {
+              HRESULT status = E_FAIL;
+              std::thread worker([&] {
+                status = adapter::SourcePresentHooks<0>::Present(receipt_inner_source, 0, 0);
+              });
+              worker.join();
+              Check(status == S_OK, "a non-nested worker source Present preserves its original success status");
+            };
+            for (const bool during_disable : {true, false}) {
+              const auto before_on = xefg::QueryBridgeOff(receipt_source);
+              const auto initial_epoch = context->epoch;
+              Check(before_on.available && Hooks::Enable(context_handle, 1) == 0
+                        && context->epoch == initial_epoch + 1
+                        && context->bridge_link_generation == before_on.source_link_generation,
+                  "Enable advances its frame epoch without changing the independently proven source relation");
+              const auto on_epoch = context->epoch;
+              if (during_disable) {
+                receipt_during_sdk = worker_source_present;
+              }
+              const auto disable_status = Hooks::Enable(context_handle, 0);
+              receipt_during_sdk = nullptr;
+              const auto after_disable = xefg::QueryBridgeOff(receipt_source);
+              Check(disable_status == 0 && context->epoch == on_epoch + 1 && !context->enabled,
+                  "successful Disable advances its own epoch in either worker ordering");
+              if (during_disable) {
+                Check(!after_disable.available && std::strcmp(after_disable.reason, "context_changed_during_disable") == 0,
+                    "a link revoked inside Disable cannot inherit that call's stale source-link generation");
+              } else {
+                Check(after_disable.available && after_disable.epoch == context->epoch
+                          && after_disable.source_link_generation == before_on.source_link_generation,
+                    "Disable with an unchanged link accepts the new epoch before any later worker Present");
+                worker_source_present();
+              }
+              const auto revoked = xefg::QueryBridgeOff(receipt_source);
+              Check(!revoked.available && context->bridge_source_swapchain == 0
+                        && revoked.source_link_generation > before_on.source_link_generation
+                        && std::strcmp(revoked.source_link_reason, "nested_proxy_unobserved") == 0
+                        && revoked.source_present_thread_id != GetCurrentThreadId() && revoked.source_present_proxy_entry_depth == 0,
+                  "a worker Present outside the SDK proxy revokes the link whether it runs inside or after Disable");
+              const auto off_epoch = context->epoch;
+              Check(run_proxy() == S_OK, "the main SDK proxy can re-observe the same source after the worker Present");
+              const auto remapped = xefg::QueryBridgeOff(receipt_source);
+              Check(!remapped.available && remapped.context_identity == before_on.context_identity
+                        && remapped.proxy == before_on.proxy && remapped.source == before_on.source
+                        && remapped.source_swapchain == before_on.source_swapchain
+                        && remapped.source_swapchain_generation == before_on.source_swapchain_generation
+                        && remapped.source_link_generation > revoked.source_link_generation && context->epoch == off_epoch
+                        && std::strcmp(remapped.reason, "source_mapping_changed") == 0,
+                  "re-proving unchanged identities creates a new link but cannot revive the old Disable receipt");
+              Check(Hooks::Enable(context_handle, 0) == 0 && xefg::QueryBridgeOff(receipt_source).available
+                        && context->epoch == off_epoch && context->bridge_link_generation == remapped.source_link_generation,
+                  "a fresh public Disable after stable mapping grants its own receipt without another epoch or link change");
+              std::cout << "OBS CPU MOCK Disable/source order: worker=" << (during_disable ? "inside_disable" : "after_disable")
+                        << " epoch=" << context->epoch << " link=" << context->bridge_link_generation
+                        << " repeated_disable_off=1; GPU=NotRun\n";
+            }
+            std::cout << "PASS CPU MOCK Disable/source ordering: inside/after revocation, stable re-proof and explicit repeated Disable; GPU=NotRun\n";
+          }
+          {
             // Function detours also see unregistered objects sharing the same
             // Present implementation; their scope must not hide the SDK call.
             ComPtr<ReceiptSwapchain> unregistered_outer;
