@@ -6,7 +6,7 @@
 ## 环境与构建
 
 沿用[项目构建前提](../../README.md#zh-build)中的固定宿主、MSVC 与 Windows SDK。
-Python 工具仅用标准库。`gpu` 后端复用既有生成 Shader 头和 embed_file 工具，并在
+除隔帧历史／缓存分析器使用 NumPy／Pillow 外，Python 工具仅用标准库。`gpu` 后端复用既有生成 Shader 头和 embed_file 工具，并在
 每个隔离构建目录重新用 FXC 编译当前 ControlMask Shader，通过预包含头绑定该字节码；
 不改共享生成目录。`replay` 仅复用通用 D3D12 测试助手，不生成或包含 ControlMask Shader。
 NGX 探针只用已有 SDK 头，不链接或打包第三方 Runtime。
@@ -38,7 +38,7 @@ HostRoot、ShaderIncludeDirectory、Fxc、EmbedFile 参数可显式指定已有�
 ~~~
 
 软件入口先原样执行 `Suite all -SoftwareOnly`（包括默认五组 FG），再复用编译产物执行
-16 个独立 FG 阶段、分辨率、生命周期及 pre-FG 入口和 4 个 Bridge 分辨率入口。
+18 个独立 FG 阶段、分辨率、生命周期、pre-FG 及隔帧复用入口和 4 个 Bridge 分辨率入口。
 `result.json` 逐项记录 Passed、Failed 或 NotRun；Vulkan 在软件模式只编译，执行记为 NotRun。
 这些是 CPU／WARP 与模型替身证据，包含有限的隐藏窗口夹具，不提供游戏或动态视觉验收。
 
@@ -75,6 +75,22 @@ Python 只需标准库，可用 `-PythonExecutable` 指定；编译器及固定�
 比较器。神经结果为合成输入：WARP／NATIVE_GPU 只证明结果编辑的响应，不记 NATIVE_NGX、
 完整 codec 输出、动态稳定性或游戏视觉通过。恢复参考为送入模型的 proxy；floor 及逐通道
 下限附近的残留沿生产保护保留。
+
+## 低档编辑量重建核验
+
+~~~powershell
+& ./tests/run-look-transport-tests.ps1
+~~~
+
+该定向入口复用 D3D12 软件夹具和生产 Look 根签名，编译、派发当前 `look_upsample`。
+只使用 WARP，要求 Debug Layer 和 InfoQueue 可用；检查 SDR 输入采样与亮度指引一致、
+无匹配输入时保留原图、正常匹配区的颜色编辑，以及 HDR 原路径和 tile 边界。
+可用 `-BaselineShaderPath` 加入旧 shader 负对照；它的预期失败不计为修后通过。
+
+可选 `-RoiFixture` 接受保留完整坐标的原码裁剪数据及 CPU 预期输出，按原格式重新量化，
+在原尺寸纹理上执行后只比较已覆盖的 ROI。缺少预期输出时只记数值捕获，不能计为像素回归通过。
+原码读回文件在比较和哈希登记后自动收尾；确需继续离线分析时，显式设置 `NR_NEXUS_TEST_KEEP_RAW=1`。
+真实游戏数据留本地；WARP 数值一致不代替 NGX、游戏后处理或动态视觉验收。
 
 ## Fixture、合成序列与原始数据
 
@@ -257,7 +273,7 @@ pwsh -File tools/run-tests.ps1 -Suite vulkan-control-mask -VulkanNativeNgx `
 
 同一组真实 SR／NR Feature 执行关闭／开启运动衰减的两段 8 帧合成序列，
 各段相同 Reset 前缀，输入平移与低分辨率运动矢量一致，MV scale 为 (-2,1)。
-固定帧测光、关闭亮度 governor 和细节稳定，以隔离墙钟及前段历史对配对的影响。
+固定帧测光、关闭亮度 governor；Detail stability 保持 Auto，最终结果包含该过滤。
 在实际消费边界复制 SR 输出、NR proxy 和 raw neural，Fence 完成后检查两组 SR／proxy
 逐字节相同、实际遮罩及 G/B/A、停止后的 R 恢复，以及 neural／最终输出响应；
 完全运动衰减时另核对 neural RGB 等于实际 proxy。完成后核对 NR 关闭后的 SR 续跑、
@@ -267,6 +283,155 @@ pwsh -File tools/run-tests.ps1 -Suite vulkan-control-mask -VulkanNativeNgx `
 Fence、provider 边界与实际 NGX 模块身份；原始读回仅在内存配对。GPU timestamp
 包含 SR、NR 及消费边界读回，仅作诊断，不与旧 NR wrapper 计时比较，也不用于性能或游戏画质验收。
 内部实际模型身份保持未知；动态实机由人工验收。
+
+## NR 隔帧历史实验
+
+`nr-edit-reuse-history` 用例用于检查 NR 不连续调用时的历史行为。固定 D3D12 Upscaled、
+单 Pass、640×360 SR 输入及 960×540 NR，关闭 ControlMask 与 Detail stability。
+它扩展既有真实 SR→NR 入口，每个条件启动独立进程及独立 SR／NR Feature：
+
+- `baseline` 和 `baseline-repeat`：逐帧 SR 与 NR，重复运行估计基线差异。
+- `x2-compose`：SR 每帧执行，NR 仅在偶数帧执行，使用当前到上一次实际 NR 帧的组合运动。
+- `x2-reset`：相同 NR 刷新节奏，每次刷新将 NR Reset 设为 1。
+
+~~~powershell
+pwsh -File tools/run-tests.ps1 -Suite fg-native -NativeCase nr-edit-reuse-history `
+    -NativeNgxProjectIdPath $projectIdPath -NativeNgxSdkLibraryDirectory $sdkLibraryDirectory `
+    -NativeNgxRuntimePath $runtimePath -NativeNgxSrRuntimePath $srRuntimePath `
+    -PythonExecutable $pythonWithNumpyAndPillow `
+    -UiPreview None -OutputDirectory tmp/offline/nr-history
+~~~
+
+四组使用相同创建前缀及24帧输入，依次包含静止、变速平移、独立运动前景的遮挡显露、光照变化。
+`$srRuntimePath` 指向已有的 `nvngx_dlss.dll`；D3D12 原生 NGX 入口可用该选项显式提供 SR 库。
+Runner 仅在测试输出目录建立临时链接，记录输入 SHA-256，并在结束时移除链接。
+若省略，SR 依赖本机 NGX 搜索路径；SR Feature 1 返回 `0xBAD0000B` 时先核对 SR 库是否可用。
+当前夹具为零 jitter、未含 jitter 的渲染像素运动和单位 scale；不覆盖非零 jitter 或 Subrect。
+组合运动从上一基础帧的对应位置取样，不是当前运动乘二。刷新沿生产 wrapper 调用真实 NR，
+仅在测试观察器边界替换 NR 运动资源或 Reset；SR 参数和生产实现不改动。
+
+每条件 JSON 保留实际 SR／NR 调用、参数、API 结果、GPU Fence、模块身份与独立 Evaluate 时间戳。
+SR 输出与最终结果为线性 HDR；v6 proxy 与 raw neural 虽用 RGBA16F 存储，仍为 sRGB 编码值。
+跳过帧只有 SR 读回，其他平面与 NR 时间明确为空，没有显示端缓存或复用输出。
+
+统一入口在收尾前调用 `tools/offline/nr_edit_reuse.py --input <fg-native输出目录>`，
+核对输入／SR／proxy 一致性，报告刷新帧差异、带运动补偿的编辑误差变化和重复基线；
+生成固定显示变换的对照预览。分析器需要已有 NumPy 和 Pillow，不自动安装依赖。
+可独立运行 `python -m unittest discover -s tests -p test_nr_edit_reuse_analysis.py` 检查比较数学与读回身份。
+数值报告不自动判定视觉通过；Evaluate 时间不包含完整编码／合成／复用成本，不能换算为游戏 FPS 收益。
+Standard 在分析后回收登记的原始平面，保留 JSON、日志、预览和配对失败样本；
+完整原始集只由显式 `NR_NEXUS_TEST_KEEP_RAW=1` 保留。使用 GPU 前应避开其他游戏或性能测试窗口。
+
+## NR x2 编辑缓存候选
+
+`nr-edit-reuse-contracts` 在 WARP＋MOCK 上检查生产 Shader 的已知编辑、运动缩放、边界／深度／颜色拒绝、
+中性及无效像素的精确原色／alpha；通过真实 wrapper 检查一次复用上限、Reset／设置变化／断档、
+非零 jitter 的刷新／复用、超范围或缺轴回退、关闭、失败和丢弃录制的资源生命周期。
+1.5 倍采样比例的独立像素检查区分两轴 offset 正确、遗漏和反号，并核对两步 MV 的上一基础帧位置。
+
+~~~powershell
+pwsh -File tools/run-tests.ps1 -Suite fg-native -NativeCase nr-edit-reuse-contracts `
+    -UiPreview None -OutputDirectory tmp/offline/nr-cache-contracts
+~~~
+
+`nr-edit-reuse-cache` 对相同的24帧短序列启动独立逐帧／缓存进程；SR 始终每帧运行，NR 的跳过、
+组合运动和最终原色回填由生产 wrapper 完成，测试观察器不替换模型输入。
+两组使用缓存开启且每次 Reset 的相同创建前缀，正式第0帧均 Reset；基线此时关闭缓存。
+当前条件为请求 B、原生 D3D12、固定100% HDR、单 Pass，关闭 Look、
+Detail stability、ControlMask 和自适应分辨率。默认测试 Upscaled（FG 关闭）；
+`NR_NEXUS_TEST_NR_CACHE_ROUTE=xefg-record` 选择 XeFG 单 Backbuffer 的生产 `Record` 与私有颜色写回。
+
+~~~powershell
+pwsh -File tools/run-tests.ps1 -Suite fg-native -NativeCase nr-edit-reuse-cache `
+    -NativeNgxProjectIdPath $projectIdPath -NativeNgxSdkLibraryDirectory $sdkLibraryDirectory `
+    -NativeNgxRuntimePath $runtimePath -NativeNgxSrRuntimePath $srRuntimePath `
+    -PythonExecutable $pythonWithNumpyAndPillow `
+    -UiPreview None -OutputDirectory tmp/offline/nr-cache
+~~~
+
+`cache-baseline/` 与 `cache/` 中的报告记录实际调用、锚点代次、复用／回退计数、显存分配及 GPU 完成。
+`nr_edit_cache.py` 核对输入、SR及实际 NR source 逐字节一致、所有帧 alpha、复用无效像素与当前 source 完全相同，
+并生成 `nr-edit-cache-analysis.json` 和24张对照预览。整链时间覆盖 Encode、真实 NR 或缓存工作、
+Resolve、Commit 和最终回填；测试平面读回与查询结果拷贝在计时外。分别报告刷新、复用、整体均值及分位数，
+不由调用减半推导 FPS。质量差异保留为测量，动态画质仍需人工验收。
+Standard 收尾与上一实验相同；分析器定向测试为 `test_nr_edit_cache_analysis.py`。
+
+XeFG 的 SDK hooks、Service 准入与生命周期通过 `-NativeCase nr-edit-reuse-xefg-contracts`
+单独验证（WARP＋MOCK；SR、NR、XeFG 均为替身，不执行插帧）。它覆盖重复 present ID、
+刷新／复用／刷新、当前 RGBA、Reset、缺 guides、忙碌跳帧、模型失败恢复和缓存退休，
+并检查缓存不持有 DXGI Backbuffer。默认关闭的生产开关只在完整的单 Backbuffer 包上授权缓存，
+按基础帧推进复用年龄；HUDless、UI 合成及其他组合沿用原有路径。
+PQ 用例使用 `R32G8X24_TYPELESS` 深度资源，按第0平面的 float 深度上传和读取，并检查四字节 footprint；
+scRGB 用例保留 `R32_FLOAT`。原有颜色、alpha、深度拒绝与失败恢复断言覆盖两种路径。
+
+原生 `xefg-record` 对照仍使用真实 SR 和 NR，但不调用 XeFG SDK 或 Service 准入。
+默认 `NR_NEXUS_TEST_NR_CACHE_FORMAT=scrgb` 使用 RGBA16F scRGB：在同一 command list 上从 SR 读回之后计时，
+覆盖 `Record`、原色暂存和私有输出写回，避免跨 CPU 提交空隙污染 GPU 区间。固定白位200 nit；
+MV flags/scale 已按 Service 后的 NGX 契约提供。两条件使用独立 Feature 和相同前缀，
+报告记录 `route`、`xefg_scope` 及白位，分析器拒绝混用路径；不能由此推导实际插帧画质或游戏兼容性。
+
+同一路径设置 `NR_NEXUS_TEST_NR_CACHE_FORMAT=pq` 选择实际 `R10G10B10A2_UNORM` HDR10 输入。
+夹具在真实 SR 完成后把 FP16 BT.709 scRGB（80 nit/unit）转换为 BT.2020／PQ（10000 nit/unit），
+按10位 RGB／2位 alpha 量化并上传；`sr` 与 `source` 分别保存，baseline／cache 的两份 source 必须逐字节一致。
+该构造增加一次 SR 完成提交；NR 整链计时在 PQ 上传后开始，排除夹具的读回、CPU转换与上传，
+继续包含生产原色暂存、缓存／模型、完整 codec 及私有写回。分析器按原码核对无效区域和 alpha，
+再将 PQ 转回 BT.709 线性光计算差异及预览，不把 PQ 码值当线性亮度。PQ 仅供 `xefg-record`，
+不扩展 Upscaled、其他 FG 或多 Pass。
+
+默认序列保持零 jitter。验证非零 jitter 时，先用相同运行参数将 `-NativeCase` 改为
+`nr-edit-reuse-jitter`，输出到新的隔离目录。它只执行九次真实 SR、每次 Reset，不调用 NR：
+零 jitter 参考及两个光栅采样符号各四个双轴相位。`sr_jitter.py` 测量 R／G 边缘相对参考的位置，
+在 `sr-jitter-analysis.json` 保存误差、符号结论及原始 SHA；结果不明确则停止后续带 jitter 的对照。
+该校准建立夹具与实际 SR 参数的对应关系，不替代游戏 guides 契约检查。
+
+校准明确后，将 `NR_NEXUS_TEST_NR_CACHE_SCENE` 设为 `jitter-lighting`，
+`NR_NEXUS_TEST_NR_RASTER_SIGN` 设为报告中的 `raster_sampling_sign`，再运行一次 `nr-edit-reuse-cache`。
+颜色、深度及运动所属表面的采样共享同一光栅偏移，MV 本身不含 jitter。
+固定四个相位为 `(±0.375, ±0.25)` 渲染像素，前景边缘从第0帧存在；
+末六帧光照为 `1, 1.15, 1.15, 1.15, 0.85, 0.85`，用于观察突变与下一次刷新后的恢复。
+生产 guide 采样使用当前 jitter，组合 MV 使用上一基础帧与当前帧的 jitter 差；
+最终编辑位移不加 jitter 差，NR 仍收到当前 API jitter。
+
+分析器在静止背景区域比较 `log2(final luma / SR luma)`，分离光照本身与 NR 编辑消失／恢复；
+`lighting_roi` 保存相对逐帧基线的编辑差及额外时间变化。`cache-lighting-strip.png` 为六帧对照，
+`cache-lighting-preview.png` 是每帧250ms的慢速 APNG，仅用于定位变化，不模拟游戏播放节奏。
+校准分析器的合成回归入口为 `test_sr_jitter_analysis.py`。
+
+### 隔帧编辑复用原生成本
+
+`nr-edit-reuse-cost` 固定真实 SR 输入 2560×1440、输出 3840×2160、RGBA16F scRGB、
+单 Pass／请求 B、零 jitter／运动，并关闭自适应分辨率、ControlMask 和时域 Look。
+它复用生产 `fg_service::Record` 的原色暂存、缓存／模型、codec 及私有颜色写回；
+不调用 XeFG SDK、Service 准入或插帧。默认固定这一路线与格式，不读取其他缓存实验的路线／场景选项。
+
+~~~powershell
+pwsh -File tools/run-tests.ps1 -Suite fg-native -NativeCase nr-edit-reuse-cost `
+    -NativeNgxProjectIdPath $projectIdPath -NativeNgxSdkLibraryDirectory $sdkLibraryDirectory `
+    -NativeNgxRuntimePath $runtimePath -NativeNgxSrRuntimePath $srRuntimePath `
+    -UiPreview None -OutputDirectory tmp/offline/nr-cache-cost
+~~~
+
+统一入口分别启动独立进程／Feature 的 `baseline`、`cache` 条件，无需 Python 图像分析器。
+两组先使用缓存开启、逐帧 Reset 的相同创建前缀，再各执行 32 帧暖机及 128 帧计量。
+SR 每帧真实执行；基线 NR 每帧执行，缓存组按刷新／复用交替执行 1／0 次 NR，
+暖机首帧 Reset=1，后续刷新 Reset=0。计量期间抑制逐帧日志，不读取图像或 GPU query；
+全部完成后才读取已写入的计时槽，复用帧的模型时间为 null。
+
+`cost-baseline/nr-edit-reuse-cost.json` 与 `cost-cache/nr-edit-reuse-cost.json` 保留实际 GPU ticks／频率、
+SR／模型／完整 NR 链 GPU 时间、CPU 录制／提交完成／相邻调用间隔、真实调用与复用计数、
+Reset、Fence、稳定模型／工作集身份及完整收尾。测量结束只读回一次最终输出，检查有限且非零；
+缓存组再读取末帧 Validity，记录 0／1 像素数并要求存在有效复用像素，均不保存全图。
+失败保留状态及错误 JSON。相邻调用间隔包含夹具等待与管理开销，结果用于静态成本比较，
+不作为游戏／显示 FPS、动态画质或真实 XeFG 帧节奏验收。
+
+设置测试进程环境变量 `NR_NEXUS_TEST_NR_CACHE_TWO_TIERS=1` 后，同一入口改为内部两档实验：
+原生 D3D12 Upscaled／FG Off、100% 与 75% 两个完整预备档，其余输入、格式和单 Pass 保持固定。
+两组独立进程先用相同设置准备真实 NR Feature／历史，再执行上档→低档→上档；
+低档单独运行 32 帧暖机和 128 帧计量，比较逐帧 NR 与 x2 的完整两帧成本，并分别保留刷新与复用时间。
+准备、切档及返回上档的记录独立于低档稳态窗口，检查实际调用、Reset、源帧计数、模型／工作集身份和收尾。
+该模式使用公开 SDK 预初始化的真实 Core provider；未覆盖游戏 snippet 启动、私有 Runtime 或自动 FPS 调档。
+GPU 计时和静态有限输出检查仍沿用上述口径，动态转镜、遮挡、光照和帧节奏须另行验收。
+使用新输出目录，运行后恢复该环境变量；不改变插件的默认设置或正式兼容范围。
 
 ## ControlMask 原生成本
 
@@ -313,6 +478,49 @@ SDK 动态计数、固定倍率失效和来源切换。配置保存／方案另�
 ~~~
 
 `adaptive-fg-service` 使用 WARP、模型替身和实际 Service／提交路径，覆盖双颜色双 Pass 的完整所选集合、5 档切回默认、缺输入暂停／恢复及真实合同变化。`adaptive-inline` 使用生产 Render／Upscaled 入口，覆盖 64×64 输入的 15 档／两输出、真实尺寸及写回、准备完成后的切档零新增分配、旧 Stage 工作集归属和清锁恢复。两者还核对临时容量占用、ControlMask 未提交、Off／On、兼容设置复用及失败停止。未提交旧录制阻止槽位复用，额外准备 Evaluate 不计入活动角色成功累计；角色计数与完整 Pass／颜色组完成分开。均为 WARP＋MOCK，不调用硬件 NR Runtime 或游戏。
+
+Bridge 两档自适应使用独立的软件单例：
+
+~~~powershell
+./tools/run-tests.ps1 -Suite bridge-motion -BridgeCase adaptive -SoftwareOnly -UiPreview None
+~~~
+
+该入口强制 WARP、同一软件适配器及 D3D11／D3D12 Debug Layer、InfoQueue，NR 为 MOCK。
+内部默认关闭的实验仅接纳 Upscaled 单组单 Pass、FG Off／x2 Off、显式两档全预备；
+共享 twins 保持完整尺寸，检查私有档位的往返、Reset、就绪后零新增创建、失败重开、Adaptive OFF 及源释放。
+watchdog 救援用例分别核验 `out`、GPU-only `done` 和实际 Reset／不可重放证明，
+防止未完成写回与提前释放。这个软件入口不覆盖真实 NGX 或硬件性能。
+
+同一两档流程另有两个显式硬件入口，不自动追加到软件组或 CI：
+
+~~~powershell
+./tools/run-tests.ps1 -Suite bridge-motion -BridgeCase adaptive-hardware -UiPreview None
+./tools/run-tests.ps1 -Suite bridge-motion -BridgeCase adaptive-native-ngx -UiPreview None `
+  -NativeNgxProjectIdPath <已有ProjectID文件> `
+  -NativeNgxSdkLibraryDirectory <同版SDK静态库目录> `
+  -NativeNgxRuntimePath <已有nvngx_dlssnr.dll> `
+  -NativeNgxSrRuntimePath <已有nvngx_dlss.dll>
+~~~
+
+两者要求同一 NVIDIA 硬件适配器及双 API Debug Layer／InfoQueue，拒绝与
+`-SoftwareOnly` 合用。输入为固定的 1280×720 合成画面、1920×1080 输出，
+私有 NR 仅准备 1920×1080 与 960×540；执行就绪往返、Adaptive OFF、NR OFF 和源释放，
+不重复软件失败注入与 watchdog 场景。`adaptive-hardware` 为 NATIVE_GPU＋MOCK；
+`adaptive-native-ngx` 分别通过 SDK 初始化真实 D3D11 SR 与私有 D3D12 NR，
+使用实际 Create／Evaluate／Release 和 D3D11 读回，失败不会改用 MOCK。
+临时 Runtime 链接只在本次输出目录创建，进程结束后移除，不修改原 Runtime。
+
+逐源 JSON 分开记录源调用 CPU、其中的严格 `done` 等待和 Bridge 分段；模型 API 另记
+Create／Evaluate 耗时，嵌套值不能重复加总。源调用计时不含夹具尾部读回或 SDK 初始化。
+真实模式验证完成及有效像素，不以像素变化宣称模型画质。该 SDK 预初始化路径也未覆盖
+游戏的 snippet 初始化。正式 Bridge 自适应兼容门禁仍关闭；自动帧率闭环、更多档位、
+有限驻留及游戏动态画质需各自证据。
+
+另一个显式入口 `-BridgeCase adaptive-native-snippet` 使用相同的 SDK／Runtime 参数，
+仅 SDK 初始化 D3D11 SR；私有 D3D12 NR 经过生产 loader、caller identity 和
+`EnsureDirectRuntime` 的 `Init_Ext`，不预写设备就绪或降级到 SDK12。它复用两档流程，
+单独记录 Init／Shutdown 结果，并在完成和退休后核验 caller identity 恢复。
+这可隔离生产初始化路径；来源 Hook 安装时机和 FG Off 在夹具中仍是明确前提，需另取游戏证据。
 
 默认 `-Suite fg-native` 会复用同一编译产物，分别在独立进程执行这两个自适应用例；默认 `-Suite ui` 也会复用菜单二进制，在独立进程执行自适应真实 ImGui 交互，包括三种介入点连续往返与配置保存。本地完整发布预检保留这些入口；远端核心回归保留 FG 默认组，UI 全量检查由本地初审承担。`NR_NEXUS_ADAPTIVE_UI_ONLY=1` 仍可单独运行自适应 UI，快照模式不额外运行回归。
 
@@ -372,6 +580,47 @@ PSO 创建，最后一个 PSO 所在源不叠加 NGX Create 或 NR Evaluate，re
 模型或工作集。trace 使用有界堆存储，JSON 转换在 Hook 计时外；墙时和源间隔包含报告、
 导出与夹具限速开销。SDK/provider、codec 根签名与 ControlMask PSO 的前置准备状态单独
 记录。同步的单个创建仍不可拆分，这项验证不预设总准备时间或单次延迟上限。
+
+有限驻留的原生单例在上述 `SELECTED_LEVELS=15`、`PIPELINE_STEPS=1`、`READY=1`
+条件下再设置 `NR_NEXUS_TEST_RESIZE_LIMITED=1`，不启用旧 `DEMAND_PREPARE` 旁路。
+它保留15个逻辑档位，验证上限→冷档→上限、旧录制仍可重放时拒绝添档、反向取消、
+真实退休后再准备和原有 OFF 收尾；只要求目标整组就绪并实际应用，不把 `Session.prepared`
+伪装为真。档位请求是夹具直接驱动，SR／NR、GPU 完成和资源退休是真实执行。
+此单例默认显式开启内部私有PSO实验，autoscale与look bands共用单个在途任务；
+玩家的有限驻留选项不自动开启它。仅此`LIMITED=1`夹具可用
+`NR_NEXUS_TEST_RESIZE_ASYNC_PSO=0`执行同步基线；省略或设为`1`保留私有任务路径。
+两个新进程可使用同一二进制对照；这同时切换两个PSO，驱动／磁盘缓存不受控，
+不将全局就绪墙时差单独归因Look。此路径需编译`NR_NEXUS_TEST_COLD_CPU_TRACE`。
+`async_pso` 使用
+`nr-nexus-native-private-pso-v2`，在 `targets.autoscale` 与 `targets.look_bands`
+分别记录真实API区间、返回／异常、线程身份及OS退出凭据、pending源返回次数，
+并以真实API产物与生产槽中的同一pipeline核对接纳，私有模式还核实际task的shader／slot。
+接纳时间是源调用返回后的观测时刻；API返回、槽接纳与线程退出分别判断，
+未完成值保留为空，同步主线程没有worker，退出字段为`null / NotApplicable`。
+成功收尾也会递增取消代次，`task.canceled_at_snapshot`不代表此前接纳被拒。
+取消、失败归属及顺序接纳仍由`adaptive-inline`严格WARP用例覆盖；旧autoscale单项
+记录不能证明look bands原生通过。同步API位于主线程嵌套trace内，私有worker另行记录，
+不能重复加总。源CPU区间为`HookedEvaluateFeatureSlot`，不含夹具在其前调用的
+`StartAsyncAutoscalePreparation`；总就绪墙时及实际源起点间隔包含这些间隙。
+前缀沿用 selected 循环的60 Hz节奏，62／180次源界限不变；准备墙时包含该节奏，
+不能直接对比旧零节拍前缀。`selected_collection.limited_residency` 保存目标、应用、
+驻留与退休数量；本模式的旧 `full_preparation_*` 字段仅继承首次上限前缀合计，完整范围
+以 `initial_target` 和 `phase_states` 为准。显存使用 `QueryVideoMemoryInfo` 的进程
+LOCAL CurrentUsage采样，含SR、NR、输入输出、工作集及待退休资源，不是额外档位显存或瞬时峰值。
+
+自动控制器单例改用 `NR_NEXUS_TEST_RESIZE_LIMITED=2`、`SELECTED_LEVELS=3`、
+`PIPELINE_STEPS=0`、`READY=1`，其他 resize 实验关闭。它通过玩家按需设置进入真实
+Controller，不直接调用 `Session.Request`，也不修改档位、blocked 状态或时钟。
+三个逻辑档为100%／75%／50%；仅输出FPS为MOCK，按实际Applied尺寸依次提供
+80／84／60 FPS，回退75%后保持60 FPS以模拟负载变化。SR／NR、GPU时间戳、
+完成凭据和资源退休均真实执行；不注入GPU收益，私有PSO实验保持关闭。
+用例在最多900个源机会、含前缀20秒内验证连续冷降档、应用、无益回退和再次探索，
+GPU收益门禁不满足即如实失败。回退通过请求代际／trial／blocked转换观察，不依赖
+可能在同源被WARMING覆盖的显示文案。最终应累计创建1／1／2个Feature，复用75%
+回退锚并先退休旧50%资源，再沿原OFF路径收尾。详细证据位于
+`selected_collection.limited_residency.automatic`；旧 `full_preparation_*` 字段仍只表示
+首次上限前缀，不是全档预备。此用例不覆盖30秒冷却自然到期、游戏FPS采集准确性、
+动态画质、完整15档探索或分配失败；没有与全档模式作成对性能比较。
 
 首调用 CPU 归因另用原生测试编译宏 `NR_NEXUS_TEST_COLD_CPU_TRACE`，配合
 `NR_NEXUS_TEST_RESIZE_COLD_COMPONENTS=1`、`NR_NEXUS_TEST_RESIZE_SELECTED_LEVELS=0`

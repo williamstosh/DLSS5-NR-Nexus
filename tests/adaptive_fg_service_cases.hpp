@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -40,6 +41,20 @@ HRESULT STDMETHODCALLTYPE ObserveCreatePipeline(ID3D12Device* device,
   return real_create_pipeline(device, desc, iid, pipeline);
 }
 
+uint32_t fail_preparation_create = 0;
+uint32_t preparation_create_failures = 0;
+NVSDK_NGX_Result NVSDK_CONV ObserveCreateModel(ID3D12GraphicsCommandList* list, NVSDK_NGX_Feature feature,
+    const NVSDK_NGX_Parameter* parameters, NVSDK_NGX_Handle** handle) {
+  if (native::preparing_adaptive_frame != nullptr && fail_preparation_create != 0) {
+    const auto failure = std::exchange(fail_preparation_create, 0u);
+    ++preparation_create_failures;
+    *handle = nullptr;
+    if (failure == 1) throw std::bad_alloc{};
+    return NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
+  }
+  return CreateModel(list, feature, parameters, handle);
+}
+
 HRESULT STDMETHODCALLTYPE ObserveClose(ID3D12GraphicsCommandList* list) {
   const auto result = real_close(list);
   list_calls.push_back({.list = list, .reset = false, .result = result});
@@ -65,6 +80,7 @@ int Run() {
     model_gpu = &gpu;
     ComPtr<ID3D12InfoQueue> info;
     gpu.device.As(&info);
+    Check(debug != nullptr && info != nullptr, "adaptive Service requires the D3D12 debug layer and InfoQueue");
     std::cout << "ADAPTIVE_SERVICE debug_layer=" << (debug != nullptr)
         << " debug_hresult=0x" << std::hex << static_cast<uint32_t>(debug_result) << std::dec
         << " info_queue=" << (info != nullptr) << '\n';
@@ -100,16 +116,27 @@ int Run() {
     native::max_worksets.store(4);
     native::adaptive_configuration_settings = native::comparison_ui::CaptureAdaptiveSettings;
     addon::gpu_timers::comparison_settings = native::comparison_ui::CaptureSettings;
+    native::direct_api.private_instance = true;
     native::direct_api.module = GetModuleHandleW(nullptr);
+    native::direct_api.init = control_mask_gpu_cases::InitializeRuntime;
     native::direct_api.create = CreateModel;
     native::direct_api.evaluate = EvaluateModel;
     native::direct_api.release = ReleaseModel;
+    native::direct_api.shutdown = control_mask_gpu_cases::ShutdownRuntime;
     native::direct_load_state = native::DirectLoadState::Ready;
     native::direct_device = gpu.device.Get();
     native::direct_device->AddRef();
     native::direct_device_native = gpu.device.Get();
     native::direct_runtime_requirements.dual_models = true;
     native::direct_runtime_requirements.file_version = "310.9.16.0";
+    // This fixture supplies a model substitute, not a loader-owned DLL. The
+    // real pre-FG service must still select an explicitly private API.
+    native::ngx_loader_staging = {};
+    native::ngx_loader_staging.nr_ready = true;
+    native::ngx_loader_staging.native_ready = true;
+    native::ngx_loader_staging.native_api = native::direct_api;
+    native::ngx_loader_staging.nr_requirements = native::direct_runtime_requirements;
+    native::PublishNgxLoaderSymbols();
     native::parameter_runtime_ready = true;
     native::core_allocate_parameters = addon::bridge::AllocateOwnedParameters;
     native::core_destroy_parameters = addon::bridge::DestroyOwnedParameters;
@@ -121,7 +148,11 @@ int Run() {
     uint64_t observing_context = 0;
     std::array<uint32_t, 2> active_pass_masks{}, failed_pass_masks{}, reset_pass_masks{};
     uint32_t partial_role_recordings = 0;
+    bool verify_limited_commit = false;
+    addon::adaptive_resolution::Sizes before_limited_commit;
     model_parameter_observer = [&](const NVSDK_NGX_Handle* model, const NVSDK_NGX_Parameter* parameters) {
+      Check(!native::parameter_runtime_via_core.load(),
+          "both native pre-FG color roles retain the private signed provider through preparation and evaluation");
       Check(native::GetD3D12Resource(parameters, "DLSSNR.ControlMask") != nullptr,
           "every model call receives the production GPU ControlMask");
       ++masked_calls;
@@ -132,6 +163,12 @@ int Run() {
       } else {
         const auto stream = native::fg_service::streams.find({false, observing_context});
         Check(stream != native::fg_service::streams.end(), "active model Evaluate belongs to the observed Service context");
+        if (verify_limited_commit && stream->second.adaptive_session->settings.limited_residency
+            && stream->second.adaptive_frame.slot == stream->second.adaptive_session->level) {
+          Check(stream->second.adaptive_session->status.applied == before_limited_commit
+              && stream->second.adaptive_session->applied_ns == 0,
+              "neither color nor an earlier Pass can commit the requested target before the complete Service output group");
+        }
         bool identified = false;
         for (size_t role = 0; role < active_pass_masks.size(); ++role) {
           const auto feature = native::features.find(stream->second.roles[role].Handle());
@@ -330,6 +367,7 @@ int Run() {
         addon::bridge::OwnedParameters composition;
         composition.Set(NVSDK_NGX_DLSSG_Parameter_UI, ui.Get());
         native::PresentTarget target;
+        target.private_signed_runtime = true;
         bool output_ready = false;
         std::array<native::NrRecording, 2> recordings;
         fail_next_pipeline = true;
@@ -489,6 +527,32 @@ int Run() {
         && std::all_of(recovered_cache->tiers.begin(), recovered_cache->tiers.begin() + recovered_cache->count,
             [](const auto& tier) { return tier.ready; }),
         "explicit clear-failure rebuilds real Features and successfully resumes the existing Service");
+    native::direct_api.create = ObserveCreateModel;
+    for (const auto failure : {1u, 2u}) {
+      native::nr_adaptive_selected_levels = 3;
+      fail_preparation_create = failure;
+      const auto failures_before = preparation_create_failures;
+      for (uint32_t frame = 0; frame < 16 && fail_preparation_create != 0; ++frame) service();
+      auto& source = native::features.at(stream.roles[0].Handle());
+      auto failed_cache = source.adaptive_cache;
+      Check(fail_preparation_create == 0 && preparation_create_failures == failures_before + 1
+          && failed_cache->standby_retired && !stream.adaptive_session->prepared
+          && (failure == 1 ? failed_cache->budget_blocked : failed_cache->failed)
+          && native::AdaptiveFallbackReady(source, *failed_cache, 0),
+          "a real two-Pass Service Create throw/return failure pauses the entire collection and retains only a GPU-ready upper");
+      const auto models_after_failure = next_handle;
+      for (uint32_t frame = 0; frame < 8; ++frame) service();
+      Check(next_handle == models_after_failure && preparation_create_failures == failures_before + 1
+          && !stream.adaptive_session->prepared,
+          "subsequent Service frames neither retry failed Create nor falsely complete the selected collection");
+      native::nr_adaptive_selected_levels = 0;
+      native::RecreateFeatures();
+      for (uint32_t frame = 0; frame < 32; ++frame) service();
+      Check(stream.adaptive_session->prepared && !stream.adaptive_session->failed
+          && service() == fg::Result::SUBMITTED,
+          "explicit Service recovery waits for its own retirements and restores complete two-Pass output");
+    }
+    native::direct_api.create = CreateModel;
     native::fg_service::Retire();
     gpu.Submit();
     native::DrainRetiredResources(true);
@@ -859,6 +923,67 @@ int Run() {
           && native::present_retired.empty(), "a subsequent Off also completes without another Service or Resize");
       std::cout << "ADAPTIVE_OFF evidence=WARP+MOCK private_replay_closed=1 external_replay_retained=1 released=1 reenabled=1\n";
     }
+    list_calls.clear();
+    native::enabled = true;
+    native::ServiceDisabledNr();
+    native::nr_adaptive_limited_residency = true;
+    native::nr_adaptive_enabled = true;
+    native::nr_adaptive_selected_levels = 5;
+    input.context = 0xADAFB;
+    input.application_frame = 0;
+    input.color_width = input.color_height = 16;
+    input.hudless = hudless.Get();
+    const auto before_limited_models = native::nr_features_created;
+    for (uint32_t source = 0; source < 32; ++source) {
+      service();
+      const auto& preparing = native::fg_service::streams.at({false, input.context});
+      if (preparing.adaptive_session != nullptr && preparing.adaptive_session->TargetReady()) break;
+    }
+    auto& limited = native::fg_service::streams.at({false, input.context});
+    auto limited_primary = native::features.at(limited.roles[0].Handle()).adaptive_cache;
+    auto limited_auxiliary = native::features.at(limited.roles[1].Handle()).adaptive_cache;
+    Check(limited.adaptive_session->TargetReady() && !limited.adaptive_session->prepared
+        && limited.adaptive_session->ladder.count == 5 && limited_primary->count == 5 && limited_auxiliary->count == 5
+        && limited_primary->active == 0 && limited_auxiliary->active == 0
+        && native::nr_features_created == before_limited_models + 4
+        && native::AdaptiveResidentWorksetCount(limited.adaptive_session) == 2,
+        "limited paired Service initially prepares only the two-Pass upper for both colors while retaining five logical levels");
+    before_limited_commit = limited.adaptive_session->status.applied;
+    limited.adaptive_session->Request(3, native::SteadyNowNs());
+    verify_limited_commit = true;
+    service();
+    Check(!limited.adaptive_session->TargetReady() && limited_primary->active == 0 && limited_auxiliary->active == 0
+        && limited.adaptive_session->status.applied == before_limited_commit,
+        "a cold two-Pass color pair keeps both actual active tiers until the whole requested group is ready");
+    for (uint32_t source = 0; source < 32 && limited_primary->active != 3; ++source) service();
+    verify_limited_commit = false;
+    Check(limited_primary->active == 3 && limited_auxiliary->active == 3 && limited.adaptive_session->TargetReady()
+        && limited.adaptive_session->status.applied == limited.adaptive_session->ladder.sizes[3]
+        && limited.adaptive_session->applied_ns != 0 && !limited.adaptive_session->prepared
+        && native::nr_features_created == before_limited_models + 8,
+        "only complete successful output for both colors commits a cold target and starts its measurement warmup");
+    limited.adaptive_session->Request(2, native::SteadyNowNs());
+    service();
+    limited.adaptive_session->Request(0, native::SteadyNowNs());
+    for (uint32_t source = 0; source < 16; ++source) service();
+    Check(limited_primary->active == 0 && limited_auxiliary->active == 0 && limited.adaptive_session->TargetReady()
+        && limited.adaptive_session->status.applied == limited.adaptive_session->status.upper
+        && !limited.adaptive_session->failed && !limited_primary->standby_retired && !limited_auxiliary->standby_retired,
+        "reversing a pending request preserves the upper pair and treats unused candidates as ordinary retirement");
+    const auto after_limited_reverse = native::nr_features_created;
+    for (uint32_t source = 0; source < 4; ++source) service();
+    Check(native::nr_features_created == after_limited_reverse
+        && !native::AdaptiveSessionRetirementPending(limited.adaptive_session)
+        && native::AdaptiveResidentWorksetCount(limited.adaptive_session) == 2,
+        "canceled candidates finish exact retirement without background rebuilding the remaining logical levels");
+    native::nr_adaptive_enabled = false;
+    service();
+    Check(limited.adaptive_session->status.applied == limited.adaptive_session->status.upper
+        && native::features.at(limited.roles[0].Handle()).adaptive_cache == nullptr
+        && native::features.at(limited.roles[1].Handle()).adaptive_cache == nullptr,
+        "limited paired Adaptive Off retains the actual manual upper behavior");
+    native::nr_adaptive_limited_residency = false;
+    native::nr_adaptive_selected_levels = 0;
     model_parameter_observer = {};
     native::fg_service::Retire();
     gpu.Submit();

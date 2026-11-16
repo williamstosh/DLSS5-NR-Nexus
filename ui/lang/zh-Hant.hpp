@@ -2339,6 +2339,11 @@ inline constexpr Translation kZhHant[] = {
     {"Default (by capacity)", "預設（依可用容量）"},
     {"Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.", "先準備全部所選檔位。檔位越多，顯示記憶體用量越高、步距越細；準備時可能短暫卡頓。"},
     {"No working-resolution range to adjust", "工作解析度無需調節"},
+    {"Preparation mode", "預備方式"},
+    {"Prepare all levels", "全檔預備"},
+    {"On-demand (experimental)", "按需備檔（實驗）"},
+    {"All levels use more VRAM for smooth switching once ready. On-demand keeps fewer levels resident, but cold preparation may stutter.", "全檔預備使用更多顯示記憶體，換取就緒後的順暢切換；按需備檔減少駐留檔位，但冷準備仍可能卡頓。"},
+    {"More levels give smaller steps. On-demand keeps fewer levels resident; preparing a missing level may stutter.", "檔位越多，步距越細。按需備檔減少駐留檔位；準備尚未就緒的檔位時可能卡頓。"},
 };
 
 }  // namespace renodx::addons::dlss5::ui::lang

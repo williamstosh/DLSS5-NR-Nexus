@@ -49,6 +49,17 @@ struct Context {
   uint64_t source_generation = 0;
   bool api_returned = false;
   bool ngx_accepted = false;
+  bool xefg_service = false;
+  uint64_t application_frame = 0;
+  uint64_t guide_serial = 0;
+  uint64_t stream_epoch = 0;
+  int64_t service_entry_ns = 0;
+  double service_interval_ms = 0;
+  bool service_interval_available = false;
+  uint32_t model_evaluates = 0;
+  bool refresh = false;
+  bool reuse = false;
+  bool output_ready = false;
 };
 
 enum class ExportState : uint8_t { NONE, PENDING, MARKER_WRITTEN, WRITTEN, FAILED };
@@ -75,6 +86,7 @@ struct Summary {
   ExportState export_state = ExportState::NONE;
   char reason[96] = {};
   char error[96] = {};
+  bool xefg_service = false;
 };
 
 // Assigned before capture configuration; callback lifetime belongs to the existing screenshot worker.
@@ -187,7 +199,8 @@ inline Summary GetSummary() {
 }
 
 // Busy sessions (including a failed export) cannot be overwritten by reconfiguration.
-inline bool Configure(uint32_t target = 0, double seconds = 30, double warmup = 0, uint32_t capacity = 8192) {
+inline bool Configure(uint32_t target = 0, double seconds = 30, double warmup = 0,
+                      uint32_t capacity = 8192, bool xefg_service = false) {
   auto& s = internal::state;
   std::unique_lock lock(s.mutex);
   if (s.armed || s.summary.active || s.worker_busy || s.marker_needed || s.terminal_needed
@@ -196,7 +209,7 @@ inline bool Configure(uint32_t target = 0, double seconds = 30, double warmup = 
       || warmup < 0 || warmup >= seconds || capacity == 0 || capacity > 8192) return false;
   s.summary = Summary{
       .target = (std::min)(target, 4096u), .capacity = capacity,
-      .window_seconds = seconds, .warmup_seconds = warmup};
+      .window_seconds = seconds, .warmup_seconds = warmup, .xefg_service = xefg_service};
   s.rows.clear();
   s.max_sequence = 0;
   s.marker_path.clear();
@@ -252,7 +265,7 @@ inline uint64_t Reserve(const Context& context, uint64_t timer_sequence, int64_t
   {
     auto& s = internal::state;
     std::unique_lock lock(s.mutex);
-    if (!s.armed) return 0;
+    if (!s.armed || context.xefg_service != s.summary.xefg_service) return 0;
     if (!s.summary.active) {
       try {
         s.rows.reserve(s.summary.capacity);
@@ -313,7 +326,9 @@ inline void Observe(const gpu_timers::Stats& stats, uint64_t token) {
       row.state = internal::RowState::DROPPED;
       ++s.summary.dropped;
     } else if (stats.valid && stats.state == gpu_timers::SampleState::VALID && stats.samples == 1
-               && stats.sequence == row.timer_sequence && row.context.api_returned && row.context.ngx_accepted) {
+                && stats.sequence == row.timer_sequence
+                && (row.context.xefg_service ? row.context.output_ready
+                                             : row.context.api_returned && row.context.ngx_accepted)) {
       row.state = internal::RowState::VALID;
       row.stats = stats;
       row.stats.queue = nullptr;
@@ -416,12 +431,30 @@ inline void ProcessPending(const std::filesystem::path& directory, const report:
         if (c.source_generation_available) {
           event["context"]["source_generation"] = c.source_generation;
         }
+        if (c.xefg_service) {
+          event["context"] = {{"runtime_version", c.runtime_version}, {"requested_model", c.requested_model},
+                              {"stage", stage_plan::Name(static_cast<stage_plan::Stage>(c.stage))},
+                              {"width", c.width}, {"height", c.height}};
+          event["xefg"] = {{"application_frame", c.application_frame}, {"guide_serial", c.guide_serial},
+                           {"stream_epoch", c.stream_epoch}, {"service_entry_ns", c.service_entry_ns},
+                           {"service_interval_available", c.service_interval_available},
+                           {"model_evaluates", c.model_evaluates}, {"refresh", c.refresh},
+                           {"reuse", c.reuse}, {"output_ready", c.output_ready}};
+          if (c.service_interval_available) {
+            event["xefg"]["service_interval_ms"] = c.service_interval_ms;
+          }
+        }
         if (row.state == internal::RowState::VALID) {
           const auto& t = row.stats;
           event["timing_us"] = {{"total", t.total_us}, {"own", t.own_us}, {"eval", t.eval_us},
                                 {"encode", t.encode_us}, {"resolve", t.resolve_us}, {"look", t.look_us},
                                 {"linearize", t.linearize_us}, {"commit", t.commit_us}, {"copies", t.copies_us}};
           event["samples"] = t.samples;
+          if (c.xefg_service) {
+            event["timing_us"]["service_total"] = t.service_total_us;
+            event["timing_us"]["staging"] = t.staging_us;
+            event["timing_us"]["writeback"] = t.writeback_us;
+          }
           event["measured_ns"] = t.measured_ns;
           event["passes"] = Json::array();
           for (const auto& pass : t.passes) {
@@ -438,7 +471,9 @@ inline void ProcessPending(const std::filesystem::path& directory, const report:
       }
       Json document{{"schema", "control_mask_capture_v1"}, {"status", "terminal"}, {"capture_id", summary.capture_id},
                     {"time_basis", "started_ns/recorded_ns are CPU recording times; ended_ns/measured_ns are CPU stop/observation times on steady_clock, not absolute GPU timestamps"},
-                    {"eval_scope", "mask_generation+NR_Evaluate; not an independent mask duration"},
+                     {"eval_scope", (summary.xefg_service
+                         ? "core eval span includes cache apply/composed motion or NR Evaluate; actual calls are xefg.model_evaluates"
+                         : "mask_generation+NR_Evaluate; not an independent mask duration")},
                     {"count_scope", "Disabled, warmup, duplicate-reservation and target-drain evaluates are excluded from event counts. timeout counts EXPIRED rejections plus window expiry; window_timed_out identifies the latter. Terminal means export ended, not necessarily target reached."},
                     {"summary", {{"target", summary.target}, {"actual_valid", summary.valid}, {"rejected", summary.rejected},
                                  {"timeout", summary.timeout}, {"dropped", summary.dropped}, {"overflow", summary.overflow},
@@ -448,6 +483,11 @@ inline void ProcessPending(const std::filesystem::path& directory, const report:
                                  {"started_ns", summary.started_ns}, {"ended_ns", summary.ended_ns},
                                  {"window_timed_out", summary.window_timed_out}}},
                     {"events", std::move(events)}};
+      if (summary.xefg_service) {
+        document["scope"] = "xefg_single_backbuffer_service";
+        document["service_timing_scope"] = "GPU service_total spans current-color staging through ProcessInline and final private-color writeback; total/eval retain their core-chain meanings; staging/writeback are the outer intervals";
+        document["service_interval_scope"] = "CPU monotonic Service entry intervals between consecutive application frames in this stream; not display/generated-frame intervals or Service call durations";
+      }
       std::string text;
       error = "terminal_redaction_failed";
       if (!report::RedactJson(document.dump(), scrub, &text)) throw 0;

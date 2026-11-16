@@ -2340,6 +2340,11 @@ inline constexpr Translation kTr[] = {
     {"Default (by capacity)", "Varsayılan (kapasiteye göre)"},
     {"Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.", "Önce seçilen düzeyler hazırlanır. Daha fazla düzey daha çok bellek kullanır ve daha küçük adımlar sağlar. Hazırlık kısa süreli takılmaya yol açabilir."},
     {"No working-resolution range to adjust", "Ayarlanacak çalışma çözünürlüğü aralığı yok"},
+    {"Preparation mode", "Hazırlama yöntemi"},
+    {"Prepare all levels", "Tüm düzeyleri hazırla"},
+    {"On-demand (experimental)", "Gerektiğinde (deneysel)"},
+    {"All levels use more VRAM for smooth switching once ready. On-demand keeps fewer levels resident, but cold preparation may stutter.", "Tüm düzeyler hazır olduğunda akıcı geçiş sağlamak için daha fazla VRAM kullanır. Gerektiğinde hazırlama daha az düzeyi bellekte tutar, ancak ilk hazırlama takılmaya neden olabilir."},
+    {"More levels give smaller steps. On-demand keeps fewer levels resident; preparing a missing level may stutter.", "Daha fazla düzey daha küçük adımlar sağlar. Gerektiğinde hazırlama daha az düzeyi bellekte tutar; eksik bir düzeyi hazırlamak takılmaya neden olabilir."},
 };
 
 }  // namespace renodx::addons::dlss5::ui::lang

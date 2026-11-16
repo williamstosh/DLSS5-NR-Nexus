@@ -332,6 +332,64 @@ class DesktopTests(unittest.TestCase):
             desktop.key(self.window, 'SHIFT')
         self.assertEqual(order, [(0, 0x2A, 8), .2, (0, 0x2A, 10)])
 
+    def test_full_keyboard_categories_emit_distinct_physical_keys(self):
+        self.assertTrue(set('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') <= desktop.KEYS.keys())
+        self.assertTrue({f'F{n}' for n in range(1, 25)} <= desktop.KEYS.keys())
+        cases = [('home', 0x47, 9), ('KP_7', 0x47, 8), ('End', 0x4F, 9),
+                 ('ins', 0x52, 9), ('DELETE', 0x53, 9), ('pgup', 0x49, 9), ('pgdn', 0x51, 9),
+                 ('Return', 0x1C, 8), ('KP_ENTER', 0x1C, 9),
+                 ('RightCtrl', 0x1D, 9), ('ctrl', 0x1D, 8), ('altgr', 0x38, 9), ('ALT', 0x38, 8),
+                 ('RSHIFT', 0x36, 8), ('LSHIFT', 0x2A, 8), ('RWIN', 0x5C, 9), ('MENU', 0x5D, 9),
+                 ('/', 0x35, 8), ('KP_DIVIDE', 0x35, 9), ('KP_MULTIPLY', 0x37, 8),
+                 ('PrtSc', 0x37, 9), ('KP_ADD', 0x4E, 8), ('KP_SUBTRACT', 0x4A, 8),
+                 ('KP_DECIMAL', 0x53, 8), ('NUMPAD0', 0x52, 8), ('\\', 0x2B, 8), ('`', 0x29, 8),
+                 ('ISO_BACKSLASH', 0x56, 8), ('NUMLOCK', 0x45, 8), ('SCROLLLOCK', 0x46, 8),
+                 ('CAPSLOCK', 0x3A, 8), ('F12', 0x58, 8), ('F13', 0x64, 8), ('F24', 0x76, 8)]
+        for name, scan, flags in cases:
+            with self.subTest(key=name):
+                events = []
+                self.u.SendInput.side_effect = lambda count, event, size: events.append(
+                    (count, event._obj.ki.wVk, event._obj.ki.wScan, event._obj.ki.dwFlags)) or 1
+                with mock.patch.object(desktop, 'ensure_foreground') as foreground, mock.patch.object(
+                        desktop.time, 'sleep', side_effect=lambda seconds: events.append(seconds)):
+                    desktop.key(self.window, name)
+                foreground.assert_called_once_with(self.window)
+                self.assertEqual(events, [(1, 0, scan, flags), .2, (1, 0, scan, flags | 2)])
+
+    def test_key_rejects_special_sequences_and_invalid_values_before_activation(self):
+        with mock.patch.object(desktop, 'ensure_foreground') as foreground:
+            for name, seconds in [('Pause', .2), ('Break', .2), ('FN', .2), ('MEDIA_UNKNOWN', .2),
+                                  ('Ctrl+F6', .2), (None, .2), ('HOME', 0), ('HOME', 2.01),
+                                  ('HOME', float('nan')), ('HOME', True), ('HOME', '.2')]:
+                with self.subTest(key=name, seconds=seconds), self.assertRaises(ValueError):
+                    desktop.key(self.window, name, seconds)
+        foreground.assert_not_called()
+        self.u.SendInput.assert_not_called()
+
+    def test_extended_home_release_survives_hold_failure(self):
+        events = []
+        self.u.SendInput.side_effect = lambda count, event, size: events.append(
+            (event._obj.ki.wScan, event._obj.ki.dwFlags)) or 1
+        with mock.patch.object(desktop, 'ensure_foreground'), mock.patch.object(
+                desktop.time, 'sleep', side_effect=RuntimeError('interrupted')):
+            with self.assertRaisesRegex(RuntimeError, 'interrupted'):
+                desktop.key(self.window, 'HOME')
+        self.assertEqual(events, [(0x47, 9), (0x47, 11)])
+
+    def test_failed_key_down_still_releases_and_failed_release_is_reported(self):
+        with mock.patch.object(desktop, 'ensure_foreground'), mock.patch.object(
+                desktop.time, 'sleep') as hold, mock.patch.object(C, 'get_last_error', return_value=5):
+            self.u.SendInput.side_effect = [0, 1]
+            with self.assertRaises(OSError):
+                desktop.key(self.window, 'HOME')
+            hold.assert_not_called()
+            self.assertEqual(self.u.SendInput.call_count, 2)
+            self.u.SendInput.reset_mock()
+            self.u.SendInput.side_effect = [1, 0]
+            with self.assertRaisesRegex(RuntimeError, 'Key release failed'):
+                desktop.key(self.window, 'HOME')
+            self.assertEqual(self.u.SendInput.call_count, 2)
+
     def test_reused_pid_with_same_hwnd_does_not_close(self):
         with mock.patch.object(desktop, '_metrics', return_value=dict(created=101)):
             desktop.close(self.window)

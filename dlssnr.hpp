@@ -31,6 +31,7 @@
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -38,6 +39,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <shared_mutex>
 #include <sstream>
@@ -98,6 +100,7 @@
 #include "reset_epoch.hpp"
 #include "root_arguments.hpp"
 #include "runtime_lock.hpp"
+#include "runtime_image.hpp"
 #include "nr_model.hpp"
 #include "stage_plan.hpp"
 #include "capability.hpp"
@@ -116,6 +119,11 @@
 #include "ui/runtime_monitor.hpp"
 #include "ui/text_input.hpp"
 #include "submission_tracker.hpp"
+#include "edit_reuse.hpp"
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+#include "nr_fg_output_marker.hpp"
+#include "nr_fg_output_probe.hpp"
+#endif
 #include "control_mask_execution.hpp"
 #include "fg_xefg.hpp"
 #include "fg_native_options.hpp"
@@ -277,6 +285,7 @@ using DestroyParametersFn =
 
 struct DirectApi {
   bool borrowed_core_context = false;
+  bool private_instance = false;
   HMODULE module = nullptr;
   AllocateParametersFn allocate = nullptr;
   DestroyParametersFn destroy = nullptr;
@@ -354,6 +363,7 @@ struct NrFeatureSlot {
   uint32_t nr_create_flags = 0;  // effective flags sent when this handle was created
   uint32_t nr_preset = 0;  // Resolved creation request, not a runtime confirmation.
   bool failed = false;
+  bool memory_failure = false;
   // Steady-clock time at which `failed` was latched; the slot retries
   // automatically once the backoff interval expires (see ProcessInline).
   int64_t failed_ns = 0;
@@ -396,6 +406,7 @@ struct NrFeatureSlot {
   float logged_model[9] = {NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN};
   int64_t model_logged_ns = 0;
   LookHistory look_history;
+  std::shared_ptr<edit_reuse::State> edit_reuse;
 };
 
 // Where a relative-HDR frame's NR input scale comes from (NRFeedMode; the
@@ -457,10 +468,16 @@ struct FeatureState {
   uint64_t adaptive_output_geometry = 0;
   uint64_t adaptive_output_failure_generation = 0;
   bool adaptive_output_blocked = false;
+  bool adaptive_retirement_blocked = false;
   // Outlives workset eviction: discarded commands also invalidate NGX History.
   std::shared_ptr<submission::RecordingStatus> control_mask_recording;
   std::shared_ptr<control_mask_execution::Stream> control_mask_stream;
   uint64_t source_generation = 0;
+  Microsoft::WRL::ComPtr<IUnknown> source_device11_identity;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  Microsoft::WRL::ComPtr<IUnknown> source_device12_identity;
+#endif
+  uint64_t sr_sequence = 0;
   bool mixed_recording_discarded = false;
   // Stage-local dimensions, normalization and slots must not alternate
   // between render and display contracts during one source evaluate.
@@ -588,10 +605,12 @@ struct AdaptiveFeatureCache {
   std::unordered_set<uint64_t> previous_output_bindings;
   int64_t last_used_ns = 0;
   uint64_t preparation_epoch = 0;
+  uint64_t target_generation = 0;
   uint32_t stalled_opportunities = 0;
   bool resident = false;
   bool failed = false;
   bool budget_blocked = false;
+  bool standby_retired = false;
   uint64_t measured_allocation_increment = 0;
 };
 
@@ -700,6 +719,8 @@ struct RetiredNrFeature {
   // The slot's look history (LookHistory), retired with its handle, or on
   // its own (handle null) when Stabilize goes off.  Every use is tracked.
   ID3D12Resource* look_history[2] = {};
+  std::shared_ptr<edit_reuse::State> edit_reuse;
+  std::shared_ptr<uint8_t> adaptive_recording_token;
   // Late leases taken for an entry retired without a fence (DrainRetiredResources).
   uint8_t late_leases = 0;
 };
@@ -868,6 +889,9 @@ struct FinalResources {
   std::shared_ptr<submission::RecordingStatus> control_mask_recording;
   mutable std::shared_ptr<submission::RecordingStatus> recording;
   mutable bool tracked_recording = false;
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+  std::shared_ptr<fg_output_marker::State> fg_output_marker;
+#endif
   // HDR worksets (rc5): `decoded` IS `original` (one reference each), one
   // output-size surface less (31.6-63.3 MiB at 4K).  Safe because nothing
   // reads `original` after the linearize dispatch: the passes, pedestal and
@@ -1014,6 +1038,22 @@ struct RetiredFinalResources {
   uint8_t late_leases = 0;
 };
 
+// Borrowed only during RunBridge's device/runtime-locked recording and delivery.
+struct BridgeAdaptiveSource {
+  capability::Api api = capability::Api::UNKNOWN;
+  capability::Backend backend = capability::Backend::UNKNOWN;
+  const NVSDK_NGX_Handle* handle = nullptr;
+  ID3D12Device* device = nullptr;
+  ID3D12GraphicsCommandList* list = nullptr;
+  IUnknown* device11_identity = nullptr;
+  uint64_t device_generation = 0;
+  uint64_t source_generation = 0;
+  uint64_t shared_layout = 0;
+  stage_plan::Stage stage = stage_plan::Stage::UPSCALED;
+};
+static std::atomic_bool bridge_adaptive_experiment{false};
+static std::atomic_uint64_t bridge_adaptive_device_generation{0};
+
 struct EvaluationContract {
   const NVSDK_NGX_Handle* source_handle = nullptr;
   ID3D12Resource* motion = nullptr;
@@ -1088,6 +1128,9 @@ struct PresentTarget {
   uint32_t sdr_restore_effective_mode = 0;
   std::array<float, kMaxNrPasses> pass_color_strength{};
   uint64_t guide_serial = 0;
+  // Granted only by XeFG's tagged, single-backbuffer service. Its private
+  // Output contains this base frame's original color before NR runs.
+  uint64_t xefg_edit_reuse_frame = 0;
   uint64_t diagnostic_source_generation = 0;
   NVSDK_NGX_Feature diagnostic_source_feature = NVSDK_NGX_Feature_Reserved_Unknown;
   uint32_t guide_mode = 0;
@@ -1096,6 +1139,9 @@ struct PresentTarget {
   bool d3d11_bridge = false;
   // Granted only by the ordinary Present caller, never by pre-FG/B1.
   bool independent_resolution_pair = false;
+  // The native pre-FG service owns its command list and must not borrow the
+  // game's Core context, which may have been initialized through a proxy.
+  bool private_signed_runtime = false;
   // Granted only to the validated native single-plane FG transaction.
   bool native_prefg_resolution_pair = false;
   present_hdr_pedestal::Snapshot hdr_pedestal;
@@ -1123,6 +1169,9 @@ struct PresentTarget {
 
 inline HMODULE addon_module = nullptr;
 inline DirectApi direct_api;
+// Only a successful Shutdown of this backend's private context permits unmap.
+inline bool native_runtime_unload_safe = false;
+inline HMODULE native_runtime_failed_instance = nullptr;
 inline DirectLoadState direct_load_state = DirectLoadState::Unknown;
 // Why the runtime is unavailable, for the status card (ui::RuntimeFault):
 // DirectLoadState has one Failed, and "the file is not there" and "the file
@@ -1133,6 +1182,38 @@ inline bool direct_runtime_failed = false;
 inline std::string direct_runtime_sha256;
 inline bool direct_runtime_reference_match = false;
 inline CodecPipeline codec_pipeline;
+// Private experiment: no config/UI surface; the existing synchronous path is the default.
+static std::atomic_bool async_autoscale_preparation{false};
+static const auto async_autoscale_cancellation = std::make_shared<std::atomic_uint64_t>(1);
+// Separate from codec_pipeline: ReleaseCodecPipeline must not reset the generation to zero.
+static uint64_t async_autoscale_cache_epoch = 1;
+struct AsyncAutoscalePreparation {
+  std::shared_mutex mutex;
+  std::shared_ptr<const std::atomic_uint64_t> cancellation;
+  uint64_t cancellation_epoch = 0;
+  uint64_t cache_epoch = 0;
+  ID3D12Device* device_identity = nullptr;
+  ID3D12RootSignature* root_identity = nullptr;
+  ID3D12Device* device = nullptr;
+  ID3D12RootSignature* root = nullptr;
+  std::span<const uint8_t> bytecode;
+  ID3D12PipelineState** target_identity = nullptr;
+  const wchar_t* debug_name = L"" NR_NEXUS_NAME " v6 same-frame autoscale";
+  const char* log_name = "v6 same-frame autoscale";
+  std::weak_ptr<adaptive_resolution::Session> session;
+  uint64_t preparation_epoch = 0;
+  bool session_owned = false;
+  bool started = false;
+  bool complete = false;
+  HRESULT result = E_PENDING;
+  DWORD system_error = ERROR_SUCCESS;
+  const char* operation = "queued";
+  std::array<char, 256> exception{};
+  // Explicitly reclaimed only at safe source/Present/Shutdown boundaries. As with
+  // the existing raw codec cache, loader detach must not call into the D3D driver.
+  ID3D12PipelineState* pipeline = nullptr;
+};
+static std::shared_ptr<AsyncAutoscalePreparation> async_autoscale_task;
 struct PipelinePreparationOpportunity {
   bool created = false;
   bool deferred = false;
@@ -1261,6 +1342,11 @@ struct HdrCommitCapture {
 // Each entry owns a write-once descriptor table and its GPU budget until exact retirement.
 inline std::vector<std::shared_ptr<HdrCommitCapture>> retired_hdr_captures;
 inline std::vector<RetiredNrFeature> retired_nr_features;
+// Failed collections retain their identity across RecreateFeatures and native
+// Service invalidation. The second half tracks ordinary limited-residency
+// evictions independently, including an active failure during their retirement.
+inline std::unordered_map<const NVSDK_NGX_Handle*,
+    std::array<std::shared_ptr<uint8_t>, 2 * adaptive_resolution::MAX_PREPARED_LEVELS>> adaptive_retiring_collections;
 // Lets lifecycle acquire an NGX turn before runtime_mutex only when feature
 // retirement has actual work. The vector itself stays under runtime_mutex.
 inline std::atomic_bool nr_retirement_pending{false};
@@ -2294,6 +2380,9 @@ inline void RequestHistoryReset(
     history_reset_request_diagnostic.source = source;
   }
 }
+#if defined(NR_NEXUS_DEV_CONTROL)
+inline std::atomic_uint64_t edit_reuse_native_fg_generation{1};
+#endif
 inline void OnNativeFgOptions(bool mode_enabled) noexcept {
   if (!mode_enabled) mixed_present_fg_seen.store(false);
   native_fg_declaration.store(mode_enabled ? NativeFgDeclaration::kOn : NativeFgDeclaration::kOff,
@@ -2305,6 +2394,10 @@ inline void OnNativeFgOptions(bool mode_enabled) noexcept {
           std::chrono::steady_clock::now().time_since_epoch()).count(),
       std::memory_order_release);
   native_fg_options_generation.fetch_add(1, std::memory_order_release);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  edit_reuse_native_fg_generation.fetch_add(1, std::memory_order_release);
+  edit_fg_observation::StopEnvironment(1, 0);
+#endif
   if (mode_enabled) {
     if (was_off) RequestHistoryReset(HistoryResetSource::kRecreate);
     return;
@@ -2348,12 +2441,27 @@ struct SuccessfulSrCoreScope {
   ID3D12Device* previous = successful_sr_device;
   ID3D12Device* device = nullptr;
 
-  explicit SuccessfulSrCoreScope(ID3D12GraphicsCommandList* list) {
+  explicit SuccessfulSrCoreScope(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle = nullptr) {
     if (list != nullptr && FAILED(list->GetDevice(IID_PPV_ARGS(&device)))) {
       if (device != nullptr) device->Release();
       device = nullptr;
     }
     successful_sr_device = device;
+#if defined(NR_NEXUS_DEV_CONTROL)
+    const auto created = create_contracts.find(handle);
+    if (device != nullptr && created != create_contracts.end() && created->second.source_type_confirmed
+        && created->second.source_generation != 0 && created->second.source_device11_identity == nullptr) {
+      auto* native_device = device;
+      renodx::utils::directx::NativeFromReShadeProxy(&native_device);
+      Microsoft::WRL::ComPtr<IUnknown> identity;
+      if (native_device != nullptr && SUCCEEDED(native_device->QueryInterface(IID_PPV_ARGS(&identity)))) {
+        created->second.source_device12_identity = identity;
+        if (const auto current = features.find(handle); current != features.end()) {
+          current->second.source_device12_identity = identity;
+        }
+      }
+    }
+#endif
   }
   ~SuccessfulSrCoreScope() {
     successful_sr_device = previous;
@@ -2567,6 +2675,96 @@ inline std::atomic_bool edit_trace_enabled = defaults::kEditTrace;
 // Latched when the look's programs or surfaces could not be created: the
 // look (and the trace) stay off for the session, NR runs on without them.
 inline std::atomic_bool look_unavailable = false;
+inline std::atomic_bool edit_reuse_enabled{false};
+// Internal two-ready-tier contract probe; no settings or runtime-control entry.
+inline std::atomic_bool edit_reuse_adaptive_experiment{false};
+#if defined(NR_NEXUS_DEV_CONTROL)
+inline std::atomic_bool edit_reuse_fg_experiment{false};
+#endif
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+// A dedicated validation build only. All access is under runtime_mutex, and
+// the normal experiment's OFF/released gate owns rearming this finite window.
+struct FgOutputMarkerWindow {
+  struct Binding {
+    uintptr_t source = 0;
+    uint64_t source_generation = 0;
+    uint64_t provider = 0;
+    uintptr_t context = 0;
+    uint64_t environment_generation = 0;
+    bool operator==(const Binding&) const = default;
+  } binding;
+  static constexpr uint32_t MAX_FRAMES = 128;
+  uint64_t request_generation = 0;
+  uint32_t recorded = 0;
+  uint32_t refreshes = 0;
+  uint32_t reuses = 0;
+  uint64_t first_sequence = 0;
+  uint64_t last_sequence = 0;
+  int64_t last_recorded_ns = 0;
+  bool enabled = false;
+  bool bound = false;
+  bool stopped = false;
+  const char* reason = "disabled";
+
+  void SetEnabled(bool requested) {
+    if (requested == enabled) return;
+    const auto generation = request_generation + 1;
+    if (requested) {
+      *this = {.request_generation = generation, .enabled = true, .reason = "armed"};
+    } else {
+      request_generation = generation;
+      enabled = false;
+      stopped = true;
+      reason = "disabled";
+    }
+  }
+
+  bool Admit(const Binding& current, bool sdk_ready) {
+    if (!enabled || stopped) return false;
+    if (bound && binding != current) {
+      stopped = true;
+      reason = "source_or_environment_changed";
+      return false;
+    }
+    if (!sdk_ready) {
+      stopped = bound;
+      reason = "sdk_display_probe_unavailable";
+      return false;
+    }
+    if (!bound) {
+      binding = current;
+      bound = true;
+    }
+    return true;
+  }
+
+  void Recorded(bool reused, uint64_t sequence, int64_t now) {
+    if (recorded == 0) first_sequence = sequence;
+    ++recorded;
+    if (reused) {
+      ++reuses;
+    } else {
+      ++refreshes;
+    }
+    last_sequence = sequence;
+    last_recorded_ns = now;
+    stopped = recorded == MAX_FRAMES;
+    reason = stopped ? "source_frame_limit" : "recording";
+  }
+
+  void StopSource(uintptr_t source, uint64_t generation, const char* failure) {
+    if (bound && !stopped && binding.source == source && binding.source_generation == generation) {
+      stopped = true;
+      reason = failure;
+    }
+  }
+};
+inline FgOutputMarkerWindow fg_output_marker_window;
+#endif
+inline std::atomic_bool xefg_gpu_capture_enabled{false};
+inline std::atomic_uint64_t edit_reuse_refreshes{0};
+inline std::atomic_uint64_t edit_reuse_reuses{0};
+inline std::atomic_uint64_t edit_reuse_fallbacks{0};
 // Look stage counters (telemetry and the support report): shaped passes,
 // passes Detail stability filtered, transported passes, traced passes,
 // history restarts, motion ring entries recycled for a new motion-vector
@@ -2637,11 +2835,21 @@ inline std::atomic_bool nr_adaptive_enabled{false};
 inline std::atomic<float> nr_adaptive_target_fps{60.f};
 inline std::atomic<float> nr_adaptive_min_scale{0.67f};
 inline std::atomic_uint32_t nr_adaptive_selected_levels{0};
+inline std::atomic_bool nr_adaptive_limited_residency{false};
 inline std::atomic_bool nr_adaptive_editing{false};
 // One accepted source session reserves the finite selected collection. FG
 // colors share their session, rather than competing for separate reservations.
 inline std::weak_ptr<adaptive_resolution::Session> adaptive_resident_session;
 inline uint32_t adaptive_resident_worksets = 0;
+inline bool AdaptiveProtectedLevel(const adaptive_resolution::Session& session, size_t slot) {
+  return slot == 0 || slot == session.active_level || slot == session.level
+      || (session.trial && slot == session.previous_level);
+}
+inline bool AdaptiveCacheOwnsWorkset(const AdaptiveFeatureCache& cache, const WorksetKey& key,
+    const FinalResources& resources) {
+  return key.handle == cache.owner && key.pre_sr == cache.pre_sr && key.adaptive_slot < cache.count
+      && resources.adaptive_recording_token == cache.tiers[key.adaptive_slot].recording_token;
+}
 inline bool IsAdaptiveResidentWorkset(const WorksetKey& key, const FinalResources& resources) {
   const auto source = features.find(key.handle);
   if (source == features.end() || source->second.adaptive_cache == nullptr) return false;
@@ -2651,18 +2859,26 @@ inline bool IsAdaptiveResidentWorkset(const WorksetKey& key, const FinalResource
       && resources.adaptive_recording_token == cache.tiers[key.adaptive_slot].recording_token;
 }
 inline uint32_t AdaptiveWorksetReservation(const std::shared_ptr<adaptive_resolution::Session>& session,
-    uint32_t levels, uint32_t required_roles, uint32_t output_count) {
+    uint32_t levels, uint32_t required_roles, uint32_t output_count, bool limited) {
+  uint32_t protected_levels = 0;
+  for (size_t slot = 0; slot < levels; ++slot) {
+    protected_levels += !limited || AdaptiveProtectedLevel(*session, slot);
+  }
   std::array<uint32_t, 2> roles{};
   for (const auto& [handle, source] : features) {
     if (source.adaptive_session != session || source.adaptive_cache == nullptr
         || !source.adaptive_cache->resident) continue;
     const auto& cache = *source.adaptive_cache;
     const size_t role = (cache.role == 2 ? 1u : 0u);
-    roles[role] = std::max(roles[role], static_cast<uint32_t>(cache.count) * cache.output_count);
+    uint32_t retained_levels = 0;
+    for (size_t slot = 0; slot < cache.count; ++slot) {
+      retained_levels += !limited || AdaptiveProtectedLevel(*session, slot) || slot == cache.active;
+    }
+    roles[role] = std::max(roles[role], retained_levels * cache.output_count);
   }
   for (uint32_t role = 0; role < roles.size(); ++role) {
     if ((required_roles & (1u << role)) != 0) {
-      roles[role] = std::max(roles[role], levels * output_count);
+      roles[role] = std::max(roles[role], protected_levels * output_count);
     }
   }
   return roles[0] + roles[1];
@@ -2714,6 +2930,7 @@ struct AdaptiveFrameScope {
   explicit AdaptiveFrameScope(const adaptive_resolution::Frame* frame) { active_adaptive_frame = frame; }
   ~AdaptiveFrameScope() { active_adaptive_frame = previous; }
 };
+
 struct AdaptiveStatusState {
   std::shared_mutex mutex;
   adaptive_resolution::Status status;
@@ -3235,6 +3452,25 @@ inline int64_t SteadyNowNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
+}
+
+inline bool AdaptivePreparationActive() {
+  return active_adaptive_frame != nullptr && active_adaptive_frame->enabled
+      && active_adaptive_frame->session != nullptr
+      && (active_adaptive_frame->preparing
+          || (!active_adaptive_frame->session->settings.legacy_preparation
+              && !active_adaptive_frame->session->TargetReady()));
+}
+
+inline void ObserveAdaptiveAllocationFailure(HRESULT result) {
+  if (!AdaptivePreparationActive()) return;
+  auto& session = *active_adaptive_frame->session;
+  if (result == E_OUTOFMEMORY) {
+    session.UpdatePreparation(active_adaptive_frame->preparation_epoch, 0,
+        static_cast<uint32_t>(session.ladder.count), adaptive_resolution::Reason::BUDGET, SteadyNowNs());
+  } else {
+    session.Fail(active_adaptive_frame->generation);
+  }
 }
 
 #if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
@@ -3981,9 +4217,8 @@ inline bool InstallCallerIdentity() {
   if (get_module_filename_iat == nullptr) {
     Log(
         reshade::log::level::error,
-        "signed feature has no GetModuleFileNameW import; the nvngx_dlssnr.dll in"
-        " the addon folder is not a valid signed NGX runtime - replace it with an"
-        " official NVIDIA build and restart");
+        "the selected NR runtime lacks the GetModuleFileNameW import required"
+        " for caller identity; this direct API path is unavailable");
     return false;
   }
 
@@ -4016,27 +4251,32 @@ inline bool InstallCallerIdentity() {
   return true;
 }
 
-inline void RestoreCallerIdentity() {
-  if (get_module_filename_iat == nullptr) return;
+inline bool RestoreCallerIdentity() {
+  if (get_module_filename_iat == nullptr) return true;
   DWORD old_protection = 0;
-  if (VirtualProtect(
+  if (!VirtualProtect(
           get_module_filename_iat,
           sizeof(*get_module_filename_iat),
           PAGE_READWRITE,
           &old_protection)) {
-    *get_module_filename_iat = original_get_module_filename;
-    FlushInstructionCache(
-        GetCurrentProcess(), get_module_filename_iat, sizeof(*get_module_filename_iat));
-    DWORD ignored = 0;
-    VirtualProtect(
-        get_module_filename_iat,
-        sizeof(*get_module_filename_iat),
-        old_protection,
-        &ignored);
+    Log(reshade::log::level::error,
+        "caller identity restore failed: VirtualProtect could not make the signed-feature IAT writable;"
+        " the patch and original function remain tracked for retry");
+    return false;
   }
+  *get_module_filename_iat = original_get_module_filename;
+  FlushInstructionCache(
+      GetCurrentProcess(), get_module_filename_iat, sizeof(*get_module_filename_iat));
+  DWORD ignored = 0;
+  VirtualProtect(
+      get_module_filename_iat,
+      sizeof(*get_module_filename_iat),
+      old_protection,
+      &ignored);
   get_module_filename_iat = nullptr;
   original_get_module_filename = nullptr;
   real_get_module_filename = nullptr;
+  return true;
 }
 
 // The addon directory never changes for the life of the process, and the
@@ -4235,6 +4475,10 @@ struct NgxLoaderSymbols {
   std::filesystem::path nr_path;
   std::string nr_sha256;
   NrRuntimeRequirements nr_requirements;
+  bool native_ready = false;
+  bool native_failed = false;
+  DirectApi native_api;
+  runtime_image::PrivateImage native_image;
   // The game's public NGX core, when it has one.
   HMODULE core = nullptr;
   AllocateParametersFn core_allocate = nullptr;
@@ -4589,13 +4833,14 @@ inline void* GatewayLookupSeh(void* (*gateway)(const char*), const char* name,
 // once for the requirements' GPU identity (see ReadNrRuntimeRequirements);
 // null leaves that identity "unknown", which every consumer treats as no
 // verdict.
-inline void PrimeNgxLoaderSymbols(ID3D12Device* device) {
+inline void PrimeNgxLoaderSymbols(ID3D12Device* device, bool prepare_native = false) {
 #if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
   const ColdCpuTraceScope cold_trace("PrimeNgxLoaderSymbols");
 #endif
   {
     const NgxLoaderSymbols& published = NgxLoaderView();
-    if ((published.nr_ready || published.nr_failed) && published.core_ready) {
+    if ((published.nr_ready || published.nr_failed) && published.core_ready
+        && (!prepare_native || published.native_ready || published.native_failed)) {
       return;
     }
   }
@@ -4753,6 +4998,91 @@ inline void PrimeNgxLoaderSymbols(ID3D12Device* device) {
       }
     }
   }
+  if (prepare_native && !symbols.native_ready && !symbols.native_failed) {
+    if (!symbols.nr_ready || symbols.nr_sha256.empty()) {
+      symbols.native_failed = true;
+      Log(reshade::log::level::error,
+          "native pre-FG runtime isolation requires a readable selected runtime and SHA256; no shared-context fallback");
+      PublishNgxLoaderSymbols();
+      return;
+    }
+    const std::array<std::filesystem::path, 2> roots{
+        symbols.nr_path.parent_path() / L"nr-nexus-runtime",
+        ReShadeBaseDirectory() / L"nr-nexus-runtime"};
+    for (uint32_t index = 0; index < roots.size(); ++index) {
+      if (index != 0 && roots[index] == roots[0]) continue;
+      NoteLoaderCall("PrimeNgxLoaderSymbols/private-LoadLibraryW",
+                     LoaderCallSafety::kUnsafeUnderLoaderLock);
+      symbols.native_image = runtime_image::LoadPrivate(
+          symbols.nr_path, roots[index], symbols.nr_module, &LoadLibraryWSeh);
+      if (symbols.native_image.module != nullptr || symbols.native_image.stage == "load"
+          || symbols.native_image.ready) break;
+      runtime_image::RemoveFiles(symbols.native_image);
+    }
+    auto& image = symbols.native_image;
+    if (image.ready && ComputeRuntimeSha256(image.path) != symbols.nr_sha256) {
+      image.ready = false;
+      image.stage = "sha256";
+      image.error = ERROR_INVALID_DATA;
+    }
+    if (image.ready) {
+      NoteLoaderCall("PrimeNgxLoaderSymbols/private-GetProcAddress");
+      DirectApi api{
+          .private_instance = true,
+          .module = image.module,
+          .allocate = reinterpret_cast<AllocateParametersFn>(GetProcAddress(image.module, "NVSDK_NGX_D3D12_AllocateParameters")),
+          .destroy = reinterpret_cast<DestroyParametersFn>(GetProcAddress(image.module, "NVSDK_NGX_D3D12_DestroyParameters")),
+          .init = reinterpret_cast<DirectInitFn>(GetProcAddress(image.module, "NVSDK_NGX_D3D12_Init_Ext")),
+          .create = reinterpret_cast<DirectCreateFn>(GetProcAddress(image.module, "NVSDK_NGX_D3D12_CreateFeature")),
+          .evaluate = reinterpret_cast<DirectEvaluateFn>(GetProcAddress(image.module, "NVSDK_NGX_D3D12_EvaluateFeature")),
+          .release = reinterpret_cast<DirectReleaseFn>(GetProcAddress(image.module, "NVSDK_NGX_D3D12_ReleaseFeature")),
+          .shutdown = reinterpret_cast<DirectShutdownFn>(GetProcAddress(image.module, "NVSDK_NGX_D3D12_Shutdown1")),
+      };
+      if (api.init == nullptr || api.create == nullptr || api.evaluate == nullptr
+          || api.release == nullptr || api.shutdown == nullptr) {
+        image.ready = false;
+        image.stage = "exports";
+        image.error = ERROR_PROC_NOT_FOUND;
+      }
+      if (api.allocate == nullptr || api.destroy == nullptr) {
+        api.allocate = nullptr;
+        api.destroy = nullptr;
+      }
+      const std::array<const void*, 7> exports{
+          reinterpret_cast<const void*>(api.init), reinterpret_cast<const void*>(api.create),
+          reinterpret_cast<const void*>(api.evaluate), reinterpret_cast<const void*>(api.release),
+          reinterpret_cast<const void*>(api.shutdown), reinterpret_cast<const void*>(api.allocate),
+          reinterpret_cast<const void*>(api.destroy)};
+      for (const void* address : exports) {
+        if (!image.ready || address == nullptr) continue;
+        HMODULE owner = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(address), &owner)
+            || owner != image.module) {
+          image.ready = false;
+          image.stage = "forwarded_export";
+          image.error = ERROR_INVALID_ADDRESS;
+        }
+      }
+      if (image.ready) {
+        symbols.native_api = api;
+        symbols.native_ready = true;
+        std::ostringstream message;
+        message << "native pre-FG runtime isolated: shared module=" << symbols.nr_module
+                << ", private module=" << image.module << ", selected " << NarrowPath(symbols.nr_path.c_str())
+                << ", private image " << NarrowPath(image.path.c_str()) << ", sha256 " << symbols.nr_sha256;
+        Log(reshade::log::level::info, message.str());
+      }
+    }
+    if (!image.ready) {
+      symbols.native_failed = true;
+      Log(reshade::log::level::error,
+          "native pre-FG runtime isolation failed at " + image.stage + " (error "
+              + std::to_string(image.error) + "); no shared-context fallback");
+      if (image.module == nullptr) runtime_image::RemoveFiles(image);
+    }
+    PublishNgxLoaderSymbols();
+  }
 }
 
 // Give the loader back what it gave us.  Called with NO addon lock held, for
@@ -4760,8 +5090,10 @@ inline void PrimeNgxLoaderSymbols(ID3D12Device* device) {
 // are cleared BEFORE the unmap, so a thread that arrives in between re-primes
 // from scratch instead of adopting a module that is being unmapped.
 inline void ReleaseNgxLoaderSymbols(HMODULE unload) {
+  runtime_image::PrivateImage native_image;
   {
     std::scoped_lock prime(ngx_loader_prime_mutex);
+    native_image = ngx_loader_staging.native_image;
     ngx_loader_staging = {};
     // A fresh empty snapshot, so a reader mid-copy keeps reading the old
     // one and every reader after this sees "nothing resolved".
@@ -4770,7 +5102,14 @@ inline void ReleaseNgxLoaderSymbols(HMODULE unload) {
   if (unload != nullptr) {
     NoteLoaderCall("ReleaseNgxLoaderSymbols/FreeLibrary",
                    LoaderCallSafety::kUnsafeUnderLoaderLock);
-    FreeLibrary(unload);
+    if (FreeLibrary(unload) && unload == native_image.module) {
+      HMODULE mapped = nullptr;
+      if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             reinterpret_cast<LPCWSTR>(unload), &mapped)
+          && !runtime_image::RemoveFiles(native_image)) {
+        Log(reshade::log::level::warning, "private NR runtime unloaded; its cache file could not be removed");
+      }
+    }
   }
 }
 
@@ -4779,8 +5118,10 @@ inline void ReleaseNgxLoaderSymbols(HMODULE unload) {
 // nothing.  Returns false while the prime has not produced a runtime yet; the
 // callers all prime immediately before taking the lock, so in practice that
 // is only the session where there is no runtime to find.
-inline bool LoadDirectApi() {
-  if (direct_load_state == DirectLoadState::Ready && direct_api.module != nullptr) {
+inline bool LoadDirectApi(std::optional<bool> private_runtime = std::nullopt) {
+  const bool requested_private = private_runtime.value_or(direct_api.private_instance);
+  if (direct_load_state == DirectLoadState::Ready && direct_api.module != nullptr
+      && direct_api.private_instance == requested_private) {
     if (direct_api.borrowed_core_context != control_mask_use_core_context.load()) return false;
     if (direct_api.borrowed_core_context) {
       const auto& symbols = NgxLoaderView();
@@ -4791,18 +5132,20 @@ inline bool LoadDirectApi() {
     }
     return true;
   }
-  if (direct_load_state == DirectLoadState::Failed) return false;
+  if (direct_load_state == DirectLoadState::Failed && direct_api.private_instance == requested_private) return false;
   // One acquire-load, and the block it hands back is immutable: the
   // readiness and the symbols cannot disagree, and nothing rewrites them
   // while this copies them out.
   const NgxLoaderSymbols& symbols = NgxLoaderView();
-  if (symbols.nr_failed) {
+  if (requested_private && symbols.native_api.module == native_runtime_failed_instance
+      && native_runtime_failed_instance != nullptr) return false;
+  if (requested_private ? symbols.native_failed : symbols.nr_failed) {
     last_result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
-    direct_load_state = DirectLoadState::Failed;
     return false;
   }
-  if (!symbols.nr_ready) return false;
+  if (requested_private ? !symbols.native_ready : !symbols.nr_ready) return false;
   const bool borrow_core = control_mask_use_core_context.load();
+  if (requested_private && borrow_core) return false;
   if (borrow_core
       && (successful_sr_device == nullptr || !symbols.core_ready || symbols.core == nullptr
           || !nr_model::SupportsControlMask(symbols.nr_requirements.file_version)
@@ -4811,15 +5154,21 @@ inline bool LoadDirectApi() {
           || symbols.core_release == nullptr)) {
     return false;
   }
-  direct_api.borrowed_core_context = borrow_core;
-  direct_api.module = symbols.nr_module;
-  direct_api.init = symbols.init;
-  direct_api.allocate = symbols.allocate;
-  direct_api.destroy = symbols.destroy;
-  direct_api.create = symbols.create;
-  direct_api.evaluate = symbols.evaluate;
-  direct_api.release = symbols.release;
-  direct_api.shutdown = symbols.shutdown;
+  // A different image cannot replace the functions that still own live or
+  // retiring objects. EnsureDirectRuntime clears them only after its proof.
+  if (direct_device != nullptr || parameter_runtime_ready || !retired_nr_features.empty()) return false;
+  if (!RestoreCallerIdentity()) return false;
+  direct_api = (requested_private ? symbols.native_api : DirectApi{
+      .borrowed_core_context = borrow_core,
+      .module = symbols.nr_module,
+      .allocate = symbols.allocate,
+      .destroy = symbols.destroy,
+      .init = symbols.init,
+      .create = symbols.create,
+      .evaluate = symbols.evaluate,
+      .release = symbols.release,
+      .shutdown = symbols.shutdown,
+  });
   if (borrow_core) {
     direct_api.init = nullptr;
     direct_api.shutdown = nullptr;
@@ -4870,7 +5219,7 @@ inline bool LoadDirectApi() {
   // cheaper of the two mistakes, and the existing "loaded but never
   // initialized; leaving it mapped" path already makes that trade.
   if (!borrow_core && !InstallCallerIdentity()) {
-    direct_api = {};
+    direct_api = {.private_instance = requested_private};
     last_result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
     direct_load_state = DirectLoadState::Failed;
     nr_runtime_fault.store(static_cast<uint8_t>(ui::RuntimeFault::kUnusable),
@@ -4976,6 +5325,14 @@ inline const std::vector<const void*>& CollectWorksetGpuObjects(const FinalResou
       if (res.norm_scale != nullptr) objects.push_back(res.norm_scale);
     }
     if (res.descriptors != nullptr) objects.push_back(res.descriptors);
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+    if (res.fg_output_marker != nullptr) {
+      objects.push_back(res.fg_output_marker.get());
+      for (auto* object : res.fg_output_marker->Objects()) {
+        if (object != nullptr) objects.push_back(object);
+      }
+    }
+#endif
   }
   return objects;
 }
@@ -5135,7 +5492,9 @@ inline int64_t workset_idle_exempt_ns = 0;
 inline std::unordered_set<const NVSDK_NGX_Handle*> owner_resident_nr_handles;
 inline void ReleaseAllNrSlots(FeatureState& state, bool retire);
 inline void ReleaseAdaptiveStandby(AdaptiveFeatureCache* cache, bool retire) {
-  for (auto& tier : cache->tiers) {
+  for (size_t index = 0; index < cache->tiers.size(); ++index) {
+    if (index == cache->active) continue;
+    auto& tier = cache->tiers[index];
     ReleaseAllNrSlots(tier.state, retire);
     ReleaseCom(tier.state.norm.commit);
     tier.ready = false;
@@ -5143,7 +5502,7 @@ inline void ReleaseAdaptiveStandby(AdaptiveFeatureCache* cache, bool retire) {
     tier.output_completions.clear();
   }
   for (auto it = worksets.begin(); it != worksets.end();) {
-    if (it->first.handle != cache->owner || it->first.adaptive_slot == cache->active) {
+    if (!AdaptiveCacheOwnsWorkset(*cache, it->first, it->second) || it->first.adaptive_slot == cache->active) {
       ++it;
       continue;
     }
@@ -5169,7 +5528,7 @@ inline void ReleaseAdaptiveCache(FeatureState* state, bool retire) {
   ReleaseAllNrSlots(*state, retire);
   ReleaseCom(state->norm.commit);
   for (auto it = worksets.begin(); it != worksets.end();) {
-    if (it->first.handle != cache->owner) {
+    if (!AdaptiveCacheOwnsWorkset(*cache, it->first, it->second)) {
       ++it;
       continue;
     }
@@ -5292,7 +5651,7 @@ inline void RefreshActiveFeatureCount() {
 // live: a lease taken here for `last_assigned + 1` completes on whatever
 // submission comes next, and that need not be the list carrying this slot's
 // last evaluate.
-inline RetiredNrFeature NrRetirement(const NrFeatureSlot& slot) {
+inline RetiredNrFeature NrRetirement(const NrFeatureSlot& slot, const std::shared_ptr<uint8_t>& adaptive_token) {
   const bool tracked = queue_tracking_active.load(std::memory_order_relaxed);
   return {
       .generation = present_generation,
@@ -5301,6 +5660,8 @@ inline RetiredNrFeature NrRetirement(const NrFeatureSlot& slot) {
                                            : AcquireGpuLease(0),
       .tracker_proof = tracked,
       .look_history = {slot.look_history.buffers[0], slot.look_history.buffers[1]},
+      .edit_reuse = slot.edit_reuse,
+      .adaptive_recording_token = adaptive_token,
   };
 }
 
@@ -5310,7 +5671,7 @@ inline void ReleaseNrSlot(
     uint32_t slot_index,
     bool retire = false) {
   NrFeatureSlot& slot = state.slots[slot_index];
-  if (slot.handle == nullptr && slot.parameters == nullptr) {
+  if (slot.handle == nullptr && slot.parameters == nullptr && slot.edit_reuse == nullptr) {
     slot.control_mask_bound = false;
     slot.jitter_bound = false;
     return;
@@ -5319,7 +5680,7 @@ inline void ReleaseNrSlot(
     ++(retire ? nr_features_retired : nr_features_released);
   }
   if (retire) {
-    RetiredNrFeature retired = NrRetirement(slot);
+    RetiredNrFeature retired = NrRetirement(slot, state.adaptive_recording_token);
     retired.handle = slot.handle;
     retired.parameters = slot.parameters;
     retired.via_core = slot.via_core;
@@ -5348,10 +5709,12 @@ inline void ReleaseNrSlot(
   slot.jitter_bound = false;
   slot.via_core = false;
   slot.tracked_since_create = false;
+  slot.memory_failure = false;
   slot.create_input_width = slot.create_input_height = 0;
   slot.create_output_width = slot.create_output_height = 0;
   slot.recording.reset();
   slot.look_history = {};
+  slot.edit_reuse.reset();
   RefreshActiveFeatureCount();
 }
 
@@ -5445,7 +5808,34 @@ inline void PruneCompletedSubmissionUses() {
 // the every-queue lease otherwise.  An entry retired while no queue fence
 // existed takes a late lease once one does; while none does it stays until
 // FlushRetiredResources at teardown, counted in retired[... unproven_*=N].
+inline bool AdaptiveRetirementPending(const NVSDK_NGX_Handle* owner) {
+  const auto pending = adaptive_retiring_collections.find(owner);
+  if (pending == adaptive_retiring_collections.end()) return false;
+  for (const auto& token : pending->second) {
+    if (token == nullptr) continue;
+    for (const auto& retired : retired_final_resources) {
+      if (retired.resources.adaptive_recording_token == token) return true;
+    }
+    for (const auto& retired : retired_nr_features) {
+      if (retired.adaptive_recording_token == token) return true;
+    }
+  }
+  return false;
+}
+
+inline bool AdaptiveSessionRetirementPending(const std::shared_ptr<adaptive_resolution::Session>& session) {
+  for (const auto& [handle, source] : features) {
+    if ((source.adaptive_session == session
+            || (source.render_session != nullptr && source.render_session->adaptive_session == session))
+        && AdaptiveRetirementPending(handle)) return true;
+  }
+  return false;
+}
+
 inline void DrainRetiredResources(bool nr_release_allowed) {
+  std::erase_if(adaptive_retiring_collections, [](const auto& pending) {
+    return !features.contains(pending.first) && !AdaptiveRetirementPending(pending.first);
+  });
   std::erase_if(retired_hdr_captures, [](const auto& capture) {
     for (const auto* object : capture->Objects()) {
       if (object != nullptr && !submission::ResourceReleasable(object)) return false;
@@ -5544,6 +5934,7 @@ inline void DrainRetiredResources(bool nr_release_allowed) {
     if (it->tracker_proof ? submission::ResourceReleasable(it->handle)
                                 && submission::ResourceReleasable(it->look_history[0])
                                 && submission::ResourceReleasable(it->look_history[1])
+                                && submission::ResourceReleasable(it->edit_reuse.get())
                                 && (it->lease.empty() || lease_released(it->lease))
                           : lease_proven(&it->lease, &it->late_leases)) {
       ReleaseRetiredNrFeature(*it);
@@ -5587,7 +5978,44 @@ inline void FlushRetiredResources() {
   nr_retirement_pending.store(false, std::memory_order_relaxed);
 }
 
+// Safe at loader detach: no mutex, allocation, wait or driver/module release.
+inline void CancelAsyncAutoscalePreparation() {
+  async_autoscale_cancellation->fetch_add(1, std::memory_order_acq_rel);
+}
+
+// runtime_mutex is held. A started task owns its input references until complete.
+inline bool DiscardAsyncAutoscalePreparation() {
+  if (async_autoscale_task == nullptr) return true;
+  const auto task = async_autoscale_task;
+  std::unique_lock lock(task->mutex);
+  if (task->started && !task->complete) return false;
+  auto* device = std::exchange(task->device, nullptr);
+  auto* root = std::exchange(task->root, nullptr);
+  auto* pipeline = std::exchange(task->pipeline, nullptr);
+  const HRESULT result = task->result;
+  const DWORD system_error = task->system_error;
+  const char* operation = task->operation;
+  const auto exception = task->exception;
+  lock.unlock();
+  ReleaseCom(pipeline);
+  ReleaseCom(root);
+  ReleaseCom(device);
+  async_autoscale_task.reset();
+  if (FAILED(result) && result != E_PENDING && result != E_ABORT) {
+    std::ostringstream message;
+    message << task->log_name << " private preparation failed: " << operation
+            << " hr=0x" << std::hex << static_cast<uint32_t>(result)
+            << std::dec << " win32=" << system_error;
+    if (exception[0] != '\0') message << " exception=" << exception.data();
+    Log(reshade::log::level::error, message.str());
+  }
+  return true;
+}
+
 inline void ReleaseCodecPipeline() {
+  ++async_autoscale_cache_epoch;
+  CancelAsyncAutoscalePreparation();
+  DiscardAsyncAutoscalePreparation();
   ReleaseCom(codec_pipeline.hdr_commit_capture);
   ReleaseCom(codec_pipeline.hdr_commit_exposure_capture);
   ReleaseCom(codec_pipeline.hdr_capture_root);
@@ -5668,12 +6096,14 @@ inline bool WaitForTrackedQueues() {
 // passes through while it waits to switch device or face (v8, LIFE-12), and
 // left as the caller set it for every other failure.
 inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
-                                NrDeclineReason* decline = nullptr) {
+                                NrDeclineReason* decline = nullptr,
+                                std::optional<bool> private_runtime = std::nullopt) {
 #if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
   const ColdCpuTraceScope cold_trace("EnsureDirectRuntime");
 #endif
+  const bool private_signed_runtime = private_runtime.value_or(direct_api.private_instance);
   if (control_mask_use_core_context.load() || direct_api.borrowed_core_context) {
-    if (!control_mask_use_core_context.load()
+    if (private_signed_runtime || !control_mask_use_core_context.load()
         || hook_point.load() != kHookUpscaled || stack_passes.load() != 1
         || successful_sr_device == nullptr || command_list == nullptr || InsideDirectCall()) return false;
     ID3D12Device* device = nullptr;
@@ -5682,79 +6112,34 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
     ReleaseCom(device);
     if (!matches) return false;
   }
-  if (command_list == nullptr || !LoadDirectApi()) return false;
-  if (direct_runtime_failed && direct_device == nullptr) return false;
-  if (!parameter_runtime_ready) {
-    // Resolved by PrimeNgxLoaderSymbols outside this lock; the acquire pairs
-    // with its release store.  `core_ready` false means no public NGX core is
-    // loaded (yet) - the same condition the old FindNgxCoreModule() ==
-    // nullptr produced, and the prime keeps retrying it, so a core that
-    // arrives later is still picked up.
-    const NgxLoaderSymbols& symbols = NgxLoaderView();
-    const bool core_ready = symbols.core_ready
-                            && (direct_api.borrowed_core_context
-                                || !bridge_force_snippet.load(std::memory_order_acquire));
-    HMODULE core = core_ready ? symbols.core : nullptr;
-    const auto allocate = core_ready ? symbols.core_allocate : nullptr;
-    const auto destroy = core_ready ? symbols.core_destroy : nullptr;
-    const auto create = core_ready ? symbols.core_create : nullptr;
-    const auto evaluate = core_ready ? symbols.core_evaluate : nullptr;
-    const auto release = core_ready ? symbols.core_release : nullptr;
-    // The signed runtime's own allocator is optional: 310.8.0 exports none
-    // (the allocator lives in the NGX core), and a block the addon owns is
-    // the shape the D0 probe's K1/K2 arms created and evaluated feature 18
-    // through (bridge_params.hpp, OwnedParameters).  Until alpha45 its
-    // absence failed every session without a public core - the bridge's
-    // private device always, and a D3D12 process whose NGX is bundled.
-    const bool runtime_allocator =
-        direct_api.allocate != nullptr && direct_api.destroy != nullptr;
-    const bool direct_ready = direct_api.create != nullptr
-        && direct_api.evaluate != nullptr && direct_api.release != nullptr;
-    if (!core_ready && !direct_ready) {
-      Log(
-          reshade::log::level::error,
-          "NGX/Streamline runtime has no complete parameter or feature export set");
-      last_result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
-      direct_runtime_failed = true;
-      return false;
-    }
-    if (core_ready) {
-      ngx_core_module = core;
-      parameter_runtime_via_core = true;
-      core_allocate_parameters = allocate;
-      core_destroy_parameters = destroy;
-      core_create_feature = create;
-      core_evaluate_feature = evaluate;
-      core_release_feature = release;
-    } else {
-      // Streamline can ship its own NGX bridge.  Keep the same parameter
-      // contract, but source every operation from the signed runtime when no
-      // complete public core is present.
-      ngx_core_module = nullptr;
-      parameter_runtime_via_core = false;
-      core_allocate_parameters = runtime_allocator
-          ? direct_api.allocate : bridge::AllocateOwnedParameters;
-      core_destroy_parameters = runtime_allocator
-          ? direct_api.destroy : bridge::DestroyOwnedParameters;
-      Log(reshade::log::level::info,
-          runtime_allocator
-              ? "NR parameter blocks come from the signed runtime's allocator"
-              : "NR parameter blocks are the addon's own: the signed runtime"
-                " exports no parameter allocator and no public NGX core serves"
-                " this device");
-      core_create_feature = nullptr;
-      core_evaluate_feature = nullptr;
-      core_release_feature = nullptr;
-    }
-    parameter_runtime_ready = true;
-  }
+  if (command_list == nullptr) return false;
+  const bool same_instance = direct_api.private_instance == private_signed_runtime;
+  const NgxLoaderSymbols& requested_symbols = NgxLoaderView();
+  if (private_signed_runtime && native_runtime_failed_instance != nullptr
+      && requested_symbols.native_api.module == native_runtime_failed_instance) return false;
+  if (!(same_instance && direct_load_state == DirectLoadState::Ready && direct_api.module != nullptr)
+      && (private_signed_runtime ? !requested_symbols.native_ready : !requested_symbols.nr_ready)) return false;
+  if (same_instance && direct_load_state == DirectLoadState::Ready && direct_api.module != nullptr
+      && !LoadDirectApi(private_signed_runtime)) return false;
+  if (direct_runtime_failed && same_instance && (direct_device == nullptr || private_signed_runtime)) return false;
   ID3D12Device* device = nullptr;
   if (FAILED(command_list->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) {
     last_result = NVSDK_NGX_Result_FAIL_InvalidParameter;
     return false;
   }
+  if (private_signed_runtime) {
+    ID3D12Device* native_device = device;
+    if (renodx::utils::directx::NativeFromReShadeProxy(&native_device) || native_device != device) {
+      last_result = NVSDK_NGX_Result_FAIL_InvalidParameter;
+      device->Release();
+      return false;
+    }
+  }
 
-  if (direct_device == device) {
+  const bool exact_device = direct_device == device;
+  const bool provider_matches = same_instance && (!private_signed_runtime
+      || (parameter_runtime_ready && !parameter_runtime_via_core.load()));
+  if (exact_device && provider_matches && parameter_runtime_ready) {
     if (FAILED(device->GetDeviceRemovedReason())) {
       device->Release();
       return false;
@@ -5763,7 +6148,7 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
     device->Release();
     return true;
   }
-  if (direct_device != nullptr) {
+  if (direct_device != nullptr && (!exact_device || !provider_matches)) {
     // The compare above is by raw pointer on purpose: NGX has to run in the
     // world of the list it records into, so a change of FACE - ReShade's
     // device proxy to the native device or back, the evaluate's list having
@@ -5799,11 +6184,12 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
     ID3D12Device* native_face = device;
     const bool proxy_face =
         renodx::utils::directx::NativeFromReShadeProxy(&native_face);
-    const char* const target =
-        !same_device ? "a different D3D12 device"
+    const char* const target = exact_device
+        ? "the signed runtime on the current D3D12 device interface"
+        : !same_device ? "a different D3D12 device"
         : proxy_face ? "ReShade's proxy of its D3D12 device"
                      : "the native face of its D3D12 device";
-    if (same_device) {
+    if (same_device && !exact_device) {
       if (runtime_face_candidate != device) {
         runtime_face_candidate = device;
         runtime_face_run = 0;
@@ -5858,16 +6244,16 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
       device->Release();
       return false;
     }
-    const uint64_t changes =
-        nr_runtime_device_changes.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t changes = (exact_device ? 0
+        : nr_runtime_device_changes.fetch_add(1, std::memory_order_relaxed) + 1);
     if (changes <= kNrRuntimeDeviceChangeLogCap) {
       Log(reshade::log::level::warning,
           std::string("NR's direct runtime re-initializes for ") + target
-              + (same_device
+              + (same_device && !exact_device
                      ? " (the evaluate's command list changed world, and NGX"
                        " records in the world of its list)"
                      : "")
-              + "; change " + std::to_string(changes)
+              + (exact_device ? "; provider change" : "; device/face change " + std::to_string(changes))
               + "; NR's recorded work had completed and every recording was closed"
               + (changes == kNrRuntimeDeviceChangeLogCap
                      ? ", further changes are not logged"
@@ -5883,9 +6269,17 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
     // runtime_mutex, and if the signed runtime called back into a detoured
     // NGX export the wrapper would try to re-lock the (non-recursive) mutex
     // on this thread and deadlock.
-    if (!direct_api.borrowed_core_context) {
+    if (direct_api.private_instance && !direct_api.borrowed_core_context) {
       DirectCallScope ngx_direct_call;
-      direct_api.shutdown(direct_device);
+      const auto shutdown_result = direct_api.shutdown(direct_device);
+      native_runtime_unload_safe = NVSDK_NGX_SUCCEED(shutdown_result);
+      if (!native_runtime_unload_safe) {
+        last_result = static_cast<uint32_t>(shutdown_result);
+        direct_runtime_failed = true;
+        Log(reshade::log::level::error, "private NR Shutdown failed; retaining its device, API and caller identity; provider switch declined");
+        device->Release();
+        return false;
+      }
     }
     direct_device->Release();
     direct_device = nullptr;
@@ -5894,6 +6288,64 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
     parameter_runtime_ready = false;
     parameter_runtime_via_core = false;
     ngx_core_module = nullptr;
+  }
+  if (!same_instance && direct_device == nullptr) {
+    // An Init failure may have selected its parameter pair without retaining a
+    // device. Its failure belongs to that image, not to another requested one.
+    parameter_runtime_ready = false;
+    parameter_runtime_via_core = false;
+    direct_runtime_failed = false;
+  }
+  if (!LoadDirectApi(private_signed_runtime)) {
+    device->Release();
+    return false;
+  }
+  // Old handles and retirements above still use the old allocator/release
+  // pair. Publish a new provider only after their complete, non-replayable proof.
+  if (!parameter_runtime_ready || !provider_matches) {
+    const NgxLoaderSymbols& symbols = NgxLoaderView();
+    const bool core_ready = !private_signed_runtime && symbols.core_ready
+        && (direct_api.borrowed_core_context
+            || !bridge_force_snippet.load(std::memory_order_acquire));
+    const bool runtime_allocator = direct_api.allocate != nullptr && direct_api.destroy != nullptr;
+    const bool direct_ready = direct_api.create != nullptr
+        && direct_api.evaluate != nullptr && direct_api.release != nullptr;
+    if (!core_ready && !direct_ready) {
+      Log(reshade::log::level::error,
+          "NGX/Streamline runtime has no complete parameter or feature export set");
+      last_result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
+      direct_runtime_failed = true;
+      device->Release();
+      return false;
+    }
+    parameter_runtime_via_core = core_ready;
+    ngx_core_module = (core_ready ? symbols.core : nullptr);
+    if (core_ready) {
+      core_allocate_parameters = symbols.core_allocate;
+      core_destroy_parameters = symbols.core_destroy;
+      core_create_feature = symbols.core_create;
+      core_evaluate_feature = symbols.core_evaluate;
+      core_release_feature = symbols.core_release;
+    } else {
+      // 310.9.16 has no parameter allocator exports. Keep the complete runtime
+      // pair when available, otherwise use our OwnedParameters pair throughout.
+      core_allocate_parameters = (runtime_allocator ? direct_api.allocate : bridge::AllocateOwnedParameters);
+      core_destroy_parameters = (runtime_allocator ? direct_api.destroy : bridge::DestroyOwnedParameters);
+      core_create_feature = nullptr;
+      core_evaluate_feature = nullptr;
+      core_release_feature = nullptr;
+      Log(reshade::log::level::info,
+          runtime_allocator
+              ? "NR parameter blocks come from the signed runtime's allocator"
+              : "NR parameter blocks are the addon's own: the signed runtime"
+                " exports no parameter allocator for this device context");
+    }
+    parameter_runtime_ready = true;
+  }
+  if (direct_device == device) {
+    const bool available = SUCCEEDED(device->GetDeviceRemovedReason());
+    device->Release();
+    return available;
   }
   // A new runtime starts a new face count and a new switch.
   runtime_face_candidate = nullptr;
@@ -5913,9 +6365,26 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
   }
 
   const auto data_path = AddonDirectory();
+  {
+    ID3D12Device* native_device = device;
+    renodx::utils::directx::NativeFromReShadeProxy(&native_device);
+    IUnknown* device_identity = nullptr;
+    IUnknown* native_identity = nullptr;
+    device->QueryInterface(IID_PPV_ARGS(&device_identity));
+    native_device->QueryInterface(IID_PPV_ARGS(&native_identity));
+    std::ostringstream message;
+    message << "NR Init starting: provider=" << (direct_api.private_instance ? "isolated-pre-FG" : "ordinary")
+            << ", module=" << direct_api.module << ", shared module=" << NgxLoaderView().nr_module
+            << ", list=" << command_list << ", device=" << device << ", device IUnknown=" << device_identity
+            << ", native device=" << native_device << ", native IUnknown=" << native_identity;
+    Log(reshade::log::level::info, message.str());
+    ReleaseCom(device_identity);
+    ReleaseCom(native_identity);
+  }
   NVSDK_NGX_Result result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
   {
     DirectCallScope ngx_direct_call;
+    if (direct_api.private_instance) native_runtime_unload_safe = false;
     try {
       result = direct_api.init(
           kDirectApplicationId,
@@ -5932,6 +6401,7 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
   }
   last_result = static_cast<uint32_t>(result);
   if (NVSDK_NGX_FAILED(result)) {
+    if (direct_api.private_instance) native_runtime_failed_instance = direct_api.module;
     std::ostringstream message;
     message << "direct Init failed with 0x" << std::hex
             << static_cast<uint32_t>(result)
@@ -6252,6 +6722,104 @@ inline bool CreateCodecPipelineState(
   return true;
 }
 
+// Both the worker and launch-failure path finish their own private input refs.
+// No global/TLS/cache access, NGX gate, command recording or runtime lock here.
+inline void CompleteAsyncAutoscalePreparation(
+    const std::shared_ptr<AsyncAutoscalePreparation>& task,
+    HRESULT result, ID3D12PipelineState* pipeline, const char* operation,
+    DWORD system_error = ERROR_SUCCESS, const char* exception = nullptr) {
+  ReleaseCom(task->root);
+  ReleaseCom(task->device);
+  if (task->cancellation->load(std::memory_order_acquire) != task->cancellation_epoch) {
+    ReleaseCom(pipeline);
+  }
+  std::unique_lock lock(task->mutex);
+  task->pipeline = pipeline;
+  task->result = result;
+  task->operation = operation;
+  task->system_error = system_error;
+  if (exception != nullptr) std::snprintf(task->exception.data(), task->exception.size(), "%s", exception);
+  task->complete = true;
+}
+
+struct AsyncAutoscaleWorkerContext {
+  HMODULE module = nullptr;
+  std::shared_ptr<AsyncAutoscalePreparation> task;
+};
+
+static DWORD WINAPI CreateAsyncAutoscalePipeline(void* argument) {
+  auto* context = static_cast<AsyncAutoscaleWorkerContext*>(argument);
+  const HMODULE module = context->module;
+  {
+    const auto task = std::move(context->task);
+    delete context;
+    ID3D12PipelineState* pipeline = nullptr;
+    HRESULT result = E_ABORT;
+    try {
+      if (task->cancellation->load(std::memory_order_acquire) == task->cancellation_epoch) {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+        desc.pRootSignature = task->root;
+        desc.CS = {task->bytecode.data(), task->bytecode.size()};
+        result = task->device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipeline));
+        if (SUCCEEDED(result) && pipeline == nullptr) result = E_FAIL;
+      }
+      CompleteAsyncAutoscalePreparation(task, result, pipeline, "ID3D12Device::CreateComputePipelineState");
+    } catch (const std::bad_alloc& error) {
+      CompleteAsyncAutoscalePreparation(task, E_OUTOFMEMORY, pipeline, "worker exception", 0, error.what());
+    } catch (const std::exception& error) {
+      CompleteAsyncAutoscalePreparation(task, E_FAIL, pipeline, "worker exception", 0, error.what());
+    } catch (...) {
+      CompleteAsyncAutoscalePreparation(task, E_FAIL, pipeline, "worker exception", 0, "unknown C++ exception");
+    }
+  }
+  // All C++ objects and private input refs die BEFORE the final module release.
+  if (module != nullptr) FreeLibraryAndExitThread(module, 0);
+  return 0;
+}
+
+// Called only by OnPresent outside runtime_mutex. The sole task is registered by
+// a source opportunity; this boundary never scans or schedules other shaders.
+inline void StartAsyncAutoscalePreparation() {
+  std::shared_ptr<AsyncAutoscalePreparation> task;
+  {
+    RuntimeTryLock lock(runtime_mutex);
+    if (!lock.owns_lock() || async_autoscale_task == nullptr
+        || !enabled.load(std::memory_order_acquire)
+        || shutting_down.load(std::memory_order_acquire)) return;
+    task = async_autoscale_task;
+    std::unique_lock task_lock(task->mutex);
+    if (task->started || task->complete) return;
+    if (task->cancellation->load(std::memory_order_acquire) != task->cancellation_epoch) {
+      task_lock.unlock();
+      DiscardAsyncAutoscalePreparation();
+      return;
+    }
+    task->started = true;
+  }
+  HMODULE module = nullptr;
+  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+          reinterpret_cast<LPCWSTR>(CreateAsyncAutoscalePipeline), &module)) {
+    const DWORD error = GetLastError();
+    CompleteAsyncAutoscalePreparation(task, HRESULT_FROM_WIN32(error), nullptr, "GetModuleHandleExW", error);
+    return;
+  }
+  // The existing EXE fixture has no DLL module to unload.
+  if (module == GetModuleHandleW(nullptr)) module = nullptr;
+  auto* context = new (std::nothrow) AsyncAutoscaleWorkerContext{.module = module, .task = task};
+  if (context == nullptr) {
+    CompleteAsyncAutoscalePreparation(task, E_OUTOFMEMORY, nullptr, "worker context allocation");
+  } else if (HANDLE thread = CreateThread(nullptr, 0, CreateAsyncAutoscalePipeline, context, 0, nullptr)) {
+    CloseHandle(thread);
+    return;
+  } else {
+    const DWORD error = GetLastError();
+    delete context;
+    CompleteAsyncAutoscalePreparation(task, HRESULT_FROM_WIN32(error), nullptr, "CreateThread", error);
+  }
+  // Launch failures release the added module reference with no runtime/task lock.
+  if (module != nullptr) FreeLibrary(module);
+}
+
 inline bool EnsureControlMaskPipeline(ID3D12Device* device) {
   return EnsureCodecRootSignature(device)
       && CreateCodecPipelineState(
@@ -6311,7 +6879,108 @@ inline bool EnsureLegacyCodecPipeline(ID3D12Device* device) {
   return true;
 }
 
+inline bool EnsureAsyncCodecPipelineState(
+    ID3D12Device* device, std::span<const uint8_t> bytecode,
+    ID3D12PipelineState** pipeline, const wchar_t* debug_name, const char* log_name,
+    ID3D12RootSignature* root_signature) {
+  if (async_autoscale_task != nullptr && !codec_pipeline.incremental_preparation
+      && !DiscardAsyncAutoscalePreparation()) return false;
+  if (*pipeline != nullptr) return true;
+  if (!codec_pipeline.incremental_preparation
+      || (!async_autoscale_preparation.load(std::memory_order_relaxed) && async_autoscale_task == nullptr)) {
+    return CreateCodecPipelineState(device, bytecode, pipeline, debug_name, log_name, root_signature);
+  }
+  if (codec_pipeline.preparation_failed || pipeline_preparation_opportunity == nullptr) return false;
+  if (!enabled.load(std::memory_order_acquire) || shutting_down.load(std::memory_order_acquire)
+      || pipeline_preparation_opportunity->created) {
+    pipeline_preparation_opportunity->deferred = true;
+    return false;
+  }
+  if (async_autoscale_task != nullptr) {
+    const auto task = async_autoscale_task;
+    std::unique_lock lock(task->mutex);
+    if (!task->complete) {
+      pipeline_preparation_opportunity->deferred = true;
+      return false;
+    }
+    // The single task can finish while the caller needs the other shader.
+    // Validate and publish its own slot/root, never the caller's empty slot.
+    const bool autoscale = task->target_identity == &codec_pipeline.autoscale
+        && task->bytecode.data() == __v6_autoscale.data() && task->bytecode.size() == __v6_autoscale.size();
+    const bool look_band = task->target_identity == &codec_pipeline.look.band
+        && task->bytecode.data() == __look_band.data() && task->bytecode.size() == __look_band.size();
+    const bool current = (autoscale || look_band)
+        && task->cache_epoch == async_autoscale_cache_epoch
+        && task->cancellation_epoch == async_autoscale_cancellation->load(std::memory_order_acquire)
+        && task->device_identity == device
+        && task->root_identity == (autoscale ? codec_pipeline.root_signature : codec_pipeline.look.root_signature)
+        && *task->target_identity == nullptr;
+    const bool succeeded = current && SUCCEEDED(task->result) && task->pipeline != nullptr;
+    const auto attempt_session = task->session.lock();
+    const auto preparation_session = codec_pipeline.preparation_session.lock();
+    const bool current_attempt = current
+        && (task->session_owned
+                ? attempt_session != nullptr && attempt_session == preparation_session
+                    && attempt_session->preparation_epoch == task->preparation_epoch
+                : preparation_session == nullptr);
+    if (succeeded) {
+      *task->target_identity = std::exchange(task->pipeline, nullptr);
+      pipeline_preparation_opportunity->created = true;
+    } else if (current_attempt) {
+      codec_pipeline.preparation_failed = true;
+      if (attempt_session != nullptr) attempt_session->Fail(attempt_session->status.generation);
+    }
+    lock.unlock();
+    if (succeeded) {
+      (*task->target_identity)->SetName(task->debug_name);
+    }
+    DiscardAsyncAutoscalePreparation();
+    if (succeeded) {
+      if (*pipeline != nullptr) return true;
+      pipeline_preparation_opportunity->deferred = true;
+      return false;
+    }
+    if (current_attempt) return false;
+  }
+  // An old attempt may finish after Session replacement. Discard its failure
+  // without poisoning the current frame, then give the new owner one attempt.
+  const auto preparation_session = codec_pipeline.preparation_session.lock();
+  if (preparation_session != nullptr && preparation_session->failed) {
+    pipeline_preparation_opportunity->deferred = true;
+    return false;
+  }
+  try {
+    auto task = std::make_shared<AsyncAutoscalePreparation>();
+    task->cancellation = async_autoscale_cancellation;
+    task->cancellation_epoch = async_autoscale_cancellation->load(std::memory_order_acquire);
+    task->cache_epoch = async_autoscale_cache_epoch;
+    task->device_identity = device;
+    task->root_identity = root_signature;
+    task->bytecode = bytecode;
+    task->target_identity = pipeline;
+    task->debug_name = debug_name;
+    task->log_name = log_name;
+    task->session = preparation_session;
+    task->session_owned = preparation_session != nullptr;
+    task->preparation_epoch = (preparation_session != nullptr ? preparation_session->preparation_epoch : 0);
+    task->device = device;
+    task->device->AddRef();
+    task->root = root_signature;
+    task->root->AddRef();
+    async_autoscale_task = std::move(task);
+    pipeline_preparation_opportunity->created = true;
+    pipeline_preparation_opportunity->deferred = true;
+  } catch (const std::bad_alloc&) {
+    codec_pipeline.preparation_failed = true;
+    if (const auto session = codec_pipeline.preparation_session.lock()) session->Fail(session->status.generation);
+    Log(reshade::log::level::error, std::string(log_name) + " private task allocation failed (E_OUTOFMEMORY)");
+  }
+  return false;
+}
+
 inline bool EnsureV6CodecPipeline(ID3D12Device* device) {
+  if (async_autoscale_task != nullptr && !codec_pipeline.incremental_preparation
+      && !DiscardAsyncAutoscalePreparation()) return false;
 #if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
   const ColdCpuTraceScope cold_trace("EnsureV6CodecPipeline");
 #endif
@@ -6355,12 +7024,8 @@ inline bool EnsureV6CodecPipeline(ID3D12Device* device) {
           &codec_pipeline.commit,
           L"" NR_NEXUS_NAME " v6 commit",
           "v6 commit")
-      || !CreateCodecPipelineState(
-          device,
-          __v6_autoscale,
-          &codec_pipeline.autoscale,
-          L"" NR_NEXUS_NAME " v6 same-frame autoscale",
-          "v6 same-frame autoscale")) {
+      || !EnsureAsyncCodecPipelineState(device, __v6_autoscale, &codec_pipeline.autoscale,
+          L"" NR_NEXUS_NAME " v6 same-frame autoscale", "v6 same-frame autoscale", codec_pipeline.root_signature)) {
     if (codec_pipeline.incremental_preparation) return false;
     ReleaseCom(codec_pipeline.linearize);
     ReleaseCom(codec_pipeline.encode_v6);
@@ -6441,7 +7106,7 @@ inline bool EnsureLookPipeline(ID3D12Device* device) {
   if (!CreateCodecPipelineState(
           device, __look_compose, &pipeline.compose, L"" NR_NEXUS_NAME " look compose",
           "look compose", pipeline.root_signature)
-      || !CreateCodecPipelineState(
+      || !EnsureAsyncCodecPipelineState(
           device, __look_band, &pipeline.band, L"" NR_NEXUS_NAME " look bands",
           "look bands", pipeline.root_signature)
       || !CreateCodecPipelineState(
@@ -6563,9 +7228,10 @@ inline bool CreateScratchTexture(
   resource_trace.End();
 #endif
   if (FAILED(result) || *resource == nullptr) {
+    ObserveAdaptiveAllocationFailure(FAILED(result) ? result : E_FAIL);
     std::ostringstream message;
     message << "scratch texture creation failed with HRESULT 0x" << std::hex
-            << static_cast<uint32_t>(result) << " (" << static_cast<uint32_t>(format)
+            << static_cast<uint32_t>(result) << std::dec << " (" << static_cast<uint32_t>(format)
             << ' ' << width << 'x' << height << "; api=ID3D12Device::CreateCommittedResource)";
     Log(reshade::log::level::error, message.str());
     return false;
@@ -6605,6 +7271,7 @@ inline bool CreateScratchBuffer(
   resource_trace.End();
 #endif
   if (FAILED(result) || *resource == nullptr) {
+    ObserveAdaptiveAllocationFailure(FAILED(result) ? result : E_FAIL);
     std::ostringstream message;
     message << "scratch buffer creation failed with HRESULT 0x" << std::hex
             << static_cast<uint32_t>(result) << std::dec << " (" << bytes
@@ -6963,17 +7630,18 @@ inline FinalResources* EnsureWorkset(
   const WorksetKey workset_key{owner, key, create_pre_sr_color,
       (active_adaptive_frame != nullptr ? active_adaptive_frame->slot : 0u)};
   NormStream* norm_stream = nullptr;
+  FeatureState* workset_owner = nullptr;
   if (const auto stream = features.find(owner); stage_resources == nullptr && stream != features.end()) {
-    FeatureState* state = &stream->second;
-    if (create_pre_sr_color && state->render_session) {
-      state = state->render_session.get();
+    workset_owner = &stream->second;
+    if (create_pre_sr_color && workset_owner->render_session) {
+      workset_owner = workset_owner->render_session.get();
     }
-    if (state->last_workset_key != nullptr
-        && state->last_workset_key != key) {
+    if (workset_owner->last_workset_key != nullptr
+        && workset_owner->last_workset_key != key) {
       ++game_window.alternations;
     }
-    state->last_workset_key = key;
-    norm_stream = &state->norm;
+    workset_owner->last_workset_key = key;
+    norm_stream = &workset_owner->norm;
   }
   // The resolved source-units contract (NRSourceEncoding / NRLinearUnitNits
   // folded into the format inference) participates in the reuse check: a
@@ -7180,9 +7848,8 @@ inline FinalResources* EnsureWorkset(
   resources.adaptive_slot = workset_key.adaptive_slot;
   if (stage_resources != nullptr) {
     resources.adaptive_recording_token = stage_resources->adaptive_recording_token;
-  } else if (const auto feature = features.find(owner); feature != features.end()
-      && feature->second.adaptive_cache != nullptr) {
-    resources.adaptive_recording_token = feature->second.adaptive_cache->tiers[workset_key.adaptive_slot].recording_token;
+  } else if (workset_owner != nullptr && workset_owner->adaptive_cache != nullptr) {
+    resources.adaptive_recording_token = workset_owner->adaptive_cache->tiers[workset_key.adaptive_slot].recording_token;
   }
   resources.shared_stage_surfaces = stage_resources != nullptr;
   resources.width = output_width;
@@ -7406,6 +8073,10 @@ inline FinalResources* EnsureWorkset(
                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &resources.look_trace_blocks,
                   L"" NR_NEXUS_NAME " look trace blocks")))) {
+    if (AdaptivePreparationActive()) {
+      ReleaseFinalResources(resources);
+      return nullptr;
+    }
     for (ID3D12Resource** surface :
          {&resources.look_trace_histogram, &resources.look_output, &resources.look_band_a,
           &resources.look_band_b, &resources.look_band_max_a, &resources.look_band_max_b,
@@ -7438,6 +8109,7 @@ inline FinalResources* EnsureWorkset(
   descriptor_trace.End();
 #endif
   if (FAILED(heap_result) || resources.descriptors == nullptr) {
+    ObserveAdaptiveAllocationFailure(FAILED(heap_result) ? heap_result : E_FAIL);
     std::ostringstream message;
     message << "v6 workset descriptor heap creation failed (hr=0x" << std::hex
             << static_cast<uint32_t>(heap_result) << std::dec
@@ -7895,6 +8567,7 @@ inline bool EnsureNrFeature(
   }
   if (command_list == nullptr || slot.failed) return false;
   if (!EnsureDirectRuntime(command_list)) return false;
+  slot.memory_failure = false;
 
   if (slot.parameters == nullptr) {
 #if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
@@ -7908,6 +8581,12 @@ inline bool EnsureNrFeature(
     last_result = static_cast<uint32_t>(allocate_result);
     if (NVSDK_NGX_FAILED(allocate_result) || slot.parameters == nullptr) {
       slot.failed = true;
+      slot.memory_failure = allocate_result == NVSDK_NGX_Result_FAIL_OutOfGPUMemory;
+      if (slot.memory_failure) {
+        ObserveAdaptiveAllocationFailure(E_OUTOFMEMORY);
+      } else if (AdaptivePreparationActive()) {
+        active_adaptive_frame->session->Fail(active_adaptive_frame->generation);
+      }
       slot.failed_ns = SteadyNowNs();
       Log(reshade::log::level::error, "DLSS-NR AllocateParameters failed");
       return false;
@@ -7960,7 +8639,11 @@ inline bool EnsureNrFeature(
             &slot.handle);
         slot.via_core = NVSDK_NGX_SUCCEED(result) && slot.handle != nullptr;
       }
-      if (!slot.via_core && !direct_api.borrowed_core_context) {
+      if (result == NVSDK_NGX_Result_FAIL_OutOfGPUMemory) {
+        slot.memory_failure = true;
+        ObserveAdaptiveAllocationFailure(E_OUTOFMEMORY);
+      }
+      if (!slot.via_core && !direct_api.borrowed_core_context && !slot.memory_failure) {
         slot.handle = nullptr;
         result = direct_api.create(
             command_list,
@@ -7968,6 +8651,14 @@ inline bool EnsureNrFeature(
             parameters,
             &slot.handle);
       }
+    } catch (const std::bad_alloc&) {
+      Log(reshade::log::level::error,
+          "feature 18 create raised std::bad_alloc; allocation failed inside NGX Create (not a confirmed GPU-memory measurement)");
+      slot.memory_failure = true;
+      ObserveAdaptiveAllocationFailure(E_OUTOFMEMORY);
+      slot.via_core = false;
+      slot.handle = nullptr;
+      result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
     } catch (...) {
       // The shared failure path below latches the feature and releases the
       // parameter block; the exception only substitutes the result code.
@@ -7977,10 +8668,17 @@ inline bool EnsureNrFeature(
       result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
     }
   }
+  if (result == NVSDK_NGX_Result_FAIL_OutOfGPUMemory) {
+    slot.memory_failure = true;
+    ObserveAdaptiveAllocationFailure(E_OUTOFMEMORY);
+  }
   last_result = static_cast<uint32_t>(result);
   if (NVSDK_NGX_FAILED(result) || slot.handle == nullptr) {
     slot.failed = true;
     slot.failed_ns = SteadyNowNs();
+    if (!slot.memory_failure && AdaptivePreparationActive()) {
+      active_adaptive_frame->session->Fail(active_adaptive_frame->generation);
+    }
     slot.handle = nullptr;
     if (slot.parameters != nullptr) {
       core_destroy_parameters(slot.parameters);
@@ -7993,7 +8691,12 @@ inline bool EnsureNrFeature(
             << static_cast<uint32_t>(result)
             << (slot_index != 0 ? " (stack pass)" : "");
     // The first failure carries the advice; a retry loop would repeat it.
-    if (!logged_nr_create_advice) {
+    if (slot.memory_failure) {
+      message << "; memory allocation failed";
+      if (AdaptivePreparationActive()) {
+        message << "; adaptive preparation is paused and its unused resources retire safely";
+      }
+    } else if (!logged_nr_create_advice) {
       logged_nr_create_advice = true;
       message << "; " << NrStartAdvice();
     }
@@ -9765,7 +10468,11 @@ inline LookRoute RunLookStage(
     uint32_t pass,
     const LookChain& chain,
     const EvaluationContract& frame,
-    uint32_t pass_offset = 0) {
+    uint32_t pass_offset = 0
+#if defined(NR_NEXUS_DEV_CONTROL)
+    , uint64_t bridge_model_capture_serial = 0
+#endif
+) {
   const uint32_t codec_set = pass * kCodecSrvSetStride;
   const LookRoute unchanged{
       codec_set, res.input_width, res.input_height, res.input_width, res.input_height};
@@ -9783,11 +10490,17 @@ inline LookRoute RunLookStage(
           || history.height != res.input_height)) {
     // Stabilize went off (or the look did), or the NR resolution changed:
     // the pair retires like a handle, behind this slot's tracked uses.
-    retired_nr_features.push_back(NrRetirement(slot));
+    retired_nr_features.push_back(NrRetirement(slot, res.adaptive_recording_token));
     nr_retirement_pending.store(true, std::memory_order_relaxed);
     history = {};
   }
-  if (live == 0 || codec_pipeline.look.compose == nullptr) return unchanged;
+  if (live == 0 || codec_pipeline.look.compose == nullptr) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+    screenshot::CaptureBridgeModelStagePlane(device, command_list, bridge_model_capture_serial, "post_compose",
+        res.nr_output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+#endif
+    return unchanged;
+  }
 
   const D3D12_GPU_DESCRIPTOR_HANDLE heap_gpu =
       res.descriptors->GetGPUDescriptorHandleForHeapStart();
@@ -9827,6 +10540,10 @@ inline LookRoute RunLookStage(
     look_traced_passes.fetch_add(1, std::memory_order_relaxed);
   }
   if (!shape) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+    screenshot::CaptureBridgeModelStagePlane(device, command_list, bridge_model_capture_serial, "post_compose",
+        res.nr_output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+#endif
     if ((live & kLookSurfaceTrace) != 0) {
       gpu_timers::Mark(command_list, gpu_timers::PassLookEnd(pass));
     }
@@ -9919,6 +10636,10 @@ inline LookRoute RunLookStage(
       command_list, res.look_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   res.look_output_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  screenshot::CaptureBridgeModelStagePlane(device, command_list, bridge_model_capture_serial, "post_compose",
+      res.look_output, res.look_output_state);
+#endif
   FinishLookPass(&history, temporal, whole_edit, now_ns, constants, res.id, pass,
                  res.input_width, res.input_height);
   if (!transport) {
@@ -10494,10 +11215,18 @@ inline void ObserveNrEvaluation(stage_plan::Stage stage, const NVSDK_NGX_Handle*
   auto& stats = stage_telemetry[static_cast<size_t>(stage)];
   if (active_adaptive_frame != nullptr && active_adaptive_frame->enabled
       && active_adaptive_frame->session != nullptr && (!api_returned || !NVSDK_NGX_SUCCEED(result))) {
-    active_adaptive_frame->session->Fail(active_adaptive_frame->generation);
+    if (slot.memory_failure && AdaptivePreparationActive()) {
+      ObserveAdaptiveAllocationFailure(E_OUTOFMEMORY);
+    } else {
+      active_adaptive_frame->session->Fail(active_adaptive_frame->generation);
+    }
     PublishAdaptiveStatus(active_adaptive_frame->session->status);
   }
   if (slot.model_reset || !api_returned || !NVSDK_NGX_SUCCEED(result)) {
+    if (active_adaptive_frame != nullptr && active_adaptive_frame->paired && !active_adaptive_frame->preparing
+        && active_adaptive_frame->session != nullptr) {
+      active_adaptive_frame->session->InvalidateSampling();
+    }
     comparison_stable_after_ns[static_cast<size_t>(stage)] = SteadyNowNs() + gpu_comparison::STABILITY_NS;
     ++comparison_stable_epochs[static_cast<size_t>(stage)];
     if (gpu_timers::internal::current.active) {
@@ -10628,12 +11357,223 @@ inline void ResolveCreateFlags(
 // guide (render) resolution, or a 33-100% fraction of the reference
 // resolution (the DLSS output for the after path, the NGX color for pre-SR;
 // 1.0 = native).  Shared by both insertion points.
+// Caller holds runtime_mutex. A device shared by more than one live source is
+// deliberately ambiguous; a later source cannot claim an earlier SDK Disable.
+inline fg::xefg::BridgeSourceIdentity UniqueBridgeSourceLocked(uintptr_t device11) {
+  fg::xefg::BridgeSourceIdentity source{.device11 = device11};
+  if (device11 == 0) return source;
+  for (const auto& [handle, contract] : create_contracts) {
+    if (reinterpret_cast<uintptr_t>(contract.source_device11_identity.Get()) != device11) continue;
+    if (!contract.source_type_confirmed || contract.source_generation == 0 || source.handle != 0) {
+      return {.device11 = device11};
+    }
+    source.handle = reinterpret_cast<uintptr_t>(handle);
+    source.generation = contract.source_generation;
+  }
+  return source;
+}
+
+// SDK observers never hold XeFG state.mutex while taking this short snapshot.
+inline fg::xefg::BridgeSourceObservation ObserveBridgeSourceForXefg(uintptr_t device11) noexcept {
+  fg::xefg::BridgeSourceObservation observation{
+      .queried_device11 = device11, .state = fg::xefg::BridgeSnapshotState::RUNTIME_BUSY};
+  RuntimeTryLock lock(runtime_mutex);
+  if (!lock.owns_lock()) return observation;
+  if (shutting_down.load(std::memory_order_acquire)) {
+    observation.state = fg::xefg::BridgeSnapshotState::SHUTTING_DOWN;
+    return observation;
+  }
+  observation.state = fg::xefg::BridgeSnapshotState::LOCKED;
+  // Diagnostic counts include only confirmed, nonzero-generation D3D11
+  // contracts; native D3D12 and unconfirmed records are not usable candidates.
+  for (const auto& [handle, contract] : create_contracts) {
+    if (handle == nullptr || !contract.source_type_confirmed || contract.source_generation == 0
+        || contract.source_device11_identity == nullptr) continue;
+    ++observation.candidates;
+    if (reinterpret_cast<uintptr_t>(contract.source_device11_identity.Get()) == device11) {
+      ++observation.matches;
+    }
+  }
+  // Keep the original rejection/early-return logic separate from diagnostics.
+  observation.identity = UniqueBridgeSourceLocked(device11);
+  return observation;
+}
+
+inline bool BridgeAdaptiveEligible(const BridgeAdaptiveSource& source,
+    ID3D12GraphicsCommandList* list, ID3D12Device* device, const NVSDK_NGX_Handle* handle,
+    const stage_plan::Plan& plan) {
+  if (!bridge_adaptive_experiment.load(std::memory_order_relaxed)) return false;
+  const auto created = create_contracts.find(handle);
+  bool fg_off = native_fg_public_off.load();
+  if (!fg_off) {
+    const auto unique = UniqueBridgeSourceLocked(reinterpret_cast<uintptr_t>(source.device11_identity));
+    auto evidence = fg::xefg::QueryBridgeOff(unique);
+    const bool source_matches = unique.handle == reinterpret_cast<uintptr_t>(handle)
+        && unique.generation == source.source_generation && created != create_contracts.end()
+        && created->second.source_device11_identity.Get() == source.device11_identity;
+    if (evidence.available && !source_matches) {
+      evidence.available = false;
+      evidence.reason = "bridge_source_does_not_match_disable";
+    }
+    // Bounded experiment-only evidence distinguishes missing identities from a
+    // missing SDK receipt. It is never a substitute for successful SetEnabled.
+    static fg::xefg::BridgeOffEvidence previous;
+    static fg::xefg::BridgeSourceIdentity previous_source;
+    static uint32_t logs = 0;
+    if (logs < 12 && (!(previous == evidence) || previous_source != unique)) {
+      ++logs;
+      previous = evidence;
+      previous_source = unique;
+      std::ostringstream text;
+      text << "Bridge Adaptive XeFG Off receipt available=" << evidence.available << " reason=" << evidence.reason
+           << " source=" << reinterpret_cast<const void*>(unique.handle) << " source_generation=" << unique.generation
+           << " source_device11=" << reinterpret_cast<const void*>(unique.device11)
+           << " context=" << reinterpret_cast<const void*>(evidence.context)
+           << " proxy=" << reinterpret_cast<const void*>(evidence.proxy)
+           << " application_device11=" << reinterpret_cast<const void*>(evidence.application_device11)
+           << " proxy_device11=" << reinterpret_cast<const void*>(evidence.proxy_device11)
+           << " source_link_reason=" << evidence.source_link_reason
+           << " source_swapchain=" << reinterpret_cast<const void*>(evidence.source_swapchain)
+           << " source_swapchain_generation=" << evidence.source_swapchain_generation
+           << " source_link_generation=" << evidence.source_link_generation
+           << " uses_source_link=" << evidence.uses_source_link
+           << " receipt_source=" << reinterpret_cast<const void*>(evidence.source.handle)
+           << " receipt_source_generation=" << evidence.source.generation
+           << " declaration=" << evidence.declaration << " epoch=" << evidence.epoch
+           << " last_successful_init=" << evidence.init_kind;
+      const auto append_source = [&](const char* phase, const fg::xefg::BridgeSourceObservation& observation) {
+        text << ' ' << phase << "_result=" << fg::xefg::BridgeSourceReason(observation)
+             << ' ' << phase << "_query_device11=" << reinterpret_cast<const void*>(observation.queried_device11)
+             << ' ' << phase << "_source=" << reinterpret_cast<const void*>(observation.identity.handle)
+             << ' ' << phase << "_source_generation=" << observation.identity.generation
+             << ' ' << phase << "_counts_available=" << (observation.state == fg::xefg::BridgeSnapshotState::LOCKED)
+             << ' ' << phase << "_candidates=" << observation.candidates
+             << ' ' << phase << "_matches=" << observation.matches;
+      };
+      append_source("before", evidence.before);
+      append_source("after", evidence.after);
+      const auto append_device = [&](const char* role, const fg::xefg::BridgeDeviceObservation& observation) {
+        text << ' ' << role << "_present=" << observation.object_present
+             << ' ' << role << "_swapchain_unwrapped=" << observation.swapchain_unwrapped
+             << ' ' << role << "_swapchain_qi_hr=0x" << std::hex << static_cast<uint32_t>(observation.swapchain_result)
+             << ' ' << role << "_device11_hr=0x" << static_cast<uint32_t>(observation.device11_result)
+             << ' ' << role << "_device12_hr=0x" << static_cast<uint32_t>(observation.device12_result) << std::dec;
+      };
+      append_device("application", evidence.application);
+      append_device("proxy", evidence.proxy_device);
+      Log(reshade::log::level::info, text.str());
+    }
+    fg_off = evidence.available;
+  }
+  return source.api == capability::Api::DX11 && source.backend == capability::Backend::DX11_BRIDGE
+      && source.handle == handle && source.list == list && source.device == device
+      && source.device_generation != 0 && source.device_generation == bridge_adaptive_device_generation.load()
+      && source.shared_layout != 0 && source.source_generation != 0
+      && created != create_contracts.end() && created->second.source_generation == source.source_generation
+      && source.stage == stage_plan::Stage::UPSCALED && plan.valid && !plan.mixed
+      && plan.pass_count == 1 && plan.group_count == 1
+      && plan.At(stage_plan::Stage::UPSCALED).begin == 0 && plan.At(stage_plan::Stage::UPSCALED).count == 1
+      && nr_adaptive_selected_levels.load() == 2 && !nr_adaptive_limited_residency.load()
+      && adaptive_feature_mode.load() == AdaptiveFeatureMode::OFF && !edit_reuse_enabled.load()
+      && fg_off && !native_fg_owns.load() && !fg::xefg::Enabled()
+      && !auto_fg_fallback_active.load();
+}
+
+#if defined(NR_NEXUS_DEV_CONTROL)
+// A successful host SR supplies this device identity; an SDK Init or a shared
+// device alone does not establish the source-to-proxy Present link.
+inline fg::xefg::BridgeSourceIdentity UniqueD3D12SourceLocked(uintptr_t device12) {
+  fg::xefg::BridgeSourceIdentity source{.device12 = device12};
+  if (device12 == 0) return source;
+  for (const auto& [handle, contract] : create_contracts) {
+    if (reinterpret_cast<uintptr_t>(contract.source_device12_identity.Get()) != device12) continue;
+    if (!contract.source_type_confirmed || contract.source_generation == 0 || source.handle != 0) {
+      return {.device12 = device12};
+    }
+    source.handle = reinterpret_cast<uintptr_t>(handle);
+    source.generation = contract.source_generation;
+  }
+  return source;
+}
+
+inline fg::xefg::BridgeSourceObservation ObserveD3D12SourceForXefg(uintptr_t device12) noexcept {
+  fg::xefg::BridgeSourceObservation observation{
+      .state = fg::xefg::BridgeSnapshotState::RUNTIME_BUSY, .queried_device12 = device12};
+  RuntimeTryLock lock(runtime_mutex);
+  if (!lock.owns_lock()) return observation;
+  if (shutting_down.load(std::memory_order_acquire)) {
+    observation.state = fg::xefg::BridgeSnapshotState::SHUTTING_DOWN;
+    return observation;
+  }
+  observation.state = fg::xefg::BridgeSnapshotState::LOCKED;
+  for (const auto& [handle, contract] : create_contracts) {
+    if (handle == nullptr || !contract.source_type_confirmed || contract.source_generation == 0
+        || contract.source_device12_identity == nullptr) continue;
+    ++observation.candidates;
+    if (reinterpret_cast<uintptr_t>(contract.source_device12_identity.Get()) == device12) ++observation.matches;
+  }
+  observation.identity = UniqueD3D12SourceLocked(device12);
+  return observation;
+}
+
+inline fg::xefg::BridgeOffEvidence EditReuseXefgOffLocked(const NVSDK_NGX_Handle* handle, uint64_t generation = 0) {
+  const auto created = create_contracts.find(handle);
+  const auto source = UniqueD3D12SourceLocked(created != create_contracts.end()
+      ? reinterpret_cast<uintptr_t>(created->second.source_device12_identity.Get()) : 0);
+  auto evidence = fg::xefg::QueryBridgeOff(source);
+  if (evidence.available && (source.handle != reinterpret_cast<uintptr_t>(handle)
+      || (generation != 0 && source.generation != generation))) {
+    evidence.available = false;
+    evidence.reason = "edit_source_does_not_match_disable";
+  }
+  return evidence;
+}
+
+struct EditReuseFgEnvironment {
+  bool available = false;
+  const char* reason = "unobserved";
+  uint64_t provider = 0;
+  uintptr_t context = 0;
+  uint64_t generation = 0;
+};
+
+// Caller holds runtime_mutex. This metadata is never an SR-to-FG input mapping or an Off receipt.
+inline EditReuseFgEnvironment ReadEditReuseFgEnvironmentLocked() {
+  EditReuseFgEnvironment environment;
+  uintptr_t native_context = 0;
+  uint32_t native_contexts = 0;
+  for (const auto& [handle, feature] : created_feature_ids) {
+    if (feature != NVSDK_NGX_Feature_FrameGeneration) continue;
+    native_context = reinterpret_cast<uintptr_t>(handle);
+    ++native_contexts;
+  }
+  const bool native_on = native_fg_declaration.load() == NativeFgDeclaration::kOn && !native_fg_public_off.load();
+  const auto xefg = fg::xefg::QueryEnabledContext();
+  // OptiScaler can expose DLSSG input while XeFG owns output; that is one XeFG environment.
+  if (xefg.available) {
+    environment = {.available = true, .reason = "xefg_on_environment", .provider = 2,
+        .context = xefg.context_identity, .generation = xefg.generation};
+  } else if (fg::xefg::Enabled()) {
+    environment.reason = xefg.reason;
+  } else if (!native_on) {
+    environment.reason = "fg_on_unobserved";
+  } else if (native_contexts != 1 || native_context == 0) {
+    environment.reason = (native_contexts == 0 ? "native_fg_handle_unobserved" : "multiple_native_fg_handles");
+  } else {
+    environment = {.available = true, .reason = "native_fg_on_environment", .provider = 1,
+        .context = native_context, .generation = edit_reuse_native_fg_generation.load(std::memory_order_acquire)};
+  }
+  return environment;
+}
+#endif
+
 inline adaptive_resolution::Frame FreezeAdaptiveFrame(
     std::shared_ptr<adaptive_resolution::Session>* owner, const stage_plan::Plan& plan,
     const stage_plan::Group& group, uint32_t reference_width, uint32_t reference_height,
     uint32_t guide_width, uint32_t guide_height, uint64_t source_identity,
     bool supported, uint64_t application_frame = 0, uint32_t required_roles = 1, bool fg_owned = false,
-    uint32_t source_outputs = 1, uint32_t observed_model_roles = 0, bool upper_capacity = false) {
+    uint32_t source_outputs = 1, uint32_t observed_model_roles = 0, bool upper_capacity = false,
+    const BridgeAdaptiveSource* bridge_source = nullptr, const fg::xefg::BridgeOffEvidence* edit_off = nullptr) {
   if (!nr_adaptive_enabled.load() && *owner == nullptr) return {};
   if (*owner == nullptr) *owner = std::make_shared<adaptive_resolution::Session>();
   adaptive_resolution::Sizes upper{}, floor{};
@@ -10658,6 +11598,16 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
   const float minimum_scale = (hold_adaptive_settings ? (*owner)->settings.minimum_scale : nr_adaptive_min_scale.load());
   const uint32_t selected_levels = (hold_adaptive_settings ? (*owner)->settings.selected_levels
       : nr_adaptive_selected_levels.load());
+  const bool limited_residency = (hold_adaptive_settings ? (*owner)->settings.limited_residency
+      : nr_adaptive_limited_residency.load() && adaptive_feature_mode.load() == AdaptiveFeatureMode::OFF);
+  if (bridge_source != nullptr) {
+    for (const uint64_t value : {static_cast<uint64_t>(bridge_source->api), static_cast<uint64_t>(bridge_source->backend),
+             bridge_source->device_generation, bridge_source->source_generation, bridge_source->shared_layout,
+             static_cast<uint64_t>(bridge_source->stage)}) {
+      source_identity ^= value;
+      source_identity *= 1099511628211ull;
+    }
+  }
   uint64_t layout_identity = source_identity;
   for (const uint64_t value : {layout.configuration_generation,
            layout.settings_hash,
@@ -10678,10 +11628,13 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
     source_identity *= 1099511628211ull;
   }
   const int64_t now_ns = SteadyNowNs();
-  const auto output = output_framerate::Read(now_ns);
+  auto output = output_framerate::Read(now_ns);
+  if (edit_off != nullptr) {
+    output.available = edit_off->MatchesOutput(output);
+  }
   capability::Input baseline;
-  baseline.api = capability::Api::DX12;
-  baseline.backend = capability::Backend::NATIVE;
+  baseline.api = (bridge_source != nullptr ? bridge_source->api : capability::Api::DX12);
+  baseline.backend = (bridge_source != nullptr ? bridge_source->backend : capability::Backend::NATIVE);
   baseline.runtime = capability::Runtime::AVAILABLE;
   baseline.fg = (native_fg_public_off.load() ? capability::Fg::OFF : capability::Fg::UNKNOWN);
   baseline.fg_owns_input = fg_owned || native_fg_owns.load();
@@ -10705,10 +11658,13 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
       && adaptive_feature_mode.load() == AdaptiveFeatureMode::OFF;
   const uint32_t requested_worksets = (explicit_reservation
       ? AdaptiveWorksetReservation(*owner, std::min(selected_levels, adaptive_resolution::MAX_PREPARED_LEVELS),
-          required_roles, source_outputs) : 0);
+          required_roles, source_outputs, limited_residency) : 0);
   const uint32_t selection_limit = EffectiveAdaptiveWorksetLimit(*owner, requested_worksets, true);
-  const uint32_t levels = std::min(upper_capacity ? 3u : adaptive_resolution::MAX_PREPARED_LEVELS,
-                                 selection_limit / outputs);
+  // Residency changes with the request; logical selection metadata must not.
+  // Otherwise a cold request edits Settings and Prepare restores the old tier.
+  const uint32_t levels = (limited_residency && selected_levels != 0
+      ? std::min(selected_levels, adaptive_resolution::MAX_PREPARED_LEVELS)
+      : std::min(upper_capacity ? 3u : adaptive_resolution::MAX_PREPARED_LEVELS, selection_limit / outputs));
   const bool eligible = supported && plan.valid && !plan.mixed && plan.group_count == 1
       && (!explicit_reservation || source_outputs <= 2);
   if (upper_capacity) {
@@ -10719,7 +11675,8 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
   (*owner)->Prepare({.enabled = nr_adaptive_enabled.load(), .target_fps = target_fps,
                        .minimum_scale = minimum_scale, .prepared_levels = levels,
                        .selected_levels = selected_levels,
-                       .legacy_preparation = adaptive_feature_mode.load() != AdaptiveFeatureMode::OFF},
+                       .legacy_preparation = adaptive_feature_mode.load() != AdaptiveFeatureMode::OFF,
+                       .limited_residency = limited_residency},
       upper, floor, source_identity,
       {.available = output.available, .source = static_cast<uint64_t>(output.source),
        .generation = output.source_generation, .configuration = output.configuration_generation,
@@ -10740,7 +11697,7 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
           .preparation_epoch = session.preparation_epoch,
           .required_roles = required_roles, .output_count = source_outputs,
            .enabled = eligible && nr_adaptive_enabled.load(),
-           .measure = measure && (session.settings.legacy_preparation || session.prepared), .immediate = same_resources,
+           .measure = measure && (session.settings.legacy_preparation || session.TargetReady()), .immediate = same_resources,
            .upper_capacity = upper_capacity};
 }
 
@@ -10768,6 +11725,27 @@ inline bool AdaptiveTierUsable(const AdaptiveFeatureCache& cache, const adaptive
                                size_t slot) {
   return slot < cache.count && cache.ladder.sizes[slot] == session.ladder.sizes[slot]
       && session.IsLegal(cache.ladder.sizes[slot]) && (slot == cache.active || cache.tiers[slot].ready);
+}
+
+inline uint32_t AdaptiveReadyLevelCount(const std::shared_ptr<adaptive_resolution::Session>& session,
+    uint64_t layout_identity, uint32_t required_roles) {
+  std::array<bool, adaptive_resolution::MAX_PREPARED_LEVELS> ready;
+  ready.fill(true);
+  uint32_t observed_roles = 0;
+  for (const auto& [handle, source] : features) {
+    for (const auto* feature : std::array<const FeatureState*, 2>{&source, source.render_session.get()}) {
+      if (feature == nullptr || feature->adaptive_session != session || feature->adaptive_cache == nullptr) continue;
+      const auto& cache = *feature->adaptive_cache;
+      if (cache.identity != layout_identity || (cache.role & required_roles) == 0) continue;
+      observed_roles |= cache.role;
+      for (size_t index = 0; index < session->ladder.count; ++index) {
+        ready[index] &= index < cache.count && cache.tiers[index].ready
+            && AdaptiveTierUsable(cache, *session, index);
+      }
+    }
+  }
+  if ((observed_roles & required_roles) != required_roles) return 0;
+  return static_cast<uint32_t>(std::count(ready.begin(), ready.begin() + session->ladder.count, true));
 }
 
 inline uint32_t AdaptiveOutputCount(FeatureState* feature, const NVSDK_NGX_Handle* owner,
@@ -10981,21 +11959,38 @@ inline uint32_t AdaptiveOutputCount(FeatureState* feature, const NVSDK_NGX_Handl
 inline void ActivateAdaptiveTier(FeatureState* feature, size_t slot, bool reset_history = true) {
   const auto cache = feature->adaptive_cache;
   if (cache == nullptr || cache->active == slot) return;
+  const uint64_t sr_sequence = feature->sr_sequence;
+  // A parked tier cannot retain an edit from an earlier source frame. This
+  // also closes an edit-bearing tier during temporary preparation switches;
+  // ordinary model histories keep reset_history=false's existing behavior.
+  for (auto* state : {feature, &cache->tiers[slot].state}) {
+    for (auto& model : state->slots) {
+      if (model.edit_reuse == nullptr) continue;
+      retired_nr_features.push_back(RetiredNrFeature{
+          .generation = present_generation, .tracker_proof = true, .edit_reuse = std::move(model.edit_reuse)});
+      nr_retirement_pending.store(true, std::memory_order_relaxed);
+      model.pending_reset = true;
+      model.pending_reset_reasons |= kResetDimensions;
+    }
+  }
   const auto session = feature->adaptive_session;
   const auto outputs = feature->adaptive_outputs;
   const auto output_geometry = feature->adaptive_output_geometry;
   const auto output_failure_generation = feature->adaptive_output_failure_generation;
   const auto output_blocked = feature->adaptive_output_blocked;
+  const auto retirement_blocked = feature->adaptive_retirement_blocked;
   feature->adaptive_cache.reset();
   std::swap(*feature, cache->tiers[cache->active].state);
   std::swap(*feature, cache->tiers[slot].state);
   cache->active = slot;
+  feature->sr_sequence = sr_sequence;
   feature->adaptive_cache = cache;
   feature->adaptive_session = session;
   feature->adaptive_outputs = outputs;
   feature->adaptive_output_geometry = output_geometry;
   feature->adaptive_output_failure_generation = output_failure_generation;
   feature->adaptive_output_blocked = output_blocked;
+  feature->adaptive_retirement_blocked = retirement_blocked;
   if (reset_history) {
     for (auto& model : feature->slots) {
       model.pending_reset = true;
@@ -11004,24 +11999,97 @@ inline void ActivateAdaptiveTier(FeatureState* feature, size_t slot, bool reset_
   }
 }
 
+inline bool AdaptiveFallbackReady(const FeatureState& feature, const AdaptiveFeatureCache& cache, size_t slot) {
+  if (feature.adaptive_session == nullptr || slot >= cache.count || !cache.tiers[slot].ready
+      || !AdaptiveTierUsable(cache, *feature.adaptive_session, slot)) return false;
+  const auto& state = (slot == cache.active ? feature : cache.tiers[slot].state);
+  bool has_model = false;
+  for (uint32_t pass = 0; pass < kMaxNrPasses - state.pass_offset; ++pass) {
+    if (cache.upper[state.pass_offset + pass].width == 0) continue;
+    if (state.slots[pass].handle == nullptr || state.slots[pass].failed) return false;
+    has_model = true;
+  }
+  return has_model;
+}
+
+inline void RetireFailedAdaptivePreparation(FeatureState* feature) {
+  const auto cache = feature->adaptive_cache;
+  if (cache == nullptr || cache->standby_retired) return;
+  if (cache->active != 0 && AdaptiveFallbackReady(*feature, *cache, 0)) {
+    ActivateAdaptiveTier(feature, 0);
+  }
+  // Storage is admitted before preparation, not allocated on the OOM path.
+  auto& pending = adaptive_retiring_collections.at(cache->owner);
+  for (size_t index = 0; index < cache->count; ++index) {
+    pending[index] = cache->tiers[index].recording_token;
+  }
+  cache->standby_retired = true;
+  ReleaseAdaptiveStandby(cache.get(), true);
+  if (!AdaptiveFallbackReady(*feature, *cache, cache->active)) {
+    ReleaseAllNrSlots(*feature, true);
+    ReleaseCom(feature->norm.commit);
+    cache->tiers[cache->active].ready = false;
+    cache->tiers[cache->active].completion.reset();
+    cache->tiers[cache->active].output_completions.clear();
+    for (auto it = worksets.begin(); it != worksets.end();) {
+      if (!AdaptiveCacheOwnsWorkset(*cache, it->first, it->second)) {
+        ++it;
+        continue;
+      }
+      RetireWorksetResources(std::move(it->second));
+      it = worksets.erase(it);
+    }
+    feature->adaptive_output_blocked = true;
+  }
+}
+
 inline void SelectAdaptiveTier(FeatureState* feature, const NVSDK_NGX_Handle* handle,
                                adaptive_resolution::Frame* frame, bool frozen_slot,
                                const ID3D12Resource* output, bool pre_sr = false) {
   frame->output_identity = reinterpret_cast<uintptr_t>(output);
   if (frame->preparing) return;
+  feature->adaptive_retirement_blocked = false;
   if (frozen_slot && frame->enabled) feature->adaptive_output_blocked = false;
+  const auto wait_for_retirement = [&] {
+    const auto cache = feature->adaptive_cache;
+    if (!AdaptiveRetirementPending(handle)
+        || (cache != nullptr && cache->standby_retired && cache->preparation_epoch == frame->preparation_epoch
+            && cache->identity == frame->layout_identity && cache->upper == frame->upper)) return false;
+    if (cache != nullptr && frame->session != nullptr && frame->session->settings.limited_residency
+        && cache->identity == frame->layout_identity && cache->upper == frame->upper
+        && (!frame->enabled || cache->preparation_epoch == frame->preparation_epoch)
+        && !cache->failed && !cache->budget_blocked
+        && !cache->standby_retired) {
+      // Ordinary eviction retains the healthy active chain. Only new cold
+      // preparation waits for this group's exact retirement proof.
+      return false;
+    }
+    feature->adaptive_retirement_blocked = true;
+    if (frame->session != nullptr) {
+      frame->session->status.reason = adaptive_resolution::Reason::BUDGET;
+      PublishAdaptiveStatus(frame->session->status);
+    }
+    return true;
+  };
+  if (wait_for_retirement()) return;
   if (!nr_adaptive_enabled.load() && feature->adaptive_cache != nullptr) {
     const auto cache = feature->adaptive_cache;
     if (cache->identity != frame->layout_identity || cache->upper != frame->upper
         || cache->failed || !cache->tiers[0].ready) {
       ReleaseAdaptiveCache(feature, true);
       feature->adaptive_output_blocked = false;
+      wait_for_retirement();
       frame->slot = 0;
       return;
     }
     ActivateAdaptiveTier(feature, 0);
     ReleaseAdaptiveStandby(cache.get(), true);
-    feature->adaptive_cache.reset();
+    // Retain only the healthy manual-upper contract while an ordinary limited
+    // eviction is still replayable. Re-enable keeps its original epoch gate.
+    if (!(frame->session != nullptr && frame->session->settings.limited_residency
+            && !cache->budget_blocked && !cache->standby_retired && AdaptiveRetirementPending(handle))) {
+      feature->adaptive_cache.reset();
+    }
     feature->adaptive_output_blocked = false;
     if (adaptive_resident_session.lock() == frame->session) {
       adaptive_resident_session.reset();
@@ -11053,6 +12121,7 @@ inline void SelectAdaptiveTier(FeatureState* feature, const NVSDK_NGX_Handle* ha
       && frame->enabled && feature->adaptive_cache->identity != frame->layout_identity) {
     ReleaseAdaptiveCache(feature, true);
   }
+  if (wait_for_retirement()) return;
   if (!frame->enabled || frame->session == nullptr) {
     if (feature->adaptive_cache != nullptr) {
       const auto& cache = *feature->adaptive_cache;
@@ -11086,6 +12155,7 @@ inline void SelectAdaptiveTier(FeatureState* feature, const NVSDK_NGX_Handle* ha
     return;
   }
   if (feature->adaptive_cache == nullptr) {
+    adaptive_retiring_collections.try_emplace(handle).first->second = {};
     feature->adaptive_cache = std::make_shared<AdaptiveFeatureCache>();
     auto& cache = *feature->adaptive_cache;
     cache.owner = handle;
@@ -11126,6 +12196,11 @@ inline void SelectAdaptiveTier(FeatureState* feature, const NVSDK_NGX_Handle* ha
     cache.stalled_opportunities = 0;
     if (!session->failed) cache.failed = false;
     if (session->preparation_reason != adaptive_resolution::Reason::BUDGET) cache.budget_blocked = false;
+    if (!cache.failed && !cache.budget_blocked) cache.standby_retired = false;
+  }
+  if (session->settings.limited_residency && cache.target_generation != frame->generation) {
+    cache.target_generation = frame->generation;
+    cache.stalled_opportunities = 0;
   }
   if (!session->settings.legacy_preparation
       && (cache.count != session->ladder.count || cache.ladder.sizes != session->ladder.sizes)) {
@@ -11214,6 +12289,7 @@ inline void SelectAdaptiveTier(FeatureState* feature, const NVSDK_NGX_Handle* ha
     cache.ladder = session->ladder;
     cache.active = 0;
     std::swap(*feature, cache.tiers[0].state);
+    feature->sr_sequence = source.sr_sequence;
     feature->adaptive_cache = cache_owner;
     feature->adaptive_session = session;
     feature->adaptive_outputs = source.adaptive_outputs;
@@ -11246,9 +12322,17 @@ inline void SelectAdaptiveTier(FeatureState* feature, const NVSDK_NGX_Handle* ha
   cache.upper = frame->upper;
   cache.output_count = frame->output_count;
   cache.role = frame->role;
+  if (session->settings.limited_residency && session->settings.selected_levels != 0
+      && adaptive_resident_session.expired()) {
+    // The first healthy upper needs its protected allocation before it can
+    // produce a completion receipt. Ordinary traffic keeps its own quota.
+    adaptive_resident_session = session;
+    cache.resident = true;
+  }
   if (adaptive_resident_session.lock() == session) {
     adaptive_resident_worksets = (session->settings.selected_levels != 0 && !session->settings.legacy_preparation
-        ? AdaptiveWorksetReservation(session, static_cast<uint32_t>(cache.count), frame->required_roles, frame->output_count) : 0);
+        ? AdaptiveWorksetReservation(session, static_cast<uint32_t>(cache.count), frame->required_roles, frame->output_count,
+            session->settings.limited_residency) : 0);
   }
   cache.output_identities.clear();
   if (feature->adaptive_outputs != nullptr) {
@@ -11261,9 +12345,17 @@ inline void SelectAdaptiveTier(FeatureState* feature, const NVSDK_NGX_Handle* ha
   cache.last_used_ns = SteadyNowNs();
   PollAdaptiveCache(&cache);
   if (cache.failed) session->Fail(frame->generation);
+  cache.failed |= session->failed;
+  cache.budget_blocked |= session->preparation_reason == adaptive_resolution::Reason::BUDGET;
+  if (cache.failed || cache.budget_blocked) RetireFailedAdaptivePreparation(feature);
+  if ((cache.failed || cache.budget_blocked) && !AdaptiveFallbackReady(*feature, cache, cache.active)) {
+    feature->adaptive_output_blocked = true;
+    PublishAdaptiveStatus(session->status);
+    return;
+  }
   size_t slot = (frozen_slot ? frame->slot : session->level);
   if (cache.failed || cache.budget_blocked || session->failed
-      || (!session->settings.legacy_preparation && !session->prepared)) {
+      || (!session->settings.legacy_preparation && !session->TargetReady())) {
     slot = (frozen_slot ? frame->slot : cache.active);
     const auto& upper_state = (cache.active == 0 ? *feature : cache.tiers[0].state);
     const bool healthy_upper = cache.tiers[0].ready
@@ -11273,7 +12365,7 @@ inline void SelectAdaptiveTier(FeatureState* feature, const NVSDK_NGX_Handle* ha
         && (cache.failed || cache.budget_blocked || session->failed
             || session->preparation_reason == adaptive_resolution::Reason::BUDGET)) {
       slot = 0;
-    } else if ((cache.failed || session->failed)
+    } else if ((cache.failed || cache.budget_blocked || session->failed)
         && std::any_of(std::begin(feature->slots), std::end(feature->slots),
             [](const auto& model) { return model.failed; })) {
       feature->adaptive_output_blocked = true;
@@ -11285,7 +12377,7 @@ inline void SelectAdaptiveTier(FeatureState* feature, const NVSDK_NGX_Handle* ha
     slot = (AdaptiveTierUsable(cache, *session, cache.active) ? cache.active : 0u);
   }
   ActivateAdaptiveTier(feature, slot);
-  session->active_level = slot;
+  if (!session->settings.limited_residency) session->active_level = slot;
   frame->slot = static_cast<uint32_t>(slot);
   frame->sizes = cache.ladder.sizes[slot];
   uint32_t ready_levels = 0;
@@ -11300,10 +12392,23 @@ inline void SelectAdaptiveTier(FeatureState* feature, const NVSDK_NGX_Handle* ha
     if (cache.budget_blocked) session->status.reason = adaptive_resolution::Reason::BUDGET;
     else if (slot != session->level && !session->failed) session->status.reason = adaptive_resolution::Reason::PREPARING;
   } else if (!frozen_slot) {
-    session->UpdatePreparation(frame->preparation_epoch, ready_levels, static_cast<uint32_t>(session->ladder.count),
-        cache.failed ? adaptive_resolution::Reason::FAILED
-            : (cache.budget_blocked ? adaptive_resolution::Reason::BUDGET : adaptive_resolution::Reason::PREPARING),
-        SteadyNowNs());
+    const auto reason = (cache.failed ? adaptive_resolution::Reason::FAILED
+        : (cache.budget_blocked ? adaptive_resolution::Reason::BUDGET : adaptive_resolution::Reason::PREPARING));
+    if (session->settings.limited_residency) {
+      session->UpdateTargetPreparation(frame->preparation_epoch, frame->generation,
+          AdaptiveReadyLevelCount(session, frame->layout_identity, frame->required_roles),
+          static_cast<uint32_t>(session->ladder.count),
+          !cache.failed && !cache.budget_blocked && cache.tiers[session->level].ready
+              && AdaptiveTierUsable(cache, *session, session->level), reason, SteadyNowNs());
+    } else {
+      session->UpdatePreparation(frame->preparation_epoch, ready_levels,
+          static_cast<uint32_t>(session->ladder.count), reason, SteadyNowNs());
+    }
+  }
+  if (session->TargetReady() && !cache.failed && !cache.budget_blocked && !AdaptiveSessionRetirementPending(session)) {
+    // Recovery is complete. A later ordinary configuration change must not
+    // turn this healthy collection back into the previous failure's barrier.
+    adaptive_retiring_collections.at(handle) = {};
   }
   PublishAdaptiveStatus(session->status);
 }
@@ -11318,6 +12423,8 @@ inline void PrepareAdaptiveTier(FeatureState* feature, const adaptive_resolution
       || !nr_adaptive_enabled.load() || frame.session->failed
       || nr_adaptive_editing.load() || gpu_timers::ComparisonActive()) return;
   const bool legacy = frame.session->settings.legacy_preparation;
+  const bool limited = frame.session->settings.limited_residency;
+  if (limited ? AdaptiveSessionRetirementPending(frame.session) : AdaptiveRetirementPending(cache->owner)) return;
   if (!legacy && frame.session->preparation_reason == adaptive_resolution::Reason::BUDGET) return;
   if (!complete) return;
   if (const auto resident = adaptive_resident_session.lock(); resident != nullptr && resident != frame.session) return;
@@ -11330,14 +12437,65 @@ inline void PrepareAdaptiveTier(FeatureState* feature, const adaptive_resolution
       source.adaptive_cache->resident = true;
     }
   }
-  const uint32_t required_worksets = AdaptiveWorksetReservation(frame.session,
-      static_cast<uint32_t>(frame.session->ladder.count), frame.required_roles, frame.output_count);
-  adaptive_resident_worksets = (!legacy && frame.session->settings.selected_levels != 0 ? required_worksets : 0);
   if (complete && !cache->tiers[cache->active].output_completions.contains(frame.output_identity)) {
     auto& tier = cache->tiers[cache->active];
     tier.completion = submission::ObserveRecording(list);
     tier.output_completions.emplace(frame.output_identity, tier.completion);
   }
+  if (limited) {
+    // Logical tiers remain indexed by the full ladder. Only roles which can
+    // still be applied or rolled back keep GPU allocations. One ordinary
+    // eviction batch is admitted at a time across every color in the Session.
+    auto& pending = adaptive_retiring_collections.at(cache->owner);
+    bool evicted = false;
+    for (size_t index = 0; index < cache->count; ++index) {
+      if (index == cache->active || AdaptiveProtectedLevel(*frame.session, index)) continue;
+      auto& tier = cache->tiers[index];
+      const bool allocated = tier.state.norm.commit != nullptr || !tier.output_completions.empty()
+          || std::any_of(std::begin(tier.state.slots), std::end(tier.state.slots),
+              [](const auto& model) { return model.handle != nullptr || model.parameters != nullptr; })
+          || std::any_of(worksets.begin(), worksets.end(), [&](const auto& workset) {
+               return workset.first.adaptive_slot == index
+                   && AdaptiveCacheOwnsWorkset(*cache, workset.first, workset.second);
+             });
+      if (!allocated) continue;
+      evicted = true;
+      pending[adaptive_resolution::MAX_PREPARED_LEVELS + index] = tier.recording_token;
+      ReleaseAllNrSlots(tier.state, true);
+      ReleaseCom(tier.state.norm.commit);
+      tier.state.slots[0] = tier.state.slots[1] = tier.state.slots[2] = tier.state.slots[3] = {};
+      tier.state.norm = {};
+      tier.state.second_resolution = {};
+      tier.state.control_mask_recording.reset();
+      tier.state.control_mask_stream.reset();
+      tier.state.last_workset_key = nullptr;
+      tier.state.working_resolution_committed = false;
+      tier.state.adaptive_resolution_generation = 0;
+      tier.ready = false;
+      tier.completion.reset();
+      tier.output_completions.clear();
+      tier.preparation_cpu_ms = 0.;
+      for (auto it = worksets.begin(); it != worksets.end();) {
+        if (it->first.adaptive_slot != index || !AdaptiveCacheOwnsWorkset(*cache, it->first, it->second)) {
+          ++it;
+          continue;
+        }
+        RetireWorksetResources(std::move(it->second));
+        it = worksets.erase(it);
+      }
+    }
+    if (evicted) {
+      frame.session->prepared = false;
+      frame.session->status.ready_levels = AdaptiveReadyLevelCount(frame.session, frame.layout_identity, frame.required_roles);
+      PublishAdaptiveStatus(frame.session->status);
+    }
+    DrainRetiredResources(true);
+    if (AdaptiveSessionRetirementPending(frame.session)) return;
+    if (frame.session->TargetReady()) return;
+  }
+  const uint32_t required_worksets = AdaptiveWorksetReservation(frame.session,
+      static_cast<uint32_t>(frame.session->ladder.count), frame.required_roles, frame.output_count, limited);
+  adaptive_resident_worksets = (!legacy && frame.session->settings.selected_levels != 0 ? required_worksets : 0);
   // A running selected collection never pays cold preparation costs. A new
   // resource binding or committed selection must first close the ready gate.
   if (!legacy && frame.session->prepared) return;
@@ -11347,11 +12505,13 @@ inline void PrepareAdaptiveTier(FeatureState* feature, const adaptive_resolution
     cache->budget_blocked = true;
     frame.session->UpdatePreparation(frame.preparation_epoch, 0, static_cast<uint32_t>(frame.session->ladder.count),
         adaptive_resolution::Reason::BUDGET, SteadyNowNs());
+    RetireFailedAdaptivePreparation(feature);
     PublishAdaptiveStatus(frame.session->status);
     return;
   }
   PollAdaptiveCache(cache.get());
   if (cache->failed) {
+    RetireFailedAdaptivePreparation(feature);
     frame.session->UpdatePreparation(frame.preparation_epoch, 0, static_cast<uint32_t>(frame.session->ladder.count),
         adaptive_resolution::Reason::FAILED, SteadyNowNs());
     return;
@@ -11360,6 +12520,7 @@ inline void PrepareAdaptiveTier(FeatureState* feature, const adaptive_resolution
     cache->failed = true;
     frame.session->UpdatePreparation(frame.preparation_epoch, 0, static_cast<uint32_t>(frame.session->ladder.count),
         adaptive_resolution::Reason::FAILED, SteadyNowNs());
+    RetireFailedAdaptivePreparation(feature);
     Log(reshade::log::level::warning,
         "NR adaptive preparation paused: no progress across 240 successful source opportunities; waiting for exact recording/GPU completion or a complete output binding");
     PublishAdaptiveStatus(frame.session->status);
@@ -11387,6 +12548,7 @@ inline void PrepareAdaptiveTier(FeatureState* feature, const adaptive_resolution
       if (!completion->closed.load() || !completion->submitted.load()) return;
     }
     if (index == cache->active || !frame.session->IsLegal(frame.session->ladder.sizes[index])) continue;
+    if (limited && index != preparation_slot) continue;
     if (legacy && (frame.session->defer_preparation
             || (frame.upper_capacity && mode == AdaptiveFeatureMode::UPPER_CAPACITY_ON_DEMAND)
             || adjacent_preparation)
@@ -11507,6 +12669,7 @@ inline void PrepareAdaptiveTier(FeatureState* feature, const adaptive_resolution
     cache->budget_blocked = true;
     frame.session->UpdatePreparation(frame.preparation_epoch, 0, static_cast<uint32_t>(frame.session->ladder.count),
         adaptive_resolution::Reason::BUDGET, SteadyNowNs());
+    RetireFailedAdaptivePreparation(feature);
     PublishAdaptiveStatus(frame.session->status);
     return;
   }
@@ -11537,6 +12700,7 @@ inline void PrepareAdaptiveTier(FeatureState* feature, const adaptive_resolution
     stage_telemetry = observed;
     cache->failed = true;
     frame.session->Fail(frame.generation);
+    RetireFailedAdaptivePreparation(feature);
     throw;
   }
   const double elapsed_ms = static_cast<double>(SteadyNowNs() - started_ns) / 1'000'000.;
@@ -11565,20 +12729,23 @@ inline void PrepareAdaptiveTier(FeatureState* feature, const adaptive_resolution
   if (nr_features_created != features_before) {
     cache->stalled_opportunities = 0;
   }
-  for (const auto& model : feature->slots) cache->failed |= model.failed;
+  cache->budget_blocked |= frame.session->preparation_reason == adaptive_resolution::Reason::BUDGET;
+  if (!cache->budget_blocked) {
+    for (const auto& model : feature->slots) cache->failed |= model.failed;
+  }
   preparing_adaptive_frame = previous_frame;
   ActivateAdaptiveTier(feature, previous_slot, false);
   evaluate_chain = previous_chain;
   comparison_stable_after_ns = stable_after;
   comparison_stable_epochs = stable_epochs;
   stage_telemetry = observed;
-  if (cache->budget_blocked) ReleaseAdaptiveStandby(cache.get(), true);
   // Admission guards can defer a standby recording before calling NR. Only
   // ObserveNrEvaluation's actual API failure pauses the shared session.
   if (frame.session->failed) {
     cache->failed = true;
   }
   if (cache->failed || cache->budget_blocked) {
+    RetireFailedAdaptivePreparation(feature);
     frame.session->UpdatePreparation(frame.preparation_epoch, 0, static_cast<uint32_t>(frame.session->ladder.count),
         cache->failed ? adaptive_resolution::Reason::FAILED : adaptive_resolution::Reason::BUDGET, SteadyNowNs());
   }
@@ -12138,6 +13305,7 @@ __declspec(noinline) inline void SetPresentCaptureMeta(
 struct NrRecording {
   bool prepared = false;
   bool model_invoked = false;
+  bool edit_reused = false;
   bool model_recorded = false;
   bool output_ready = false;
   bool group_complete = false;
@@ -12194,6 +13362,7 @@ inline bool RecordInline(
 #if defined(NR_NEXUS_DEV_CONTROL)
     , bool inline_restore_bridge = false
 #endif
+    , const BridgeAdaptiveSource* bridge_source = nullptr
 ) {
 #if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
   const ColdCpuTraceScope cold_trace("RecordInline");
@@ -12325,7 +13494,8 @@ inline bool RecordInline(
   // inside EnsureDirectRuntime releases every feature state, so the
   // FeatureState& bound below must not exist yet (see FindOrRegisterFeature).
   NrDeclineReason runtime_decline = NrDeclineReason::kNrRuntimeUnavailable;
-  if (!EnsureDirectRuntime(command_list, &runtime_decline)) {
+  if (!EnsureDirectRuntime(command_list, &runtime_decline,
+                           present != nullptr && present->private_signed_runtime)) {
     // Named, not silent: with no nvngx_dlssnr.dll on the machine this is
     // where EVERY evaluate ends, and until v6.8.0-alpha23 it ended without
     // counting anything.  The verdict said UNAVAILABLE and was right; the
@@ -12557,19 +13727,32 @@ inline bool RecordInline(
       && output_format == DXGI_FORMAT_R16G16B16A16_FLOAT && hdr_mode == 1
       && direct_runtime_requirements.file_version == "310.9.16.0"
       && nr_model::ResolvePreset(preset.load(), 0, direct_runtime_requirements.dual_models) == 2;
+  const bool bridge_adaptive = bridge_source != nullptr
+      && BridgeAdaptiveEligible(*bridge_source, command_list, device, handle, plan);
+  fg::xefg::BridgeOffEvidence edit_off;
+  const fg::xefg::BridgeOffEvidence* edit_output_contract = nullptr;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (edit_reuse_enabled.load() && edit_reuse_adaptive_experiment.load()
+      && !(native_fg_public_off.load() && native_fg_declaration.load() == NativeFgDeclaration::kOff)
+      && present == nullptr && bridge_source == nullptr) {
+    edit_off = EditReuseXefgOffLocked(handle, feature.source_generation);
+    edit_output_contract = &edit_off;
+  }
+#endif
   auto adaptive = (preparing_adaptive_frame != nullptr ? *preparing_adaptive_frame
       : present != nullptr && present->adaptive_frame != nullptr ? *present->adaptive_frame
       : FreezeAdaptiveFrame(&feature.adaptive_session, plan, group, width, height,
           current.input_width, current.input_height,
-           reinterpret_cast<uintptr_t>(handle) ^ reinterpret_cast<uintptr_t>(device) ^ feature.source_generation
+           reinterpret_cast<uintptr_t>(handle) ^ reinterpret_cast<uintptr_t>(device)
+               ^ (bridge_source != nullptr ? bridge_source->source_generation : feature.source_generation)
                ^ (static_cast<uint64_t>(output_desc.Format) * 1099511628211ull) ^ feature.create_flags,
-          !D3D11OnlySession() && (present == nullptr
+          bridge_adaptive || (bridge_source == nullptr && !D3D11OnlySession() && (present == nullptr
               || (!present->d3d11_bridge && present->domain == present_restore_scope::Domain::FINAL_PRESENT
-                  && present->stage_execution_plan == nullptr && !present->native_prefg_resolution_pair)),
-          0, 1, false, adaptive_output_count, 0, upper_capacity));
+                  && present->stage_execution_plan == nullptr && !present->native_prefg_resolution_pair))),
+          0, 1, false, adaptive_output_count, 0, upper_capacity, bridge_source, edit_output_contract));
   SelectAdaptiveTier(&feature, handle, &adaptive, present != nullptr && present->adaptive_frame != nullptr,
       present != nullptr ? present->workset_key : output);
-  if (feature.adaptive_output_blocked) {
+  if (feature.adaptive_output_blocked || feature.adaptive_retirement_blocked) {
     device->Release();
     return false;
   }
@@ -12624,6 +13807,7 @@ inline bool RecordInline(
       && !plan.mixed && group.begin == 0
       && nr_model::SupportsControlMask(direct_runtime_requirements.file_version);
   const bool control_mask_capture_eligible = control_mask_capture::Enabled()
+      && !xefg_gpu_capture_enabled.load(std::memory_order_relaxed)
       && gpu_timers_enabled.load(std::memory_order_relaxed)
       && control_mask_capture_route_eligible;
   const bool control_mask_requested = control_mask_enabled.load(std::memory_order_relaxed);
@@ -12638,9 +13822,150 @@ inline bool RecordInline(
   }
   stage_stats.width = width;
   stage_stats.height = height;
+  const bool edit_reuse_requested = edit_reuse_enabled.load(std::memory_order_relaxed);
+  // Tier preparation can yield to a public FG call. Recheck its receipt at
+  // reuse admission, while retaining the unchanged native-Off gate.
+  const bool edit_reuse_current_native_off = native_fg_public_off.load()
+      && native_fg_declaration.load() == NativeFgDeclaration::kOff;
+  if (edit_reuse_current_native_off) edit_off = {};
+#if defined(NR_NEXUS_DEV_CONTROL)
+  else if (edit_output_contract != nullptr) edit_off = EditReuseXefgOffLocked(handle, feature.source_generation);
+#endif
+#if defined(NR_NEXUS_DEV_CONTROL)
+  EditReuseFgEnvironment edit_fg_environment;
+  bool edit_reuse_fg_inline_route = false;
+  if (edit_reuse_requested && edit_reuse_fg_experiment.load() && present == nullptr && bridge_source == nullptr
+      && hook_point.load() == kHookUpscaled && successful_sr_device == device
+      && !nr_adaptive_enabled.load() && !adaptive.enabled && nr_input_width == width && nr_input_height == height
+      && !native_fg_owns.load() && !fg::xefg::OwnsStream() && !auto_fg_fallback_active.load()) {
+    const auto created = create_contracts.find(handle);
+    const auto source = UniqueD3D12SourceLocked(created != create_contracts.end()
+        ? reinterpret_cast<uintptr_t>(created->second.source_device12_identity.Get()) : 0);
+    if (created != create_contracts.end() && created->second.source_type_confirmed
+        && feature.source_type_confirmed && feature.source_generation != 0
+        && created->second.source_generation == feature.source_generation
+        && source.handle == reinterpret_cast<uintptr_t>(handle) && source.generation == feature.source_generation) {
+      edit_fg_environment = ReadEditReuseFgEnvironmentLocked();
+      edit_reuse_fg_inline_route = edit_fg_environment.available;
+      if (!edit_fg_environment.available) {
+        edit_fg_observation::StopEnvironment(1, 0);
+        edit_fg_observation::StopEnvironment(2, 0);
+      }
+    }
+  }
+#endif
+  const bool edit_reuse_inline_route =
+#if defined(NR_NEXUS_DEV_CONTROL)
+      edit_reuse_fg_inline_route ||
+#endif
+      present == nullptr
+      && hook_point.load() == kHookUpscaled && successful_sr_device == device
+      && (edit_reuse_current_native_off || (edit_off.available && nr_adaptive_enabled.load()
+          && native_fg_declaration.load() != NativeFgDeclaration::kOn))
+      && !native_fg_owns.load() && !fg::xefg::Enabled() && !fg::xefg::OwnsStream()
+      && !auto_fg_fallback_active.load() && !mixed_present_fg_seen.load();
+  const bool edit_reuse_xefg_route = present != nullptr && present->xefg_edit_reuse_frame != 0
+      && hook_point.load() == kHookPresent && !present->d3d11_bridge
+      && present->domain == present_restore_scope::Domain::PRE_FG_BACKBUFFER
+      && present->stage_execution_plan == nullptr && !present->native_prefg_resolution_pair
+      && present->source_color == nullptr;
+  // PQ stays in the existing Present codec: decode and convert to BT.709
+  // before the sRGB model proxy, then commit back to HDR10 after reuse.
+  const bool edit_reuse_hdr10 = edit_reuse_xefg_route && hdr_mode == 2
+      && output_desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM
+      && present->units.encoding == codec::Encoding::Pq && present->units.absolute
+      && present->units.unit_nits == 10000.f && present->units.bt2020 && present->hdr_encoding == 4u;
+  const bool edit_reuse_contract_eligible = edit_reuse_requested && (edit_reuse_inline_route || edit_reuse_xefg_route)
+      && !plan.mixed && group.begin == 0 && requested_stack == 1
+      && !D3D11OnlySession() && !direct_api.borrowed_core_context
+      && !control_mask_requested && !look_mode.load() && detail_stability.load() == 1u
+      && preset.load() == 2u && !nr_follow_input_res.load()
+      && ((hdr_mode == 1 && output_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) || edit_reuse_hdr10)
+      && (output_desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0
+      && output_rect.x == 0 && output_rect.y == 0 && width == output_desc.Width && height == output_desc.Height
+      && current.motion_x == 0 && current.motion_y == 0 && current.depth_x == 0 && current.depth_y == 0
+      && motion_desc.Width == current.input_width && motion_desc.Height == current.input_height
+      && depth_desc.Width == current.input_width && depth_desc.Height == current.input_height
+      && (depth_desc.Format == DXGI_FORMAT_R32_FLOAT || depth_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS)
+      && (depth_desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0
+      && depth_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+      && motion_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+      && depth_desc.DepthOrArraySize == 1 && motion_desc.DepthOrArraySize == 1
+      && depth_desc.SampleDesc.Count == 1 && motion_desc.SampleDesc.Count == 1
+      && (motion_desc.Format == DXGI_FORMAT_R16G16_FLOAT || motion_desc.Format == DXGI_FORMAT_R32G32_FLOAT)
+      && (current.create_flags & NVSDK_NGX_DLSS_Feature_Flags_MVJittered) == 0
+      && current.has_jitter && std::isfinite(current.jitter_x) && std::isfinite(current.jitter_y)
+      && std::abs(current.jitter_x) <= 0.5f && std::abs(current.jitter_y) <= 0.5f
+      && std::isfinite(current.motion_scale_x) && std::isfinite(current.motion_scale_y)
+      && current.motion_scale_x != 0.f && current.motion_scale_y != 0.f
+      && motion_scale_x_multiplier.load() == 1.f && motion_scale_y_multiplier.load() == 1.f
+      && nr_model::SupportsControlMask(direct_runtime_requirements.file_version);
+  const auto& edit_tiers = feature.adaptive_cache;
+  // Establish the same ordered-history provenance while both tiers prepare.
+  // Otherwise the first x2 frame must discard their unguarded ready objects.
+  const bool edit_reuse_adaptive_contract = edit_reuse_contract_eligible
+      && edit_reuse_adaptive_experiment.load(std::memory_order_relaxed)
+      && edit_reuse_inline_route && bridge_source == nullptr && execution_stage == stage_plan::Stage::UPSCALED
+      && nr_adaptive_enabled.load() && adaptive.enabled
+      && adaptive.session != nullptr && adaptive.session == feature.adaptive_session && !adaptive.session->failed
+      && !nr_adaptive_limited_residency.load() && !adaptive.session->settings.limited_residency
+      && !adaptive.session->settings.legacy_preparation && adaptive_feature_mode.load() == AdaptiveFeatureMode::OFF
+      && nr_adaptive_selected_levels.load() == 2 && adaptive.session->settings.selected_levels == 2
+      && adaptive.session->ladder.count == 2 && adaptive.output_count == 1
+      && edit_tiers != nullptr && edit_tiers->count == 2 && edit_tiers->ladder.count == 2
+      && edit_tiers->output_count == 1 && !edit_tiers->pre_sr
+      && !edit_tiers->failed && !edit_tiers->budget_blocked && !edit_tiers->standby_retired
+      && edit_tiers->identity == adaptive.layout_identity && edit_tiers->preparation_epoch == adaptive.preparation_epoch
+      && edit_tiers->active == adaptive.slot && nr_input_width <= width && nr_input_height <= height;
+  const bool edit_reuse_adaptive_route = edit_reuse_adaptive_contract && adaptive.session->prepared
+      && edit_tiers->tiers[0].ready && edit_tiers->tiers[1].ready
+      && AdaptiveTierUsable(*edit_tiers, *adaptive.session, 0) && AdaptiveTierUsable(*edit_tiers, *adaptive.session, 1);
+  const uint64_t edit_reuse_sequence = (present != nullptr ? present->xefg_edit_reuse_frame : feature.sr_sequence);
+  const bool edit_reuse_route_eligible = edit_reuse_contract_eligible && !adaptive.preparing && !prepare_models_only
+      && ((!nr_adaptive_enabled.load() && !adaptive.enabled && nr_input_width == width && nr_input_height == height)
+          || edit_reuse_adaptive_route);
+  if (adaptive.session != nullptr && !adaptive.preparing) {
+    uint64_t off_identity = 0;
+    if (edit_off.available) {
+      off_identity = 1469598103934665603ull;
+      for (const auto value : {static_cast<uint64_t>(edit_off.context_identity), edit_off.epoch,
+               edit_off.source_link_generation}) {
+        off_identity = (off_identity ^ value) * 1099511628211ull;
+      }
+    }
+    adaptive.session->SetPairedSampling(edit_reuse_adaptive_route && edit_reuse_route_eligible, off_identity);
+    adaptive.paired = adaptive.session->paired_sampling;
+    adaptive.sampling_generation = adaptive.session->sampling_generation;
+    if (adaptive.paired) {
+      adaptive.application_frame = feature.sr_sequence;
+      adaptive.pair_first_frame = adaptive.session->SelectMeasurementPair(feature.sr_sequence, adaptive.measure);
+      adaptive.measure = adaptive.pair_first_frame != 0;
+    }
+  }
+  if (adaptive_recording != nullptr) {
+    adaptive_recording->frame = adaptive;
+  }
+  if (edit_reuse_requested && !edit_reuse_route_eligible) ++edit_reuse_fallbacks;
+  const auto retire_edit_reuse = [&] {
+    auto& slot = feature.slots[0];
+    if (slot.edit_reuse == nullptr) return;
+    if (slot.edit_reuse->reused || slot.edit_reuse->source_sequence + 1 != edit_reuse_sequence
+#if defined(NR_NEXUS_DEV_CONTROL)
+        // Inline On keys use provider 1/2; Off uses zero or a captured context pointer.
+        || (present == nullptr && (slot.edit_reuse->contract[32] == 1 || slot.edit_reuse->contract[32] == 2))
+#endif
+    ) {
+      slot.pending_reset = true;
+      slot.pending_reset_reasons |= kResetRecovery;
+    }
+    retired_nr_features.push_back(RetiredNrFeature{
+        .generation = present_generation, .tracker_proof = true, .edit_reuse = std::move(slot.edit_reuse)});
+    nr_retirement_pending.store(true, std::memory_order_relaxed);
+  };
+  if (!edit_reuse_route_eligible) retire_edit_reuse();
   const uint32_t history_slot = (feature.adaptive_cache != nullptr
       ? static_cast<uint32_t>(feature.adaptive_cache->active) : 0u);
-  const bool track_control_mask_history = control_mask_eligible
+  const bool track_control_mask_history = control_mask_eligible || edit_reuse_route_eligible || edit_reuse_adaptive_contract
       || feature.control_mask_recording != nullptr || feature.control_mask_stream != nullptr;
   if (track_control_mask_history) {
     const auto current_recording = submission::RecordingIdentity(command_list);
@@ -12659,7 +13984,7 @@ inline bool RecordInline(
         if (slot.handle == nullptr) continue;
         if (slot.recording != nullptr) {
           ready &= slot.tracked_since_create && reusable(
-              {slot.handle, slot.look_history.buffers[0], slot.look_history.buffers[1]}, slot.recording);
+              {slot.handle, slot.look_history.buffers[0], slot.look_history.buffers[1], slot.edit_reuse.get()}, slot.recording);
         } else {
           // Off -> on: old NR has no ControlMask provenance. Only reconstruct
           // after every exact tracked reference has ended; never reuse it.
@@ -12667,6 +13992,7 @@ inline bool RecordInline(
           for (const auto* history : slot.look_history.buffers) {
             ready &= submission::ResourceReleasable(history);
           }
+          ready &= submission::ResourceReleasable(slot.edit_reuse.get());
         }
       }
       if (feature.slots[0].recording != nullptr && feature.slots[0].recording->closed.load()
@@ -12721,7 +14047,7 @@ inline bool RecordInline(
       // is established on the actual submitting queues, without waiting for Reset.
       ready &= ordered_source
           && control_mask_execution::BeginRecording(feature.control_mask_stream, command_list);
-    } else if (ready && ordered_source && control_mask_eligible) {
+    } else if (ready && ordered_source && (control_mask_eligible || edit_reuse_route_eligible || edit_reuse_adaptive_contract)) {
       // Adopt only after the old path's exact provenance has settled. This
       // also prevents enabling the mask from borrowing untracked old History.
       feature.control_mask_stream = control_mask_execution::CreateStream(device);
@@ -12781,7 +14107,7 @@ inline bool RecordInline(
   }
   stage_stats.work_width = nr_input_width;
   stage_stats.work_height = nr_input_height;
-  if (adaptive.session != nullptr && !adaptive.preparing) {
+  if (adaptive.session != nullptr && !adaptive.preparing && !adaptive.session->settings.limited_residency) {
     adaptive_resolution::Sizes actual;
     for (uint32_t pass = 0; pass < requested_stack; ++pass) {
       actual[group.begin + pass] = {.width = pass_widths[pass], .height = pass_heights[pass]};
@@ -12898,8 +14224,8 @@ inline bool RecordInline(
   // preserving frame-ahead maturation without evaluating or reading color.
   if (prepare_models_only) {
     bool prepared = true;
-    for (uint32_t pass = 0; pass < requested_stack; ++pass) {
-      prepared &= EnsureNrFeature(command_list, feature, pass,
+    for (uint32_t pass = 0; pass < requested_stack && prepared; ++pass) {
+      prepared = EnsureNrFeature(command_list, feature, pass,
                                   FinalResources{.hdr_mode = hdr_mode},
                                   pass_widths[pass], pass_heights[pass], pass_widths[pass], pass_heights[pass]);
     }
@@ -13080,6 +14406,13 @@ inline bool RecordInline(
     }
   }
   bool capture_this_eval = false;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  const bool bridge_model_stage_request = recording != nullptr && bridge_source != nullptr && present == nullptr
+      && !plan.mixed && group.begin == 0 && requested_stack == 1
+      && nr_input_width <= width && nr_input_height <= height
+      && (nr_input_width != width || nr_input_height != height)
+      && screenshot::stage_planes_enabled.load(std::memory_order_relaxed);
+#endif
   if (setup_ok && present != nullptr && present->capture_display
       && screenshot::WantsFinalPresent()) {
     // F5 copies the same completed game presentation image on either side
@@ -13454,6 +14787,61 @@ inline bool RecordInline(
   // chain's resets across two epochs.
   const uint64_t chain_reset_epoch =
       history_reset_epoch.load(std::memory_order_relaxed);
+  std::array<uint64_t, 40> edit_contract{};
+  if (edit_reuse_route_eligible) {
+    edit_contract = {configuration_generation.load(), chain_reset_epoch, feature.source_generation,
+        width, height, frame.motion_width, frame.motion_height, frame.create_flags, preset.load(), style.load(),
+        std::bit_cast<uint32_t>(intensity.load()), std::bit_cast<uint32_t>(local_tone_strength.load()),
+        std::bit_cast<uint32_t>(local_structure_strength.load()), std::bit_cast<uint32_t>(skin_structure_strength.load()),
+        skin_independent.load(), use_auto_mask.load(), ui_correction.load(), codec_mode.load(), source_encoding.load(),
+        FrameDisplayCodec(res), std::bit_cast<uint32_t>(color_strength.load()),
+        std::bit_cast<uint32_t>(transfer_strength.load()), std::bit_cast<uint32_t>(frame.motion_scale_x),
+        std::bit_cast<uint32_t>(frame.motion_scale_y), feed_mode.load(), norm_governor.load(), depth_mode.load(),
+        std::bit_cast<uint32_t>(norm_attack_stops.load()), std::bit_cast<uint32_t>(norm_release_stops.load()),
+        std::bit_cast<uint32_t>(norm_slew_stops.load()), norm_cut_aware.load(),
+        std::bit_cast<uint32_t>(proxy_anchor_nits.load()),
+        // Inline SDK-Off reuse is also bound to the observed source/proxy
+        // lifetime; repeated Disable calls do not change these stable keys.
+        (present != nullptr ? present->restore_config_epoch :
+#if defined(NR_NEXUS_DEV_CONTROL)
+            edit_reuse_fg_inline_route ? edit_fg_environment.provider :
+#endif
+            edit_off.context_identity),
+        (present != nullptr ? std::bit_cast<uint32_t>(frame_divisor) :
+#if defined(NR_NEXUS_DEV_CONTROL)
+            edit_reuse_fg_inline_route ? edit_fg_environment.context :
+#endif
+            edit_off.epoch),
+        (present != nullptr ? static_cast<uint32_t>(frame.ui_correction) :
+#if defined(NR_NEXUS_DEV_CONTROL)
+            edit_reuse_fg_inline_route ? edit_fg_environment.generation :
+#endif
+            edit_off.source_link_generation),
+        static_cast<uint32_t>(output_desc.Format), hdr_mode, v6_encoding, nr_input_width, nr_input_height};
+    if (auto& cache = feature.slots[0].edit_reuse; cache != nullptr) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+      if (present == nullptr && (edit_reuse_fg_inline_route || cache->contract[32] == 1 || cache->contract[32] == 2)
+          && cache->contract != edit_contract) {
+        feature.slots[0].pending_reset = true;
+        feature.slots[0].pending_reset_reasons |= kResetRecovery;
+      }
+#endif
+      if (cache->width != nr_input_width || cache->height != nr_input_height
+          || cache->output_width != width || cache->output_height != height || cache->motion_width != frame.motion_width
+          || cache->motion_height != frame.motion_height) {
+        retire_edit_reuse();
+      } else if (cache->contract != edit_contract || cache->source_sequence + 1 != edit_reuse_sequence
+                 || frame.frame_reset != 0 || feature.slots[0].pending_reset) {
+        if (cache->reused || cache->source_sequence + 1 != edit_reuse_sequence) {
+          feature.slots[0].pending_reset = true;
+          feature.slots[0].pending_reset_reasons |= kResetRecovery;
+        }
+        cache->valid = false;
+        cache->reused = false;
+        cache->contract = edit_contract;
+      }
+    }
+  }
   int32_t executed = -1;
   int32_t last_model_pass = -1;
   bool last_model_used_control_mask = false;
@@ -13461,6 +14849,8 @@ inline bool RecordInline(
   // v6 audit issue 23: `executed` alone cannot distinguish a frame that ran
   // the model from a rule-3 bypass frame whose passes only copied through.
   bool model_evaluated = false;
+  bool edit_reused = false;
+  edit_reuse::Inputs edit_inputs;
   // Strengths of the last EXECUTED pass, consumed by the v6 pedestal and
   // commit dispatches after the loop.
   float final_pass_transfer = 0.f;
@@ -13686,201 +15076,343 @@ inline bool RecordInline(
     if (timers_active) {
       gpu_timers::Mark(command_list, gpu_timers::PassEvalStart(pass));
     }
-    const ControlMaskParameters mask_parameters =
-        ResolveControlMaskParameters(group.begin + pass);
-    const uint32_t mask_mode = mask_parameters.mode;
-    const uint32_t mask_blend = mask_parameters.blend_mode;
-    const std::array<float, 3>& mask_rgb = mask_parameters.rgb;
-    bool pass_control_mask_eligible = control_mask_eligible;
-    if (pass_control_mask_eligible) {
-      const uint32_t model_bucket = feature.slots[pass].nr_preset == 2u ? 1u : 0u;
-      if (!control_mask_active_logged[model_bucket].exchange(true, std::memory_order_relaxed)) {
-        const auto mask_desc = res.control_mask->GetDesc();
-        const auto allocation = device->GetResourceAllocationInfo(0, 1, &mask_desc);
-        std::ostringstream message;
-        message << "ControlMask active: runtime=" << direct_runtime_requirements.file_version
-                << " requested_model=" << (feature.slots[pass].nr_preset == 2u ? 'B' : 'A')
-                << " size=" << mask_desc.Width << 'x' << mask_desc.Height
-                << " allocation_bytes=" << allocation.SizeInBytes
-                << " generator_mode=" << mask_mode
-                << " blend_mode=" << mask_blend
-                << " rgb=" << mask_rgb[0] << ',' << mask_rgb[1] << ',' << mask_rgb[2]
-                << " auto_mask=" << PassModel(group.begin + pass, use_auto_mask, pass_auto_mask)
-                << " stage=DX12-Upscaled passes=" << requested_stack
-                << "; cost is included in the existing per-pass evaluate GPU timer";
-        if (mask_mode == kControlMaskDepthFar) {
-          message << " depth_range=" << mask_parameters.depth_near << ','
-                  << mask_parameters.depth_far;
-        }
-        if (mask_mode == kControlMaskGreenRect || mask_mode == kControlMaskBlueRect) {
-          message << " configured_rgb_ignored=1 base_rgba=1,1,1,1 local_zero_channel="
-                  << (mask_mode == kControlMaskGreenRect ? 'G' : 'B')
-                  << " rect=0,0," << nr_input_width / 2 << ',' << nr_input_height / 2;
-        }
-        Log(reshade::log::level::info, message.str());
-      }
-      pass_control_mask_eligible = DispatchControlMask(
-          device, command_list, res, frame.depth, depth_desc, frame,
-          nr_input_width, nr_input_height, mask_parameters,
-          control_mask_guides_have_provenance, control_mask_guides_have_provenance,
-          adaptive.enabled ? adaptive.upper[group.begin + pass].width : 0u,
-          adaptive.enabled ? adaptive.upper[group.begin + pass].height : 0u);
-    }
-    SetEvaluationParameters(
-        feature,
-        feature.slots[pass],
-        group.begin + pass,
-        chain_reset_epoch,
-        res,
-        frame,
-        nr_input_width,
-        nr_input_height,
-        feature_out_width,
-        feature_out_height,
-        pass_control_mask_eligible,
-        mask_blend);
-    ++stage_stats.evaluates;
-    stage_stats.resets += feature.slots[pass].model_reset;
-    stage_stats.resolved_requests[group.begin + pass] = feature.slots[pass].nr_preset;
-
-    // The NGX runtime records this handle's work into the game's list: a
-    // tracked use, so a later retirement waits for exactly this submission.
-    submission::TrackUse(command_list, feature.slots[pass].handle);
-    if (control_mask_enabled.load(std::memory_order_relaxed) || feature.control_mask_recording != nullptr) {
-      feature.slots[pass].recording = submission::ObserveRecording(command_list);
-    }
+    bool reuse_this_pass = false;
+    bool composed_motion = false;
     NVSDK_NGX_Result nr_result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
     bool nr_returned = false;
-    if (recording != nullptr) {
-      recording->model_invoked = true;
-      recording->model_evaluate_mask |= 1u << pass;
-      if (feature.slots[pass].model_reset) {
-        recording->model_reset_mask |= 1u << pass;
+    edit_reuse::State* edit_cache = nullptr;
+    if (edit_reuse_route_eligible) {
+      auto& cache = feature.slots[0].edit_reuse;
+      if (cache == nullptr) {
+        cache = std::make_shared<edit_reuse::State>();
+        cache->contract = edit_contract;
       }
-      recording->model_reset_reasons[pass] = feature.slots[pass].model_reset_reasons;
-    }
-    {
-      DirectCallScope ngx_direct_call;
-      try {
-        nr_result = feature.slots[pass].via_core
-            ? core_evaluate_feature(
-                  command_list,
-                  feature.slots[pass].handle,
-                  feature.slots[pass].parameters,
-                  nullptr)
-            : direct_api.evaluate(
-                  command_list,
-                  feature.slots[pass].handle,
-                  feature.slots[pass].parameters,
-                  nullptr);
-        nr_returned = true;
-      } catch (...) {
-        // The shared failure path below retains the game DLSS output,
-        // releases the handle, and arms the correct retry policy; the
-        // exception only substitutes the result code.
-        Log(reshade::log::level::error, "feature 18 evaluate raised an exception");
-        nr_result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
-      }
-    }
-    if (pass_control_mask_eligible) {
-      FinishControlMaskEvaluation(command_list, res, feature.slots[pass]);
-      const uint32_t model_bucket = feature.slots[pass].nr_preset == 2u ? 1u : 0u;
-      const bool accepted = nr_returned && NVSDK_NGX_SUCCEED(nr_result);
-      const bool log_result = (accepted
-          ? !control_mask_success_logged[model_bucket].exchange(true, std::memory_order_relaxed)
-          : !control_mask_evaluate_failure_logged.exchange(true, std::memory_order_relaxed));
-      if (log_result) {
-        std::ostringstream message;
-        message << "ControlMask evaluate: api_returned=" << nr_returned
-                << " ngx_accepted=" << accepted << " result=0x" << std::hex
-                << static_cast<uint32_t>(nr_result)
-                << " gpu_execution=unverified retry_same_frame=0";
-        Log(accepted ? reshade::log::level::info : reshade::log::level::error, message.str());
-      }
-    }
-    if (control_mask_capture_eligible) {
-      const auto& slot = feature.slots[pass];
-      control_mask_capture::Context context{
-          .requested_model = slot.nr_preset,
-          .stage = static_cast<uint32_t>(execution_stage),
-          .mask_enabled = control_mask_eligible, .mask_mode = mask_mode,
-          .mask_blend = static_cast<float>(mask_blend),
-          .mask_r = mask_rgb[0], .mask_g = mask_rgb[1], .mask_b = mask_rgb[2],
-          .auto_mask = slot.model_sent[4] != 0.f, .style = slot.model_sent[0],
-          .intensity = slot.model_intensity_sent, .local_tone = slot.model_sent[1],
-          .sent_structure = slot.model_sent[7], .sent_skin = slot.model_sent[8],
-          .width = nr_input_width, .height = nr_input_height,
-          .api_returned = nr_returned,
-          .ngx_accepted = nr_returned && NVSDK_NGX_SUCCEED(nr_result)};
-      std::snprintf(context.runtime_version, sizeof(context.runtime_version), "%s",
-                    direct_runtime_requirements.file_version.c_str());
-      if (timers_active && gpu_timers::internal::current.active) {
-        auto& timing = gpu_timers::internal::segments[gpu_timers::internal::current.idx];
-        // Same-stage passes share one timer segment and its first captured context.
-        if (timing.diagnostic_token == 0) {
-          timing.diagnostic_token = control_mask_capture::Reserve(context, timing.sequence, gpu_timers::NowNs());
+      // Real SR edge calibration maps pixelCenter - API jitter to the
+      // unjittered output: guide lookup therefore adds the API jitter.
+      // Motion values remain physical displacements, with no jitter term.
+      edit_inputs = {.width = nr_input_width, .height = nr_input_height, .output_width = width, .output_height = height,
+          .motion_width = frame.motion_width, .motion_height = frame.motion_height,
+          .motion_scale_x = frame.motion_scale_x, .motion_scale_y = frame.motion_scale_y,
+          .raster_offset_x = frame.jitter_x, .raster_offset_y = frame.jitter_y,
+          .previous_motion_offset_x = cache->motion_offset_x, .previous_motion_offset_y = cache->motion_offset_y,
+          .proxy = res.proxy, .neural = res.nr_output, .motion = frame.motion, .depth = frame.depth,
+          .original = output, .decoded = res.decoded,
+          .depth_view_format = ControlMaskDepthViewFormat(depth_desc.Format)};
+      if (edit_reuse::Record(device, command_list, cache.get(), edit_inputs, edit_reuse::Phase::PREPARE)) {
+        edit_cache = cache.get();
+        reuse_this_pass = cache->valid && !cache->reused;
+        if (reuse_this_pass) {
+          reuse_this_pass = edit_reuse::Record(device, command_list, edit_cache, edit_inputs, edit_reuse::Phase::APPLY)
+              && edit_reuse::Record(device, command_list, edit_cache, edit_inputs, edit_reuse::Phase::SNAPSHOT_MOTION);
+          if (reuse_this_pass) {
+            cache->reused = true;
+            cache->source_sequence = edit_reuse_sequence;
+            cache->motion_offset_x = edit_inputs.raster_offset_x;
+            cache->motion_offset_y = edit_inputs.raster_offset_y;
+          }
+        } else if (cache->valid && cache->reused) {
+          composed_motion = edit_reuse::Record(device, command_list, edit_cache, edit_inputs, edit_reuse::Phase::MOTION);
+          if (composed_motion) {
+            Transition(command_list, cache->composed_motion.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+          }
         }
       } else {
-        const uint64_t token = control_mask_capture::Reserve(context, 0, gpu_timers::NowNs());
-        control_mask_capture::Observe(gpu_timers::Stats{
-            .state = gpu_timers::SampleState::PROOF_UNAVAILABLE,
-            .measured_ns = gpu_timers::NowNs()}, token);
+        ++edit_reuse_fallbacks;
+        retire_edit_reuse();
+      }
+      if (edit_cache != nullptr && edit_cache->valid && edit_cache->reused
+          && !reuse_this_pass && !composed_motion) {
+        feature.slots[0].pending_reset = true;
+        feature.slots[0].pending_reset_reasons |= kResetRecovery;
+        edit_cache->valid = false;
+        ++edit_reuse_fallbacks;
       }
     }
-    ObserveNrEvaluation(execution_stage, handle, feature, feature.slots[pass], group.begin + pass, nr_result, plan, present, nr_returned);
-    last_result = static_cast<uint32_t>(nr_result);
-    if (NVSDK_NGX_FAILED(nr_result)) {
-      stack_failure = nr_result;
-      failed_pass = pass;
-      break;
-    }
-    last_model_pass = static_cast<int32_t>(pass);
-    last_model_used_control_mask = pass_control_mask_eligible;
-    last_model_control_mask_mode = mask_parameters.mode;
-    if (recording != nullptr) {
-      recording->model_recorded = true;
-      recording->model_pass_mask |= 1u << pass;
-    }
-    // Decode pass: blend the neural result over this pass's reference image
-    // and upscale from the NR working resolution to the output resolution.
-    // v6 HDR resolves in LINEAR source units onto the work ping-pong
-    // surface (no transfer function until the single commit below).
-    UavBarrier(command_list, res.nr_output);
-    if (timers_active) {
-      gpu_timers::Mark(command_list, gpu_timers::PassEvalEnd(pass));
-    }
-    if (capture_this_eval) {
-      // Diagnostics: the RAW neural output, before any transfer - evidence
-      // of what the model actually returns for the conditioned proxy.  With
-      // a multi-pass stack each pass records its own plane.
-      Transition(
-          command_list, res.nr_output,
-          D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-          D3D12_RESOURCE_STATE_COPY_SOURCE);
-      screenshot::RecordStackPlaneCopy(
-          device, command_list, res.nr_output,
-          res.input_width, res.input_height,
-          "neural", pass, requested_stack);
-      Transition(
-          command_list, res.nr_output,
-          D3D12_RESOURCE_STATE_COPY_SOURCE,
-          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (reuse_this_pass) {
+      UavBarrier(command_list, res.nr_output);
+      Transition(command_list, res.nr_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      res.nr_output_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+      edit_reused = true;
+      if (timers_active) {
+        gpu_timers::Mark(command_list, gpu_timers::PassEvalEnd(pass));
+      }
     } else {
-      Transition(
-          command_list, res.nr_output,
-          D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      const ControlMaskParameters mask_parameters =
+          ResolveControlMaskParameters(group.begin + pass);
+      const uint32_t mask_mode = mask_parameters.mode;
+      const uint32_t mask_blend = mask_parameters.blend_mode;
+      const std::array<float, 3>& mask_rgb = mask_parameters.rgb;
+      bool pass_control_mask_eligible = control_mask_eligible;
+      if (pass_control_mask_eligible) {
+        const uint32_t model_bucket = feature.slots[pass].nr_preset == 2u ? 1u : 0u;
+        if (!control_mask_active_logged[model_bucket].exchange(true, std::memory_order_relaxed)) {
+          const auto mask_desc = res.control_mask->GetDesc();
+          const auto allocation = device->GetResourceAllocationInfo(0, 1, &mask_desc);
+          std::ostringstream message;
+          message << "ControlMask active: runtime=" << direct_runtime_requirements.file_version
+                  << " requested_model=" << (feature.slots[pass].nr_preset == 2u ? 'B' : 'A')
+                  << " size=" << mask_desc.Width << 'x' << mask_desc.Height
+                  << " allocation_bytes=" << allocation.SizeInBytes
+                  << " generator_mode=" << mask_mode
+                  << " blend_mode=" << mask_blend
+                  << " rgb=" << mask_rgb[0] << ',' << mask_rgb[1] << ',' << mask_rgb[2]
+                  << " auto_mask=" << PassModel(group.begin + pass, use_auto_mask, pass_auto_mask)
+                  << " stage=DX12-Upscaled passes=" << requested_stack
+                  << "; cost is included in the existing per-pass evaluate GPU timer";
+          if (mask_mode == kControlMaskDepthFar) {
+            message << " depth_range=" << mask_parameters.depth_near << ','
+                    << mask_parameters.depth_far;
+          }
+          if (mask_mode == kControlMaskGreenRect || mask_mode == kControlMaskBlueRect) {
+            message << " configured_rgb_ignored=1 base_rgba=1,1,1,1 local_zero_channel="
+                    << (mask_mode == kControlMaskGreenRect ? 'G' : 'B')
+                    << " rect=0,0," << nr_input_width / 2 << ',' << nr_input_height / 2;
+          }
+          Log(reshade::log::level::info, message.str());
+        }
+        pass_control_mask_eligible = DispatchControlMask(
+            device, command_list, res, frame.depth, depth_desc, frame,
+            nr_input_width, nr_input_height, mask_parameters,
+            control_mask_guides_have_provenance, control_mask_guides_have_provenance,
+            adaptive.enabled ? adaptive.upper[group.begin + pass].width : 0u,
+            adaptive.enabled ? adaptive.upper[group.begin + pass].height : 0u);
+      }
+      EvaluationContract model_frame = frame;
+      if (composed_motion) model_frame.motion = edit_cache->composed_motion.Get();
+      SetEvaluationParameters(
+          feature,
+          feature.slots[pass],
+          group.begin + pass,
+          chain_reset_epoch,
+          res,
+          model_frame,
+          nr_input_width,
+          nr_input_height,
+          feature_out_width,
+          feature_out_height,
+          pass_control_mask_eligible,
+          mask_blend);
+      ++stage_stats.evaluates;
+      stage_stats.resets += feature.slots[pass].model_reset;
+      stage_stats.resolved_requests[group.begin + pass] = feature.slots[pass].nr_preset;
+
+      // The NGX runtime records this handle's work into the game's list: a
+      // tracked use, so a later retirement waits for exactly this submission.
+      submission::TrackUse(command_list, feature.slots[pass].handle);
+      if (control_mask_enabled.load(std::memory_order_relaxed) || feature.control_mask_recording != nullptr) {
+        feature.slots[pass].recording = submission::ObserveRecording(command_list);
+      }
+      if (recording != nullptr) {
+        recording->model_invoked = true;
+        recording->model_evaluate_mask |= 1u << pass;
+        if (feature.slots[pass].model_reset) {
+          recording->model_reset_mask |= 1u << pass;
+        }
+        recording->model_reset_reasons[pass] = feature.slots[pass].model_reset_reasons;
+      }
+      {
+        DirectCallScope ngx_direct_call;
+        try {
+          nr_result = feature.slots[pass].via_core
+              ? core_evaluate_feature(
+                    command_list,
+                    feature.slots[pass].handle,
+                    feature.slots[pass].parameters,
+                    nullptr)
+              : direct_api.evaluate(
+                    command_list,
+                    feature.slots[pass].handle,
+                    feature.slots[pass].parameters,
+                    nullptr);
+          nr_returned = true;
+        } catch (...) {
+          // The shared failure path below retains the game DLSS output,
+          // releases the handle, and arms the correct retry policy; the
+          // exception only substitutes the result code.
+          Log(reshade::log::level::error, "feature 18 evaluate raised an exception");
+          nr_result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
+        }
+      }
+      if (composed_motion) {
+        Transition(command_list, edit_cache->composed_motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      }
+      if (pass_control_mask_eligible) {
+        FinishControlMaskEvaluation(command_list, res, feature.slots[pass]);
+        const uint32_t model_bucket = feature.slots[pass].nr_preset == 2u ? 1u : 0u;
+        const bool accepted = nr_returned && NVSDK_NGX_SUCCEED(nr_result);
+        const bool log_result = (accepted
+            ? !control_mask_success_logged[model_bucket].exchange(true, std::memory_order_relaxed)
+            : !control_mask_evaluate_failure_logged.exchange(true, std::memory_order_relaxed));
+        if (log_result) {
+          std::ostringstream message;
+          message << "ControlMask evaluate: api_returned=" << nr_returned
+                  << " ngx_accepted=" << accepted << " result=0x" << std::hex
+                  << static_cast<uint32_t>(nr_result)
+                  << " gpu_execution=unverified retry_same_frame=0";
+          Log(accepted ? reshade::log::level::info : reshade::log::level::error, message.str());
+        }
+      }
+      if (control_mask_capture_eligible) {
+        const auto& slot = feature.slots[pass];
+        control_mask_capture::Context context{
+            .requested_model = slot.nr_preset,
+            .stage = static_cast<uint32_t>(execution_stage),
+            .mask_enabled = control_mask_eligible, .mask_mode = mask_mode,
+            .mask_blend = static_cast<float>(mask_blend),
+            .mask_r = mask_rgb[0], .mask_g = mask_rgb[1], .mask_b = mask_rgb[2],
+            .auto_mask = slot.model_sent[4] != 0.f, .style = slot.model_sent[0],
+            .intensity = slot.model_intensity_sent, .local_tone = slot.model_sent[1],
+            .sent_structure = slot.model_sent[7], .sent_skin = slot.model_sent[8],
+            .width = nr_input_width, .height = nr_input_height,
+            .api_returned = nr_returned,
+            .ngx_accepted = nr_returned && NVSDK_NGX_SUCCEED(nr_result)};
+        std::snprintf(context.runtime_version, sizeof(context.runtime_version), "%s",
+                      direct_runtime_requirements.file_version.c_str());
+        if (timers_active && gpu_timers::internal::current.active) {
+          auto& timing = gpu_timers::internal::segments[gpu_timers::internal::current.idx];
+          // Same-stage passes share one timer segment and its first captured context.
+          if (timing.diagnostic_token == 0) {
+            timing.diagnostic_token = control_mask_capture::Reserve(context, timing.sequence, gpu_timers::NowNs());
+          }
+        } else {
+          const uint64_t token = control_mask_capture::Reserve(context, 0, gpu_timers::NowNs());
+          control_mask_capture::Observe(gpu_timers::Stats{
+              .state = gpu_timers::SampleState::PROOF_UNAVAILABLE,
+              .measured_ns = gpu_timers::NowNs()}, token);
+        }
+      }
+      ObserveNrEvaluation(execution_stage, handle, feature, feature.slots[pass], group.begin + pass, nr_result, plan, present, nr_returned);
+      last_result = static_cast<uint32_t>(nr_result);
+      if (NVSDK_NGX_FAILED(nr_result)) {
+        stack_failure = nr_result;
+        failed_pass = pass;
+        break;
+      }
+      last_model_pass = static_cast<int32_t>(pass);
+      last_model_used_control_mask = pass_control_mask_eligible;
+      last_model_control_mask_mode = mask_parameters.mode;
+      if (recording != nullptr) {
+        recording->model_recorded = true;
+        recording->model_pass_mask |= 1u << pass;
+      }
+      // Decode pass: blend the neural result over this pass's reference image
+      // and upscale from the NR working resolution to the output resolution.
+      // v6 HDR resolves in LINEAR source units onto the work ping-pong
+      // surface (no transfer function until the single commit below).
+      UavBarrier(command_list, res.nr_output);
+      if (timers_active) {
+        gpu_timers::Mark(command_list, gpu_timers::PassEvalEnd(pass));
+      }
+      if (capture_this_eval) {
+        // Diagnostics: the RAW neural output, before any transfer - evidence
+        // of what the model actually returns for the conditioned proxy.  With
+        // a multi-pass stack each pass records its own plane.
+        Transition(
+            command_list, res.nr_output,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
+        screenshot::RecordStackPlaneCopy(
+            device, command_list, res.nr_output,
+            res.input_width, res.input_height,
+            "neural", pass, requested_stack);
+        Transition(
+            command_list, res.nr_output,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      } else {
+        Transition(
+            command_list, res.nr_output,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      }
+      res.nr_output_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+      if (edit_cache != nullptr) {
+        edit_cache->valid = edit_reuse::Record(device, command_list, edit_cache, edit_inputs, edit_reuse::Phase::CAPTURE);
+        edit_cache->reused = false;
+        edit_cache->source_sequence = edit_reuse_sequence;
+        if (edit_cache->valid) {
+          ++edit_cache->anchor_generation;
+        } else {
+          ++edit_reuse_fallbacks;
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+          fg_output_marker_window.StopSource(reinterpret_cast<uintptr_t>(handle), feature.source_generation,
+              "source_anchor_capture_failed");
+#endif
+        }
+      }
+      if (edit_reuse_route_eligible) {
+        ++edit_reuse_refreshes;
+      }
     }
-    res.nr_output_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+#if defined(NR_NEXUS_DEV_CONTROL)
+    const auto& observed = stage_stats.last_evaluate;
+    const screenshot::InlineRestoreContext inline_capture_context{
+        .d3d11_bridge = true, .mixed = plan.mixed, .present = present != nullptr,
+        .preparing = adaptive.preparing || prepare_models_only, .warmup = !nr_returned,
+        .reset_sent = observed.reset_sent, .upscaled = execution_stage == stage_plan::Stage::UPSCALED,
+        .api_returned = observed.api_returned, .ngx_succeeded = nr_returned && NVSDK_NGX_SUCCEED(nr_result),
+        .group_begin = group.begin, .stack = requested_stack, .pass = pass,
+        .work_width = nr_input_width, .work_height = nr_input_height,
+        .output_width = resource_width, .output_height = resource_height,
+        .output_rect = {.x = output_rect.x, .y = output_rect.y, .width = output_rect.width, .height = output_rect.height},
+        .hdr_mode = res.hdr_mode, .codec = codec_mode.load(), .ngx_result = static_cast<uint32_t>(nr_result),
+        .reset_reasons = observed.reset_reasons, .format = res.format,
+        .evaluation_sequence = observed.sequence, .source_generation = observed.source_generation,
+        .present_generation = present_generation,
+        .tail_inputs_aligned = pass_color == 1.f && frame.depth_x == 0 && frame.depth_y == 0
+            && frame.input_width == width && frame.input_height == height,
+        .model_evaluation_index = stage_stats.evaluates,
+        .source_feature = static_cast<uint64_t>(observed.source_feature)};
+    const auto claim_inline_roi = [&](bool tail_only) -> uint64_t {
+      if (reuse_this_pass || !inline_restore_bridge
+          || !screenshot::internal::inline_restore_active.load(std::memory_order_acquire)) return 0;
+      return screenshot::ClaimInlineRestoreRoi(command_list, inline_capture_context, tail_only);
+    };
+    inline_restore_serial = claim_inline_roi(true);
+    const bool tail_roi = inline_restore_serial != 0;
+    const uint64_t bridge_model_serial = (bridge_model_stage_request && !reuse_this_pass
+        ? screenshot::BeginBridgeModelStages(device, command_list, inline_capture_context,
+            res.proxy, res.proxy_state, res.nr_output, res.nr_output_state, path_name) : 0);
+    if (bridge_model_serial != 0) {
+      recording->inline_restore_serial = bridge_model_serial;
+      screenshot::CaptureBridgeModelStagePlane(device, command_list, bridge_model_serial, "original",
+          res.original, res.original_state);
+    }
+    const uint64_t stability_before = (tail_roi || bridge_model_serial != 0
+        ? look_stability_passes.load(std::memory_order_relaxed) : 0);
+    if (tail_roi) {
+      if (recording != nullptr) recording->inline_restore_serial = inline_restore_serial;
+      screenshot::CaptureInlineRestorePlane(device, command_list, inline_restore_serial, "nr_model",
+          res.nr_output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      screenshot::CaptureInlineRestorePlane(device, command_list, inline_restore_serial, "depth",
+          frame.depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+#endif
     // The look stage reshapes the model's edit (or measures it) before the
     // resolve, which then reads the route it returns.
-    const LookRoute route =
-        RunLookStage(command_list, device, res, feature.slots[pass], pass, look_chain, frame, group.begin);
+    LookRoute route{srv_table_start, nr_input_width, nr_input_height, nr_input_width, nr_input_height};
+    if (!reuse_this_pass) {
+      route = RunLookStage(command_list, device, res, feature.slots[pass], pass, look_chain, frame, group.begin
+#if defined(NR_NEXUS_DEV_CONTROL)
+          , bridge_model_serial
+#endif
+      );
+    }
     ID3D12Resource* const looked_neural =
         (route.shaped ? (route.srv_set == kDescriptorTransportSet + srv_table_start
                             ? res.look_up_neural : res.look_output) : res.nr_output);
     capture_stage("post_look", looked_neural, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                   route.neural_width, route.neural_height, pass, requested_stack);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    screenshot::CaptureBridgeModelStagePlane(device, command_list, bridge_model_serial, "post_look",
+        looked_neural, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        screenshot::InlineRestoreExecution{.look_shaped = route.shaped,
+            .look_stability_recorded = bridge_model_serial != 0
+                && look_stability_passes.load(std::memory_order_relaxed) > stability_before});
+#endif
     Transition(
         command_list, write_surface,
         *write_state,
@@ -13935,32 +15467,25 @@ inline bool RecordInline(
     command_list->Dispatch((width + 15) / 16, (height + 15) / 16, 1);
     UavBarrier(command_list, write_surface);
 #if defined(NR_NEXUS_DEV_CONTROL)
-    if (inline_restore_bridge && screenshot::internal::inline_restore_active.load(std::memory_order_acquire)) {
-      const auto& observed = stage_stats.last_evaluate;
-      inline_restore_serial = screenshot::ClaimInlineRestoreRoi(command_list, {
-          .d3d11_bridge = true, .mixed = plan.mixed, .present = present != nullptr,
-          .preparing = adaptive.preparing || prepare_models_only, .warmup = !nr_returned,
-          .reset_sent = observed.reset_sent, .upscaled = execution_stage == stage_plan::Stage::UPSCALED,
-          .api_returned = observed.api_returned, .ngx_succeeded = nr_returned && NVSDK_NGX_SUCCEED(nr_result),
-          .group_begin = group.begin, .stack = requested_stack, .pass = pass,
-          .work_width = nr_input_width, .work_height = nr_input_height,
-          .output_width = resource_width, .output_height = resource_height,
-          .output_rect = {.x = output_rect.x, .y = output_rect.y, .width = output_rect.width, .height = output_rect.height},
-          .hdr_mode = res.hdr_mode, .codec = codec_mode.load(), .ngx_result = static_cast<uint32_t>(nr_result),
-          .reset_reasons = observed.reset_reasons, .format = res.format,
-          .evaluation_sequence = observed.sequence, .source_generation = observed.source_generation,
-          .present_generation = present_generation});
-      if (inline_restore_serial != 0) {
-        if (recording != nullptr) recording->inline_restore_serial = inline_restore_serial;
-        screenshot::CaptureInlineRestorePlane(device, command_list, inline_restore_serial, "original",
-            res.original, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        screenshot::CaptureInlineRestorePlane(device, command_list, inline_restore_serial, "post_resolve",
-            write_surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-      }
+    if (!tail_roi) {
+      inline_restore_serial = claim_inline_roi(false);
+    }
+    if (inline_restore_serial != 0) {
+      if (recording != nullptr) recording->inline_restore_serial = inline_restore_serial;
+      screenshot::CaptureInlineRestorePlane(device, command_list, inline_restore_serial, "original",
+          res.original, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      screenshot::CaptureInlineRestorePlane(device, command_list, inline_restore_serial, "post_resolve",
+          write_surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+          screenshot::InlineRestoreExecution{.look_shaped = route.shaped,
+              .look_stability_recorded = tail_roi && look_stability_passes.load(std::memory_order_relaxed) > stability_before});
     }
 #endif
     capture_stage("post_resolve", write_surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                   width, height, pass, requested_stack);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    screenshot::CaptureBridgeModelStagePlane(device, command_list, bridge_model_serial, "post_resolve",
+        write_surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+#endif
     if (present == nullptr
         || present_sdr_restore::ShouldRestore(present->sdr_restore_policy, res.hdr_mode,
                                              present->diagnostic.bypass_sdr_restore)) {
@@ -13984,13 +15509,17 @@ inline bool RecordInline(
     }
     capture_stage("post_restore", write_surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                   width, height, pass, requested_stack);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    screenshot::CaptureBridgeModelStagePlane(device, command_list, bridge_model_serial, "post_restore",
+        write_surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+#endif
     if (timers_active) {
       gpu_timers::Mark(command_list, gpu_timers::PassResolveEnd(pass));
     }
     // Intermediate results stay in the ping-pong surfaces for the next pass
     // (resting in UAV, their tracked state); the write-back to the game
     // output happens once, after the loop, on the last executed pass.
-    model_evaluated = true;
+    model_evaluated |= !reuse_this_pass;
     executed = static_cast<int32_t>(pass);
     final_pass_transfer = pass_transfer;
     final_pass_color = pass_color;
@@ -14009,10 +15538,16 @@ inline bool RecordInline(
       const auto& model_resources = (last_model_pass == 1 && second_workset != nullptr ? *second_workset : res);
       const uint64_t previous_capture_serial = (last_model_used_control_mask
           ? screenshot::PendingModelCaptureSerial(command_list) : 0);
+#if defined(NR_NEXUS_DEV_CONTROL)
+      if (!bridge_model_stage_request) {
+#endif
       screenshot::CaptureModelPair(
           device, command_list, model_resources.proxy, model_resources.proxy_state, model_resources.nr_output,
           model_resources.nr_output_state, present_generation, path_name,
           static_cast<uint32_t>(last_model_pass), requested_stack);
+#if defined(NR_NEXUS_DEV_CONTROL)
+      }
+#endif
       if (last_model_used_control_mask) {
         const uint64_t capture_serial = screenshot::PendingModelCaptureSerial(command_list);
         if (capture_serial != 0 && capture_serial != previous_capture_serial
@@ -14298,6 +15833,64 @@ inline bool RecordInline(
           0.f, present, hdr_capture.get());
       command_list->Dispatch((width + 15) / 16, (height + 15) / 16, 1);
       UavBarrier(command_list, res.decoded);
+      if (edit_reused) {
+        Transition(command_list, output, output_rest, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, 0u);
+        auto& cache = feature.slots[0].edit_reuse;
+        if (!edit_reuse::Record(device, command_list, cache.get(), edit_inputs, edit_reuse::Phase::SELECT_ORIGINAL)) {
+          // No model was invoked on this frame. Keep its original output and
+          // restart NR history on the next actual refresh.
+          Transition(command_list, output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                     D3D12_RESOURCE_STATE_COPY_SOURCE, 0u);
+          Transition(command_list, res.decoded, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+          CopyMip0(command_list, res.decoded, output);
+          Transition(command_list, res.decoded, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+          Transition(command_list, output, D3D12_RESOURCE_STATE_COPY_SOURCE, output_rest, 0u);
+          cache->valid = false;
+          feature.slots[0].pending_reset = true;
+          feature.slots[0].pending_reset_reasons |= kResetRecovery;
+          ++edit_reuse_fallbacks;
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+          fg_output_marker_window.StopSource(reinterpret_cast<uintptr_t>(handle), feature.source_generation,
+              "source_original_selection_failed");
+#endif
+        } else {
+          Transition(command_list, output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, output_rest, 0u);
+        }
+      }
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+      if (edit_reuse_fg_inline_route && edit_reuse_route_eligible && !adaptive.preparing
+          && executed + 1 == static_cast<int32_t>(requested_stack) && !NVSDK_NGX_FAILED(stack_failure)
+          && (model_evaluated || edit_reused) && feature.slots[0].edit_reuse != nullptr
+          && feature.slots[0].edit_reuse->valid) {
+        const auto probe = fg_output_probe::CopySnapshot();
+        bool sdk_ready = edit_fg_environment.provider == 1 && probe.native.active;
+        if (edit_fg_environment.provider == 2) {
+          for (const auto& context : probe.xefg) {
+            sdk_ready |= context.registered && context.debug_applied && !context.stopped
+                && context.context_identity == edit_fg_environment.context;
+          }
+        }
+        if (fg_output_marker_window.Admit(
+                {.source = reinterpret_cast<uintptr_t>(handle), .source_generation = feature.source_generation,
+                    .provider = edit_fg_environment.provider, .context = edit_fg_environment.context,
+                    .environment_generation = edit_fg_environment.generation}, sdk_ready)) {
+          if (res.fg_output_marker == nullptr) {
+            res.fg_output_marker = std::make_shared<fg_output_marker::State>();
+          }
+          // This diagnostic runs after cache capture/apply and original-color
+          // selection. Its code never enters the anchor or the model proxy.
+          const auto result = fg_output_marker::Record(device, command_list, res.fg_output_marker.get(),
+              res.decoded, width, height, res.hdr_mode, edit_reused);
+          if (result == fg_output_marker::Result::RECORDED) {
+            fg_output_marker_window.Recorded(edit_reused, feature.sr_sequence, SteadyNowNs());
+          } else {
+            fg_output_marker_window.stopped = true;
+            fg_output_marker_window.reason = result == fg_output_marker::Result::NOT_SUPPORTED
+                ? "marker_contract_not_supported" : "marker_recording_failed";
+          }
+        }
+      }
+#endif
       if (hdr_capture != nullptr) {
         constexpr const char* names[] = {
             "hdr_post_pedestal_linear", "hdr_post_gamut_linear", "hdr_encoded_float", "hdr_pedestal_field"};
@@ -14423,6 +16016,10 @@ inline bool RecordInline(
   }
   device->Release();
   if (NVSDK_NGX_FAILED(stack_failure)) {
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+    fg_output_marker_window.StopSource(reinterpret_cast<uintptr_t>(handle), feature.source_generation,
+        "source_model_failed");
+#endif
     FinalResources& failed_resources = (failed_pass == 1 && second_workset != nullptr ? *second_workset : res);
     // Park the tracked states: the proxy is post-encode (SRV-readable) and
     // returns to its UAV resting state; nr_output is already parked; the
@@ -14474,7 +16071,56 @@ inline bool RecordInline(
     CountNrDecline(NrDeclineReason::kSlotWarmupMaturation);
     return true;
   }
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (edit_reuse_fg_inline_route && edit_reuse_route_eligible && !adaptive.preparing
+      && stage_scope.complete && (edit_reused || model_evaluated)) {
+    if (const auto generation = edit_fg_observation::CaptureGeneration(true); generation != 0) {
+      try {
+        edit_fg_observation::RecordSrCopyback(generation,
+            {.source_handle = reinterpret_cast<uintptr_t>(handle), .source_generation = feature.source_generation,
+              .sr_sequence = feature.sr_sequence, .reused = edit_reused,
+              .output = edit_fg_observation::ObserveResource(output), .width = width, .height = height,
+              .format = static_cast<uint32_t>(output_desc.Format),
+              .recording = edit_fg_observation::ObserveRecording(command_list),
+              .environment_provider = edit_fg_environment.provider, .environment_context = edit_fg_environment.context,
+              .environment_generation = edit_fg_environment.generation});
+      } catch (...) {
+        edit_fg_observation::Stop("observation_failed");
+      }
+    }
+  }
+#endif
   ++captured_guides;
+  if (adaptive.session != nullptr && adaptive.session->settings.limited_residency && !adaptive.preparing
+      && stage_scope.complete && (present == nullptr || present->adaptive_frame == nullptr)) {
+    adaptive_resolution::Sizes actual;
+    for (uint32_t pass = 0; pass < requested_stack; ++pass) {
+      actual[group.begin + pass] = {.width = pass_widths[pass], .height = pass_heights[pass]};
+    }
+    adaptive.session->Applied(adaptive.generation, actual, SteadyNowNs());
+    PublishAdaptiveStatus(adaptive.session->status);
+  }
+  if (edit_reused) {
+    const uint64_t count = edit_reuse_reuses.fetch_add(1, std::memory_order_relaxed) + 1;
+    ++feature.slots[0].edit_reuse->reuse_count;
+    if (count == 1 || count == 60 || count == 600) {
+      std::ostringstream message;
+      message << "NR edit reuse: refresh=" << edit_reuse_refreshes.load()
+              << " reuse=" << count << " fallback=" << edit_reuse_fallbacks.load()
+              << " anchor=" << feature.slots[0].edit_reuse->anchor_generation
+              << " allocation_bytes=" << feature.slots[0].edit_reuse->allocated_bytes
+              << " source_format=" << static_cast<uint32_t>(output_desc.Format)
+              << " hdr=" << static_cast<uint32_t>(hdr_mode) << " encoding=" << v6_encoding
+              << " model_evaluates=0 age=1";
+      Log(reshade::log::level::info, message.str());
+    }
+    if (recording != nullptr) {
+      recording->edit_reused = true;
+      recording->output_ready = true;
+      recording->group_complete = stage_scope.complete;
+    }
+    return true;
+  }
   if (!model_evaluated) {
     ++bypassed_evaluations;
     CountNrDecline(NrDeclineReason::kSlotWarmupMaturation);
@@ -14527,6 +16173,7 @@ inline bool ProcessInline(ID3D12GraphicsCommandList* command_list, const NVSDK_N
 #if defined(NR_NEXUS_DEV_CONTROL)
                           , bool inline_restore_bridge = false
 #endif
+                          , const BridgeAdaptiveSource* bridge_source = nullptr
 ) {
 #if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
   const ColdCpuTraceScope cold_trace("ProcessInline");
@@ -14538,12 +16185,17 @@ inline bool ProcessInline(ID3D12GraphicsCommandList* command_list, const NVSDK_N
 #if defined(NR_NEXUS_DEV_CONTROL)
       , inline_restore_bridge
 #endif
+      , bridge_source
   );
   if (result && adaptive.feature != nullptr && !prepare_models_only && adaptive.complete) {
     PrepareAdaptiveTier(adaptive.feature, adaptive.frame, command_list, true, [&](bool* complete) {
       NrRecording prepared;
       bool touched = false;
-      const bool accepted = RecordInline(command_list, handle, game_parameters, &touched, present, &prepared);
+      const bool accepted = RecordInline(command_list, handle, game_parameters, &touched, present, &prepared, false, nullptr
+#if defined(NR_NEXUS_DEV_CONTROL)
+          , false
+#endif
+          , bridge_source);
       if (command_list_touched != nullptr) *command_list_touched |= touched;
       uint32_t expected = 0;
       for (uint32_t pass = 0; pass < kMaxNrPasses; ++pass) {
@@ -14587,6 +16239,7 @@ inline uint64_t SourceSuccessfulEvaluations() {
       + successful_pre_sr_evaluations.load(std::memory_order_relaxed);
   const auto split_groups = mixed_stage_group_successes.load(std::memory_order_relaxed);
   return (groups > split_groups ? groups - split_groups : 0)
+      + edit_reuse_reuses.load(std::memory_order_relaxed)
       + mixed_stage_source_successes.load(std::memory_order_relaxed);
 }
 
@@ -14764,7 +16417,7 @@ inline bool RecordInlinePreSR(
   // inside EnsureDirectRuntime releases every feature state, so the
   // FeatureState& bound below must not exist yet (see FindOrRegisterFeature).
   NrDeclineReason runtime_decline = NrDeclineReason::kNrRuntimeUnavailable;
-  if (!EnsureDirectRuntime(command_list, &runtime_decline)) {
+  if (!EnsureDirectRuntime(command_list, &runtime_decline, false)) {
     // Named, not silent: with no nvngx_dlssnr.dll on the machine this is
     // where EVERY evaluate ends, and until v6.8.0-alpha23 it ended without
     // counting anything.  The verdict said UNAVAILABLE and was right; the
@@ -14894,9 +16547,13 @@ inline bool RecordInlinePreSR(
            ^ (static_cast<uint64_t>(color_desc.Format) * 1099511628211ull) ^ feature.create_flags,
       !D3D11OnlySession(), 0, 1, false, AdaptiveOutputCount(&feature, handle, color, true, width, height, color_desc.Format, color)));
   SelectAdaptiveTier(&feature, handle, &adaptive, false, color, true);
-  if (feature.adaptive_output_blocked) {
+  if (feature.adaptive_output_blocked || feature.adaptive_retirement_blocked) {
     device->Release();
     return false;
+  }
+  if (adaptive.session != nullptr && !adaptive.preparing) {
+    adaptive.session->SetPairedSampling(false);
+    adaptive.sampling_generation = adaptive.session->sampling_generation;
   }
   if (adaptive_recording != nullptr) {
     adaptive_recording->feature = &feature;
@@ -15086,7 +16743,7 @@ inline bool RecordInlinePreSR(
   }
   stage_stats.work_width = nr_input_width;
   stage_stats.work_height = nr_input_height;
-  if (adaptive.session != nullptr && !adaptive.preparing) {
+  if (adaptive.session != nullptr && !adaptive.preparing && !adaptive.session->settings.limited_residency) {
     adaptive_resolution::Sizes actual;
     for (uint32_t pass = 0; pass < requested_stack; ++pass) {
       actual[group.begin + pass] = {.width = pass_widths[pass], .height = pass_heights[pass]};
@@ -16132,6 +17789,15 @@ inline bool RecordInlinePreSR(
   }
   for (auto& slot : feature.slots) slot.fail_count = 0;
   uint64_t count = 0;
+  if (adaptive.session != nullptr && adaptive.session->settings.limited_residency && !adaptive.preparing
+      && stage_scope.complete) {
+    adaptive_resolution::Sizes actual;
+    for (uint32_t pass = 0; pass < requested_stack; ++pass) {
+      actual[group.begin + pass] = {.width = pass_widths[pass], .height = pass_heights[pass]};
+    }
+    adaptive.session->Applied(adaptive.generation, actual, SteadyNowNs());
+    PublishAdaptiveStatus(adaptive.session->status);
+  }
   if (!adaptive.preparing) {
     count = ++successful_pre_sr_evaluations;
   }
@@ -16245,7 +17911,7 @@ inline bool ProcessStreamlineInline(
     return false;
   }
   NrDeclineReason runtime_decline = NrDeclineReason::kStreamlineRuntimeUnavailable;
-  if (!EnsureDirectRuntime(command_list, &runtime_decline)
+  if (!EnsureDirectRuntime(command_list, &runtime_decline, false)
       || core_allocate_parameters == nullptr || core_destroy_parameters == nullptr) {
     CountNrDecline(runtime_decline);
     return false;
@@ -16465,6 +18131,17 @@ inline bool CreatedSrHandle(const NVSDK_NGX_Handle* handle) {
       && (created->second == kFeatureDlss || created->second == kFeatureDlssd);
 }
 
+#if defined(NR_NEXUS_DEV_CONTROL)
+// The public Disable must be observable while NR is released. Record only a
+// successful, registered host SR; this probe does not run or prepare NR.
+inline void ObserveReleasedD3D12Source(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle) {
+  if (!edit_reuse_adaptive_experiment.load() || enabled.load()) return;
+  RuntimeTryLock lock(runtime_mutex);
+  if (!lock.owns_lock() || !CreatedSrHandle(handle)) return;
+  const SuccessfulSrCoreScope core_scope(list, handle);
+}
+#endif
+
 // A DLSSG.* resource of an evaluate's block (DLSS-G, nvsdk_ngx_defs_dlssg.h),
 // set as a D3D12 resource or as a void pointer.
 inline ID3D12Resource* PreFgResource(const NVSDK_NGX_Parameter* parameters, const char* key) {
@@ -16474,6 +18151,46 @@ inline ID3D12Resource* PreFgResource(const NVSDK_NGX_Parameter* parameters, cons
              ? static_cast<ID3D12Resource*>(pointer)
              : nullptr;
 }
+
+#if defined(NR_NEXUS_DEV_CONTROL)
+inline edit_fg_observation::Ticket ObserveEditNativeFg(ID3D12GraphicsCommandList* command_list,
+    const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* parameters, uint32_t slot, bool c_export) {
+  const auto generation = edit_fg_observation::CaptureGeneration();
+  if (generation == 0 || parameters == nullptr) return {};
+  try {
+    edit_fg_observation::NativeFgObservation observation{
+        .handle = reinterpret_cast<uintptr_t>(handle),
+        .generation = edit_reuse_native_fg_generation.load(std::memory_order_acquire),
+        .slot = slot, .c_export = c_export,
+        .recording = {.raw = reinterpret_cast<uintptr_t>(command_list)}};
+    {
+      RuntimeLock lock(runtime_mutex);
+      if (const auto it = native_fg_ui_recomposition.find(handle); it != native_fg_ui_recomposition.end()) {
+        observation.ui_mode = static_cast<uint32_t>(it->second);
+        observation.has_ui_mode = true;
+      }
+    }
+    observation.recording = edit_fg_observation::ObserveRecording(command_list);
+    observation.backbuffer = edit_fg_observation::ObserveResource(
+        PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_Backbuffer));
+    observation.hudless = edit_fg_observation::ObserveResource(
+        PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_HUDLess));
+    observation.ui = edit_fg_observation::ObserveResource(
+        PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_UI));
+    observation.ui_alpha = edit_fg_observation::ObserveResource(
+        PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_UIAlpha));
+    unsigned long long frame_id = 0;
+    observation.has_frame_id = NVSDK_NGX_SUCCEED(parameters->Get(
+        NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID, &frame_id));
+    observation.frame_id = frame_id;
+    return edit_fg_observation::Record(generation,
+        {.kind = edit_fg_observation::Kind::NATIVE_FG_ENTRY, .native_fg = observation});
+  } catch (...) {
+    edit_fg_observation::Stop("observation_failed");
+    return {};
+  }
+}
+#endif
 
 // A DLSS-G (feature 11) evaluate.  The handle decides whenever its create was
 // seen.  Games and Streamline reuse ONE parameter block for DLSS/RR and
@@ -16701,7 +18418,8 @@ inline std::string ArgGateTelemetry() {
 inline bool ForgetSourceHandleLocked(const NVSDK_NGX_Handle* handle);
 inline void RegisterCreatedFeatureLocked(const NVSDK_NGX_Handle* handle,
                                          NVSDK_NGX_Feature feature,
-                                         const NVSDK_NGX_Parameter* parameters) {
+                                         const NVSDK_NGX_Parameter* parameters,
+                                         IUnknown* device11_identity = nullptr) {
   if (feature == kFeatureDlssNr) {
     NoteForeignNr(true, "a feature-18 (DLSSNR) create that is not this"
                         " addon's succeeded");
@@ -16726,6 +18444,10 @@ inline void RegisterCreatedFeatureLocked(const NVSDK_NGX_Handle* handle,
   }
   created_feature_ids[handle] = feature;
   if (feature == NVSDK_NGX_Feature_FrameGeneration) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+    edit_reuse_native_fg_generation.fetch_add(1, std::memory_order_release);
+    edit_fg_observation::StopEnvironment(1, 0);
+#endif
     const uint32_t ui_recomposition = GetUInt(parameters, NVSDK_NGX_DLSSG_Parameter_UserInterfaceRecompositionEnabled);
     native_fg_ui_recomposition[handle] = ui_recomposition != 0;
     std::ostringstream text;
@@ -16751,6 +18473,7 @@ inline void RegisterCreatedFeatureLocked(const NVSDK_NGX_Handle* handle,
   FeatureState state = DeriveFeatureState(parameters);
   static uint64_t source_generation = 0;
   state.source_generation = ++source_generation;
+  state.source_device11_identity = device11_identity;
   state.source_feature = feature;
   state.source_type_confirmed = true;
   if (const auto stale = features.find(handle); stale != features.end()) {
@@ -16773,6 +18496,14 @@ inline void RegisterCreatedFeatureLocked(const NVSDK_NGX_Handle* handle,
 // a 2-minute session) accumulated orphans up to the cap.  Returns whether
 // that was the last DLSS feature.  Caller holds runtime_mutex.
 inline bool ForgetSourceHandleLocked(const NVSDK_NGX_Handle* handle) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+  edit_fg_observation::StopSource(reinterpret_cast<uintptr_t>(handle));
+  if (const auto created = created_feature_ids.find(handle);
+      created != created_feature_ids.end() && created->second == NVSDK_NGX_Feature_FrameGeneration) {
+    edit_reuse_native_fg_generation.fetch_add(1, std::memory_order_release);
+    edit_fg_observation::StopEnvironment(1, 0);
+  }
+#endif
   OnNativeFgFeatureReleased(handle);
   if (last_source_plan.source_handle == handle) {
     last_source_plan.source_released = true;
@@ -19222,6 +20953,17 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
 #if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
     lock_trace.End();
 #endif
+    if (source_scope.owner) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+      if (auto source = features.find(handle); source != features.end()) {
+        ++source->second.sr_sequence;
+        edit_fg_observation::ObserveSourceFrame(reinterpret_cast<uintptr_t>(handle),
+            source->second.source_generation, source->second.sr_sequence);
+      }
+#else
+      if (auto source = features.find(handle); source != features.end()) ++source->second.sr_sequence;
+#endif
+    }
     // NRPresentPreFg (present_path.hpp): a DLSS-G evaluate gets NR on its
     // input frame here, recorded into its list before DLSS-G reads it, and
     // a HUD-less stand-in in its block for the duration of real().
@@ -19287,11 +21029,21 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
   // injection would double-run are dedup-skipped inside ProcessInline.
   ComputeStateEnvelope state_envelope(
       (!nested_in_c_wrapper && !InsideDirectCall()) ? command_list : nullptr);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  const auto edit_fg_ticket = (frame_generation && source_scope.owner && !nested_in_c_wrapper && !InsideDirectCall()
+      ? ObserveEditNativeFg(command_list, handle, parameters, Slot, false) : edit_fg_observation::Ticket{});
+#endif
   const NVSDK_NGX_Result result = [&] {
     const NgxRuntimeCommandScope runtime_scope;
     const bool outer = inside_game_evaluate_wrapper;
     if (control_mask_use_core_context.load()) inside_game_evaluate_wrapper = true;
     const auto result = real(command_list, handle, parameters, callback);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (edit_fg_ticket.call_id != 0) {
+      const auto edit_fg_return_ns = edit_fg_observation::NowNs();
+      edit_fg_observation::RecordResult(edit_fg_ticket, static_cast<uint32_t>(result), edit_fg_return_ns);
+    }
+#endif
     inside_game_evaluate_wrapper = outer;
     return result;
   }();
@@ -19323,6 +21075,9 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
     CountNrDecline(NrDeclineReason::kGameEvaluateFailed);
     return result;
   }
+#if defined(NR_NEXUS_DEV_CONTROL)
+  ObserveReleasedD3D12Source(command_list, handle);
+#endif
   if (!enabled.load()) {
     CountNrDecline(NrDeclineReason::kNrDisabledEvaluation);
     return result;
@@ -19350,7 +21105,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
     return result;
   }
   const SuccessfulSrCoreScope core_scope(
-      CreatedSrHandle(handle) ? command_list : nullptr);
+      CreatedSrHandle(handle) ? command_list : nullptr, handle);
   ObservePresentDlssEvaluate(parameters);
   ngx_dlss_evaluate_seen.store(true, std::memory_order_relaxed);
   // Both insertion modes: the pre-SR block above skipped its pass silently.
@@ -19478,6 +21233,17 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
   bool frame_generation = false;
   if (!InsideDirectCall()) {
     RuntimeLock lock(runtime_mutex);
+    if (source_scope.owner) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+      if (auto source = features.find(handle); source != features.end()) {
+        ++source->second.sr_sequence;
+        edit_fg_observation::ObserveSourceFrame(reinterpret_cast<uintptr_t>(handle),
+            source->second.source_generation, source->second.sr_sequence);
+      }
+#else
+      if (auto source = features.find(handle); source != features.end()) ++source->second.sr_sequence;
+#endif
+    }
     // NRPresentPreFg: NR on DLSS-G's input before DLSS-G reads it (see the
     // C++ wrapper).
     frame_generation =
@@ -19528,12 +21294,25 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
       }
     }
   }
+#if defined(NR_NEXUS_DEV_CONTROL)
+  const auto edit_fg_ticket = (frame_generation && source_scope.owner && !InsideDirectCall()
+      ? ObserveEditNativeFg(command_list, handle, parameters, Slot, true) : edit_fg_observation::Ticket{});
+#endif
   inside_game_evaluate_wrapper = true;
   ComputeStateEnvelope state_envelope(
       InsideDirectCall() ? nullptr : command_list);
   const NVSDK_NGX_Result result = [&] {
     const NgxRuntimeCommandScope runtime_scope;
+#if defined(NR_NEXUS_DEV_CONTROL)
+    const auto result = real(command_list, handle, parameters, callback);
+    if (edit_fg_ticket.call_id != 0) {
+      const auto edit_fg_return_ns = edit_fg_observation::NowNs();
+      edit_fg_observation::RecordResult(edit_fg_ticket, static_cast<uint32_t>(result), edit_fg_return_ns);
+    }
+    return result;
+#else
     return real(command_list, handle, parameters, callback);
+#endif
   }();
   inside_game_evaluate_wrapper = false;
   state_envelope.StopCapture();
@@ -19555,6 +21334,9 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
     CountNrDecline(NrDeclineReason::kGameEvaluateFailed);
     return result;
   }
+#if defined(NR_NEXUS_DEV_CONTROL)
+  ObserveReleasedD3D12Source(command_list, handle);
+#endif
   if (!enabled.load()) {
     CountNrDecline(NrDeclineReason::kNrDisabledEvaluation);
     return result;
@@ -19570,7 +21352,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
     return result;
   }
   const SuccessfulSrCoreScope core_scope(
-      CreatedSrHandle(handle) ? command_list : nullptr);
+      CreatedSrHandle(handle) ? command_list : nullptr, handle);
   ObservePresentDlssEvaluate(parameters);
   ngx_dlss_evaluate_seen.store(true, std::memory_order_relaxed);
   if (NrYieldsToForeign()) {
@@ -21112,6 +22894,11 @@ inline void OnInitSwapchain(reshade::api::swapchain* swapchain, bool /*resize*/)
     // detours installed: before the game's first frame and, in most games,
     // before its DLSS create.
     InstallHooks();
+#if defined(NR_NEXUS_DEV_CONTROL)
+    fg::xefg::RegisterBridgeSourceSwapchain(
+        reinterpret_cast<uintptr_t>(swapchain),
+        reinterpret_cast<IDXGISwapChain*>(swapchain->get_native()));
+#endif
     return;
   }
   if (device->get_api() != reshade::api::device_api::d3d12) {
@@ -21121,6 +22908,10 @@ inline void OnInitSwapchain(reshade::api::swapchain* swapchain, bool /*resize*/)
     return;
   }
   d3d12_swapchain_seen.store(true, std::memory_order_relaxed);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  fg::xefg::RegisterD3D12SourceSwapchain(
+      reinterpret_cast<uintptr_t>(swapchain), reinterpret_cast<IDXGISwapChain*>(swapchain->get_native()));
+#endif
   if (dx11_source.load(std::memory_order_relaxed) != kDx11SourceOff) return;
   InstallHooks();
   if (dx11_source_off_device_deferred.exchange(false, std::memory_order_acq_rel)) {
@@ -21221,6 +23012,7 @@ inline constexpr int64_t kHudToastNs = 2'000'000'000LL;
 inline std::array<std::atomic_uint64_t, kMaxNrPasses> model_adjustment_notice_signatures{};
 
 inline void NotifyNrOperation(bool on) {
+  if (!on) CancelAsyncAutoscalePreparation();
   std::unique_lock lock(profile_feedback.mutex);
   profile_feedback.operation = (on ? "NR enabled" : "NR disabled");
   profile_feedback_until_ns.store(SteadyNowNs() + kHudToastNs, std::memory_order_release);
@@ -24070,6 +25862,15 @@ inline void OnDestroyEffectRuntime(reshade::api::effect_runtime* runtime) {
 // and Render while cleanup retries; OnPresent's normal Present-only arming
 // cannot lower it. Every wait precedes runtime_mutex, and GPU proof is polled.
 inline void ServiceDisabledNr() {
+  if (!enabled.load(std::memory_order_acquire)) {
+    CancelAsyncAutoscalePreparation();
+    RuntimeTryLock lock(runtime_mutex);
+    if (!lock.owns_lock()) return;
+    if (!DiscardAsyncAutoscalePreparation()) {
+      disabled_resources_released.store(false, std::memory_order_relaxed);
+      return;
+    }
+  }
   if (!ngx_serial::retirement_armed.load(std::memory_order_acquire)
       && (enabled.load(std::memory_order_acquire)
               ? !disabled_resources_released.load(std::memory_order_relaxed)
@@ -24102,7 +25903,9 @@ inline void ServiceDisabledNr() {
   if (worksets.empty() && retired_final_resources.empty()
       && active_features.load(std::memory_order_relaxed) == 0u
       && retired_nr_features.empty() && present_ring.device == nullptr
-      && present_streams.empty() && fg_service::streams.empty() && present_retired.empty()) {
+      && present_streams.empty() && fg_service::streams.empty() && present_retired.empty()
+      && codec_pipeline.root_signature == nullptr && codec_pipeline.look.root_signature == nullptr
+      && codec_pipeline.hdr_capture_root == nullptr) {
     disabled_resources_released.store(true, std::memory_order_relaxed);
     ngx_serial::retirement_armed.store(false, std::memory_order_release);
     return;
@@ -24163,6 +25966,7 @@ inline void OnPresent(
     uint32_t,
     const reshade::api::rect*) {
   if (shutting_down.load(std::memory_order_acquire)) return;
+  StartAsyncAutoscalePreparation();
   // Bind to the selected runtime's device and first backbuffer, rather than
   // interleaving different swapchains or treating lifecycle ticks as presents.
   if (swapchain != nullptr && swapchain->get_back_buffer_count() != 0
@@ -24659,6 +26463,7 @@ struct Setting {
   }
   // Caller owns the configuration lock; preset batches publish one epoch.
   void StoreLocked(float value) const {
+    if (b == &enabled && value == 0.f) CancelAsyncAutoscalePreparation();
     if (f != nullptr) {
       f->store(value);
     } else if (u != nullptr) {
@@ -24869,6 +26674,8 @@ inline constexpr Setting kSetAdaptiveMinScale{
     "NRAdaptiveMinScale", &nr_adaptive_min_scale, 0.67f, SettingEffect::kNone};
 inline constexpr Setting kSetAdaptiveLevelCount{
     "NRAdaptiveLevelCount", &nr_adaptive_selected_levels, 0u, SettingEffect::kNone};
+inline constexpr Setting kSetAdaptiveLimitedResidency{
+    "NRAdaptiveLimitedResidency", &nr_adaptive_limited_residency, false, SettingEffect::kNone};
 inline constexpr Setting kSetPassResolutionMode[] = {
     {"NRPass2ResolutionMode", &pass_resolution_mode[0], 0u, SettingEffect::kNone},
     {"NRPass3ResolutionMode", &pass_resolution_mode[1], 0u, SettingEffect::kNone},
@@ -25366,7 +27173,8 @@ inline constexpr const Setting* kHookPointSettings[] = {
     &kSetPresentSdrRestorePolicy, &kSetPresentBlockHudless};
 inline constexpr const Setting* kPerformanceSettings[] = {
     &kSetFollowInputRes, &kSetResolutionScale, &kSetLookUpsample,
-    &kSetAdaptiveEnabled, &kSetAdaptiveTargetFps, &kSetAdaptiveMinScale, &kSetAdaptiveLevelCount};
+    &kSetAdaptiveEnabled, &kSetAdaptiveTargetFps, &kSetAdaptiveMinScale, &kSetAdaptiveLevelCount,
+    &kSetAdaptiveLimitedResidency};
 inline constexpr const Setting* kStackingSettings[] = {
     &kSetPassResolutionMode[0], &kSetPassResolutionMode[1], &kSetPassResolutionMode[2],
     &kSetPassResolutionScale[0], &kSetPassResolutionScale[1], &kSetPassResolutionScale[2],
@@ -26909,8 +28717,13 @@ inline void DrawResolutionControls(const ui::PanelText& text) {
       "Adjust NR working resolution toward your target output FPS, including generated frames. Manual resolutions are the upper limits. No extra program is required.");
   if (nr_adaptive_enabled.load()) {
     ImGui::Indent();
-    ui::RowLabel("Resolution levels",
-        "Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.");
+    constexpr const char* preparation_modes[] = {"Prepare all levels", "On-demand (experimental)"};
+    ChoiceSetting(text, kSetAdaptiveLimitedResidency, "Preparation mode", preparation_modes,
+        "All levels use more VRAM for smooth switching once ready. On-demand keeps fewer levels resident, but cold preparation may stutter.");
+    const char* levels_tip = (nr_adaptive_limited_residency.load()
+        ? "More levels give smaller steps. On-demand keeps fewer levels resident; preparing a missing level may stutter."
+        : "Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.");
+    ui::RowLabel("Resolution levels", levels_tip);
     const auto selected_levels = nr_adaptive_selected_levels.load();
     const auto levels_preview = (selected_levels == 0
         ? std::string(text.Tr("Default (by capacity)")) : std::to_string(selected_levels));
@@ -26933,7 +28746,7 @@ inline void DrawResolutionControls(const ui::PanelText& text) {
       kSetAdaptiveLevelCount.Commit(0.f);
     }
     if (CopyAdaptiveStatus().reason == adaptive_resolution::Reason::PREPARING) {
-      ImGui::TextWrapped("%s", text.Tr("Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter."));
+      ImGui::TextWrapped("%s", text.Tr(levels_tip));
     }
     SliderSetting(text, kSetAdaptiveTargetFps, "Target output FPS", 30.f, 360.f, "%.0f FPS",
         "The target includes generated frames. If lowering NR brings no FPS benefit, the previous quality is restored.");
@@ -30124,6 +31937,7 @@ inline void LoadConfiguration() {
   float saved_adaptive_target_fps = 60.f;
   float saved_adaptive_min_scale = 0.67f;
   uint32_t saved_adaptive_selected_levels = 0u;
+  bool saved_adaptive_limited_residency = false;
   bool saved_gpu_timers = defaults::kGpuTimers;
   bool saved_crash_dump = defaults::kCrashDump;
   bool saved_cost_meter = defaults::kCostMeter;
@@ -30436,6 +32250,7 @@ inline void LoadConfiguration() {
   reshade::get_config_value(nullptr, kConfigSection, "NRAdaptiveTargetFPS", saved_adaptive_target_fps);
   reshade::get_config_value(nullptr, kConfigSection, "NRAdaptiveMinScale", saved_adaptive_min_scale);
   reshade::get_config_value(nullptr, kConfigSection, "NRAdaptiveLevelCount", saved_adaptive_selected_levels);
+  reshade::get_config_value(nullptr, kConfigSection, "NRAdaptiveLimitedResidency", saved_adaptive_limited_residency);
   reshade::get_config_value(
       nullptr, kConfigSection, "NRGpuTimers", saved_gpu_timers);
   reshade::get_config_value(nullptr, kConfigSection, "NRCrashDump", saved_crash_dump);
@@ -30473,6 +32288,9 @@ inline void LoadConfiguration() {
   reshade::get_config_value(nullptr, kConfigSection, "NRLookUpsample", saved_look.upsample);
   reshade::get_config_value(
       nullptr, kConfigSection, "NRDetailStability", saved_detail_stability);
+  bool saved_edit_reuse = false;
+  reshade::get_config_value(nullptr, kConfigSection, "NREditReuse", saved_edit_reuse);
+  edit_reuse_enabled = saved_edit_reuse;
   // Diagnostics, read-only from the ini (never persisted): the telemetry line
   // interval (0 = off) and the per-frame normalization trace.
   uint32_t saved_telemetry_seconds = telemetry_seconds.load();
@@ -30537,6 +32355,9 @@ inline void LoadConfiguration() {
         "ControlMask depth range is invalid or uses legacy defaults; using 0.999900 and 0.999950");
   }
   uint32_t capture_samples = 0, capture_seconds = 120, capture_warmup = 6;
+  bool capture_xefg = false;
+  reshade::get_config_value(nullptr, kConfigSection, "NRXeFgGpuCapture", capture_xefg);
+  xefg_gpu_capture_enabled = capture_xefg;
   reshade::get_config_value(nullptr, kConfigSection, "NRControlMaskGpuCaptureSamples", capture_samples);
   reshade::get_config_value(nullptr, kConfigSection, "NRControlMaskGpuCaptureSeconds", capture_seconds);
   reshade::get_config_value(nullptr, kConfigSection, "NRControlMaskGpuCaptureWarmupSeconds", capture_warmup);
@@ -30549,7 +32370,7 @@ inline void LoadConfiguration() {
   }
   control_mask_capture::wake_worker = &screenshot::WakeControlMaskCapture;
   gpu_timers::raw_observer = &control_mask_capture::Observe;
-  if (!control_mask_capture::Configure(capture_samples, capture_seconds, capture_warmup)) {
+  if (!control_mask_capture::Configure(capture_samples, capture_seconds, capture_warmup, 8192, capture_xefg)) {
     Log(reshade::log::level::warning, "ControlMask GPU capture configuration unavailable or busy; no capture was armed");
   }
   bool saved_norm_trace = false;
@@ -30932,6 +32753,7 @@ inline void LoadConfiguration() {
       "NRAdaptiveMinScale");
   nr_adaptive_selected_levels = SanitizeEnumKey(saved_adaptive_selected_levels, 0u, 0u, adaptive_resolution::MAX_PREPARED_LEVELS,
       "NRAdaptiveLevelCount");
+  nr_adaptive_limited_residency = saved_adaptive_limited_residency;
   gpu_timers_enabled = saved_gpu_timers;
   lastgasp::dumps_on = saved_crash_dump;
   cost_meter_enabled = saved_cost_meter;
@@ -31414,6 +33236,9 @@ inline void OnDestroyDevice(reshade::api::device* device) {
 // session.  `swapchains=` / `swapchains_ours=` in the telemetry line are what
 // a field log would show it by.
 inline void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+  fg::xefg::ForgetBridgeSourceSwapchain(reinterpret_cast<uintptr_t>(swapchain));
+#endif
   if (swapchain != nullptr) {
     RuntimeLock lock(runtime_mutex);
     if (auto stream = present_streams.find(swapchain); stream != present_streams.end()) {
@@ -31551,6 +33376,7 @@ inline void UnhookInstalledDetours() {
 // detours must die with the DLL that owns them.
 inline void DetachLite() {
   shutting_down.store(true, std::memory_order_release);
+  CancelAsyncAutoscalePreparation();
   UnhookMixedPresentCopyHooks();
   UnhookCommandListStateHooks();
   UnhookDeviceStateHooks();
@@ -31610,6 +33436,10 @@ inline bool Shutdown(bool proof_gated) {
   // caller: acquiring runtime_mutex later cannot make a queue-fence snapshot
   // taken while a callback still records cover that callback's later work.
   shutting_down.store(true, std::memory_order_seq_cst);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  edit_fg_observation::Stop("teardown");
+#endif
+  CancelAsyncAutoscalePreparation();
   const int64_t drain_deadline_ns = SteadyNowNs() + 500 * 1000000LL;
   while (callbacks_in_flight.load(std::memory_order_seq_cst) != 0
          && SteadyNowNs() < drain_deadline_ns) {
@@ -31744,6 +33574,10 @@ inline bool Shutdown(bool proof_gated) {
   HMODULE unload = nullptr;
   {
     RuntimeLock lock(runtime_mutex);
+    if (!DiscardAsyncAutoscalePreparation()) {
+      shutting_down.store(false, std::memory_order_release);
+      return false;
+    }
     UnhookInstalledDetours();
     // The queue detour stays installed; tracking is off while the state it
     // proves is released here, and re-arms at the end of this function.
@@ -31753,8 +33587,6 @@ inline bool Shutdown(bool proof_gated) {
     // After the tracked queues' wait above, which covers the present ring's
     // own submissions.
     ReleasePresentPath();
-    // Captured before the teardown below clears direct_device.
-    const bool runtime_was_initialized = direct_device != nullptr;
     // Device rebuild: the readbacks belong to the dying device, but the
     // encoding worker must survive for the next capture.
     screenshot::AbortPending();
@@ -31769,27 +33601,41 @@ inline bool Shutdown(bool proof_gated) {
     telemetry_probe_lease = GpuLease{};
     telemetry_probe_taken = false;
     if (direct_device != nullptr) {
-      if (!direct_api.borrowed_core_context && direct_api.shutdown != nullptr) {
-        direct_api.shutdown(direct_device);
+      if (direct_api.private_instance && !direct_api.borrowed_core_context && direct_api.shutdown != nullptr) {
+        DirectCallScope ngx_direct_call;
+        const auto shutdown_result = direct_api.shutdown(direct_device);
+        native_runtime_unload_safe = NVSDK_NGX_SUCCEED(shutdown_result);
+        if (!native_runtime_unload_safe) {
+          last_result = static_cast<uint32_t>(shutdown_result);
+          direct_runtime_failed = true;
+          queue_tracking_active.store(true, std::memory_order_release);
+          shutting_down.store(false, std::memory_order_release);
+          Log(reshade::log::level::error, "private NR Shutdown failed; its device, API, image and caller identity remain active");
+          return false;
+        }
       }
       direct_device->Release();
       direct_device = nullptr;
       direct_device_native = nullptr;
     }
-    if (!direct_api.borrowed_core_context) RestoreCallerIdentity();
-    if (direct_api.module != nullptr) {
-      if (runtime_was_initialized && !direct_api.borrowed_core_context) {
-        unload = direct_api.module;
-      } else {
-        // The runtime was loaded but never initialized: boot probe devices can
-        // load and destroy a device within milliseconds (seen on Dead Space
-        // 2023).  Unloading an NVIDIA runtime that young is a known
-        // delayed-crash source when its attach cycle spawned threads, so keep
-        // it mapped for the process lifetime; a later load just bumps the
-        // module refcount.
-        Log(reshade::log::level::info,
-            "nvngx_dlssnr.dll was not initialized by this backend; leaving it mapped");
-      }
+    bool identity_restored = true;
+    if (!direct_api.borrowed_core_context) {
+      identity_restored = RestoreCallerIdentity();
+    }
+    const auto& symbols = NgxLoaderView();
+    if (identity_restored && native_runtime_unload_safe && symbols.native_image.module != nullptr) {
+      unload = symbols.native_image.module;
+    } else if (symbols.native_image.module != nullptr) {
+      // DllMain alone can start worker threads. An unused image or an image
+      // whose context/IAT could not retire remains mapped until process exit.
+      Log(reshade::log::level::info,
+          "private NR runtime retirement was not proven; leaving its image mapped");
+    }
+    if (symbols.nr_module != nullptr) {
+      // The game's Core can share the same device key and internal context.
+      // Our successful Init is not ownership of that context or its lifetime.
+      Log(reshade::log::level::info,
+          "shared NR runtime retained without Shutdown; the game owns its context lifetime");
     }
     direct_api = {};
     ngx_core_module = nullptr;
@@ -31801,6 +33647,8 @@ inline bool Shutdown(bool proof_gated) {
     core_evaluate_feature = nullptr;
     core_release_feature = nullptr;
     direct_load_state = DirectLoadState::Unknown;
+    native_runtime_unload_safe = false;
+    native_runtime_failed_instance = nullptr;
     processed_outputs.clear();
     processed_render_outputs.clear();
     synthetic_handles.clear();
@@ -31871,6 +33719,10 @@ inline void Use(DWORD reason, HMODULE module, LPVOID reserved) {
       internal::LoadConfiguration();
       gpu_timers::comparison_settings = internal::comparison_ui::CaptureSettings;
       internal::adaptive_configuration_settings = internal::comparison_ui::CaptureAdaptiveSettings;
+      fg::xefg::ConfigureBridgeSource(internal::ObserveBridgeSourceForXefg);
+#if defined(NR_NEXUS_DEV_CONTROL)
+      fg::xefg::ConfigureD3D12Source(internal::ObserveD3D12SourceForXefg);
+#endif
       debug::Mark("attach:config-loaded");
       internal::Log(
           reshade::log::level::info,

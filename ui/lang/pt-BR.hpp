@@ -2340,6 +2340,11 @@ inline constexpr Translation kPtBr[] = {
     {"Default (by capacity)", "Padrão (conforme a capacidade)"},
     {"Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.", "Os níveis escolhidos são preparados primeiro. Mais níveis usam mais memória e oferecem passos menores. A preparação pode causar uma breve travada."},
     {"No working-resolution range to adjust", "Não há intervalo de resolução de trabalho para ajustar"},
+    {"Preparation mode", "Modo de preparação"},
+    {"Prepare all levels", "Preparar todos os níveis"},
+    {"On-demand (experimental)", "Sob demanda (experimental)"},
+    {"All levels use more VRAM for smooth switching once ready. On-demand keeps fewer levels resident, but cold preparation may stutter.", "Todos os níveis usam mais VRAM para trocas suaves após a preparação. O modo sob demanda mantém menos níveis na memória, mas a preparação inicial pode causar travadinhas."},
+    {"More levels give smaller steps. On-demand keeps fewer levels resident; preparing a missing level may stutter.", "Mais níveis oferecem passos menores. O modo sob demanda mantém menos níveis na memória; preparar um nível ausente pode causar travadinhas."},
 };
 
 }  // namespace renodx::addons::dlss5::ui::lang

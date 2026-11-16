@@ -69,7 +69,9 @@ constexpr uint32_t kSlotCommitStart =
     kSlotPassBase + kSlotPerPass * kTimerMaxPasses;
 constexpr uint32_t kSlotCommitEnd = kSlotCommitStart + 1;
 constexpr uint32_t kSlotCopyBackEnd = kSlotCommitEnd + 1;
-constexpr uint32_t kSlotCount = kSlotCopyBackEnd + 1;
+constexpr uint32_t kSlotServiceStart = kSlotCopyBackEnd + 1;
+constexpr uint32_t kSlotServiceEnd = kSlotServiceStart + 1;
+constexpr uint32_t kSlotCount = kSlotServiceEnd + 1;
 
 // 64 slots per segment keeps the readback stride at 512 bytes, the alignment
 // ResolveQueryData requires for its buffer offset.
@@ -165,6 +167,8 @@ struct Segment {
   gpu_comparison::Sample comparison;
   uint64_t diagnostic_token = 0;
   adaptive_resolution::Frame adaptive;
+  bool service_scope = false;
+  ID3D12GraphicsCommandList* service_list = nullptr;  // Borrowed only while current.active.
 };
 
 // Latest published per-evaluate timing, in microseconds.  Guarded by
@@ -193,6 +197,9 @@ struct Stats {
   // an old completed sample merely because stage/model/dimensions are equal.
   gpu_comparison::Identity identity;
   int64_t recorded_ns = 0;
+  uint32_t service_total_us = 0;
+  uint32_t staging_us = 0;
+  uint32_t writeback_us = 0;
 };
 inline Stats stats;
 inline Stats stage_stats[3];
@@ -376,7 +383,9 @@ inline void Reject(const Segment& s, SampleState state) {
     s.adaptive.session->ObserveGpu({.generation = s.adaptive.generation,
         .frame = s.adaptive.application_frame, .sequence = s.sequence,
         .recorded_ns = static_cast<int64_t>(s.comparison.recorded_ns), .completed_ns = NowNs(),
-        .role = s.adaptive.role, .required_roles = s.adaptive.required_roles}, NowNs());
+        .role = s.adaptive.role, .required_roles = s.adaptive.required_roles,
+        .paired = s.adaptive.paired, .pair_first_frame = s.adaptive.pair_first_frame,
+        .sampling_generation = s.adaptive.sampling_generation}, NowNs());
   }
   if (s.measure && s.diagnostic_token != 0 && raw_observer != nullptr && state != SampleState::PENDING) {
     Stats rejected{.width = s.width, .height = s.height, .passes = s.passes,
@@ -445,6 +454,17 @@ inline bool Publish(const Segment& s, bool log, const void* queue) {
     return false;
   }
   next.total_us = delta_us(kSlotFrameStart, kSlotCopyBackEnd);
+  if (s.service_scope) {
+    if (!has_span(kSlotServiceStart, kSlotFrameStart)
+        || !has_span(kSlotCopyBackEnd, kSlotServiceEnd)
+        || (q[kSlotServiceEnd] - q[kSlotServiceStart]) * inv > UINT32_MAX) {
+      Reject(s, SampleState::INVALID_TIMESTAMPS);
+      return false;
+    }
+    next.service_total_us = delta_us(kSlotServiceStart, kSlotServiceEnd);
+    next.staging_us = delta_us(kSlotServiceStart, kSlotFrameStart);
+    next.writeback_us = delta_us(kSlotCopyBackEnd, kSlotServiceEnd);
+  }
   next.copies_us = delta_us(kSlotFrameStart, kSlotCopyInEnd)
                    + delta_us(kSlotCommitEnd, kSlotCopyBackEnd);
   next.linearize_us = delta_us(kSlotCopyInEnd, kSlotLinearizeEnd);
@@ -518,12 +538,13 @@ inline bool Publish(const Segment& s, bool log, const void* queue) {
         .recorded_ns = next.recorded_ns, .completed_ns = next.measured_ns,
         .total_us = static_cast<double>(next.total_us), .role = s.adaptive.role,
         .required_roles = s.adaptive.required_roles, .valid = complete,
-        .stable = s.comparison.stable}, next.measured_ns);
+        .stable = s.comparison.stable, .paired = s.adaptive.paired,
+        .pair_first_frame = s.adaptive.pair_first_frame, .sampling_generation = s.adaptive.sampling_generation}, next.measured_ns);
   }
-  if (superseded) return false;
   if (s.diagnostic_token != 0 && raw_observer != nullptr) {
     raw_observer(next, s.diagnostic_token);
   }
+  if (superseded) return false;
   QueueMonitorSample(next);
   if (s.comparison.sequence != 0 && ComparisonActive()) {
     auto sample = s.comparison;
@@ -673,7 +694,20 @@ inline bool Begin(
     ID3D12Device* device,
     const char* path,
     uint32_t width,
-    uint32_t height, uint32_t pass_begin = 0, uint32_t pass_count = 0, bool measure = true) {
+    uint32_t height, uint32_t pass_begin = 0, uint32_t pass_count = 0, bool measure = true,
+    bool service_scope = false) {
+  if (internal::current.active) {
+    auto& outer = internal::segments[internal::current.idx];
+    // The diagnostic XeFG wrapper owns one segment through its final private
+    // writeback; its sole ProcessInline chain keeps the ordinary core markers.
+    if (service_scope || !outer.service_scope || outer.service_list != command_list
+        || std::strcmp(path, "present") != 0 || pass_begin != 0 || pass_count != 1
+        || outer.width != width || outer.height != height
+        || (outer.written & (uint64_t{1} << kSlotFrameStart)) != 0) return false;
+    command_list->EndQuery(internal::heap, D3D12_QUERY_TYPE_TIMESTAMP, outer.base + kSlotFrameStart);
+    outer.written |= uint64_t{1} << kSlotFrameStart;
+    return true;
+  }
   if (measure) {
     if (!internal::Ensure(device)) return false;
   } else {
@@ -720,6 +754,8 @@ inline bool Begin(
   s.comparison = {};
   s.diagnostic_token = 0;
   s.adaptive = {};
+  s.service_scope = service_scope;
+  s.service_list = (service_scope ? command_list : nullptr);
   s.comparison.stage = StageIndex(path);
   s.comparison.recorded_ns = NowNs();
   s.comparison.identity.device_session = device_session;
@@ -735,12 +771,13 @@ inline bool Begin(
   }
   internal::current.active = true;
   internal::current.idx = internal::head;
+  const uint32_t first_slot = (service_scope ? kSlotServiceStart : kSlotFrameStart);
   if (s.measure) {
     command_list->EndQuery(
-        internal::heap, D3D12_QUERY_TYPE_TIMESTAMP, s.base + kSlotFrameStart);
+        internal::heap, D3D12_QUERY_TYPE_TIMESTAMP, s.base + first_slot);
   }
-  s.count = kSlotFrameStart + 1;
-  s.written = uint64_t{1} << kSlotFrameStart;
+  s.count = first_slot + 1;
+  s.written = uint64_t{1} << first_slot;
   return true;
 }
 
@@ -773,10 +810,15 @@ inline void MarkBypassed() {
 
 // Resolve on the original list and retain its slots through the existing
 // recording tracker. The lease is delivery telemetry only, never readback proof.
-inline void End(ID3D12GraphicsCommandList* command_list) {
+inline void End(ID3D12GraphicsCommandList* command_list, bool finish_service = false) {
   if (!internal::current.active) return;
-  internal::current.active = false;
   Segment& s = internal::segments[internal::current.idx];
+  if (s.service_scope && !finish_service) return;
+  if (s.service_scope) {
+    Mark(command_list, kSlotServiceEnd);
+  }
+  internal::current.active = false;
+  s.service_list = nullptr;
   if (s.comparison.sequence != 0 && comparison_settings != nullptr) {
     auto identity = s.comparison.identity;
     comparison_settings(&identity);

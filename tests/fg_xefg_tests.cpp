@@ -3,10 +3,13 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
+#include <array>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 #include <include/reshade.hpp>
 #include "d3d12_test_gpu.hpp"
@@ -97,6 +100,200 @@ int32_t FakeResource(void* context, ID3D12CommandList* list, uint32_t id, const 
 }
 int32_t FakeConstants(void*, uint32_t, const xefg::abi::Constants*) { return sdk_status; }
 int32_t FakeId(void*, uint32_t) { return sdk_status; }
+std::atomic_bool receipt_device_destroyed{false};
+std::atomic_bool receipt_device_release_unlocked{false};
+// CPU receipt tests supply captured identities explicitly; the Bridge WARP
+// fixture separately checks real D3D11 GetDevice capture and source matching.
+struct ReceiptDeviceIdentity : IUnknown {
+  ULONG references = 1;
+  bool supports_device11 = true;
+  bool supports_device12 = false;
+  HRESULT device11_query_result = S_OK;
+  HRESULT device12_query_result = S_OK;
+  bool null_device11_interface = false;
+  bool null_device12_interface = false;
+  ComPtr<IUnknown> native_identity;
+  uint32_t device11_queries = 0;
+  uint32_t device12_queries = 0;
+  void (*on_destroy)() = nullptr;
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** output) override {
+    if (output == nullptr) return E_POINTER;
+    *output = nullptr;
+    if (iid == __uuidof(renodx::utils::directx::ReShadeRetrieveBaseInterface) && native_identity != nullptr) {
+      return native_identity->QueryInterface(IID_IUnknown, output);
+    }
+    if (iid == __uuidof(ID3D11Device)) {
+      ++device11_queries;
+      if (supports_device11 && (FAILED(device11_query_result) || null_device11_interface)) return device11_query_result;
+    }
+    if (iid == __uuidof(ID3D12Device)) {
+      ++device12_queries;
+      if (supports_device12 && (FAILED(device12_query_result) || null_device12_interface)) return device12_query_result;
+    }
+    if (iid != IID_IUnknown && !(iid == __uuidof(ID3D11Device) && supports_device11)
+        && !(iid == __uuidof(ID3D12Device) && supports_device12)) return E_NOINTERFACE;
+    *output = this;
+    AddRef();
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return ++references; }
+  ULONG STDMETHODCALLTYPE Release() override {
+    const auto remaining = --references;
+    if (remaining == 0) {
+      if (on_destroy != nullptr) on_destroy();
+      delete this;
+    }
+    return remaining;
+  }
+};
+struct ReceiptSwapchain : IDXGISwapChain {
+  ULONG references = 1;
+  uint32_t get_device_calls = 0;
+  ComPtr<IUnknown> reported_device;
+  ComPtr<IDXGISwapChain> native_swapchain;
+  ComPtr<IUnknown> reported_device12;
+  HRESULT device11_result = S_OK;
+  HRESULT device12_result = S_OK;
+  bool null_device11 = false;
+  bool null_device12 = false;
+  HRESULT (*present_callback)(ReceiptSwapchain*, UINT, UINT) = nullptr;
+  explicit ReceiptSwapchain(IUnknown* device, IDXGISwapChain* native = nullptr)
+      : reported_device(device), native_swapchain(native) {}
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** output) override {
+    if (output == nullptr) return E_POINTER;
+    *output = nullptr;
+    if (iid == __uuidof(renodx::utils::directx::ReShadeRetrieveBaseInterface) && native_swapchain != nullptr) {
+      return native_swapchain->QueryInterface(__uuidof(IDXGISwapChain), output);
+    }
+    if (iid != IID_IUnknown && iid != __uuidof(IDXGIObject) && iid != __uuidof(IDXGIDeviceSubObject)
+        && iid != __uuidof(IDXGISwapChain)) return E_NOINTERFACE;
+    *output = static_cast<IDXGISwapChain*>(this);
+    AddRef();
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return ++references; }
+  ULONG STDMETHODCALLTYPE Release() override {
+    const auto remaining = --references;
+    if (remaining == 0) {
+      delete this;
+    }
+    return remaining;
+  }
+  HRESULT STDMETHODCALLTYPE GetDevice(REFIID iid, void** output) override {
+    ++get_device_calls;
+    if (output == nullptr) return E_POINTER;
+    *output = nullptr;
+    IUnknown* device = nullptr;
+    HRESULT result = S_OK;
+    bool null_device = false;
+    if (iid == __uuidof(ID3D11Device)) {
+      device = reported_device.Get();
+      result = device11_result;
+      null_device = null_device11;
+    } else if (iid == __uuidof(ID3D12Device)) {
+      device = reported_device12.Get();
+      result = device12_result;
+      null_device = null_device12;
+    }
+    if (FAILED(result) || null_device) return result;
+    if (device == nullptr) return E_NOINTERFACE;
+    // The identity-only MOCK supports the IUnknown methods used by capture;
+    // no D3D device method or GPU operation is emulated or executed.
+    *output = device;
+    device->AddRef();
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetParent(REFIID, void**) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE Present(UINT interval, UINT flags) override {
+    return (present_callback != nullptr ? present_callback(this, interval, flags) : E_NOTIMPL);
+  }
+  HRESULT STDMETHODCALLTYPE GetBuffer(UINT, REFIID, void**) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL, IDXGIOutput*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetFullscreenState(BOOL*, IDXGIOutput**) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetDesc(DXGI_SWAP_CHAIN_DESC*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE ResizeBuffers(UINT, UINT, UINT, DXGI_FORMAT, UINT) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE ResizeTarget(const DXGI_MODE_DESC*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetContainingOutput(IDXGIOutput**) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetFrameStatistics(DXGI_FRAME_STATISTICS*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetLastPresentCount(UINT*) override { return E_NOTIMPL; }
+};
+xefg::BridgeSourceIdentity receipt_source;
+bool receipt_source_available = true;
+uint32_t receipt_candidates = 1;
+uint32_t receipt_device12_matches = 1;
+int32_t receipt_sdk_status = 0;
+void (*receipt_during_sdk)() = nullptr;
+#if defined(NR_NEXUS_DEV_CONTROL)
+void (*receipt_after_sdk_observer)() = nullptr;
+bool receipt_after_sdk_observer_pending = false;
+#endif
+IUnknown* receipt_proxy = nullptr;  // Borrowed only across the mock SDK callback.
+IUnknown* receipt_secondary_proxy = nullptr;
+IDXGISwapChain* receipt_inner_source = nullptr;
+void* receipt_context_handle = nullptr;
+xefg::BridgeSourceObservation ObserveReceiptSource(uintptr_t device11) noexcept {
+  xefg::BridgeSourceObservation observation{.queried_device11 = device11,
+      .state = xefg::BridgeSnapshotState::RUNTIME_BUSY};
+  if (!receipt_source_available) return observation;
+  observation.state = xefg::BridgeSnapshotState::LOCKED;
+  observation.candidates = receipt_candidates;
+  if (receipt_source.device11 == device11) {
+    observation.identity = receipt_source;
+    observation.matches = 1;
+  } else {
+    observation.identity.device11 = device11;
+  }
+  return observation;
+}
+xefg::BridgeSourceObservation ObserveReceiptD3D12Source(uintptr_t device12) noexcept {
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (receipt_after_sdk_observer_pending && receipt_after_sdk_observer != nullptr) {
+    receipt_after_sdk_observer_pending = false;
+    receipt_after_sdk_observer();
+  }
+#endif
+  xefg::BridgeSourceObservation observation{.state = xefg::BridgeSnapshotState::RUNTIME_BUSY,
+      .queried_device12 = device12};
+  if (!receipt_source_available) return observation;
+  observation.state = xefg::BridgeSnapshotState::LOCKED;
+  observation.candidates = receipt_device12_matches;
+  if (receipt_source.device11 == 0 && receipt_source.device12 == device12) {
+    observation.matches = receipt_device12_matches;
+    if (receipt_device12_matches == 1) observation.identity = receipt_source;
+  }
+  observation.identity.device12 = device12;
+  return observation;
+}
+int32_t FakeReceiptPresentStatus(void*, xefg::abi::PresentStatus* status) {
+  *status = {.frames_presented = 1, .frame_gen_result = 0, .enabled = 0};
+  return 0;
+}
+int32_t ReceiptSdkCall() {
+  Check(!xefg::QueryBridgeOff(receipt_source).available, "old Off cannot authorize while the SDK contract call is in flight");
+  if (receipt_during_sdk != nullptr) {
+    receipt_during_sdk();
+  }
+  return receipt_sdk_status;
+}
+int32_t FakeReceiptEnable(void*, uint32_t) {
+  const auto status = ReceiptSdkCall();
+#if defined(NR_NEXUS_DEV_CONTROL)
+  receipt_after_sdk_observer_pending = receipt_after_sdk_observer != nullptr;
+#endif
+  return status;
+}
+int32_t FakeReceiptInit(void*, ID3D12CommandQueue*, const xefg::abi::Init*) { return ReceiptSdkCall(); }
+int32_t FakeReceiptInitDesc(void*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*,
+    ID3D12CommandQueue*, IDXGIFactory2*, const xefg::abi::Init*) { return ReceiptSdkCall(); }
+int32_t FakeReceiptGetSwapchain(void*, REFIID iid, void** output) {
+  const auto status = ReceiptSdkCall();
+  if (status != 0 || receipt_proxy == nullptr) return status;
+  return receipt_proxy->QueryInterface(iid, output);
+}
+int32_t FakeReceiptDestroy(void*) { return ReceiptSdkCall(); }
 uint32_t fake_present_calls = 0;
 bool fake_present_owns_stream = false;
 HRESULT STDMETHODCALLTYPE FakePresent(IDXGISwapChain*, UINT, UINT) {
@@ -104,6 +301,11 @@ HRESULT STDMETHODCALLTYPE FakePresent(IDXGISwapChain*, UINT, UINT) {
   fake_present_owns_stream = xefg::OwnsStream();
   return S_OK;
 }
+HRESULT STDMETHODCALLTYPE FakeSourcePresent(IDXGISwapChain* swapchain, UINT interval, UINT flags) {
+  return swapchain->Present(interval, flags);
+}
+HRESULT STDMETHODCALLTYPE FailedReceiptPresent(IDXGISwapChain*, UINT, UINT) { return E_FAIL; }
+HRESULT STDMETHODCALLTYPE OccludedReceiptPresent(IDXGISwapChain*, UINT, UINT) { return DXGI_STATUS_OCCLUDED; }
 HRESULT STDMETHODCALLTYPE FakePresent1(IDXGISwapChain1* swapchain, UINT interval, UINT flags,
                                       const DXGI_PRESENT_PARAMETERS*) {
   return adapter::ProxyHooks<0>::Present(swapchain, interval, flags);
@@ -117,8 +319,9 @@ struct Session {
   uint32_t extent_top = 2;
   uint32_t extent_width = 4;
   uint32_t extent_height = 3;
-  explicit Session(Gpu* value, int32_t ui_mode = 0) : gpu(value), proxy(value->Swapchain()) {
-    xefg::abi::Init init{.application_swapchain = proxy.Get(), .flags = 17, .max_interpolated = 1, .ui_mode = ui_mode};
+  explicit Session(Gpu* value, int32_t ui_mode = 0, uint32_t init_flags = 17,
+                   DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM) : gpu(value), proxy(value->Swapchain(format)) {
+    xefg::abi::Init init{.application_swapchain = proxy.Get(), .flags = init_flags, .max_interpolated = 1, .ui_mode = ui_mode};
     Check(Hooks::Init(handle, gpu->queue.Get(), &init) == 0, "SDK init");
     context = adapter::state.contexts.at(handle);
     context->proxy_identity = adapter::Identity(proxy.Get());
@@ -228,8 +431,9 @@ void TestRouteDiagnostics(Gpu* gpu) {
   std::cout << "PASS last Present route/reason diagnostics: successful roles, SDK consumers, Off, skipped and failed\n";
 }
 }  // namespace
-int main() {
+int main(int argc, char** argv) {
   try {
+    const bool bridge_off_cpu = argc == 2 && std::strcmp(argv[1], "--bridge-off-cpu") == 0;
     reshade::internal::get_reshade_module_handle(GetModuleHandleW(nullptr));
     TestDiagnosticBudgets();
     std::cout << "PASS bounded XeFG contract diagnostics\n";
@@ -251,6 +455,1087 @@ int main() {
     fg::native_options::internal::HookedSetOptions(viewport, options);
     Check(options_events == 2 && options_calls == 4, "stopped native hook did not pass through");
     std::cout << "PASS native options result, explicit Off/On and stopped pass-through\n";
+    {
+      Check(adapter::state.contexts.empty(), "CPU Off receipt starts without a live XeFG context");
+      const auto saved_real = adapter::modules[0].real;
+      ComPtr<IUnknown> identity;
+      identity.Attach(new ReceiptDeviceIdentity());
+      ComPtr<IUnknown> other_identity;
+      other_identity.Attach(new ReceiptDeviceIdentity());
+      auto* context_handle = reinterpret_cast<void*>(uintptr_t{0xEF001});
+      receipt_source = {.device11 = reinterpret_cast<uintptr_t>(identity.Get()), .handle = 0xD311, .generation = 1};
+      const std::array<std::pair<xefg::BridgeSourceObservation, const char*>, 6> classifications{{
+          {{.queried_device11 = receipt_source.device11, .state = xefg::BridgeSnapshotState::RUNTIME_BUSY}, "runtime_busy"},
+          {{.queried_device11 = receipt_source.device11, .state = xefg::BridgeSnapshotState::SHUTTING_DOWN}, "shutting_down"},
+          {{.queried_device11 = receipt_source.device11, .state = xefg::BridgeSnapshotState::LOCKED}, "no_live_source"},
+          {{.queried_device11 = receipt_source.device11, .state = xefg::BridgeSnapshotState::LOCKED, .candidates = 1}, "device_mismatch"},
+          {{.identity = {.device11 = receipt_source.device11}, .queried_device11 = receipt_source.device11,
+               .state = xefg::BridgeSnapshotState::LOCKED, .candidates = 2, .matches = 2}, "ambiguous"},
+          {{.identity = receipt_source, .queried_device11 = receipt_source.device11,
+               .state = xefg::BridgeSnapshotState::LOCKED, .candidates = 1, .matches = 1}, "matched"},
+      }};
+      for (const auto& [observation, expected] : classifications) {
+        Check(std::strcmp(xefg::BridgeSourceReason(observation), expected) == 0,
+            "source observation classifies unavailable locks, usable D3D11 candidates and exact matches");
+      }
+      const auto fresh_context = [&] {
+        adapter::state.contexts.clear();
+        auto context = std::make_shared<adapter::Context>();
+        context->bridge_context_ready = context->bridge_proxy_ready = true;
+        context->bridge_application_device11 = identity;
+        context->bridge_proxy_device11 = identity;
+        context->proxy_identity = 0xEF111;
+        context->bridge_declaration = ++adapter::state.bridge_declaration;
+        adapter::state.contexts[context_handle] = context;
+        return context;
+      };
+      adapter::modules[0].real[0] = reinterpret_cast<void*>(&FakeReceiptInit);
+      adapter::modules[0].real[1] = reinterpret_cast<void*>(&FakeReceiptInitDesc);
+      adapter::modules[0].real[2] = reinterpret_cast<void*>(&FakeReceiptGetSwapchain);
+      adapter::modules[0].real[6] = reinterpret_cast<void*>(&FakeReceiptEnable);
+      adapter::modules[0].real[8] = reinterpret_cast<void*>(&FakeReceiptDestroy);
+      xefg::ConfigureBridgeSource(&ObserveReceiptSource);
+      auto context = fresh_context();
+      {
+        ComPtr<ReceiptSwapchain> native_swapchain;
+        native_swapchain.Attach(new ReceiptSwapchain(identity.Get()));
+        ComPtr<ReceiptSwapchain> wrapper;
+        wrapper.Attach(new ReceiptSwapchain(other_identity.Get(), native_swapchain.Get()));
+        const auto native_refs = native_swapchain->references;
+        const auto wrapper_refs = wrapper->references;
+        const auto captured = adapter::BridgeDeviceIdentity(wrapper.Get());
+        Check(captured.Get() == identity.Get() && wrapper->get_device_calls == 0 && native_swapchain->get_device_calls == 1,
+            "known ReShade swapchain base supplies the canonical source device before proxy GetDevice can select another face");
+        Check(wrapper->references == wrapper_refs && native_swapchain->references == native_refs,
+            "Bridge identity capture balances outer and borrowed-base swapchain references");
+        xefg::BridgeDeviceObservation application_observation;
+        Check(adapter::BridgeDeviceIdentity(nullptr, &application_observation) == nullptr
+                  && !application_observation.object_present && application_observation.swapchain_result == E_PENDING,
+            "missing application swapchain records unattempted queries rather than a D3D11 failure result");
+        xefg::BridgeDeviceObservation proxy_observation;
+        Check(adapter::BridgeDeviceIdentity(wrapper.Get(), &proxy_observation).Get() == identity.Get()
+                  && proxy_observation.object_present && proxy_observation.swapchain_unwrapped
+                  && proxy_observation.swapchain_result == S_OK && proxy_observation.device11_result == S_OK
+                  && proxy_observation.device12_result == E_NOINTERFACE,
+            "lock-free capture preserves the known ReShade unwrap and separate D3D11/D3D12 GetDevice results");
+        context->bridge_application_device11.Reset();
+        context->bridge_proxy_device11 = captured;
+        context->bridge_init_kind = "InitDesc";
+        context->bridge_application_observation = application_observation;
+        context->bridge_proxy_observation = proxy_observation;
+        const auto metadata_only = xefg::QueryBridgeOff(receipt_source);
+        Check(!metadata_only.available && metadata_only.application == application_observation
+                  && metadata_only.proxy_device == proxy_observation && std::strcmp(metadata_only.init_kind, "InitDesc") == 0,
+            "captured host API metadata is visible but cannot itself authorize Off");
+        Hooks::Enable(context_handle, 0);
+        Check(xefg::QueryBridgeOff(receipt_source).available,
+            "the captured matching native device still requires and accepts a successful same-source SDK Disable");
+        context = fresh_context();
+        ComPtr<ReceiptSwapchain> different_swapchain;
+        different_swapchain.Attach(new ReceiptSwapchain(other_identity.Get()));
+        context->bridge_application_device11.Reset();
+        context->bridge_proxy_device11 = adapter::BridgeDeviceIdentity(different_swapchain.Get());
+        Hooks::Enable(context_handle, 0);
+        Check(!xefg::QueryBridgeOff(receipt_source).available,
+            "an unwrapped but genuinely different device cannot claim the source's Disable receipt");
+        ComPtr<ReceiptSwapchain> device12_swapchain;
+        device12_swapchain.Attach(new ReceiptSwapchain(nullptr));
+        ComPtr<ReceiptDeviceIdentity> device12_identity;
+        device12_identity.Attach(new ReceiptDeviceIdentity());
+        device12_identity->supports_device11 = false;
+        device12_identity->supports_device12 = true;
+        device12_swapchain->reported_device12 = device12_identity.Get();
+        xefg::BridgeDeviceObservation device12_observation;
+        Check(adapter::BridgeDeviceIdentity(device12_swapchain.Get(), &device12_observation) == nullptr
+                  && device12_observation.device11_result == E_NOINTERFACE && device12_observation.device12_result == S_OK
+                  && device12_observation.returned_device_request == 12
+                  && adapter::BridgeDeviceCaptureReady(device12_observation, nullptr, false),
+            "normal D3D12 GetDevice fallback verifies the returned interface without inventing a D3D11 identity");
+        device12_swapchain->device12_result = E_FAIL;
+        Check(adapter::BridgeDeviceIdentity(device12_swapchain.Get(), &device12_observation) == nullptr
+                  && device12_observation.returned_device_request == 0
+                  && !adapter::BridgeDeviceCaptureReady(device12_observation, nullptr, false),
+            "failed GetDevice calls leave the context contract unready");
+        device12_swapchain->device12_result = S_OK;
+        device12_swapchain->null_device12 = true;
+        Check(adapter::BridgeDeviceIdentity(device12_swapchain.Get(), &device12_observation) == nullptr
+                  && device12_observation.returned_device_request == 0
+                  && !adapter::BridgeDeviceCaptureReady(device12_observation, nullptr, false),
+            "S_OK with a null getter object is not a confirmed API");
+        xefg::BridgeDeviceObservation absent_device;
+        Check(adapter::BridgeDeviceCaptureReady(absent_device, nullptr, true)
+                  && !adapter::BridgeDeviceCaptureReady(absent_device, nullptr, false),
+            "InitDesc alone may omit the application object while the SDK proxy must be observed");
+        context = fresh_context();
+        for (const auto& [supports_device11, supports_device12] : std::array<std::pair<bool, bool>, 4>{
+                 {{false, false}, {false, true}, {true, false}, {true, true}}}) {
+          ComPtr<ReceiptDeviceIdentity> returned_device;
+          returned_device.Attach(new ReceiptDeviceIdentity());
+          returned_device->supports_device11 = supports_device11;
+          returned_device->supports_device12 = supports_device12;
+          ComPtr<ReceiptSwapchain> reported_swapchain;
+          reported_swapchain.Attach(new ReceiptSwapchain(returned_device.Get()));
+          if (supports_device12) {
+            reported_swapchain->reported_device12 = returned_device.Get();
+          }
+          const auto device_refs = returned_device->references;
+          const auto swapchain_refs = reported_swapchain->references;
+          xefg::BridgeDeviceObservation typed_observation;
+          auto captured_device = adapter::BridgeDeviceIdentity(reported_swapchain.Get(), &typed_observation);
+          const auto expected_identity = reinterpret_cast<uintptr_t>(static_cast<IUnknown*>(returned_device.Get()));
+          Check(typed_observation.device11_result == S_OK
+                    && typed_observation.device12_result == (supports_device12 ? S_OK : E_NOINTERFACE)
+                    && typed_observation.returned_device_identity == expected_identity && typed_observation.returned_device_request == 11
+                    && typed_observation.device11_interface_result == (supports_device11 ? S_OK : E_NOINTERFACE)
+                    && typed_observation.device12_interface_result == (supports_device12 ? S_OK : E_NOINTERFACE)
+                    && typed_observation.device11_interface_identity == (supports_device11 ? expected_identity : 0)
+                    && typed_observation.device12_interface_identity == (supports_device12 ? expected_identity : 0),
+              "returned-device diagnostics separate getter success, explicit interface capability and canonical identity");
+          Check(captured_device.Get() == (supports_device11 ? returned_device.Get() : nullptr)
+                    && adapter::BridgeDeviceCaptureReady(typed_observation, captured_device.Get(), false)
+                        == (supports_device11 || supports_device12),
+              "only a verified D3D11 face supplies its identity and unknown API capability keeps the contract unready");
+          context->bridge_proxy_observation = typed_observation;
+          const auto typed_evidence = xefg::QueryBridgeOff(receipt_source);
+          Check(!typed_evidence.available && typed_evidence.proxy_device == typed_observation,
+              "returned-device interface metadata cannot independently grant an Off receipt");
+          captured_device.Reset();
+          const auto query11_before = returned_device->device11_queries;
+          const auto query12_before = returned_device->device12_queries;
+          auto identity_only = adapter::BridgeDeviceIdentity(reported_swapchain.Get());
+          Check(identity_only.Get() == (supports_device11 ? returned_device.Get() : nullptr)
+                    && returned_device->device11_queries == query11_before + 1 && returned_device->device12_queries == query12_before,
+              "captures without an observation verify D3D11 alone without adding full per-Present API diagnostics");
+          identity_only.Reset();
+          Check(returned_device->references == device_refs && reported_swapchain->references == swapchain_refs,
+              "successful and rejected interface probes balance device and swapchain references");
+        }
+        {
+          ComPtr<ReceiptDeviceIdentity> failed_interface;
+          failed_interface.Attach(new ReceiptDeviceIdentity());
+          failed_interface->supports_device12 = true;
+          failed_interface->device11_query_result = E_FAIL;
+          ComPtr<ReceiptSwapchain> failed_swapchain;
+          failed_swapchain.Attach(new ReceiptSwapchain(failed_interface.Get()));
+          failed_swapchain->reported_device12 = failed_interface.Get();
+          const auto references = failed_interface->references;
+          xefg::BridgeDeviceObservation failed_observation;
+          Check(adapter::BridgeDeviceIdentity(failed_swapchain.Get(), &failed_observation) == nullptr
+                    && failed_observation.device11_interface_result == E_FAIL
+                    && !adapter::BridgeDeviceCaptureReady(failed_observation, nullptr, false),
+              "a failed QI11 is not an explicit D3D11 absence even when QI12 succeeds");
+          failed_interface->device11_query_result = S_OK;
+          failed_interface->null_device11_interface = true;
+          Check(adapter::BridgeDeviceIdentity(failed_swapchain.Get(), &failed_observation) == nullptr
+                    && failed_observation.device11_interface_result == S_OK && failed_observation.device11_interface_identity == 0
+                    && !adapter::BridgeDeviceCaptureReady(failed_observation, nullptr, false)
+                    && failed_interface->references == references,
+              "S_OK with a null interface remains unready and failed/successful probes balance references");
+        }
+        std::cout << "PASS CPU MOCK device-interface classification: IUnknown/D3D12/D3D11/dual, fallback, failure, null and balanced references; GPU=NotRun\n";
+      }
+      Check(!xefg::QueryBridgeOff(receipt_source).available, "default enabled=false is not an observed Disable");
+      receipt_sdk_status = -19;
+      Check(Hooks::Enable(context_handle, 0) == -19 && !xefg::QueryBridgeOff(receipt_source).available,
+          "failed SetEnabled(false) cannot publish Off");
+      receipt_sdk_status = 0;
+      receipt_source_available = false;
+      receipt_during_sdk = +[] { receipt_source_available = true; };
+      Hooks::Enable(context_handle, 0);
+      Check(!xefg::QueryBridgeOff(receipt_source).available, "a source arriving during Disable cannot claim that declaration");
+      receipt_during_sdk = nullptr;
+      Hooks::Enable(context_handle, 0);
+      const auto accepted = xefg::QueryBridgeOff(receipt_source);
+      Check(accepted.available && accepted.source == receipt_source && accepted.epoch == context->epoch,
+          "successful false with the same captured context/proxy/source publishes a current receipt");
+      receipt_during_sdk = +[] { receipt_candidates = 2; };
+      Hooks::Enable(context_handle, 0);
+      const auto metadata_changed = xefg::QueryBridgeOff(receipt_source);
+      Check(metadata_changed.available && metadata_changed.before.identity == metadata_changed.after.identity
+                && metadata_changed.before.candidates == 1 && metadata_changed.after.candidates == 2
+                && metadata_changed.before != metadata_changed.after,
+          "diagnostic candidate changes do not alter the original before/after identity-only admission comparison");
+      receipt_during_sdk = nullptr;
+      receipt_candidates = 1;
+      auto wrong_source = receipt_source;
+      ++wrong_source.generation;
+      Check(!xefg::QueryBridgeOff(wrong_source).available, "a rebuilt source cannot inherit an older Disable");
+      wrong_source = receipt_source;
+      ++wrong_source.device11;
+      Check(!xefg::QueryBridgeOff(wrong_source).available, "a different D3D11 device cannot inherit Off");
+      receipt_source_available = false;
+      Hooks::Enable(context_handle, 0);
+      Check(!xefg::QueryBridgeOff(receipt_source).available, "unavailable source snapshot revokes the prior Off receipt");
+      Check(std::strcmp(xefg::BridgeSourceReason(xefg::QueryBridgeOff(receipt_source).before), "runtime_busy") == 0,
+          "a busy observer is diagnosed and its empty identity still revokes Off immediately");
+      receipt_source_available = true;
+      Hooks::Enable(context_handle, 0);
+      Hooks::Enable(context_handle, 1);
+      Check(context->enabled && !xefg::QueryBridgeOff(receipt_source).available, "reenable immediately revokes Off");
+      Hooks::Enable(context_handle, 0);
+      Check(xefg::QueryBridgeOff(receipt_source).available, "a fresh successful Disable recovers after reenable");
+      receipt_during_sdk = +[] { ++receipt_source.generation; };
+      Hooks::Enable(context_handle, 0);
+      Check(!xefg::QueryBridgeOff(receipt_source).available, "source generation changing inside SDK call rejects the result");
+      receipt_during_sdk = nullptr;
+      Hooks::Enable(context_handle, 0);
+      adapter::ReleaseFrames(context.get());
+      Check(!xefg::QueryBridgeOff(receipt_source).available, "context epoch changes invalidate an existing receipt");
+      Hooks::Enable(context_handle, 0);
+      adapter::state.contexts[reinterpret_cast<void*>(uintptr_t{0xEF002})] = std::make_shared<adapter::Context>();
+      Check(!xefg::QueryBridgeOff(receipt_source).available, "multiple XeFG contexts are ambiguous");
+      context = fresh_context();
+      context->bridge_proxy_device11 = other_identity;
+      Hooks::Enable(context_handle, 0);
+      Check(!xefg::QueryBridgeOff(receipt_source).available, "conflicting original/proxy D3D11 identities reject Off");
+      context = fresh_context();
+      context->bridge_application_device11.Reset();
+      context->bridge_proxy_device11.Reset();
+      Hooks::Enable(context_handle, 0);
+      Check(!xefg::QueryBridgeOff(receipt_source).available, "unknown D3D11 identity cannot infer the source from a private D3D12 context");
+      context = fresh_context();
+      Hooks::Enable(context_handle, 0);
+      receipt_sdk_status = -19;
+      Hooks::Init(context_handle, nullptr, nullptr);
+      Check(!xefg::QueryBridgeOff(receipt_source).available && !context->bridge_context_ready,
+          "failed Init revokes old Off before entering SDK");
+      context = fresh_context();
+      receipt_sdk_status = 0;
+      Hooks::Enable(context_handle, 0);
+      receipt_sdk_status = -19;
+      Hooks::InitDesc(context_handle, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+      Check(!xefg::QueryBridgeOff(receipt_source).available && !context->bridge_context_ready,
+          "failed InitDesc revokes old Off before entering SDK");
+      context = fresh_context();
+      receipt_sdk_status = 0;
+      Hooks::Enable(context_handle, 0);
+      receipt_sdk_status = -19;
+      void* proxy = nullptr;
+      Hooks::GetSwapchain(context_handle, IID_IUnknown, &proxy);
+      Check(!xefg::QueryBridgeOff(receipt_source).available && !context->bridge_proxy_ready,
+          "failed proxy observation revokes old Off before entering SDK");
+      context = fresh_context();
+      receipt_sdk_status = 0;
+      Hooks::Enable(context_handle, 0);
+      receipt_sdk_status = -19;
+      Hooks::Destroy(context_handle);
+      Check(!xefg::QueryBridgeOff(receipt_source).available && !context->bridge_context_ready,
+          "failed Destroy cannot leave an old Off receipt valid");
+      context = fresh_context();
+      receipt_sdk_status = 0;
+      Hooks::Enable(context_handle, 0);
+      adapter::state.contexts.erase(context_handle);
+      Hooks::Enable(context_handle, 0);
+      Check(!xefg::QueryBridgeOff(receipt_source).available, "a missing tracked context is never positive Off evidence");
+      context = fresh_context();
+      Check(!xefg::QueryBridgeOff(receipt_source).available, "replacement context starts without inherited Off");
+      Hooks::Enable(context_handle, 0);
+      Check(xefg::QueryBridgeOff(receipt_source).available, "replacement context can accept its own fresh Disable");
+      {
+        context = fresh_context();
+        ComPtr<ReceiptSwapchain> source_swapchain;
+        source_swapchain.Attach(new ReceiptSwapchain(identity.Get()));
+        ComPtr<ReceiptSwapchain> sdk_proxy;
+        sdk_proxy.Attach(new ReceiptSwapchain(other_identity.Get()));
+        receipt_proxy = sdk_proxy.Get();
+        receipt_context_handle = context_handle;
+        context->bridge_application_device11.Reset();
+        context->bridge_proxy_device11 = other_identity;
+        context->proxy_identity = adapter::Identity(sdk_proxy.Get());
+        const auto saved_proxy_real = adapter::proxies[0].real;
+        const auto saved_source_real = adapter::source_present_slots[0].real;
+        adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakePresent);
+        adapter::source_present_slots[0].real[0] = reinterpret_cast<void*>(&FakeSourcePresent);
+        const auto register_source = [&](ReceiptSwapchain* swapchain, uintptr_t owner) {
+          auto source = std::make_shared<adapter::BridgeSourceSwapchain>();
+          source->owner = owner;
+          source->identity = adapter::Identity(swapchain);
+          source->device11 = adapter::BridgeDeviceIdentity(swapchain);
+          source->generation = ++adapter::state.bridge_source_generation;
+          source->hook_ready = true;  // MOCK registration; no code detour or GPU is installed.
+          adapter::state.bridge_swapchains[owner] = source;
+          return source;
+        };
+        constexpr uintptr_t SOURCE_OWNER = 0xED001;
+        auto registration = register_source(source_swapchain.Get(), SOURCE_OWNER);
+        const auto source_refs = source_swapchain->references;
+        const auto normal_present = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+          return adapter::ProxyHooks<0>::Present(static_cast<IDXGISwapChain*>(receipt_proxy), interval, flags);
+        };
+        source_swapchain->present_callback = normal_present;
+        const auto run_source = [&](UINT flags = 0) {
+          return adapter::SourcePresentHooks<0>::Present(source_swapchain.Get(), 0, flags);
+        };
+        const auto accept_link = [&] {
+          Check(run_source() == S_OK, "source wrapper forwards its exact successful SDK proxy call");
+          Hooks::Enable(context_handle, 0);
+          Check(xefg::QueryBridgeOff(receipt_source).available, "a proven host link still requires a fresh successful Disable");
+        };
+        Hooks::Enable(context_handle, 0);
+        Check(!xefg::QueryBridgeOff(receipt_source).available,
+            "different device identities cannot infer a host link from the sole registered source");
+        adapter::ProxyHooks<0>::Present(sdk_proxy.Get(), 0, 0);
+        Check(context->bridge_source_swapchain == 0, "an SDK proxy outside the source call stack does not establish a link");
+        Check(run_source(DXGI_PRESENT_TEST) == S_OK && context->bridge_source_swapchain == 0,
+            "test Presents do not establish a source link");
+        accept_link();
+        const auto linked = xefg::QueryBridgeOff(receipt_source);
+        Check(linked.uses_source_link && linked.source_swapchain == SOURCE_OWNER
+                  && linked.source_swapchain_generation == registration->generation
+                  && linked.proxy_device11 == reinterpret_cast<uintptr_t>(other_identity.Get())
+                  && source_swapchain->references == source_refs,
+            "host mapping preserves the different raw SDK device and never retains the source swapchain");
+        Check(run_source() == S_OK && xefg::QueryBridgeOff(receipt_source).available
+                  && context->bridge_link_generation == linked.source_link_generation,
+            "repeated identical successful calls do not churn an existing link or Disable receipt");
+        adapter::proxies[0].real[0] = reinterpret_cast<void*>(&OccludedReceiptPresent);
+        Check(run_source() == DXGI_STATUS_OCCLUDED && xefg::QueryBridgeOff(receipt_source).available
+                  && context->bridge_link_generation == linked.source_link_generation,
+            "a normal positive Present status preserves the call relation without claiming image delivery");
+        adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakePresent);
+        source_swapchain->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+          const auto status = adapter::ProxyHooks<0>::Present(static_cast<IDXGISwapChain*>(receipt_proxy), interval, flags);
+          Hooks::Enable(receipt_context_handle, 1);
+          Hooks::Enable(receipt_context_handle, 0);
+          return status;
+        };
+        Check(run_source() == S_OK && xefg::QueryBridgeOff(receipt_source).available
+                  && context->bridge_link_generation == linked.source_link_generation,
+            "an interleaved Enable/Disable owns its new receipt without an old Present candidate revoking the stable link");
+        source_swapchain->present_callback = normal_present;
+        receipt_source_available = false;
+        Check(run_source() == S_OK && xefg::QueryBridgeOff(receipt_source).available,
+            "a busy nonblocking observer cannot grant a link or revoke an unchanged proven one");
+        receipt_source_available = true;
+        {
+          adapter::BridgeSourcePresent present1(source_swapchain.Get(), 0);
+          Check(run_source() == S_OK, "same-wrapper nested Present forwarding");
+          present1.Finish(S_OK);
+        }
+        Check(context->bridge_link_generation == linked.source_link_generation,
+            "the same wrapper's Present1-to-Present nesting counts one exact SDK call");
+        adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FailedReceiptPresent);
+        Check(run_source() == E_FAIL && !xefg::QueryBridgeOff(receipt_source).available
+                  && std::strcmp(xefg::QueryBridgeOff(receipt_source).source_link_reason, "proxy_present_failed") == 0,
+            "a failed inner SDK Present revokes the source link with a distinct reason");
+        adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakePresent);
+        accept_link();
+        source_swapchain->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) -> HRESULT {
+          adapter::ProxyHooks<0>::Present(static_cast<IDXGISwapChain*>(receipt_proxy), interval, flags);
+          throw std::runtime_error("MOCK source Present exception");
+        };
+        bool caught = false;
+        try { run_source(); } catch (const std::runtime_error&) { caught = true; }
+        Check(caught && adapter::BridgeSourcePresent::current == nullptr && !xefg::QueryBridgeOff(receipt_source).available,
+            "an exceptional outer return restores TLS and cannot preserve a mapped Disable receipt");
+        source_swapchain->present_callback = normal_present;
+        accept_link();
+        source_swapchain->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+          HRESULT status = E_FAIL;
+          std::thread worker([&] {
+            status = adapter::ProxyHooks<0>::Present(static_cast<IDXGISwapChain*>(receipt_proxy), interval, flags);
+          });
+          worker.join();
+          return status;
+        };
+        Check(run_source() == S_OK && !xefg::QueryBridgeOff(receipt_source).available,
+            "another thread's SDK Present cannot establish the caller's source association");
+        source_swapchain->present_callback = normal_present;
+        accept_link();
+        ComPtr<ReceiptSwapchain> other_proxy;
+        other_proxy.Attach(new ReceiptSwapchain(other_identity.Get()));
+        receipt_secondary_proxy = other_proxy.Get();
+        auto second_context = std::make_shared<adapter::Context>();
+        second_context->bridge_context_ready = second_context->bridge_proxy_ready = true;
+        second_context->proxy_identity = adapter::Identity(other_proxy.Get());
+        second_context->bridge_declaration = ++adapter::state.bridge_declaration;
+        adapter::state.contexts[reinterpret_cast<void*>(uintptr_t{0xEF002})] = second_context;
+        source_swapchain->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+          adapter::ProxyHooks<0>::Present(static_cast<IDXGISwapChain*>(receipt_proxy), interval, flags);
+          return adapter::ProxyHooks<0>::Present(static_cast<IDXGISwapChain*>(receipt_secondary_proxy), interval, flags);
+        };
+        Check(run_source() == S_OK && context->bridge_source_swapchain == 0,
+            "two exact SDK proxies in one source call are ambiguous rather than last-write-wins");
+        adapter::state.contexts.erase(reinterpret_cast<void*>(uintptr_t{0xEF002}));
+        Check(!xefg::QueryBridgeOff(receipt_source).available, "removing a second context cannot revive the revoked receipt");
+        source_swapchain->present_callback = normal_present;
+        accept_link();
+        ComPtr<ReceiptSwapchain> second_source;
+        second_source.Attach(new ReceiptSwapchain(identity.Get()));
+        second_source->present_callback = normal_present;
+        register_source(second_source.Get(), SOURCE_OWNER + 1);
+        Check(adapter::SourcePresentHooks<0>::Present(second_source.Get(), 0, 0) == S_OK
+                  && context->bridge_source_swapchain == 0,
+            "two different source wrappers calling one proxy revoke the previous association");
+        Check(run_source() == S_OK && context->bridge_source_swapchain == 0,
+            "subsequent calls cannot overwrite an unresolved multiple-source association");
+        xefg::ForgetBridgeSourceSwapchain(SOURCE_OWNER + 1);
+        accept_link();
+        source_swapchain->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+          const auto status = adapter::ProxyHooks<0>::Present(static_cast<IDXGISwapChain*>(receipt_proxy), interval, flags);
+          ++receipt_source.generation;
+          return status;
+        };
+        Check(run_source() == S_OK && !xefg::QueryBridgeOff(receipt_source).available,
+            "a source rebuilt inside Present cannot receive the old source generation's link");
+        source_swapchain->present_callback = normal_present;
+        accept_link();
+        receipt_during_sdk = +[] { ++receipt_source.generation; };
+        Hooks::Enable(context_handle, 0);
+        Check(!xefg::QueryBridgeOff(receipt_source).available,
+            "mapped devices retain the original before/after source-generation Disable requirement");
+        receipt_during_sdk = nullptr;
+        accept_link();
+        {
+          adapter::BridgeSourcePresent pending(source_swapchain.Get(), 0);
+          adapter::ProxyHooks<0>::Present(sdk_proxy.Get(), 0, 0);
+          xefg::ForgetBridgeSourceSwapchain(SOURCE_OWNER);
+          registration = register_source(source_swapchain.Get(), SOURCE_OWNER);
+          pending.Finish(S_OK);
+        }
+        Check(context->bridge_source_swapchain == 0 && !xefg::QueryBridgeOff(receipt_source).available,
+            "resize/re-registration during Present cannot grant to a replacement registration at the same address");
+        accept_link();
+        Hooks::Enable(context_handle, 1);
+        Check(!xefg::QueryBridgeOff(receipt_source).available, "reenabling revokes a mapped Off receipt");
+        Hooks::Enable(context_handle, 0);
+        Check(xefg::QueryBridgeOff(receipt_source).available, "a current link can receive its own fresh Disable after reenable");
+        xefg::ForgetBridgeSourceSwapchain(SOURCE_OWNER);
+        Check(!xefg::QueryBridgeOff(receipt_source).available && source_swapchain->references == source_refs,
+            "source destroy revokes its mapped Off and leaves the source swapchain's COM ownership unchanged");
+        adapter::proxies[0].real = saved_proxy_real;
+        adapter::source_present_slots[0].real = saved_source_real;
+        receipt_proxy = receipt_secondary_proxy = nullptr;
+        const auto register_release_probe = [&](uintptr_t owner) {
+          receipt_device_destroyed = receipt_device_release_unlocked = false;
+          ComPtr<ReceiptDeviceIdentity> device;
+          device.Attach(new ReceiptDeviceIdentity());
+          device->on_destroy = +[] {
+            std::thread probe([] {
+              std::unique_lock lock(adapter::state.mutex, std::try_to_lock);
+              receipt_device_destroyed.store(true);
+              receipt_device_release_unlocked.store(lock.owns_lock());
+            });
+            probe.join();
+          };
+          auto source = std::make_shared<adapter::BridgeSourceSwapchain>();
+          source->owner = owner;
+          source->device11 = device;
+          adapter::state.bridge_swapchains[owner] = std::move(source);
+        };
+        register_release_probe(SOURCE_OWNER);
+        xefg::ForgetBridgeSourceSwapchain(SOURCE_OWNER);
+        Check(receipt_device_destroyed && receipt_device_release_unlocked,
+            "source unregister releases the last device reference after unlocking XeFG state");
+        register_release_probe(SOURCE_OWNER);
+        xefg::Stop();
+        Check(receipt_device_destroyed && receipt_device_release_unlocked && adapter::state.bridge_swapchains.empty(),
+            "Stop retires registered devices outside the state lock");
+        adapter::stopped.store(false);
+        std::cout << "PASS CPU MOCK source Present association: nested SDK boundary, identity, failure, ambiguity and teardown\n";
+      }
+      {
+        const auto saved_proxy_real = adapter::proxies[0].real;
+        auto& source_slot = adapter::source_present_slots[0];
+        const auto saved_source_real = source_slot.real;
+        const auto saved_source_target = source_slot.records[0].target;
+        const bool saved_source_installed = source_slot.installed;
+        const bool saved_source_complete = source_slot.complete;
+        ComPtr<ReceiptDeviceIdentity> native_device12;
+        native_device12.Attach(new ReceiptDeviceIdentity());
+        native_device12->supports_device11 = false;
+        native_device12->supports_device12 = true;
+        ComPtr<ReceiptDeviceIdentity> wrapped_device12;
+        wrapped_device12.Attach(new ReceiptDeviceIdentity());
+        wrapped_device12->supports_device11 = false;
+        wrapped_device12->supports_device12 = true;
+        wrapped_device12->native_identity = native_device12.Get();
+        ComPtr<ReceiptSwapchain> source_swapchain;
+        source_swapchain.Attach(new ReceiptSwapchain(nullptr));
+        source_swapchain->reported_device12 = native_device12.Get();
+        ComPtr<ReceiptSwapchain> sdk_proxy;
+        sdk_proxy.Attach(new ReceiptSwapchain(nullptr));
+        sdk_proxy->reported_device = wrapped_device12.Get();
+        sdk_proxy->reported_device12 = wrapped_device12.Get();
+        receipt_proxy = sdk_proxy.Get();
+        receipt_context_handle = context_handle;
+        receipt_source = {.handle = 0xD312, .generation = 1,
+            .device12 = reinterpret_cast<uintptr_t>(static_cast<IUnknown*>(native_device12.Get()))};
+        xefg::ConfigureD3D12Source(&ObserveReceiptD3D12Source);
+        context = fresh_context();
+        context->bridge_application_device11.Reset();
+        context->bridge_proxy_device11.Reset();
+        context->device_identity = native_device12.Get();
+        context->proxy_identity = adapter::Identity(sdk_proxy.Get());
+        context->get_status = &FakeReceiptPresentStatus;
+        const auto capture_proxy = [&] {
+          context->bridge_proxy_device11 = adapter::BridgeDeviceIdentity(sdk_proxy.Get(), &context->bridge_proxy_observation);
+          context->bridge_proxy_ready = adapter::BridgeDeviceCaptureReady(
+              context->bridge_proxy_observation, context->bridge_proxy_device11.Get(), false);
+        };
+        capture_proxy();
+        Check(context->bridge_proxy_device11 == nullptr && context->bridge_proxy_ready
+                  && context->bridge_proxy_observation.device11_result == S_OK
+                  && context->bridge_proxy_observation.device11_interface_result == E_NOINTERFACE
+                  && context->bridge_proxy_observation.device12_interface_result == S_OK
+                  && context->bridge_proxy_observation.returned_device_identity == adapter::Identity(wrapped_device12.Get())
+                  && context->bridge_proxy_observation.device12_interface_identity == adapter::Identity(wrapped_device12.Get())
+                  && renodx::utils::directx::NativeIdentity(wrapped_device12.Get()) == native_device12.Get(),
+            "a D3D12-only object returned for GetDevice11 keeps its raw wrapper identity without being mislabeled D3D11");
+        adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakePresent);
+        // Reuse a MOCK installed slot, so registration exercises its real
+        // bookkeeping without installing a detour or creating a GPU device.
+        source_slot.real[0] = reinterpret_cast<void*>(&FakeSourcePresent);
+        source_slot.records[0].target = reinterpret_cast<uint8_t*>((*reinterpret_cast<void***>(source_swapchain.Get()))[8]);
+        source_slot.installed = source_slot.complete = true;
+        constexpr uintptr_t SOURCE_OWNER = 0xED012;
+        const auto source_refs = source_swapchain->references;
+        const auto register_source = [&] {
+          Check(xefg::RegisterD3D12SourceSwapchain(SOURCE_OWNER, source_swapchain.Get()),
+              "D3D12 source registration reuses its captured native device and installed source hook");
+        };
+        const auto normal_present = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+          return adapter::ProxyHooks<0>::Present(static_cast<IDXGISwapChain*>(receipt_proxy), interval, flags);
+        };
+        source_swapchain->present_callback = normal_present;
+        const auto run_source = [&](UINT flags = 0) {
+          return adapter::SourcePresentHooks<0>::Present(source_swapchain.Get(), 0, flags);
+        };
+        const auto accept_link = [&] {
+          Check(run_source() == S_OK, "D3D12 source forwards one successful nested SDK proxy Present");
+          Hooks::Enable(context_handle, 0);
+          Check(xefg::QueryBridgeOff(receipt_source).available,
+              "D3D12 linked source accepts its own successful explicit Disable");
+        };
+        register_source();
+        Check(adapter::BridgeDeviceIdentity(source_swapchain.Get()) == nullptr
+                  && adapter::D3D12SourceDeviceIdentity(source_swapchain.Get()) == native_device12,
+            "D3D12 identity stays separate from the established D3D11 capture contract");
+        ComPtr<ReceiptDeviceIdentity> unknown_proxy_device;
+        unknown_proxy_device.Attach(new ReceiptDeviceIdentity());
+        unknown_proxy_device->supports_device11 = false;
+        sdk_proxy->reported_device = unknown_proxy_device.Get();
+        sdk_proxy->reported_device12 = unknown_proxy_device.Get();
+        capture_proxy();
+        Check(!context->bridge_proxy_ready && context->bridge_proxy_device11 == nullptr
+                  && run_source() == S_OK && Hooks::Enable(context_handle, 0) == 0
+                  && !xefg::QueryBridgeOff(receipt_source).available && context->bridge_source_swapchain == 0,
+            "an unknown returned object cannot acquire a native D3D12 link or Off receipt through a null D3D11 identity");
+        ComPtr<ReceiptDeviceIdentity> dual_proxy_device;
+        dual_proxy_device.Attach(new ReceiptDeviceIdentity());
+        dual_proxy_device->supports_device12 = true;
+        sdk_proxy->reported_device = dual_proxy_device.Get();
+        sdk_proxy->reported_device12 = dual_proxy_device.Get();
+        capture_proxy();
+        Check(context->bridge_proxy_ready && context->bridge_proxy_device11 != nullptr
+                  && run_source() == S_OK && Hooks::Enable(context_handle, 0) == 0
+                  && !xefg::QueryBridgeOff(receipt_source).available && context->bridge_source_swapchain == 0,
+            "a true dual-interface device retains D3D11 classification and cannot enter the native D3D12 source contract");
+        sdk_proxy->reported_device = wrapped_device12.Get();
+        sdk_proxy->reported_device12 = wrapped_device12.Get();
+        capture_proxy();
+        Hooks::Enable(context_handle, 0);
+        Check(!xefg::QueryBridgeOff(receipt_source).available,
+            "same device and a unique D3D12 source cannot substitute for a nested source/proxy link");
+        adapter::ProxyHooks<0>::Present(sdk_proxy.Get(), 0, 0);
+        const auto sdk_output = renodx::addons::dlss5::output_framerate::Read(
+            renodx::addons::dlss5::output_framerate::NowNs());
+        Check(sdk_output.fg_off && sdk_output.identity == reinterpret_cast<uintptr_t>(context.get())
+                  && !xefg::QueryBridgeOff(receipt_source).available,
+            "SDK Off samples expose the real output context token without inventing a Disable receipt");
+        Check(run_source(DXGI_PRESENT_TEST) == S_OK && context->bridge_source_swapchain == 0,
+            "D3D12 test Presents cannot establish the source/proxy relation");
+        accept_link();
+        const auto linked = xefg::QueryBridgeOff(receipt_source);
+        Check(linked.context == reinterpret_cast<uintptr_t>(context_handle)
+                  && linked.context_identity == sdk_output.identity && linked.uses_source_link
+                  && linked.source == receipt_source && linked.source_swapchain == SOURCE_OWNER
+                  && linked.source.device11 == 0 && source_swapchain->references == source_refs
+                  && linked.source_present_thread_id == GetCurrentThreadId() && linked.source_present_proxy_entry_depth == 0,
+            "D3D12 Off evidence binds SDK handle, output identity, source generation and borrowed source swapchain");
+        auto matched_output = sdk_output;
+        matched_output.available = true;  // MOCK ready window; no wall-clock/GPU measurement.
+        Check(linked.MatchesOutput(matched_output), "D3D12 Off receipt accepts a ready Off SDK window from its exact context");
+        ++matched_output.identity;
+        Check(!linked.MatchesOutput(matched_output), "D3D12 Off receipt rejects another context's SDK FPS");
+        matched_output.identity = linked.context_identity;
+        matched_output.source = renodx::addons::dlss5::output_framerate::Source::PRESENT;
+        Check(!linked.MatchesOutput(matched_output), "D3D12 Off receipt does not relabel Present cadence as SDK output");
+        matched_output.source = sdk_output.source;
+        matched_output.fg_off = false;
+        Check(!linked.MatchesOutput(matched_output), "D3D12 Off receipt rejects SDK windows without Off samples");
+        matched_output.fg_off = true;
+        matched_output.available = false;
+        Check(!linked.MatchesOutput(matched_output), "D3D12 Off receipt rejects a warming or stale SDK window");
+        matched_output.available = true;
+        auto unobserved_off = linked;
+        unobserved_off.available = false;
+        Check(!unobserved_off.MatchesOutput(matched_output), "ready SDK Off samples cannot replace an explicit Disable receipt");
+        Check(run_source() == S_OK && Hooks::Enable(context_handle, 0) == 0
+                  && xefg::QueryBridgeOff(receipt_source).available
+                  && context->epoch == linked.epoch && context->bridge_link_generation == linked.source_link_generation
+                  && context->bridge_declaration != linked.declaration,
+            "repeated identical Disable calls preserve the stable epoch/link cache key");
+        receipt_sdk_status = -19;
+        Hooks::Enable(context_handle, 0);
+        Check(!xefg::QueryBridgeOff(receipt_source).available,
+            "D3D12 failed Disable revokes the old receipt despite Off status samples");
+        receipt_sdk_status = 0;
+        accept_link();
+        receipt_source_available = false;
+        Hooks::Enable(context_handle, 0);
+        Check(!xefg::QueryBridgeOff(receipt_source).available,
+            "a busy D3D12 observer cannot preserve the previous Disable receipt");
+        receipt_source_available = true;
+        accept_link();
+        receipt_during_sdk = +[] { ++receipt_source.generation; };
+        Hooks::Enable(context_handle, 0);
+        Check(!xefg::QueryBridgeOff(receipt_source).available,
+            "D3D12 source generation changing inside Disable rejects the result");
+        receipt_during_sdk = nullptr;
+        accept_link();
+        receipt_device12_matches = 2;
+        Check(run_source() == S_OK && !xefg::QueryBridgeOff(receipt_source).available,
+            "multiple D3D12 SR sources on one device revoke the established relation");
+        receipt_device12_matches = 1;
+        Check(!xefg::QueryBridgeOff(receipt_source).available,
+            "removing the source ambiguity cannot revive its old Disable receipt");
+        accept_link();
+        ComPtr<ReceiptSwapchain> second_source;
+        second_source.Attach(new ReceiptSwapchain(nullptr));
+        second_source->reported_device12 = native_device12.Get();
+        Check(xefg::RegisterD3D12SourceSwapchain(SOURCE_OWNER + 1, second_source.Get())
+                  && !xefg::QueryBridgeOff(receipt_source).available,
+            "a second registered D3D12 chain immediately revokes same-device Off before it presents");
+        Check(run_source() == S_OK && context->bridge_source_swapchain == 0,
+            "a proven chain cannot overwrite same-device D3D12 chain ambiguity");
+        xefg::ForgetBridgeSourceSwapchain(SOURCE_OWNER + 1);
+        Check(!xefg::QueryBridgeOff(receipt_source).available,
+            "removing the second D3D12 chain does not revive a revoked receipt");
+        accept_link();
+        context->device_identity = other_identity;
+        Check(run_source() == S_OK && !xefg::QueryBridgeOff(receipt_source).available,
+            "a nested proxy on another D3D12 device cannot authorize the source");
+        context->device_identity = native_device12.Get();
+        accept_link();
+        Hooks::Enable(context_handle, 1);
+        Check(!xefg::QueryBridgeOff(receipt_source).available, "D3D12 Enable immediately revokes explicit Off");
+        Hooks::Enable(context_handle, 0);
+        Check(xefg::QueryBridgeOff(receipt_source).available && context->epoch != linked.epoch,
+            "D3D12 reenable/disable changes the epoch before accepting a new receipt");
+        adapter::BeforeResize(sdk_proxy.Get());
+        Check(!xefg::QueryBridgeOff(receipt_source).available,
+            "D3D12 SDK proxy resize revokes its source link and Disable receipt");
+        accept_link();
+        xefg::ForgetBridgeSourceSwapchain(SOURCE_OWNER);
+        Check(!xefg::QueryBridgeOff(receipt_source).available && source_swapchain->references == source_refs,
+            "D3D12 source teardown revokes Off without retaining the swapchain");
+        sdk_proxy->present_callback = normal_present;
+        Check(xefg::RegisterD3D12SourceSwapchain(SOURCE_OWNER, sdk_proxy.Get()),
+            "MOCK can register the SDK proxy itself to test rejection at the nested boundary");
+        Check(adapter::SourcePresentHooks<0>::Present(sdk_proxy.Get(), 0, 0) == S_OK
+                  && context->bridge_source_swapchain == 0 && !xefg::QueryBridgeOff(receipt_source).available,
+            "D3D12 SDK proxy cannot self-certify as an independent source chain");
+        xefg::ForgetBridgeSourceSwapchain(SOURCE_OWNER);
+        register_source();
+        accept_link();
+        {
+          // Reverse the same callbacks: the SDK proxy now presents the
+          // registered D3D12 chain inside its own original Present call.
+          const auto saved_secondary_real = adapter::proxies[1].real[0];
+          adapter::proxies[1].real[0] = reinterpret_cast<void*>(&FakePresent);
+          adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakeSourcePresent);
+          receipt_inner_source = source_swapchain.Get();
+          const auto leaf_present = +[](ReceiptSwapchain*, UINT, UINT) { return S_OK; };
+          source_swapchain->present_callback = leaf_present;
+          const auto reverse_present = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+            return adapter::SourcePresentHooks<0>::Present(receipt_inner_source, interval, flags);
+          };
+          sdk_proxy->present_callback = reverse_present;
+          const auto run_proxy = [&](UINT flags = 0) {
+            return adapter::ProxyHooks<0>::Present(sdk_proxy.Get(), 0, flags);
+          };
+          const auto accept_reverse = [&] {
+            Check(run_proxy() == S_OK && Hooks::Enable(context_handle, 0) == 0
+                      && xefg::QueryBridgeOff(receipt_source).available,
+                "one successful reverse D3D12 proxy/source call accepts its own public Disable");
+          };
+          adapter::BeforeResize(sdk_proxy.Get());
+          sdk_proxy->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+            const auto status = adapter::SourcePresentHooks<0>::Present(receipt_inner_source, interval, flags);
+            Check(adapter::state.contexts.at(receipt_context_handle)->bridge_source_swapchain == 0,
+                "a completed inner D3D12 source cannot grant a link before the outer SDK proxy returns");
+            return status;
+          };
+          accept_reverse();
+          sdk_proxy->present_callback = reverse_present;
+          const auto reverse_link = xefg::QueryBridgeOff(receipt_source);
+          Check(std::strcmp(reverse_link.source_link_reason, "proxy_to_source_mapping_observed") == 0,
+              "reverse mapping reports its actual observed call direction as metadata");
+          Check(reverse_link.source_present_thread_id == GetCurrentThreadId()
+                    && reverse_link.source_present_proxy_entry_depth == 1,
+              "reverse source metadata records its actual entry thread and SDK proxy depth");
+          accept_reverse();
+          Check(xefg::QueryBridgeOff(receipt_source).source_link_generation == reverse_link.source_link_generation
+                    && source_swapchain->references == source_refs,
+              "repeated reverse Presents retain the link generation without owning the source swapchain");
+          {
+            const auto worker_source_present = +[] {
+              HRESULT status = E_FAIL;
+              std::thread worker([&] {
+                status = adapter::SourcePresentHooks<0>::Present(receipt_inner_source, 0, 0);
+              });
+              worker.join();
+              Check(status == S_OK, "a non-nested worker source Present preserves its original success status");
+            };
+#if defined(NR_NEXUS_DEV_CONTROL)
+            const auto events_after = [](uint64_t sequence) {
+              const auto snapshot = xefg::CopyBridgeEvents();
+              std::vector<xefg::BridgeEvent> events;
+              for (uint32_t index = 0; index < snapshot.count; ++index) {
+                if (snapshot.events[index].sequence > sequence) {
+                  events.push_back(snapshot.events[index]);
+                }
+              }
+              return events;
+            };
+#endif
+            for (const bool during_disable : {true, false}) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+              const auto trace_start = xefg::CopyBridgeEvents().last_sequence;
+#endif
+              const auto before_on = xefg::QueryBridgeOff(receipt_source);
+              const auto initial_epoch = context->epoch;
+              Check(before_on.available && Hooks::Enable(context_handle, 1) == 0
+                        && context->epoch == initial_epoch + 1
+                        && context->bridge_link_generation == before_on.source_link_generation,
+                  "Enable advances its frame epoch without changing the independently proven source relation");
+              const auto on_epoch = context->epoch;
+              if (during_disable) {
+                receipt_during_sdk = worker_source_present;
+              }
+              const auto disable_status = Hooks::Enable(context_handle, 0);
+              receipt_during_sdk = nullptr;
+              const auto after_disable = xefg::QueryBridgeOff(receipt_source);
+              Check(disable_status == 0 && context->epoch == on_epoch + 1 && !context->enabled,
+                  "successful Disable advances its own epoch in either worker ordering");
+              if (during_disable) {
+                Check(!after_disable.available && std::strcmp(after_disable.reason, "context_changed_during_disable") == 0,
+                    "a link revoked inside Disable cannot inherit that call's stale source-link generation");
+              } else {
+                Check(after_disable.available && after_disable.epoch == context->epoch
+                          && after_disable.source_link_generation == before_on.source_link_generation,
+                    "Disable with an unchanged link accepts the new epoch before any later worker Present");
+                worker_source_present();
+              }
+              const auto revoked = xefg::QueryBridgeOff(receipt_source);
+              Check(!revoked.available && context->bridge_source_swapchain == 0
+                        && revoked.source_link_generation > before_on.source_link_generation
+                        && std::strcmp(revoked.source_link_reason, "nested_proxy_unobserved") == 0
+                        && revoked.source_present_thread_id != GetCurrentThreadId() && revoked.source_present_proxy_entry_depth == 0,
+                  "a worker Present outside the SDK proxy revokes the link whether it runs inside or after Disable");
+              const auto off_epoch = context->epoch;
+              Check(run_proxy() == S_OK, "the main SDK proxy can re-observe the same source after the worker Present");
+              const auto remapped = xefg::QueryBridgeOff(receipt_source);
+              Check(!remapped.available && remapped.context_identity == before_on.context_identity
+                        && remapped.proxy == before_on.proxy && remapped.source == before_on.source
+                        && remapped.source_swapchain == before_on.source_swapchain
+                        && remapped.source_swapchain_generation == before_on.source_swapchain_generation
+                        && remapped.source_link_generation > revoked.source_link_generation && context->epoch == off_epoch
+                        && std::strcmp(remapped.reason, "source_mapping_changed") == 0,
+                  "re-proving unchanged identities creates a new link but cannot revive the old Disable receipt");
+              Check(Hooks::Enable(context_handle, 0) == 0 && xefg::QueryBridgeOff(receipt_source).available
+                        && context->epoch == off_epoch && context->bridge_link_generation == remapped.source_link_generation,
+                  "a fresh public Disable after stable mapping grants its own receipt without another epoch or link change");
+#if defined(NR_NEXUS_DEV_CONTROL)
+              const auto events = events_after(trace_start);
+              Check(events.size() == 8 && events[0].kind == xefg::BridgeEventKind::ENABLE_BEGIN
+                        && events[1].kind == xefg::BridgeEventKind::ENABLE_END
+                        && events[2].kind == xefg::BridgeEventKind::ENABLE_BEGIN,
+                  "DEV events record only SDK boundaries and actual link changes, not repeated stable Presents");
+              const auto& disable_begin = events[2];
+              const auto& disable_end = events[during_disable ? 4 : 3];
+              const auto& revoke = events[during_disable ? 3 : 4];
+              const auto& observed = events[5];
+              Check(disable_end.kind == xefg::BridgeEventKind::ENABLE_END
+                        && revoke.kind == xefg::BridgeEventKind::LINK_REVOKED
+                        && disable_begin.declaration == disable_end.declaration
+                        && disable_begin.enabled_request == 0 && disable_end.enabled_request == 0
+                        && disable_end.sdk_status == 0 && disable_end.off_observed == !during_disable
+                        && disable_begin.observed_ns <= disable_end.sdk_return_ns
+                        && disable_end.sdk_return_ns <= disable_end.observed_ns,
+                  "DEV Disable events bind the real SDK return and later receipt result to one declaration");
+              Check(during_disable ? revoke.observed_ns <= disable_end.sdk_return_ns
+                                   : revoke.observed_ns >= disable_end.observed_ns,
+                  "DEV timestamps preserve callback revocation before the return sample and later revocation after receipt commit");
+              Check(revoke.source == before_on.source && revoke.source_swapchain == before_on.source_swapchain
+                        && revoke.source_swapchain_generation == before_on.source_swapchain_generation
+                        && revoke.link_generation == revoked.source_link_generation && !revoke.off_observed
+                        && revoke.context_identity == before_on.context_identity
+                        && std::strcmp(revoke.reason, "nested_proxy_unobserved") == 0
+                        && revoke.source_entry.method == xefg::BridgePresentMethod::PRESENT
+                        && revoke.source_entry.return_address != 0 && revoke.source_entry.thread_id == revoke.thread_id
+                        && revoke.source_entry.thread_id != GetCurrentThreadId()
+                        && revoke.source_entry.proxy_entry_depth == 0
+                        && revoke.source_entry.interval == 0 && revoke.source_entry.flags == 0,
+                  "DEV revocation preserves the old identity, new generation, and actual non-nested worker entry");
+              Check(observed.kind == xefg::BridgeEventKind::LINK_OBSERVED
+                        && observed.source == before_on.source && observed.link_generation == remapped.source_link_generation
+                        && observed.source_entry.thread_id == GetCurrentThreadId() && observed.source_entry.proxy_entry_depth == 1
+                        && events[6].kind == xefg::BridgeEventKind::ENABLE_BEGIN
+                        && events[7].kind == xefg::BridgeEventKind::ENABLE_END && events[7].off_observed
+                        && events[7].declaration == events[6].declaration
+                        && events[7].declaration > disable_end.declaration,
+                  "DEV re-proof and a fresh Disable remain separate events and cannot revive an old Off receipt");
+              for (size_t index = 1; index < events.size(); ++index) {
+                Check(events[index].sequence == events[index - 1].sequence + 1
+                          && events[index].observed_ns >= events[index - 1].observed_ns,
+                    "DEV link and SDK events retain one ordered sequence and steady clock across threads");
+              }
+#endif
+              std::cout << "OBS CPU MOCK Disable/source order: worker=" << (during_disable ? "inside_disable" : "after_disable")
+                        << " epoch=" << context->epoch << " link=" << context->bridge_link_generation
+                        << " repeated_disable_off=1; GPU=NotRun\n";
+            }
+#if defined(NR_NEXUS_DEV_CONTROL)
+            const auto trace_before_observer = xefg::CopyBridgeEvents().last_sequence;
+            receipt_after_sdk_observer = worker_source_present;
+            const auto observer_disable_status = Hooks::Enable(context_handle, 0);
+            receipt_after_sdk_observer = nullptr;
+            const auto observer_events = events_after(trace_before_observer);
+            Check(observer_disable_status == 0 && !xefg::QueryBridgeOff(receipt_source).available
+                      && observer_events.size() == 3
+                      && observer_events[0].kind == xefg::BridgeEventKind::ENABLE_BEGIN
+                      && observer_events[1].kind == xefg::BridgeEventKind::LINK_REVOKED
+                      && observer_events[2].kind == xefg::BridgeEventKind::ENABLE_END
+                      && observer_events[2].sdk_return_ns <= observer_events[1].observed_ns
+                      && observer_events[1].observed_ns <= observer_events[2].observed_ns
+                      && !observer_events[2].off_observed,
+                "DEV SDK return timestamp separates post-return observer revocation from the later rejected receipt commit");
+            Check(run_proxy() == S_OK && Hooks::Enable(context_handle, 0) == 0
+                      && xefg::QueryBridgeOff(receipt_source).available,
+                "a fresh explicit Disable recovers after post-return revocation without relaxing source gates");
+            const auto trace_before_reentry = xefg::CopyBridgeEvents().last_sequence;
+            receipt_during_sdk = +[] {
+              receipt_during_sdk = nullptr;
+              Check(Hooks::Enable(receipt_context_handle, 0) == 0,
+                  "a reentrant public Disable preserves the real SDK success status");
+            };
+            const auto reentrant_status = Hooks::Enable(context_handle, 0);
+            receipt_during_sdk = nullptr;
+            const auto reentrant_events = events_after(trace_before_reentry);
+            Check(reentrant_status == 0 && !xefg::QueryBridgeOff(receipt_source).available
+                      && context->bridge_enable_inflight == 0 && reentrant_events.size() == 4
+                      && reentrant_events[0].kind == xefg::BridgeEventKind::ENABLE_BEGIN
+                      && reentrant_events[1].kind == xefg::BridgeEventKind::ENABLE_BEGIN
+                      && reentrant_events[2].kind == xefg::BridgeEventKind::ENABLE_END
+                      && reentrant_events[3].kind == xefg::BridgeEventKind::ENABLE_END
+                      && reentrant_events[0].declaration == reentrant_events[3].declaration
+                      && reentrant_events[1].declaration == reentrant_events[2].declaration
+                      && reentrant_events[1].declaration > reentrant_events[0].declaration
+                      && !reentrant_events[2].off_observed && !reentrant_events[3].off_observed
+                      && std::strcmp(reentrant_events[2].reason, "context_changed_during_disable") == 0
+                      && std::strcmp(reentrant_events[3].reason, "context_changed_during_disable") == 0
+                      && std::strcmp(context->bridge_off_reason, "set_enabled_in_flight") == 0,
+                "DEV END metadata belongs to its own rejected declaration and does not rewrite the production context reason");
+            Check(Hooks::Enable(context_handle, 0) == 0 && xefg::QueryBridgeOff(receipt_source).available,
+                "reentrant declarations still require a fresh stable explicit Disable for Off evidence");
+            const auto trace_before_overflow = xefg::CopyBridgeEvents().last_sequence;
+            for (uint32_t index = 0; index < 17; ++index) {
+              Check(Hooks::Enable(context_handle, 0) == 0 && xefg::QueryBridgeOff(receipt_source).available,
+                  "bounded event retention does not alter stable explicit Off evidence");
+            }
+            const auto overflow = xefg::CopyBridgeEvents();
+            const auto repeated = xefg::CopyBridgeEvents();
+            Check(overflow.count == 32 && overflow.last_sequence == trace_before_overflow + 34
+                      && overflow.overwritten == overflow.last_sequence - overflow.count
+                      && overflow.events[0].sequence == overflow.last_sequence - 31
+                      && overflow.events[31].sequence == overflow.last_sequence
+                      && repeated.count == overflow.count && repeated.last_sequence == overflow.last_sequence
+                      && repeated.overwritten == overflow.overwritten && xefg::QueryBridgeOff(receipt_source).available,
+                "DEV event storage retains the newest 32 records with an explicit overwrite count and non-consuming reads");
+            for (uint32_t index = 1; index < overflow.count; ++index) {
+              Check(overflow.events[index].sequence == overflow.events[index - 1].sequence + 1,
+                  "DEV ring wrap preserves append order");
+            }
+            std::cout << "PASS CPU MOCK bounded DEV source/Disable events: SDK return/commit, source entries, re-proof and 32-event wrap; GPU=NotRun\n";
+#endif
+            std::cout << "PASS CPU MOCK Disable/source ordering: inside/after revocation, stable re-proof and explicit repeated Disable; GPU=NotRun\n";
+          }
+          {
+            // Function detours also see unregistered objects sharing the same
+            // Present implementation; their scope must not hide the SDK call.
+            ComPtr<ReceiptSwapchain> unregistered_outer;
+            unregistered_outer.Attach(new ReceiptSwapchain(nullptr));
+            unregistered_outer->reported_device12 = native_device12.Get();
+            unregistered_outer->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+              return adapter::ProxyHooks<0>::Present(static_cast<IDXGISwapChain*>(receipt_proxy), interval, flags);
+            };
+            ComPtr<ReceiptSwapchain> unregistered_inner;
+            unregistered_inner.Attach(new ReceiptSwapchain(nullptr));
+            unregistered_inner->reported_device12 = native_device12.Get();
+            unregistered_inner->present_callback = leaf_present;
+            Check(adapter::Identity(unregistered_outer.Get()) != adapter::Identity(sdk_proxy.Get())
+                      && adapter::Identity(unregistered_outer.Get()) != adapter::Identity(source_swapchain.Get())
+                      && adapter::Identity(sdk_proxy.Get()) != adapter::Identity(source_swapchain.Get()),
+                "unregistered outer, SDK proxy and registered source use different IUnknown identities");
+            const auto run_wrapped_proxy = [&] {
+              return adapter::SourcePresentHooks<0>::Present(unregistered_outer.Get(), 0, 0);
+            };
+            adapter::BeforeResize(sdk_proxy.Get());
+            receipt_inner_source = unregistered_inner.Get();
+            Check(run_wrapped_proxy() == S_OK && Hooks::Enable(context_handle, 0) == 0
+                      && !xefg::QueryBridgeOff(receipt_source).available && context->bridge_source_swapchain == 0,
+                "an unregistered outer and unregistered inner cannot certify a D3D12 source relation");
+            receipt_inner_source = source_swapchain.Get();
+            sdk_proxy->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+              adapter::SourcePresentHooks<0>::Present(receipt_inner_source, interval, flags);
+              return adapter::SourcePresentHooks<0>::Present(receipt_inner_source, interval, flags);
+            };
+            Check(run_wrapped_proxy() == S_OK && Hooks::Enable(context_handle, 0) == 0
+                      && !xefg::QueryBridgeOff(receipt_source).available && context->bridge_source_swapchain == 0,
+                "an unregistered outer does not authorize two registered inner source Presents");
+            std::cout << "PASS CPU MOCK unregistered-scope safety: missing registered inner and duplicate inner remain rejected\n";
+            sdk_proxy->present_callback = reverse_present;
+            source_swapchain->present_callback = +[](ReceiptSwapchain*, UINT, UINT) {
+              Check(adapter::proxy_entry_depth == 1,
+                  "the registered source runs inside the actual instrumented SDK proxy call");
+              Check(adapter::state.contexts.at(receipt_context_handle)->bridge_source_swapchain == 0,
+                  "the unregistered-wrapper reverse candidate stays pending until outer SDK success");
+              std::cout << "OBS CPU MOCK unregistered-scope inner: proxy_entry_depth=" << adapter::proxy_entry_depth
+                        << " reverse_scope=" << (adapter::D3D12ProxyPresentObservation::current != nullptr) << '\n';
+              return S_OK;
+            };
+            const auto presents_before = context->application_frame;
+            const auto status = run_wrapped_proxy();
+            const auto disable = Hooks::Enable(context_handle, 0);
+            const auto wrapped_link = xefg::QueryBridgeOff(receipt_source);
+            std::cout << "OBS CPU MOCK unregistered-scope result: present_status=" << status << " disable_status=" << disable
+                      << " sdk_application_presents=" << context->application_frame - presents_before
+                      << " source_link_reason=" << wrapped_link.source_link_reason
+                      << " source_link_generation=" << wrapped_link.source_link_generation
+                      << " available=" << wrapped_link.available << "; GPU=NotRun\n";
+            Check(status == S_OK && disable == 0 && wrapped_link.available
+                      && std::strcmp(wrapped_link.source_link_reason, "proxy_to_source_mapping_observed_unregistered_outer") == 0
+                      && wrapped_link.source_present_thread_id == GetCurrentThreadId()
+                      && wrapped_link.source_present_proxy_entry_depth == 1,
+                "an unregistered source detour wrapper must not hide the strict reverse D3D12 source/proxy relation");
+            source_swapchain->present_callback = leaf_present;
+          }
+          sdk_proxy->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+            adapter::SourcePresentHooks<0>::Present(receipt_inner_source, interval, flags);
+            return E_FAIL;
+          };
+          Check(run_proxy() == E_FAIL && !xefg::QueryBridgeOff(receipt_source).available
+                    && context->bridge_source_swapchain == 0,
+              "a successful inner source cannot preserve proof after its outer proxy fails");
+          sdk_proxy->present_callback = reverse_present;
+          accept_reverse();
+          sdk_proxy->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+            adapter::SourcePresentHooks<0>::Present(receipt_inner_source, interval, flags);
+            return adapter::SourcePresentHooks<0>::Present(receipt_inner_source, interval, flags);
+          };
+          Check(run_proxy() == S_OK && !xefg::QueryBridgeOff(receipt_source).available
+                    && context->bridge_source_swapchain == 0,
+              "two inner D3D12 source Presents cannot certify a one-to-one reverse relation");
+          sdk_proxy->present_callback = reverse_present;
+          accept_reverse();
+          source_swapchain->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+            return adapter::ProxyHooks<1>::Present(static_cast<IDXGISwapChain*>(receipt_proxy), interval, flags);
+          };
+          Check(run_proxy() == S_OK && !xefg::QueryBridgeOff(receipt_source).available,
+              "another proxy entry inside the reverse source revokes the one-to-one proof");
+          source_swapchain->present_callback = leaf_present;
+          accept_reverse();
+          sdk_proxy->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+            const auto status = adapter::SourcePresentHooks<0>::Present(receipt_inner_source, interval, flags);
+            ++receipt_source.generation;
+            return status;
+          };
+          Check(run_proxy() == S_OK && !xefg::QueryBridgeOff(receipt_source).available
+                    && context->bridge_source_swapchain == 0,
+              "a source rebuilt after the inner return cannot receive the outer proxy's pending link");
+          adapter::BeforeResize(sdk_proxy.Get());
+          sdk_proxy->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+            const auto status = adapter::SourcePresentHooks<0>::Present(receipt_inner_source, interval, flags);
+            ++adapter::state.contexts.at(receipt_context_handle)->epoch;
+            return status;
+          };
+          Check(run_proxy() == S_OK && !xefg::QueryBridgeOff(receipt_source).available
+                    && context->bridge_source_swapchain == 0,
+              "an epoch change after the inner return cannot accept a pending reverse link");
+          sdk_proxy->present_callback = reverse_present;
+          accept_reverse();
+          sdk_proxy->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+            const auto status = adapter::SourcePresentHooks<0>::Present(receipt_inner_source, interval, flags);
+            adapter::state.contexts.at(receipt_context_handle) = std::make_shared<adapter::Context>();
+            return status;
+          };
+          Check(run_proxy() == S_OK && !xefg::QueryBridgeOff(receipt_source).available
+                    && context->bridge_source_swapchain == 0,
+              "a replacement context at the same SDK handle cannot receive a pending reverse link");
+          adapter::state.contexts[context_handle] = context;
+          sdk_proxy->present_callback = reverse_present;
+          accept_reverse();
+          sdk_proxy->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) -> HRESULT {
+            adapter::SourcePresentHooks<0>::Present(receipt_inner_source, interval, flags);
+            throw std::runtime_error("MOCK outer SDK proxy exception");
+          };
+          bool caught = false;
+          try { run_proxy(); } catch (const std::runtime_error&) { caught = true; }
+          Check(caught && !xefg::QueryBridgeOff(receipt_source).available
+                    && adapter::BridgeSourcePresent::current == nullptr
+                    && adapter::D3D12ProxyPresentObservation::current == nullptr && adapter::proxy_entry_depth == 0,
+              "an exceptional reverse outer return revokes proof and restores all observation TLS");
+          sdk_proxy->present_callback = reverse_present;
+          accept_reverse();
+          sdk_proxy->present_callback = leaf_present;
+          Check(run_proxy() == S_OK && !xefg::QueryBridgeOff(receipt_source).available
+                    && context->bridge_source_swapchain == 0,
+              "a later SDK proxy without its registered inner source revokes an earlier reverse proof");
+          sdk_proxy->present_callback = reverse_present;
+          Check(run_proxy(DXGI_PRESENT_TEST) == S_OK && context->bridge_source_swapchain == 0,
+              "reverse test Presents cannot establish a source relation");
+          accept_reverse();
+          adapter::BeforeResize(sdk_proxy.Get());
+          xefg::ConfigureD3D12Source(nullptr);
+          Check(run_proxy() == S_OK && context->bridge_source_swapchain == 0
+                    && adapter::D3D12ProxyPresentObservation::current == nullptr,
+              "an unconfigured production observer cannot activate reverse D3D12 observation");
+          xefg::ConfigureD3D12Source(&ObserveReceiptD3D12Source);
+          receipt_inner_source = nullptr;
+          adapter::proxies[1].real[0] = saved_secondary_real;
+          adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakePresent);
+          source_swapchain->present_callback = normal_present;
+          sdk_proxy->present_callback = nullptr;
+          accept_link();
+          std::cout << "PASS CPU MOCK reverse D3D12 Present: deferred commit, public Disable, failure, ambiguity, generation and TLS; GPU=NotRun\n";
+        }
+        receipt_sdk_status = -19;
+        Hooks::Init(context_handle, nullptr, nullptr);
+        Check(!xefg::QueryBridgeOff(receipt_source).available && !context->bridge_context_ready,
+            "D3D12 failed reinitialization revokes Off before the real SDK call");
+        receipt_sdk_status = 0;
+        xefg::ForgetBridgeSourceSwapchain(SOURCE_OWNER);
+        xefg::ConfigureD3D12Source(nullptr);
+        adapter::proxies[0].real = saved_proxy_real;
+        source_slot.real = saved_source_real;
+        source_slot.records[0].target = saved_source_target;
+        source_slot.installed = saved_source_installed;
+        source_slot.complete = saved_source_complete;
+        receipt_proxy = nullptr;
+        std::cout << "PASS CPU MOCK D3D12 explicit Off: nested source/proxy/device identity, SDK FPS token, failure and revocation; GPU=NotRun\n";
+      }
+      adapter::state.contexts.clear();
+      adapter::modules[0].real = saved_real;
+      xefg::ConfigureBridgeSource(nullptr);
+      receipt_source = {};
+      std::cout << "PASS CPU mocked SDK Off receipt: in-flight/failure, source/proxy/context identity, reenable and recovery\n";
+    }
+    if (bridge_off_cpu) {
+      std::cout << "PASS CPU-only Bridge device capture and existing Off receipts; GPU=NotRun\n";
+      return 0;
+    }
     adapter::modules[0].complete = true;
     adapter::modules[0].real[0] = reinterpret_cast<void*>(&FakeInit);
     adapter::modules[0].real[3] = reinterpret_cast<void*>(&FakeResource);

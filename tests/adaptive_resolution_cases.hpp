@@ -62,16 +62,33 @@ inline bool Run() {
   for (int i = 1; i <= 13; ++i) tick(start + i * adaptive::SAMPLE_INTERVAL_NS, 50., 3000.);
   check(session.level == 1 && session.trial, "sustained low FPS probes the next prepared size without a prior NR cost increase");
   const auto lower_generation = session.status.generation;
-  for (int i = 14; i <= 27; ++i) tick(start + i * adaptive::SAMPLE_INTERVAL_NS, 50., 2400.);
+  for (int i = 14; i <= 100; ++i) tick(start + i * adaptive::SAMPLE_INTERVAL_NS, 50., 2400.);
   check(session.level == 0 && session.blocked && !session.trial,
-        "lower NR cost without output FPS benefit restores quality and stops probing");
-  for (int i = 28; i <= 60; ++i) tick(start + i * adaptive::SAMPLE_INTERVAL_NS, 50., 3000.);
-  check(session.level == 0 && session.blocked, "a steady cap does not trigger repeated downscaling");
+        "a bounded descent without output FPS benefit restores quality and stops probing");
+  for (int i = 101; i <= 140; ++i) tick(start + i * adaptive::SAMPLE_INTERVAL_NS, 50., 3000.);
+  check(session.level == 0 && session.blocked, "a steady cap does not trigger downscaling during the cooldown");
   const size_t samples = session.gpu_count;
   session.ObserveGpu({.generation = lower_generation, .frame = ++sequence, .sequence = sequence,
       .recorded_ns = start, .completed_ns = start, .total_us = 1., .valid = true, .stable = true},
       start + 20'000'000'000);
   check(session.gpu_count == samples, "old generation completions cannot drive the new size");
+
+  const int64_t blocked_deadline = session.blocked_until_ns;
+  int retry_step = 141;
+  for (; start + retry_step * adaptive::SAMPLE_INTERVAL_NS < blocked_deadline; ++retry_step) {
+    tick(start + retry_step * adaptive::SAMPLE_INTERVAL_NS, 50., 3000.);
+  }
+  check(session.blocked && !session.trial && session.level == 0,
+        "an unchanged workload remains at the accepted anchor until the bounded cooldown ends");
+  const int64_t retry_ns = start + retry_step * adaptive::SAMPLE_INTERVAL_NS;
+  tick(retry_ns, 50., 3000.);
+  check(!session.blocked && !session.trial && session.gpu_count == 0 && session.stable_after_ns == retry_ns,
+        "cooldown expiry discards prior measurements instead of immediately retrying with old windows");
+  for (int i = 1; i < 8; ++i) tick(retry_ns + i * adaptive::SAMPLE_INTERVAL_NS, 50., 3000.);
+  check(!session.trial && session.level == 0, "pre-expiry output windows cannot launch the retry");
+  tick(retry_ns + 8 * adaptive::SAMPLE_INTERVAL_NS, 50., 3000.);
+  check(session.trial && session.level == 1,
+        "a fresh output and GPU window reopens a bounded trial after the cooldown");
 
   session = {};
   sequence = 0;
@@ -117,6 +134,142 @@ inline bool Run() {
         && profiling.gpu_recorded_ns.back() - profiling.gpu_recorded_ns.front() >= 1'000'000'000,
         "profiling is downsampled by recording time at 60/120/240 Hz");
   }
+  // Two-phase NR costs must be averaged before the 250 ms / five-point filter.
+  // At 120 Hz that cadence can otherwise stay on either phase with zero MAD.
+  constexpr double paired_refresh_us = 3390.9725, paired_reuse_us = 533.0355;
+  constexpr double paired_mean_us = (paired_refresh_us + paired_reuse_us) / 2.;
+  const auto paired_sample = [](adaptive::Session& target, uint64_t frame, uint64_t first,
+                                int64_t now, double cost, bool valid = true, uint64_t context = 1) {
+    adaptive::GpuSample sample{.generation = target.status.generation, .frame = frame, .sequence = frame,
+        .context = context, .recorded_ns = now, .completed_ns = now, .total_us = cost, .valid = valid, .stable = true};
+    sample.paired = true;
+    sample.pair_first_frame = first;
+    sample.sampling_generation = target.sampling_generation;
+    return sample;
+  };
+  for (uint32_t phase = 0; phase < 2; ++phase) {
+    adaptive::Session profiling;
+    profiling.prepared = true;
+    profiling.status.generation = 1;
+    profiling.applied_ns = profiling.stable_after_ns = start;
+    profiling.SetPairedSampling(true);
+    uint32_t measured_sources = 0;
+    int64_t now = start;
+    for (uint64_t frame = 1; frame <= 240; ++frame) {
+      now = start + static_cast<int64_t>(frame - 1) * 1'000'000'000 / 120;
+      const auto first = profiling.SelectMeasurementPair(frame, (frame - 1) % 30 == 0);
+      measured_sources += first != 0;
+      const double cost = ((frame - 1 + phase) % 2 == 0 ? paired_refresh_us : paired_reuse_us);
+      // Include profiling's extra completions; they must not enter as single samples.
+      profiling.ObserveGpu(paired_sample(profiling, frame, first, now, cost), now);
+    }
+    double median = 0., mad = 0.;
+    check(measured_sources == 16 && profiling.GpuStatistics(now, &median, &mad)
+              && std::abs(median - paired_mean_us) < .0001 && mad < .0001,
+          "either 120 Hz phase selects only adjacent pairs and reports their complete per-source mean");
+  }
+  {
+    adaptive::Session pairing;
+    pairing.prepared = true;
+    pairing.status.generation = 1;
+    pairing.applied_ns = pairing.stable_after_ns = start;
+    pairing.SetPairedSampling(true, 0xA1);
+    const auto feed = [&](uint64_t frame, uint64_t first, bool valid = true, uint64_t context = 1) {
+      const int64_t now = start + static_cast<int64_t>(frame) * 10'000'000;
+      pairing.ObserveGpu(paired_sample(pairing, frame, first, now, 2000., valid, context), now);
+    };
+    check(pairing.SelectMeasurementPair(1, true) == 1 && pairing.SelectMeasurementPair(3, false) == 0,
+          "a missing adjacent source does not extend a measurement pair to a later source");
+    feed(1, 1);
+    check(pairing.gpu_count == 0, "one completed source cannot publish a paired cost");
+    feed(2, 1, false);
+    feed(3, 3);
+    feed(5, 3);
+    check(pairing.gpu_count == 0, "invalid or nonadjacent completions never form a GPU cost pair");
+    feed(6, 6);
+    auto old_completion = paired_sample(pairing, 7, 6, start + 70'000'000, 2000.);
+    pairing.InvalidateSampling();
+    pairing.ObserveGpu(old_completion, old_completion.completed_ns);
+    check(pairing.gpu_count == 0, "Reset invalidation rejects a late second source in the same adaptive generation");
+    feed(8, 8);
+    feed(9, 8, true, 2);
+    check(pairing.gpu_count == 0, "different queue contexts cannot supply opposite halves of one pair");
+    feed(10, 10, true, 2);
+    feed(11, 10, true, 2);
+    check(pairing.gpu_count == 1 && pairing.gpu_us[0] == 2000., "a fresh complete pair resumes after rejected halves");
+    feed(12, 12, true, 2);
+    check(pairing.SelectMeasurementPair(12, true) == 12, "the identity probe has a scheduled adjacent source");
+    pairing.trial = true;
+    const auto identity_epoch = pairing.sampling_generation;
+    const auto identity_sequence = pairing.last_sequence;
+    pairing.SetPairedSampling(true, 0xA1);
+    check(pairing.paired_identity == 0xA1 && pairing.sampling_generation == identity_epoch
+              && pairing.gpu_count == 1 && pairing.gpu_us[0] == 2000. && pairing.trial
+              && pairing.pending_pair.frame == 12 && pairing.measure_pair_first_frame == 12,
+          "the same paired identity preserves costs, in-flight halves, scheduling and the active trial");
+    old_completion = paired_sample(pairing, 13, 12, start + 130'000'000, 2000., true, 2);
+    pairing.SetPairedSampling(true, 0xB2);
+    check(pairing.paired_sampling && pairing.paired_identity == 0xB2
+              && pairing.sampling_generation == identity_epoch + 1 && pairing.gpu_count == 0 && !pairing.trial
+              && pairing.pending_pair.frame == 0 && pairing.pending_roles == 0 && pairing.measure_pair_first_frame == 0,
+          "a changed paired identity clears costs and in-flight work and cancels the old trial");
+    pairing.ObserveGpu(old_completion, old_completion.completed_ns);
+    check(pairing.gpu_count == 0 && pairing.pending_pair.frame == 0 && pairing.last_sequence == identity_sequence,
+          "an old-identity completion cannot advance the current sampling sequence or seed a half pair");
+    feed(14, 14, true, 2);
+    feed(15, 14, true, 2);
+    check(pairing.gpu_count == 1 && pairing.gpu_us[0] == 2000., "new-identity adjacent sources resume complete cost pairs");
+    feed(16, 16, true, 2);
+    old_completion = paired_sample(pairing, 17, 16, start + 170'000'000, 2000., true, 2);
+    pairing.SetPairedSampling(false, 0xB2);
+    pairing.ObserveGpu(old_completion, old_completion.completed_ns);
+    check(pairing.gpu_count == 0 && !pairing.paired_sampling && pairing.paired_identity == 0,
+          "leaving paired sampling zeroes its identity and rejects old-mode completions");
+    auto ordinary = paired_sample(pairing, 18, 0, start + 180'000'000, 3000., true, 2);
+    ordinary.paired = false;
+    pairing.ObserveGpu(ordinary, ordinary.completed_ns);
+    check(pairing.gpu_count == 1 && pairing.gpu_us[0] == 3000., "ordinary single-source sampling resumes after paired mode");
+  }
+  for (const bool fps_benefit : {true, false}) {
+    adaptive::Sizes paired_upper{}, paired_floor{};
+    paired_upper[0] = {.width = 3840, .height = 2160};
+    paired_floor[0] = {.width = 2880, .height = 1620};
+    const adaptive::Settings paired_settings{.enabled = true, .target_fps = 60.f, .minimum_scale = .75f,
+        .prepared_levels = 2, .selected_levels = 2};
+    adaptive::Session controller;
+    adaptive::Output paired_output{.available = true, .source = 1, .generation = 1, .configuration = 1};
+    controller.Prepare(paired_settings, paired_upper, paired_floor, 1, paired_output, start, true, false);
+    controller.UpdatePreparation(controller.preparation_epoch, 2, 2, adaptive::Reason::PREPARING, start);
+    controller.Applied(controller.status.generation, controller.status.requested, start);
+    controller.SetPairedSampling(true);
+    const uint32_t steps = (fps_benefit ? 40u : 72u);
+    uint32_t changes = 0;
+    for (uint32_t step = 1; step <= steps; ++step) {
+      const auto now = start + step * adaptive::SAMPLE_INTERVAL_NS;
+      const auto next = now + 8'333'333;
+      const uint64_t first = static_cast<uint64_t>(step) * 30 + 1;
+      const double refresh = (controller.level == 0 ? 5150. : paired_refresh_us);
+      const double reuse = (controller.level == 0 ? 737. : paired_reuse_us);
+      const auto selected = controller.SelectMeasurementPair(first, true);
+      controller.ObserveGpu(paired_sample(controller, first, selected, now, step % 2 == 0 ? refresh : reuse), now);
+      const auto adjacent = controller.SelectMeasurementPair(first + 1, false);
+      controller.ObserveGpu(paired_sample(controller, first + 1, adjacent, next, step % 2 == 0 ? reuse : refresh), next);
+      ++paired_output.serial;
+      paired_output.begin_ns = next - 2'000'000'000;
+      paired_output.end_ns = next;
+      paired_output.fps = (controller.level == 1 && fps_benefit ? 60. : 50.);
+      const auto previous = controller.level;
+      controller.Prepare(paired_settings, paired_upper, paired_floor, 1, paired_output, next, true, false);
+      controller.UpdatePreparation(controller.preparation_epoch, 2, 2, adaptive::Reason::PREPARING, next);
+      controller.Applied(controller.status.generation, controller.status.requested, next);
+      changes += previous != controller.level;
+    }
+    check(fps_benefit ? controller.level == 1 && !controller.trial && !controller.blocked && changes == 1
+                      : controller.level == 0 && !controller.trial && controller.blocked && changes == 2,
+          fps_benefit ? "phase-independent paired costs accept a useful lower tier under the unchanged FPS policy"
+                      : "an unchanged FPS cap rolls back once and changing pair phase cannot reopen its cooldown");
+  }
+
   adaptive::Session dual;
   dual.prepared = true;
   dual.status.generation = 1;
@@ -164,6 +317,73 @@ inline bool Run() {
   check(default_range.count == 8 && full_range.count == 15 && full_range.count == adaptive::MAX_PREPARED_LEVELS
       && full_range.sizes[0] == full_upper && full_range.sizes[full_range.count - 1] == full_floor,
       "the unchanged five-percent grid provides eight default-range sizes and fifteen at the legal minimum");
+  for (const uint32_t count : {9u, 4u}) {
+    const adaptive::Settings curve_settings{.enabled = true, .target_fps = 360.f, .minimum_scale = .33f,
+        .prepared_levels = count, .selected_levels = count};
+    adaptive::Session cumulative;
+    adaptive::Output measured{.available = true, .source = 1, .generation = 1, .configuration = 1,
+        .observed_multiplier = 4.};
+    const auto advance = [&](adaptive::Session* controller, adaptive::Output* observation,
+                             uint64_t step, double fps, double gpu_us) {
+      const int64_t now = start + static_cast<int64_t>(step) * adaptive::SAMPLE_INTERVAL_NS;
+      const uint64_t sequence = ++observation->serial;
+      controller->ObserveGpu({.generation = controller->status.generation, .frame = sequence,
+          .sequence = sequence, .context = 1, .recorded_ns = now, .completed_ns = now,
+          .total_us = gpu_us, .valid = true, .stable = true}, now);
+      observation->begin_ns = now - 2'000'000'000;
+      observation->end_ns = now;
+      observation->fps = fps;
+      controller->Prepare(curve_settings, full_upper, full_floor, 1, *observation, now, true, false);
+      controller->UpdatePreparation(controller->preparation_epoch, static_cast<uint32_t>(controller->ladder.count),
+          static_cast<uint32_t>(controller->ladder.count), adaptive::Reason::PREPARING, now);
+      controller->Applied(controller->status.generation, controller->status.requested, now);
+    };
+    bool retained_anchor = false, checked_boundaries = false;
+    size_t deepest = 0;
+    for (uint64_t step = 0; step <= 480; ++step) {
+      const double coefficient = (cumulative.ladder.count == 0 ? 1. : cumulative.ladder.coefficients[cumulative.level]);
+      advance(&cumulative, &measured, step, 100. + 30. * (1. - coefficient), 4000. * coefficient);
+      deepest = std::max(deepest, cumulative.level);
+      if (count == 9 && cumulative.trial && cumulative.level > 1 && cumulative.previous_level == 0) {
+        retained_anchor |= cumulative.baseline_fps == 100. && cumulative.baseline_gpu_us == 4000.;
+        if (!checked_boundaries) {
+          checked_boundaries = true;
+          auto worsening = cumulative;
+          auto worse_output = measured;
+          for (uint64_t offset = 1; offset <= 13; ++offset) {
+            advance(&worsening, &worse_output, step + offset, 80., 1000.);
+          }
+          check(worsening.level == 0 && worsening.blocked && !worsening.trial,
+                "a clearly worse cumulative trial returns to the accepted anchor without descending further");
+          auto changed = cumulative;
+          auto changed_output = measured;
+          ++changed_output.configuration;
+          changed.Prepare(curve_settings, full_upper, full_floor, 1, changed_output,
+              measured.end_ns + 1, true, false);
+          check(changed.level == 0 && !changed.trial && changed.gpu_count == 0,
+                "an output contract change abandons the cumulative trial and its old measurements");
+          auto unready = cumulative;
+          unready.UpdatePreparation(unready.preparation_epoch, count - 1, count,
+              adaptive::Reason::PREPARING, measured.end_ns + 1);
+          const auto unready_generation = unready.status.generation;
+          unready.Prepare(curve_settings, full_upper, full_floor, 1, measured,
+              measured.end_ns + 2, true, false);
+          check(!unready.prepared && !unready.trial && unready.status.generation == unready_generation
+              && unready.status.reason == adaptive::Reason::PREPARING,
+                "partial readiness cannot advance a cumulative trial into another tier");
+        }
+      }
+    }
+    check(deepest == cumulative.ladder.count - 1 && cumulative.status.coefficient <= .4001f,
+          "the recorded fine/coarse synthetic curve explores the low end instead of sticking at 95 percent");
+    if (count == 9) {
+      check(retained_anchor && checked_boundaries,
+            "two individually small steps compare their cumulative benefit with the same accepted anchor");
+    } else {
+      check(cumulative.level == cumulative.ladder.count - 1 && !cumulative.blocked,
+            "the existing coarse-step curve still accepts its useful exact minimum");
+    }
+  }
   for (const uint32_t count : {9u, adaptive::MAX_PREPARED_LEVELS}) {
     adaptive::Settings extended_settings{
         .enabled = true, .minimum_scale = .33f, .prepared_levels = adaptive::MAX_PREPARED_LEVELS, .selected_levels = count};
@@ -377,6 +597,228 @@ inline bool Run() {
   check(legacy_automatic.trial && legacy_automatic.level == 1 && legacy_automatic.ladder.count == 2
       && legacy_automatic.status.requested == legacy_automatic.minimum && !legacy_automatic.prepared,
       "the default-off experiment still starts its automatic on-demand endpoint request without a full-set gate");
+
+  adaptive::Settings limited_settings{.enabled = true, .target_fps = 360.f, .minimum_scale = .33f,
+      .prepared_levels = 2, .selected_levels = 15, .limited_residency = true};
+  adaptive::Session limited;
+  adaptive::Output limited_output{.available = true, .source = 1, .generation = 1, .configuration = 1,
+      .fps = 100., .observed_multiplier = 4.};
+  limited.Prepare(limited_settings, full_upper, full_floor, 1, limited_output, start, true, false, 70);
+  limited.UpdateTargetPreparation(limited.preparation_epoch, limited.status.generation, 1, 15,
+      true, adaptive::Reason::PREPARING, start);
+  limited.Applied(limited.status.generation, full_upper, start);
+  check(limited.ladder.count == 15 && !limited.prepared && limited.TargetReady()
+      && limited.status.ready_levels == 1 && limited.status.applied == full_upper,
+      "limited residency retains the full logical ladder while reporting only the ready target");
+  limited.trial = true;
+  limited.previous_level = 0;
+  limited.baseline_fps = 100.;
+  limited.baseline_gpu_us = 4000.;
+  limited.Request(1, start + 1);
+  const auto cold_generation = limited.status.generation;
+  const auto cold_target = limited.status.requested;
+  for (uint64_t index = 1; index <= 24; ++index) {
+    const int64_t now = start + static_cast<int64_t>(index) * adaptive::SAMPLE_INTERVAL_NS;
+    limited.ObserveGpu({.generation = cold_generation, .frame = index, .sequence = index,
+        .context = 1, .recorded_ns = now, .completed_ns = now, .total_us = 100.,
+        .valid = true, .stable = true}, now);
+    limited_output.serial++;
+    limited_output.begin_ns = now - adaptive::WARMUP_NS;
+    limited_output.end_ns = now;
+    limited.Prepare(limited_settings, full_upper, full_floor, 1, limited_output, now, true, false, 70);
+    limited.UpdateTargetPreparation(limited.preparation_epoch, cold_generation, 1, 15,
+        false, adaptive::Reason::PREPARING, now);
+    limited.Applied(cold_generation, cold_target, now);
+  }
+  check(limited.level == 1 && limited.trial && limited.previous_level == 0 && limited.baseline_fps == 100.
+      && limited.status.applied == full_upper && limited.active_level == 0 && limited.status.coefficient == 1.f
+      && limited.applied_ns == 0 && limited.gpu_count == 0 && !limited.TargetReady(),
+      "a cold target keeps the actual output and cumulative anchor without measuring fallback work as benefit");
+  const int64_t target_ready_ns = start + 7'000'000'000;
+  limited.UpdateTargetPreparation(limited.preparation_epoch, cold_generation - 1, 2, 15,
+      true, adaptive::Reason::PREPARING, target_ready_ns);
+  limited.UpdateTargetPreparation(limited.preparation_epoch, cold_generation, 1, 1,
+      true, adaptive::Reason::PREPARING, target_ready_ns);
+  check(!limited.TargetReady(), "stale targets and partial logical contracts cannot publish target readiness");
+  limited.UpdateTargetPreparation(limited.preparation_epoch, cold_generation, 2, 15,
+      true, adaptive::Reason::PREPARING, target_ready_ns);
+  check(limited.TargetReady() && !limited.prepared && limited.applied_ns == 0,
+      "a complete target receipt is distinct from actual application and full-ladder readiness");
+  const int64_t applied_now = target_ready_ns + adaptive::WARMUP_NS;
+  limited.Applied(cold_generation, cold_target, applied_now);
+  check(limited.active_level == 1 && limited.status.applied == cold_target
+      && limited.stable_after_ns == applied_now + adaptive::WARMUP_NS && limited.last_switch_ns == applied_now,
+      "cold waiting does not consume the actual application's warmup or minimum switch spacing");
+  limited.Request(2, applied_now + 1);
+  const auto superseded = limited.status.generation;
+  limited.Request(0, applied_now + 2);
+  limited.UpdateTargetPreparation(limited.preparation_epoch, superseded, 3, 15,
+      true, adaptive::Reason::PREPARING, applied_now + 3);
+  limited.Applied(superseded, limited.ladder.sizes[2], applied_now + 3);
+  check(!limited.TargetReady() && limited.status.applied == cold_target && limited.active_level == 1,
+      "a superseded cold completion cannot apply after a reverse request");
+  limited.UpdateTargetPreparation(limited.preparation_epoch, limited.status.generation, 2, 15,
+      true, adaptive::Reason::PREPARING, applied_now + 4);
+  limited.Applied(limited.status.generation, full_upper, applied_now + 5);
+  check(limited.status.applied == full_upper && limited.active_level == 0 && !limited.prepared,
+      "a reverse request can reuse its ready rollback tier without claiming the full ladder is resident");
+  limited.Request(3, applied_now + 6);
+  limited.UpdateTargetPreparation(limited.preparation_epoch, limited.status.generation, 2, 15,
+      false, adaptive::Reason::BUDGET, applied_now + 7);
+  check(limited.status.reason == adaptive::Reason::BUDGET && limited.level == 3
+      && limited.status.applied == full_upper && !limited.TargetReady(),
+      "capacity failure leaves actual fallback ownership to the runtime without inventing an applied upper");
+  auto disabled_limited = limited;
+  disabled_limited.status.applied = cold_target;
+  disabled_limited.active_level = 1;
+  auto disabled_settings = limited_settings;
+  disabled_settings.enabled = false;
+  disabled_limited.Prepare(disabled_settings, full_upper, full_floor, 2, limited_output,
+      applied_now + 8, true, false, 70);
+  disabled_limited.Applied(disabled_limited.status.generation, full_upper, applied_now + 9);
+  check(disabled_limited.status.reason == adaptive::Reason::DISABLED
+      && disabled_limited.status.applied == full_upper && disabled_limited.active_level == 0,
+      "disabling automatic sizing records the successful return to its retained manual upper");
+
+  adaptive::Session limited_curve;
+  limited_settings.selected_levels = 9;
+  limited_output = {.available = true, .source = 1, .generation = 1, .configuration = 1,
+      .fps = 100., .observed_multiplier = 4.};
+  uint64_t pending_generation = 0;
+  int pending_ticks = 0;
+  size_t deepest_applied = 0;
+  for (uint64_t index = 0; index <= 220; ++index) {
+    const int64_t now = start + static_cast<int64_t>(index) * adaptive::SAMPLE_INTERVAL_NS;
+    const double coefficient = limited_curve.status.coefficient;
+    limited_curve.ObserveGpu({.generation = limited_curve.status.generation, .frame = index + 1,
+        .sequence = index + 1, .context = 1, .recorded_ns = now, .completed_ns = now,
+        .total_us = 4000. * coefficient, .valid = true, .stable = true}, now);
+    limited_output.serial++;
+    limited_output.begin_ns = now - 2'000'000'000;
+    limited_output.end_ns = now;
+    limited_output.fps = 100. + 30. * (1. - coefficient);
+    limited_curve.Prepare(limited_settings, full_upper, full_floor, 1, limited_output, now, true, false, 71);
+    if (pending_generation != limited_curve.status.generation) {
+      pending_generation = limited_curve.status.generation;
+      pending_ticks = 0;
+    }
+    const bool complete = ++pending_ticks >= 8;
+    limited_curve.UpdateTargetPreparation(limited_curve.preparation_epoch, pending_generation, 2, 9,
+        complete, adaptive::Reason::PREPARING, now);
+    if (complete) {
+      limited_curve.Applied(pending_generation, limited_curve.status.requested, now);
+      deepest_applied = std::max(deepest_applied, limited_curve.active_level);
+    }
+  }
+  check(deepest_applied >= 3 && !limited_curve.prepared && !limited_curve.settings.legacy_preparation,
+      "delayed cold targets still explore useful fine steps through the normal cumulative controller");
+
+  adaptive::Session mode_switch;
+  auto mode_settings = limited_settings;
+  mode_settings.selected_levels = mode_settings.prepared_levels = 15;
+  mode_settings.limited_residency = false;
+  mode_switch.Prepare(mode_settings, full_upper, full_floor, 1, limited_output, start, true, false, 72);
+  mode_switch.UpdatePreparation(mode_switch.preparation_epoch, 15, 15, adaptive::Reason::PREPARING, start);
+  mode_switch.Applied(mode_switch.status.generation, full_upper, start);
+  mode_switch.UpdatePreparation(mode_switch.preparation_epoch, 1, 15, adaptive::Reason::BUDGET, start + 1);
+  const auto denied_epoch = mode_switch.preparation_epoch;
+  mode_settings.limited_residency = true;
+  mode_switch.Prepare(mode_settings, full_upper, full_floor, 1, limited_output, start + 2, true, false, 72);
+  check(mode_switch.preparation_epoch == denied_epoch + 1 && mode_switch.ladder.count == 15
+      && mode_switch.preparation_reason == adaptive::Reason::PREPARING && !mode_switch.failed
+      && !mode_switch.TargetReady() && mode_switch.status.applied == full_upper,
+      "changing residency mode explicitly retries a denied budget while preserving all logical levels and actual output");
+  mode_switch.UpdateTargetPreparation(mode_switch.preparation_epoch, mode_switch.status.generation, 1, 15,
+      true, adaptive::Reason::PREPARING, start + 3);
+  mode_switch.Applied(mode_switch.status.generation, full_upper, start + 3);
+  mode_settings.limited_residency = false;
+  mode_switch.Prepare(mode_settings, full_upper, full_floor, 1, limited_output, start + 4, true, false, 72);
+  mode_switch.UpdatePreparation(mode_switch.preparation_epoch, 1, 15, adaptive::Reason::PREPARING, start + 5);
+  check(!mode_switch.prepared && !mode_switch.TargetReady() && mode_switch.ladder.count == 15,
+      "returning to full preparation closes automatic decisions until the complete logical collection is ready");
+  mode_switch.UpdatePreparation(mode_switch.preparation_epoch, 15, 15, adaptive::Reason::PREPARING, start + 6);
+  check(mode_switch.prepared && mode_switch.TargetReady(), "full preparation reopens only after the complete collection receipt");
+  mode_switch.Fail(mode_switch.status.generation);
+  mode_settings.limited_residency = true;
+  mode_switch.Prepare(mode_settings, full_upper, full_floor, 1, limited_output, start + 7, true, false, 72);
+  check(mode_switch.failed && mode_switch.status.reason == adaptive::Reason::FAILED && !mode_switch.TargetReady(),
+      "a mode edit does not retry an actual execution failure through the budget recovery path");
+
+  // CPU design check only: FPS, GPU durations, completion delay and time are
+  // synthetic here. The native single case obtains GPU samples and time live.
+  adaptive::Session automatic_player;
+  const adaptive::Settings automatic_settings{.enabled = true, .target_fps = 100.f, .minimum_scale = .5f,
+      .prepared_levels = 3, .selected_levels = 3, .limited_residency = true};
+  adaptive::Output automatic_output{.available = true, .source = 1, .generation = 1, .configuration = 1};
+  uint32_t automatic_phase = 0, completion_ticks = 0;
+  uint64_t completion_generation = 0;
+  size_t actual_slot = 0;
+  int64_t rejected_cooldown = 0;
+  bool returned_anchor = false, anchor_ready = false, same_tick_rollback = false;
+  for (uint64_t index = 0; index <= 80 && automatic_phase != 9; ++index) {
+    const auto now = start + static_cast<int64_t>(index) * adaptive::SAMPLE_INTERVAL_NS;
+    automatic_player.ObserveGpu({.generation = automatic_player.status.generation,
+        .frame = index + 1, .sequence = index + 1, .context = 1, .recorded_ns = now, .completed_ns = now,
+        .total_us = (actual_slot == 0 ? 4000. : (actual_slot == 1 ? 3000. : 2000.)),
+        .valid = true, .stable = true}, now);
+    ++automatic_output.serial;
+    automatic_output.begin_ns = now - 500'000'000;
+    automatic_output.end_ns = now;
+    automatic_output.fps = (actual_slot == 0 ? 80. : (actual_slot == 1 && !returned_anchor ? 84. : 60.));
+    const auto before_requested = automatic_player.level;
+    const auto before_generation = automatic_player.status.generation;
+    const bool before_trial = automatic_player.trial;
+    const auto before_previous = automatic_player.previous_level;
+    const double before_baseline_fps = automatic_player.baseline_fps;
+    automatic_player.Prepare(automatic_settings, full_upper, full_floor, 1, automatic_output, now, true, false, 73);
+    if (completion_generation != automatic_player.status.generation) {
+      completion_generation = automatic_player.status.generation;
+      completion_ticks = 0;
+    }
+    const bool ready = actual_slot == automatic_player.level
+        || (automatic_player.level == 1 && anchor_ready) || ++completion_ticks >= 3;
+    automatic_player.UpdateTargetPreparation(automatic_player.preparation_epoch, completion_generation,
+        ready ? 2u : 1u, 3, ready, adaptive::Reason::PREPARING, now);
+    if (ready) {
+      automatic_player.Applied(completion_generation, automatic_player.status.requested, now);
+      actual_slot = automatic_player.active_level;
+      anchor_ready |= actual_slot == 1;
+    }
+    if (automatic_phase == 0 && automatic_player.TargetReady() && actual_slot == 0) {
+      check(automatic_player.ladder.count == 3 && automatic_player.ladder.coefficients[1] == .75f
+          && automatic_player.ladder.coefficients[2] == .5f, "the bounded player curve uses exactly 100/75/50 logical sizes");
+      ++automatic_phase;
+    } else if (automatic_phase == 1 && automatic_player.level == 1 && automatic_player.trial) {
+      ++automatic_phase;
+    } else if (automatic_phase == 2 && automatic_player.TargetReady() && actual_slot == 1) {
+      ++automatic_phase;
+    } else if (automatic_phase == 3 && automatic_player.level == 2 && automatic_player.trial
+        && automatic_player.previous_level == 1 && automatic_player.baseline_fps == 84.) {
+      ++automatic_phase;
+    } else if (automatic_phase == 4 && automatic_player.TargetReady() && actual_slot == 2) {
+      ++automatic_phase;
+    } else if (automatic_phase == 5 && before_trial && before_requested == 2 && before_previous == 1
+        && before_baseline_fps == 84. && automatic_player.status.generation > before_generation
+        && automatic_player.level == 1 && automatic_player.blocked && !automatic_player.trial) {
+      rejected_cooldown = automatic_player.blocked_until_ns;
+      returned_anchor = true;
+      same_tick_rollback = actual_slot == 1 && automatic_player.applied_ns == now;
+      check(same_tick_rollback, "a hot rollback is observed even when Applied completes in the same synthetic tick");
+      ++automatic_phase;
+    } else if (automatic_phase == 6 && automatic_player.TargetReady() && actual_slot == 1) {
+      ++automatic_phase;
+    } else if (automatic_phase == 7 && automatic_player.level == 2 && automatic_player.trial && !automatic_player.blocked) {
+      check(now < rejected_cooldown && automatic_player.baseline_fps == 60.,
+          "the synthetic workload change reopens the existing gate before its unchanged 30-second expiry");
+      ++automatic_phase;
+    } else if (automatic_phase == 8 && automatic_player.TargetReady() && actual_slot == 2) {
+      ++automatic_phase;
+    }
+  }
+  check(automatic_phase == 9 && actual_slot == 2 && automatic_player.previous_level == 1 && same_tick_rollback,
+      "synthetic CPU input validates two automatic cold descents, no-benefit rollback and workload-triggered re-exploration");
+  std::cout << "ADAPTIVE_AUTOMATIC_DESIGN evidence=CPU synthetic_FPS_GPU_completion_time=1 completed_phase=" << automatic_phase
+      << " hot_rollback_same_tick=" << same_tick_rollback << '\n';
   return passed;
 }
 }  // namespace adaptive_resolution_cases

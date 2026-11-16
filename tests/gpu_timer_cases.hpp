@@ -47,14 +47,20 @@ int Run() {
     const auto finish = [&](uint32_t submissions = 1, bool preserve = true, bool poll = true) {
       Check(SUCCEEDED(gpu.list->Close()), "timer close");
       ID3D12CommandList* lists[]{gpu.list.Get()};
-      for (uint32_t i = 0; i < submissions; ++i) gpu.queue->ExecuteCommandLists(1, lists);
-      Check(SUCCEEDED(gpu.queue->Signal(gpu.fence.Get(), ++gpu.serial)), "timer completion signal");
-      HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-      Check(event != nullptr, "timer completion event");
-      const auto signal = gpu.fence->SetEventOnCompletion(gpu.serial, event);
-      const auto wait = (SUCCEEDED(signal) ? WaitForSingleObject(event, 10000) : WAIT_FAILED);
-      CloseHandle(event);
-      Check(wait == WAIT_OBJECT_0, "timer bounded GPU completion");
+      // Replay keeps the recording generation, but D3D12 requires the prior
+      // execution to finish first. Zero-submission discard probes still drain.
+      for (uint32_t i = 0; i < std::max(1u, submissions); ++i) {
+        if (i < submissions) {
+          gpu.queue->ExecuteCommandLists(1, lists);
+        }
+        Check(SUCCEEDED(gpu.queue->Signal(gpu.fence.Get(), ++gpu.serial)), "timer completion signal");
+        HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        Check(event != nullptr, "timer completion event");
+        const auto signal = gpu.fence->SetEventOnCompletion(gpu.serial, event);
+        const auto wait = (SUCCEEDED(signal) ? WaitForSingleObject(event, 10000) : WAIT_FAILED);
+        CloseHandle(event);
+        Check(wait == WAIT_OBJECT_0, "timer bounded GPU completion");
+      }
       if (poll) {
         const auto before_close = timers::published_segments;
         timers::Poll(true, false);
@@ -76,6 +82,29 @@ int Run() {
     };
     finish();
     gpu_completion_cases::Run(gpu, finish);
+
+    Check(timers::Begin(gpu.list.Get(), gpu.device.Get(), "present", 16, 16, 0, 1, true, true),
+          "XeFG diagnostic starts before the private-color staging");
+    const auto service_index = timers::internal::current.idx;
+    Check(timers::Begin(gpu.list.Get(), gpu.device.Get(), "present", 16, 16, 0, 1, true)
+              && timers::internal::current.idx == service_index,
+          "XeFG core joins the same segment without overwriting its service start");
+    timers::SetPass(0, 0, 2, 16, 16, 16, 16);
+    for (const auto slot : {timers::kSlotCopyInEnd, timers::PassEncodeStart(0), timers::PassEncodeEnd(0),
+             timers::PassEvalStart(0), timers::PassEvalEnd(0), timers::PassResolveEnd(0),
+             timers::kSlotCopyBackEnd}) timers::Mark(gpu.list.Get(), slot);
+    timers::End(gpu.list.Get());
+    Check(timers::internal::current.active && !timers::internal::segments[service_index].recorded,
+          "core End defers query resolve and ownership registration until service writeback");
+    timers::End(gpu.list.Get(), true);
+    Check(!timers::internal::current.active && timers::internal::segments[service_index].recorded
+              && timers::internal::segments[service_index].service_list == nullptr,
+          "service End freezes both spans and releases the borrowed command-list identity");
+    finish();
+    Check(timers::stats.valid && timers::stats.service_total_us >= timers::stats.total_us
+              && std::abs(static_cast<int64_t>(timers::stats.service_total_us)
+                      - timers::stats.total_us - timers::stats.staging_us - timers::stats.writeback_us) <= 2,
+          "single completed Service proof keeps the outer and core GPU intervals consistent");
 
     Check(timers::Begin(gpu.list.Get(), gpu.device.Get(), "preSR", 16, 16), "start-only timer begin");
     const auto start_only = timers::internal::current.idx;
@@ -525,6 +554,18 @@ int Run() {
     --synthetic.sequence;
     Check(!timers::internal::Publish(synthetic, false, gpu.queue.Get()),
           "older completion cannot replace a newer published result");
+    raw_observations.clear();
+    const auto saved_service_observer = timers::raw_observer;
+    timers::raw_observer = [](const timers::Stats& sample, uint64_t token) {
+      raw_observations.emplace_back(sample, token);
+    };
+    synthetic.diagnostic_token = 75;
+    Check(!timers::internal::Publish(synthetic, false, gpu.queue.Get())
+              && raw_observations.size() == 1 && raw_observations[0].second == 75
+              && raw_observations[0].first.valid && raw_observations[0].first.sequence == synthetic.sequence,
+          "older proven completion reaches the bounded raw collector without replacing newer display state");
+    synthetic.diagnostic_token = 0;
+    timers::raw_observer = saved_service_observer;
     {
       auto newer = synthetic;
       newer.sequence = ++timers::internal::next_sequence;
@@ -540,6 +581,20 @@ int Run() {
               && timers::stats.passes[0].resolve_us == 10 && timers::stats.passes[0].look_us == 5
               && timers::stats.passes[0].look_measured
               && timers::stats.own_us == 40, "look is included in resolve, never added twice");
+    synthetic.service_scope = true;
+    timestamps[timers::kSlotServiceStart] = 80;
+    timestamps[timers::kSlotServiceEnd] = 180;
+    synthetic.written |= (uint64_t{1} << timers::kSlotServiceStart) | (uint64_t{1} << timers::kSlotServiceEnd);
+    Check(publish(1) && timers::stats.total_us == 60 && timers::stats.service_total_us == 100
+              && timers::stats.staging_us == 20 && timers::stats.writeback_us == 20,
+          "synthetic Service timestamps preserve core cost and partition the full outer interval");
+    synthetic.written &= ~(uint64_t{1} << timers::kSlotServiceEnd);
+    Check(!publish(1) && timers::stats.state == State::INVALID_TIMESTAMPS,
+          "missing Service end marker cannot publish a partial full-service duration");
+    synthetic.service_scope = false;
+    synthetic.written &= ~(uint64_t{1} << timers::kSlotServiceStart);
+    Check(publish(1) && timers::stats.total_us == 60 && timers::stats.service_total_us == 0,
+          "ordinary core timing keeps its old meaning without an active Service scope");
     auto& window = timers::internal::display_windows[1];
     const auto first_display = timers::stage_stats[1].total_us;
     const auto first_sequence = timers::stage_stats[1].sequence;

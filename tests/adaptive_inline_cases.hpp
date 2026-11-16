@@ -5,6 +5,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <exception>
 #include <iostream>
 #include <thread>
@@ -16,16 +17,137 @@ namespace addon = renodx::addons::dlss5;
 
 using CreatePipelineFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
 CreatePipelineFn real_create_pipeline = nullptr;
-uint32_t pipeline_calls = 0;
-uint32_t fail_pipeline_call = 0;
+std::atomic_uint32_t pipeline_calls = 0;
+std::atomic_uint32_t fail_pipeline_call = 0;
+std::atomic<HANDLE> async_entered = nullptr;
+std::atomic<HANDLE> async_release = nullptr;
+std::atomic<HANDLE> async_worker_thread = nullptr;
+std::atomic_uint32_t async_pipeline_calls = 0;
+std::atomic_uint32_t async_band_calls = 0;
+std::atomic<ID3D12RootSignature*> async_pipeline_root = nullptr;
+std::atomic_uint32_t async_threads_started = 0;
+std::atomic_uint32_t async_threads_joined = 0;
+std::atomic_bool fail_async_pipeline = false;
+std::atomic_bool async_gate_failed = false;
+using CreateThreadFn = HANDLE(WINAPI*)(LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE, LPVOID, DWORD, LPDWORD);
+CreateThreadFn real_create_thread = CreateThread;
+
+HANDLE WINAPI ObserveCreateThread(LPSECURITY_ATTRIBUTES attributes, SIZE_T stack_size,
+    LPTHREAD_START_ROUTINE entry, LPVOID argument, DWORD flags, LPDWORD id) {
+  HANDLE thread = real_create_thread(attributes, stack_size, entry, argument, flags, id);
+  if (thread != nullptr && entry == native::CreateAsyncAutoscalePipeline) {
+    ++async_threads_started;
+    HANDLE proof = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), thread, GetCurrentProcess(), &proof, SYNCHRONIZE, FALSE, 0)) {
+      async_gate_failed = true;
+    }
+    async_worker_thread.store(proof);
+  }
+  return thread;
+}
+
+struct AsyncPipelineGate {
+  HANDLE entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  HANDLE release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  bool thread_observer_attached = false;
+
+  AsyncPipelineGate() {
+    async_entered.store(entered);
+    async_release.store(release);
+  }
+
+  bool Finish() {
+    if (release != nullptr) SetEvent(release);
+    const HANDLE worker = async_worker_thread.exchange(nullptr);
+    if (worker == nullptr) return !async_gate_failed.load();
+    const DWORD wait = WaitForSingleObject(worker, 15000);
+    if (wait != WAIT_OBJECT_0) {
+      async_worker_thread.store(worker);
+      return false;
+    }
+    CloseHandle(worker);
+    ++async_threads_joined;
+    return true;
+  }
+
+  void Reset() {
+    Check(Finish(), "private PSO previous real worker exited");
+    Check(ResetEvent(entered) && ResetEvent(release), "private PSO event reset");
+  }
+
+  ~AsyncPipelineGate() {
+    native::async_autoscale_preparation = false;
+    native::CancelAsyncAutoscalePreparation();
+    const bool finished = Finish();
+    if (finished) {
+      {
+        addon::RuntimeLock lock(native::runtime_mutex);
+        native::DiscardAsyncAutoscalePreparation();
+      }
+      async_entered.store(nullptr);
+      async_release.store(nullptr);
+      if (entered != nullptr) CloseHandle(entered);
+      if (release != nullptr) CloseHandle(release);
+      if (thread_observer_attached) {
+        const bool detached = DetourTransactionBegin() == NO_ERROR && DetourUpdateThread(GetCurrentThread()) == NO_ERROR
+            && DetourDetach(reinterpret_cast<PVOID*>(&real_create_thread), reinterpret_cast<PVOID>(ObserveCreateThread)) == NO_ERROR
+            && DetourTransactionCommit() == NO_ERROR;
+        if (!detached) std::cerr << "ADAPTIVE_ASYNC thread_observer_detach_failed=1\n";
+      }
+    } else {
+      std::cerr << "ADAPTIVE_ASYNC worker_cleanup_timeout=1 events_kept_open=1\n";
+    }
+  }
+};
 
 HRESULT STDMETHODCALLTYPE ObserveCreatePipeline(ID3D12Device* device,
     const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID iid, void** pipeline) {
-  if (++pipeline_calls == fail_pipeline_call) {
+  const auto call = ++pipeline_calls;
+  const bool autoscale = desc->CS.BytecodeLength == __v6_autoscale.size()
+      && std::memcmp(desc->CS.pShaderBytecode, __v6_autoscale.data(), __v6_autoscale.size()) == 0;
+  const bool look_band = desc->CS.BytecodeLength == __look_band.size()
+      && std::memcmp(desc->CS.pShaderBytecode, __look_band.data(), __look_band.size()) == 0;
+  if (async_release.load() != nullptr && (autoscale || look_band)) {
+    ++async_pipeline_calls;
+    if (look_band) {
+      ++async_band_calls;
+    }
+    async_pipeline_root.store(desc->pRootSignature);
+    SetEvent(async_entered.load());
+    if (WaitForSingleObject(async_release.load(), 10000) != WAIT_OBJECT_0) {
+      async_gate_failed = true;
+      *pipeline = nullptr;
+      return E_ABORT;
+    }
+    if (fail_async_pipeline.exchange(false)) {
+      *pipeline = nullptr;
+      return E_FAIL;
+    }
+  }
+  if (call == fail_pipeline_call.load()) {
     *pipeline = nullptr;
     return E_FAIL;
   }
   return real_create_pipeline(device, desc, iid, pipeline);
+}
+
+using CreateResourceFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
+    const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
+CreateResourceFn real_create_resource = nullptr;
+uint32_t fail_resource_phase = 0;
+
+HRESULT STDMETHODCALLTYPE ObserveCreateResource(ID3D12Device* device, const D3D12_HEAP_PROPERTIES* heap,
+    D3D12_HEAP_FLAGS flags, const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
+    const D3D12_CLEAR_VALUE* clear, REFIID iid, void** resource) {
+  if (native::AdaptivePreparationActive()
+      && ((fail_resource_phase == 1 && native::preparing_adaptive_frame == nullptr)
+          || (fail_resource_phase == 2 && native::preparing_adaptive_frame != nullptr
+              && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER))) {
+    fail_resource_phase = 0;
+    *resource = nullptr;
+    return E_OUTOFMEMORY;
+  }
+  return real_create_resource(device, heap, flags, desc, state, clear, iid, resource);
 }
 
 int Run() {
@@ -37,6 +159,8 @@ int Run() {
     model_gpu = &gpu;
     ComPtr<ID3D12InfoQueue> info;
     gpu.device.As(&info);
+    Check(debug != nullptr && info != nullptr, "adaptive inline requires the D3D12 debug layer and InfoQueue");
+    std::cout << "ADAPTIVE_INLINE debug_layer=1 info_queue=1\n";
     native::enabled = true;
     native::hooks_enabled = true;
     Check(native::dedupe_mode.load() == native::defaults::kDedupeMode,
@@ -58,6 +182,7 @@ int Run() {
     native::nr_adaptive_min_scale = .33f;
     native::nr_adaptive_target_fps = 116.f;
     Check(native::adaptive_feature_mode.load() == native::AdaptiveFeatureMode::OFF, "Feature capacity experiment defaults to disabled");
+    Check(!native::nr_adaptive_limited_residency.load(), "limited residency experiment defaults to disabled");
     native::max_worksets = 4;
     native::OnNativeFgOptions(false);
     native::adaptive_configuration_settings = native::comparison_ui::CaptureAdaptiveSettings;
@@ -155,7 +280,7 @@ int Run() {
       const auto cold_record = [&](bool models_only = false) {
         ++cold_sources;
         ++native::present_generation;
-        const auto pipelines_before = pipeline_calls;
+        const auto pipelines_before = pipeline_calls.load();
         native::NrRecording recording;
         bool accepted = false;
         {
@@ -193,7 +318,7 @@ int Run() {
       cold_record();
       Check(native::codec_pipeline.preparation_failed && native::features.at(cold_handle).adaptive_session->failed,
           "one actual PSO API failure latches the current preparation");
-      const auto first_failure_calls = pipeline_calls;
+      const auto first_failure_calls = pipeline_calls.load();
       const auto* second_source = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xADA081});
       native::RegisterCreatedFeatureLocked(second_source, native::kFeatureDlss, &parameters);
       {
@@ -209,7 +334,7 @@ int Run() {
           "returning to the old failed source cannot advance or repeatedly retry the new owner's preparation");
       native::ReleaseFeatureState(native::features.at(second_source));
       native::features.erase(second_source);
-      const auto failed_calls = pipeline_calls;
+      const auto failed_calls = pipeline_calls.load();
       native::nr_adaptive_target_fps = 115.f;
       for (uint32_t repeat = 0; repeat < 3; ++repeat) cold_record();
       Check(pipeline_calls == failed_calls && native::codec_pipeline.linearize == first_pipeline,
@@ -235,6 +360,493 @@ int Run() {
       for (uint32_t step = 0; step < 32; ++step) cold_record();
       Check(native::features.at(cold_handle).adaptive_session->prepared && model_calls > evaluates_before
           && pipeline_calls == 15, "ready two-Pass operation reuses every prepared pipeline");
+      {
+        Check(!native::async_autoscale_preparation.load(), "private autoscale experiment defaults to disabled");
+        AsyncPipelineGate gate;
+        Check(gate.entered != nullptr && gate.release != nullptr, "private PSO deterministic events");
+        Check(DetourTransactionBegin() == NO_ERROR && DetourUpdateThread(GetCurrentThread()) == NO_ERROR
+            && DetourAttach(reinterpret_cast<PVOID*>(&real_create_thread), reinterpret_cast<PVOID>(ObserveCreateThread)) == NO_ERROR
+            && DetourTransactionCommit() == NO_ERROR, "private PSO actual worker thread exit observer attach");
+        gate.thread_observer_attached = true;
+        ComPtr<ID3D12PipelineState> synchronous_autoscale = native::codec_pipeline.autoscale;
+        const auto original_session = native::features.at(cold_handle).adaptive_session;
+        addon::adaptive_resolution::Frame async_frame{
+            .session = original_session, .preparation_epoch = original_session->preparation_epoch, .enabled = true};
+        const auto pipeline_source = [&] {
+          addon::RuntimeLock lock(native::runtime_mutex);
+          const native::PipelinePreparationScope opportunity;
+          const auto result = native::PrepareAdaptivePipelines(gpu.device.Get(), async_frame, 1, true);
+          return std::pair{result, native::pipeline_preparation_opportunity->created};
+        };
+        const auto wait_entered = [&] {
+          Check(WaitForSingleObject(gate.entered, 10000) == WAIT_OBJECT_0
+              && async_worker_thread.load() != nullptr, "private PSO production Start created a real worker");
+        };
+        const auto meter = std::find_if(native::worksets.begin(), native::worksets.end(), [&](const auto& entry) {
+          return entry.first.handle == cold_handle && entry.second.norm_scale != nullptr && entry.second.norm_commit != nullptr;
+        });
+        Check(meter != native::worksets.end(), "private PSO equivalence uses the existing real HDR workset");
+        const auto sample_autoscale = [&](ID3D12PipelineState* pipeline) {
+          auto& resources = meter->second;
+          const auto previous_state = resources.norm_scale_state;
+          native::Transition(gpu.list.Get(), resources.norm_scale, previous_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+          native::UavBarrier(gpu.list.Get(), resources.norm_commit);
+          native::BindCodecV6(gpu.list.Get(), resources, pipeline,
+              native::kDescriptorMeterSet, native::kDescriptorNormScaleUav,
+              1, 1, resources.width, resources.height, 0, 0, 1, 1, 1, 1, 0.f, 0.f, 0.f, 0.f, 1u, 0.f, 0.f);
+          const float snap = 1.f;
+          gpu.list->SetComputeRoot32BitConstants(2, 1, &snap,
+              offsetof(native::V6CodecConstants, snap_now) / sizeof(uint32_t));
+          gpu.list->Dispatch(1, 1, 1);
+          auto transfer = gpu.CreateTextureTransfer(resources.norm_scale);
+          native::Transition(gpu.list.Get(), resources.norm_scale,
+              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+          gpu.RecordTextureReadback(resources.norm_scale, transfer);
+          native::Transition(gpu.list.Get(), resources.norm_scale, D3D12_RESOURCE_STATE_COPY_SOURCE, previous_state);
+          submit();
+          return gpu.ReadTexture(transfer);
+        };
+        const auto synchronous_pixels = sample_autoscale(synchronous_autoscale.Get());
+        Check(std::any_of(synchronous_pixels.begin(), synchronous_pixels.end(), [](uint8_t value) { return value != 0; }),
+            "synchronous autoscale comparison dispatched and returned nonzero scale data");
+        native::async_autoscale_preparation = true;
+        native::ReleaseCom(native::codec_pipeline.autoscale);
+        Check(pipeline_source().first == native::PipelinePreparationResult::PENDING
+            && native::async_autoscale_task != nullptr && async_pipeline_calls == 0,
+            "a source registers only the private target and waits for the existing Present start boundary");
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        const auto waiting_models = next_handle;
+        const auto waiting_evaluates = model_calls;
+        const auto waiting_worksets = native::worksets_created;
+        {
+          const addon::EvaluateChainScope chain;
+          const addon::SourceStageScope source(cold_handle, true);
+          native::NrRecording recording;
+          Check(!native::ProcessInline(gpu.list.Get(), cold_handle, &parameters, nullptr, nullptr, &recording)
+              && !recording.model_invoked && !recording.output_ready
+              && next_handle == waiting_models && model_calls == waiting_evaluates
+              && native::worksets_created == waiting_worksets
+              && WaitForSingleObject(gate.release, 0) == WAIT_TIMEOUT && !async_gate_failed.load(),
+              "a real blocked PSO worker leaves source pending with zero NGX/scratch work and no source wait");
+        }
+        submit();
+        Check(gate.Finish(), "private PSO real worker exited before result admission");
+        const auto accepted = pipeline_source();
+        auto* accepted_pipeline = native::codec_pipeline.autoscale;
+        Check(accepted.first == native::PipelinePreparationResult::PENDING && accepted.second
+            && accepted_pipeline != nullptr && async_pipeline_calls == 1,
+            "one successful private result consumes its source opportunity before any NGX Create");
+        Check(pipeline_source().first == native::PipelinePreparationResult::READY
+            && native::codec_pipeline.autoscale == accepted_pipeline && async_pipeline_calls == 1
+            && next_handle == waiting_models && model_calls == waiting_evaluates,
+            "the result is accepted once and the next source sees a complete unchanged pipeline cache");
+        Check(sample_autoscale(accepted_pipeline) == synchronous_pixels,
+            "private and synchronous PSOs use the exact embedded shader and produce identical WARP autoscale pixels");
+
+        gate.Reset();
+        native::ReleaseCom(native::codec_pipeline.autoscale);
+        async_frame.enabled = false;
+        async_frame.session.reset();
+        native::codec_pipeline.preparation_session.reset();
+        Check(pipeline_source().first == native::PipelinePreparationResult::PENDING, "manual upper can register without a Session owner");
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        Check(gate.Finish(), "manual-upper private worker exits");
+        pipeline_source();
+        Check(pipeline_source().first == native::PipelinePreparationResult::READY,
+            "disabling only Adaptive cannot strand the legal manual upper behind a missing weak Session");
+        gate.Reset();
+        native::ReleaseCom(native::codec_pipeline.autoscale);
+        pipeline_source();
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        fail_async_pipeline = true;
+        Check(gate.Finish(), "ownerless failure worker actually exits");
+        Check(pipeline_source().first == native::PipelinePreparationResult::FAILED
+            && native::codec_pipeline.preparation_failed && async_frame.session == nullptr,
+            "an ownerless manual preparation failure latches its device attempt without dereferencing a missing Session");
+        const auto ownerless_failure_calls = async_pipeline_calls.load();
+        pipeline_source();
+        Check(async_pipeline_calls == ownerless_failure_calls, "ownerless failure cannot requeue every source");
+
+        gate.Reset();
+        async_frame.session = original_session;
+        async_frame.preparation_epoch = original_session->preparation_epoch;
+        async_frame.enabled = true;
+        native::ReleaseCom(native::codec_pipeline.autoscale);
+        pipeline_source();
+        native::CancelAsyncAutoscalePreparation();
+        const auto canceled_calls = async_pipeline_calls.load();
+        native::StartAsyncAutoscalePreparation();
+        Check(native::async_autoscale_task == nullptr && async_pipeline_calls == canceled_calls,
+            "a canceled queued task is reclaimed before module/thread startup");
+        pipeline_source();
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        auto* retained_root = native::codec_pipeline.root_signature;
+        native::disable_release_mode = 0;
+        native::enabled = false;
+        native::ServiceDisabledNr();
+        Check(!native::disabled_resources_released.load() && native::codec_pipeline.root_signature == retained_root,
+            "NR Off cancels a running private task at release=0 without claiming exit or clearing retained cache");
+        Check(gate.Finish(), "canceled private worker actually exits");
+        native::ServiceDisabledNr();
+        Check(native::async_autoscale_task == nullptr && native::codec_pipeline.autoscale == nullptr
+            && native::codec_pipeline.root_signature == retained_root, "the canceled late PSO is never admitted");
+        native::enabled = true;
+        gate.Reset();
+        pipeline_source();
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        Check(gate.Finish(), "reenabled private worker exits");
+        pipeline_source();
+        Check(pipeline_source().first == native::PipelinePreparationResult::READY,
+            "ordinary re-enable recovers with a new valid private attempt");
+
+        gate.Reset();
+        native::ReleaseCom(native::codec_pipeline.autoscale);
+        pipeline_source();
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        async_frame.session = std::make_shared<addon::adaptive_resolution::Session>(*original_session);
+        async_frame.preparation_epoch = async_frame.session->preparation_epoch;
+        pipeline_source();
+        fail_async_pipeline = true;
+        Check(gate.Finish(), "obsolete attempt failure worker exits");
+        pipeline_source();
+        Check(!native::codec_pipeline.preparation_failed && !async_frame.session->failed
+            && native::async_autoscale_task != nullptr && !native::async_autoscale_task->started,
+            "an old Session failure is recorded and discarded without poisoning the current frame or blocking its one attempt");
+        gate.Reset();
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        fail_async_pipeline = true;
+        Check(gate.Finish(), "current attempt failure worker exits");
+        Check(pipeline_source().first == native::PipelinePreparationResult::FAILED
+            && native::codec_pipeline.preparation_failed && async_frame.session->failed && !original_session->failed,
+            "only the matching current attempt latches pipeline and Session failure");
+        const auto failed_async_calls = async_pipeline_calls.load();
+        pipeline_source();
+        pipeline_source();
+        Check(async_pipeline_calls == failed_async_calls && native::async_autoscale_task == nullptr && !async_gate_failed.load(),
+            "failed preparation neither requeues every source nor leaves a stuck worker gate");
+        native::codec_pipeline.preparation_failed = false;
+        native::codec_pipeline.preparation_session = original_session;
+        Check(SUCCEEDED(synchronous_autoscale.CopyTo(&native::codec_pipeline.autoscale)), "restore the original completed autoscale cache");
+        async_frame.session = original_session;
+        async_frame.preparation_epoch = original_session->preparation_epoch;
+        ComPtr<ID3D12PipelineState> synchronous_band = native::codec_pipeline.look.band;
+        std::array band_inputs{
+            gpu.Texture(16, 16, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST),
+            gpu.Texture(16, 16, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST)};
+        for (uint32_t source = 0; source < band_inputs.size(); ++source) {
+          std::array<uint16_t, 16 * 16 * 4> pixels{};
+          for (uint32_t pixel = 0; pixel < 16 * 16; ++pixel) {
+            for (uint32_t channel = 0; channel < 3; ++channel) {
+              pixels[pixel * 4 + channel] = (source == 0 ? 0x3400u : (pixel % 3 == 0 ? 0x3A00u : 0x3800u));
+            }
+            pixels[pixel * 4 + 3] = 0x3C00u;
+          }
+          auto transfer = gpu.CreateTextureTransfer(band_inputs[source].Get());
+          gpu.UploadTexture(band_inputs[source].Get(), transfer,
+              reinterpret_cast<const uint8_t*>(pixels.data()), sizeof(pixels), 16 * 8);
+          gpu.Transition(band_inputs[source].Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+        std::array band_surfaces{
+            texture(DXGI_FORMAT_R32G32B32A32_FLOAT, true, 8),
+            texture(DXGI_FORMAT_R32G32B32A32_FLOAT, true, 8),
+            texture(DXGI_FORMAT_R32G32_FLOAT, true, 8),
+            texture(DXGI_FORMAT_R32G32_FLOAT, true, 8)};
+        const D3D12_DESCRIPTOR_HEAP_DESC band_heap_desc{
+            .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, .NumDescriptors = 14,
+            .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+        ComPtr<ID3D12DescriptorHeap> band_heap;
+        Check(SUCCEEDED(gpu.device->CreateDescriptorHeap(&band_heap_desc, IID_PPV_ARGS(&band_heap))), "look bands comparison heap");
+        const auto band_stride = gpu.device->GetDescriptorHandleIncrementSize(band_heap_desc.Type);
+        const auto band_cpu = [&](uint32_t slot) {
+          return D3D12_CPU_DESCRIPTOR_HANDLE{band_heap->GetCPUDescriptorHandleForHeapStart().ptr + slot * band_stride};
+        };
+        const auto band_gpu = [&](uint32_t slot) {
+          return D3D12_GPU_DESCRIPTOR_HANDLE{band_heap->GetGPUDescriptorHandleForHeapStart().ptr + slot * band_stride};
+        };
+        const D3D12_SHADER_RESOURCE_VIEW_DESC band_srv{
+            .Format = DXGI_FORMAT_R16G16B16A16_FLOAT, .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, .Texture2D = {.MipLevels = 1}};
+        for (uint32_t slot = 0; slot < 4; ++slot) {
+          gpu.device->CreateShaderResourceView(band_inputs[slot == 2 ? 1 : 0].Get(), &band_srv, band_cpu(slot));
+        }
+        auto band_motion_srv = band_srv;
+        band_motion_srv.Format = DXGI_FORMAT_R16G16_FLOAT;
+        gpu.device->CreateShaderResourceView(nullptr, &band_motion_srv, band_cpu(13));
+        for (uint32_t slot = 0; slot < addon::look::kUavCount; ++slot) {
+          D3D12_UNORDERED_ACCESS_VIEW_DESC uav{
+              .Format = DXGI_FORMAT_R16G16B16A16_FLOAT, .ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D};
+          ID3D12Resource* surface = nullptr;
+          if (slot >= addon::look::kUavBandA && slot <= addon::look::kUavBandMaxB) {
+            surface = band_surfaces[slot - addon::look::kUavBandA].Get();
+            uav.Format = surface->GetDesc().Format;
+          } else if (slot == addon::look::kUavTraceBlocks) {
+            uav.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+          } else if (slot == addon::look::kUavTraceHistogram) {
+            uav.Format = DXGI_FORMAT_R32_TYPELESS;
+            uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+            uav.Buffer = {.NumElements = addon::look::kTraceWords, .Flags = D3D12_BUFFER_UAV_FLAG_RAW};
+          }
+          gpu.device->CreateUnorderedAccessView(surface, nullptr, &uav, band_cpu(4 + slot));
+        }
+        const addon::look::Bindings band_bindings{
+            .heap = band_heap.Get(), .codec_set = band_gpu(0), .look_set = band_gpu(0),
+            .uav_table = band_gpu(4), .motion = band_gpu(13),
+            .history_in = meter->second.norm_commit->GetGPUVirtualAddress(),
+            .history_out = meter->second.norm_commit->GetGPUVirtualAddress()};
+        const auto sample_band = [&](ID3D12PipelineState* pipeline) {
+          auto constants = addon::look::MakeConstants({.tone = .5f},
+              {.nr_width = 16, .nr_height = 16, .full_width = 16, .full_height = 16});
+          constants.size[0] = constants.size[1] = 8;
+          for (uint32_t mode = 0; mode < 5; ++mode) {
+            constants.mode = mode;
+            addon::look::Bind(gpu.list.Get(), native::codec_pipeline.look, pipeline,
+                band_bindings, band_bindings.codec_set, constants);
+            gpu.list->Dispatch(1, 1, 1);
+            addon::look::UavBarrierAll(gpu.list.Get());
+          }
+          std::array<d3d12_test::TextureTransfer, 4> transfers;
+          for (uint32_t surface = 0; surface < band_surfaces.size(); ++surface) {
+            transfers[surface] = gpu.CreateTextureTransfer(band_surfaces[surface].Get());
+            gpu.Transition(band_surfaces[surface].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            gpu.RecordTextureReadback(band_surfaces[surface].Get(), transfers[surface]);
+            gpu.Transition(band_surfaces[surface].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+          }
+          submit();
+          std::vector<uint8_t> pixels;
+          for (const auto& transfer : transfers) {
+            const auto surface = gpu.ReadTexture(transfer);
+            pixels.insert(pixels.end(), surface.begin(), surface.end());
+          }
+          return pixels;
+        };
+        const auto synchronous_band_pixels = sample_band(synchronous_band.Get());
+        Check(std::any_of(synchronous_band_pixels.begin(), synchronous_band_pixels.end(), [](uint8_t value) { return value != 0; }),
+            "synchronous look bands comparison dispatches all five modes and reads nonzero band/extrema data");
+        gate.Reset();
+        native::ReleaseCom(native::codec_pipeline.look.band);
+        Check(pipeline_source().first == native::PipelinePreparationResult::PENDING
+            && native::async_autoscale_task != nullptr
+            && native::async_autoscale_task->target_identity == &native::codec_pipeline.look.band
+            && native::async_autoscale_task->root_identity == native::codec_pipeline.look.root_signature
+            && native::async_autoscale_task->root_identity != native::codec_pipeline.root_signature,
+            "look bands registers its exact shader slot and distinct Look root in the existing single task");
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        native::async_autoscale_preparation = false;
+        Check(pipeline_source().first == native::PipelinePreparationResult::PENDING
+            && native::codec_pipeline.look.band == nullptr && async_band_calls == 1
+            && async_pipeline_root.load() == native::codec_pipeline.look.root_signature
+            && next_handle == waiting_models && model_calls == waiting_evaluates
+            && native::worksets_created == waiting_worksets,
+            "pending look bands cannot become ready or fall back to synchronous Create when the private flag changes");
+        native::async_autoscale_preparation = true;
+        Check(gate.Finish(), "look bands worker exits before admission");
+        const auto band_accepted = pipeline_source();
+        auto* accepted_band = native::codec_pipeline.look.band;
+        Check(band_accepted.first == native::PipelinePreparationResult::PENDING && band_accepted.second
+            && accepted_band != nullptr && native::async_autoscale_task == nullptr,
+            "look bands accepts once at a source opportunity without starting NGX");
+        Check(pipeline_source().first == native::PipelinePreparationResult::READY
+            && native::codec_pipeline.look.band == accepted_band && async_band_calls == 1
+            && sample_band(accepted_band) == synchronous_band_pixels,
+            "private Look-root bands produces identical nonzero WARP band/extrema pixels with no second admission");
+
+        gate.Reset();
+        native::ReleaseCom(native::codec_pipeline.look.band);
+        pipeline_source();
+        native::CancelAsyncAutoscalePreparation();
+        native::StartAsyncAutoscalePreparation();
+        Check(native::async_autoscale_task == nullptr && async_band_calls == 1, "queued look bands cancels before worker startup");
+        pipeline_source();
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        auto* retained_look_root = native::codec_pipeline.look.root_signature;
+        native::enabled = false;
+        native::ServiceDisabledNr();
+        Check(!native::disabled_resources_released.load() && native::codec_pipeline.look.root_signature == retained_look_root,
+            "NR Off does not release the Look root while its canceled private worker is still running");
+        Check(gate.Finish(), "canceled look bands worker exits");
+        native::ServiceDisabledNr();
+        Check(native::async_autoscale_task == nullptr && native::codec_pipeline.look.band == nullptr
+            && native::codec_pipeline.look.root_signature == retained_look_root, "late canceled look bands cannot populate its retained slot");
+        native::enabled = true;
+
+        gate.Reset();
+        pipeline_source();
+        const auto band_task = native::async_autoscale_task;
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        native::ReleaseCom(native::codec_pipeline.autoscale);
+        const auto other_target_pending = pipeline_source();
+        Check(other_target_pending.first == native::PipelinePreparationResult::PENDING && !other_target_pending.second
+            && native::async_autoscale_task == band_task && native::codec_pipeline.autoscale == nullptr,
+            "a missing autoscale slot cannot replace or synchronously bypass the in-flight Look bands task");
+        Check(gate.Finish(), "re-enabled look bands worker exits");
+        const auto other_target_accepted = pipeline_source();
+        auto* recovered_band = native::codec_pipeline.look.band;
+        Check(other_target_accepted.first == native::PipelinePreparationResult::PENDING && other_target_accepted.second
+            && recovered_band != nullptr && native::codec_pipeline.autoscale == nullptr && native::async_autoscale_task == nullptr,
+            "an autoscale caller admits the healthy Look result only into its own slot and consumes this source");
+        gate.Reset();
+        pipeline_source();
+        Check(native::async_autoscale_task != nullptr
+            && native::async_autoscale_task->target_identity == &native::codec_pipeline.autoscale
+            && native::async_autoscale_task->root_identity == native::codec_pipeline.root_signature,
+            "the second private PSO starts only after the first target was admitted and its worker exited");
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        Check(gate.Finish(), "serial autoscale worker exits");
+        pipeline_source();
+        Check(pipeline_source().first == native::PipelinePreparationResult::READY
+            && native::codec_pipeline.look.band == recovered_band,
+            "serial Look and autoscale preparation recovers both distinct roots without replacing the healthy first target");
+
+        gate.Reset();
+        native::ReleaseCom(native::codec_pipeline.look.band);
+        pipeline_source();
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        async_frame.session = std::make_shared<addon::adaptive_resolution::Session>(*original_session);
+        async_frame.preparation_epoch = async_frame.session->preparation_epoch;
+        pipeline_source();
+        fail_async_pipeline = true;
+        Check(gate.Finish(), "obsolete Look attempt failure worker exits");
+        pipeline_source();
+        Check(!native::codec_pipeline.preparation_failed && !async_frame.session->failed
+            && native::async_autoscale_task != nullptr && !native::async_autoscale_task->started,
+            "an obsolete Look failure cannot poison the new Session or consume its legitimate attempt");
+        gate.Reset();
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        fail_async_pipeline = true;
+        Check(gate.Finish(), "current Look attempt failure worker exits");
+        Check(pipeline_source().first == native::PipelinePreparationResult::FAILED
+            && native::codec_pipeline.preparation_failed && async_frame.session->failed && !original_session->failed,
+            "Look failure belongs only to the matching current preparation Session");
+        const auto failed_band_calls = async_band_calls.load();
+        pipeline_source();
+        pipeline_source();
+        Check(async_band_calls == failed_band_calls && native::async_autoscale_task == nullptr,
+            "a current Look failure cannot requeue each source");
+        gate.Reset();
+        async_frame.session = std::make_shared<addon::adaptive_resolution::Session>(*original_session);
+        async_frame.preparation_epoch = async_frame.session->preparation_epoch;
+        pipeline_source();
+        native::StartAsyncAutoscalePreparation();
+        wait_entered();
+        Check(gate.Finish(), "new valid Look attempt worker exits");
+        pipeline_source();
+        Check(pipeline_source().first == native::PipelinePreparationResult::READY && !async_frame.session->failed
+            && !native::codec_pipeline.preparation_failed && async_band_calls == failed_band_calls + 1,
+            "an explicitly new healthy Session recovers from the bounded Look preparation failure");
+        native::codec_pipeline.preparation_session = original_session;
+        Check(async_threads_started == async_threads_joined && !async_gate_failed.load(),
+            "every autoscale and Look private worker has an OS thread exit proof");
+        std::cout << "ADAPTIVE_ASYNC evidence=WARP+MOCK real_threads=" << async_threads_started.load()
+            << " thread_exit_proofs=" << async_threads_joined.load()
+            << " look_band_calls=" << async_band_calls.load()
+            << " pending_zero_NGX=1 admitted_once=1 pixel_equal=1 look_band_modes=5 look_pixel_equal=1 distinct_roots=1 serial_targets=1 ownerless_manual=1 off_late_rejected=1 stale_failure_isolated=1 current_failure_bounded=1\n";
+      }
+      {
+        real_create_resource = reinterpret_cast<CreateResourceFn>((*reinterpret_cast<void***>(gpu.device.Get()))[27]);
+        Check(DetourTransactionBegin() == NO_ERROR && DetourUpdateThread(GetCurrentThread()) == NO_ERROR
+            && DetourAttach(reinterpret_cast<PVOID*>(&real_create_resource), reinterpret_cast<PVOID>(ObserveCreateResource)) == NO_ERROR
+            && DetourTransactionCommit() == NO_ERROR, "adaptive allocation-failure observer attach");
+        const auto pressure_record = [&](bool reset = true) {
+          ++native::present_generation;
+          bool accepted = false;
+          {
+            const addon::EvaluateChainScope chain;
+            const addon::SourceStageScope source(cold_handle, true);
+            accepted = native::ProcessInline(gpu.list.Get(), cold_handle, &parameters);
+          }
+          submit(reset);
+          return accepted;
+        };
+        native::nr_adaptive_selected_levels = 2;
+        native::RecreateFeatures();
+        submit();
+        const auto before_upper_oom = next_handle;
+        const bool look_before = native::look_unavailable;
+        fail_resource_phase = 1;
+        for (uint32_t step = 0; step < 8; ++step) pressure_record();
+        Check(fail_resource_phase == 0 && next_handle == before_upper_oom
+            && !native::features.at(cold_handle).adaptive_session->prepared
+            && native::features.at(cold_handle).adaptive_session->status.reason == addon::adaptive_resolution::Reason::BUDGET
+            && native::look_unavailable == look_before,
+            "first-upper resource OOM pauses every subsequent source without creating any model or disabling the ordinary Look stage");
+        native::RecreateFeatures();
+        submit();
+        for (uint32_t step = 0; step < 32; ++step) pressure_record();
+        auto cache = native::features.at(cold_handle).adaptive_cache;
+        Check(native::features.at(cold_handle).adaptive_session->prepared && cache->count == 2,
+            "explicit recovery after first-upper OOM prepares a complete two-Pass collection");
+        const auto* upper = native::features.at(cold_handle).slots[0].handle;
+        const auto* standby = cache->tiers[1].state.slots[0].handle;
+        const auto released_before = std::count(model_released_handles.begin(), model_released_handles.end(), standby);
+        addon::submission::TrackUse(gpu.list.Get(), standby);
+        addon::submission::TrackUse(gpu.list.Get(), cache->tiers[1].recording_token.get());
+        pressure_record(false);
+        auto parked_list = gpu.list;
+        auto parked_allocator = gpu.allocator;
+        Check(!addon::submission::ResourceReleasable(standby),
+            "the completed parked recording genuinely retains the standby before allocation failure");
+        ComPtr<ID3D12CommandAllocator> next_allocator;
+        ComPtr<ID3D12GraphicsCommandList> next_list;
+        Check(SUCCEEDED(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(&next_allocator))), "resource-pressure recovery allocator");
+        Check(SUCCEEDED(gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            next_allocator.Get(), nullptr, IID_PPV_ARGS(&next_list))), "resource-pressure recovery list");
+        gpu.allocator = next_allocator;
+        gpu.list = next_list;
+        Check(native::InstallCommandListStateHooks(gpu.list.Get()), "resource-pressure recovery list hooks");
+        native::kSetAdaptiveLevelCount.Store(3.f);
+        const auto before_standby_oom = next_handle;
+        fail_resource_phase = 2;
+        for (uint32_t step = 0; step < 12 && fail_resource_phase != 0; ++step) pressure_record();
+        Check(fail_resource_phase == 0 && next_handle == before_standby_oom && cache->budget_blocked
+            && cache->standby_retired && !native::features.at(cold_handle).adaptive_session->prepared
+            && native::features.at(cold_handle).slots[0].handle == upper
+            && native::AdaptiveRetirementPending(cold_handle),
+            "standby Look allocation OOM stops before NGX Create and retires the unused collection while retaining the healthy upper");
+        Check(std::count(model_released_handles.begin(), model_released_handles.end(), standby) == released_before,
+            "a GPU-complete but replayable recording still protects the failed collection's standby model");
+        native::disable_release_mode = 0;
+        native::enabled = false;
+        native::ServiceDisabledNr();
+        Check(native::features.at(cold_handle).slots[0].handle == upper,
+            "NRDisableRelease=0 still retains the healthy upper while NR is Off");
+        native::enabled = true;
+        native::RecreateFeatures();
+        const auto before_retry = next_handle;
+        for (uint32_t step = 0; step < 4; ++step) {
+          Check(!pressure_record(), "re-enable keeps the host output while its failed collection is still replayable");
+        }
+        Check(next_handle == before_retry && native::AdaptiveRetirementPending(cold_handle),
+            "re-enable never overlaps new models with the failed collection's necessary retirements");
+        Check(SUCCEEDED(parked_allocator->Reset()) && SUCCEEDED(parked_list->Reset(parked_allocator.Get(), nullptr))
+            && SUCCEEDED(parked_list->Close()), "discard only the already completed parked recording");
+        native::DrainRetiredResources(true);
+        Check(!native::AdaptiveRetirementPending(cold_handle)
+            && std::count(model_released_handles.begin(), model_released_handles.end(), standby) == released_before + 1,
+            "the failed standby releases after its exact recording closes");
+        for (uint32_t step = 0; step < 40; ++step) pressure_record();
+        Check(native::features.at(cold_handle).adaptive_session->prepared
+            && !native::features.at(cold_handle).adaptive_retirement_blocked,
+            "ordinary inline re-enable clears its retirement gate and fully recovers without weakening the proof");
+        Check(DetourTransactionBegin() == NO_ERROR && DetourUpdateThread(GetCurrentThread()) == NO_ERROR
+            && DetourDetach(reinterpret_cast<PVOID*>(&real_create_resource), reinterpret_cast<PVOID>(ObserveCreateResource)) == NO_ERROR
+            && DetourTransactionCommit() == NO_ERROR, "adaptive allocation-failure observer detach");
+        native::nr_adaptive_selected_levels = 0;
+      }
       Check(DetourTransactionBegin() == NO_ERROR && DetourUpdateThread(GetCurrentThread()) == NO_ERROR
           && DetourDetach(reinterpret_cast<PVOID*>(&real_create_pipeline), reinterpret_cast<PVOID>(ObserveCreatePipeline)) == NO_ERROR
           && DetourTransactionCommit() == NO_ERROR, "cold inline PSO observer detach");
@@ -385,6 +997,41 @@ int Run() {
           << " reason=" << addon::adaptive_resolution::ReasonText(feature.adaptive_session->status.reason) << '\n';
       Check(cache != nullptr && cache->count == 2 && cache->output_count == 2,
           "inline A/B rotation shares the original four-workset budget across two tiers");
+      if (hook == native::kHookRender) {
+        for (const auto& [key, resources] : native::worksets) {
+          if (key.handle != handle || !key.pre_sr) continue;
+          Check(resources.adaptive_recording_token != nullptr
+              && resources.adaptive_recording_token == cache->tiers[key.adaptive_slot].recording_token,
+              "the actual Render workset owns the selected Render tier's recording token");
+        }
+        auto nested_color = texture(DXGI_FORMAT_R8G8B8A8_UNORM, false);
+        auto nested = std::make_shared<native::FeatureState>();
+        nested->adaptive_session = feature.adaptive_session;
+        nested->adaptive_cache = std::make_shared<native::AdaptiveFeatureCache>();
+        auto& nested_cache = *nested->adaptive_cache;
+        nested_cache.owner = handle;
+        nested_cache.pre_sr = true;
+        nested_cache.count = 1;
+        nested_cache.tiers[0].recording_token = std::make_shared<uint8_t>(0);
+        const auto nested_token = nested_cache.tiers[0].recording_token;
+        auto previous_render = std::exchange(feature.render_session, nested);
+        native::max_worksets = 5;
+        auto* nested_workset = native::EnsureWorkset(gpu.device.Get(), handle, nested_color.Get(),
+            16, 16, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 1, 0, true);
+        Check(nested_workset != nullptr && nested_workset->adaptive_recording_token == nested_token
+            && nested_workset->adaptive_recording_token != cache->tiers[0].recording_token,
+            "nested Render allocation takes its real owner token instead of the parent's adaptive cache");
+        native::RetireFailedAdaptivePreparation(nested.get());
+        native::max_worksets = 4;
+        Check(native::AdaptiveRetirementPending(handle)
+            && std::count_if(native::worksets.begin(), native::worksets.end(), [&](const auto& workset) {
+                 return native::AdaptiveCacheOwnsWorkset(*cache, workset.first, workset.second);
+               }) == 4,
+            "failed nested Render retirement tracks its actual scratch and preserves the parent's four live worksets");
+        submit();
+        Check(!native::AdaptiveRetirementPending(handle), "nested Render scratch completes its own exact retirement");
+        feature.render_session = std::move(previous_render);
+      }
       {
         const addon::adaptive_resolution::Frame adaptive_frame{.slot = 1, .enabled = true};
         const native::AdaptiveFrameScope scope(&adaptive_frame);
@@ -524,9 +1171,12 @@ int Run() {
         native::max_worksets = 4;
         set(native::kSetAdaptiveLevelCount, 2.f);
         set(native::kSetAdaptiveTargetFps, saved_target);
-        Check(record() && record() && feature.adaptive_cache == cache && feature.adaptive_session->prepared
-            && cache->count == 2 && native::nr_features_created == three_models,
-            "an explicit selection rechecks budget once and reuses both retained complete-size tuples");
+        for (uint32_t warmup = 0; warmup < 24; ++warmup) record();
+        Check(feature.adaptive_cache == cache && feature.adaptive_session->prepared
+            && cache->count == 2 && native::nr_features_created == three_models + 1
+            && feature.slots[0].handle == upper_model,
+            "an explicit selection rechecks budget and rebuilds the retired lower tier while retaining its healthy upper");
+        const auto recovered_models = native::nr_features_created;
 
         set(native::kSetAdaptiveMinScale, .5f);
         record();
@@ -535,7 +1185,7 @@ int Run() {
         for (uint32_t warmup = 0; warmup < 24; ++warmup) record();
         Check(feature.adaptive_cache == cache && feature.adaptive_session->prepared && cache->tiers[1].ready
             && cache->ladder.sizes[1][0].width == 8 && feature.slots[0].handle == upper_model
-            && native::nr_features_created == three_models + 1,
+            && native::nr_features_created == recovered_models + 1,
             "editing the minimum prepares the missing endpoint while retaining the complete upper allocation");
         feature.adaptive_session->Request(1, native::SteadyNowNs());
         Check(record() && record() && cache->active == 1 && feature.input_width == 8,
@@ -838,7 +1488,7 @@ int Run() {
       native::RegisterCreatedFeatureLocked(wide_handle, native::kFeatureDlss, &wide_parameters);
       const auto before_wide_models = native::nr_features_created;
       uint32_t wide_frame = 0;
-      const auto wide_record = [&](bool verify_writeback = false) {
+      const auto wide_record = [&](bool verify_writeback = false, bool reset = true) {
         ++native::present_generation;
         const uint32_t output = wide_frame++ % 2;
         if (verify_writeback) {
@@ -869,7 +1519,7 @@ int Run() {
           gpu.Transition(wide_outputs[output].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
-        submit();
+        submit(reset);
         Check(SUCCEEDED(gpu.device->GetDeviceRemovedReason())
             && gpu.fence->GetCompletedValue() != UINT64_MAX && gpu.fence->GetCompletedValue() >= gpu.serial,
             "every selected-level step finishes on a healthy WARP Fence");
@@ -932,6 +1582,44 @@ int Run() {
       }
       Check(native::nr_features_created == steady_models && native::worksets_created == steady_worksets,
           "all-level and immediate fifteen-level round trips perform no new Feature or workset allocations");
+      const auto* mode_upper = wide.slots[0].handle;
+      // This GPU host has no ReShade configuration exports. The separate real
+      // configuration/ImGui fixtures cover Commit, persistence and profile undo.
+      native::kSetAdaptiveLimitedResidency.Store(1.f);
+      native::ApplySettingEffect(native::kSetAdaptiveLimitedResidency.effect);
+      for (uint32_t source = 0; source < 16; ++source) {
+        wide_record();
+        if (wide.adaptive_session->TargetReady()
+            && native::AdaptiveResidentWorksetCount(wide.adaptive_session) == 2) break;
+      }
+      std::cerr << "ADAPTIVE_MODE to_limited cache_same=" << (wide.adaptive_cache == collection)
+          << " requested_mode=" << native::nr_adaptive_limited_residency.load()
+          << " session_mode=" << wide.adaptive_session->settings.limited_residency
+          << " logical=" << collection->count << " active=" << collection->active
+          << " ready=" << wide.adaptive_session->TargetReady() << " full=" << wide.adaptive_session->prepared
+          << " failed=" << wide.adaptive_session->failed << " budget=" << collection->budget_blocked
+          << " epoch=" << wide.adaptive_session->preparation_epoch << '/' << collection->preparation_epoch
+          << " resident=" << native::AdaptiveResidentWorksetCount(wide.adaptive_session)
+          << " retiring=" << native::AdaptiveSessionRetirementPending(wide.adaptive_session)
+          << " upper_same=" << (wide.slots[0].handle == mode_upper)
+          << " models=" << native::nr_features_created << '/' << steady_models
+          << " reason=" << addon::adaptive_resolution::ReasonText(wide.adaptive_session->status.reason) << '\n';
+      Check(wide.adaptive_cache == collection && collection->active == 0 && collection->count == 15
+          && wide.adaptive_session->TargetReady() && !wide.adaptive_session->prepared
+          && wide.slots[0].handle == mode_upper && native::nr_features_created == steady_models
+          && native::AdaptiveResidentWorksetCount(wide.adaptive_session) == 2,
+          "the registered on-demand mode retires optional allocations in the same cache without reducing its logical ladder");
+      native::kSetAdaptiveLimitedResidency.Store(0.f);
+      native::ApplySettingEffect(native::kSetAdaptiveLimitedResidency.effect);
+      wide_record();
+      Check(wide.adaptive_cache == collection && !wide.adaptive_session->prepared && collection->active == 0
+          && wide.slots[0].handle == mode_upper,
+          "switching back to full preparation closes the ready gate and retains the compatible actual upper");
+      for (uint32_t source = 0; source < 128 && !wide.adaptive_session->prepared; ++source) wide_record();
+      Check(wide.adaptive_cache == collection && wide.adaptive_session->prepared && collection->count == 15
+          && wide.slots[0].handle == mode_upper && native::AdaptiveResidentWorksetCount(wide.adaptive_session) == 30
+          && native::nr_features_created == steady_models + 14,
+          "full preparation rebuilds only the fourteen evicted models and requires both outputs of all fifteen levels");
       native::nr_adaptive_enabled = false;
       wide_record();
       wide_record();
@@ -968,6 +1656,119 @@ int Run() {
           && std::none_of(native::worksets.begin(), native::worksets.end(), [&](const auto& workset) {
                return workset.first.handle == wide_handle && !workset.first.pre_sr;
              }), "the pool can recycle old PostSR scratch while every selected Render workset stays resident");
+
+      native::RecreateFeatures();
+      submit();
+      native::nr_adaptive_limited_residency = true;
+      native::nr_adaptive_selected_levels = 15;
+      const auto before_limited_models = native::nr_features_created;
+      for (uint32_t source = 0; source < 32; ++source) {
+        wide_record();
+        if (wide.adaptive_session->TargetReady()) break;
+      }
+      auto limited = wide.adaptive_cache;
+      std::cout << "ADAPTIVE_LIMITED initial logical=" << (limited != nullptr ? limited->count : 0)
+          << " ready=" << wide.adaptive_session->TargetReady() << " failed=" << wide.adaptive_session->failed
+          << " active=" << (limited != nullptr ? limited->active : 0)
+          << " reserved=" << native::adaptive_resident_worksets
+          << " resident=" << native::AdaptiveResidentWorksetCount(wide.adaptive_session)
+          << " pool=" << native::worksets.size() << '/' << native::EffectiveAdaptiveWorksetLimit()
+          << " new_models=" << native::nr_features_created - before_limited_models
+          << " reason=" << addon::adaptive_resolution::ReasonText(wide.adaptive_session->status.reason) << '\n';
+      Check(limited != nullptr && limited->count == 15 && wide.adaptive_session->TargetReady()
+          && !wide.adaptive_session->prepared && limited->active == 0
+          && native::nr_features_created == before_limited_models + 1
+          && native::AdaptiveResidentWorksetCount(wide.adaptive_session) == 2,
+          "limited residency retains fifteen logical sizes but initially creates only the complete upper on both outputs");
+      const auto upper_applied = wide.adaptive_session->status.applied;
+      wide.adaptive_session->Request(6, native::SteadyNowNs());
+      wide_record();
+      Check(wide.adaptive_session->settings.prepared_levels == 15 && wide.adaptive_session->level == 6
+          && !wide.adaptive_session->TargetReady() && limited->active == 0
+          && wide.adaptive_session->status.applied == upper_applied && wide.adaptive_session->applied_ns == 0,
+          "a cold target preserves the actually applied upper until both output receipts are healthy");
+      for (uint32_t source = 0; source < 32 && limited->active != 6; ++source) wide_record();
+      Check(limited->active == 6 && wide.adaptive_session->TargetReady()
+          && wide.adaptive_session->status.applied == limited->ladder.sizes[6]
+          && native::nr_features_created == before_limited_models + 2,
+          "the requested cold Render tier applies only after its complete output group is ready");
+
+      wide_record(false, false);
+      auto retained_allocator = gpu.allocator;
+      auto retained_list = gpu.list;
+      const auto* retained_model = wide.slots[0].handle;
+      Check(!addon::submission::ResourceReleasable(retained_model),
+          "the limited active tier is still protected by its completed replayable host recording");
+      Check(SUCCEEDED(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(&gpu.allocator)))
+          && SUCCEEDED(gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                gpu.allocator.Get(), nullptr, IID_PPV_ARGS(&gpu.list)))
+          && native::InstallCommandListStateHooks(gpu.list.Get()), "limited residency replacement recording");
+      wide.adaptive_session->Request(0, native::SteadyNowNs());
+      wide_record();
+      wide_record();
+      Check(limited->active == 0 && native::AdaptiveRetirementPending(wide_handle)
+          && !wide.adaptive_session->failed && !limited->standby_retired,
+          "ordinary eviction leaves the healthy upper running while the old host recording remains replayable");
+      const auto waiting_models = native::nr_features_created;
+      wide.adaptive_session->Request(10, native::SteadyNowNs());
+      wide_record();
+      wide_record();
+      Check(limited->active == 0 && !wide.adaptive_session->TargetReady()
+          && native::nr_features_created == waiting_models && native::AdaptiveRetirementPending(wide_handle),
+          "a later cold request cannot allocate over an unretired ordinary eviction");
+      wide.adaptive_session->Request(0, native::SteadyNowNs());
+      wide_record();
+      wide_record();
+      Check(limited->active == 0 && wide.adaptive_session->TargetReady()
+          && native::nr_features_created == waiting_models,
+          "a reverse request can use the protected upper without waiting for or creating the canceled target");
+      Check(SUCCEEDED(retained_allocator->Reset())
+          && SUCCEEDED(retained_list->Reset(retained_allocator.Get(), nullptr)),
+          "only the legitimate host Reset ends the retired tier's replay eligibility");
+      native::DrainRetiredResources(true);
+      Check(!native::AdaptiveRetirementPending(wide_handle)
+          && addon::submission::ResourceReleasable(retained_model), "exact retirement completes before the next cold admission");
+      wide.adaptive_session->Request(10, native::SteadyNowNs());
+      for (uint32_t source = 0; source < 32 && limited->active != 10; ++source) wide_record();
+      Check(limited->active == 10 && wide.adaptive_session->TargetReady()
+          && wide.adaptive_session->status.applied == limited->ladder.sizes[10]
+          && native::nr_features_created == waiting_models + 1 && !wide.adaptive_session->prepared,
+          "a retired slot can be reused for one new complete target without claiming full-ladder preparedness");
+      wide_record(false, false);
+      auto off_retained_allocator = gpu.allocator;
+      auto off_retained_list = gpu.list;
+      const auto* off_retained_model = wide.slots[0].handle;
+      // The earlier retained list was Reset above and is still open and empty.
+      gpu.allocator = retained_allocator;
+      gpu.list = retained_list;
+      wide.adaptive_session->Request(0, native::SteadyNowNs());
+      wide_record();
+      wide_record();
+      Check(limited->active == 0 && native::AdaptiveRetirementPending(wide_handle)
+          && !addon::submission::ResourceReleasable(off_retained_model),
+          "the final optional target genuinely remains replayable while the healthy upper is active");
+      native::nr_adaptive_enabled = false;
+      const bool off_accepted = wide_record();
+      Check(off_accepted && wide.adaptive_cache == limited
+          && wide.adaptive_session->status.applied == wide.adaptive_session->status.upper
+          && native::AdaptiveRetirementPending(wide_handle)
+          && !addon::submission::ResourceReleasable(off_retained_model),
+          "disabling Adaptive renders with the retained healthy upper without releasing the old replayable target");
+      Check(wide_record() && wide.adaptive_cache == limited
+          && wide.adaptive_session->status.applied == wide.adaptive_session->status.upper
+          && native::AdaptiveRetirementPending(wide_handle)
+          && !addon::submission::ResourceReleasable(off_retained_model)
+          && native::nr_features_created == waiting_models + 1,
+          "successive Adaptive-Off frames keep the upper contract without recreating or releasing pending resources");
+      Check(SUCCEEDED(off_retained_allocator->Reset())
+          && SUCCEEDED(off_retained_list->Reset(off_retained_allocator.Get(), nullptr))
+          && SUCCEEDED(off_retained_list->Close()), "discard the final retired recording only after its real Fence");
+      native::DrainRetiredResources(true);
+      wide_record();
+      Check(wide.adaptive_cache == nullptr && wide.adaptive_session->status.applied == wide.adaptive_session->status.upper,
+          "limited adaptive Off restores the retained manual upper and retires optional tiers");
+      native::nr_adaptive_limited_residency = false;
       native::ForgetSourceHandleLocked(wide_handle);
       for (uint32_t stream = 0; stream < 4; ++stream) {
         const auto* ordinary = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xADA810} + stream);

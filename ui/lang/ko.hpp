@@ -2340,6 +2340,11 @@ inline constexpr Translation kKo[] = {
     {"Default (by capacity)", "기본값 (가용 용량 기준)"},
     {"Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.", "선택한 단계를 먼저 모두 준비합니다. 단계가 많을수록 메모리 사용량이 늘고 조정 간격이 작아집니다. 준비 중 잠시 끊길 수 있습니다."},
     {"No working-resolution range to adjust", "조정할 작업 해상도 범위가 없습니다"},
+    {"Preparation mode", "준비 방식"},
+    {"Prepare all levels", "모든 단계 미리 준비"},
+    {"On-demand (experimental)", "필요할 때 준비 (실험적)"},
+    {"All levels use more VRAM for smooth switching once ready. On-demand keeps fewer levels resident, but cold preparation may stutter.", "모든 단계를 준비하면 VRAM을 더 사용하지만 준비 후 부드럽게 전환할 수 있습니다. 필요할 때 준비하면 상주 단계가 줄지만 최초 준비 시 끊김이 발생할 수 있습니다."},
+    {"More levels give smaller steps. On-demand keeps fewer levels resident; preparing a missing level may stutter.", "단계가 많을수록 조정 폭이 작아집니다. 필요할 때 준비하면 상주 단계가 줄지만 아직 없는 단계를 준비할 때 끊김이 발생할 수 있습니다."},
 };
 
 }  // namespace renodx::addons::dlss5::ui::lang

@@ -32,6 +32,11 @@ int main() {
     return 7;
   }
   const char* report_strings[] = {
+      "Preparation mode",
+      "Prepare all levels",
+      "On-demand (experimental)",
+      "All levels use more VRAM for smooth switching once ready. On-demand keeps fewer levels resident, but cold preparation may stutter.",
+      "More levels give smaller steps. On-demand keeps fewer levels resident; preparing a missing level may stutter.",
       "Resolution levels",
       "Default (by capacity)",
       "Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.",

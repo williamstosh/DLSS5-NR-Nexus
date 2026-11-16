@@ -62,6 +62,7 @@ struct NativeRuntimeEvaluation {
   ID3D12Resource* mask = nullptr;
 };
 native::DirectEvaluateFn native_runtime_evaluate = nullptr;
+native::DirectEvaluateFn native_runtime_private_evaluate = nullptr;
 std::vector<NativeRuntimeEvaluation> native_runtime_evaluations;
 std::vector<NVSDK_NGX_Result> native_runtime_evaluation_results;
 constexpr auto NATIVE_INPUT_STATE = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -186,7 +187,9 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeRuntimeEvaluation(
       .depth = native::GetD3D12Resource(parameters, "DLSSNR.Depth"),
       .motion = native::GetD3D12Resource(parameters, "DLSSNR.MVec"),
       .mask = native::GetD3D12Resource(parameters, "DLSSNR.ControlMask")});
-  const NVSDK_NGX_Result result = native_runtime_evaluate(list, handle, parameters, progress);
+  const auto evaluate = (native::direct_api.private_instance ? native_runtime_private_evaluate : native_runtime_evaluate);
+  Check(evaluate != nullptr, "real NGX observation retains the selected instance's Evaluate entry");
+  const NVSDK_NGX_Result result = evaluate(list, handle, parameters, progress);
   native_runtime_evaluation_results.push_back(result);
   return result;
 }
@@ -735,6 +738,11 @@ int RunNativeRequiredMenuTest() {
 #include "gpu_comparison_cases.hpp"
 #include "gpu_timer_cases.hpp"
 #include "control_mask_gpu_cases.hpp"
+#include "nr_edit_reuse_gpu_cases.hpp"
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+#include "nr_fg_output_marker_gpu_cases.hpp"
+#endif
+#include "nr_edit_reuse_xefg_cases.hpp"
 #include "control_mask_capture_cases.hpp"
 #include "adaptive_fg_service_cases.hpp"
 #include "adaptive_inline_cases.hpp"
@@ -743,12 +751,33 @@ int RunNativeRequiredMenuTest() {
 #endif
 
 int main(int argc, char** argv) {
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+  if (argc == 2 && std::strcmp(argv[1], "--nr-fg-output-marker") == 0) return nr_fg_output_marker_gpu_cases::Run();
+#endif
 #if defined(NR_NEXUS_DEV_CONTROL)
   if (argc == 2 && std::strcmp(argv[1], "--inline-restore-roi") == 0) return inline_restore_roi_cases::Run();
 #endif
+  if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-xefg-contracts") == 0) return nr_edit_reuse_xefg_cases::Run();
+  if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-contracts") == 0) return nr_edit_reuse_gpu_cases::Run();
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-inline") == 0) return adaptive_inline_cases::Run();
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-fg-service") == 0) return adaptive_fg_service_cases::Run();
 #if defined(NR_NEXUS_TEST_NATIVE_NGX)
+  if (argc == 3 && std::strcmp(argv[1], "--nr-edit-reuse-cost") == 0) {
+    return control_mask_gpu_cases::RunNativeNgx(
+        argv[2], false, renodx::addons::dlss5::internal::kControlMaskRgb, false, false, false, false, false, false, true);
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--nr-edit-reuse-jitter") == 0) {
+    return control_mask_gpu_cases::RunNativeNgx(
+        argv[2], false, renodx::addons::dlss5::internal::kControlMaskRgb, false, false, false, false, false, true);
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--nr-edit-reuse-cache") == 0) {
+    return control_mask_gpu_cases::RunNativeNgx(
+        argv[2], false, renodx::addons::dlss5::internal::kControlMaskRgb, false, false, false, false, true);
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--nr-edit-reuse-history") == 0) {
+    return control_mask_gpu_cases::RunNativeNgx(
+        argv[2], false, renodx::addons::dlss5::internal::kControlMaskRgb, false, false, false, true);
+  }
   if (argc == 3 && std::strcmp(argv[1], "--control-mask-native-ngx-resize") == 0) {
     return control_mask_gpu_cases::RunNativeNgx(
         argv[2], false, renodx::addons::dlss5::internal::kControlMaskRgb, false, false, true);
@@ -775,7 +804,11 @@ int main(int argc, char** argv) {
     return RunPresentGuideModelsTest(true, argv[2]);
   }
 #else
-  if (argc >= 2 && std::strncmp(argv[1], "--control-mask-native-ngx", 25) == 0) {
+  if (argc >= 2 && (std::strncmp(argv[1], "--control-mask-native-ngx", 25) == 0
+                    || std::strcmp(argv[1], "--nr-edit-reuse-history") == 0
+                    || std::strcmp(argv[1], "--nr-edit-reuse-jitter") == 0
+                    || std::strcmp(argv[1], "--nr-edit-reuse-cache") == 0
+                    || std::strcmp(argv[1], "--nr-edit-reuse-cost") == 0)) {
     std::cerr << "FAIL native NGX support was not compiled; rebuild with "
                  "tools/run-tests.ps1 -NativeNgxSdkLibraryDirectory containing nvsdk_ngx_s.lib\n";
     return 1;
@@ -4116,10 +4149,13 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
 
     if (!native_ngx) {
       native::direct_api = {};
+      native::direct_api.private_instance = true;
       native::direct_api.module = test_module;
+      native::direct_api.init = control_mask_gpu_cases::InitializeRuntime;
       native::direct_api.create = CreateModel;
       native::direct_api.evaluate = EvaluateModel;
       native::direct_api.release = ReleaseModel;
+      native::direct_api.shutdown = control_mask_gpu_cases::ShutdownRuntime;
       native::direct_load_state = native::DirectLoadState::Ready;
       if (native::direct_device == nullptr) {
         native::direct_device = gpu.device.Get();
@@ -4133,6 +4169,28 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
       native::core_allocate_parameters = renodx::addons::dlss5::bridge::AllocateOwnedParameters;
       native::core_destroy_parameters = renodx::addons::dlss5::bridge::DestroyOwnedParameters;
       native::direct_runtime_requirements.file_version = "310.9.16.0";
+      native::ngx_loader_staging = {};
+      native::ngx_loader_staging.nr_ready = true;
+      native::ngx_loader_staging.nr_module = test_module;
+      native::ngx_loader_staging.init = native::direct_api.init;
+      native::ngx_loader_staging.create = CreateModel;
+      native::ngx_loader_staging.evaluate = EvaluateModel;
+      native::ngx_loader_staging.release = ReleaseModel;
+      native::ngx_loader_staging.shutdown = native::direct_api.shutdown;
+      native::ngx_loader_staging.native_ready = true;
+      native::ngx_loader_staging.native_api = native::direct_api;
+      native::ngx_loader_staging.nr_requirements = native::direct_runtime_requirements;
+      native::PublishNgxLoaderSymbols();
+    } else {
+      native::PrimeNgxLoaderSymbols(gpu.device.Get(), true);
+      const auto& symbols = native::NgxLoaderView();
+      Check(symbols.native_ready && symbols.native_api.private_instance
+                && symbols.native_api.module != symbols.nr_module && symbols.native_api.evaluate != nullptr,
+          "real XeFG service requires the actual isolated runtime image, without a model substitute");
+      native_runtime_private_evaluate = symbols.native_api.evaluate;
+      // Observe the real private call separately from the earlier Core calls.
+      native::ngx_loader_staging.native_api.evaluate = ObserveNativeRuntimeEvaluation;
+      native::PublishNgxLoaderSymbols();
     }
 
     adapter::modules[0].complete = true;
@@ -4375,6 +4433,11 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
     native::control_mask_mode.store(saved_control_mask_mode);
     native::control_mask_motion_enabled.store(saved_control_mask_motion);
     native::direct_runtime_requirements.file_version = saved_control_mask_runtime_version;
+    Check(native::EnsureDirectRuntime(gpu.list.Get(), nullptr, false),
+        "ordinary Present resumes after the completed private XeFG service retires its provider");
+    // The provider switch releases older models whose allocator addresses can
+    // be reused. Start this lifetime's release interval before creating models.
+    const auto releases_before_final_models = model_released_handles.size();
     std::array<native::FeatureState, 2> contracts;
     for (size_t i = 0; i < contracts.size(); ++i) {
       auto& contract = contracts[i];
@@ -4539,7 +4602,8 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
     for (size_t i = 0; i < handles.size(); ++i) {
       Check(!native::features.contains(handles[i]) && !native::worksets.contains({handles[i], target.workset_key})
                 && !native::owner_resident_nr_handles.contains(handles[i]), "retirement removes both features, worksets and residency");
-      Check(std::find(model_released_handles.begin(), model_released_handles.end(), models[i]) == model_released_handles.end(),
+      Check(std::find(model_released_handles.begin() + releases_before_final_models,
+                model_released_handles.end(), models[i]) == model_released_handles.end(),
             "retirement cannot release an NR model still referenced by the unsubmitted GPU list");
       Check(std::any_of(native::retired_nr_features.begin(), native::retired_nr_features.end(), [&](const auto& entry) {
         return entry.handle == models[i] && entry.tracker_proof;
@@ -4551,7 +4615,8 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
     submit();
     native::DrainRetiredResources(true);
     for (const auto* model : models) {
-      Check(std::count(model_released_handles.begin(), model_released_handles.end(), model) == 1,
+      Check(std::count(model_released_handles.begin() + releases_before_final_models,
+                model_released_handles.end(), model) == 1,
             "exact GPU completion releases each retired model once");
     }
     Check(native::retired_nr_features.empty() && native::retired_final_resources.empty(),

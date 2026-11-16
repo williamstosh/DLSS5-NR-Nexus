@@ -12,8 +12,9 @@ inline Json last_receipt;
 
 inline bool Allowed(std::string_view key) {
   constexpr std::string_view base[] = {
-      "NeuralUplift", "NRHookPoint", "NRPasses", "NRFollowInputRes", "NRResolutionScale",
-      "NRAdaptiveEnabled", "NRAdaptiveTargetFPS", "NRAdaptiveMinScale", "NRAdaptiveLevelCount", "NRControlMaskEnabled",
+      "NeuralUplift", "NRDisableRelease", "NRHookPoint", "NRPasses", "NRFollowInputRes", "NRResolutionScale",
+      "NRAdaptiveEnabled", "NRAdaptiveTargetFPS", "NRAdaptiveMinScale", "NRAdaptiveLevelCount", "NRAdaptiveLimitedResidency",
+      "NRControlMaskEnabled",
       "NRControlMaskMode", "NRControlMaskBlendMode", "NRControlMaskRed", "NRControlMaskGreen",
       "NRControlMaskBlue", "NRControlMaskDepthNear", "NRControlMaskDepthFar",
       "NRControlMaskMotionEnabled", "NRControlMaskMotionStart", "NRControlMaskMotionEnd"};
@@ -33,7 +34,11 @@ inline Json Identity() {
   return {{"configuration_generation", identity.configuration_generation}, {"config_epoch", identity.config_epoch},
       {"settings_hash", identity.settings_hash}, {"resolution_hash", identity.resolution_hash},
       {"route", identity.route}, {"fg", identity.fg},
-      {"experiments", {{"adaptive_feature_mode", static_cast<uint32_t>(adaptive_feature_mode.load())}}}};
+      {"experiments", {{"adaptive_feature_mode", static_cast<uint32_t>(adaptive_feature_mode.load())},
+          {"bridge_adaptive_experiment", bridge_adaptive_experiment.load()},
+          {"edit_reuse_adaptive_experiment", edit_reuse_adaptive_experiment.load()},
+          {"edit_reuse_fg_experiment", edit_reuse_fg_experiment.load()},
+          {"edit_reuse_adaptive_evidence", "requested_enabled_not_activation"}}}};
 }
 
 inline Json Snapshot() {
@@ -54,6 +59,9 @@ inline Json Snapshot() {
     for (const auto* setting : group) {
       if (Allowed(setting->key)) settings[setting->key] = preset_ui::ReadSetting(setting->key);
     }
+  }
+  for (const auto& setting : preset_ui::kExtraSettings) {
+    if (Allowed(setting.key)) settings[setting.key] = preset_ui::ReadSetting(setting.key);
   }
   const auto plan = RequestedStagePlan();
   Json passes = Json::array();
@@ -110,8 +118,196 @@ inline Json Snapshot() {
     }
   }
   const auto output = output_framerate::Read(now);
+  const auto fg_environment = ReadEditReuseFgEnvironmentLocked();
+  edit_fg_observation::Snapshot fg_observed;
+  edit_fg_observation::CopySnapshot(&fg_observed);
+  const auto resource_identity = [](const edit_fg_observation::ResourceIdentity& resource) {
+    return Json{{"raw", resource.raw}, {"canonical", resource.canonical},
+        {"canonical_available", resource.canonical != 0}};
+  };
+  const auto recording_identity = [](const edit_fg_observation::RecordingIdentity& recording) {
+    return Json{{"raw", recording.raw}, {"list_id", recording.list_id}, {"generation", recording.generation},
+        {"identity_available", recording.list_id != 0 && recording.generation != 0}};
+  };
+  const auto source_observation = [&](const edit_fg_observation::SrCopyback& source) {
+    return Json{{"handle", source.source_handle}, {"generation", source.source_generation},
+        {"sequence", source.sr_sequence}, {"reused", source.reused},
+        {"output", resource_identity(source.output)}, {"size", {source.width, source.height}}, {"format", source.format},
+        {"recording", recording_identity(source.recording)},
+        {"environment_provider", source.environment_provider}, {"environment_context", source.environment_context},
+        {"environment_generation", source.environment_generation}};
+  };
+  const char* fg_observation_state = "disabled";
+  switch (fg_observed.state) {
+    case edit_fg_observation::State::DISABLED: break;
+    case edit_fg_observation::State::ARMED: fg_observation_state = "armed"; break;
+    case edit_fg_observation::State::CAPTURING: fg_observation_state = "capturing"; break;
+    case edit_fg_observation::State::STOPPED: fg_observation_state = "stopped"; break;
+  }
+  Json fg_observation_events = Json::array();
+  for (uint32_t index = 0; index < fg_observed.count; ++index) {
+#if defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+    // The dedicated output probe needs its SDK receipts, not a second full
+    // metadata trace. Keep a labeled prefix within the unchanged pipe limit.
+    if (index == 16) break;
+#endif
+    const auto& observed = fg_observed.events[index];
+    Json event{{"sequence", observed.sequence}, {"observed_ns", observed.observed_ns},
+        {"thread_id", observed.thread_id}};
+    switch (observed.kind) {
+      case edit_fg_observation::Kind::SR_COPYBACK:
+        event["kind"] = "sr_copyback_recorded";
+        event["source"] = source_observation(observed.sr);
+        break;
+      case edit_fg_observation::Kind::NATIVE_FG_ENTRY: {
+        const auto& native = observed.native_fg;
+        event["kind"] = "native_fg_entry";
+        event["call_id"] = observed.call_id;
+        event["native"] = {{"handle", native.handle}, {"environment_generation", native.generation},
+            {"slot", native.slot}, {"c_export", native.c_export},
+            {"recording", recording_identity(native.recording)},
+            {"backbuffer", resource_identity(native.backbuffer)}, {"hudless", resource_identity(native.hudless)},
+            {"ui", resource_identity(native.ui)}, {"ui_alpha", resource_identity(native.ui_alpha)},
+            {"ui_mode", native.has_ui_mode ? Json(native.ui_mode) : Json(nullptr)},
+            {"frame_id", native.has_frame_id ? Json(native.frame_id) : Json(nullptr)}};
+        break;
+      }
+      case edit_fg_observation::Kind::XEFG_TAG_ENTRY: {
+        const auto& tag = observed.xefg_tag;
+        event["kind"] = "xefg_tag_entry";
+        event["call_id"] = observed.call_id;
+        event["tag"] = {{"sdk_context", tag.sdk_context}, {"sdk_slot", tag.sdk_slot},
+            {"context_identity", tag.context_identity},
+            {"epoch", tag.epoch}, {"generation", tag.generation}, {"present_id", tag.present_id},
+            {"type", tag.type}, {"validity", tag.validity}, {"resource", resource_identity(tag.resource)},
+            {"recording", recording_identity(tag.recording)}, {"base", {tag.base_x, tag.base_y}},
+            {"size", {tag.width, tag.height}}, {"resource_state", tag.resource_state},
+            {"ui_mode", tag.ui_mode}, {"ui_composition", tag.ui_composition}};
+        break;
+      }
+      case edit_fg_observation::Kind::XEFG_PRESENT_ENTRY: {
+        const auto& present = observed.xefg_present;
+        event["kind"] = "xefg_present_entry";
+        event["call_id"] = observed.call_id;
+        event["present"] = {{"sdk_context", present.sdk_context}, {"context_identity", present.context_identity},
+            {"epoch", present.epoch}, {"generation", present.generation},
+            {"present_id", present.has_present_id ? Json(present.present_id) : Json(nullptr)},
+            {"repeated", present.repeated}, {"proxy", resource_identity(present.proxy)},
+            {"backbuffer", resource_identity(present.backbuffer)}, {"method", present.method},
+            {"interval", present.interval}, {"flags", present.flags}};
+        break;
+      }
+      case edit_fg_observation::Kind::NATIVE_FG_RETURN:
+      case edit_fg_observation::Kind::XEFG_TAG_RETURN:
+      case edit_fg_observation::Kind::XEFG_PRESENT_RETURN:
+        switch (observed.kind) {
+          case edit_fg_observation::Kind::NATIVE_FG_RETURN: event["kind"] = "native_fg_return"; break;
+          case edit_fg_observation::Kind::XEFG_TAG_RETURN: event["kind"] = "xefg_tag_return"; break;
+          default: event["kind"] = "xefg_present_return"; break;
+        }
+        event["call_id"] = observed.call_id;
+        event["api_result"] = observed.api_result;
+        event["api_return_ns"] = observed.api_return_ns;
+        if (observed.kind == edit_fg_observation::Kind::XEFG_PRESENT_RETURN) {
+          const auto& status = observed.present_status;
+          const bool valid = status.queried && status.api_result == 0;
+          event["sdk_present_status"] = {{"queried", status.queried},
+              {"api_result", status.queried ? Json(status.api_result) : Json(nullptr)},
+              {"frames_presented", valid ? Json(status.frames_presented) : Json(nullptr)},
+              {"frame_gen_result", valid ? Json(status.frame_gen_result) : Json(nullptr)},
+              {"enabled", valid ? Json(status.enabled) : Json(nullptr)}};
+        }
+        break;
+    }
+    fg_observation_events.push_back(std::move(event));
+  }
+  const auto device_observation = [](const fg::xefg::BridgeDeviceObservation& observed) {
+    return Json{{"object_present", observed.object_present}, {"swapchain_unwrapped", observed.swapchain_unwrapped},
+        {"swapchain_result", observed.swapchain_result}, {"device11_result", observed.device11_result},
+        {"device12_result", observed.device12_result}, {"returned_device_request", observed.returned_device_request},
+        {"returned_device_identity", observed.returned_device_identity},
+        {"device11_interface_result", observed.device11_interface_result},
+        {"device12_interface_result", observed.device12_interface_result},
+        {"device11_interface_identity", observed.device11_interface_identity},
+        {"device12_interface_identity", observed.device12_interface_identity}};
+  };
+  Json edit_off_sources = Json::array();
+  Json edit_device_observation = nullptr;
+  Json edit_off_events = nullptr;
+  if (edit_reuse_adaptive_experiment.load()) {
+    const auto trace = fg::xefg::CopyBridgeEvents();
+    Json events = Json::array();
+    for (uint32_t index = 0; index < trace.count; ++index) {
+      const auto& event = trace.events[index];
+      const char* kind = "unobserved";
+      switch (event.kind) {
+        case fg::xefg::BridgeEventKind::ENABLE_BEGIN: kind = "enable_begin"; break;
+        case fg::xefg::BridgeEventKind::ENABLE_END: kind = "enable_end"; break;
+        case fg::xefg::BridgeEventKind::LINK_REVOKED: kind = "link_revoked"; break;
+        case fg::xefg::BridgeEventKind::LINK_OBSERVED: kind = "link_observed"; break;
+      }
+      const char* method = "unobserved";
+      switch (event.source_entry.method) {
+        case fg::xefg::BridgePresentMethod::UNOBSERVED: break;
+        case fg::xefg::BridgePresentMethod::PRESENT: method = "Present"; break;
+        case fg::xefg::BridgePresentMethod::PRESENT1: method = "Present1"; break;
+      }
+      events.push_back({{"kind", kind}, {"sequence", event.sequence}, {"observed_ns", event.observed_ns},
+          {"sdk_return_ns", event.sdk_return_ns}, {"thread_id", event.thread_id},
+          {"context_identity", event.context_identity}, {"declaration", event.declaration}, {"epoch", event.epoch},
+          {"link_generation", event.link_generation}, {"source_swapchain", event.source_swapchain},
+          {"source_swapchain_generation", event.source_swapchain_generation},
+          {"source", {{"handle", event.source.handle}, {"generation", event.source.generation},
+              {"device11", event.source.device11}, {"device12", event.source.device12}}},
+          {"reason", event.reason}, {"enabled_request", event.enabled_request}, {"sdk_status", event.sdk_status},
+          {"off_observed", event.off_observed},
+          {"source_entry", {{"method", method}, {"return_address", event.source_entry.return_address},
+              {"thread_id", event.source_entry.thread_id}, {"proxy_entry_depth", event.source_entry.proxy_entry_depth},
+              {"interval", event.source_entry.interval}, {"flags", event.source_entry.flags}}}});
+    }
+    edit_off_events = {{"last_sequence", trace.last_sequence}, {"overwritten", trace.overwritten},
+        {"events", std::move(events)}};
+    const auto observed = fg::xefg::QueryBridgeOff({});
+    edit_device_observation = {{"query_reason", observed.reason}, {"sdk_context", observed.context},
+        {"sdk_proxy", observed.proxy}, {"context_identity", observed.context_identity},
+        {"context_epoch", observed.epoch}, {"init_kind", observed.init_kind},
+        {"application_device11", observed.application_device11}, {"proxy_device11", observed.proxy_device11},
+        {"application_device_observation", device_observation(observed.application)},
+        {"proxy_device_observation", device_observation(observed.proxy_device)}};
+    for (const auto& [handle, source] : create_contracts) {
+      if (source.source_device12_identity == nullptr) continue;
+      const auto off = EditReuseXefgOffLocked(handle);
+      edit_off_sources.push_back({{"source_handle", reinterpret_cast<uintptr_t>(handle)},
+          {"source_generation", source.source_generation},
+          {"device12", reinterpret_cast<uintptr_t>(source.source_device12_identity.Get())},
+          {"available", off.available}, {"reason", off.reason}, {"source_link_reason", off.source_link_reason},
+          {"context_identity", off.context_identity}, {"context_epoch", off.epoch},
+          {"sdk_context", off.context}, {"sdk_proxy", off.proxy}, {"init_kind", off.init_kind},
+          {"application_device11", off.application_device11}, {"proxy_device11", off.proxy_device11},
+          {"application_device_observation", device_observation(off.application)},
+          {"proxy_device_observation", device_observation(off.proxy_device)},
+          {"source_link_generation", off.source_link_generation}, {"uses_source_link", off.uses_source_link},
+          {"source_swapchain", off.source_swapchain}, {"source_swapchain_generation", off.source_swapchain_generation},
+          {"source_present_thread_id", off.source_present_thread_id},
+          {"source_present_proxy_entry_depth", off.source_present_proxy_entry_depth},
+          {"provider_matches", off.MatchesOutput(output)}});
+    }
+  }
+  Json edit_sources = Json::array();
   Json caches = Json::array();
   for (const auto& [handle, feature] : features) {
+    for (uint32_t pass = 0; pass < kMaxNrPasses; ++pass) {
+      const auto& edit = feature.slots[pass].edit_reuse;
+      if (edit == nullptr) continue;
+      edit_sources.push_back({{"source_handle", reinterpret_cast<uintptr_t>(handle)},
+          {"source_generation", feature.source_generation}, {"source_frame", feature.sr_sequence},
+          {"source_type_confirmed", feature.source_type_confirmed},
+          {"source_feature", static_cast<uint32_t>(feature.source_feature)}, {"pass", pass + 1},
+          {"working_size", {edit->width, edit->height}}, {"output_size", {edit->output_width, edit->output_height}},
+          {"anchor_generation", edit->anchor_generation}, {"source_sequence", edit->source_sequence},
+          {"reuse_count", edit->reuse_count}, {"valid", edit->valid}, {"reused", edit->reused},
+          {"evidence", "recorded_edit_cache_state_not_gpu_completion"}});
+    }
     const auto& cache = feature.adaptive_cache;
     if (cache == nullptr) continue;
     Json slots = Json::array();
@@ -130,8 +326,21 @@ inline Json Snapshot() {
       slots.push_back({{"slot", index}, {"active", index == cache->active}, {"ready", tier.ready},
           {"logical_size", {current.input_width, current.input_height}}, {"models", std::move(models)}});
     }
+    Json sampling = nullptr;
+    if (feature.adaptive_session != nullptr) {
+      const auto& session = *feature.adaptive_session;
+      double median = 0., mad = 0.;
+      const bool statistics_valid = session.GpuStatistics(now, &median, &mad);
+      sampling = {{"paired_sampling", session.paired_sampling}, {"sampling_generation", session.sampling_generation},
+          {"gpu_count", session.gpu_count},
+          {"latest_recorded_ns", session.gpu_count != 0 ? Json(session.gpu_recorded_ns[session.gpu_count - 1]) : Json(nullptr)},
+          {"statistics_valid", statistics_valid}, {"median_us", statistics_valid ? Json(median) : Json(nullptr)},
+          {"mad_us", statistics_valid ? Json(mad) : Json(nullptr)}, {"evidence", "controller_per_source_gpu_chain"}};
+    }
     caches.push_back({{"source_handle", reinterpret_cast<uintptr_t>(handle)}, {"physical_slot_count", cache->count},
-        {"active_slot", cache->active}, {"slots", std::move(slots)}});
+        {"active_slot", cache->active}, {"source_frame", feature.sr_sequence},
+        {"trial", feature.adaptive_session != nullptr ? Json(feature.adaptive_session->trial) : Json(nullptr)},
+        {"sampling", std::move(sampling)}, {"slots", std::move(slots)}});
   }
   if (identity != Identity()) {
     state["reason"] = "configuration_changed";
@@ -142,11 +351,37 @@ inline Json Snapshot() {
       {"config_epoch", identity["config_epoch"]}, {"presents", presents_observed.load()},
       {"successful_source_frames", SourceSuccessfulEvaluations()},
       {"nr_features_created", nr_features_created},
+      {"edit_reuse", {{"requested", edit_reuse_enabled.load()}, {"refreshes", edit_reuse_refreshes.load()},
+          {"reuses", edit_reuse_reuses.load()}, {"fallbacks", edit_reuse_fallbacks.load()},
+          {"sources", std::move(edit_sources)},
+          {"fg_environment", {{"available", fg_environment.available}, {"reason", fg_environment.reason},
+              {"provider", fg_environment.provider}, {"context", fg_environment.context},
+              {"generation", fg_environment.generation},
+              {"evidence", "fg_environment_metadata_not_source_handoff"}}},
+          {"fg_observation", {{"enabled", fg_observed.enabled}, {"state", fg_observation_state},
+              {"reason", fg_observed.stop_reason}, {"request_generation", fg_observed.request_generation},
+              {"source_frames", fg_observed.source_frames}, {"event_count", fg_observed.count},
+              {"overflow", fg_observed.overflow},
+              {"source", source_observation(fg_observed.source)}, {"events", std::move(fg_observation_events)},
+              {"evidence", "cpu_call_and_recording_observations_not_gpu_completion_or_pixel_handoff"},
+              {"resource_identity_scope", "IUnknown_after_known_ReShade_unwrap;Streamline_faces_remain_distinct"},
+              {"first_source_prefix_complete", false}}},
+          {"xefg_off_sources", std::move(edit_off_sources)},
+          {"xefg_device_observation", std::move(edit_device_observation)},
+          {"xefg_off_events", std::move(edit_off_events)},
+          {"evidence", "process_counters_not_activation_or_gpu_completion"}}},
       {"experiments", {{"adaptive_feature_mode", identity["experiments"]["adaptive_feature_mode"]},
+          {"bridge_adaptive_experiment", identity["experiments"]["bridge_adaptive_experiment"]},
+          {"bridge_adaptive_evidence", "requested_enabled_not_activation"},
+          {"edit_reuse_adaptive_experiment", identity["experiments"]["edit_reuse_adaptive_experiment"]},
+          {"edit_reuse_adaptive_evidence", identity["experiments"]["edit_reuse_adaptive_evidence"]},
+          {"edit_reuse_fg_experiment", identity["experiments"]["edit_reuse_fg_experiment"]},
+          {"edit_reuse_fg_evidence", "requested_enabled_not_activation"},
           {"evidence", "requested_mode_not_activation"}}},
       {"adaptive_caches", std::move(caches)},
       {"output_framerate", {{"available", output.available}, {"reason", output_framerate::ReasonText(output.reason)},
           {"source", output_framerate::SourceText(output.source)}, {"source_generation", output.source_generation},
+          {"identity", output.identity}, {"fg_off", output.fg_off},
           {"configuration_generation", output.configuration_generation}, {"window_serial", output.window_serial},
           {"window_begin_ns", output.window_begin_ns}, {"window_end_ns", output.window_end_ns},
           {"fps", output.available ? Json(output.fps) : Json(nullptr)},
@@ -166,6 +401,55 @@ inline Json Snapshot() {
           {"preparation_cpu_ms", adaptive.preparation_cpu_ms},
           {"preparation_vram_delta_bytes", adaptive.preparation_vram_delta_bytes},
           {"peak_process_vram_bytes", adaptive.peak_process_vram_bytes}}}});
+#if defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+  const auto probe = fg_output_probe::CopySnapshot();
+  const auto& native_probe = probe.native;
+  Json xefg_probes = Json::array();
+  for (const auto& context : probe.xefg) {
+    if (!context.observed) continue;
+    xefg_probes.push_back({{"sequence", context.observed_sequence}, {"registered", context.registered},
+        {"stopped", context.stopped}, {"reason", context.reason}, {"sdk_slot", context.sdk_slot},
+        {"module_base", context.module_base}, {"sdk_context", context.sdk_context},
+        {"context_identity", context.context_identity}, {"init_epoch", context.init_epoch},
+        {"init_generation", context.init_generation}, {"current_epoch", context.current_epoch},
+        {"current_generation", context.current_generation}, {"debug_export", context.debug_export},
+        {"init_result", context.init_result_available ? Json(context.init_result) : Json(nullptr)},
+        {"show_result", context.show_called ? Json(context.show_result) : Json(nullptr)},
+        {"tag_result", context.tag_called ? Json(context.tag_result) : Json(nullptr)},
+        {"debug_applied", context.debug_applied},
+        {"active", context.registered && !context.stopped && context.debug_applied
+            && fg_environment.available && fg_environment.provider == 2
+            && fg_environment.context == context.context_identity},
+        {"destroy_result", context.destroy_called ? Json(context.destroy_result) : Json(nullptr)}});
+  }
+  const auto& marker = fg_output_marker_window;
+  state["edit_reuse"]["fg_observation"]["serialized_event_limit"] = 16;
+  state["edit_reuse"]["fg_output_probe"] = {
+      {"dedicated_validation_build", true}, {"evidence", "sdk_display_configuration_and_marker_recording_not_output_pixels"},
+      {"sequence", probe.sequence}, {"overflow", probe.overflow}, {"xefg", std::move(xefg_probes)},
+      {"native", {{"observed", native_probe.observed}, {"active", native_probe.active},
+          {"sequence", native_probe.observed_sequence}, {"success_generation", native_probe.after_success_generation},
+          {"reason", native_probe.reason}, {"stopped", native_probe.stopped},
+          {"version_supported", native_probe.version_supported},
+          {"viewport", native_probe.observed ? Json(native_probe.viewport) : Json(nullptr)},
+          {"struct_version", native_probe.observed ? Json(native_probe.struct_version) : Json(nullptr)},
+          {"mode", native_probe.version_supported ? Json(native_probe.mode) : Json(nullptr)},
+          {"num_frames", native_probe.version_supported ? Json(native_probe.num_frames) : Json(nullptr)},
+          {"original_flags", native_probe.version_supported ? Json(native_probe.original_flags) : Json(nullptr)},
+          {"forwarded_flags", native_probe.version_supported ? Json(native_probe.forwarded_flags) : Json(nullptr)},
+          {"flag_forwarded", native_probe.flag_forwarded},
+          {"api_result", native_probe.observed ? Json(native_probe.result) : Json(nullptr)}}},
+      {"marker", {{"request_generation", marker.request_generation}, {"enabled", marker.enabled},
+          {"bound", marker.bound}, {"stopped", marker.stopped}, {"reason", marker.reason},
+          {"frame_limit", marker.MAX_FRAMES}, {"recorded", marker.recorded},
+          {"refreshes", marker.refreshes}, {"reuses", marker.reuses},
+          {"first_sequence", marker.first_sequence}, {"last_sequence", marker.last_sequence},
+          {"last_recorded_ns", marker.last_recorded_ns}, {"source", marker.binding.source},
+          {"source_generation", marker.binding.source_generation}, {"provider", marker.binding.provider},
+          {"context", marker.binding.context}, {"environment_generation", marker.binding.environment_generation},
+          {"roi_position", "source_width/4,source_height/3"}, {"roi_size", {128, 64}},
+          {"encoding", "linear_FP16_after_resolve_alpha_preserved"}}}};
+#endif
   return state;
 }
 
@@ -188,7 +472,10 @@ inline Json Execute(const Json& request) {
         {"receipt", request.contains("query_id") && last_request.is_object()
                 && request["query_id"] == last_request["id"] ? last_receipt : Json(nullptr)}};
   }
-  if (*operation != "set" && *operation != "adaptive_feature_experiment" && *operation != "inline_restore_roi") {
+  if (*operation != "set" && *operation != "adaptive_feature_experiment"
+      && *operation != "bridge_adaptive_experiment" && *operation != "edit_reuse_adaptive_experiment"
+      && *operation != "edit_reuse_fg_experiment"
+      && *operation != "inline_restore_roi") {
     return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "invalid_operation"}};
   }
   if (last_request.is_object() && last_request["id"] == *id) {
@@ -199,6 +486,14 @@ inline Json Execute(const Json& request) {
       {"message", ""}, {"changes", Json::object()}};
   const auto finish = [&]() {
     response["state"] = Snapshot();
+    if (response["state"].value("available", false)) {
+      // Status can contain both the current state and this cached receipt.
+      // Keep bounded events in the current status, rather than duplicating
+      // them into every mutation receipt under the same 64 KiB pipe limit.
+      auto& observed = response["state"]["edit_reuse"]["fg_observation"];
+      observed["events"] = Json::array();
+      observed["events_in_status_only"] = true;
+    }
     response["identity"] = response["state"].value("identity", Json(nullptr));
     last_request = request;
     last_receipt = response;
@@ -213,6 +508,14 @@ inline Json Execute(const Json& request) {
     response["reason"] = "invalid_output_directory";
     const auto directory = request.find("output_directory");
     if (directory == request.end() || !directory->is_string()) return finish();
+    uint32_t tail_frames = 0;
+    if (const auto count = request.find("tail_frames"); count != request.end()) {
+      if (!count->is_number_integer() || *count < 2 || *count > screenshot::MAX_INLINE_TAIL_FRAMES) {
+        response["reason"] = "invalid_tail_frame_count";
+        return finish();
+      }
+      tail_frames = count->get<uint32_t>();
+    }
     if (configuration_busy) {
       response["reason"] = "configuration_busy";
       return finish();
@@ -221,7 +524,7 @@ inline Json Execute(const Json& request) {
     try {
       const auto& utf8_directory = directory->get_ref<const std::string&>();
       const bool armed = screenshot::RequestInlineRestoreRoi(
-          std::filesystem::path(std::u8string(utf8_directory.begin(), utf8_directory.end())), &reason);
+          std::filesystem::path(std::u8string(utf8_directory.begin(), utf8_directory.end())), &reason, tail_frames);
       response["ok"] = armed;
       response["status"] = (armed ? "armed" : "rejected");
       response["reason"] = reason;
@@ -230,11 +533,18 @@ inline Json Execute(const Json& request) {
     }
     return finish();
   }
-  if (*operation == "adaptive_feature_experiment") {
-    response["reason"] = "invalid_mode";
-    const auto mode = request.find("mode");
-    if (mode == request.end() || !mode->is_number_integer() || *mode < 0 || *mode > 3) return finish();
-    response["requested"] = {{"mode", *mode}};
+  const bool bridge_experiment = *operation == "bridge_adaptive_experiment";
+  const bool fg_experiment = *operation == "edit_reuse_fg_experiment";
+  const bool boolean_experiment = bridge_experiment || fg_experiment || *operation == "edit_reuse_adaptive_experiment";
+  if (*operation == "adaptive_feature_experiment" || boolean_experiment) {
+    const auto value = request.find(boolean_experiment ? "enabled" : "mode");
+    response["reason"] = (boolean_experiment ? "invalid_enabled" : "invalid_mode");
+    if (boolean_experiment) {
+      if (value == request.end() || !value->is_boolean()) return finish();
+    } else if (value == request.end() || !value->is_number_integer() || *value < 0 || *value > 3) {
+      return finish();
+    }
+    response["requested"] = {{boolean_experiment ? "enabled" : "mode", *value}};
     if (configuration_busy) {
       response["reason"] = "configuration_busy";
       return finish();
@@ -248,9 +558,29 @@ inline Json Execute(const Json& request) {
       } else if (!disabled_resources_released.load()) {
         response["reason"] = "resources_not_released";
       } else {
-        const auto requested = static_cast<AdaptiveFeatureMode>(mode->get<uint32_t>());
-        const bool unchanged = adaptive_feature_mode.load() == requested;
-        adaptive_feature_mode.store(requested);
+        bool unchanged = false;
+        if (boolean_experiment) {
+          auto* requested_flag = &edit_reuse_adaptive_experiment;
+          if (bridge_experiment) {
+            requested_flag = &bridge_adaptive_experiment;
+          }
+          if (fg_experiment) {
+            requested_flag = &edit_reuse_fg_experiment;
+          }
+          const bool requested = value->get<bool>();
+          unchanged = requested_flag->load() == requested;
+          requested_flag->store(requested);
+          if (fg_experiment && !unchanged) {
+            edit_fg_observation::SetEnabled(requested);
+#if defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+            fg_output_marker_window.SetEnabled(requested);
+#endif
+          }
+        } else {
+          const auto requested = static_cast<AdaptiveFeatureMode>(value->get<uint32_t>());
+          unchanged = adaptive_feature_mode.load() == requested;
+          adaptive_feature_mode.store(requested);
+        }
         response["ok"] = true;
         response["status"] = unchanged ? "unchanged" : "applied";
         response["reason"] = "experiment_requested";
@@ -340,7 +670,7 @@ inline Json Execute(const Json& request) {
     resolution_edit::Cancel();
   } else {
     applied = preset_ui::Apply({.metadata = Json::object(), .scope = presets::Scope::FULL, .settings = changes},
-        false, false, &error);
+        key == "NRDisableRelease", false, &error);
   }
   response["ok"] = applied;
   response["status"] = applied ? (unchanged ? "unchanged" : "applied") : "rejected";

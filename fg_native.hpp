@@ -50,7 +50,9 @@ struct Stream {
   const NVSDK_NGX_Handle* native_handle = nullptr;
   bool continuing_submission = false;
   uint64_t last_model_frame[2] = {};
+  uint64_t last_output_frame[2] = {};
   int64_t diagnostic_logged_ns = 0;
+  int64_t gpu_capture_entry_ns = 0;
   bool has_frame = false;
   fg::Result result = fg::Result::NOT_SERVED;
   PresentStream roles[2];
@@ -128,6 +130,7 @@ inline void Invalidate(Stream* stream) {
   stream->native_serial = 0;
   stream->continuing_submission = false;
   stream->last_model_frame[0] = stream->last_model_frame[1] = 0;
+  stream->last_output_frame[0] = stream->last_output_frame[1] = 0;
   stream->result = fg::Result::NOT_SERVED;
   for (auto& role : stream->roles) {
     if (const auto it = features.find(role.Handle()); it != features.end()) {
@@ -384,7 +387,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     // Runtime/device adoption can release the old global codec. It must run
     // before this CPU-only gate, while no FeatureState references are held.
     auto decline = NrDeclineReason::kNrRuntimeUnavailable;
-    if (!EnsureDirectRuntime(list, &decline)) {
+    if (!EnsureDirectRuntime(list, &decline, base.private_signed_runtime)) {
       CountNrDecline(decline);
       return fg::Result::NOT_SERVED;
     }
@@ -622,11 +625,17 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     if (!stream->adaptive_session->settings.legacy_preparation) {
       uint32_t ready = 0;
       for (size_t tier = 0; tier < stream->adaptive_session->ladder.count; ++tier) ready += selected_ready[tier];
-      stream->adaptive_session->UpdatePreparation(stream->adaptive_frame.preparation_epoch, ready,
-          static_cast<uint32_t>(stream->adaptive_session->ladder.count),
-          group_failed ? adaptive_resolution::Reason::FAILED
-              : (group_budget ? adaptive_resolution::Reason::BUDGET : adaptive_resolution::Reason::PREPARING), SteadyNowNs());
-      group_ready &= stream->adaptive_session->prepared;
+      const auto reason = (group_failed ? adaptive_resolution::Reason::FAILED
+          : (group_budget ? adaptive_resolution::Reason::BUDGET : adaptive_resolution::Reason::PREPARING));
+      if (stream->adaptive_session->settings.limited_residency) {
+        stream->adaptive_session->UpdateTargetPreparation(stream->adaptive_frame.preparation_epoch,
+            stream->adaptive_frame.generation, ready, static_cast<uint32_t>(stream->adaptive_session->ladder.count),
+            group_ready, reason, SteadyNowNs());
+      } else {
+        stream->adaptive_session->UpdatePreparation(stream->adaptive_frame.preparation_epoch, ready,
+            static_cast<uint32_t>(stream->adaptive_session->ladder.count), reason, SteadyNowNs());
+      }
+      group_ready &= stream->adaptive_session->TargetReady();
       PublishAdaptiveStatus(stream->adaptive_session->status);
     }
     const bool return_upper = upper_ready && (group_failed || group_budget
@@ -664,9 +673,17 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
   // XeFG full-frame inputs can feed the core's original copy directly while
   // output stays private. Composition needs the unmodified staged backbuffer.
   const auto backbuffer_desc = input.backbuffer->GetDesc();
+  const bool xefg_edit_reuse_frame = edit_reuse_enabled.load(std::memory_order_relaxed)
+      && !stream->native && native_parameters == nullptr && !has_hudless && !input.ui_composition
+      && input.fg_enabled && input.has_present_id && input.has_constants && input.application_frame != 0
+      && real_guides && input.color_x == 0 && input.color_y == 0
+      && backbuffer_desc.Width == input.color_width && backbuffer_desc.Height == input.color_height;
+  // Cache descriptors retain their sources. Stage the current original in
+  // the existing private slot instead of retaining a DXGI backbuffer across ResizeBuffers.
   const bool borrow_color_inputs = native_parameters == nullptr
       && input.color_x == 0 && input.color_y == 0
-      && backbuffer_desc.Width == input.color_width && backbuffer_desc.Height == input.color_height;
+      && backbuffer_desc.Width == input.color_width && backbuffer_desc.Height == input.color_height
+      && !xefg_edit_reuse_frame;
   if (!borrow_color_inputs) {
     CopyColor(list, slot->color[0], kRead, input.backbuffer, input.backbuffer_state,
               input.color_x, input.color_y);
@@ -699,9 +716,10 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     auto& role = stream->roles[i];
     // Public motion relates adjacent application frames, not the last frame
     // for which a busy service could obtain a recording slot or NGX turn.
+    // A cache output is a completed base frame without a new model call.
+    const uint64_t previous_frame = (xefg_edit_reuse_frame ? stream->last_output_frame[i] : stream->last_model_frame[i]);
     if (input.reset || role.real_guides != real_guides || stream->epoch != input.epoch
-        || (input.application_frame != 0 && stream->last_model_frame[i] != 0
-            && input.application_frame != stream->last_model_frame[i] + 1)) {
+        || (input.application_frame != 0 && previous_frame != 0 && input.application_frame != previous_frame + 1)) {
       ResetPresentStreamHistory(&role);
     }
     role.real_guides = real_guides;
@@ -721,6 +739,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     target.capture_display = false;
     target.ui_correction = i == 0 && base.ui_correction;
     target.guide_serial = (real_guides ? input.application_frame + 1 : 0u);
+    target.xefg_edit_reuse_frame = (xefg_edit_reuse_frame ? input.application_frame : 0u);
     target.domain = (i == 0 ? present_restore_scope::Domain::PRE_FG_BACKBUFFER
                             : present_restore_scope::Domain::PRE_FG_HUDLESS);
     target.original_identity = reinterpret_cast<uintptr_t>(i == 0 ? input.backbuffer : input.hudless);
@@ -737,11 +756,24 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
            << " application_frame=" << input.application_frame
            << " present_id=" << input.present_id << " tagged_id=" << input.has_present_id
            << " previous_model_frame=" << stream->last_model_frame[i]
+           << " previous_output_frame=" << stream->last_output_frame[i]
            << " guides=" << (real_guides ? "real" : "neutral")
            << " guide_frame_basis=" << (stream->native ? "native_fg_input" : "present_id")
            << " guide_serial=" << target.guide_serial << " constants=" << input.has_constants
            << " guide_size=" << contract.input_width << 'x' << contract.input_height
            << " color_size=" << input.color_width << 'x' << input.color_height
+           << " color_format=" << backbuffer_desc.Format
+           << " motion_format=" << motion->GetDesc().Format
+           << " motion_size=" << motion->GetDesc().Width << 'x' << motion->GetDesc().Height
+           << " motion_flags=" << motion->GetDesc().Flags
+           << " depth_format=" << depth->GetDesc().Format
+           << " depth_size=" << depth->GetDesc().Width << 'x' << depth->GetDesc().Height
+           << " depth_flags=" << depth->GetDesc().Flags
+           << " edit_requested=" << edit_reuse_enabled.load(std::memory_order_relaxed)
+           << " edit_frame=" << target.xefg_edit_reuse_frame
+           << " edit_refresh=" << edit_reuse_refreshes.load(std::memory_order_relaxed)
+           << " edit_reuse=" << edit_reuse_reuses.load(std::memory_order_relaxed)
+           << " edit_fallback=" << edit_reuse_fallbacks.load(std::memory_order_relaxed)
            << " motion_base=" << contract.motion_x << ',' << contract.motion_y
            << " depth_base=" << contract.depth_x << ',' << contract.depth_y
            << " motion_scale=" << contract.motion_scale_x << ',' << contract.motion_scale_y
@@ -914,7 +946,16 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
       if ((*recordings)[i].model_recorded) {
         stream->last_model_frame[i] = input.application_frame;
       }
+      if ((*recordings)[i].output_ready) {
+        stream->last_output_frame[i] = input.application_frame;
+      }
     }
+  }
+  if (stream->adaptive_session != nullptr && stream->adaptive_session->settings.limited_residency
+      && (stream->adaptive_frame.enabled || !stream->adaptive_session->settings.enabled)) {
+    // A role's ProcessInline success cannot commit the whole color group.
+    stream->adaptive_session->Applied(stream->adaptive_frame.generation, stream->adaptive_frame.sizes, SteadyNowNs());
+    PublishAdaptiveStatus(stream->adaptive_session->status);
   }
   *output_ready = true;
   return fg::Result::PREPARED;
@@ -922,6 +963,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
 
 inline fg::Result Service(const fg::FrameInput& input) noexcept {
   try {
+    const int64_t service_entry_ns = (xefg_gpu_capture_enabled.load(std::memory_order_relaxed) ? SteadyNowNs() : 0);
     if (!Requested() || input.queue == nullptr || input.backbuffer == nullptr
         || input.color_width == 0 || input.color_height == 0 || !input.fg_enabled) return fg::Result::NOT_SERVED;
     // AUTO composition may consume HUDLess too. If a mode change happened
@@ -934,8 +976,8 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     renodx::utils::directx::NativeFromReShadeProxy(&queue);
     if (!InstallQueueCompletionHooks(queue)) return fg::Result::NOT_SERVED;
     ID3D12Device* device = nullptr;
-    if (FAILED(input.queue->GetDevice(IID_PPV_ARGS(&device)))) return fg::Result::FAILED;
-    PrimeNgxLoaderSymbols(device);
+    if (FAILED(queue->GetDevice(IID_PPV_ARGS(&device)))) return fg::Result::FAILED;
+    PrimeNgxLoaderSymbols(device, true);
     auto device_release = std::unique_ptr<ID3D12Device, void (*)(ID3D12Device*)>(device,
         [](ID3D12Device* value) { value->Release(); });
     const ngx_serial::PresentTurn turn(true);
@@ -959,6 +1001,12 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
       }
     }
     if (stream.has_frame && stream.application_frame == input.application_frame) return stream.result;
+    const bool service_interval_available = service_entry_ns > stream.gpu_capture_entry_ns
+        && stream.gpu_capture_entry_ns != 0 && stream.has_frame
+        && input.application_frame == stream.application_frame + 1;
+    const double service_interval_ms = (service_interval_available
+        ? (service_entry_ns - stream.gpu_capture_entry_ns) / 1e6 : 0.);
+    stream.gpu_capture_entry_ns = service_entry_ns;
     stream.has_frame = true;
     stream.application_frame = input.application_frame;
     stream.result = fg::Result::NOT_SERVED;
@@ -1024,6 +1072,12 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
       if (submitted) return;
       try {
         if (!close_attempted) {
+          if (gpu_timers::internal::current.active) {
+            const auto& timing = gpu_timers::internal::segments[gpu_timers::internal::current.idx];
+            if (timing.service_scope && timing.service_list == slot->list) {
+              gpu_timers::End(slot->list, true);
+            }
+          }
           close_recording();
         }
         submission::OnCommandListReset(slot->list);
@@ -1043,6 +1097,7 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
       return stream.result;
     }
     PresentTarget target;
+    target.private_signed_runtime = true;
     SnapshotPresentRestoreConfiguration(&target);
     target.swapchain_identity = reinterpret_cast<uintptr_t>(input.swapchain);
     target.swapchain_format = input.backbuffer->GetDesc().Format;
@@ -1091,6 +1146,45 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     if (exact_ui) composition.Set(NVSDK_NGX_DLSSG_Parameter_UI, input.ui);
     bool output_ready = false;
     std::array<NrRecording, 2> recordings;
+    const auto color_desc = input.backbuffer->GetDesc();
+    const bool capture_service = xefg_gpu_capture_enabled.load(std::memory_order_relaxed)
+        && control_mask_capture::Enabled() && gpu_timers_enabled.load(std::memory_order_relaxed)
+        && nr_input.hudless == nullptr && !input.ui_composition && input.has_present_id && input.has_constants
+        && input.depth != nullptr && input.motion != nullptr && input.guide_width != 0 && input.guide_height != 0
+        && input.color_x == 0 && input.color_y == 0
+        && color_desc.Width == input.color_width && color_desc.Height == input.color_height
+        && stack_passes.load(std::memory_order_relaxed) == 1;
+    const bool capture_timer = capture_service && gpu_timers::Begin(slot->list, device, "present",
+        input.color_width, input.color_height, 0, 1, true, true);
+    const uint32_t capture_index = gpu_timers::internal::current.idx;
+    const auto finish_capture = [&] {
+      if (!capture_service) return;
+      uint32_t model_evaluates = 0;
+      for (uint32_t mask = recordings[0].model_evaluate_mask; mask != 0; mask >>= 1) {
+        model_evaluates += mask & 1u;
+      }
+      control_mask_capture::Context context{
+          .requested_model = preset.load(std::memory_order_relaxed),
+          .stage = static_cast<uint32_t>(stage_plan::Stage::PRESENT),
+          .width = input.color_width, .height = input.color_height,
+          .xefg_service = true, .application_frame = input.application_frame,
+          .guide_serial = input.application_frame + 1, .stream_epoch = input.epoch,
+          .service_entry_ns = service_entry_ns, .service_interval_ms = service_interval_ms,
+          .service_interval_available = service_interval_available,
+          .model_evaluates = model_evaluates, .refresh = recordings[0].model_recorded,
+          .reuse = recordings[0].edit_reused, .output_ready = output_ready};
+      std::snprintf(context.runtime_version, sizeof(context.runtime_version), "%s",
+                    direct_runtime_requirements.file_version.c_str());
+      const uint64_t token = control_mask_capture::Reserve(context,
+          (capture_timer ? gpu_timers::internal::segments[capture_index].sequence : 0), service_entry_ns);
+      if (capture_timer) {
+        gpu_timers::internal::segments[capture_index].diagnostic_token = token;
+        gpu_timers::End(slot->list, true);
+      } else {
+        control_mask_capture::Observe(gpu_timers::Stats{
+            .state = gpu_timers::SampleState::PROOF_UNAVAILABLE, .measured_ns = gpu_timers::NowNs()}, token);
+      }
+    };
     const auto recorded = Record(&stream, slot, slot->list, nr_input, target,
                                  &output_ready, &recordings, exact_ui ? &composition : nullptr);
     uint32_t process_calls = 0;
@@ -1120,6 +1214,7 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
         hudless_processes != 0 && backbuffer_processes != 0,
         exact_ui && hudless_processes != 0 && backbuffer_processes == 0 && output_ready);
     if (!output_ready) {
+      finish_capture();
       const bool closed = SUCCEEDED(close_recording());
       if (recorded == fg::Result::PREPARED && closed) {
         // Feature creation/maturation is real GPU work, but no color is
@@ -1150,6 +1245,7 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, 0, 0, input.color_x, input.color_y,
                 input.color_width, input.color_height);
     }
+    finish_capture();
     if (FAILED(close_recording())) {
       submission::OnCommandListReset(slot->list);
       Invalidate(&stream);

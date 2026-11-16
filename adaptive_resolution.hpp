@@ -16,6 +16,7 @@ namespace renodx::addons::dlss5::adaptive_resolution {
 constexpr int64_t SAMPLE_INTERVAL_NS = 250'000'000;
 constexpr int64_t SAMPLE_MAX_AGE_NS = 2'000'000'000;
 constexpr int64_t WARMUP_NS = 1'000'000'000;
+constexpr int64_t RETRY_COOLDOWN_NS = 30'000'000'000;
 constexpr size_t MAX_PASSES = 4, MAX_LEVELS = 16;
 constexpr uint32_t MINIMUM_SCALE_PERCENT = 33, SCALE_STEP_PERCENT = 5;
 constexpr float MINIMUM_SCALE = static_cast<float>(MINIMUM_SCALE_PERCENT) / 100.f;
@@ -63,6 +64,7 @@ struct Settings {
   uint32_t selected_levels = 0;
   // The default-off preparation experiments retain their original on-demand ladder.
   bool legacy_preparation = false;
+  bool limited_residency = false;
   bool operator==(const Settings&) const = default;
 };
 struct Output {
@@ -129,6 +131,8 @@ struct GpuSample {
   double total_us = 0.;
   uint32_t role = 1, required_roles = 1;
   bool valid = false, stable = false;
+  bool paired = false;
+  uint64_t pair_first_frame = 0, sampling_generation = 0;
 };
 
 struct Session {
@@ -140,6 +144,7 @@ struct Session {
   uint64_t configuration_epoch = 0;
   uint64_t preparation_epoch = 0;
   bool prepared = false;
+  bool target_ready = false;
   Reason preparation_reason = Reason::PREPARING;
   Sizes minimum{};
   uint64_t last_output_serial = 0, last_sequence = 0, gpu_context = 0;
@@ -147,6 +152,7 @@ struct Session {
   int64_t applied_ns = 0, stable_after_ns = 0, last_switch_ns = 0, at_target_since_ns = 0;
   int64_t next_measure_ns = 0;
   int64_t failed_raise_until_ns = 0;
+  int64_t blocked_until_ns = 0;
   size_t failed_raise_level = MAX_LEVELS;
   bool trial = false, raising = false, extra_window = false, blocked = false, failed = false;
   bool defer_preparation = false;
@@ -159,6 +165,10 @@ struct Session {
   size_t gpu_count = 0;
   GpuSample pending;
   uint32_t pending_roles = 0;
+  bool paired_sampling = false;
+  uint64_t paired_identity = 0;
+  uint64_t sampling_generation = 0, measure_pair_first_frame = 0;
+  GpuSample pending_pair;
 
   void ResetMeasurements() {
     gpu_count = 0;
@@ -166,8 +176,40 @@ struct Session {
     gpu_recorded_ns = {};
     pending = {};
     pending_roles = 0;
+    measure_pair_first_frame = 0;
+    pending_pair = {};
     last_output_serial = 0;
     at_target_since_ns = 0;
+  }
+
+  void InvalidateSampling() {
+    ++sampling_generation;
+    ResetMeasurements();
+  }
+
+  void SetPairedSampling(bool enabled, uint64_t sampling_identity = 0) {
+    if (!enabled) sampling_identity = 0;
+    if (paired_sampling == enabled && paired_identity == sampling_identity) return;
+    paired_sampling = enabled;
+    paired_identity = sampling_identity;
+    InvalidateSampling();
+    trial = false;
+  }
+
+  uint64_t SelectMeasurementPair(uint64_t source_frame, bool first_due) {
+    if (!paired_sampling || source_frame == 0) {
+      measure_pair_first_frame = 0;
+      return 0;
+    }
+    if (measure_pair_first_frame != 0) {
+      const uint64_t first = measure_pair_first_frame;
+      if (source_frame == first) return 0;
+      measure_pair_first_frame = 0;
+      if (source_frame == first + 1) return first;
+    }
+    if (!first_due) return 0;
+    measure_pair_first_frame = source_frame;
+    return source_frame;
   }
 
   bool IsLegal(const Sizes& sizes) const {
@@ -177,6 +219,10 @@ struct Session {
     return true;
   }
 
+  bool TargetReady() const {
+    return (settings.limited_residency ? target_ready : prepared);
+  }
+
   void Request(size_t candidate, int64_t now_ns) {
     if (candidate >= ladder.count) return;
     if (!IsLegal(ladder.sizes[candidate])) {
@@ -184,7 +230,11 @@ struct Session {
     }
     level = candidate;
     ++status.generation;
-    status.coefficient = ladder.coefficients[level];
+    if (settings.limited_residency) {
+      target_ready = false;
+    } else {
+      status.coefficient = ladder.coefficients[level];
+    }
     status.requested = ladder.sizes[level];
     applied_ns = 0;
     stable_after_ns = now_ns + WARMUP_NS;
@@ -237,24 +287,74 @@ struct Session {
 
   void Applied(uint64_t generation, const Sizes& actual, int64_t now_ns) {
     if (generation != status.generation || actual != status.requested) return;
+    if (settings.enabled && settings.limited_residency && !target_ready) return;
     status.applied = actual;
     active_level = level;
     if (applied_ns != 0) return;
     applied_ns = now_ns;
     stable_after_ns = now_ns + WARMUP_NS;
+    if (settings.limited_residency) {
+      status.coefficient = ladder.coefficients[level];
+      last_switch_ns = now_ns;
+    }
   }
 
   void Fail(uint64_t generation) {
     if (generation != status.generation) return;
     failed = true;
     prepared = false;
+    target_ready = false;
     preparation_reason = Reason::FAILED;
     trial = false;
     status.reason = Reason::FAILED;
     ResetMeasurements();
   }
 
+  void UpdateTargetPreparation(uint64_t epoch, uint64_t generation, uint32_t ready, uint32_t required,
+                               bool target_complete, Reason reason, int64_t now_ns) {
+    if (!settings.limited_residency || epoch != preparation_epoch || generation != status.generation
+        || !settings.enabled) return;
+    status.ready_levels = std::min(ready, required);
+    status.prepared_levels = required;
+    prepared = required == ladder.count && required != 0 && ready == required;
+    if (failed || preparation_reason == Reason::FAILED || reason == Reason::FAILED) {
+      Fail(generation);
+      return;
+    }
+    if (reason == Reason::BUDGET || preparation_reason == Reason::BUDGET) {
+      target_ready = false;
+      prepared = false;
+      trial = false;
+      preparation_reason = Reason::BUDGET;
+      status.reason = Reason::BUDGET;
+      ResetMeasurements();
+      return;
+    }
+    const bool complete = required == ladder.count && required != 0 && ready != 0 && target_complete;
+    if (!complete) {
+      if (target_ready) {
+        ResetMeasurements();
+        applied_ns = 0;
+      }
+      target_ready = false;
+      preparation_reason = Reason::PREPARING;
+      status.reason = Reason::PREPARING;
+      return;
+    }
+    if (!target_ready) {
+      target_ready = true;
+      ResetMeasurements();
+      stable_after_ns = now_ns + WARMUP_NS;
+      preparation_reason = Reason::PREPARING;
+      status.reason = Reason::WARMING;
+    }
+  }
+
   void UpdatePreparation(uint64_t epoch, uint32_t ready, uint32_t required, Reason reason, int64_t now_ns) {
+    if (settings.limited_residency) {
+      UpdateTargetPreparation(epoch, status.generation, ready, required, false, reason, now_ns);
+      return;
+    }
     if (epoch != preparation_epoch || !settings.enabled) return;
     status.ready_levels = std::min(ready, required);
     status.prepared_levels = required;
@@ -297,14 +397,21 @@ struct Session {
   }
 
   void ObserveGpu(const GpuSample& sample, int64_t now_ns) {
-    if ((!prepared && !settings.legacy_preparation) || sample.generation != status.generation
+    if (sample.paired != paired_sampling || sample.sampling_generation != sampling_generation
+        || (sample.paired && sample.pair_first_frame == 0)) return;
+    if ((!TargetReady() && !settings.legacy_preparation) || sample.generation != status.generation
         || (sample.sequence <= last_sequence && (pending_roles == 0 || sample.frame != pending.frame))) return;
     last_sequence = std::max(last_sequence, sample.sequence);
     if (!sample.valid || !sample.stable || sample.recorded_ns < stable_after_ns || applied_ns == 0
         || sample.recorded_ns > sample.completed_ns || sample.completed_ns > now_ns
         || now_ns - sample.recorded_ns > SAMPLE_MAX_AGE_NS
-        || now_ns - sample.completed_ns > SAMPLE_MAX_AGE_NS) {
+        || now_ns - sample.completed_ns > SAMPLE_MAX_AGE_NS
+        || (sample.paired && (!std::isfinite(sample.total_us) || sample.total_us <= 0.))) {
       pending_roles = 0;
+      pending_pair = {};
+      if (sample.paired && measure_pair_first_frame == sample.pair_first_frame) {
+        measure_pair_first_frame = 0;
+      }
       return;
     }
     if (gpu_context != 0 && gpu_context != sample.context) {
@@ -312,17 +419,42 @@ struct Session {
       trial = false;
     }
     gpu_context = sample.context;
-    if (pending_roles == 0 || pending.frame != sample.frame || pending.generation != sample.generation
-        || pending.required_roles != sample.required_roles || pending.context != sample.context) {
-      pending = sample;
+    auto complete = sample;
+    if (sample.paired) {
+      if (sample.role != 1 || sample.required_roles != 1) {
+        pending_pair = {};
+        return;
+      }
+      if (sample.frame == sample.pair_first_frame) {
+        pending_pair = sample;
+        return;
+      }
+      if (pending_pair.pair_first_frame != sample.pair_first_frame
+          || pending_pair.frame + 1 != sample.frame || pending_pair.generation != sample.generation
+          || pending_pair.context != sample.context || pending_pair.sampling_generation != sample.sampling_generation
+          || sample.recorded_ns <= pending_pair.recorded_ns
+          || now_ns - pending_pair.recorded_ns > SAMPLE_MAX_AGE_NS
+          || now_ns - pending_pair.completed_ns > SAMPLE_MAX_AGE_NS) {
+        pending_pair = {};
+        return;
+      }
+      complete.total_us = (pending_pair.total_us + sample.total_us) / 2.;
+      complete.recorded_ns = pending_pair.recorded_ns;
+      complete.completed_ns = std::max(pending_pair.completed_ns, sample.completed_ns);
+      complete.frame = pending_pair.frame;
+      pending_pair = {};
+    }
+    if (pending_roles == 0 || pending.frame != complete.frame || pending.generation != complete.generation
+        || pending.required_roles != complete.required_roles || pending.context != complete.context) {
+      pending = complete;
       pending.total_us = 0.;
       pending_roles = 0;
     }
-    if ((pending_roles & sample.role) != 0) return;
-    pending_roles |= sample.role;
-    pending.total_us += sample.total_us;
-    pending.recorded_ns = std::min(pending.recorded_ns, sample.recorded_ns);
-    if (pending_roles != sample.required_roles) return;
+    if ((pending_roles & complete.role) != 0) return;
+    pending_roles |= complete.role;
+    pending.total_us += complete.total_us;
+    pending.recorded_ns = std::min(pending.recorded_ns, complete.recorded_ns);
+    if (pending_roles != complete.required_roles) return;
     pending_roles = 0;
     if (gpu_count != 0 && pending.recorded_ns - gpu_recorded_ns[gpu_count - 1] < SAMPLE_INTERVAL_NS) return;
     if (gpu_count == gpu_us.size()) {
@@ -372,7 +504,8 @@ struct Session {
     const bool selection_changed = ladder.count != selected.count || ladder.sizes != selected.sizes;
     const bool selection_edited = settings.selected_levels != next.selected_levels || settings.minimum_scale != next.minimum_scale;
     const bool toggled = settings.enabled != next.enabled;
-    const bool preparation_mode_changed = settings.legacy_preparation != next.legacy_preparation;
+    const bool preparation_mode_changed = settings.legacy_preparation != next.legacy_preparation
+        || settings.limited_residency != next.limited_residency;
     const bool changed = identity != source_identity || settings != next || status.upper != upper || selection_changed;
     if (resources_changed) {
       const uint64_t generation = status.generation + 1;
@@ -391,10 +524,12 @@ struct Session {
     } else if (changed) {
       const auto retained = (trial ? ladder.sizes[previous_level] : status.applied);
       const bool defer_legacy = retain_legacy && (defer_preparation || settings.minimum_scale != next.minimum_scale);
-      const bool retry_budget = preparation_reason == Reason::BUDGET && selection_edited;
+      const bool retry_budget = preparation_reason == Reason::BUDGET
+          && (selection_edited || settings.limited_residency != next.limited_residency);
       if (selection_changed || toggled || preparation_mode_changed || retry_budget) {
         ++preparation_epoch;
         prepared = false;
+        target_ready = false;
         status.ready_levels = 0;
         status.prepared_levels = static_cast<uint32_t>(selected.count);
       }
@@ -423,6 +558,7 @@ struct Session {
       raising = false;
       extra_window = false;
       blocked = false;
+      blocked_until_ns = 0;
       minimum_pending = false;
       defer_preparation = defer_legacy;
       failed_raise_level = MAX_LEVELS;
@@ -447,11 +583,12 @@ struct Session {
       status.reason = Reason::FROZEN;
       return;
     }
-    if (!settings.legacy_preparation && (preparation_reason == Reason::BUDGET || ladder.count > settings.prepared_levels)) {
+    if (!settings.legacy_preparation && (preparation_reason == Reason::BUDGET
+        || (!settings.limited_residency && ladder.count > settings.prepared_levels))) {
       UpdatePreparation(preparation_epoch, status.ready_levels, static_cast<uint32_t>(ladder.count), Reason::BUDGET, now_ns);
       return;
     }
-    if (!settings.legacy_preparation && !prepared) {
+    if (!settings.legacy_preparation && !settings.limited_residency && !prepared) {
       status.reason = Reason::PREPARING;
       return;
     }
@@ -465,6 +602,7 @@ struct Session {
       if (trial) Request(previous_level, now_ns);
       trial = false;
       blocked = false;
+      blocked_until_ns = 0;
       minimum_pending = false;
       ResetMeasurements();
       output_source = output.source;
@@ -483,6 +621,18 @@ struct Session {
       status.reason = Reason::COLLECTING;
       return;
     }
+    if (settings.limited_residency && !target_ready) {
+      status.reason = Reason::PREPARING;
+      return;
+    }
+    if (blocked && now_ns >= blocked_until_ns) {
+      blocked = false;
+      blocked_until_ns = 0;
+      ResetMeasurements();
+      stable_after_ns = now_ns;
+      status.reason = Reason::COLLECTING;
+      return;
+    }
     if (applied_ns == 0 || now_ns < stable_after_ns) {
       status.reason = Reason::WARMING;
       return;
@@ -496,6 +646,24 @@ struct Session {
     status.gpu_ms = gpu / 1000.;
     if (last_output_serial == output.serial) return;
     last_output_serial = output.serial;
+    const auto adjacent = [&](bool higher, size_t steps) {
+      size_t result = level;
+      for (size_t step = 0; step < steps; ++step) {
+        size_t nearest = result;
+        for (size_t slot = 0; slot < ladder.count; ++slot) {
+          if (!IsLegal(ladder.sizes[slot])) continue;
+          if (higher ? ladder.coefficients[slot] <= ladder.coefficients[result]
+                     : ladder.coefficients[slot] >= ladder.coefficients[result]) continue;
+          if (nearest == result || (higher ? ladder.coefficients[slot] < ladder.coefficients[nearest]
+                                          : ladder.coefficients[slot] > ladder.coefficients[nearest])) {
+            nearest = slot;
+          }
+        }
+        if (nearest == result) break;
+        result = nearest;
+      }
+      return result;
+    };
     if (trial) {
       const bool multiplier_changed = baseline_multiplier > 0. && output.observed_multiplier > 0.
           && std::abs(output.observed_multiplier / baseline_multiplier - 1.) > 0.10;
@@ -519,11 +687,26 @@ struct Session {
           stable_after_ns = output.end_ns;
           return;
         }
+        if (!settings.legacy_preparation && TargetReady() && !raising && !multiplier_changed && cheaper
+            && output.fps >= baseline_fps - fps_margin) {
+          const size_t candidate = adjacent(false, 1);
+          if (candidate != level) {
+            // Compare cumulative savings with the accepted anchor. A small
+            // adjacent step cannot establish that every lower ready tier is useless.
+            if (now_ns - last_switch_ns >= 3'000'000'000) {
+              extra_window = false;
+              Request(candidate, now_ns);
+            }
+            status.reason = Reason::LOWERING;
+            return;
+          }
+        }
         if (raising) {
           failed_raise_level = level;
-          failed_raise_until_ns = now_ns + 30'000'000'000;
+          failed_raise_until_ns = now_ns + RETRY_COOLDOWN_NS;
         } else {
           blocked = true;
+          blocked_until_ns = now_ns + RETRY_COOLDOWN_NS;
           blocked_fps = (multiplier_changed ? output.fps : baseline_fps);
           blocked_gpu_us = baseline_gpu_us;
         }
@@ -534,31 +717,16 @@ struct Session {
       }
     }
     if (blocked && (std::abs(output.fps - blocked_fps) > std::max(3., blocked_fps * 0.15)
-        || std::abs(gpu - blocked_gpu_us) > std::max(100., blocked_gpu_us * 0.2))) blocked = false;
+        || std::abs(gpu - blocked_gpu_us) > std::max(100., blocked_gpu_us * 0.2))) {
+      blocked = false;
+      blocked_until_ns = 0;
+    }
     if (output.fps >= settings.target_fps * 0.99) {
       if (at_target_since_ns == 0) at_target_since_ns = output.begin_ns;
     } else {
       at_target_since_ns = 0;
     }
     size_t candidate = level;
-    const auto adjacent = [&](bool higher, size_t steps) {
-      size_t result = level;
-      for (size_t step = 0; step < steps; ++step) {
-        size_t nearest = result;
-        for (size_t slot = 0; slot < ladder.count; ++slot) {
-          if (!IsLegal(ladder.sizes[slot])) continue;
-          if (higher ? ladder.coefficients[slot] <= ladder.coefficients[result]
-                     : ladder.coefficients[slot] >= ladder.coefficients[result]) continue;
-          if (nearest == result || (higher ? ladder.coefficients[slot] < ladder.coefficients[nearest]
-                                          : ladder.coefficients[slot] > ladder.coefficients[nearest])) {
-            nearest = slot;
-          }
-        }
-        if (nearest == result) break;
-        result = nearest;
-      }
-      return result;
-    };
     if (output.fps < settings.target_fps * 0.95 && !blocked && now_ns - last_switch_ns >= 3'000'000'000) {
       candidate = (settings.legacy_preparation && minimum_pending ? MAX_LEVELS
           : adjacent(false, settings.legacy_preparation && settings.prepared_levels == 0 ? 2 : 1));
@@ -608,6 +776,8 @@ struct Frame {
   uintptr_t output_identity = 0;
   bool enabled = false, measure = false, preparing = false, immediate = true;
   bool upper_capacity = false;
+  bool paired = false;
+  uint64_t pair_first_frame = 0, sampling_generation = 0;
 };
 
 }  // namespace renodx::addons::dlss5::adaptive_resolution

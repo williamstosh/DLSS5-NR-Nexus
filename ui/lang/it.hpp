@@ -2340,6 +2340,11 @@ inline constexpr Translation kIt[] = {
     {"Default (by capacity)", "Predefinito (in base alla capacità)"},
     {"Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.", "Prima vengono preparati tutti i livelli scelti. Più livelli usano più memoria e offrono passi più piccoli. La preparazione può causare brevi scatti."},
     {"No working-resolution range to adjust", "Nessun intervallo di risoluzione di lavoro da regolare"},
+    {"Preparation mode", "Modalità di preparazione"},
+    {"Prepare all levels", "Prepara tutti i livelli"},
+    {"On-demand (experimental)", "Su richiesta (sperimentale)"},
+    {"All levels use more VRAM for smooth switching once ready. On-demand keeps fewer levels resident, but cold preparation may stutter.", "Tutti i livelli usano più VRAM per cambi fluidi una volta pronti. La modalità su richiesta mantiene meno livelli in memoria, ma la preparazione iniziale può causare scatti."},
+    {"More levels give smaller steps. On-demand keeps fewer levels resident; preparing a missing level may stutter.", "Più livelli offrono passi più piccoli. La modalità su richiesta mantiene meno livelli in memoria; preparare un livello mancante può causare scatti."},
 };
 
 }  // namespace renodx::addons::dlss5::ui::lang

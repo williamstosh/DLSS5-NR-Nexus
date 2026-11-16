@@ -324,17 +324,59 @@ class INPUT(C.Structure):
     _fields_ = [('type', W.DWORD), ('value', INPUTUNION)]
 u.SendInput.argtypes = [W.UINT, C.POINTER(INPUT), C.c_int]
 u.SendInput.restype = W.UINT
-KEYS = dict(ENTER=0x1C, ESC=0x01, SPACE=0x39, UP=0x48, DOWN=0x50, LEFT=0x4B, RIGHT=0x4D, HOME=0x47, F6=0x40, SHIFT=0x2A, W=0x11, A=0x1E, S=0x1F, D=0x20, E=0x12)
+# Physical Scan 1 positions, not text/character translation. Microsoft table:
+# https://learn.microsoft.com/windows/win32/inputdev/about-keyboard-input#scan-codes
+KEYS = dict(
+    A=0x1E, B=0x30, C=0x2E, D=0x20, E=0x12, F=0x21, G=0x22, H=0x23,
+    I=0x17, J=0x24, K=0x25, L=0x26, M=0x32, N=0x31, O=0x18, P=0x19,
+    Q=0x10, R=0x13, S=0x1F, T=0x14, U=0x16, V=0x2F, W=0x11, X=0x2D, Y=0x15, Z=0x2C,
+    ESC=0x01, BACKSPACE=0x0E, TAB=0x0F, ENTER=0x1C, SPACE=0x39,
+    MINUS=0x0C, EQUAL=0x0D, LEFTBRACKET=0x1A, RIGHTBRACKET=0x1B, BACKSLASH=0x2B,
+    SEMICOLON=0x27, APOSTROPHE=0x28, GRAVE=0x29, COMMA=0x33, PERIOD=0x34, SLASH=0x35,
+    ISO_BACKSLASH=0x56, CAPSLOCK=0x3A, NUMLOCK=0x45, SCROLLLOCK=0x46,
+    UP=0x48, DOWN=0x50, LEFT=0x4B, RIGHT=0x4D, HOME=0x47, END=0x4F,
+    INSERT=0x52, DELETE=0x53, PAGEUP=0x49, PAGEDOWN=0x51,
+    LCTRL=0x1D, RCTRL=0x1D, LALT=0x38, RALT=0x38, LSHIFT=0x2A, RSHIFT=0x36,
+    LWIN=0x5B, RWIN=0x5C, APPS=0x5D, PRINTSCREEN=0x37,
+    NUMPAD0=0x52, NUMPAD1=0x4F, NUMPAD2=0x50, NUMPAD3=0x51, NUMPAD4=0x4B,
+    NUMPAD5=0x4C, NUMPAD6=0x4D, NUMPAD7=0x47, NUMPAD8=0x48, NUMPAD9=0x49,
+    NUMPAD_ADD=0x4E, NUMPAD_SUBTRACT=0x4A, NUMPAD_MULTIPLY=0x37, NUMPAD_DIVIDE=0x35,
+    NUMPAD_DECIMAL=0x53, NUMPAD_ENTER=0x1C, NUMPAD_EQUAL=0x59, NUMPAD_COMMA=0x7E)
+KEYS.update({name: scan for name, scan in zip('1234567890', range(0x02, 0x0C))})
+KEYS.update({f'F{number}': scan for number, scan in enumerate(
+    [*range(0x3B, 0x45), 0x57, 0x58, *range(0x64, 0x6F), 0x76], 1)})
+EXTENDED_KEYS = frozenset(('UP', 'DOWN', 'LEFT', 'RIGHT', 'HOME', 'END', 'INSERT', 'DELETE',
+                         'PAGEUP', 'PAGEDOWN', 'RCTRL', 'RALT', 'LWIN', 'RWIN', 'APPS',
+                         'NUMPAD_DIVIDE', 'NUMPAD_ENTER', 'PRINTSCREEN'))
+KEY_ALIASES = dict(RETURN='ENTER', ESCAPE='ESC', BACK='BACKSPACE', SPACEBAR='SPACE',
+    INS='INSERT', DEL='DELETE', PGUP='PAGEUP', PGDN='PAGEDOWN', PRIOR='PAGEUP', NEXT='PAGEDOWN',
+    CTRL='LCTRL', CONTROL='LCTRL', LCONTROL='LCTRL', RCONTROL='RCTRL',
+    ALT='LALT', ALTGR='RALT', SHIFT='LSHIFT', WIN='LWIN', MENU='APPS',
+    LEFTCTRL='LCTRL', RIGHTCTRL='RCTRL', LEFTALT='LALT', RIGHTALT='RALT',
+    LEFTSHIFT='LSHIFT', RIGHTSHIFT='RSHIFT', LEFTWIN='LWIN', RIGHTWIN='RWIN',
+    PRTSC='PRINTSCREEN', PRTSCN='PRINTSCREEN', PRINT='PRINTSCREEN',
+    KP_ENTER='NUMPAD_ENTER', KP_ADD='NUMPAD_ADD', KP_SUBTRACT='NUMPAD_SUBTRACT',
+    KP_MULTIPLY='NUMPAD_MULTIPLY', KP_DIVIDE='NUMPAD_DIVIDE', KP_DECIMAL='NUMPAD_DECIMAL',
+    KP_EQUAL='NUMPAD_EQUAL', KP_COMMA='NUMPAD_COMMA')
+KEY_ALIASES.update({f'KP_{n}': f'NUMPAD{n}' for n in range(10)})
+KEY_ALIASES.update(dict(zip("-=[]\\;'`,./", ('MINUS', 'EQUAL', 'LEFTBRACKET', 'RIGHTBRACKET',
+    'BACKSLASH', 'SEMICOLON', 'APOSTROPHE', 'GRAVE', 'COMMA', 'PERIOD', 'SLASH'))))
 
 def key(window, name, seconds=.2, *, activate=True):
+    name = name.upper() if isinstance(name, str) else ''
+    name = KEY_ALIASES.get(name, name)
+    # Pause uses E1, which KEYEVENTF_EXTENDEDKEY cannot represent. Never alias
+    # it to NumLock or pretend that the raw multi-byte sequence is a held key.
+    if name in ('PAUSE', 'BREAK'):
+        raise ValueError('Pause/Break is not supported by this single scan-code hold path')
+    if name not in KEYS or type(seconds) not in (int, float) or not 0 < seconds <= 2:
+        raise ValueError('Unsupported key or hold duration')
     if activate:
         ensure_foreground(window)
     else:
         require_foreground(window, 'key input')
-    if name not in KEYS or not 0 < seconds <= 2:
-        raise ValueError('Unsupported key or hold duration')
     scan = KEYS[name]
-    flags = 8 | (1 if name in ('UP', 'DOWN', 'LEFT', 'RIGHT', 'HOME') else 0)
+    flags = 8 | (1 if name in EXTENDED_KEYS else 0)
     down = INPUT(type=1, ki=KEYBDINPUT(0, scan, flags, 0, 0))
     up = INPUT(type=1, ki=KEYBDINPUT(0, scan, flags | 2, 0, 0))
     try:

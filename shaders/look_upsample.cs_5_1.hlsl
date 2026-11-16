@@ -9,9 +9,10 @@
 // Per output pixel the effective edit e = log2(n' / p) of the 4x4 NR pixels
 // around it is averaged with joint-bilateral weights (Kopf et al. 2007):
 // spatial on the distance in NR pixels, range on the difference between this
-// pixel's log2 luminance G_full and the NR pixel's footprint mean G_low.  The
-// weights are normalised, so a constant edit transports exactly.  Where no
-// neighbour matches (sum of weights ~ 0) the spatial weights alone decide.
+// pixel's log2 luminance G_full and the actual ratio denominator P in SDR,
+// or the footprint mean G_low in HDR.  The weights are normalised, so a
+// constant edit transports exactly where supported.  With no matching SDR
+// denominator, keep the original; HDR retains its spatial fallback.
 // The window is symmetric about the sample (floor - 1 .. floor + 2) and the
 // spatial sigma is half an NR pixel.  Until rc6 it was the 3x3 around the
 // nearest NR pixel with sigma 1: wider than the footprint and lopsided, it
@@ -34,10 +35,10 @@ static const float kRangeSigma = 0.5;    // stops
 // base + 2, and base moves at most 16 NR pixels across the group while NR's
 // grid is not larger than the output (look::TransportWanted), so a 20x20
 // tile from the group's first base - 1 holds every tap and the bilinear P.
-// Every value is the per-tap arithmetic unchanged; the index is clamped so a
-// grid outside that contract reads wrong taps, never outside the tile.
+// Each tap's edit and guide are computed once. The index is clamped so a grid
+// outside that contract reads wrong taps, never outside the tile.
 static const int kTile = 20;
-groupshared float4 tile_edit[kTile * kTile];   // e per channel, .a = G_low
+groupshared float4 tile_edit[kTile * kTile];   // e per channel, .a = SDR P guide or HDR G_low
 groupshared float3 tile_proxy[kTile * kTile];  // P, sRGB-decoded
 
 uint TileIndex(int2 local) {
@@ -48,6 +49,7 @@ uint TileIndex(int2 local) {
 [numthreads(16, 16, 1)]
 void main(uint3 dispatch_id : SV_DispatchThreadID, uint3 group_id : SV_GroupID,
           uint group_index : SV_GroupIndex) {
+  const bool linear_reference = (Flags & kFlagRefLinear) != 0u;
   const int2 last = int2(NrSize) - 1;
   const int2 origin = int2(floor((float2(group_id.xy * 16u) + 0.5) * float2(NrSize)
                                  / float2(Size) - 0.5)) - 1;
@@ -58,14 +60,14 @@ void main(uint3 dispatch_id : SV_DispatchThreadID, uint3 group_id : SV_GroupID,
     tile_proxy[i] = proxy;
     tile_edit[i] = float4(log2(max(SrgbDecode(neural.rgb), kRatioFloor))
                               - log2(max(proxy, kRatioFloor)),
-                          neural.a);
+                          linear_reference ? neural.a
+                              : log2(max(Luminance(proxy), kGuideFloor)));
   }
   GroupMemoryBarrierWithGroupSync();
   const int2 pixel = int2(dispatch_id.xy);
   if (any(dispatch_id.xy >= Size)) return;
   const float2 position = (float2(pixel) + 0.5) * float2(NrSize) / float2(Size) - 0.5;
   const int2 base = int2(floor(position));
-  const bool linear_reference = (Flags & kFlagRefLinear) != 0u;
   const float3 reference = Reference.Load(int3(pixel, 0)).rgb;
   const float3 original = linear_reference ? reference : SrgbDecode(reference);
   const float guide_full = log2(max(Luminance(max(original, 0.0)), kGuideFloor));
@@ -90,8 +92,12 @@ void main(uint3 dispatch_id : SV_DispatchThreadID, uint3 group_id : SV_GroupID,
       spatial_weight += ws;
     }
   }
-  const float3 edit_up = joint_weight > 1e-6 ? joint / joint_weight
-                                             : spatial / spatial_weight;
+  float3 edit_up = 0.0;
+  if (joint_weight > 1e-6) {
+    edit_up = joint / joint_weight;
+  } else if (linear_reference) {
+    edit_up = spatial / spatial_weight;
+  }
 
   // The resolve's own bilinear reconstruction of P at this pixel.
   const float2 clamped = clamp(position, 0.0, float2(last));

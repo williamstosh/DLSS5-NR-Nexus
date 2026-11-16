@@ -2340,6 +2340,11 @@ inline constexpr Translation kJa[] = {
     {"Default (by capacity)", "既定（使用可能容量に応じる）"},
     {"Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.", "選んだ段階を先にすべて準備します。段階数を増やすとメモリ使用量が増え、調整幅が細かくなります。準備中は一時的にカクつく場合があります。"},
     {"No working-resolution range to adjust", "調整できる処理解像度の範囲がありません"},
+    {"Preparation mode", "準備方式"},
+    {"Prepare all levels", "全段階を事前準備"},
+    {"On-demand (experimental)", "必要時に準備（実験的）"},
+    {"All levels use more VRAM for smooth switching once ready. On-demand keeps fewer levels resident, but cold preparation may stutter.", "全段階の準備はVRAMを多く使いますが、準備後は滑らかに切り替えられます。必要時に準備する方式は常駐する段階を減らしますが、初回の準備でカクつくことがあります。"},
+    {"More levels give smaller steps. On-demand keeps fewer levels resident; preparing a missing level may stutter.", "段階が多いほど刻みが細かくなります。必要時に準備する方式は常駐する段階を減らしますが、未準備の段階を用意する際にカクつくことがあります。"},
 };
 
 }  // namespace renodx::addons::dlss5::ui::lang

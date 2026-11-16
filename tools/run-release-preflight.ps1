@@ -33,7 +33,8 @@ $checks = [Collections.Generic.List[object]]::new()
 $nativeCases = @('stage-chain','stage-resolution','same-stage-resolution','render-stage-resolution',
     'present-stage-resolution','native-prefg-resolution','source-lifecycle','feature-switch',
     'native-required-menu','native-owner-idle','native-options-resume','native-options-delayed',
-    'native-guide-contract','present-guide-models','native-present-decision','present-chain')
+    'native-guide-contract','present-guide-models','native-present-decision','present-chain',
+    'nr-edit-reuse-contracts','nr-edit-reuse-xefg-contracts')
 $bridgeCases = @('stage-resolution','same-stage-resolution','render-stage-resolution','present-stage-resolution')
 $summary = [ordered]@{
     schema='nr-nexus-local-preflight/1'; mode=$Mode; sourceCommit=$source

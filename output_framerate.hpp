@@ -59,6 +59,7 @@ struct Snapshot {
   uint32_t declared_multiplier = 0;
   bool fg_off = false;
   bool multiplier_variable = false;
+  uint64_t identity = 0;
 };
 
 inline int64_t NowNs() {
@@ -179,6 +180,7 @@ struct Stream {
 
   Snapshot Read(int64_t now_ns) const {
     auto result = snapshot;
+    result.identity = identity;
     if (previous_ns != 0 && (now_ns < previous_ns || now_ns - previous_ns > MaxAgeNs(snapshot.source))) {
       result.available = false;
       result.reason = Reason::kSTALE;

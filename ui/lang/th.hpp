@@ -2340,6 +2340,11 @@ inline constexpr Translation kTh[] = {
     {"Default (by capacity)", "ค่าเริ่มต้น (ตามความจุที่มี)"},
     {"Prepare selected levels first. More levels use more memory and give smaller steps. Preparation may briefly stutter.", "เตรียมระดับที่เลือกทั้งหมดก่อน ระดับที่มากขึ้นใช้หน่วยความจำมากขึ้นและปรับได้ละเอียดขึ้น ระหว่างเตรียมอาจกระตุกชั่วครู่"},
     {"No working-resolution range to adjust", "ไม่มีช่วงความละเอียดการทำงานให้ปรับ"},
+    {"Preparation mode", "วิธีเตรียมระดับ"},
+    {"Prepare all levels", "เตรียมทุกระดับ"},
+    {"On-demand (experimental)", "เตรียมตามต้องการ (ทดลอง)"},
+    {"All levels use more VRAM for smooth switching once ready. On-demand keeps fewer levels resident, but cold preparation may stutter.", "การเตรียมทุกระดับใช้ VRAM มากขึ้นเพื่อให้สลับได้ลื่นไหลเมื่อพร้อม โหมดตามต้องการเก็บระดับไว้ในหน่วยความจำน้อยลง แต่การเตรียมระดับครั้งแรกอาจทำให้กระตุกได้"},
+    {"More levels give smaller steps. On-demand keeps fewer levels resident; preparing a missing level may stutter.", "ยิ่งมีหลายระดับ ขั้นการปรับยิ่งละเอียด โหมดตามต้องการเก็บระดับไว้ในหน่วยความจำน้อยลง แต่การเตรียมระดับที่ยังไม่มีอาจทำให้กระตุกได้"},
 };
 
 }  // namespace renodx::addons::dlss5::ui::lang

@@ -1,12 +1,14 @@
 # 巫师3本地测试入口
 
-本入口支持 Steam／巫师3 DX12。默认用游戏脚本桥操作标题菜单、精确加载存档及正常退出；runner 在受保护会话中临时部署本仓库的 source-only bridge Mod，使用 -net -debugscripts 与本机 loopback 调试端口通信。现有存档／配置保护、进程归属、崩溃检查、恢复流程继续复用。它不是通用游戏驱动，不包含悟空无人选档。
+本入口支持 Steam／巫师3 DX12。自动启动先用 OCR 确认片头／标题主菜单，再通过游戏脚本桥精确加载存档及正常退出；runner 在受保护会话中临时部署本仓库的 source-only bridge Mod，使用 -net -debugscripts 与本机 loopback 调试端口通信。现有存档／配置保护、进程归属、崩溃检查、恢复流程继续复用。它不是通用游戏驱动，不包含悟空无人选档。
 
 客户端连接 `127.0.0.1:37001`；已验证的游戏调试服务监听 `0.0.0.0:37001`，外部可达范围取决于现有防火墙设置。调试服务随本次所属游戏进程退出而结束。
 
-默认 smoke／menu／calibrate 不建 OCR，也不以鼠标或键盘导航游戏菜单。Smoke 必须每轮传 -Save 和当前存档文件名；游戏通过 ListSavedGames 按唯一完整文件名载入，runner 先核对该存档 SHA-256，再连续两次确认 GetLoadGameProgress 非错误且玩家对象有效，才记为游戏态就绪。菜单退出调用游戏 API 并等待所属进程退出。需要 CaptureScript 捕获桌面时，采集边界仍核对 HWND、PID、创建时间、路径和真实前台；只在采集要求下激活窗口。确定性脚本错误立即失败，不拖到整段超时；默认自动重试为 0。
+默认 smoke／menu／calibrate 在启动阶段构建并使用 OCR，选档和退出不以鼠标或键盘导航。标题确认保留“读取游戏／退出游戏／新游戏”组合；脚本后端遇到浮层遮挡“新游戏”时，也接受“读取游戏／退出游戏／游戏模组”及“更新亮点”或“制作人员”的组合，随后仍核对脚本桥回执。未知界面和普通暂停菜单不会仅凭桥能响应就算标题就绪。
 
-代码桥接会等待游戏标题菜单可用，但不会跳过启动片头。与本机 Witcher 3 5.00 匹配的 Skip Intro Movies - Remastered 尚未在本机安装或实测；没有该验证时，不能把片头已跳过作为测试能力。
+Smoke 必须每轮传 -Save 和当前存档文件名；游戏通过 ListSavedGames 按唯一完整文件名载入，runner 先核对该存档 SHA-256，再连续两次确认 GetLoadGameProgress 非错误且玩家对象有效，才记为游戏态就绪。菜单退出调用游戏 API 并等待所属进程退出。首次启动观察／输入及 CaptureScript 采集边界均核对 HWND、PID、创建时间、路径和真实前台。确定性脚本错误立即失败，不拖到整段超时；默认自动重试为 0。
+
+片头跳过只使用实际识别到的“跳过”提示及现有 Space 输入；没有提示时继续在原预算内等待，不安装或依赖强制跳过片头的 Mod。
 
 两个 PowerShell 入口接受 `-CaptureScript 指向 tools/ 或 tmp/ 下的 Python 脚本`，同时指定非零 `-CaptureHoldSeconds`。入口在安装前校验参数，普通桌面上下文重启保留该绝对路径。runner 预检记录脚本 SHA256，在 `CAPTURE_READY` 后复核并仅启动一次，调用形式为同一 Python 的 `-B <脚本> <本次运行目录>`，输出写 `automatic-capture.log`。该选项不能与 `ManualImeSession` 或 `InstallOnly` 搭配。
 
@@ -50,7 +52,74 @@ $taskRoiDirectory = [IO.Path]::GetFullPath((Join-Path $PWD 'tmp/mafia-same-frame
 `adaptive_feature_experiment(0|1|2|3)` 专用于默认关闭的容量实验，不是 INI 设置：分别请求关闭、已有容量复用、
 三槽上限容量、上限容量按需准备。模式 3 只准备控制器当前请求的候选；首次请求的冷 Create 仍在前台。
 请求只在 NR OFF、真实资源已释放且配置空闲时接受；实验取证应临时使用现有
-`NRDisableRelease=1` 和 `NRWorksetFreePolicy=0`，结束恢复原值。模式请求不等于实际准入，仍须检查槽、容量和 GPU 完成。
+`NRDisableRelease=1` 和 `NRWorksetFreePolicy=0`，结束恢复原值。DEV 的 `set NRDisableRelease 1` 复用正式配置校验和保存路径；策略接受后仍须等待 `disabled_resources_released=true`，接口不制造资源释放证明。模式请求不等于实际准入，仍须检查槽、容量和 GPU 完成。
+
+Bridge 两档接入使用独立的 DEV 请求：`Client.bridge_adaptive_experiment(True|False)`，
+协议为 `{"id":"bridge-enable-1","op":"bridge_adaptive_experiment","enabled":true}`。
+开启和关闭都要求 NR OFF、资源已释放、配置空闲；它不写 INI，也不替用户改动其他设置。
+`state.experiments.bridge_adaptive_experiment` 与 `identity.experiments` 返回请求开关，
+`bridge_adaptive_evidence=requested_enabled_not_activation` 标明尚不能据此判断执行。
+实际每源仍只接纳两档全预备、Upscaled 单 Pass、可信 FG Off、x2 Off 和有效来源代际；
+接口不会制造 FG Off 或 snippet 初始化成功。关闭流程先沿现有 NR OFF 收尾，待释放凭据成立后请求 false；
+释放未完成时保持原请求状态。该通道仅编入 `NR_NEXUS_DEV_CONTROL` 开发候选，普通 Publishing 不含入口，
+不是玩家兼容开关；`status`／原 ID 回执查询及同一 deadline 的规则与其他开发请求相同。
+
+内部两档 x2 接线复用 `Client.edit_reuse_adaptive_experiment(True|False)`，协议为
+`{"id":"edit-reuse-enable-1","op":"edit_reuse_adaptive_experiment","enabled":true}`。
+它沿用上述双向 OFF／释放／配置空闲门禁，仅改变 DEV 实验请求；启动配置 `NREditReuse`、默认值和生产准入不变。
+该组合仍限原生 D3D12 Upscaled、FG Off、单 Pass／单输出和两个完整预备档。
+`state.edit_reuse` 返回请求开关和进程级刷新／复用／回退计数；`adaptive_caches` 中的 `source_frame`、`trial`、
+`sampling` 分别反映源序号、试档状态和已完成采样。统计有效时 `median_us`／`mad_us` 是每源完整 NR 链成本，
+x2 先平均相邻两源再统计；未满窗口或过期时为 null。请求、计数、已完成成本和实际档位须分别判断。
+输出 FPS 沿用真实 `Present cadence estimate` 或 `XeFG SDK output estimate`，两者均不报告显示器扫描完成。
+
+固定100% Upscaled与FG On的DEV实验使用`Client.edit_reuse_fg_experiment(True|False)`，协议为
+`{"id":"edit-fg-1","op":"edit_reuse_fg_experiment","enabled":true}`，同样要求NR OFF、资源已释放及配置空闲。
+它默认关闭，不写INI；仅在真实SR成功后的单Pass路径接纳已观察的FG On环境，保持原尺寸、颜色、运动、历史及提交保护。
+`state.edit_reuse.fg_environment`的provider为1（native DLSS FG）、2（XeFG）或0（未观察），context／generation用于缓存切换失效，
+不是源到FG的像素交接证明。`state.edit_reuse.sources`按source／pass报告源序号、尺寸、锚点代次及复用状态，
+明确属于录制状态；须与GPU完成、实际FG输出及同帧作用证据分别核验。原XeFG单Backbuffer Present路径与Off两档实验保持各自准入。
+
+从关闭切换到开启该DEV实验时，会同时准备一次`state.edit_reuse.fg_observation`有界观察；相同请求或重复开启不重置它。
+完整`events`通过`status`读取；修改请求的缓存回执只保留`event_count`等摘要，并标记`events_in_status_only=true`，避免查询回执时重复装入整个观察窗口。
+首个合格SR写回才开始记录，最多覆盖4个源帧、64个事件；第5个源帧入口停止，关闭实验保留已有快照，重新关闭／开启才准备新一轮。
+记录区分SR写回、native FG调用与返回、XeFG实际转发Tag及Proxy Present；返回事件用`call_id`关联本轮入口。
+`api_return_ns`采样在实际调用返回后，`observed_ns`是随后记录事件的时刻。native的`environment_generation`仅是已观察的FG环境修订代次。
+资源的规范身份或录制身份不可用时明确标记，未读到的FrameID为`null`；可读FrameID只表示SDK参数读取成功，尚未证明它与SR序号对应。
+native颜色记录包含Backbuffer、HUDLess、UI及UIAlpha的身份。XeFG区域声明和无有效列表契约的Tag不会被当作可解引用的命令列表。
+规范身份沿宿主只解包已知ReShade代理；Streamline接口面保持独立，身份不同本身也不能证明不存在后续数据流。
+这些CPU观察不包含GPU完成或像素交接结论，首个SR帧之前的Tag前缀也未覆盖。源／FG环境代次变化会停止观察；缺少返回或未读到颜色角色时保留缺口，不根据临近时刻关联来源。
+
+专用输出验证构建同时定义`NR_NEXUS_DEV_CONTROL`与`NR_NEXUS_TEST_FG_OUTPUT_PROBE`时，
+`state.edit_reuse.fg_output_probe`报告实际SDK诊断调用回执：XeFG按真实模块／context调用仅显示生成帧及生成帧标记，
+native在游戏本次已知版本的On选项中加入官方生成帧显示标志，保留调用方对象和其他字段。
+此构建在实验开启后最多128个合格源帧插入局部识别图案，区分刷新／复用；只处理完成Resolve后的线性RGBA16F，保留alpha、ROI外画面及原缓存锚点。
+源或FG环境变化、诊断回执失效和资源准备失败均停止本次标记。它使用工作集的实际提交与退休，普通DEV与正式构建不启用。
+此专用构建的`fg_observation.events`仅序列化前16项并报告`serialized_event_limit`，给SDK回执保留管道空间；完整事件数量仍单独记录。
+SDK成功和标记录制不等于屏幕像素确认，XeFG生成失败还可能显示应用帧。专用软件像素验证沿用
+`tools/run-tests.ps1 -Suite fg-native -NativeCase nr-fg-output-marker -SoftwareOnly -UiPreview None`，使用当前生成的shader；不运行游戏或模型。
+
+DEV 两档 x2 另可接纳与当前 D3D12 源、真实来源链与 XeFG proxy 的嵌套 Present 关联及 context 代次绑定的成功
+`SetEnabled(false)`。它保持原生 FG 声明不变；Unknown 自身不能准入。`state.edit_reuse.xefg_off_sources`
+报告凭据及 provider 匹配情况；`source_link_reason` 独立说明来源关联状态，`reason` 说明关闭凭据状态。
+设备接口查询结果与最近登记来源 Present 的线程 ID／SDK 嵌套深度也单独记录；这些字段本身不构成来源或 Off 凭据。
+设备类型按返回对象实际支持的接口识别，GetDevice 请求结果与 D3D11／D3D12 QueryInterface 结果分开记录。
+`returned_device_request` 为 11、12 或 0，说明被探测对象来自哪个 getter，0 表示未取得对象；GetDevice11 失败或为空时才改用 GetDevice12 返回对象。
+未解包的规范 IUnknown 身份用于核对返回对象与接口是否一致，已知 ReShade 解包后的身份用于既有来源匹配；两种身份不能混用。未知与双接口对象不能自动取得 D3D12 准入。
+`state.edit_reuse.xefg_device_observation` 在实验启用时独立报告唯一 SDK context 的设备诊断，即使尚无 SR 来源；它不提供 Off 或来源关联凭据，多 context 时沿用歧义状态。
+DEV 的 `state.edit_reuse.xefg_off_events` 在同一实验启用时返回最多 32 条有序事件，以及 `last_sequence`、`overwritten`；关闭实验时为 null。记录仅覆盖 SetEnabled 调用边界和有效来源关联的建立／撤销，不逐帧追加。`declaration` 配对调用，`observed_ns` 是记录提交时间，END 的 `sdk_return_ns` 是 SDK 返回后相邻语句取得的单调时钟采样点，用于区分该采样点前后以及凭据提交后的撤销。BEGIN 的代次／来源交换链是调用准备时快照，END 的代次是提交后状态，两者的 `source` 均保留调用前来源观察；采样点与实际函数返回间的极窄时间差不作函数体内归因。
+撤销事件保留被撤销来源身份，`link_generation` 为撤销后的代次；`source_entry` 给出触发 Present 的线程、方法、参数、SDK 嵌套深度和调用地址，非 Present 触发时显式为未观察。地址须结合本次进程模块范围离线解释。环形记录是只读诊断，溢出由计数说明，不参与 Off 准入或恢复旧凭据。
+D3D12 可观察来源调用 proxy 或 proxy 调用唯一登记来源；内外调用都成功后才能建立关联，同设备及 proxy 自身不能替代嵌套证据。
+共享方法钩子命中的未登记外层不充当来源，实际登记来源及 SDK proxy 仍须完整匹配。
+SDK FPS 必须来自同一个 context 且当前观测为 Off。重建或重新关联会清掉旧编辑与成对测量。
+公开配置请求或倍率 1 都不能代替关闭回执；可用已配置的 FG 快捷键触发实际 SDK 调用。
+离屏原生 NGX 夹具无 Present 循环，其串行吞吐或合成 FPS 不可替代上述来源。
+
+可信 FG Off 可以来自成功的 Streamline `SetOptions(eOff)`，或绑定当前 XeFG context／proxy、
+D3D11 设备和源代次的成功 `SetEnabled(false)`。XeFG 路径要求关闭调用前后均能观察到同一个已创建来源；
+重新启用、重建、来源变化或失败／在途调用撤销旧回执。默认 `enabled=false` 与配置请求不提供此证明。
+`Bridge Adaptive XeFG Off receipt` 日志报告接纳及缺失原因；它不改写 `identity.fg` 中的 Streamline 声明。
+实际游戏返回的身份和回调顺序仍须现场核实，不能以软件 SDK 替身的成功代替。
 
 `set` 一次提交一个现有 INI key 和 JSON 类型值。返回 `confirmation_required` 时默认停止；只有明确使用 `--confirm`，或阶段请求显式写入 `confirmation_required=true`，才将服务返回的完整 `identity` 和 `changes` 原样携带到新请求，由服务复核提案。服务复用菜单的配置缓存／持久化提交语义，受保护 runner 在退出时恢复原文件。不能把接口配置当作临时无副作用事务。`status` 遇到 `available=false` 且原因为 `runtime_busy`／`configuration_changed` 时，只在同一 deadline 内重试读取。连接失败或 `outcome_unknown` 后仅以 `status(query_id=<原请求ID>)` 查询 `receipt`，不会自动重放设置；deadline 内没有明确回执则抛出 `OutcomeUnknown`，可另用 `--query-id <原请求ID> status` 核查。
 
@@ -75,6 +144,12 @@ collector 在每个 active 阶段先读状态，仅在 NR 关闭时请求 `Neura
 
 主代理原子写入本次 `static-control.json`，例如 `{"pid":42,"label":"render","expected_stage":"Render","expected_pass":1,"expected_plan":{"1":"Render","2":"Upscaled"},"confirmation_required":false}`（PID 取本次 ready，Pass 默认1）。等 `static-progress.json` 的 `state=awaiting_stage`、`pending_label=render` 后操作；需要确认的 UI 先实际完成确认，再在同一请求写 `confirmation_completed=true`。`expected_plan` 核对整个当前请求／有效计划；只指定 `expected_pass` 时仅核对该层，其他层不推导。Render＋Upscaled 的双层请求观察Pass1；同阶段双层周期日志常保留最后一层，Present双层应指定 `expected_pass=2`、两层Present及 `confirmation_required=true`。输入由主代理复用 `desktop.click(window,x,y,activate=False)`／`desktop.key(window,name,activate=False)`：window 来自已核对的本次 owner／ready，操作前检查取消／失败凭据和前台，坐标来自刚观察的原图，并把动作与观察时间写入本次 journal。现有 click 按下120ms、key 默认200ms，均在 finally 释放。旧的带 case 路径临时 action 脚本和一次 CUA 点击记录不能充当切换成功。collector 不自动点坐标；只有请求后的完整新增日志、超过请求前基线的序号、按首次观察区间核对的 age_ms，以及当前有效计划和成功 `last_nr_evaluate` 一致才记录 `stage_observed`。规划、旧 Evaluate、点击和未完成确认均不足；API 回执不提供 GPU 完成或视觉验收结论。
 
+实机脚本的键盘输入统一调用 `desktop.key`，默认持键 200 ms，down/up 分开发送，finally 释放，沿用目标窗口身份和前台校验；不以短促桌面按键替代。Mafia 的“继续游戏”仍使用已验证的持续虚拟手柄。Home 输入后必须读取真实 overlay 状态和画面，未出现菜单时保留输入回执并定位，不能仅凭输入调用成功或重复按键记为通过。
+
+键名不区分大小写，按 Windows Scan 1 的物理位置命名：A–Z、0–9、F1–F24、导航键、普通/小键盘 Enter、Tab/Space/Backspace、左右 Ctrl/Alt/Shift/Win、菜单键、锁定键，以及标点和小键盘数字/运算/小数。常用别名包括 `RETURN`、`ESCAPE`、`PGUP/PGDN`、`CTRL/ALT/SHIFT`（左侧）、`ALTGR`（右 Alt）、`KP_0`–`KP_9`、`KP_ENTER` 和 `PRTSC`。标点可用 US 位置名称（如 `SEMICOLON`）或未按 Shift 的符号；这不是任意字符输入，实际字符受布局、IME 和锁定状态影响。
+
+导航区、右 Ctrl/Alt、小键盘 Enter/Divide、Win/菜单与 PrintScreen 使用 E0 扩展标志；小键盘数字、左右 Shift 和锁定键沿用各自普通扫描码。PrintScreen 使用 Windows 定义的 E0 37，不拼接原始 PS/2 序列；Pause/Break 的 E1/组合语义不适用此单键持键入口，明确拒绝。未登记的厂商/Fn/媒体键及组合宏不作支持声明。映射依据 [Microsoft 键盘输入文档](https://learn.microsoft.com/windows/win32/inputdev/about-keyboard-input#scan-codes) 与 [KEYBDINPUT](https://learn.microsoft.com/windows/win32/api/winuser/ns-winuser-keybdinput)。
+
 已获授权的主代理动作可复用同一身份检查；下面的坐标和观察时间来自刚捕获的原图，完成点击后仍等待 collector 的实际阶段回执：
 
 ```python
@@ -94,6 +169,10 @@ with (run / 'actions.jsonl').open('a', encoding='utf-8') as journal:
 
 首次控制接管前的等待受总采证截止时间约束；600秒总采集、60秒退出预留时，初次请求须在 ready 后540秒前到达，已耗时间始终扣除。首个实际阶段请求到来后，每阶段执行和阶段成功后等待下一请求均限60秒；重复 control 不延长窗口。阶段无进展即记 `functionalOutcome=Blocked`，停止接受新阶段并进入最多60秒的清理窗口；总采证预算到期也如此，清理仍不得越过总600秒。正常完成时先写同 PID 的 `{"completed":true}` 请求清理，等 `state=cleanup` 后实际关闭面板、关闭 NR，再补 `overlay_closed=true,nr_off=true`。`overlay_closed` 是主代理对实际画面的确认，不由 Home 按键推断。collector 要求清理开始后新增且最新的 NR OFF 日志，并留一张 `addon-menu-cleanup.png`，才写完成凭据并零码退出；缺证、取消、失焦、身份变化和清理超时仍失败。`static-progress.json` 分别记录当前窗口和总采集预算余量；`static-complete.json` 保留 `Blocked`／`Observed`／`NotTested`，runner 的启动／退出成功不把 `Blocked` 变为功能通过。
 
+自动采集失败时，worker 保持输入封锁；父进程确认采集器停止后，脚本后端先核对所属进程及调试桥监听归属，
+尝试现有游戏脚本 Exit 并等待退出。桥不可用或退出超时才保留所属进程终止兜底；`protected-script-exit.json`
+与 `recovery.json` 分别记录尝试和实际方法。失败采集仍记失败，Manual IME 行为不变，原文件保护持续到退出恢复。
+
 回归覆盖后台激活、最小化恢复、身份变化拒绝、失败门禁、脚本单次启动、完成与退出顺序及保护恢复。单测属于 MOCK／本地文件合同；独立 Windows 窗口探针验证前台 API 路径，IN_GAME／VISUAL 和长时稳定性另行验收。
 
 旧桌面选档曾依赖唯一时间戳、焦点和鼠标输入；默认脚本流程不再调用这段路径。游戏桥按存档文件名加载，并将游戏引擎状态与本地存档哈希分别记录。采集前的进程响应检查仍执行；它不替代画面、视觉效果或性能验收。
@@ -106,7 +185,7 @@ with (run / 'actions.jsonl').open('a', encoding='utf-8') as journal:
 
 多显示环境可同时配置 `expected_hdr_adapter_luid`（查询返回的16位十六进制字符串）和 `expected_hdr_target_id`（JSON uint32 整数）。入口只接受唯一匹配该身份的 active 对象，并继续核对 `expected_hdr_monitor` 精确名称与 HDR enabled；不按同名对象的顺序猜测。仅配置一个字段、身份缺失／不匹配、重复身份或 HDR 未启用均在安装前拒绝。两字段省略或均为 null 时，保留原有“恰好一个 active 输出”的检查。先只读确认物理输出映射，再填写本地配置；该选择不会改变系统显示设置。
 
-需要 Python 3（含 Pillow）、PowerShell 7、已登录的 Steam；桌面采集另需可交互的 Windows 桌面。通过 -Python 明确传入解释器，不依赖 WindowsApps 占位命令。默认脚本后端不需要 OCR；HDR 查询工具使用 MSVC 14.44／SDK 26100，不随源码分发其生成 EXE。
+需要 Python 3（含 Pillow）、PowerShell 7、已登录的 Steam，以及供启动识别和采集使用的可交互 Windows 桌面。通过 -Python 明确传入解释器，不依赖 WindowsApps 占位命令。自动启动使用入口构建的 OCR 工具；HDR 查询工具使用 MSVC 14.44／SDK 26100，不随源码分发其生成 EXE。
 
 Windows 入口会在替换安装文件前，通过合成文件的最终句柄路径检查 AppData 是否被应用环境重定向。发生重定向时，整个入口从当前用户的普通桌面上下文重新运行；备份、游戏启动、存档保护和恢复继续处于同一上下文。验证失败会拒绝安装，不以包身份查询或日志中的逻辑路径代替实际落点检查。该流程不改变插件保存路径、系统配置或宿主，启动输出仍实时转发给原采集流程。
 
@@ -136,6 +215,16 @@ Windows 入口会在替换安装文件前，通过合成文件的最终句柄路
 ```
 
 普通桌面上下文可通过 `normal_process.py --run <Python绝对路径> -B <probe_foreground.py绝对路径> --output-root <本仓库tmp绝对路径>` 运行同一探针。核对 result.json 的各场景和 cleanup，不能将请求激活当作实际成功。
+
+NR 编辑复用静态对照使用 PowerShell 入口的 `-NrEditReuse 0|1`（逐帧基线／x2候选）。
+它要求 `-RestoreInstallation -NrPreset 2 -NrPasses 1 -NrHookPoint 2 -BlockOptionalHudless -XeFGUiComposition 0`，
+要求实际输出为 FP16 scRGB 或10位 HDR10/PQ；不能与 ControlMask case、SR-only 或 InstallOnly 混用。
+两组都临时关闭自适应、Look、Detail stability、ControlMask 和 UI 校正，固定100%尺寸并要求真实 guides；
+除缓存开关外设置相同，实际设置写入 receipt，沿原备份和完整恢复流程。
+可用受保护 `-CaptureScript` 采集静态日志／画面；实际 SDK 状态、NR Evaluate 频率和动态画质分别判断。
+先从运行日志核对实际颜色格式与 `hdr` 契约；系统 HDR 开启不能替代实际格式核验。PQ 须为 format24／hdr2，
+且实际颜色合同为 PQ／BT.2020／10000 nit／Encoding4；合同不符回到逐帧 NR。以 `NR edit reuse` 和服务 Evaluate
+频率确认缓存生效，不能把配置开关或 runner 的启动／退出通过当作功能通过。
 
 ## 后续获授权的实机入口
 
@@ -181,6 +270,8 @@ IME 等交互专项可在 `menu` 场景显式传 `-CaptureHoldSeconds 900`，只
 巫师3的 P0 SR 定向可加 `-SrOnly`，在完整备份的游戏配置中临时请求关闭 RR、DLSS FG、
 XeFG 和 FSR FG；保持 HDR／分辨率。退出后完整恢复，日志须另外确认真实源 Feature 与运行路径。
 `-TelemetrySeconds 1` 可为短场景临时请求逐秒性能／阶段遥测，沿用完整恢复保护；默认不覆盖游戏现有值。
+
+固定场景的 XeFG 编辑复用成本对照可在同一候选下分别使用 `-NrEditReuse 0|1 -StartNrDisabled -XeFgGpuCapture -GpuTimers`，并通过既有 `-ControlMaskGpuSamples/-ControlMaskGpuSeconds/-ControlMaskGpuWarmupSeconds` 限定采样。采集器确认场景后开启 NR，等待 `control-mask-*.json` 的 `xefg_single_backbuffer_service` 终态，再关闭 NR 和退出；有效记录包含原色暂存至最终写回的 GPU 成本、刷新／复用身份及基础帧 Service 入口间隔。后者与 ReShade Present 入口间隔、XeFG SDK 输出帧计数均分别报告，不作为屏幕 scanout 测量。需要排除游戏上限时显式传 `-UncapGameFps`，仅将巫师3 `LimitFPS` 临时设为 unlimited；原文件整体备份并在退出后校验恢复。上述覆盖只允许完整恢复的测试会话，默认均不启用，测量窗口内不截图。
 仅指定的键会临时变化；Runtime 先核对版本和 SHA-256，与已安装文件相同则直接复用，
 不同才备份替换并在退出后恢复。恢复哈希核验完成且游戏／CrashReporter 已退出时自动删除冗余二进制备份，保留版本、哈希及回执；恢复未完成时继续保护备份。必须同时使用 `-RestoreInstallation`，不以创建
 参数日志代替实际网络确认或画质／性能验收。
