@@ -100,6 +100,8 @@
   check(status["state"]["edit_reuse"]["sources"].is_array()
           && status["state"]["edit_reuse"]["sources"].empty(),
       "an empty runtime exposes no invented per-source edit cache");
+  check(!status["state"]["edit_reuse"].contains("native_evaluate"),
+      "the disabled FG experiment leaves the existing status envelope free of gateway diagnostics");
   {
     struct RestoreSdkContexts {
       decltype(xefg::internal::state.contexts) contexts;
@@ -670,6 +672,50 @@
             && reply.dump().size() < renodx::addons::dlss5::dev_control_pipe::internal::MAX_FRAME_BYTES,
         "a full observation plus its idempotent cached receipt fits the existing pipe frame limit");
     std::printf("FG metadata status plus receipt bytes=%zu\n", reply.dump().size());
+    namespace source = renodx::addons::dlss5::fg::native_options::frame_source;
+    struct RestoreEvaluateObservation {
+      source::EvaluateEvents evaluations;
+      bool edit_reuse = runtime::edit_reuse_enabled.exchange(true);
+      bool experiment = runtime::edit_reuse_fg_experiment.exchange(true);
+      Json request = control::last_request;
+      Json receipt = control::last_receipt;
+      RestoreEvaluateObservation() {
+        std::unique_lock lock(source::state.mutex);
+        evaluations = source::state.metadata.evaluations;
+        auto& observed = source::state.metadata.evaluations;
+        for (auto& feature : observed.features) feature.enters = UINT64_MAX;
+        observed.ngx_fg_calls = observed.ngx_fg_under_dlssg = UINT64_MAX;
+      }
+      ~RestoreEvaluateObservation() {
+        std::unique_lock lock(source::state.mutex);
+        source::state.metadata.evaluations = evaluations;
+        runtime::edit_reuse_enabled = edit_reuse;
+        runtime::edit_reuse_fg_experiment = experiment;
+        control::last_request = request;
+        control::last_receipt = receipt;
+      }
+    } restore;
+    const Json max_request{{"id", "native-evaluate-summary-receipt"},
+        {"op", "edit_reuse_fg_experiment"}, {"enabled", true}};
+    const auto max_receipt = control::Execute(max_request);
+    const auto maximum = control::Execute({{"id", "native-evaluate-summary-query"}, {"op", "status"},
+        {"query_id", max_request["id"]}});
+    const auto& native_evaluate = maximum["state"]["edit_reuse"]["native_evaluate"];
+    check(native_evaluate["feature_order"] == Json::array({sl::kFeatureDLSS, sl::kFeatureDLSS_RR, sl::kFeatureDLSS_G, "other"})
+            && native_evaluate["feature_calls"] == Json::array({UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX})
+            && native_evaluate["ngx_fg_calls"] == UINT64_MAX && native_evaluate["ngx_fg_under_dlssg"] == UINT64_MAX
+            && native_evaluate["evidence"] == "cpu_calls_only",
+        "gateway status reports fixed feature buckets and CPU call counters without truncating uint64 values");
+    check(!max_receipt["state"]["edit_reuse"].contains("native_evaluate")
+            && maximum["receipt"] == max_receipt && control::Execute(max_request) == max_receipt
+            && maximum["state"]["edit_reuse"]["fg_observation"]["events"].size() == serialized_events
+            && maximum.dump().size() < renodx::addons::dlss5::dev_control_pipe::internal::MAX_FRAME_BYTES,
+        "maximum gateway counters, the complete existing trace and its original receipt fit the unchanged pipe limit");
+    std::printf("Native gateway summary bytes=%zu; full status plus receipt bytes=%zu\n",
+        native_evaluate.dump().size(), maximum.dump().size());
+    runtime::edit_reuse_fg_experiment = false;
+    check(!control::Snapshot()["edit_reuse"].contains("native_evaluate"),
+        "disabling the experiment removes the additional diagnostics without clearing retained observations");
   }
   {
     namespace screenshot = renodx::addons::dlss5::screenshot;

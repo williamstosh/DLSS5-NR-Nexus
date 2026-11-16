@@ -1790,6 +1790,47 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
       append_event("marker_return", observation.events.marker_return);
       append_event("sdk_enter", observation.events.sdk_enter);
       append_event("sdk_exit", observation.events.sdk_exit);
+      const auto append_gateway = [&](const char* name, const fg::native_options::frame_source::EvaluateBinding& request) {
+        line << ' ' << name << "=[call:" << request.call << ",parent:" << request.parent
+             << ",feature:" << request.feature << ",frame:" << request.frame
+             << ",command_buffer:" << request.command_buffer << ",inputs:" << request.inputs
+             << ",depth:" << request.depth << ",dlssg_call:" << request.dlssg_call
+             << ",dlssg_frame:" << request.dlssg_frame << ']';
+      };
+      append_gateway("evaluate_current", observation.current_evaluate);
+      const auto& evaluated = observation.evaluations;
+      line << " evaluate_calls=" << evaluated.enters << " evaluate_returns=" << evaluated.returns
+           << " evaluate_active=" << evaluated.active << " ngx_observed_calls=" << evaluated.ngx_calls
+           << " ngx_fg_calls=" << evaluated.ngx_fg_calls << " ngx_fg_nested=" << evaluated.ngx_fg_nested
+           << " ngx_fg_under_dlssg=" << evaluated.ngx_fg_under_dlssg;
+      for (uint32_t index = 0; index < evaluated.features.size(); ++index) {
+        const auto& feature = evaluated.features[index];
+        line << " evaluate_bucket" << index << "=[calls:" << feature.enters << ",returns:" << feature.returns
+             << ",active:" << feature.active << ",ngx_calls:" << feature.ngx_calls
+             << ",ngx_fg_calls:" << feature.ngx_fg_calls << ']';
+        for (const auto& [name, event] : {std::pair{"evaluate_enter", &feature.enter},
+                 {"evaluate_exit", &feature.returned}}) {
+          if (event->request.call == 0) continue;
+          const auto event_name = std::string(name) + std::to_string(index);
+          line << ' ' << event_name << "=[seq:" << event->cpu.sequence << ",qpc:" << event->cpu.qpc
+               << ",thread:" << event->cpu.thread << ",returned:" << event->returned
+               << ",result:" << event->result << ']';
+          append_gateway((event_name + "_request").c_str(), event->request);
+        }
+      }
+      for (const auto& [name, event] : {std::pair{"ngx_enter", &evaluated.ngx_enter},
+               {"ngx_exit", &evaluated.ngx_return}, {"ngx_fg_enter", &evaluated.ngx_fg_enter},
+               {"ngx_fg_exit", &evaluated.ngx_fg_return}}) {
+        line << ' ' << name << "=[seq:" << event->cpu.sequence << ",qpc:" << event->cpu.qpc
+             << ",thread:" << event->cpu.thread << ",call:" << event->call << ",parent:" << event->parent
+             << ",depth:" << event->depth << ",slot:" << event->slot << ",c_export:" << event->c_export
+             << ",wrapper_delegate:" << event->wrapper_delegate << ",fg_classified:" << event->frame_generation
+             << ",handle:" << event->handle << ",list:" << event->command_list
+             << ",returned:" << event->returned << ",result:" << event->result << ']';
+        append_gateway((std::string(name) + "_gateway").c_str(), event->gateway);
+      }
+      line << " evaluate_evidence=cpu_api_arguments_and_nesting_only"
+           << " ngx_observation_scope=classified_d3d12_forward_paths";
       line << " log_budget=" << ++observations << "/32";
       LogPresent(reshade::log::level::info, line.str());
     }

@@ -119,6 +119,15 @@ inline Json Snapshot() {
   }
   const auto output = output_framerate::Read(now);
   const auto fg_environment = ReadEditReuseFgEnvironmentLocked();
+  Json native_evaluate = nullptr;
+  if (edit_reuse_enabled.load() && edit_reuse_fg_experiment.load()) {
+    const auto observed = fg::native_options::frame_source::Snapshot().evaluations;
+    native_evaluate = {{"feature_order", {sl::kFeatureDLSS, sl::kFeatureDLSS_RR, sl::kFeatureDLSS_G, "other"}},
+        {"feature_calls", {observed.features[0].enters, observed.features[1].enters,
+            observed.features[2].enters, observed.features[3].enters}},
+        {"ngx_fg_calls", observed.ngx_fg_calls}, {"ngx_fg_under_dlssg", observed.ngx_fg_under_dlssg},
+        {"evidence", "cpu_calls_only"}};
+  }
   edit_fg_observation::Snapshot fg_observed;
   edit_fg_observation::CopySnapshot(&fg_observed);
   const auto resource_identity = [](const edit_fg_observation::ResourceIdentity& resource) {
@@ -401,6 +410,9 @@ inline Json Snapshot() {
           {"preparation_cpu_ms", adaptive.preparation_cpu_ms},
           {"preparation_vram_delta_bytes", adaptive.preparation_vram_delta_bytes},
           {"peak_process_vram_bytes", adaptive.peak_process_vram_bytes}}}});
+  if (!native_evaluate.is_null()) {
+    state["edit_reuse"]["native_evaluate"] = std::move(native_evaluate);
+  }
 #if defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
   const auto probe = fg_output_probe::CopySnapshot();
   const auto& native_probe = probe.native;
@@ -493,6 +505,7 @@ inline Json Execute(const Json& request) {
       auto& observed = response["state"]["edit_reuse"]["fg_observation"];
       observed["events"] = Json::array();
       observed["events_in_status_only"] = true;
+      response["state"]["edit_reuse"].erase("native_evaluate");
     }
     response["identity"] = response["state"].value("identity", Json(nullptr));
     last_request = request;

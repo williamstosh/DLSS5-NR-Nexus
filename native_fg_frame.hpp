@@ -7,6 +7,7 @@
 #if defined(NR_NEXUS_DEV_CONTROL)
 #include <windows.h>
 
+#include <array>
 #include <cstdint>
 #include <mutex>
 #include <shared_mutex>
@@ -45,6 +46,66 @@ struct Events {
   uint64_t sdk_active = 0;
 };
 
+// Borrowed SDK inputs are reduced to scalar observations before taking the
+// state lock. These scopes never grant a Frame or retain SDK objects.
+struct EvaluateBinding {
+  uint64_t call = 0;
+  uint64_t parent = 0;
+  uint32_t feature = 0;
+  uint32_t frame = 0;
+  uintptr_t command_buffer = 0;
+  uint32_t inputs = 0;
+  uint32_t depth = 0;
+  uint64_t dlssg_call = 0;
+  uint32_t dlssg_frame = 0;
+};
+struct EvaluateEvent {
+  Event cpu;
+  EvaluateBinding request;
+  bool returned = false;
+  uint32_t result = 0;
+};
+struct EvaluateFeatureEvents {
+  uint64_t enters = 0;
+  uint64_t returns = 0;
+  uint64_t active = 0;
+  uint64_t ngx_calls = 0;
+  uint64_t ngx_fg_calls = 0;
+  EvaluateEvent enter;
+  EvaluateEvent returned;
+};
+struct NgxEvent {
+  Event cpu;
+  uint64_t call = 0;
+  uint64_t parent = 0;
+  uint32_t depth = 0;
+  uint32_t slot = 0;
+  bool c_export = false;
+  bool wrapper_delegate = false;
+  bool frame_generation = false;
+  uintptr_t handle = 0;
+  uintptr_t command_list = 0;
+  EvaluateBinding gateway;
+  bool returned = false;
+  uint32_t result = 0;
+};
+struct EvaluateEvents {
+  // DLSS, RR and DLSS-G have reserved slots; all other feature IDs share
+  // the final bucket. Its events still contain the actual requested ID.
+  std::array<EvaluateFeatureEvents, 4> features{};
+  uint64_t enters = 0;
+  uint64_t returns = 0;
+  uint64_t active = 0;
+  uint64_t ngx_calls = 0;
+  uint64_t ngx_fg_calls = 0;
+  uint64_t ngx_fg_nested = 0;
+  uint64_t ngx_fg_under_dlssg = 0;
+  NgxEvent ngx_enter;
+  NgxEvent ngx_return;
+  NgxEvent ngx_fg_enter;
+  NgxEvent ngx_fg_return;
+};
+
 struct Metadata {
   uint64_t generation = 1;
   uint64_t epoch = 0;
@@ -56,6 +117,7 @@ struct Metadata {
   bool stopped = false;
   const char* reason = "reflex_marker_unobserved";
   Events events;
+  EvaluateEvents evaluations;
 };
 struct State {
   std::shared_mutex mutex;
@@ -70,6 +132,9 @@ struct Binding {
 };
 static thread_local Binding sdk_binding;
 static thread_local uint32_t sdk_depth = 0;
+static thread_local EvaluateBinding evaluate_binding;
+static thread_local uint64_t ngx_call = 0;
+static thread_local uint32_t ngx_depth = 0;
 
 inline int64_t Qpc() {
   LARGE_INTEGER value{};
@@ -82,8 +147,144 @@ inline Event NextEvent(Metadata* metadata) {
   return {.sequence = ++metadata->events.sequence, .qpc = Qpc(), .thread = GetCurrentThreadId()};
 }
 
+inline uint32_t EvaluateFeatureIndex(uint32_t feature) {
+  switch (feature) {
+    case sl::kFeatureDLSS: return 0;
+    case sl::kFeatureDLSS_RR: return 1;
+    case sl::kFeatureDLSS_G: return 2;
+    default: return 3;
+  }
+}
+
+struct EvaluateCall {
+  EvaluateBinding previous = evaluate_binding;
+  EvaluateEvent event;
+
+  EvaluateCall(bool enabled, sl::Feature feature, const sl::FrameToken& frame,
+      uint32_t inputs, sl::CommandBuffer* command_buffer) {
+    evaluate_binding = {};
+    if (!enabled) return;
+    event.request = {.parent = previous.call, .feature = feature,
+        .frame = static_cast<uint32_t>(frame), .command_buffer = reinterpret_cast<uintptr_t>(command_buffer),
+        .inputs = inputs, .depth = previous.depth + 1,
+        .dlssg_call = previous.dlssg_call, .dlssg_frame = previous.dlssg_frame};
+    std::unique_lock lock(state.mutex);
+    auto& metadata = state.metadata;
+    event.cpu = NextEvent(&metadata);
+    event.request.call = event.cpu.sequence;
+    if (feature == sl::kFeatureDLSS_G) {
+      event.request.dlssg_call = event.request.call;
+      event.request.dlssg_frame = event.request.frame;
+    }
+    auto& observed = metadata.evaluations;
+    auto& bucket = observed.features[EvaluateFeatureIndex(feature)];
+    ++observed.enters;
+    ++observed.active;
+    ++bucket.enters;
+    ++bucket.active;
+    bucket.enter = event;
+    evaluate_binding = event.request;
+  }
+
+  void Finish(sl::Result result) {
+    if (event.request.call == 0 || event.returned) return;
+    event.returned = true;
+    event.result = static_cast<uint32_t>(result);
+  }
+
+  ~EvaluateCall() {
+    if (event.request.call != 0) {
+      std::unique_lock lock(state.mutex);
+      auto& metadata = state.metadata;
+      event.cpu = NextEvent(&metadata);
+      auto& observed = metadata.evaluations;
+      auto& bucket = observed.features[EvaluateFeatureIndex(event.request.feature)];
+      if (event.returned) {
+        ++observed.returns;
+      }
+      --observed.active;
+      if (event.returned) {
+        ++bucket.returns;
+      }
+      --bucket.active;
+      bucket.returned = event;
+    }
+    evaluate_binding = previous;
+  }
+  EvaluateCall(const EvaluateCall&) = delete;
+  EvaluateCall& operator=(const EvaluateCall&) = delete;
+};
+
+// Covers the real D3D12 NGX forward, after the wrapper has classified FG.
+// C/C++ exports and module slots are separate calls, not separate frames.
+struct NgxCall {
+  NgxEvent event;
+  uint64_t previous_call = ngx_call;
+  uint32_t previous_depth = ngx_depth;
+
+  NgxCall(bool enabled, bool frame_generation, uint32_t slot, bool c_export, bool wrapper_delegate,
+      uintptr_t handle, uintptr_t command_list) {
+    ngx_call = 0;
+    ngx_depth = 0;
+    if (!enabled) return;
+    event = {.parent = previous_call, .depth = previous_depth + 1,
+        .slot = slot, .c_export = c_export, .wrapper_delegate = wrapper_delegate, .frame_generation = frame_generation,
+        .handle = handle, .command_list = command_list, .gateway = evaluate_binding};
+    std::unique_lock lock(state.mutex);
+    auto& metadata = state.metadata;
+    event.cpu = NextEvent(&metadata);
+    event.call = event.cpu.sequence;
+    ngx_call = event.call;
+    ngx_depth = event.depth;
+    auto& observed = metadata.evaluations;
+    ++observed.ngx_calls;
+    observed.ngx_enter = event;
+    if (event.gateway.call != 0) {
+      auto& bucket = observed.features[EvaluateFeatureIndex(event.gateway.feature)];
+      ++bucket.ngx_calls;
+      if (frame_generation) {
+        ++bucket.ngx_fg_calls;
+      }
+    }
+    if (frame_generation) {
+      ++observed.ngx_fg_calls;
+      observed.ngx_fg_enter = event;
+      if (event.gateway.call != 0) {
+        ++observed.ngx_fg_nested;
+      }
+      if (event.gateway.dlssg_call != 0) {
+        ++observed.ngx_fg_under_dlssg;
+      }
+    }
+  }
+
+  void Finish(uint32_t result) {
+    if (event.call == 0 || event.returned) return;
+    event.returned = true;
+    event.result = result;
+  }
+
+  ~NgxCall() {
+    if (event.call != 0) {
+      std::unique_lock lock(state.mutex);
+      auto& metadata = state.metadata;
+      event.cpu = NextEvent(&metadata);
+      metadata.evaluations.ngx_return = event;
+      if (event.frame_generation) {
+        metadata.evaluations.ngx_fg_return = event;
+      }
+    }
+    ngx_call = previous_call;
+    ngx_depth = previous_depth;
+  }
+  NgxCall(const NgxCall&) = delete;
+  NgxCall& operator=(const NgxCall&) = delete;
+};
+
 struct ObservationSnapshot {
   Events events;
+  EvaluateEvents evaluations;
+  EvaluateBinding current_evaluate;
   bool marker_published = false;
   bool marker_claimed = false;
   uint32_t marker_frame = 0;
@@ -106,7 +307,8 @@ struct ObservationSnapshot {
 inline ObservationSnapshot Snapshot() {
   std::shared_lock lock(state.mutex);
   const auto& metadata = state.metadata;
-  return {.events = metadata.events, .marker_published = metadata.published, .marker_claimed = metadata.claimed,
+  return {.events = metadata.events, .evaluations = metadata.evaluations, .current_evaluate = evaluate_binding,
+      .marker_published = metadata.published, .marker_claimed = metadata.claimed,
       .marker_frame = metadata.frame, .marker_thread = metadata.thread, .marker_in_flight = metadata.in_flight,
       .marker_epoch = metadata.epoch, .generation = metadata.generation, .marker_reason = metadata.reason,
       .current_thread = GetCurrentThreadId(), .tls_depth = sdk_depth, .current_output = sdk_binding.output,

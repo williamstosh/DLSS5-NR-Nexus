@@ -7,6 +7,7 @@
 #if defined(NR_NEXUS_DEV_CONTROL)
 #include <atomic>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
@@ -14,11 +15,16 @@
 namespace native_fg_frame_cases {
 namespace options = renodx::addons::dlss5::fg::native_options;
 namespace source = options::frame_source;
+namespace runtime = renodx::addons::dlss5::internal;
 
 struct FakeFrameToken : sl::FrameToken {
   uint32_t value;
+  mutable uint32_t conversions = 0;
   explicit FakeFrameToken(uint32_t frame) : value(frame) {}
-  operator uint32_t() const override { return value; }
+  operator uint32_t() const override {
+    ++conversions;
+    return value;
+  }
 };
 
 static std::atomic_uint32_t mock_calls{0};
@@ -29,6 +35,13 @@ static HANDLE mock_entered = nullptr;
 static HANDLE mock_release = nullptr;
 static uint32_t blocked_frame = 0;
 static thread_local bool reentering = false;
+static std::function<sl::Result(sl::Feature, const sl::FrameToken&, const sl::BaseStructure**,
+    uint32_t, sl::CommandBuffer*)> evaluate_handler;
+
+inline sl::Result MockEvaluate(sl::Feature feature, const sl::FrameToken& frame,
+    const sl::BaseStructure** inputs, uint32_t num_inputs, sl::CommandBuffer* command_buffer) {
+  return evaluate_handler(feature, frame, inputs, num_inputs, command_buffer);
+}
 
 inline sl::Result MockMarker(sl::PCLMarker marker, const sl::FrameToken& frame) {
   ++mock_calls;
@@ -65,18 +78,36 @@ inline int Run() {
     source::Metadata metadata;
     source::Binding binding = source::sdk_binding;
     uint32_t depth = source::sdk_depth;
+    source::EvaluateBinding evaluate_binding = source::evaluate_binding;
+    uint64_t ngx_call = source::ngx_call;
+    uint32_t ngx_depth = source::ngx_depth;
+    bool edit_reuse = runtime::edit_reuse_enabled.load();
+    bool fg_experiment = runtime::edit_reuse_fg_experiment.load();
+    bool shutting_down = runtime::shutting_down.load();
+    decltype(runtime::real_streamline_evaluate) real_evaluate = runtime::real_streamline_evaluate;
     Restore() {
       std::unique_lock lock(source::state.mutex);
       metadata = source::state.metadata;
       source::state.metadata = {};
       source::sdk_binding = {};
       source::sdk_depth = 0;
+      source::evaluate_binding = {};
+      source::ngx_call = 0;
+      source::ngx_depth = 0;
     }
     ~Restore() {
       std::unique_lock lock(source::state.mutex);
       source::state.metadata = metadata;
       source::sdk_binding = binding;
       source::sdk_depth = depth;
+      source::evaluate_binding = evaluate_binding;
+      source::ngx_call = ngx_call;
+      source::ngx_depth = ngx_depth;
+      runtime::edit_reuse_enabled = edit_reuse;
+      runtime::edit_reuse_fg_experiment = fg_experiment;
+      runtime::shutting_down = shutting_down;
+      runtime::real_streamline_evaluate = real_evaluate;
+      evaluate_handler = {};
       mock_entered = mock_release = nullptr;
       mock_token.store(nullptr);
     }
@@ -285,6 +316,137 @@ inline int Run() {
               && returned.events.sdk_active == 0 && returned.events.sdk_enters == returned.events.sdk_exits
               && returned.tls_depth == 0 && !returned.binding_active && !options::CurrentFrame(output).available,
           "post-SDK observations expose exit ordering while preserving the original outside-scope rejection");
+    }
+    {
+      const auto before = source::Snapshot();
+      const FakeFrameToken request_frame(0);
+      const FakeFrameToken nested_frame(UINT32_MAX);
+      const sl::BaseStructure* inputs[] = {reinterpret_cast<const sl::BaseStructure*>(0x6600)};
+      auto* command_buffer = reinterpret_cast<sl::CommandBuffer*>(0x7700);
+      uint32_t forwarded = 0;
+      bool observe = false;
+      uint64_t gateway_call = 0;
+      source::NgxEvent delegated;
+      source::ObservationSnapshot worker;
+      runtime::real_streamline_evaluate = MockEvaluate;
+      runtime::shutting_down = false;
+      runtime::edit_reuse_enabled = true;
+      runtime::edit_reuse_fg_experiment = false;
+      evaluate_handler = [&](sl::Feature feature, const sl::FrameToken& frame,
+                             const sl::BaseStructure** actual_inputs, uint32_t num_inputs,
+                             sl::CommandBuffer* actual_command) {
+        ++forwarded;
+        check(actual_inputs == inputs && num_inputs == 1 && actual_command == command_buffer,
+            "the real gateway forwards original input and opaque command-buffer addresses without querying them");
+        check(&frame == (feature == sl::kFeatureDLSS_RR ? &nested_frame : &request_frame),
+            "the real gateway passes the original borrowed FrameToken unchanged");
+        if (!observe) return sl::Result::eErrorInvalidState;
+        const auto entered = source::Snapshot();
+        check(entered.current_evaluate.feature == feature && entered.current_evaluate.command_buffer == 0x7700
+                && entered.current_evaluate.inputs == 1 && !options::CurrentFrame(output).available,
+            "the request observation preserves API arguments without granting a source frame");
+        if (feature == sl::kFeatureDLSS_RR) {
+          check(entered.current_evaluate.frame == UINT32_MAX && entered.current_evaluate.depth == 2
+                  && entered.current_evaluate.parent == gateway_call
+                  && entered.current_evaluate.dlssg_call == gateway_call && entered.current_evaluate.dlssg_frame == 0,
+              "a nested gateway preserves its own frame and the actual enclosing DLSS-G call");
+          source::NgxCall ngx(true, true, 2, false, false, 0x3300, 0x4400);
+          ngx.Finish(0xBAD00002);
+          return sl::Result::eErrorInvalidState;
+        }
+        gateway_call = entered.current_evaluate.call;
+        check(entered.current_evaluate.frame == 0 && entered.current_evaluate.depth == 1
+                && entered.current_evaluate.parent == 0 && entered.current_evaluate.dlssg_call == gateway_call,
+            "the SDK's public conversion preserves request frame zero rather than borrowing the latest Reflex token");
+        {
+          source::NgxCall ngx(true, true, 3, true, false, 0x3300, 0x4400);
+          const auto outer_call = source::ngx_call;
+          {
+            source::NgxCall cpp(true, false, 4, false, true, 0x3300, 0x4400);
+            delegated = source::Snapshot().evaluations.ngx_enter;
+            check(delegated.parent == outer_call && delegated.depth == 2 && delegated.wrapper_delegate
+                    && !delegated.c_export && delegated.gateway.call == gateway_call
+                    && delegated.gateway.frame == 0,
+                "the real C-to-C++ nesting relationship remains a call relationship, not another source frame");
+            cpp.Finish(0xBAD00003);
+          }
+          check(source::ngx_call == outer_call && source::ngx_depth == 1
+                  && source::Snapshot().evaluations.ngx_return.returned,
+              "a nested NGX return restores the enclosing call and retains the actual API result");
+          ngx.Finish(0xBAD00001);
+        }
+        check(source::ngx_call == 0 && source::ngx_depth == 0,
+            "NGX observation ends before unrelated calls can inherit its parent");
+        check(runtime::HookedStreamlineEvaluate(sl::kFeatureDLSS_RR, nested_frame, inputs, 1, command_buffer)
+                    == sl::Result::eErrorInvalidState
+                && source::Snapshot().current_evaluate.call == gateway_call,
+            "a nested actual gateway returns its real error and restores its parent request");
+        std::jthread consumer([&] {
+          source::NgxCall ngx(true, true, 5, false, false, 0x3300, 0x4400);
+          worker = source::Snapshot();
+          ngx.Finish(0xBAD00004);
+        });
+        consumer.join();
+        check(worker.current_evaluate.call == 0 && worker.evaluations.ngx_fg_enter.gateway.call == 0
+                && worker.evaluations.ngx_fg_enter.gateway.dlssg_call == 0
+                && worker.evaluations.active == 1 && worker.current_thread != entered.current_thread,
+            "an asynchronous consumer observes active work but never inherits another thread's request frame");
+        return sl::Result::eErrorInvalidState;
+      };
+      check(runtime::HookedStreamlineEvaluate(sl::kFeatureDLSS_G, request_frame, inputs, 1, command_buffer)
+                  == sl::Result::eErrorInvalidState
+              && forwarded == 1 && request_frame.conversions == 0
+              && source::Snapshot().events.sequence == before.events.sequence,
+          "the default-disabled observation forwards exactly once without reading a token or changing diagnostic state");
+      runtime::edit_reuse_fg_experiment = true;
+      observe = true;
+      check(runtime::HookedStreamlineEvaluate(sl::kFeatureDLSS_G, request_frame, inputs, 1, command_buffer)
+                  == sl::Result::eErrorInvalidState
+              && forwarded == 3 && request_frame.conversions == 1 && nested_frame.conversions == 1,
+          "the enabled actual gateway reads each SDK token only through its public numeric conversion");
+      const auto returned = source::Snapshot();
+      const auto& fg = returned.evaluations.features[source::EvaluateFeatureIndex(sl::kFeatureDLSS_G)];
+      check(returned.current_evaluate.call == 0 && returned.evaluations.enters == 2
+              && returned.evaluations.returns == 2 && returned.evaluations.active == 0
+              && fg.enters == 1 && fg.returns == 1 && fg.ngx_calls == 2 && fg.ngx_fg_calls == 1
+              && fg.returned.returned && fg.returned.result == static_cast<uint32_t>(sl::Result::eErrorInvalidState)
+              && fg.returned.cpu.sequence > fg.enter.cpu.sequence
+              && fg.returned.cpu.qpc >= fg.enter.cpu.qpc && fg.enter.cpu.thread == GetCurrentThreadId(),
+          "feature counts and ordered request/return events describe CPU API calls with the real result");
+      check(returned.evaluations.ngx_calls == 4 && returned.evaluations.ngx_fg_calls == 3
+              && returned.evaluations.ngx_fg_nested == 2 && returned.evaluations.ngx_fg_under_dlssg == 2
+              && delegated.call != 0 && returned.evaluations.ngx_fg_return.returned
+              && returned.evaluations.ngx_fg_return.result == 0xBAD00004,
+          "nested and asynchronous FG forwards remain distinguishable without counting C delegates as frames");
+      check(returned.marker_epoch == before.marker_epoch && returned.generation == before.generation
+              && returned.marker_published == before.marker_published && returned.marker_claimed == before.marker_claimed
+              && returned.marker_frame == before.marker_frame && !options::CurrentFrame(output).available,
+          "all new observations leave marker publication, epochs, claims and frame admission unchanged");
+      evaluate_handler = [&](sl::Feature, const sl::FrameToken&, const sl::BaseStructure**, uint32_t, sl::CommandBuffer*) {
+        ++forwarded;
+        return sl::Result::eErrorInvalidState;
+      };
+      for (uint32_t index = 0; index < 12; ++index) {
+        runtime::HookedStreamlineEvaluate(2000 + index, request_frame, inputs, 1, command_buffer);
+      }
+      const auto bounded = source::Snapshot();
+      check(bounded.evaluations.features.size() == 4 && bounded.evaluations.features[3].enters == 12
+              && bounded.evaluations.features[3].enter.request.feature == 2011
+              && bounded.evaluations.features[2].enter.request.call == gateway_call,
+          "arbitrary feature IDs share one bounded bucket and cannot evict the DLSS-G observation");
+      runtime::shutting_down = true;
+      const auto calls_before_drain = forwarded;
+      check(runtime::HookedStreamlineEvaluate(sl::kFeatureDLSS_G, request_frame, inputs, 1, command_buffer)
+                  == sl::Result::eErrorInvalidState
+              && forwarded == calls_before_drain + 1,
+          "the draining gateway continues forwarding the real call and result without changing shutdown behavior");
+      runtime::shutting_down = false;
+      runtime::real_streamline_evaluate = nullptr;
+      const auto before_null = source::Snapshot();
+      check(runtime::HookedStreamlineEvaluate(sl::kFeatureDLSS_G, request_frame, inputs, 1, command_buffer)
+                  == sl::Result::eErrorInvalidParameter
+              && forwarded == calls_before_drain + 1 && source::Snapshot().events.sequence == before_null.events.sequence,
+          "a missing real API neither forwards nor invents an evaluate observation");
     }
     {
       Events events;

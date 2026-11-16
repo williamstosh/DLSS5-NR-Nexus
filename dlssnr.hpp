@@ -21057,10 +21057,17 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
 #endif
   const NVSDK_NGX_Result result = [&] {
     const NgxRuntimeCommandScope runtime_scope;
+#if defined(NR_NEXUS_DEV_CONTROL)
+    fg::native_options::frame_source::NgxCall evaluate_observation(
+        edit_reuse_enabled.load() && edit_reuse_fg_experiment.load() && !InsideDirectCall(),
+        frame_generation, Slot, false, nested_in_c_wrapper,
+        reinterpret_cast<uintptr_t>(handle), reinterpret_cast<uintptr_t>(command_list));
+#endif
     const bool outer = inside_game_evaluate_wrapper;
     if (control_mask_use_core_context.load()) inside_game_evaluate_wrapper = true;
     const auto result = real(command_list, handle, parameters, callback);
 #if defined(NR_NEXUS_DEV_CONTROL)
+    evaluate_observation.Finish(static_cast<uint32_t>(result));
     if (edit_fg_ticket.call_id != 0) {
       const auto edit_fg_return_ns = edit_fg_observation::NowNs();
       edit_fg_observation::RecordResult(edit_fg_ticket, static_cast<uint32_t>(result), edit_fg_return_ns);
@@ -21326,7 +21333,12 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
   const NVSDK_NGX_Result result = [&] {
     const NgxRuntimeCommandScope runtime_scope;
 #if defined(NR_NEXUS_DEV_CONTROL)
+    fg::native_options::frame_source::NgxCall evaluate_observation(
+        edit_reuse_enabled.load() && edit_reuse_fg_experiment.load() && !InsideDirectCall(),
+        frame_generation, Slot, true, false,
+        reinterpret_cast<uintptr_t>(handle), reinterpret_cast<uintptr_t>(command_list));
     const auto result = real(command_list, handle, parameters, callback);
+    evaluate_observation.Finish(static_cast<uint32_t>(result));
     if (edit_fg_ticket.call_id != 0) {
       const auto edit_fg_return_ns = edit_fg_observation::NowNs();
       edit_fg_observation::RecordResult(edit_fg_ticket, static_cast<uint32_t>(result), edit_fg_return_ns);
@@ -22288,6 +22300,17 @@ inline sl::Result HookedStreamlineEvaluate(
     uint32_t num_inputs,
     sl::CommandBuffer* command_buffer) {
   CallbackScope callback_scope;
+  const auto forward = [&] {
+#if defined(NR_NEXUS_DEV_CONTROL)
+    fg::native_options::frame_source::EvaluateCall observation(
+        edit_reuse_enabled.load() && edit_reuse_fg_experiment.load(), feature, frame, num_inputs, command_buffer);
+    const auto result = ngx_serial::Serialized(real_streamline_evaluate)(feature, frame, inputs, num_inputs, command_buffer);
+    observation.Finish(result);
+    return result;
+#else
+    return ngx_serial::Serialized(real_streamline_evaluate)(feature, frame, inputs, num_inputs, command_buffer);
+#endif
+  };
   // The command buffer goes on exactly as the caller passed it, and the
   // direct fallback below records into it in that same world, as the NGX
   // hooks do with theirs (README, "ReShade's proxies").  Until rc11 both got
@@ -22300,8 +22323,7 @@ inline sl::Result HookedStreamlineEvaluate(
   // draining.
   if (!callback_scope || real_streamline_evaluate == nullptr) {
     return real_streamline_evaluate != nullptr
-        ? ngx_serial::Serialized(real_streamline_evaluate)(
-              feature, frame, inputs, num_inputs, command_buffer)
+        ? forward()
         : sl::Result::eErrorInvalidParameter;
   }
   const EvaluateChainScope chain_scope;
@@ -22312,8 +22334,7 @@ inline sl::Result HookedStreamlineEvaluate(
   }
   const uint64_t nr_before = successful_evaluations.load();
   // Its NGX turn (ngx_serial.hpp): sl.dlss evaluates NGX inside.
-  const sl::Result result = ngx_serial::Serialized(real_streamline_evaluate)(
-      feature, frame, inputs, num_inputs, command_buffer);
+  const sl::Result result = forward();
   if (result != sl::Result::eOk
       || (feature != sl::kFeatureDLSS && feature != sl::kFeatureDLSS_RR)
       || NrYieldsToForeign()
