@@ -77,12 +77,13 @@ struct BridgeDeviceObservation {
   HRESULT swapchain_result = E_PENDING;
   HRESULT device11_result = E_PENDING;
   HRESULT device12_result = E_PENDING;
-  // These probes inspect the object returned by GetDevice(ID3D11Device).
+  // Prefer GetDevice11's returned object; use GetDevice12 when it is absent.
   uintptr_t returned_device_identity = 0;
   HRESULT device11_interface_result = E_PENDING;
   HRESULT device12_interface_result = E_PENDING;
   uintptr_t device11_interface_identity = 0;
   uintptr_t device12_interface_identity = 0;
+  uint32_t returned_device_request = 0;
   bool operator==(const BridgeDeviceObservation&) const = default;
 };
 struct BridgeOffEvidence {
@@ -517,7 +518,7 @@ inline ComPtr<IUnknown> BridgeDeviceIdentity(IUnknown* object, BridgeDeviceObser
     *observation = {.object_present = object != nullptr};
   }
   ComPtr<IDXGISwapChain> swapchain;
-  ComPtr<ID3D11Device> device;
+  ComPtr<IUnknown> device;
   if (object == nullptr) return {};
   const auto swapchain_result = object->QueryInterface(IID_PPV_ARGS(&swapchain));
   if (observation != nullptr) {
@@ -533,27 +534,50 @@ inline ComPtr<IUnknown> BridgeDeviceIdentity(IUnknown* object, BridgeDeviceObser
       observation->swapchain_unwrapped = true;
     }
   }
-  const auto device11_result = swapchain->GetDevice(IID_PPV_ARGS(&device));
-  if (observation != nullptr) {
-    observation->device11_result = device11_result;
-    ComPtr<ID3D12Device> device12;
-    observation->device12_result = swapchain->GetDevice(IID_PPV_ARGS(&device12));
-    if (SUCCEEDED(device11_result) && device != nullptr) {
-      observation->returned_device_identity = Identity(device.Get());
-      ComPtr<ID3D11Device> device11_interface;
-      observation->device11_interface_result = device->QueryInterface(IID_PPV_ARGS(&device11_interface));
-      if (SUCCEEDED(observation->device11_interface_result)) {
-        observation->device11_interface_identity = Identity(device11_interface.Get());
-      }
-      ComPtr<ID3D12Device> device12_interface;
-      observation->device12_interface_result = device->QueryInterface(IID_PPV_ARGS(&device12_interface));
-      if (SUCCEEDED(observation->device12_interface_result)) {
-        observation->device12_interface_identity = Identity(device12_interface.Get());
-      }
-    }
+  const auto device11_result = swapchain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(device.GetAddressOf()));
+  if (observation == nullptr) {
+    if (FAILED(device11_result) || device == nullptr) return {};
+    ComPtr<ID3D11Device> device11_interface;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device11_interface))) || device11_interface == nullptr) return {};
+    return ComPtr<IUnknown>(renodx::utils::directx::NativeIdentity(device11_interface.Get()));
   }
-  if (FAILED(device11_result)) return {};
-  return ComPtr<IUnknown>(renodx::utils::directx::NativeIdentity(device.Get()));
+  observation->device11_result = device11_result;
+  ComPtr<IUnknown> device12;
+  observation->device12_result = swapchain->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(device12.GetAddressOf()));
+  if (SUCCEEDED(device11_result) && device != nullptr) {
+    observation->returned_device_request = 11;
+  } else if (SUCCEEDED(observation->device12_result) && device12 != nullptr) {
+    observation->returned_device_request = 12;
+    device = std::move(device12);
+  } else {
+    return {};
+  }
+  observation->returned_device_identity = Identity(device.Get());
+  ComPtr<ID3D11Device> device11_interface;
+  observation->device11_interface_result = device->QueryInterface(IID_PPV_ARGS(&device11_interface));
+  if (SUCCEEDED(observation->device11_interface_result)) {
+    observation->device11_interface_identity = Identity(device11_interface.Get());
+  }
+  ComPtr<ID3D12Device> device12_interface;
+  observation->device12_interface_result = device->QueryInterface(IID_PPV_ARGS(&device12_interface));
+  if (SUCCEEDED(observation->device12_interface_result)) {
+    observation->device12_interface_identity = Identity(device12_interface.Get());
+  }
+  if (FAILED(observation->device11_interface_result) || device11_interface == nullptr
+      || observation->returned_device_identity == 0
+      || observation->device11_interface_identity != observation->returned_device_identity) return {};
+  return ComPtr<IUnknown>(renodx::utils::directx::NativeIdentity(device11_interface.Get()));
+}
+
+inline bool BridgeDeviceCaptureReady(const BridgeDeviceObservation& observation, IUnknown* device11, bool allow_absent) {
+  if (!observation.object_present) return allow_absent;
+  if (FAILED(observation.swapchain_result) || observation.returned_device_identity == 0
+      || (observation.returned_device_request != 11 && observation.returned_device_request != 12)) return false;
+  if (SUCCEEDED(observation.device11_interface_result)) {
+    return device11 != nullptr && observation.device11_interface_identity == observation.returned_device_identity;
+  }
+  return observation.device11_interface_result == E_NOINTERFACE && SUCCEEDED(observation.device12_interface_result)
+      && observation.device12_interface_identity == observation.returned_device_identity;
 }
 
 inline ComPtr<IUnknown> D3D12SourceDeviceIdentity(IDXGISwapChain* swapchain) {
@@ -718,7 +742,8 @@ inline void Initialize(void* handle, ID3D12CommandQueue* queue, const abi::Init*
       || FAILED(context->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&context->fence)))) return;
   context->device_identity = renodx::utils::directx::NativeIdentity(context->device.Get());
   std::unique_lock lock(state.mutex);
-  context->bridge_context_ready = true;
+  context->bridge_context_ready = BridgeDeviceCaptureReady(
+      context->bridge_application_observation, context->bridge_application_device11.Get(), true);
   context->bridge_declaration = ++state.bridge_declaration;
   if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
     state.retired_contexts.push_back(it->second);
@@ -1683,14 +1708,17 @@ struct SdkHooks {
         const auto identity = Identity(static_cast<IUnknown*>(*output));
         BridgeDeviceObservation device_observation;
         auto device11 = BridgeDeviceIdentity(static_cast<IUnknown*>(*output), &device_observation);
+        const bool proxy_ready = BridgeDeviceCaptureReady(device_observation, device11.Get(), false);
+        ComPtr<IUnknown> retired_device11;
         {
           std::unique_lock lock(state.mutex);
           if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
             it->second->proxy_identity = identity;
             if (it->second->bridge_declaration == declaration) {
+              retired_device11 = std::move(it->second->bridge_proxy_device11);
               it->second->bridge_proxy_device11 = std::move(device11);
               it->second->bridge_proxy_observation = device_observation;
-              it->second->bridge_proxy_ready = true;
+              it->second->bridge_proxy_ready = proxy_ready;
             } else {
               it->second->bridge_off_observed = false;
               it->second->bridge_proxy_ready = false;

@@ -120,7 +120,8 @@ inline Json Snapshot() {
   const auto device_observation = [](const fg::xefg::BridgeDeviceObservation& observed) {
     return Json{{"object_present", observed.object_present}, {"swapchain_unwrapped", observed.swapchain_unwrapped},
         {"swapchain_result", observed.swapchain_result}, {"device11_result", observed.device11_result},
-        {"device12_result", observed.device12_result}, {"returned_device_identity", observed.returned_device_identity},
+        {"device12_result", observed.device12_result}, {"returned_device_request", observed.returned_device_request},
+        {"returned_device_identity", observed.returned_device_identity},
         {"device11_interface_result", observed.device11_interface_result},
         {"device12_interface_result", observed.device12_interface_result},
         {"device11_interface_identity", observed.device11_interface_identity},

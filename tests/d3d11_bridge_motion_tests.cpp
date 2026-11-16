@@ -970,6 +970,19 @@ int main(int argc, char** argv) {
         const DXGI_SWAP_CHAIN_DESC1 description{.Width = 8, .Height = 8, .Format = DXGI_FORMAT_R8G8B8A8_UNORM,
             .SampleDesc = {1, 0}, .BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT, .BufferCount = 2,
             .SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, .AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED};
+        {
+          ComPtr<IDXGISwapChain1> device12_swapchain;
+          Check(SUCCEEDED(factory->CreateSwapChainForComposition(native::bridge.queue, &description, nullptr, &device12_swapchain)),
+              "WARP creates a real D3D12 swapchain for device-interface classification");
+          xefg::BridgeDeviceObservation device12_observation;
+          Check(receipt_adapter::BridgeDeviceIdentity(device12_swapchain.Get(), &device12_observation) == nullptr
+                    && device12_observation.returned_device_request == 12
+                    && device12_observation.device11_interface_result == E_NOINTERFACE
+                    && device12_observation.device12_interface_result == S_OK
+                    && device12_observation.returned_device_identity != 0
+                    && device12_observation.device12_interface_identity == device12_observation.returned_device_identity,
+              "real D3D12 getter fallback verifies the returned interface without inventing a D3D11 identity");
+        }
         Check(SUCCEEDED(factory->CreateSwapChainForComposition(device.Get(), &description, nullptr, &receipt_swapchain)),
             "WARP creates the D3D11 application/proxy swapchain used for identity observation");
         ComPtr<IDXGISwapChain3> receipt_swapchain3;
@@ -1021,8 +1034,12 @@ int main(int argc, char** argv) {
             "mock SDK Init uses the real application-swapchain callback identity capture");
         const auto receipt_context = receipt_adapter::state.contexts.at(receipt_cleanup.handle);
         Check(receipt_context->bridge_application_device11.Get()
-                  == native::create_contracts.at(handle).source_device11_identity.Get(),
-            "the Init callback holds the exact normalized D3D11 device identity captured at source Create");
+                  == native::create_contracts.at(handle).source_device11_identity.Get()
+                  && receipt_context->bridge_context_ready
+                  && receipt_context->bridge_application_observation.returned_device_request == 11
+                  && receipt_context->bridge_application_observation.device11_interface_result == S_OK
+                  && receipt_context->bridge_application_observation.device12_interface_result == E_NOINTERFACE,
+            "the Init callback verifies the real D3D11 interface and holds the exact normalized source identity");
         receipt_during_sdk = +[] {
           receipt_during_sdk = nullptr;
           Hooks::Enable(receipt_context_handle, 0);

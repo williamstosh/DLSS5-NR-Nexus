@@ -75,8 +75,10 @@ x2 先平均相邻两源再统计；未满窗口或过期时为 null。请求、
 DEV 两档 x2 另可接纳与当前 D3D12 源、真实来源链与 XeFG proxy 的嵌套 Present 关联及 context 代次绑定的成功
 `SetEnabled(false)`。它保持原生 FG 声明不变；Unknown 自身不能准入。`state.edit_reuse.xefg_off_sources`
 报告凭据及 provider 匹配情况；`source_link_reason` 独立说明来源关联状态，`reason` 说明关闭凭据状态。
-设备接口查询结果与最近登记来源 Present 的线程 ID／SDK 嵌套深度也单独记录；这些诊断字段不参与准入。
-GetDevice 请求结果与返回对象自身的 D3D11／D3D12 QueryInterface 结果分开记录；未解包的规范 IUnknown 身份仅用于对象对照。
+设备接口查询结果与最近登记来源 Present 的线程 ID／SDK 嵌套深度也单独记录；这些字段本身不构成来源或 Off 凭据。
+设备类型按返回对象实际支持的接口识别，GetDevice 请求结果与 D3D11／D3D12 QueryInterface 结果分开记录。
+`returned_device_request` 为 11、12 或 0，说明被探测对象来自哪个 getter，0 表示未取得对象；GetDevice11 失败或为空时才改用 GetDevice12 返回对象。
+未解包的规范 IUnknown 身份用于核对返回对象与接口是否一致，已知 ReShade 解包后的身份用于既有来源匹配；两种身份不能混用。未知与双接口对象不能自动取得 D3D12 准入。
 `state.edit_reuse.xefg_device_observation` 在实验启用时独立报告唯一 SDK context 的设备诊断，即使尚无 SR 来源；它不提供 Off 或来源关联凭据，多 context 时沿用歧义状态。
 D3D12 可观察来源调用 proxy 或 proxy 调用唯一登记来源；内外调用都成功后才能建立关联，同设备及 proxy 自身不能替代嵌套证据。
 共享方法钩子命中的未登记外层不充当来源，实际登记来源及 SDK proxy 仍须完整匹配。

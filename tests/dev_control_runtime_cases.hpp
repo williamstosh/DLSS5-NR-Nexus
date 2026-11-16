@@ -125,6 +125,7 @@
         .device11_result = S_OK, .device12_result = S_OK, .returned_device_identity = DEVICE_IDENTITY,
         .device11_interface_result = E_NOINTERFACE, .device12_interface_result = S_OK,
         .device12_interface_identity = DEVICE_IDENTITY};
+    context->bridge_proxy_observation.returned_device_request = 11;
     {
       std::unique_lock lock(xefg::internal::state.mutex);
       xefg::internal::state.contexts.emplace(reinterpret_cast<void*>(SDK_HANDLE), context);
@@ -140,11 +141,12 @@
         "a unique SDK context exposes its device metadata independently of missing SR source records");
     const auto& proxy_device = device["proxy_device_observation"];
     check(proxy_device["object_present"] && proxy_device["device11_result"] == S_OK
-            && proxy_device["device12_result"] == S_OK && proxy_device["returned_device_identity"] == DEVICE_IDENTITY
+            && proxy_device["device12_result"] == S_OK && proxy_device["returned_device_request"] == 11
+            && proxy_device["returned_device_identity"] == DEVICE_IDENTITY
             && proxy_device["device11_interface_result"] == E_NOINTERFACE
             && proxy_device["device12_interface_result"] == S_OK && proxy_device["device11_interface_identity"] == 0
             && proxy_device["device12_interface_identity"] == DEVICE_IDENTITY,
-        "source-independent status preserves captured getter results and all five returned-device QI diagnostics");
+        "source-independent status preserves the queried getter, returned-device identity and interface capabilities");
     check(!device.contains("available") && !device.contains("uses_source_link") && !device.contains("source")
             && !device.contains("source_swapchain") && !xefg::QueryBridgeOff({}).available
             && context->bridge_source_swapchain == 0 && context->bridge_link_generation == 0
