@@ -1131,6 +1131,10 @@ struct PresentTarget {
   // Granted only by XeFG's tagged, single-backbuffer service. Its private
   // Output contains this base frame's original color before NR runs.
   uint64_t xefg_edit_reuse_frame = 0;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  // Native Pre-FG uses the observed producer FrameToken, never the XeFG clock.
+  uint64_t native_edit_reuse_frame = 0;
+#endif
   uint64_t diagnostic_source_generation = 0;
   NVSDK_NGX_Feature diagnostic_source_feature = NVSDK_NGX_Feature_Reserved_Unknown;
   uint32_t guide_mode = 0;
@@ -13869,13 +13873,24 @@ inline bool RecordInline(
       && present->domain == present_restore_scope::Domain::PRE_FG_BACKBUFFER
       && present->stage_execution_plan == nullptr && !present->native_prefg_resolution_pair
       && present->source_color == nullptr;
+  bool edit_reuse_native_route = false;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  edit_reuse_native_route = edit_reuse_fg_experiment.load() && present != nullptr
+      && present->native_edit_reuse_frame != 0 && present->xefg_edit_reuse_frame == 0
+      && hook_point.load() == kHookPresent && !present->d3d11_bridge
+      && (present->domain == present_restore_scope::Domain::PRE_FG_BACKBUFFER
+          || present->domain == present_restore_scope::Domain::PRE_FG_HUDLESS)
+      && present->stage_execution_plan == nullptr && !present->native_prefg_resolution_pair
+      && present->source_color == nullptr;
+#endif
+  const bool edit_reuse_prefg_route = edit_reuse_xefg_route || edit_reuse_native_route;
   // PQ stays in the existing Present codec: decode and convert to BT.709
   // before the sRGB model proxy, then commit back to HDR10 after reuse.
-  const bool edit_reuse_hdr10 = edit_reuse_xefg_route && hdr_mode == 2
+  const bool edit_reuse_hdr10 = edit_reuse_prefg_route && hdr_mode == 2
       && output_desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM
       && present->units.encoding == codec::Encoding::Pq && present->units.absolute
       && present->units.unit_nits == 10000.f && present->units.bt2020 && present->hdr_encoding == 4u;
-  const bool edit_reuse_contract_eligible = edit_reuse_requested && (edit_reuse_inline_route || edit_reuse_xefg_route)
+  const bool edit_reuse_contract_eligible = edit_reuse_requested && (edit_reuse_inline_route || edit_reuse_prefg_route)
       && !plan.mixed && group.begin == 0 && requested_stack == 1
       && !D3D11OnlySession() && !direct_api.borrowed_core_context
       && !control_mask_requested && !look_mode.load() && detail_stability.load() == 1u
@@ -13920,7 +13935,10 @@ inline bool RecordInline(
   const bool edit_reuse_adaptive_route = edit_reuse_adaptive_contract && adaptive.session->prepared
       && edit_tiers->tiers[0].ready && edit_tiers->tiers[1].ready
       && AdaptiveTierUsable(*edit_tiers, *adaptive.session, 0) && AdaptiveTierUsable(*edit_tiers, *adaptive.session, 1);
-  const uint64_t edit_reuse_sequence = (present != nullptr ? present->xefg_edit_reuse_frame : feature.sr_sequence);
+  uint64_t edit_reuse_sequence = (present != nullptr ? present->xefg_edit_reuse_frame : feature.sr_sequence);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (edit_reuse_native_route) edit_reuse_sequence = present->native_edit_reuse_frame;
+#endif
   const bool edit_reuse_route_eligible = edit_reuse_contract_eligible && !adaptive.preparing && !prepare_models_only
       && ((!nr_adaptive_enabled.load() && !adaptive.enabled && nr_input_width == width && nr_input_height == height)
           || edit_reuse_adaptive_route);

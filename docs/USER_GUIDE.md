@@ -446,7 +446,7 @@ Present 显示以下选项。兼容的 Pre-FG 先增强游戏帧再交给 FG；�
 
 关闭游戏后，在 ReShade 配置的 `[RenoDX.DLSS5]` 段加入 `NREditReuse=1`，重启后读取。普通安装包支持原生 DX12 的两条限定路径：关闭 FG 的 Upscaled，以及 XeFG 的 Present 单 Backbuffer（不含 HUDless/UI 合成）。均要求模型 B、1 层、固定100% HDR 输出，并关闭调整 NR 外观、细节稳定性、ControlMask 和自适应尺寸。游戏须提供匹配的深度和运动数据，以及完整的 jitter 采样偏移（支持非零值，每轴不超过半个渲染像素）；运动数据须不含 jitter。Upscaled 使用 FP16 scRGB；XeFG 单 Backbuffer 另支持10位 HDR10/PQ。格式或实际颜色契约不符时保持逐帧 NR。光照突然变化时可能短暂回到原色，NR 色调变化也可能延后一帧；《巫师3》HDR10/PQ＋XeFG 的静态场景已确认隔帧调用；动态画质与帧节奏仍待实际场景验收。日志中的 `NR edit reuse` 表示实际发生复用；移除该键或设为 `0` 后重启即可关闭。此实验未加入菜单或方案分享。
 
-最新的真实 SR Upscaled＋FG On 准入仍属于默认关闭的 DEV 实验，普通安装包不开放这条路径。它与上文的 XeFG Present 单 Backbuffer 路径分开；当前 XeFG／DLSS FG On 的刷新、复用与 SDK 输出观察尚未验收生成帧的实际编辑像素消费、动态画质或微卡顿。
+后续开发版还包含默认关闭的 FG On 实验：真实 SR 的 Upscaled 路径，以及原生 DLSS FG 的 Present 路径。原生 Present 限定模型 B、单层、固定100%，已接入 HDR10/PQ 的去 HUD 画面与精确透明度合成输入，以保留游戏 HUD。这两条 DEV 路径尚未进入普通安装包；生成帧画面、动态画质与微卡顿仍待验收。
 
 <a id="zh-paths"></a>
 #### 可用组合
@@ -1003,7 +1003,7 @@ Use this for specific issues. Record old values and compare one change at a time
 
 With the game closed, add `NREditReuse=1` under `[RenoDX.DLSS5]` in the ReShade configuration, then restart. The ordinary package supports two restricted native DX12 paths: Upscaled with FG off, and XeFG Present with a single Backbuffer and no HUDless/UI composition. Both require model B, one pass and fixed 100% HDR output, with Adjust NR's look, Detail stability, ControlMask and adaptive sizing off. The game must provide matching depth and motion plus both jitter sampling offsets; nonzero values up to half a render pixel per axis are supported, with jitter excluded from motion. Upscaled uses FP16 scRGB; XeFG single Backbuffer also supports 10-bit HDR10/PQ. Other formats or mismatched actual color contracts continue running NR every frame. Sudden lighting changes may briefly restore the original color, and changes in NR's tone may lag by one frame. HDR10/PQ x2 reuse has been confirmed in a static The Witcher 3 XeFG scene; dynamic image quality and frame pacing still need acceptance in the intended scene. An `NR edit reuse` log entry confirms actual reuse. Remove the key or set it to `0` and restart to disable it. There is no menu control or preset-sharing field for this experiment.
 
-The newer real-SR Upscaled + FG On path remains a disabled-by-default DEV experiment and is not enabled in the ordinary package. It is separate from the XeFG single-Backbuffer Present path above. Current XeFG/DLSS FG On refresh, reuse and SDK-output observations do not yet include acceptance of edited-pixel consumption by generated frames, dynamic image quality or microstutter.
+The development branch also includes disabled-by-default FG On experiments for real-SR Upscaled and native DLSS FG Present. Native Present requires model B, one pass and fixed 100% resolution; it handles HDR10/PQ HUD-less color and exact alpha composition inputs to preserve the game's HUD. These two DEV paths are not included in the ordinary package. Generated-frame appearance, dynamic image quality and microstutter still await acceptance.
 
 <a id="en-paths"></a>
 #### Compatible combinations

@@ -20,6 +20,10 @@
 #include "fg_frame.hpp"
 #include "lastgasp.hpp"
 #include "output_framerate.hpp"
+#if defined(NR_NEXUS_DEV_CONTROL)
+#include "../../utils/directx.hpp"
+#include "native_fg_frame.hpp"
+#endif
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
 #include <cstring>
 
@@ -56,12 +60,36 @@ struct State {
 };
 static State state;
 
+#if defined(NR_NEXUS_DEV_CONTROL)
+struct ReflexMarkerHook {
+  HMODULE module = nullptr;
+  frame_source::SetMarker real = nullptr;
+  detour_guard::Record record;
+  bool installed = false;
+};
+static ReflexMarkerHook reflex_marker;
+
+static sl::Result HookedReflexMarker(sl::PCLMarker marker, const sl::FrameToken& frame) {
+  if (!stopped.load(std::memory_order_acquire)) PinRuntimeCallback();
+  return frame_source::ObserveMarker(reflex_marker.real, marker, frame);
+}
+#endif
+
 struct PresentDecisionScope {
   IDXGISwapChain* swapchain;
   UINT flags;
   PresentObserved callback = nullptr;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  frame_source::SdkScope frame_scope;
+#endif
 
-  PresentDecisionScope(IDXGISwapChain* output, UINT present_flags) : swapchain(output), flags(present_flags) {
+  PresentDecisionScope(IDXGISwapChain* output, UINT present_flags) : swapchain(output), flags(present_flags)
+#if defined(NR_NEXUS_DEV_CONTROL)
+      , frame_scope((!stopped.load(std::memory_order_acquire) && (present_flags & DXGI_PRESENT_TEST) == 0
+                        ? reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(output)) : 0),
+            !stopped.load(std::memory_order_acquire) && (present_flags & DXGI_PRESENT_TEST) == 0)
+#endif
+  {
     if (present_depth == 0 && (flags & DXGI_PRESENT_TEST) != 0) {
       output_framerate::Invalidate(output_framerate::Reason::kTEST_PRESENT);
     }
@@ -189,6 +217,12 @@ inline bool ObservesPresentDecisions() noexcept {
       && !internal::stopped.load(std::memory_order_acquire);
 }
 
+#if defined(NR_NEXUS_DEV_CONTROL)
+inline frame_source::Frame CurrentFrame(uintptr_t output_identity) {
+  return frame_source::CurrentFrame(output_identity);
+}
+#endif
+
 // Terminal logical disable; it does not drain an already executing callback.
 // Both images remain pinned and the installed hook continues to pass through.
 inline void Stop() noexcept {
@@ -197,6 +231,9 @@ inline void Stop() noexcept {
 #endif
   output_framerate::ReleaseNative();
   internal::stopped.store(true, std::memory_order_release);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  frame_source::Stop();
+#endif
   internal::options_changed.store(nullptr, std::memory_order_release);
   internal::present_observed.store(nullptr, std::memory_order_release);
   internal::decisions_ready.store(false, std::memory_order_release);
@@ -216,6 +253,12 @@ inline void Stop() noexcept {
           reinterpret_cast<void*>(&internal::HookedPresent1), internal::state.present1_record);
     }
   }
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (internal::reflex_marker.installed) {
+    detour_guard::Neutralize(reinterpret_cast<void* const*>(&internal::reflex_marker.real),
+        reinterpret_cast<void*>(&internal::HookedReflexMarker), internal::reflex_marker.record);
+  }
+#endif
 }
 
 // Call outside DllMain and without the host's runtime lock: discovery takes
@@ -224,8 +267,13 @@ inline void Poll() {
   if (internal::stopped.load(std::memory_order_acquire)
       || internal::options_changed.load(std::memory_order_acquire) == nullptr) return;
   std::unique_lock lock(internal::state.mutex, std::try_to_lock);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (!lock.owns_lock() || (internal::state.installed && internal::reflex_marker.installed)
+      || internal::stopped.load(std::memory_order_acquire)) return;
+#else
   if (!lock.owns_lock() || internal::state.installed
       || internal::stopped.load(std::memory_order_acquire)) return;
+#endif
 
   HMODULE plugin = nullptr;
   if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"sl.dlss_g.dll", &plugin)) return;
@@ -251,6 +299,37 @@ inline void Poll() {
       --lastgasp::expected_fault_depth;
     }
   };
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (!internal::reflex_marker.installed) {
+    HMODULE reflex = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"sl.reflex.dll", &reflex)) {
+      const auto reflex_size = detour_guard::ImageIdentity(reflex) & 0xFFFFFFFFu;
+      const auto reflex_gateway = reinterpret_cast<Gateway>(GetProcAddress(reflex, "slGetPluginFunction"));
+      if (reflex_size != 0 && reflex_gateway != nullptr
+          && reinterpret_cast<uintptr_t>(reflex_gateway) - reinterpret_cast<uintptr_t>(reflex) < reflex_size) {
+        void* const marker = resolve(reflex_gateway, "slReflexSetMarker");
+        if (marker != nullptr && reinterpret_cast<uintptr_t>(marker) - reinterpret_cast<uintptr_t>(reflex) < reflex_size
+            && !internal::stopped.load(std::memory_order_acquire)) {
+          internal::reflex_marker.module = reflex;
+          internal::reflex_marker.real = reinterpret_cast<frame_source::SetMarker>(marker);
+          const detour_guard::Hook hooks[] = {{
+              .name = "slReflexSetMarker", .real = reinterpret_cast<void**>(&internal::reflex_marker.real),
+              .detour = reinterpret_cast<void*>(&internal::HookedReflexMarker), .record = &internal::reflex_marker.record}};
+          size_t failed = 0;
+          internal::reflex_marker.installed = detour_guard::AttachAll(hooks, &failed) == 1;
+          if (internal::reflex_marker.installed) {
+            frame_source::Activate();
+            if (internal::stopped.load(std::memory_order_acquire)) {
+              detour_guard::Neutralize(reinterpret_cast<void* const*>(&internal::reflex_marker.real),
+                  reinterpret_cast<void*>(&internal::HookedReflexMarker), internal::reflex_marker.record);
+            }
+          }
+        }
+      }
+    }
+  }
+  if (internal::state.installed) return;
+#endif
   void* const target = resolve(gateway, "slDLSSGSetOptions");
   if (target == nullptr
       || reinterpret_cast<uintptr_t>(target) - reinterpret_cast<uintptr_t>(plugin) >= image_size) return;

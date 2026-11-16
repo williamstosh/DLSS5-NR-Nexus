@@ -748,6 +748,8 @@ int RunNativeRequiredMenuTest() {
 #include "adaptive_inline_cases.hpp"
 #if defined(NR_NEXUS_DEV_CONTROL)
 #include "inline_restore_roi_cases.hpp"
+#include "native_fg_frame_cases.hpp"
+#include "nr_edit_reuse_native_cases.hpp"
 #endif
 
 int main(int argc, char** argv) {
@@ -755,6 +757,8 @@ int main(int argc, char** argv) {
   if (argc == 2 && std::strcmp(argv[1], "--nr-fg-output-marker") == 0) return nr_fg_output_marker_gpu_cases::Run();
 #endif
 #if defined(NR_NEXUS_DEV_CONTROL)
+  if (argc == 2 && std::strcmp(argv[1], "--native-frame-source") == 0) return native_fg_frame_cases::Run();
+  if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-native-contracts") == 0) return nr_edit_reuse_native_cases::Run();
   if (argc == 2 && std::strcmp(argv[1], "--inline-restore-roi") == 0) return inline_restore_roi_cases::Run();
 #endif
   if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-xefg-contracts") == 0) return nr_edit_reuse_xefg_cases::Run();
