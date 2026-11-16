@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import struct
 import subprocess
+import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -335,6 +337,56 @@ class ClientTests(unittest.TestCase):
             with self.assertRaises(TimeoutError):
                 client.status(deadline=1.05)
         self.assertLessEqual(len(self.transport.requests), 4)
+
+
+class JournalCliTests(unittest.TestCase):
+    def observe_timeout(self, action, clock=None):
+        original_client = dev.Client
+        transport = Transport(action)
+
+        def client(pid, created, **kwargs):
+            return original_client(pid, created, transport=transport,
+                                   identity_probe=lambda _: '123', **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'journal.jsonl'
+            argv = ['dev_control.py', '--pid', '42', '--process-created', '123',
+                    '--timeout', '.05', '--journal', str(path), 'status']
+            with mock.patch.object(sys, 'argv', argv), mock.patch.object(dev, 'Client', side_effect=client):
+                if clock is None:
+                    with self.assertRaises(TimeoutError):
+                        dev.main()
+                else:
+                    with mock.patch.object(dev.time, 'monotonic', side_effect=lambda: clock[0]), \
+                            mock.patch.object(dev.time, 'sleep', side_effect=lambda s: clock.__setitem__(0, clock[0] + s)):
+                        with self.assertRaises(TimeoutError):
+                            dev.main()
+            return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
+
+    def test_busy_receipts_survive_final_status_timeout(self):
+        def busy(request):
+            result = response(request)
+            result['state'].update(available=False, reason='runtime_busy')
+            return result
+
+        entries = self.observe_timeout(busy, [1.0])
+        receipts = [entry for entry in entries if entry['kind'] == 'dev_control_receipt']
+        self.assertGreater(len(receipts), 0)
+        self.assertTrue(all(entry['response']['state']['reason'] == 'runtime_busy' for entry in receipts))
+        self.assertEqual(entries[-1]['kind'], 'dev_control_error')
+        self.assertEqual(entries[-1]['error'], 'Development control deadline expired')
+        self.assertIn('status', entries[-1]['traceback'])
+        self.assertTrue(all(entry['time'].endswith('+00:00') for entry in entries))
+
+    def test_transport_timeout_is_distinct_from_received_busy_replies(self):
+        def stalled(_):
+            raise TimeoutError('Development pipe I/O deadline expired')
+
+        entries = self.observe_timeout(stalled)
+        self.assertEqual([entry['kind'] for entry in entries], ['dev_control_request', 'dev_control_error'])
+        self.assertEqual(entries[-1]['error'], 'Development pipe I/O deadline expired')
+        self.assertIn('exchange', entries[-1]['traceback'])
+        self.assertEqual(entries[-1]['pid'], 42)
 
 
 class FakeKernel:

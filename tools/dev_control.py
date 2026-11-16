@@ -6,12 +6,14 @@ The interface reports configuration, API and GPU evidence separately.
 import argparse
 import ctypes as C
 from ctypes import wintypes as W
+from datetime import datetime, timezone
 import json
 import math
 import os
 import struct
 import sys
 import time
+import traceback
 import uuid
 
 
@@ -334,6 +336,7 @@ def main():
     parser.add_argument('--pid', type=int, required=True)
     parser.add_argument('--process-created', required=True, help='Raw decimal Windows FILETIME from owned-process.json')
     parser.add_argument('--timeout', type=float, default=3)
+    parser.add_argument('--journal', help='Write request, receipt and error JSONL to a new local file')
     parser.add_argument('--query-id', help='status only: look up an uncertain original request receipt')
     parser.add_argument('--confirm', action='store_true', help='Explicitly approve a returned configuration proposal')
     parser.add_argument('--tail-frames', type=int, help='inline-restore-roi only: capture 2–48 consecutive evaluations at the character ROI')
@@ -343,19 +346,36 @@ def main():
     args = parser.parse_args()
     if args.tail_frames is not None and (args.op != 'inline-restore-roi' or not 2 <= args.tail_frames <= 48):
         parser.error('--tail-frames requires inline-restore-roi and a value from 2 to 48')
-    client = Client(args.pid, args.process_created, timeout=args.timeout)
-    if args.op == 'set':
-        if not args.key or args.value is None or args.query_id:
-            parser.error('set requires key and JSON value')
-        response = client.set(args.key, json.loads(args.value), confirm=args.confirm)
-    elif args.op == 'inline-restore-roi':
-        if not args.key or args.value is not None or args.query_id or args.confirm:
-            parser.error('inline-restore-roi requires one output directory and no setting or confirmation')
-        response = client.inline_restore_roi(args.key, tail_frames=args.tail_frames)
-    else:
-        if args.key or args.value or args.confirm:
-            parser.error('status accepts no setting or confirmation')
-        response = client.status(query_id=args.query_id)
+    journal_file = open(args.journal, 'x', encoding='utf-8') if args.journal else None
+
+    def journal(kind, **values):
+        journal_file.write(json.dumps(dict(time=datetime.now(timezone.utc).isoformat(), kind=kind, **values),
+                                      ensure_ascii=False, allow_nan=False) + '\n')
+        journal_file.flush()
+
+    try:
+        client = Client(args.pid, args.process_created, timeout=args.timeout,
+                        journal=journal if journal_file else None)
+        if args.op == 'set':
+            if not args.key or args.value is None or args.query_id:
+                parser.error('set requires key and JSON value')
+            response = client.set(args.key, json.loads(args.value), confirm=args.confirm)
+        elif args.op == 'inline-restore-roi':
+            if not args.key or args.value is not None or args.query_id or args.confirm:
+                parser.error('inline-restore-roi requires one output directory and no setting or confirmation')
+            response = client.inline_restore_roi(args.key, tail_frames=args.tail_frames)
+        else:
+            if args.key or args.value or args.confirm:
+                parser.error('status accepts no setting or confirmation')
+            response = client.status(query_id=args.query_id)
+    except Exception as error:
+        if journal_file:
+            journal('dev_control_error', pid=args.pid, process_created=args.process_created,
+                    error_type=type(error).__name__, error=str(error), traceback=traceback.format_exc())
+        raise
+    finally:
+        if journal_file:
+            journal_file.close()
     print(json.dumps(response, ensure_ascii=False, indent=2))
     return 0 if response['ok'] else 1
 

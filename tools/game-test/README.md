@@ -24,6 +24,8 @@ Smoke 必须每轮传 -Save 和当前存档文件名；游戏通过 ListSavedGam
 
 开发接口接线需显式给目标副本设置 `static_capture.dev_control=true`，或在上述准备命令增加 `--development-control`。默认仍沿用手工菜单路径。接口客户端 `tools/dev_control.py` 只依赖 Python 标准库，连接 `\\.\pipe\nr-nexus-dev-<pid>`；每帧为 4 字节小端长度和最多 64 KiB 的 UTF-8 JSON。连接等待、OVERLAPPED 读写、部分帧和确认往返共用有界 deadline。客户端核对管道服务 PID，并在请求前后核对 `owned-process.json.created` 的原始 Windows FILETIME；`--process-created` 使用该整数的十进制字符串，不转换成 Unix 时间。接口需由开发候选显式启用；本说明不授予安装或游戏启动权限。
 
+定位状态超时时，可在同一命令附加 `--journal <新的本地JSONL路径>`，保留带UTC时间的请求、每次回执和最终异常栈。`status()` 会在原deadline内重试 `runtime_busy`／`configuration_changed`；最终超时不能单独解释为管道没有回复。请求记录表示客户端准备发送，不等于服务端已接收；按回执与异常位置区分忙碌重试、连接等待及读写阶段。Python采集器可直接复用 `Client(..., journal=callback)`；日志只保存本地，不覆盖已有文件或改变请求／确认语义。
+
 开发候选使用 `tools/build.ps1 -ToolRoot <既有工具目录> -Configuration Release -DevControl -BuildDirectory build/dev-control`；该开关不能使用普通 `build` 输出目录。普通构建显式设置 `NR_NEXUS_DEV_CONTROL=OFF`，开发目录与普通目录的 DLL 分别核对哈希和实际加载身份。无面板／绘制请求时接口仍由选定 ReShade 帧回调执行。只读配置状态不建立 GPU 完成证据；区域遮罩的 `resolved_masks` 也只表示逐层解析参数。
 
 ```powershell
