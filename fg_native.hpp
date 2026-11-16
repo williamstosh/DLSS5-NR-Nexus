@@ -1676,6 +1676,7 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     if (observations < 32 && now - last_observation_ns >= 1'000'000'000) {
       last_observation_ns = now;
       const auto observation = fg::native_options::frame_source::Snapshot();
+      const auto tag_observation = native_tag_source::Snapshot();
       std::ostringstream line;
       line << "NR native edit source: available=" << native_frame.available
            << " reason=" << native_frame.reason << " token=" << native_frame.frame
@@ -1684,6 +1685,23 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
            << " real_guides=" << current_guides << " route=" << native_edit_route
            << " source_provider=" << (native_tag_frame ? "tag_copy" : "sdk_scope")
            << " tag_source_reason=" << tagged_frame.reason
+           << " tag=[legacy:" << tag_observation.legacy_calls << ",framed:" << tag_observation.for_frame_calls
+           << ",legacy_hudless:" << tag_observation.legacy_hudless_calls
+           << ",framed_hudless:" << tag_observation.for_frame_hudless_calls
+           << ",hudless:" << tag_observation.hudless_calls << ",scopes:" << tag_observation.scope_enters
+           << ",copies:" << tag_observation.copy_calls << ",scoped:" << tag_observation.scoped_copies
+           << ",matches:" << tag_observation.source_matches << ",published:" << tag_observation.publish_count
+           << ",removed:" << tag_observation.removal_count << ",live:" << tag_observation.live_versions
+           << ",framed_last:" << tag_observation.last_frame_bound << ",tag_token:" << tag_observation.tag_frame
+           << ",tag_viewport:" << tag_observation.tag_viewport << ",token:" << tag_observation.frame
+           << ",viewport:" << tag_observation.viewport << ",life:" << tag_observation.lifecycle
+           << ",native:" << tag_observation.tag_native << ",source:" << tag_observation.source_identity
+           << ",clone:" << tag_observation.clone_identity << ",input:" << tag_observation.query_identity
+           << ",list:" << tag_observation.list_identity << ",recording:" << tag_observation.recording_list
+           << '/' << tag_observation.recording_generation << ",hooks:" << tag_observation.hooks_ready
+           << ",gate:" << tag_observation.gate_reason << ",scope:" << tag_observation.scope_reason
+           << ",copy:" << tag_observation.copy_reason << ",finish:" << tag_observation.finish_reason
+           << ",remove:" << tag_observation.removal_reason << ",resets:" << tag_observation.reset_count << ']'
            << " hook_facts=" << fg::native_options::FrameHookFacts()
            << " sdk_ready=" << fg::native_options::ObservesPresentDecisions()
            << " current_thread=" << observation.current_thread << " tls_depth=" << observation.tls_depth

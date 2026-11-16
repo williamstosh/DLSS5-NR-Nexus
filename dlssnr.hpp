@@ -22392,6 +22392,11 @@ inline sl::Result HookedStreamlineSetTag(
     RuntimeLock lock(runtime_mutex);
     CaptureStreamlineTagSet(
         static_cast<uint32_t>(viewport), tags, num_tags, std::nullopt);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (edit_reuse_fg_experiment.load()) {
+      native_tag_source::ObserveTags(false, 0, static_cast<uint32_t>(viewport), tags, num_tags);
+    }
+#endif
   }
   return real_streamline_set_tag(viewport, tags, num_tags, command_buffer);
 }
@@ -22450,6 +22455,11 @@ inline sl::Result HookedStreamlineSetTagForFrame(
     CaptureStreamlineTagSet(
         static_cast<uint32_t>(viewport), tags, num_tags,
         static_cast<uint32_t>(frame));
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (edit_reuse_fg_experiment.load()) {
+      native_tag_source::ObserveTags(true, static_cast<uint32_t>(frame), static_cast<uint32_t>(viewport), tags, num_tags);
+    }
+#endif
   }
 #if defined(NR_NEXUS_DEV_CONTROL)
   std::unique_ptr<ID3D12GraphicsCommandList, void (*)(ID3D12GraphicsCommandList*)> tag_list(
@@ -22461,9 +22471,13 @@ inline sl::Result HookedStreamlineSetTagForFrame(
       && hook_point.load() == kHookPresent && !shutting_down.load() && has_hudless_tag && !fg::xefg::Enabled()) {
     tag_list.reset(NativeStreamlineTagList(command_buffer));
     bool hooks_ready = false;
-    if (tag_list != nullptr) {
+    {
       RuntimeLock lock(runtime_mutex);
-      hooks_ready = InstallCommandListStateHooks(tag_list.get()) && InstallMixedPresentCopyHooks(tag_list.get());
+      if (tag_list != nullptr) {
+        hooks_ready = InstallCommandListStateHooks(tag_list.get()) && InstallMixedPresentCopyHooks(tag_list.get());
+      }
+      native_tag_source::NoteGate(tag_list == nullptr ? "tag_list_unavailable"
+          : hooks_ready ? "tag_hooks_ready" : "tag_hooks_unavailable", tag_list.get(), hooks_ready);
     }
     if (hooks_ready) {
       tag_source.emplace(tag_list.get(), static_cast<uint32_t>(frame), static_cast<uint32_t>(viewport), tags, num_tags);
