@@ -3616,11 +3616,10 @@ inline void RunPresentPath(
   }
   DrainPresentRetired();
   if (!d3d11) {
-    // NGX records in the world of its list: the face NR's runtime holds, or
-    // the one ReShade hands resources' GetDevice callers (its device proxy)
-    // when the runtime is not up yet - the world the game's own lists are in.
+    // Ordinary Present uses the game's device face. The private service's
+    // native face cannot select a list for Core's proxy-backed context.
     ID3D12Device* face = nullptr;
-    if (direct_device != nullptr
+    if (direct_device != nullptr && !direct_api.private_instance
         && renodx::utils::directx::SameNativeObject(
             direct_device, reinterpret_cast<IUnknown*>(api_device->get_native()))) {
       face = direct_device;

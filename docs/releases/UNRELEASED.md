@@ -9,6 +9,7 @@
 ### 修复内容
 
 - 修复使用 Present 时，开启 XeFG 后 NR 可能持续显示没有提交的问题，并恢复关闭 XeFG 后的普通 Present 处理。
+- 修复载档或关闭 XeFG、回到普通 Present 时可能出现的崩溃。
 
 ### 验证情况
 
@@ -21,6 +22,7 @@ These changes are available in development builds and have not been released.
 ### Fixes
 
 - Fixed an issue where enabling XeFG with Present processing could leave NR without submissions, and restored ordinary Present processing after XeFG is disabled.
+- Fixed a possible crash while loading a save or disabling XeFG as processing returned to ordinary Present.
 
 ### Validation
 

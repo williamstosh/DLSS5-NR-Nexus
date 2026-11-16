@@ -11,6 +11,9 @@
 #include <tuple>
 #include <type_traits>
 #include <dlssnr.hpp>
+// The shared FG runner uses the parent ReShade include root.
+#pragma include_alias(<reshade_api.hpp>, <include/reshade_api.hpp>)
+#include "vulkan_test_api_stubs.hpp"
 
 // Reuse the WARP/list/submission host, without running the adapter matrix.
 #define main UnusedXeFgTestMain
@@ -3905,6 +3908,127 @@ int RunNativeOptionsResumeTest(bool delayed_options) {
   }
 }
 
+namespace {
+// Only the COM slots reached by RunPresentPath's face selection are provided.
+// CreateFence deliberately fails before a proxy allocator/list can be requested.
+struct PresentFaceProxy {
+  void** vtable = nullptr;
+  std::array<void*, 37> slots{};
+  ID3D12Device* native = nullptr;
+  ULONG references = 1;
+  uint32_t fence_calls = 0;
+
+  explicit PresentFaceProxy(ID3D12Device* device) : native(device) {
+    slots.fill(reinterpret_cast<void*>(+[] { throw std::logic_error("unexpected face-probe COM method"); }));
+    slots[0] = reinterpret_cast<void*>(+[](PresentFaceProxy* self, REFIID iid, void** output) -> HRESULT {
+      if (output == nullptr) return E_POINTER;
+      *output = nullptr;
+      if (iid == __uuidof(renodx::utils::directx::ReShadeRetrieveBaseInterface)) {
+        return self->native->QueryInterface(IID_IUnknown, output);
+      }
+      if (iid != IID_IUnknown && iid != __uuidof(ID3D12Device)) return E_NOINTERFACE;
+      *output = self;
+      ++self->references;
+      return S_OK;
+    });
+    slots[1] = reinterpret_cast<void*>(+[](PresentFaceProxy* self) -> ULONG { return ++self->references; });
+    slots[2] = reinterpret_cast<void*>(+[](PresentFaceProxy* self) -> ULONG { return --self->references; });
+    slots[36] = reinterpret_cast<void*>(+[](PresentFaceProxy* self, UINT64, D3D12_FENCE_FLAGS,
+                                         REFIID, void** output) -> HRESULT {
+      ++self->fence_calls;
+      if (output != nullptr) *output = nullptr;
+      return E_ABORT;
+    });
+    vtable = slots.data();
+  }
+  ID3D12Device* Face() { return reinterpret_cast<ID3D12Device*>(this); }
+};
+
+struct PresentFaceDevice final : nr::test::vk::DeviceApiStubs {
+  ID3D12Device* native = nullptr;
+  uint64_t get_native() const override { return reinterpret_cast<uintptr_t>(native); }
+  reshade::api::device_api get_api() const override { return reshade::api::device_api::d3d12; }
+};
+
+struct PresentFaceQueue final : reshade::api::command_queue {
+  PresentFaceDevice* device = nullptr;
+  ID3D12CommandQueue* native = nullptr;
+  uint64_t get_native() const override { return reinterpret_cast<uintptr_t>(native); }
+  void get_private_data(const uint8_t[16], uint64_t*) const override { throw std::logic_error("unexpected queue data"); }
+  void set_private_data(const uint8_t[16], uint64_t) override { throw std::logic_error("unexpected queue data"); }
+  reshade::api::device* get_device() override { return device; }
+  reshade::api::command_queue_type get_type() const override { return reshade::api::command_queue_type::graphics; }
+  void wait_idle() const override { throw std::logic_error("unexpected queue wait"); }
+  void flush_immediate_command_list() const override { throw std::logic_error("face probe must not submit NR"); }
+  reshade::api::command_list* get_immediate_command_list() override { throw std::logic_error("face probe must not record NR"); }
+  void begin_debug_event(const char*, const float[4]) override { throw std::logic_error("unexpected queue event"); }
+  void end_debug_event() override { throw std::logic_error("unexpected queue event"); }
+  void insert_debug_marker(const char*, const float[4]) override { throw std::logic_error("unexpected queue event"); }
+  bool wait(reshade::api::fence, uint64_t) override { throw std::logic_error("unexpected queue wait"); }
+  bool signal(reshade::api::fence, uint64_t) override { throw std::logic_error("unexpected queue signal"); }
+  uint64_t get_timestamp_frequency() const override { return 0; }
+};
+
+struct PresentRingFaceProbe final : reshade::api::swapchain {
+  using GetDeviceFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Resource*, REFIID, void**);
+  static inline PresentRingFaceProbe* active = nullptr;
+  static inline GetDeviceFn original_get_device = nullptr;
+  PresentFaceProxy proxy;
+  PresentFaceDevice device;
+  PresentFaceQueue queue;
+  ID3D12Resource* back = nullptr;
+  IDXGISwapChain* swapchain = nullptr;
+  uint32_t back_device_calls = 0;
+  renodx::utils::vtable::Slot<GetDeviceFn> get_device_slot;
+  uint32_t saved_guides = native::present_guides.load();
+  uint32_t saved_pre_fg = native::present_pre_fg.load();
+  bool saved_unusable = native::present_unusable.load();
+
+  PresentRingFaceProbe(Gpu* gpu, ID3D12Resource* resource, IDXGISwapChain* output)
+      : proxy(gpu->device.Get()), back(resource), swapchain(output) {
+    device.native = gpu->device.Get();
+    queue.device = &device;
+    queue.native = gpu->queue.Get();
+    Check(active == nullptr, "one bounded Present face probe");
+    get_device_slot = {.object = back, .index = 7, .original = &original_get_device,
+        .replacement = +[](ID3D12Resource* resource, REFIID iid, void** output) -> HRESULT {
+          if (active != nullptr && resource == active->back) {
+            ++active->back_device_calls;
+            return active->proxy.Face()->QueryInterface(iid, output);
+          }
+          return original_get_device(resource, iid, output);
+        }};
+    renodx::utils::vtable::Install(&get_device_slot);
+    active = this;
+    native::present_guides = native::kPresentGuidesRequired;
+    native::present_pre_fg = 0;
+    native::present_sdr_white_polled_ns = native::SteadyNowNs();
+  }
+  ~PresentRingFaceProbe() {
+    native::present_guides = saved_guides;
+    native::present_pre_fg = saved_pre_fg;
+    native::present_unusable = saved_unusable;
+    renodx::utils::vtable::Uninstall(&get_device_slot);
+    active = nullptr;
+  }
+  uint64_t get_native() const override { return reinterpret_cast<uintptr_t>(swapchain); }
+  void get_private_data(const uint8_t[16], uint64_t*) const override { throw std::logic_error("unexpected swapchain data"); }
+  void set_private_data(const uint8_t[16], uint64_t) override { throw std::logic_error("unexpected swapchain data"); }
+  reshade::api::device* get_device() override { return &device; }
+  void* get_hwnd() const override { return nullptr; }
+  reshade::api::resource get_back_buffer(uint32_t index) override {
+    Check(index == 0, "face probe uses its real WARP backbuffer");
+    return {reinterpret_cast<uintptr_t>(back)};
+  }
+  uint32_t get_back_buffer_count() const override { return 1; }
+  uint32_t get_current_back_buffer_index() const override { return 0; }
+  bool check_color_space_support(reshade::api::color_space color) const override {
+    return color == reshade::api::color_space::srgb;
+  }
+  reshade::api::color_space get_color_space() const override { return reshade::api::color_space::srgb; }
+};
+}  // namespace
+
 int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
   try {
     const HMODULE test_module = GetModuleHandleW(nullptr);
@@ -4863,6 +4987,40 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
             "completed XeFG list is still replayable just before public Disable");
       Check(Hooks::Enable(session.handle, 0) == 0 && !xefg::OwnsStream(),
             "public XeFG Disable returns Present ownership without a Resize");
+      if (via_core) {
+        Check(native::direct_api.private_instance && native::direct_device == gpu.device.Get(),
+              "face probe begins at the actual private native provider after public Disable");
+        const auto evaluations_before = model_calls;
+        const auto no_guides_before = addon::nr_decline_counts[
+            static_cast<size_t>(addon::NrDeclineReason::kPresentNoGuides)].load();
+        bool selected_proxy = false;
+        {
+          PresentRingFaceProbe probe(&gpu, back.Get(), session.proxy.Get());
+          Check(probe.proxy.Face() != gpu.device.Get()
+                    && renodx::utils::directx::SameNativeObject(probe.proxy.Face(), gpu.device.Get()),
+                "distinct proxy/native faces share the actual WARP identity");
+          native::RunPresentPath(&probe.queue, &probe);
+          selected_proxy = probe.back_device_calls == 1 && probe.proxy.fence_calls == 1;
+          const bool native_ring = native::present_ring.device == gpu.device.Get();
+          const auto no_guides_after = addon::nr_decline_counts[
+              static_cast<size_t>(addon::NrDeclineReason::kPresentNoGuides)].load();
+          std::cout << "PRESENT_RING_FACE evidence=WARP-resource+MOCK-face-probe"
+                    << " provider=private-native disable=public back_GetDevice=" << probe.back_device_calls
+                    << " proxy_CreateFence=" << probe.proxy.fence_calls << " native_ring=" << native_ring
+                    << " required_no_guides=" << no_guides_after - no_guides_before
+                    << " model_evals=" << model_calls - evaluations_before << std::endl;
+          Check(model_calls == evaluations_before && native::direct_api.private_instance,
+                "bounded face probe never enters Core/model creation or changes provider");
+          Check(!native_ring || no_guides_after == no_guides_before + 1,
+                "old native ring stops normally at Required/no-guide before any model call");
+          const addon::ngx_serial::PresentTurn turn;
+          Check(turn.owns(), "face probe cleanup owns NGX turn");
+          const addon::RuntimeLock lock(native::runtime_mutex);
+          Check(native::ReleasePresentRing(), "face probe releases only its unsubmitted ring");
+          native::RetirePresentStream(&probe);
+        }
+        Check(selected_proxy, "wrong-face: ordinary Present must reacquire the swapchain proxy after private native XeFG");
+      }
       for (auto* resource : {guides[2].Get(), guides[3].Get()}) {
         gpu.Transition(resource, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
       }
