@@ -18768,6 +18768,16 @@ inline void* real_cmd_set_compute_root_32bit_constants = nullptr;
 inline void* real_cmd_set_compute_root_constant_buffer_view = nullptr;
 inline void* real_cmd_set_compute_root_shader_resource_view = nullptr;
 inline void* real_cmd_set_compute_root_unordered_access_view = nullptr;
+#if defined(NR_NEXUS_DEV_CONTROL)
+// List/queue wrappers precede the tag observer's composition boundary.
+using NativePremiseResetObserver = void (*)(ID3D12GraphicsCommandList*, bool);
+using NativePremiseSubmitObserver = void (*)(ID3D12CommandQueue*, const std::vector<submission::PendingSubmission>&);
+inline std::atomic<NativePremiseResetObserver> native_premise_reset{nullptr};
+inline std::atomic<NativePremiseSubmitObserver> native_premise_submit{nullptr};
+inline bool NativePremiseEnabled() {
+  return enabled.load() && edit_reuse_enabled.load() && edit_reuse_fg_experiment.load() && !shutting_down.load();
+}
+#endif
 inline std::mutex cmd_hook_mutex;
 inline bool cmd_hooks_installed = false;
 // Same latch, same reason as ngx_ever_hooked: the funnel's list_hooks_live
@@ -18992,6 +19002,13 @@ inline HRESULT STDMETHODCALLTYPE HookedCmdReset(
       // perspective; unknown is the only safe shadow.
       EraseListShadow(command_list);
     }
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (NativePremiseEnabled()) {
+      if (auto observe = native_premise_reset.load()) {
+        observe(command_list, SUCCEEDED(result));
+      }
+    }
+#endif
   });
   return result;
 }
@@ -20327,6 +20344,13 @@ inline void STDMETHODCALLTYPE HookedQueueExecuteCommandLists(
     // never guessed.
     submission::CompleteSubmission(
         pending_submissions, completion_fence.fence, completion_value);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (NativePremiseEnabled()) {
+      if (auto observe = native_premise_submit.load()) {
+        observe(queue, pending_submissions);
+      }
+    }
+#endif
     const void* marker = native_fg_marker.load(std::memory_order_acquire);
     if (marker != nullptr && native_fg_result.load(std::memory_order_acquire) == fg::Result::PREPARED) {
       const auto serial = native_fg_recording_serial.load(std::memory_order_acquire);
@@ -22490,6 +22514,7 @@ inline sl::Result HookedStreamlineSetTagForFrame(
   std::unique_ptr<ID3D12GraphicsCommandList, void (*)(ID3D12GraphicsCommandList*)> tag_list(
       nullptr, [](ID3D12GraphicsCommandList* list) { if (list != nullptr) list->Release(); });
   std::optional<native_tag_source::Scope> tag_source;
+  native_tag_source::PremiseHooks premise_hooks;
   const bool has_hudless_tag = tags != nullptr && std::any_of(tags, tags + num_tags,
       [](const sl::ResourceTag& tag) { return tag.type == sl::kBufferTypeHUDLessColor; });
   const bool has_direct_hudless = tags != nullptr && std::any_of(tags, tags + num_tags,
@@ -22504,13 +22529,14 @@ inline sl::Result HookedStreamlineSetTagForFrame(
       RuntimeLock lock(runtime_mutex);
       if (tag_list != nullptr) {
         hooks_ready = InstallCommandListStateHooks(tag_list.get()) && InstallMixedPresentCopyHooks(tag_list.get());
+        premise_hooks = InstallNativePremiseBarrierHooks(tag_list.get());
       }
       native_tag_source::NoteGate(has_direct_hudless ? "direct_tag_no_copy_required"
           : tag_list == nullptr ? "tag_list_unavailable"
           : hooks_ready ? "tag_hooks_ready" : "tag_hooks_unavailable", tag_list.get(), hooks_ready);
     }
     if (has_direct_hudless || hooks_ready) {
-      tag_source.emplace(tag_list.get(), static_cast<uint32_t>(frame), static_cast<uint32_t>(viewport), tags, num_tags);
+      tag_source.emplace(tag_list.get(), static_cast<uint32_t>(frame), static_cast<uint32_t>(viewport), tags, num_tags, premise_hooks);
     }
   }
   const auto result = real_streamline_set_tag_for_frame(frame, viewport, tags, num_tags, command_buffer);
@@ -22837,6 +22863,12 @@ inline void OnDestroyCommandListEvent(reshade::api::command_list* cmd_list) {
       static_cast<uintptr_t>(cmd_list->get_native()));
   if (native == nullptr) return;
   submission::OnCommandListDestroyed(native);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (NativePremiseEnabled()) {
+    native_tag_source::ObservePremiseEvent({.kind = native_tag_source::PremiseKind::RESET,
+        .list = reinterpret_cast<uintptr_t>(native)});
+  }
+#endif
   // NOT a teardown service point, although the destroy may be what closes
   // the recording a pending teardown waits for.  ReShade's list proxy holds
   // no reference to its device proxy (d3d12_command_list.cpp:16-24; the
@@ -22848,6 +22880,14 @@ inline void OnDestroyCommandListEvent(reshade::api::command_list* cmd_list) {
   // that outlives the game's last queue is released there instead (see
   // TeardownMayRelease).
 }
+
+#if defined(NR_NEXUS_DEV_CONTROL)
+inline void OnPremiseResourceDestroyed(reshade::api::device* device, reshade::api::resource resource) {
+  if (device != nullptr && device->get_api() == reshade::api::device_api::d3d12) {
+    native_tag_source::ForgetPremiseResource(resource.handle);
+  }
+}
+#endif
 
 // A destroyed queue leaves the lease tracker (gpu_lease.hpp,
 // ForgetQueueCompletion); ReShade raises this before the final Release.
@@ -33885,6 +33925,9 @@ inline void Use(DWORD reason, HMODULE module, LPVOID reserved) {
           internal::OnDestroyEffectRuntime);
       reshade::register_event<reshade::addon_event::destroy_command_list>(
           internal::OnDestroyCommandListEvent);
+#if defined(NR_NEXUS_DEV_CONTROL)
+      reshade::register_event<reshade::addon_event::destroy_resource>(internal::OnPremiseResourceDestroyed);
+#endif
       reshade::register_event<reshade::addon_event::destroy_command_queue>(
           internal::OnDestroyCommandQueueEvent);
       reshade::register_overlay(internal::kOverlayTitle, internal::OnOverlay);
@@ -33937,6 +33980,9 @@ inline void Use(DWORD reason, HMODULE module, LPVOID reserved) {
       internal::vk::UnregisterStateEvents();
       reshade::unregister_event<reshade::addon_event::destroy_command_list>(
           internal::OnDestroyCommandListEvent);
+#if defined(NR_NEXUS_DEV_CONTROL)
+      reshade::unregister_event<reshade::addon_event::destroy_resource>(internal::OnPremiseResourceDestroyed);
+#endif
       reshade::unregister_event<reshade::addon_event::destroy_command_queue>(
           internal::OnDestroyCommandQueueEvent);
       reshade::unregister_overlay(internal::kOverlayTitle, internal::OnOverlay);

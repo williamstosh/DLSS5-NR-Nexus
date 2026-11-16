@@ -16,6 +16,7 @@ namespace native_fg_frame_cases {
 namespace options = renodx::addons::dlss5::fg::native_options;
 namespace source = options::frame_source;
 namespace runtime = renodx::addons::dlss5::internal;
+namespace submission = renodx::addons::dlss5::submission;
 
 struct FakeFrameToken : sl::FrameToken {
   uint32_t value;
@@ -37,6 +38,34 @@ static uint32_t blocked_frame = 0;
 static thread_local bool reentering = false;
 static std::function<sl::Result(sl::Feature, const sl::FrameToken&, const sl::BaseStructure**,
     uint32_t, sl::CommandBuffer*)> evaluate_handler;
+static uint64_t premise_identity = 0;
+static uint32_t premise_reads = 0, premise_writes = 0, premise_forwards = 0;
+static uintptr_t premise_forward_list = 0;
+static uint32_t premise_forward_count = 0;
+static const void* premise_forward_array = nullptr;
+inline HRESULT STDMETHODCALLTYPE MockPremiseGetData(ID3D12CommandList*, REFGUID, UINT* size, void* data) {
+  ++premise_reads;
+  if (premise_identity == 0) return E_FAIL;
+  if (size == nullptr || data == nullptr || *size != sizeof(premise_identity)) return E_INVALIDARG;
+  std::memcpy(data, &premise_identity, sizeof(premise_identity));
+  return S_OK;
+}
+inline HRESULT STDMETHODCALLTYPE MockPremiseSetData(ID3D12CommandList*, REFGUID, UINT, const void*) {
+  ++premise_writes;
+  return E_FAIL;
+}
+inline void STDMETHODCALLTYPE MockPremiseBarrier(ID3D12GraphicsCommandList* list, UINT count, const D3D12_RESOURCE_BARRIER* barriers) {
+  ++premise_forwards;
+  premise_forward_list = reinterpret_cast<uintptr_t>(list);
+  premise_forward_count = count;
+  premise_forward_array = barriers;
+}
+inline void STDMETHODCALLTYPE MockPremiseEnhanced(ID3D12GraphicsCommandList7* list, UINT32 count, const D3D12_BARRIER_GROUP* groups) {
+  ++premise_forwards;
+  premise_forward_list = reinterpret_cast<uintptr_t>(list);
+  premise_forward_count = count;
+  premise_forward_array = groups;
+}
 
 inline sl::Result MockEvaluate(sl::Feature feature, const sl::FrameToken& frame,
     const sl::BaseStructure** inputs, uint32_t num_inputs, sl::CommandBuffer* command_buffer) {
@@ -447,6 +476,187 @@ inline int Run() {
                   == sl::Result::eErrorInvalidParameter
               && forwarded == calls_before_drain + 1 && source::Snapshot().events.sequence == before_null.events.sequence,
           "a missing real API neither forwards nor invents an evaluate observation");
+    }
+    {
+      namespace probe = runtime::native_tag_source;
+      struct RestorePremise {
+        probe::PremiseSnapshot snapshot;
+        std::array<probe::PremiseEvent, 5> live;
+        std::array<uint64_t, 2> calls;
+        uint64_t sequence = 0, epoch = 0;
+        bool enabled = runtime::enabled.load();
+        bool edit_reuse = runtime::edit_reuse_enabled.load(), fg_experiment = runtime::edit_reuse_fg_experiment.load();
+        bool owns_key = false;
+        decltype(runtime::real_premise_barrier) legacy = runtime::real_premise_barrier;
+        decltype(runtime::real_premise_enhanced) enhanced = runtime::real_premise_enhanced;
+        RestorePremise() {
+          std::unique_lock lock(probe::premise.mutex);
+          snapshot = probe::premise.snapshot;
+          live = probe::premise.live;
+          calls = probe::premise.barrier_calls;
+          sequence = probe::premise.sequence;
+          epoch = probe::premise.epoch;
+        }
+        ~RestorePremise() {
+          {
+            std::unique_lock lock(probe::premise.mutex);
+            probe::premise.snapshot = snapshot;
+            probe::premise.live = live;
+            probe::premise.barrier_calls = calls;
+            probe::premise.sequence = sequence;
+            probe::premise.epoch = epoch;
+          }
+          std::lock_guard lock(submission::tracker_mutex);
+          if (owns_key) {
+            submission::tracked_lists.erase(0xF0000022);
+          }
+          runtime::enabled = enabled;
+          runtime::edit_reuse_enabled = edit_reuse;
+          runtime::edit_reuse_fg_experiment = fg_experiment;
+          runtime::real_premise_barrier = legacy;
+          runtime::real_premise_enhanced = enhanced;
+        }
+      } restore_premise;
+      probe::ResetPremise();
+      std::array<void*, 5> vtable{};
+      vtable[3] = reinterpret_cast<void*>(MockPremiseGetData);
+      vtable[4] = reinterpret_cast<void*>(MockPremiseSetData);
+      struct { void** vtable; } fake_list{vtable.data()};
+      auto* list = reinterpret_cast<ID3D12GraphicsCommandList*>(&fake_list);
+      auto* list7 = reinterpret_cast<ID3D12GraphicsCommandList7*>(&fake_list);
+      auto* resource = reinterpret_cast<ID3D12Resource*>(0x4400);
+      runtime::real_premise_barrier = MockPremiseBarrier;
+      runtime::real_premise_enhanced = MockPremiseEnhanced;
+      runtime::enabled = true;
+      runtime::edit_reuse_enabled = true;
+      runtime::edit_reuse_fg_experiment = false;
+      premise_identity = premise_reads = premise_writes = premise_forwards = 0;
+      D3D12_RESOURCE_BARRIER barrier{.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+          .Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE,
+          .Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+              D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE}};
+      D3D12_TEXTURE_BARRIER texture{.SyncBefore = D3D12_BARRIER_SYNC_COPY, .SyncAfter = D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+          .AccessBefore = D3D12_BARRIER_ACCESS_COPY_DEST, .AccessAfter = D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+          .LayoutBefore = D3D12_BARRIER_LAYOUT_COPY_DEST, .LayoutAfter = D3D12_BARRIER_LAYOUT_SHADER_RESOURCE,
+          .pResource = resource, .Subresources = {2, 3, 4, 5, 6, 7}, .Flags = D3D12_TEXTURE_BARRIER_FLAG_DISCARD};
+      D3D12_BARRIER_GROUP group{.Type = D3D12_BARRIER_TYPE_TEXTURE, .NumBarriers = 1, .pTextureBarriers = &texture};
+      const auto unknown = runtime::InstallNativePremiseBarrierHooks(list);
+      runtime::HookedNativePremiseBarrier(list, 1, &barrier);
+      check(premise_forwards == 1 && premise_forward_list == reinterpret_cast<uintptr_t>(list)
+              && premise_forward_count == 1 && premise_forward_array == &barrier && premise_reads == 0,
+          "the legacy native entry preserves its original face, count and array in one real call");
+      runtime::HookedNativePremiseEnhanced(list7, 1, &group);
+      check(!unknown.legacy && !runtime::premise_hooks_installed && premise_reads == 0 && premise_writes == 0
+              && premise_forwards == 2 && premise_forward_list == reinterpret_cast<uintptr_t>(list7)
+              && premise_forward_count == 1 && premise_forward_array == &group,
+          "OFF installs nothing and both real native entry points forward the original face/array exactly once without metadata queries");
+      runtime::edit_reuse_fg_experiment = true;
+      const auto tracker_size = submission::tracked_lists.size();
+      const auto next_identity = submission::next_list_identity.load();
+      const auto tracked_uses = submission::HasEverTrackedUses();
+      check(probe::ReadPremiseRecording(list).list == 0 && premise_writes == 0
+              && submission::tracked_lists.size() == tracker_size && submission::next_list_identity.load() == next_identity,
+          "a missing private identity remains unknown without SetPrivateData or tracker entry creation");
+      premise_identity = 0xF0000022;
+      check(probe::ReadPremiseRecording(list).generation == 0 && submission::tracked_lists.size() == tracker_size,
+          "a readable identity alone does not manufacture a recording generation");
+      {
+        std::lock_guard lock(submission::tracker_mutex);
+        check(!submission::tracked_lists.contains(premise_identity), "the CPU fixture owns its synthetic tracker key");
+        submission::tracked_lists[premise_identity].current = 7;
+        restore_premise.owns_key = true;
+      }
+      probe::PremiseSnapshot tag{.native = 0x4400, .identity = 0x4410, .viewport = 12, .frame = 0,
+          .declared_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, .list_type = D3D12_COMMAND_LIST_TYPE_DIRECT,
+          .hooks = {.legacy = true, .list7_acquired = true, .enhanced = true},
+          .tag = {.list = reinterpret_cast<uintptr_t>(list), .recording = probe::ReadPremiseRecording(list)}};
+      probe::FreezePremiseTag(tag);
+      probe::ObservePremiseCopy(list, reinterpret_cast<ID3D12Resource*>(0x5500), resource, true);
+      runtime::HookedNativePremiseBarrier(list, 1, &barrier);
+      const auto ticket = probe::FreezePremiseTag(tag);
+      auto frozen = probe::premise.snapshot;
+      check(frozen.before[0].legacy.Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES
+              && frozen.before[0].legacy.Transition.StateBefore == D3D12_RESOURCE_STATE_COPY_DEST
+              && static_cast<uint32_t>(frozen.before[0].legacy.Transition.StateAfter) == tag.declared_state
+              && frozen.before[0].recording.list == premise_identity && frozen.before[0].recording.generation == 7
+              && frozen.before[2].full && frozen.before[2].sequence < frozen.before[0].sequence
+              && frozen.before[0].sequence < ticket,
+          "actual legacy forwarding and an existing strong recording preserve full-write/transition/tag CPU order");
+      barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY;
+      barrier.Transition.Subresource = 3;
+      runtime::HookedNativePremiseBarrier(list, 1, &barrier);
+      runtime::HookedNativePremiseEnhanced(list7, 1, &group);
+      check(probe::premise.snapshot.before[0].legacy.Flags == D3D12_RESOURCE_BARRIER_FLAG_NONE
+              && probe::premise.snapshot.before[1].sequence == 0,
+          "later partial/split/enhanced commands never rewrite the earlier tag-entry snapshot");
+      probe::FreezePremiseTag(tag);
+      frozen = probe::premise.snapshot;
+      check(frozen.before[0].legacy.Flags == D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY
+              && frozen.before[0].legacy.Transition.Subresource == 3
+              && frozen.before[1].enhanced.Subresources.NumPlanes == 7
+              && frozen.before[1].enhanced.LayoutAfter == texture.LayoutAfter
+              && frozen.before[1].enhanced.SyncBefore == texture.SyncBefore
+              && frozen.before[1].enhanced.AccessAfter == texture.AccessAfter && frozen.before[1].enhanced.Flags == texture.Flags,
+          "split/subresource and enhanced layout/sync/access/range/flags remain exact raw evidence without state conversion");
+      probe::FinishPremiseTag(ticket, true);
+      check(!probe::premise.snapshot.returned, "a superseded tag return cannot update a later observation");
+      probe::FinishPremiseTag(probe::premise.snapshot.tag.sequence, false);
+      {
+        std::lock_guard lock(submission::tracker_mutex);
+        auto& tracked = submission::tracked_lists.at(premise_identity);
+        tracked.current = 8;
+        auto& submitted = tracked.generations[7];
+        submitted.status = std::make_shared<submission::RecordingStatus>();
+        submitted.status->submitted.store(true);
+        submitted.submissions.push_back({.pending = false, .value = 9, .list_identity = premise_identity, .recording_generation = 7});
+      }
+      auto* queue = reinterpret_cast<ID3D12CommandQueue*>(0x6600);
+      probe::ObservePremiseSubmit(queue, {{.list = premise_identity, .generation = 7}});
+      check(probe::ReadPremiseRecording(list).generation == 8
+              && probe::premise.snapshot.submitted_after_tag.recording.generation == 7
+              && probe::premise.snapshot.submitted_after_tag.recording.value == 9,
+          "a submit frozen at generation seven stays seven after current advances to eight");
+      const auto submitted_sequence = probe::premise.snapshot.submitted_after_tag.sequence;
+      probe::ObservePremiseSubmit(queue, {{.list = premise_identity, .generation = 8}});
+      check(probe::premise.snapshot.submitted_after_tag.sequence == submitted_sequence,
+          "a different captured recording cannot be reassigned to the tag's earlier generation");
+      std::ostringstream evidence;
+      probe::AppendPremiseObservation(evidence);
+      check(evidence.str().find("gpu_completion=unqueried") != std::string::npos
+              && evidence.str().find("enhanced_state_mapping=none") != std::string::npos
+              && probe::premise.snapshot.submitted_after_tag.sequence > probe::premise.snapshot.tag.sequence
+              && probe::premise.snapshot.returned && !probe::premise.snapshot.success,
+          "actual submit/return observations stay separate from GPU completion and SDK success");
+      probe::ObservePremiseCopy(list, reinterpret_cast<ID3D12Resource*>(0x5500), resource, false);
+      probe::FreezePremiseTag(tag);
+      check(!probe::premise.snapshot.before[2].full, "a Region write remains partial/unknown rather than an asserted full target write");
+      barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+      barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+      barrier.Aliasing = {resource, nullptr};
+      runtime::HookedNativePremiseBarrier(list, 1, &barrier);
+      probe::FreezePremiseTag(tag);
+      check(probe::premise.snapshot.before[0].legacy.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING
+              && probe::premise.snapshot.before[0].legacy.Aliasing.pResourceBefore == resource
+              && probe::premise.snapshot.before[0].legacy.Aliasing.pResourceAfter == nullptr,
+          "an alias boundary remains an alias event and cannot masquerade as a transition state");
+      probe::ObservePremiseEvent({.kind = probe::PremiseKind::RESET, .list = tag.tag.list, .full = true});
+      probe::FreezePremiseTag(tag);
+      check(probe::premise.snapshot.before[0].sequence == 0 && probe::premise.snapshot.before[1].sequence == 0
+              && probe::premise.snapshot.before[2].sequence == 0 && probe::premise.snapshot.before[3].sequence != 0,
+          "Reset removes earlier recording facts instead of carrying state into a new recording");
+      const auto epoch = probe::premise.snapshot.epoch;
+      tag.native = 0x7700;
+      probe::FreezePremiseTag(tag);
+      check(probe::premise.snapshot.epoch > epoch && probe::premise.snapshot.before[3].sequence == 0,
+          "a changed resource starts an independent observation epoch");
+      probe::ObservePremiseEvent({.kind = probe::PremiseKind::LEGACY, .source = 0x4400, .legacy = barrier});
+      probe::FreezePremiseTag(tag);
+      check(probe::premise.snapshot.before[0].sequence == 0,
+          "a delayed event for the previous resource cannot contaminate the new observation");
+      probe::ForgetPremiseResource(tag.native);
+      check(probe::PremiseNative() == 0 && premise_writes == 0 && submission::HasEverTrackedUses() == tracked_uses
+              && submission::next_list_identity.load() == next_identity,
+          "resource destruction clears borrowed facts and all observations leave production identity/use authority untouched");
     }
     {
       Events events;

@@ -8,6 +8,250 @@
 // Composed inside dlss5::internal, after the Present retirement primitives.
 namespace native_tag_source {
 
+struct PremiseRecording {
+  uint64_t list = 0, generation = 0;
+  uint32_t receipts = 0;
+  bool submitted = false, pending = true;
+  uintptr_t fence = 0;
+  uint64_t value = 0;
+};
+// Never creates a tracker entry, private identity, use, or completion signal.
+inline PremiseRecording ReadPremiseRecording(uint64_t identity, uint64_t generation_id) {
+  std::lock_guard lock(submission::tracker_mutex);
+  const auto entry = submission::tracked_lists.find(identity);
+  if (entry == submission::tracked_lists.end()) return {.list = identity, .generation = generation_id};
+  PremiseRecording result{.list = identity, .generation = (generation_id != 0 ? generation_id : entry->second.current)};
+  const auto generation = entry->second.generations.find(result.generation);
+  if (generation == entry->second.generations.end()) return result;
+  result.receipts = static_cast<uint32_t>(generation->second.submissions.size());
+  result.submitted = generation->second.status != nullptr && generation->second.status->submitted.load();
+  if (result.receipts == 1) {
+    const auto& receipt = generation->second.submissions.front();
+    result.pending = receipt.pending;
+    result.fence = reinterpret_cast<uintptr_t>(receipt.fence.fence);
+    result.value = receipt.value;
+  }
+  return result;
+}
+inline PremiseRecording ReadPremiseRecording(ID3D12CommandList* list) {
+  if (list == nullptr) return {};
+  const auto identity = submission::ListIdentity(list, false);
+  return ((identity >> 63) != 0 ? PremiseRecording{} : ReadPremiseRecording(identity, 0));
+}
+enum class PremiseKind : uint32_t { TAG, LEGACY, ENHANCED, COPY, RESET, SUBMIT };
+struct PremiseEvent {
+  uint64_t sequence = 0;
+  int64_t qpc = 0;
+  DWORD thread = 0;
+  PremiseKind kind = PremiseKind::TAG;
+  uintptr_t list = 0;
+  PremiseRecording recording;
+  uintptr_t source = 0, destination = 0;
+  bool full = false;
+  D3D12_RESOURCE_BARRIER legacy{};
+  D3D12_TEXTURE_BARRIER enhanced{};
+  uintptr_t queue = 0;
+};
+struct PremiseHooks {
+  bool legacy = false, list7_acquired = false, enhanced = false;
+};
+struct PremiseSnapshot {
+  uint64_t epoch = 0;
+  uintptr_t native = 0, identity = 0;
+  uint32_t viewport = 0, frame = 0, declared_state = UINT32_MAX, list_type = UINT32_MAX;
+  PremiseHooks hooks;
+  std::array<uint64_t, 2> barrier_calls{};
+  PremiseEvent tag;
+  uint64_t return_sequence = 0;
+  bool returned = false, success = false;
+  std::array<PremiseEvent, 5> before{};
+  PremiseEvent submitted_after_tag;
+  const char* boundary = "unbound";
+};
+struct PremiseState {
+  std::shared_mutex mutex;
+  uint64_t sequence = 0, epoch = 0;
+  std::array<uint64_t, 2> barrier_calls{};
+  PremiseSnapshot snapshot;
+  std::array<PremiseEvent, 5> live{};
+};
+static PremiseState premise;
+
+inline uintptr_t PremiseNative() {
+  std::shared_lock lock(premise.mutex);
+  return premise.snapshot.native;
+}
+inline uintptr_t ObservePremiseBarrierCall(PremiseKind kind) {
+  std::unique_lock lock(premise.mutex);
+  if (premise.snapshot.native != 0) {
+    ++premise.barrier_calls[kind == PremiseKind::LEGACY ? 0 : 1];
+  }
+  return premise.snapshot.native;
+}
+inline void ObservePremiseEvent(PremiseEvent event) {
+  event.qpc = fg::native_options::frame_source::Qpc();
+  event.thread = GetCurrentThreadId();
+  std::unique_lock lock(premise.mutex);
+  auto& sample = premise.snapshot;
+  if (sample.native == 0 || event.kind == PremiseKind::TAG) return;
+  if ((event.kind == PremiseKind::LEGACY || event.kind == PremiseKind::ENHANCED) && event.source != sample.native) return;
+  if (event.kind == PremiseKind::COPY && event.destination != sample.native) return;
+  if (event.kind == PremiseKind::SUBMIT && (event.recording.list == 0 || event.recording.generation == 0
+      || event.recording.list != sample.tag.recording.list || event.recording.generation != sample.tag.recording.generation)) return;
+  if ((event.kind == PremiseKind::RESET || event.kind == PremiseKind::SUBMIT) && event.list != sample.tag.list
+      && std::none_of(premise.live.begin(), premise.live.end(), [&](const PremiseEvent& previous) { return previous.list == event.list; })) return;
+  event.sequence = ++premise.sequence;
+  if (event.kind == PremiseKind::RESET) {
+    for (auto& previous : premise.live) {
+      if (previous.list == event.list) {
+        previous = {};
+      }
+    }
+    if (event.list == sample.tag.list) {
+      sample.boundary = (event.full ? "list_reset" : "reset_failed_or_destroyed");
+    }
+  }
+  premise.live[static_cast<size_t>(event.kind) - 1] = event;
+  if (event.kind == PremiseKind::SUBMIT && event.list == sample.tag.list) {
+    sample.submitted_after_tag = event;
+  }
+}
+// Freeze the commands seen before this tag, not the latest commands when a
+// later FG worker samples them. There is one watched resource, no state grant.
+inline uint64_t FreezePremiseTag(PremiseSnapshot sample) {
+  sample.tag.qpc = fg::native_options::frame_source::Qpc();
+  sample.tag.thread = GetCurrentThreadId();
+  {
+    std::unique_lock lock(premise.mutex);
+    if (premise.snapshot.native != sample.native || premise.snapshot.viewport != sample.viewport
+        || premise.snapshot.identity != sample.identity) {
+      premise.live = {};
+      premise.barrier_calls = {};
+      ++premise.epoch;
+      sample.boundary = "resource_or_viewport_changed";
+    } else {
+      sample.boundary = "tag_entry_recording_only";
+    }
+    sample.epoch = premise.epoch;
+    sample.barrier_calls = premise.barrier_calls;
+    sample.before = premise.live;
+    for (auto& event : sample.before) {
+      if (event.qpc > sample.tag.qpc) {
+        event = {};
+      }
+    }
+    sample.tag.sequence = ++premise.sequence;
+    premise.snapshot = sample;
+  }
+  return sample.tag.sequence;
+}
+inline void FinishPremiseTag(uint64_t ticket, bool success) {
+  if (ticket == 0) return;
+  std::unique_lock lock(premise.mutex);
+  if (premise.snapshot.tag.sequence != ticket) return;
+  premise.snapshot.return_sequence = ++premise.sequence;
+  premise.snapshot.returned = true;
+  premise.snapshot.success = success;
+}
+inline void ObservePremiseReset(ID3D12GraphicsCommandList* list, bool success) {
+  if (PremiseNative() == 0) return;
+  renodx::utils::directx::NativeFromReShadeProxy(&list);
+  ObservePremiseEvent({.kind = PremiseKind::RESET, .list = reinterpret_cast<uintptr_t>(list),
+      .recording = ReadPremiseRecording(list), .full = success});
+}
+inline void ObservePremiseCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* source,
+    ID3D12Resource* destination, bool full) {
+  if (!NativePremiseEnabled()) return;
+  const auto watched = PremiseNative();
+  if (watched == 0 || reinterpret_cast<uintptr_t>(destination) != watched) return;
+  ObservePremiseEvent({.kind = PremiseKind::COPY, .list = reinterpret_cast<uintptr_t>(list),
+      .recording = ReadPremiseRecording(list), .source = reinterpret_cast<uintptr_t>(source),
+      .destination = watched, .full = full});
+}
+inline void ObservePremiseSubmit(ID3D12CommandQueue* queue, const std::vector<submission::PendingSubmission>& pending) {
+  PremiseEvent target;
+  {
+    std::shared_lock lock(premise.mutex);
+    target = premise.snapshot.tag;
+  }
+  if (target.recording.list == 0 || target.recording.generation == 0) return;
+  for (const auto& captured : pending) {
+    if (captured.list != target.recording.list || captured.generation != target.recording.generation) continue;
+    ObservePremiseEvent({.kind = PremiseKind::SUBMIT, .list = target.list,
+        .recording = ReadPremiseRecording(captured.list, captured.generation), .queue = reinterpret_cast<uintptr_t>(queue)});
+  }
+}
+inline void ResetPremise() {
+  std::unique_lock lock(premise.mutex);
+  premise.snapshot = {};
+  premise.snapshot.boundary = "source_reset";
+  premise.live = {};
+  premise.barrier_calls = {};
+  ++premise.epoch;
+}
+inline void ForgetPremiseResource(uintptr_t resource) {
+  std::unique_lock lock(premise.mutex);
+  if (resource != premise.snapshot.native && resource != premise.snapshot.identity) return;
+  premise.snapshot = {};
+  premise.snapshot.boundary = "resource_destroyed";
+  premise.live = {};
+  premise.barrier_calls = {};
+  ++premise.epoch;
+}
+
+inline void AppendPremiseObservation(std::ostream& line) {
+  PremiseSnapshot sample;
+  {
+    std::shared_lock lock(premise.mutex);
+    sample = premise.snapshot;
+  }
+  line << " premise=[epoch:" << sample.epoch << ",native:" << sample.native << ",identity:" << sample.identity
+       << ",viewport:" << sample.viewport << ",frame:" << sample.frame << ",declared_state:" << sample.declared_state
+       << ",list_type:" << sample.list_type << ",legacy_hook:" << sample.hooks.legacy
+       << ",list7_acquired:" << sample.hooks.list7_acquired << ",enhanced_hook:" << sample.hooks.enhanced
+       << ",legacy_calls:" << sample.barrier_calls[0] << ",enhanced_calls:" << sample.barrier_calls[1]
+       << ",boundary:" << sample.boundary << ",return_seq:" << sample.return_sequence
+       << ",returned:" << sample.returned << ",ok:" << sample.success << ']';
+  const auto append = [&](const char* name, const PremiseEvent& event) {
+    line << ' ' << name << "=[seq:" << event.sequence << ",qpc:" << event.qpc << ",thread:" << event.thread
+         << ",list:" << event.list << ",recording:" << event.recording.list << '/' << event.recording.generation
+         << ",receipts:" << event.recording.receipts << ",submitted:" << event.recording.submitted
+         << ",pending:" << event.recording.pending << ",fence:" << event.recording.fence << ",value:" << event.recording.value;
+    if (event.kind == PremiseKind::LEGACY) {
+      line << ",type:" << event.legacy.Type << ",flags:" << event.legacy.Flags;
+      if (event.legacy.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
+        line << ",subresource:" << event.legacy.Transition.Subresource << ",before:" << event.legacy.Transition.StateBefore
+             << ",after:" << event.legacy.Transition.StateAfter;
+      } else if (event.legacy.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
+        line << ",alias_before:" << reinterpret_cast<uintptr_t>(event.legacy.Aliasing.pResourceBefore)
+             << ",alias_after:" << reinterpret_cast<uintptr_t>(event.legacy.Aliasing.pResourceAfter);
+      } else {
+        line << ",uav_resource:" << reinterpret_cast<uintptr_t>(event.legacy.UAV.pResource);
+      }
+    } else if (event.kind == PremiseKind::ENHANCED) {
+      const auto& barrier = event.enhanced;
+      const auto& range = barrier.Subresources;
+      line << ",sync_before:" << barrier.SyncBefore << ",sync_after:" << barrier.SyncAfter
+           << ",access_before:" << barrier.AccessBefore << ",access_after:" << barrier.AccessAfter
+           << ",layout_before:" << barrier.LayoutBefore << ",layout_after:" << barrier.LayoutAfter
+           << ",flags:" << barrier.Flags << ",range:" << range.IndexOrFirstMipLevel << '/' << range.NumMipLevels
+           << '/' << range.FirstArraySlice << '/' << range.NumArraySlices << '/' << range.FirstPlane << '/' << range.NumPlanes;
+    } else {
+      line << ",source:" << event.source << ",destination:" << event.destination << ",full:" << event.full << ",queue:" << event.queue;
+    }
+    line << ']';
+  };
+  append("premise_tag", sample.tag);
+  for (size_t index = 0; index < sample.before.size(); ++index) {
+    if (sample.before[index].sequence != 0) {
+      append(("premise_before" + std::to_string(index)).c_str(), sample.before[index]);
+    }
+  }
+  append("premise_submit_after_tag", sample.submitted_after_tag);
+  line << " premise_evidence=recorded_api_order_only gpu_completion=unqueried enhanced_state_mapping=none"
+       << " region_full_write=unknown";
+}
+
 struct Version {
   uint32_t frame = 0;
   uint32_t viewport = 0;
@@ -172,9 +416,10 @@ struct Scope {
   bool finished = false;
   bool has_hudless = false;
   bool direct_lifecycle = false;
+  uint64_t premise_ticket = 0;
 
   Scope(ID3D12GraphicsCommandList* list, uint32_t frame, uint32_t viewport,
-      const sl::ResourceTag* tags, uint32_t count) {
+      const sl::ResourceTag* tags, uint32_t count, PremiseHooks premise_hooks = {}) {
     std::optional<RuntimeLock> lock;
     if (!HoldingRuntimeLock()) {
       lock.emplace(runtime_mutex);
@@ -261,6 +506,14 @@ struct Scope {
       observation.scope_reason = "source_shape_or_extent_ineligible";
       return;
     }
+    if (NativePremiseEnabled()) {
+      auto* native = source.resource;
+      renodx::utils::directx::NativeFromReShadeProxy(&native);
+      premise_ticket = FreezePremiseTag({.native = reinterpret_cast<uintptr_t>(native),
+          .identity = reinterpret_cast<uintptr_t>(source_identity), .viewport = viewport, .frame = frame,
+          .declared_state = source.state, .list_type = (list != nullptr ? static_cast<uint32_t>(list->GetType()) : UINT32_MAX),
+          .hooks = premise_hooks, .tag = {.list = reinterpret_cast<uintptr_t>(list), .recording = ReadPremiseRecording(list)}});
+    }
     std::pair<uint64_t, uint64_t> recording{};
     if (!direct) {
       recording = submission::RecordingIdentity(list);
@@ -335,6 +588,7 @@ struct Scope {
 
   void Finish(bool success) {
     if (finished) return;
+    FinishPremiseTag(premise_ticket, success);
     std::optional<RuntimeLock> lock;
     if (!HoldingRuntimeLock()) {
       lock.emplace(runtime_mutex);
@@ -626,6 +880,7 @@ inline bool ClaimFrame(const fg::native_options::frame_source::Frame& frame,
 // Caller holds runtime_mutex; an in-flight Scope can no longer publish after
 // its version is erased. Serial identities are never recycled by Reset.
 inline void Reset() {
+  ResetPremise();
   ++state.observation.reset_count;
   for (auto& version : state.versions) {
     NoteRemoval(version, "reset");

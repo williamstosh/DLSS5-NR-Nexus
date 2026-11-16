@@ -2872,12 +2872,122 @@ struct MixedCopyForwardScope {
   ~MixedCopyForwardScope() { --mixed_copy_forward_depth; }
 };
 
+#if defined(NR_NEXUS_DEV_CONTROL)
+using NativePremiseBarrierFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
+using NativePremiseEnhancedFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList7*, UINT32, const D3D12_BARRIER_GROUP*);
+inline NativePremiseBarrierFn real_premise_barrier = nullptr;
+inline NativePremiseEnhancedFn real_premise_enhanced = nullptr;
+inline std::shared_mutex premise_hook_mutex;
+inline bool premise_hooks_installed = false;
+inline void* premise_barrier_target = nullptr;
+inline void* premise_enhanced_target = nullptr;
+
+inline void STDMETHODCALLTYPE HookedNativePremiseBarrier(ID3D12GraphicsCommandList* list,
+    UINT count, const D3D12_RESOURCE_BARRIER* barriers) {
+  CallbackScope callback;
+  real_premise_barrier(list, count, barriers);
+  if (!callback || !NativePremiseEnabled()) return;
+  GuardHook([&] {
+    const auto watched = native_tag_source::ObservePremiseBarrierCall(native_tag_source::PremiseKind::LEGACY);
+    if (watched == 0 || barriers == nullptr) return;
+    std::optional<native_tag_source::PremiseRecording> recording;
+    for (UINT index = 0; index < count; ++index) {
+      const auto& barrier = barriers[index];
+      const auto pointer = [](auto* resource) { return reinterpret_cast<uintptr_t>(resource); };
+      const bool matches = (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && pointer(barrier.Transition.pResource) == watched)
+          || (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV && (barrier.UAV.pResource == nullptr || pointer(barrier.UAV.pResource) == watched))
+          || (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING
+              && (barrier.Aliasing.pResourceBefore == nullptr || barrier.Aliasing.pResourceAfter == nullptr
+                  || pointer(barrier.Aliasing.pResourceBefore) == watched || pointer(barrier.Aliasing.pResourceAfter) == watched));
+      if (!matches) continue;
+      if (!recording) {
+        recording = native_tag_source::ReadPremiseRecording(list);
+      }
+      native_tag_source::ObservePremiseEvent({.kind = native_tag_source::PremiseKind::LEGACY,
+          .list = reinterpret_cast<uintptr_t>(list), .recording = *recording, .source = watched, .legacy = barrier});
+    }
+  });
+}
+inline void STDMETHODCALLTYPE HookedNativePremiseEnhanced(ID3D12GraphicsCommandList7* list,
+    UINT32 count, const D3D12_BARRIER_GROUP* groups) {
+  CallbackScope callback;
+  real_premise_enhanced(list, count, groups);
+  if (!callback || !NativePremiseEnabled()) return;
+  GuardHook([&] {
+    const auto watched = native_tag_source::ObservePremiseBarrierCall(native_tag_source::PremiseKind::ENHANCED);
+    if (watched == 0 || groups == nullptr) return;
+    std::optional<native_tag_source::PremiseRecording> recording;
+    for (UINT32 group = 0; group < count; ++group) {
+      if (groups[group].Type != D3D12_BARRIER_TYPE_TEXTURE) continue;
+      for (UINT32 index = 0; index < groups[group].NumBarriers; ++index) {
+        const auto& barrier = groups[group].pTextureBarriers[index];
+        if (reinterpret_cast<uintptr_t>(barrier.pResource) != watched) continue;
+        if (!recording) {
+          recording = native_tag_source::ReadPremiseRecording(list);
+        }
+        native_tag_source::ObservePremiseEvent({.kind = native_tag_source::PremiseKind::ENHANCED,
+            .list = reinterpret_cast<uintptr_t>(list), .recording = *recording, .source = watched, .enhanced = barrier});
+      }
+    }
+  });
+}
+inline native_tag_source::PremiseHooks InstallNativePremiseBarrierHooks(ID3D12GraphicsCommandList* list) {
+  if (!NativePremiseEnabled() || list == nullptr) return {};
+  // Independent from the compute-hook latch: a failed detach must never
+  // leave a native entry point targeting an unmapped observer module.
+  if (!fg::PinRuntimeCallback()) return {};
+  auto* legacy = (*reinterpret_cast<void***>(list))[kCmdSlotResourceBarrier];
+  Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList7> enhanced_list;
+  list->QueryInterface(IID_PPV_ARGS(&enhanced_list));
+  auto* enhanced = (enhanced_list != nullptr ? (*reinterpret_cast<void***>(enhanced_list.Get()))[kCmdSlot7Barrier] : nullptr);
+  std::lock_guard lock(premise_hook_mutex);
+  if (!premise_hooks_installed) {
+    real_premise_barrier = reinterpret_cast<NativePremiseBarrierFn>(legacy);
+    real_premise_enhanced = reinterpret_cast<NativePremiseEnhancedFn>(enhanced);
+    std::lock_guard transaction(renodx::utils::vtable::TransactionMutex());
+    if (!renodx::utils::vtable::BeginTransaction()) return {};
+    DetourUpdateThread(GetCurrentThread());
+    if (DetourAttach(reinterpret_cast<PVOID*>(&real_premise_barrier), HookedNativePremiseBarrier) != NO_ERROR
+        || (enhanced != nullptr && DetourAttach(reinterpret_cast<PVOID*>(&real_premise_enhanced), HookedNativePremiseEnhanced) != NO_ERROR)
+        || DetourTransactionCommit() != NO_ERROR) {
+      DetourTransactionAbort();
+      return {};
+    }
+    premise_barrier_target = legacy;
+    premise_enhanced_target = enhanced;
+    premise_hooks_installed = true;
+    native_premise_reset.store(native_tag_source::ObservePremiseReset);
+    native_premise_submit.store(native_tag_source::ObservePremiseSubmit);
+  }
+  return {.legacy = legacy == premise_barrier_target, .list7_acquired = enhanced != nullptr,
+      .enhanced = enhanced != nullptr && enhanced == premise_enhanced_target};
+}
+inline void UnhookNativePremiseBarriers() {
+  std::lock_guard lock(premise_hook_mutex);
+  if (!premise_hooks_installed) return;
+  std::lock_guard transaction(renodx::utils::vtable::TransactionMutex());
+  if (!renodx::utils::vtable::BeginTransaction()) return;
+  DetourUpdateThread(GetCurrentThread());
+  if (DetourDetach(reinterpret_cast<PVOID*>(&real_premise_barrier), HookedNativePremiseBarrier) != NO_ERROR
+      || (premise_enhanced_target != nullptr && DetourDetach(reinterpret_cast<PVOID*>(&real_premise_enhanced), HookedNativePremiseEnhanced) != NO_ERROR)
+      || DetourTransactionCommit() != NO_ERROR) {
+    DetourTransactionAbort();
+    return;
+  }
+  premise_hooks_installed = false;
+  native_premise_reset.store(nullptr);
+  native_premise_submit.store(nullptr);
+  native_tag_source::ResetPremise();
+}
+#endif
+
 inline void STDMETHODCALLTYPE HookedMixedCopyResource(ID3D12GraphicsCommandList* list,
     ID3D12Resource* destination, ID3D12Resource* source) {
   const MixedCopyForwardScope copy_scope;
   real_mixed_copy_resource(list, destination, source);
   if (!copy_scope.outermost) return;
 #if defined(NR_NEXUS_DEV_CONTROL)
+  GuardHook([&] { native_tag_source::ObservePremiseCopy(list, source, destination, true); });
   GuardHook([&] { native_tag_source::ObserveCopy(list, source, destination, true); });
 #endif
   GuardHook([&] { ObserveMixedPresentCopy(list, source, destination); });
@@ -2893,6 +3003,7 @@ inline void STDMETHODCALLTYPE HookedMixedCopyRegion(ID3D12GraphicsCommandList* l
       && source->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && source->SubresourceIndex == 0
       && destination->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && destination->SubresourceIndex == 0;
 #if defined(NR_NEXUS_DEV_CONTROL)
+  GuardHook([&] { native_tag_source::ObservePremiseCopy(list, source->pResource, destination->pResource, false); });
   GuardHook([&] { native_tag_source::ObserveCopy(list, source->pResource, destination->pResource, full); });
 #endif
   GuardHook([&] { ObserveMixedPresentCopy(list, source->pResource, destination->pResource, full); });
@@ -2916,6 +3027,9 @@ inline bool InstallMixedPresentCopyHooks(ID3D12GraphicsCommandList* list) {
   return mixed_copy_hooks_installed;
 }
 inline void UnhookMixedPresentCopyHooks() {
+#if defined(NR_NEXUS_DEV_CONTROL)
+  UnhookNativePremiseBarriers();
+#endif
   std::lock_guard lock(mixed_copy_hook_mutex);
   if (!mixed_copy_hooks_installed) return;
   std::lock_guard transaction(renodx::utils::vtable::TransactionMutex());

@@ -1831,6 +1831,7 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
       }
       line << " evaluate_evidence=cpu_api_arguments_and_nesting_only"
            << " ngx_observation_scope=classified_d3d12_forward_paths";
+      native_tag_source::AppendPremiseObservation(line);
       line << " log_budget=" << ++observations << "/32";
       LogPresent(reshade::log::level::info, line.str());
     }
