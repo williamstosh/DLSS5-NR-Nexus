@@ -37,13 +37,13 @@ HostRoot、ShaderIncludeDirectory、Fxc、EmbedFile 参数可显式指定已有�
 ./tools/run-release-preflight.ps1 -Mode Software -OutputDirectory tmp/release-preflight/software
 ~~~
 
-软件入口先原样执行 `Suite all -SoftwareOnly`（包括默认五组 FG），再复用编译产物执行
-18 个独立 FG 阶段、分辨率、生命周期、pre-FG 及隔帧复用入口和 4 个 Bridge 分辨率入口。
+软件入口先执行 `Suite all -SoftwareOnly`。默认 `fg-native` 包含 `present-guide-models`，覆盖 XeFG
+接管时的持续提交和回切时的设备接口选择，预检复用该结果。其余独立 FG 和 Bridge 用例复用编译产物运行。
 `result.json` 逐项记录 Passed、Failed 或 NotRun；Vulkan 在软件模式只编译，执行记为 NotRun。
 这些是 CPU／WARP 与模型替身证据，包含有限的隐藏窗口夹具，不提供游戏或动态视觉验收。
 
 已有完整 `all` 结果可通过 `-ReuseAllOutputDirectory` 复用，入口校验每项实际编译输入；
-仅 FG 夹具有修正时可加 `-RefreshFg` 重编并重跑默认五组，其他结果仍须通过输入校验。
+仅 FG 夹具有修正时可加 `-RefreshFg` 重编并重跑默认 FG 组，其他结果仍须通过输入校验。
 显式 `run-tests -NativeCase` 会替换默认 FG 组，因此不能用单个专项结果充当默认组已通过。
 
 原生检查使用独立的本地分支，需先取得空闲设备窗口：`-Mode NativeGpu` 运行现有
@@ -710,7 +710,7 @@ Feature18 Create／Evaluate 并发安全；结束后恢复环境变量。
 
 ## 自动回归与证据保存
 
-GitHub 分支 CI 使用 [`ci-core.ps1`](../ci-core.ps1)：保留核心 CPU／配置／生命周期检查、FG 的五个默认组，以及复用同一 EXE、在独立进程执行的 pre-FG 异尺寸与复制链回归。完整本地发布初审继续使用 `run-release-preflight.ps1`，不因远端精简删减。远端产物为 `core-regression-<attempt>`（检查结果与失败日志）和 `windows-x64-<attempt>`（安装包及 SHA-256）。
+GitHub 分支 CI 使用 [`ci-core.ps1`](../ci-core.ps1)：保留核心 CPU／配置／生命周期检查、默认 FG 组，以及复用同一 EXE、在独立进程执行的 pre-FG 异尺寸与复制链回归。完整本地发布初审继续使用 `run-release-preflight.ps1`，不因远端精简删减。远端产物为 `core-regression-<attempt>`（检查结果与失败日志）和 `windows-x64-<attempt>`（安装包及 SHA-256）。
 
 `main` 的 [`ci-evidence.ps1`](../ci-evidence.ps1) 仅复用完整 Git 根 tree 相同的成功核心记录，依赖锁、工具锁和 workflow 均包含在 tree 中；找不到或状态不符则执行核心验证。Tag 必须先取得同身份成功核心证据，再重新构建 Publishing 并通过 [`check-publishing.ps1`](../check-publishing.ps1) 核对 DEV-OFF 编译命令、诊断标记、版本、包白名单与哈希，不重跑完整测试。原始 run／源码／tree 及复用来源显示在 Actions summary。
 

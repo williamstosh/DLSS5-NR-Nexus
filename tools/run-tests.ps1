@@ -323,6 +323,7 @@ foreach ($item in $Suite) {
                 Invoke-TestProcess $exe $directory 'control-mask' @('--control-mask')
                 Invoke-TestProcess $exe $directory 'adaptive-fg-service' @('--adaptive-fg-service')
                 Invoke-TestProcess $exe $directory 'adaptive-inline' @('--adaptive-inline')
+                Invoke-TestProcess $exe $directory 'present-guide-models' @('--present-guide-models')
             }
         }
         if ($item -eq 'vulkan-control-mask' -and $VulkanNativeNgx) {
