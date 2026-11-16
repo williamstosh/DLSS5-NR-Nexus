@@ -80,6 +80,8 @@ DEV 两档 x2 另可接纳与当前 D3D12 源、真实来源链与 XeFG proxy �
 `returned_device_request` 为 11、12 或 0，说明被探测对象来自哪个 getter，0 表示未取得对象；GetDevice11 失败或为空时才改用 GetDevice12 返回对象。
 未解包的规范 IUnknown 身份用于核对返回对象与接口是否一致，已知 ReShade 解包后的身份用于既有来源匹配；两种身份不能混用。未知与双接口对象不能自动取得 D3D12 准入。
 `state.edit_reuse.xefg_device_observation` 在实验启用时独立报告唯一 SDK context 的设备诊断，即使尚无 SR 来源；它不提供 Off 或来源关联凭据，多 context 时沿用歧义状态。
+DEV 的 `state.edit_reuse.xefg_off_events` 在同一实验启用时返回最多 32 条有序事件，以及 `last_sequence`、`overwritten`；关闭实验时为 null。记录仅覆盖 SetEnabled 调用边界和有效来源关联的建立／撤销，不逐帧追加。`declaration` 配对调用，`observed_ns` 是记录提交时间，END 的 `sdk_return_ns` 是 SDK 返回后相邻语句取得的单调时钟采样点，用于区分该采样点前后以及凭据提交后的撤销。BEGIN 的代次／来源交换链是调用准备时快照，END 的代次是提交后状态，两者的 `source` 均保留调用前来源观察；采样点与实际函数返回间的极窄时间差不作函数体内归因。
+撤销事件保留被撤销来源身份，`link_generation` 为撤销后的代次；`source_entry` 给出触发 Present 的线程、方法、参数、SDK 嵌套深度和调用地址，非 Present 触发时显式为未观察。地址须结合本次进程模块范围离线解释。环形记录是只读诊断，溢出由计数说明，不参与 Off 准入或恢复旧凭据。
 D3D12 可观察来源调用 proxy 或 proxy 调用唯一登记来源；内外调用都成功后才能建立关联，同设备及 proxy 自身不能替代嵌套证据。
 共享方法钩子命中的未登记外层不充当来源，实际登记来源及 SDK proxy 仍须完整匹配。
 SDK FPS 必须来自同一个 context 且当前观测为 Off。重建或重新关联会清掉旧编辑与成对测量。

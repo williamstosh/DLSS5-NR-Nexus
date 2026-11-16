@@ -226,6 +226,10 @@ uint32_t receipt_candidates = 1;
 uint32_t receipt_device12_matches = 1;
 int32_t receipt_sdk_status = 0;
 void (*receipt_during_sdk)() = nullptr;
+#if defined(NR_NEXUS_DEV_CONTROL)
+void (*receipt_after_sdk_observer)() = nullptr;
+bool receipt_after_sdk_observer_pending = false;
+#endif
 IUnknown* receipt_proxy = nullptr;  // Borrowed only across the mock SDK callback.
 IUnknown* receipt_secondary_proxy = nullptr;
 IDXGISwapChain* receipt_inner_source = nullptr;
@@ -245,6 +249,12 @@ xefg::BridgeSourceObservation ObserveReceiptSource(uintptr_t device11) noexcept 
   return observation;
 }
 xefg::BridgeSourceObservation ObserveReceiptD3D12Source(uintptr_t device12) noexcept {
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (receipt_after_sdk_observer_pending && receipt_after_sdk_observer != nullptr) {
+    receipt_after_sdk_observer_pending = false;
+    receipt_after_sdk_observer();
+  }
+#endif
   xefg::BridgeSourceObservation observation{.state = xefg::BridgeSnapshotState::RUNTIME_BUSY,
       .queried_device12 = device12};
   if (!receipt_source_available) return observation;
@@ -268,7 +278,13 @@ int32_t ReceiptSdkCall() {
   }
   return receipt_sdk_status;
 }
-int32_t FakeReceiptEnable(void*, uint32_t) { return ReceiptSdkCall(); }
+int32_t FakeReceiptEnable(void*, uint32_t) {
+  const auto status = ReceiptSdkCall();
+#if defined(NR_NEXUS_DEV_CONTROL)
+  receipt_after_sdk_observer_pending = receipt_after_sdk_observer != nullptr;
+#endif
+  return status;
+}
 int32_t FakeReceiptInit(void*, ID3D12CommandQueue*, const xefg::abi::Init*) { return ReceiptSdkCall(); }
 int32_t FakeReceiptInitDesc(void*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*,
     ID3D12CommandQueue*, IDXGIFactory2*, const xefg::abi::Init*) { return ReceiptSdkCall(); }
@@ -1172,7 +1188,22 @@ int main(int argc, char** argv) {
               worker.join();
               Check(status == S_OK, "a non-nested worker source Present preserves its original success status");
             };
+#if defined(NR_NEXUS_DEV_CONTROL)
+            const auto events_after = [](uint64_t sequence) {
+              const auto snapshot = xefg::CopyBridgeEvents();
+              std::vector<xefg::BridgeEvent> events;
+              for (uint32_t index = 0; index < snapshot.count; ++index) {
+                if (snapshot.events[index].sequence > sequence) {
+                  events.push_back(snapshot.events[index]);
+                }
+              }
+              return events;
+            };
+#endif
             for (const bool during_disable : {true, false}) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+              const auto trace_start = xefg::CopyBridgeEvents().last_sequence;
+#endif
               const auto before_on = xefg::QueryBridgeOff(receipt_source);
               const auto initial_epoch = context->epoch;
               Check(before_on.available && Hooks::Enable(context_handle, 1) == 0
@@ -1216,10 +1247,119 @@ int main(int argc, char** argv) {
               Check(Hooks::Enable(context_handle, 0) == 0 && xefg::QueryBridgeOff(receipt_source).available
                         && context->epoch == off_epoch && context->bridge_link_generation == remapped.source_link_generation,
                   "a fresh public Disable after stable mapping grants its own receipt without another epoch or link change");
+#if defined(NR_NEXUS_DEV_CONTROL)
+              const auto events = events_after(trace_start);
+              Check(events.size() == 8 && events[0].kind == xefg::BridgeEventKind::ENABLE_BEGIN
+                        && events[1].kind == xefg::BridgeEventKind::ENABLE_END
+                        && events[2].kind == xefg::BridgeEventKind::ENABLE_BEGIN,
+                  "DEV events record only SDK boundaries and actual link changes, not repeated stable Presents");
+              const auto& disable_begin = events[2];
+              const auto& disable_end = events[during_disable ? 4 : 3];
+              const auto& revoke = events[during_disable ? 3 : 4];
+              const auto& observed = events[5];
+              Check(disable_end.kind == xefg::BridgeEventKind::ENABLE_END
+                        && revoke.kind == xefg::BridgeEventKind::LINK_REVOKED
+                        && disable_begin.declaration == disable_end.declaration
+                        && disable_begin.enabled_request == 0 && disable_end.enabled_request == 0
+                        && disable_end.sdk_status == 0 && disable_end.off_observed == !during_disable
+                        && disable_begin.observed_ns <= disable_end.sdk_return_ns
+                        && disable_end.sdk_return_ns <= disable_end.observed_ns,
+                  "DEV Disable events bind the real SDK return and later receipt result to one declaration");
+              Check(during_disable ? revoke.observed_ns <= disable_end.sdk_return_ns
+                                   : revoke.observed_ns >= disable_end.observed_ns,
+                  "DEV timestamps preserve callback revocation before the return sample and later revocation after receipt commit");
+              Check(revoke.source == before_on.source && revoke.source_swapchain == before_on.source_swapchain
+                        && revoke.source_swapchain_generation == before_on.source_swapchain_generation
+                        && revoke.link_generation == revoked.source_link_generation && !revoke.off_observed
+                        && revoke.context_identity == before_on.context_identity
+                        && std::strcmp(revoke.reason, "nested_proxy_unobserved") == 0
+                        && revoke.source_entry.method == xefg::BridgePresentMethod::PRESENT
+                        && revoke.source_entry.return_address != 0 && revoke.source_entry.thread_id == revoke.thread_id
+                        && revoke.source_entry.thread_id != GetCurrentThreadId()
+                        && revoke.source_entry.proxy_entry_depth == 0
+                        && revoke.source_entry.interval == 0 && revoke.source_entry.flags == 0,
+                  "DEV revocation preserves the old identity, new generation, and actual non-nested worker entry");
+              Check(observed.kind == xefg::BridgeEventKind::LINK_OBSERVED
+                        && observed.source == before_on.source && observed.link_generation == remapped.source_link_generation
+                        && observed.source_entry.thread_id == GetCurrentThreadId() && observed.source_entry.proxy_entry_depth == 1
+                        && events[6].kind == xefg::BridgeEventKind::ENABLE_BEGIN
+                        && events[7].kind == xefg::BridgeEventKind::ENABLE_END && events[7].off_observed
+                        && events[7].declaration == events[6].declaration
+                        && events[7].declaration > disable_end.declaration,
+                  "DEV re-proof and a fresh Disable remain separate events and cannot revive an old Off receipt");
+              for (size_t index = 1; index < events.size(); ++index) {
+                Check(events[index].sequence == events[index - 1].sequence + 1
+                          && events[index].observed_ns >= events[index - 1].observed_ns,
+                    "DEV link and SDK events retain one ordered sequence and steady clock across threads");
+              }
+#endif
               std::cout << "OBS CPU MOCK Disable/source order: worker=" << (during_disable ? "inside_disable" : "after_disable")
                         << " epoch=" << context->epoch << " link=" << context->bridge_link_generation
                         << " repeated_disable_off=1; GPU=NotRun\n";
             }
+#if defined(NR_NEXUS_DEV_CONTROL)
+            const auto trace_before_observer = xefg::CopyBridgeEvents().last_sequence;
+            receipt_after_sdk_observer = worker_source_present;
+            const auto observer_disable_status = Hooks::Enable(context_handle, 0);
+            receipt_after_sdk_observer = nullptr;
+            const auto observer_events = events_after(trace_before_observer);
+            Check(observer_disable_status == 0 && !xefg::QueryBridgeOff(receipt_source).available
+                      && observer_events.size() == 3
+                      && observer_events[0].kind == xefg::BridgeEventKind::ENABLE_BEGIN
+                      && observer_events[1].kind == xefg::BridgeEventKind::LINK_REVOKED
+                      && observer_events[2].kind == xefg::BridgeEventKind::ENABLE_END
+                      && observer_events[2].sdk_return_ns <= observer_events[1].observed_ns
+                      && observer_events[1].observed_ns <= observer_events[2].observed_ns
+                      && !observer_events[2].off_observed,
+                "DEV SDK return timestamp separates post-return observer revocation from the later rejected receipt commit");
+            Check(run_proxy() == S_OK && Hooks::Enable(context_handle, 0) == 0
+                      && xefg::QueryBridgeOff(receipt_source).available,
+                "a fresh explicit Disable recovers after post-return revocation without relaxing source gates");
+            const auto trace_before_reentry = xefg::CopyBridgeEvents().last_sequence;
+            receipt_during_sdk = +[] {
+              receipt_during_sdk = nullptr;
+              Check(Hooks::Enable(receipt_context_handle, 0) == 0,
+                  "a reentrant public Disable preserves the real SDK success status");
+            };
+            const auto reentrant_status = Hooks::Enable(context_handle, 0);
+            receipt_during_sdk = nullptr;
+            const auto reentrant_events = events_after(trace_before_reentry);
+            Check(reentrant_status == 0 && !xefg::QueryBridgeOff(receipt_source).available
+                      && context->bridge_enable_inflight == 0 && reentrant_events.size() == 4
+                      && reentrant_events[0].kind == xefg::BridgeEventKind::ENABLE_BEGIN
+                      && reentrant_events[1].kind == xefg::BridgeEventKind::ENABLE_BEGIN
+                      && reentrant_events[2].kind == xefg::BridgeEventKind::ENABLE_END
+                      && reentrant_events[3].kind == xefg::BridgeEventKind::ENABLE_END
+                      && reentrant_events[0].declaration == reentrant_events[3].declaration
+                      && reentrant_events[1].declaration == reentrant_events[2].declaration
+                      && reentrant_events[1].declaration > reentrant_events[0].declaration
+                      && !reentrant_events[2].off_observed && !reentrant_events[3].off_observed
+                      && std::strcmp(reentrant_events[2].reason, "context_changed_during_disable") == 0
+                      && std::strcmp(reentrant_events[3].reason, "context_changed_during_disable") == 0
+                      && std::strcmp(context->bridge_off_reason, "set_enabled_in_flight") == 0,
+                "DEV END metadata belongs to its own rejected declaration and does not rewrite the production context reason");
+            Check(Hooks::Enable(context_handle, 0) == 0 && xefg::QueryBridgeOff(receipt_source).available,
+                "reentrant declarations still require a fresh stable explicit Disable for Off evidence");
+            const auto trace_before_overflow = xefg::CopyBridgeEvents().last_sequence;
+            for (uint32_t index = 0; index < 17; ++index) {
+              Check(Hooks::Enable(context_handle, 0) == 0 && xefg::QueryBridgeOff(receipt_source).available,
+                  "bounded event retention does not alter stable explicit Off evidence");
+            }
+            const auto overflow = xefg::CopyBridgeEvents();
+            const auto repeated = xefg::CopyBridgeEvents();
+            Check(overflow.count == 32 && overflow.last_sequence == trace_before_overflow + 34
+                      && overflow.overwritten == overflow.last_sequence - overflow.count
+                      && overflow.events[0].sequence == overflow.last_sequence - 31
+                      && overflow.events[31].sequence == overflow.last_sequence
+                      && repeated.count == overflow.count && repeated.last_sequence == overflow.last_sequence
+                      && repeated.overwritten == overflow.overwritten && xefg::QueryBridgeOff(receipt_source).available,
+                "DEV event storage retains the newest 32 records with an explicit overwrite count and non-consuming reads");
+            for (uint32_t index = 1; index < overflow.count; ++index) {
+              Check(overflow.events[index].sequence == overflow.events[index - 1].sequence + 1,
+                  "DEV ring wrap preserves append order");
+            }
+            std::cout << "PASS CPU MOCK bounded DEV source/Disable events: SDK return/commit, source entries, re-proof and 32-event wrap; GPU=NotRun\n";
+#endif
             std::cout << "PASS CPU MOCK Disable/source ordering: inside/after revocation, stable re-proof and explicit repeated Disable; GPU=NotRun\n";
           }
           {

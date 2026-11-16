@@ -10,6 +10,9 @@
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
+#if defined(NR_NEXUS_DEV_CONTROL)
+#include <intrin.h>
+#endif
 
 #include <array>
 #include <algorithm>
@@ -44,6 +47,48 @@ struct BridgeSourceIdentity {
   uintptr_t device12 = 0;
   bool operator==(const BridgeSourceIdentity&) const = default;
 };
+#if defined(NR_NEXUS_DEV_CONTROL)
+enum class BridgeEventKind : uint8_t { ENABLE_BEGIN, ENABLE_END, LINK_REVOKED, LINK_OBSERVED };
+enum class BridgePresentMethod : uint8_t { UNOBSERVED, PRESENT, PRESENT1 };
+struct BridgeSourceEntry {
+  BridgePresentMethod method = BridgePresentMethod::UNOBSERVED;
+  uintptr_t return_address = 0;
+  uint32_t thread_id = 0;
+  uint32_t proxy_entry_depth = 0;
+  uint32_t interval = 0;
+  uint32_t flags = 0;
+};
+struct BridgeEvent {
+  BridgeEventKind kind = BridgeEventKind::ENABLE_BEGIN;
+  uint64_t sequence = 0;
+  int64_t observed_ns = 0;
+  // Next-statement sample after the real SDK call, not an exact function-body boundary.
+  // ENABLE_END's observed_ns is the later receipt commit.
+  int64_t sdk_return_ns = 0;
+  uint32_t thread_id = 0;
+  uintptr_t context_identity = 0;
+  uint64_t declaration = 0;
+  uint64_t epoch = 0;
+  uint64_t link_generation = 0;
+  // ENABLE_BEGIN keeps the initial attempt snapshot, captured before its source observer.
+  // ENABLE_END keeps the link state after receipt commit.
+  uintptr_t source_swapchain = 0;
+  uint64_t source_swapchain_generation = 0;
+  // SDK events keep the source sampled before the call; link events keep the affected link's source.
+  BridgeSourceIdentity source;
+  const char* reason = "unobserved";
+  uint32_t enabled_request = 0;
+  int32_t sdk_status = 0;
+  bool off_observed = false;
+  BridgeSourceEntry source_entry;
+};
+struct BridgeEventSnapshot {
+  std::array<BridgeEvent, 32> events{};
+  uint32_t count = 0;
+  uint64_t last_sequence = 0;
+  uint64_t overwritten = 0;
+};
+#endif
 enum class BridgeSnapshotState : uint8_t { UNOBSERVED, RUNTIME_BUSY, SHUTTING_DOWN, LOCKED };
 struct BridgeSourceObservation {
   BridgeSourceIdentity identity;
@@ -356,14 +401,46 @@ struct State {
   std::map<uintptr_t, std::shared_ptr<BridgeSourceSwapchain>> bridge_swapchains;
   uint64_t bridge_source_generation = 0;
   uint64_t bridge_link_generation = 0;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  std::array<BridgeEvent, 32> bridge_events{};
+  uint64_t bridge_event_sequence = 0;
+#endif
 };
 inline State state;
 inline std::shared_mutex install_mutex;
 inline std::atomic<DWORD> module_bytes{0};
 
+#if defined(NR_NEXUS_DEV_CONTROL)
+// state.mutex is held by callers. No callbacks, allocation, or file I/O occur here.
+inline void RecordBridgeEventLocked(BridgeEvent event) {
+  event.sequence = ++state.bridge_event_sequence;
+  event.observed_ns = output_framerate::NowNs();
+  event.thread_id = GetCurrentThreadId();
+  state.bridge_events[(event.sequence - 1) % state.bridge_events.size()] = event;
+}
+#endif
+
 // state.mutex is held by callers. A host link never substitutes for a Disable
 // receipt, and its failure must not invalidate the independent direct path.
-inline void RevokeBridgeSourceLinkLocked(Context* context, const char* reason) {
+inline void RevokeBridgeSourceLinkLocked(Context* context, const char* reason
+#if defined(NR_NEXUS_DEV_CONTROL)
+    , const BridgeSourceEntry& source_entry = {}
+#endif
+) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+  const bool had_link = context->bridge_source_swapchain != 0;
+  // Revocation keeps the old identity, but its generation and Off state describe the committed revocation.
+  BridgeEvent event{
+      .kind = BridgeEventKind::LINK_REVOKED,
+      .context_identity = reinterpret_cast<uintptr_t>(context),
+      .declaration = context->bridge_declaration,
+      .epoch = context->epoch,
+      .source_swapchain = context->bridge_source_swapchain,
+      .source_swapchain_generation = context->bridge_source_generation,
+      .source = context->bridge_link_source,
+      .reason = reason,
+      .source_entry = source_entry};
+#endif
   if (context->bridge_source_swapchain != 0) {
     context->bridge_link_generation = ++state.bridge_link_generation;
   }
@@ -375,6 +452,13 @@ inline void RevokeBridgeSourceLinkLocked(Context* context, const char* reason) {
     context->bridge_off_observed = false;
     context->bridge_off_reason = reason;
   }
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (had_link) {
+    event.link_generation = context->bridge_link_generation;
+    event.off_observed = context->bridge_off_observed;
+    RecordBridgeEventLocked(event);
+  }
+#endif
 }
 
 inline bool BridgeSourceLinkCurrentLocked(const Context& context) {
@@ -778,6 +862,9 @@ struct BridgeSourcePresentMapping {
   bool unregistered_outer = false;
   uint32_t source_present_thread_id = 0;
   uint32_t source_present_proxy_entry_depth = 0;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  BridgeSourceEntry source_entry;
+#endif
 };
 
 // Both call directions commit only after their outer Present returns. All
@@ -837,7 +924,11 @@ inline void RecordSourcePresentMapping(const BridgeSourcePresentMapping& mapping
     if (const auto old = registration->context.lock(); old != nullptr
         && old->bridge_source_swapchain == registration->owner
         && old->bridge_source_generation == registration->generation) {
-      RevokeBridgeSourceLinkLocked(old.get(), reason);
+      RevokeBridgeSourceLinkLocked(old.get(), reason
+#if defined(NR_NEXUS_DEV_CONTROL)
+          , mapping.source_entry
+#endif
+      );
     }
     registration->context.reset();
     registration->proxy = 0;
@@ -860,16 +951,38 @@ inline void RecordSourcePresentMapping(const BridgeSourcePresentMapping& mapping
   }
   if (sources != 1) {
     registration->reason = "multiple_source_swapchains";
-    RevokeBridgeSourceLinkLocked(context.get(), "multiple_source_swapchains");
+    RevokeBridgeSourceLinkLocked(context.get(), "multiple_source_swapchains"
+#if defined(NR_NEXUS_DEV_CONTROL)
+        , mapping.source_entry
+#endif
+    );
     return;
   }
   if (context->bridge_source_swapchain != registration->owner
       || context->bridge_source_generation != registration->generation || context->bridge_link_source != before.identity) {
-    RevokeBridgeSourceLinkLocked(context.get(), "source_mapping_changed");
+    RevokeBridgeSourceLinkLocked(context.get(), "source_mapping_changed"
+#if defined(NR_NEXUS_DEV_CONTROL)
+        , mapping.source_entry
+#endif
+    );
     context->bridge_source_swapchain = registration->owner;
     context->bridge_source_generation = registration->generation;
     context->bridge_link_source = before.identity;
     context->bridge_link_generation = ++state.bridge_link_generation;
+#if defined(NR_NEXUS_DEV_CONTROL)
+    RecordBridgeEventLocked({
+        .kind = BridgeEventKind::LINK_OBSERVED,
+        .context_identity = reinterpret_cast<uintptr_t>(context.get()),
+        .declaration = context->bridge_declaration,
+        .epoch = context->epoch,
+        .link_generation = context->bridge_link_generation,
+        .source_swapchain = context->bridge_source_swapchain,
+        .source_swapchain_generation = context->bridge_source_generation,
+        .source = context->bridge_link_source,
+        .reason = observed_reason,
+        .off_observed = context->bridge_off_observed,
+        .source_entry = mapping.source_entry});
+#endif
   }
   context->bridge_link_reason = observed_reason;
 }
@@ -895,8 +1008,15 @@ struct BridgeSourcePresent : BridgeSourcePresentMapping {
   bool test = false;
   bool finished = false;
 
-  BridgeSourcePresent(IDXGISwapChain* swapchain, UINT flags) noexcept
+  BridgeSourcePresent(IDXGISwapChain* swapchain, UINT flags
+#if defined(NR_NEXUS_DEV_CONTROL)
+      , const BridgeSourceEntry& entry = {}
+#endif
+  ) noexcept
       : borrowed_swapchain(swapchain), test((flags & DXGI_PRESENT_TEST) != 0) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+    source_entry = entry;
+#endif
     try {
       if (!stopped.load() && sdk_detours_enabled.load()) {
         const auto identity = Identity(swapchain);
@@ -932,6 +1052,9 @@ struct BridgeSourcePresent : BridgeSourcePresentMapping {
               outer_proxy->mapping.registration = registration;
               outer_proxy->mapping.source_present_thread_id = source_present_thread_id;
               outer_proxy->mapping.source_present_proxy_entry_depth = source_present_proxy_entry_depth;
+#if defined(NR_NEXUS_DEV_CONTROL)
+              outer_proxy->mapping.source_entry = source_entry;
+#endif
             }
           }
           const auto device = (native12 ? D3D12SourceDeviceIdentity(swapchain) : BridgeDeviceIdentity(swapchain));
@@ -1166,14 +1289,26 @@ inline std::array<SourcePresentSlot, 4> source_present_slots;
 template <size_t Index>
 struct SourcePresentHooks {
   static HRESULT STDMETHODCALLTYPE Present(IDXGISwapChain* swapchain, UINT interval, UINT flags) {
-    BridgeSourcePresent present(swapchain, flags);
+    BridgeSourcePresent present(swapchain, flags
+#if defined(NR_NEXUS_DEV_CONTROL)
+        , {.method = BridgePresentMethod::PRESENT,
+            .return_address = reinterpret_cast<uintptr_t>(_ReturnAddress()),
+            .thread_id = GetCurrentThreadId(), .proxy_entry_depth = proxy_entry_depth, .interval = interval, .flags = flags}
+#endif
+    );
     const auto status = reinterpret_cast<PresentFn>(source_present_slots[Index].real[0])(swapchain, interval, flags);
     present.Finish(status);
     return status;
   }
   static HRESULT STDMETHODCALLTYPE Present1(IDXGISwapChain1* swapchain, UINT interval, UINT flags,
                                             const DXGI_PRESENT_PARAMETERS* parameters) {
-    BridgeSourcePresent present(swapchain, flags);
+    BridgeSourcePresent present(swapchain, flags
+#if defined(NR_NEXUS_DEV_CONTROL)
+        , {.method = BridgePresentMethod::PRESENT1,
+            .return_address = reinterpret_cast<uintptr_t>(_ReturnAddress()),
+            .thread_id = GetCurrentThreadId(), .proxy_entry_depth = proxy_entry_depth, .interval = interval, .flags = flags}
+#endif
+    );
     const auto status = reinterpret_cast<Present1Fn>(source_present_slots[Index].real[1])(swapchain, interval, flags, parameters);
     present.Finish(status);
     return status;
@@ -1911,6 +2046,11 @@ struct SdkHooks {
     bool uses_source_link = false;
     uint64_t link_generation = 0;
     BridgeSourceIdentity linked_source;
+#if defined(NR_NEXUS_DEV_CONTROL)
+    uintptr_t source_swapchain = 0;
+    uint64_t source_swapchain_generation = 0;
+    uint64_t initial_link_generation = 0;
+#endif
     {
       std::unique_lock lock(state.mutex);
       if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
@@ -1922,6 +2062,11 @@ struct SdkHooks {
         declaration = attempt->bridge_declaration = ++state.bridge_declaration;
         epoch = attempt->epoch;
         proxy = attempt->proxy_identity;
+#if defined(NR_NEXUS_DEV_CONTROL)
+        source_swapchain = attempt->bridge_source_swapchain;
+        source_swapchain_generation = attempt->bridge_source_generation;
+        initial_link_generation = attempt->bridge_link_generation;
+#endif
         ++attempt->bridge_enable_inflight;
         auto* application_device = attempt->bridge_application_device11.Get();
         auto* proxy_device = attempt->bridge_proxy_device11.Get();
@@ -1951,7 +2096,26 @@ struct SdkHooks {
     const auto before_observation = (observer != nullptr && observed_device != 0 && !stopped.load()
         ? observer(observed_device) : BridgeSourceObservation{});
     const auto before = before_observation.identity;
+#if defined(NR_NEXUS_DEV_CONTROL)
+    {
+      std::unique_lock lock(state.mutex);
+      RecordBridgeEventLocked({
+          .kind = BridgeEventKind::ENABLE_BEGIN,
+          .context_identity = reinterpret_cast<uintptr_t>(attempt.get()),
+          .declaration = declaration,
+          .epoch = epoch,
+          .link_generation = initial_link_generation,
+          .source_swapchain = source_swapchain,
+          .source_swapchain_generation = source_swapchain_generation,
+          .source = before,
+          .reason = "set_enabled_in_flight",
+          .enabled_request = enabled});
+    }
+#endif
     const auto status = reinterpret_cast<int32_t (*)(void*, uint32_t)>(modules[Index].real[6])(handle, enabled);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    const auto sdk_return_ns = output_framerate::NowNs();
+#endif
     const auto after_observation = (status == 0 && enabled == 0 && observer != nullptr && observed_device != 0 && !stopped.load()
         ? observer(observed_device) : BridgeSourceObservation{});
     const auto after = after_observation.identity;
@@ -2004,6 +2168,24 @@ struct SdkHooks {
               : !attempt->bridge_proxy_ready ? "proxy_contract_unavailable" : "context_changed_during_disable");
         }
       }
+#if defined(NR_NEXUS_DEV_CONTROL)
+      // The event reports this call's acceptance, independently of the context's latest declaration/reason.
+      RecordBridgeEventLocked({
+          .kind = BridgeEventKind::ENABLE_END,
+          .sdk_return_ns = sdk_return_ns,
+          .context_identity = reinterpret_cast<uintptr_t>(attempt.get()),
+          .declaration = declaration,
+          .epoch = (attempt != nullptr ? attempt->epoch : epoch),
+          .link_generation = (attempt != nullptr ? attempt->bridge_link_generation : link_generation),
+          .source_swapchain = (attempt != nullptr ? attempt->bridge_source_swapchain : source_swapchain),
+          .source_swapchain_generation = (attempt != nullptr ? attempt->bridge_source_generation : source_swapchain_generation),
+          .source = before,
+          .reason = (current ? attempt->bridge_off_reason
+                            : (attempt != nullptr ? "context_changed_during_disable" : "context_unobserved")),
+          .enabled_request = enabled,
+          .sdk_status = status,
+          .off_observed = current && attempt->bridge_off_observed});
+#endif
     }
     if (status == 0) {
       RefreshOwnership();
@@ -2088,6 +2270,22 @@ inline std::array<void*, EXPORTS.size()> SdkDetours() {
       reinterpret_cast<void*>(&SdkHooks<Index>::Destroy), reinterpret_cast<void*>(&SdkHooks<Index>::NumInterpolated)};
 }
 }  // namespace internal
+
+#if defined(NR_NEXUS_DEV_CONTROL)
+// Snapshot only: reading events neither consumes them nor changes source/Off evidence.
+inline BridgeEventSnapshot CopyBridgeEvents() {
+  BridgeEventSnapshot snapshot;
+  std::shared_lock lock(internal::state.mutex);
+  snapshot.last_sequence = internal::state.bridge_event_sequence;
+  snapshot.count = static_cast<uint32_t>(std::min<uint64_t>(snapshot.last_sequence, snapshot.events.size()));
+  snapshot.overwritten = snapshot.last_sequence - snapshot.count;
+  const auto first_sequence = snapshot.last_sequence - snapshot.count + 1;
+  for (uint32_t index = 0; index < snapshot.count; ++index) {
+    snapshot.events[index] = internal::state.bridge_events[(first_sequence + index - 1) % snapshot.events.size()];
+  }
+  return snapshot;
+}
+#endif
 
 inline void Configure(Service service, PrepareCapture capture, Retire retire, bool (*requested)() noexcept,
                       bool block_optional_hudless = false, bool enable_sdk_detours = true) {

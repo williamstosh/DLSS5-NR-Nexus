@@ -93,6 +93,8 @@
       "status reports an empty XeFG Off source list when this CPU fixture has no recorded D3D12 sources");
   check(status["state"]["edit_reuse"]["xefg_device_observation"].is_null(),
       "the disabled experiment leaves independent SDK device diagnostics null");
+  check(status["state"]["edit_reuse"]["xefg_off_events"].is_null(),
+      "the disabled experiment leaves bounded Off event diagnostics null");
   {
     struct RestoreSdkContexts {
       decltype(xefg::internal::state.contexts) contexts;
@@ -152,9 +154,39 @@
             && context->bridge_source_swapchain == 0 && context->bridge_link_generation == 0
             && runtime::create_contracts.empty(),
         "context metadata exports neither source authority nor an Off receipt and cannot create a source link");
+    {
+      std::unique_lock lock(xefg::internal::state.mutex);
+      for (uint32_t index = 0; index < 32; ++index) {
+        context->bridge_source_swapchain = SDK_PROXY + 1;
+        context->bridge_source_generation = 2;
+        context->bridge_link_source = {.handle = 0xD3C400, .generation = 3, .device12 = DEVICE_IDENTITY};
+        xefg::internal::RevokeBridgeSourceLinkLocked(context.get(), "source_swapchain_removed");
+      }
+    }
+    const auto traced = control::Snapshot();
+    const auto& trace = traced["edit_reuse"]["xefg_off_events"];
+    const auto& event = trace["events"].back();
+    check(trace["events"].size() == 32 && trace["last_sequence"] == event["sequence"]
+            && event["kind"] == "link_revoked" && event["observed_ns"].get<int64_t>() > 0
+            && event["thread_id"] == GetCurrentThreadId()
+            && event["context_identity"] == reinterpret_cast<uintptr_t>(context.get())
+            && event["source_swapchain"] == SDK_PROXY + 1 && event["source_swapchain_generation"] == 2
+            && event["source"]["handle"] == 0xD3C400 && event["source"]["generation"] == 3
+            && event["source"]["device12"] == DEVICE_IDENTITY
+            && event["reason"] == "source_swapchain_removed" && !event["off_observed"].get<bool>()
+            && event["source_entry"]["method"] == "unobserved"
+            && event["source_entry"]["return_address"] == 0,
+        "bounded Off diagnostics retain the revoked identity, event ordering and explicit missing Present origin");
+    check(!xefg::QueryBridgeOff({}).available && context->bridge_source_swapchain == 0
+            && control::Snapshot()["edit_reuse"]["xefg_off_events"] == trace,
+        "reading Off events neither consumes them nor grants a receipt or restores the source link");
+    check(control::Execute({{"id", "off-events-bound"}, {"op", "status"}}).dump().size() < 64 * 1024,
+        "a full bounded Off event window fits the unchanged control-pipe frame limit with the real status envelope");
     runtime::edit_reuse_adaptive_experiment = false;
     check(control::Snapshot()["edit_reuse"]["xefg_device_observation"].is_null(),
         "disabling the experiment hides device diagnostics even while a captured SDK context remains");
+    check(control::Snapshot()["edit_reuse"]["xefg_off_events"].is_null(),
+        "disabling the experiment hides retained Off events without clearing their sequence");
     runtime::edit_reuse_adaptive_experiment = true;
     auto second_context = std::make_shared<xefg::internal::Context>();
     {

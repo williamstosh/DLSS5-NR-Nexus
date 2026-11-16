@@ -129,7 +129,40 @@ inline Json Snapshot() {
   };
   Json edit_off_sources = Json::array();
   Json edit_device_observation = nullptr;
+  Json edit_off_events = nullptr;
   if (edit_reuse_adaptive_experiment.load()) {
+    const auto trace = fg::xefg::CopyBridgeEvents();
+    Json events = Json::array();
+    for (uint32_t index = 0; index < trace.count; ++index) {
+      const auto& event = trace.events[index];
+      const char* kind = "unobserved";
+      switch (event.kind) {
+        case fg::xefg::BridgeEventKind::ENABLE_BEGIN: kind = "enable_begin"; break;
+        case fg::xefg::BridgeEventKind::ENABLE_END: kind = "enable_end"; break;
+        case fg::xefg::BridgeEventKind::LINK_REVOKED: kind = "link_revoked"; break;
+        case fg::xefg::BridgeEventKind::LINK_OBSERVED: kind = "link_observed"; break;
+      }
+      const char* method = "unobserved";
+      switch (event.source_entry.method) {
+        case fg::xefg::BridgePresentMethod::UNOBSERVED: break;
+        case fg::xefg::BridgePresentMethod::PRESENT: method = "Present"; break;
+        case fg::xefg::BridgePresentMethod::PRESENT1: method = "Present1"; break;
+      }
+      events.push_back({{"kind", kind}, {"sequence", event.sequence}, {"observed_ns", event.observed_ns},
+          {"sdk_return_ns", event.sdk_return_ns}, {"thread_id", event.thread_id},
+          {"context_identity", event.context_identity}, {"declaration", event.declaration}, {"epoch", event.epoch},
+          {"link_generation", event.link_generation}, {"source_swapchain", event.source_swapchain},
+          {"source_swapchain_generation", event.source_swapchain_generation},
+          {"source", {{"handle", event.source.handle}, {"generation", event.source.generation},
+              {"device11", event.source.device11}, {"device12", event.source.device12}}},
+          {"reason", event.reason}, {"enabled_request", event.enabled_request}, {"sdk_status", event.sdk_status},
+          {"off_observed", event.off_observed},
+          {"source_entry", {{"method", method}, {"return_address", event.source_entry.return_address},
+              {"thread_id", event.source_entry.thread_id}, {"proxy_entry_depth", event.source_entry.proxy_entry_depth},
+              {"interval", event.source_entry.interval}, {"flags", event.source_entry.flags}}}});
+    }
+    edit_off_events = {{"last_sequence", trace.last_sequence}, {"overwritten", trace.overwritten},
+        {"events", std::move(events)}};
     const auto observed = fg::xefg::QueryBridgeOff({});
     edit_device_observation = {{"query_reason", observed.reason}, {"sdk_context", observed.context},
         {"sdk_proxy", observed.proxy}, {"context_identity", observed.context_identity},
@@ -205,6 +238,7 @@ inline Json Snapshot() {
           {"reuses", edit_reuse_reuses.load()}, {"fallbacks", edit_reuse_fallbacks.load()},
           {"xefg_off_sources", std::move(edit_off_sources)},
           {"xefg_device_observation", std::move(edit_device_observation)},
+          {"xefg_off_events", std::move(edit_off_events)},
           {"evidence", "process_counters_not_activation_or_gpu_completion"}}},
       {"experiments", {{"adaptive_feature_mode", identity["experiments"]["adaptive_feature_mode"]},
           {"bridge_adaptive_experiment", identity["experiments"]["bridge_adaptive_experiment"]},
