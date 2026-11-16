@@ -67,6 +67,44 @@ inline void STDMETHODCALLTYPE MockPremiseEnhanced(ID3D12GraphicsCommandList7* li
   premise_forward_array = groups;
 }
 
+// Two typed resource faces can share one canonical IUnknown. No GPU methods
+// are used; the counters expose every temporary identity reference.
+struct PremiseResourceFace final : ID3D12Resource {
+  PremiseResourceFace* identity = this;
+  ULONG references = 1;
+  uint32_t queries = 0, add_refs = 0, releases = 0;
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
+    ++queries;
+    if (object == nullptr) return E_POINTER;
+    *object = nullptr;
+    if (iid == IID_IUnknown) {
+      *object = static_cast<IUnknown*>(identity);
+      identity->AddRef();
+    } else if (iid == __uuidof(ID3D12Resource) || iid == __uuidof(ID3D12Pageable)
+        || iid == __uuidof(ID3D12DeviceChild) || iid == __uuidof(ID3D12Object)) {
+      *object = static_cast<ID3D12Resource*>(this);
+      AddRef();
+    } else {
+      return E_NOINTERFACE;
+    }
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { ++add_refs; return ++references; }
+  ULONG STDMETHODCALLTYPE Release() override { ++releases; return --references; }
+  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE SetName(LPCWSTR) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetDevice(REFIID, void**) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE Map(UINT, const D3D12_RANGE*, void**) override { return E_NOTIMPL; }
+  void STDMETHODCALLTYPE Unmap(UINT, const D3D12_RANGE*) override {}
+  D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override { return {}; }
+  D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override { return 0; }
+  HRESULT STDMETHODCALLTYPE WriteToSubresource(UINT, const D3D12_BOX*, const void*, UINT, UINT) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE ReadFromSubresource(void*, UINT, UINT, UINT, const D3D12_BOX*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetHeapProperties(D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS*) override { return E_NOTIMPL; }
+};
+
 inline sl::Result MockEvaluate(sl::Feature feature, const sl::FrameToken& frame,
     const sl::BaseStructure** inputs, uint32_t num_inputs, sl::CommandBuffer* command_buffer) {
   return evaluate_handler(feature, frame, inputs, num_inputs, command_buffer);
@@ -481,7 +519,7 @@ inline int Run() {
       namespace probe = runtime::native_tag_source;
       struct RestorePremise {
         probe::PremiseSnapshot snapshot;
-        std::array<probe::PremiseEvent, 5> live;
+        std::array<probe::PremiseEvent, 7> live;
         std::array<uint64_t, 2> calls;
         uint64_t sequence = 0, epoch = 0;
         bool enabled = runtime::enabled.load();
@@ -598,6 +636,19 @@ inline int Run() {
               && frozen.before[1].enhanced.SyncBefore == texture.SyncBefore
               && frozen.before[1].enhanced.AccessAfter == texture.AccessAfter && frozen.before[1].enhanced.Flags == texture.Flags,
           "split/subresource and enhanced layout/sync/access/range/flags remain exact raw evidence without state conversion");
+      D3D12_RESOURCE_BARRIER global_uav{.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV,
+          .Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE, .UAV = {nullptr}};
+      runtime::HookedNativePremiseBarrier(list, 1, &global_uav);
+      probe::FreezePremiseTag(tag);
+      frozen = probe::premise.snapshot;
+      check(frozen.before[0].legacy.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION
+              && frozen.before[0].legacy.Flags == D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY
+              && frozen.before[0].legacy.Transition.Subresource == 3
+              && frozen.before[5].legacy.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV
+              && frozen.before[5].legacy.UAV.pResource == nullptr
+              && frozen.before[5].match == probe::PremiseMatchSource::GLOBAL
+              && frozen.before[0].sequence < frozen.before[5].sequence,
+          "a later global UAV boundary has its own slot and preserves the exact target transition");
       probe::FinishPremiseTag(ticket, true);
       check(!probe::premise.snapshot.returned, "a superseded tag return cannot update a later observation");
       probe::FinishPremiseTag(probe::premise.snapshot.tag.sequence, false);
@@ -614,16 +665,28 @@ inline int Run() {
       probe::ObservePremiseSubmit(queue, {{.list = premise_identity, .generation = 7}});
       check(probe::ReadPremiseRecording(list).generation == 8
               && probe::premise.snapshot.submitted_after_tag.recording.generation == 7
+              && probe::premise.snapshot.submitted_after_tag.recording.status_available
+              && probe::premise.snapshot.submitted_after_tag.recording.submitted
               && probe::premise.snapshot.submitted_after_tag.recording.value == 9,
           "a submit frozen at generation seven stays seven after current advances to eight");
       const auto submitted_sequence = probe::premise.snapshot.submitted_after_tag.sequence;
       probe::ObservePremiseSubmit(queue, {{.list = premise_identity, .generation = 8}});
       check(probe::premise.snapshot.submitted_after_tag.sequence == submitted_sequence,
           "a different captured recording cannot be reassigned to the tag's earlier generation");
+      {
+        std::lock_guard lock(submission::tracker_mutex);
+        submission::tracked_lists.at(premise_identity).generations.at(7).status.reset();
+      }
+      probe::ObservePremiseSubmit(queue, {{.list = premise_identity, .generation = 7}});
+      const auto without_status = probe::premise.snapshot.submitted_after_tag.recording;
+      check(!without_status.status_available && !without_status.submitted && without_status.receipts == 1
+              && !without_status.pending && without_status.value == 9 && without_status.generation == 7,
+          "missing optional status stays explicitly unavailable while the real frozen generation receipt remains visible");
       std::ostringstream evidence;
       probe::AppendPremiseObservation(evidence);
       check(evidence.str().find("gpu_completion=unqueried") != std::string::npos
               && evidence.str().find("enhanced_state_mapping=none") != std::string::npos
+              && evidence.str().find("receipts:1,status_available:0,submitted:0,pending:0") != std::string::npos
               && probe::premise.snapshot.submitted_after_tag.sequence > probe::premise.snapshot.tag.sequence
               && probe::premise.snapshot.returned && !probe::premise.snapshot.success,
           "actual submit/return observations stay separate from GPU completion and SDK success");
@@ -635,14 +698,17 @@ inline int Run() {
       barrier.Aliasing = {resource, nullptr};
       runtime::HookedNativePremiseBarrier(list, 1, &barrier);
       probe::FreezePremiseTag(tag);
-      check(probe::premise.snapshot.before[0].legacy.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING
-              && probe::premise.snapshot.before[0].legacy.Aliasing.pResourceBefore == resource
-              && probe::premise.snapshot.before[0].legacy.Aliasing.pResourceAfter == nullptr,
-          "an alias boundary remains an alias event and cannot masquerade as a transition state");
+      check(probe::premise.snapshot.before[6].legacy.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING
+              && probe::premise.snapshot.before[6].legacy.Aliasing.pResourceBefore == resource
+              && probe::premise.snapshot.before[6].legacy.Aliasing.pResourceAfter == nullptr
+              && probe::premise.snapshot.before[0].legacy.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION
+              && probe::premise.snapshot.before[5].legacy.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV,
+          "alias, target transition and global UAV facts survive independently in fixed slots");
       probe::ObservePremiseEvent({.kind = probe::PremiseKind::RESET, .list = tag.tag.list, .full = true});
       probe::FreezePremiseTag(tag);
       check(probe::premise.snapshot.before[0].sequence == 0 && probe::premise.snapshot.before[1].sequence == 0
-              && probe::premise.snapshot.before[2].sequence == 0 && probe::premise.snapshot.before[3].sequence != 0,
+              && probe::premise.snapshot.before[2].sequence == 0 && probe::premise.snapshot.before[3].sequence != 0
+              && probe::premise.snapshot.before[5].sequence == 0 && probe::premise.snapshot.before[6].sequence == 0,
           "Reset removes earlier recording facts instead of carrying state into a new recording");
       const auto epoch = probe::premise.snapshot.epoch;
       tag.native = 0x7700;
@@ -657,6 +723,58 @@ inline int Run() {
       check(probe::PremiseNative() == 0 && premise_writes == 0 && submission::HasEverTrackedUses() == tracked_uses
               && submission::next_list_identity.load() == next_identity,
           "resource destruction clears borrowed facts and all observations leave production identity/use authority untouched");
+      PremiseResourceFace canonical, tagged, alternate, other;
+      tagged.identity = alternate.identity = &canonical;
+      tag.native = reinterpret_cast<uintptr_t>(static_cast<ID3D12Resource*>(&tagged));
+      tag.identity = reinterpret_cast<uintptr_t>(static_cast<IUnknown*>(&canonical));
+      probe::FreezePremiseTag(tag);
+      D3D12_RESOURCE_BARRIER face_barrier{.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+          .Flags = D3D12_RESOURCE_BARRIER_FLAG_END_ONLY,
+          .Transition = {&alternate, 2, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS}};
+      texture.pResource = &alternate;
+      runtime::edit_reuse_fg_experiment = false;
+      const auto forwards_before_off = premise_forwards;
+      runtime::HookedNativePremiseBarrier(list, 1, &face_barrier);
+      runtime::HookedNativePremiseEnhanced(list7, 1, &group);
+      probe::ObservePremiseCopy(list, &other, &alternate, true);
+      check(alternate.queries == 0 && canonical.add_refs == 0 && canonical.releases == 0
+              && premise_forwards == forwards_before_off + 2,
+          "OFF forwards both real entries without querying resource identity or retaining a resource");
+      runtime::edit_reuse_fg_experiment = true;
+      runtime::HookedNativePremiseBarrier(list, 1, &face_barrier);
+      check(premise_forwards == forwards_before_off + 3 && premise_forward_list == reinterpret_cast<uintptr_t>(list)
+              && premise_forward_count == 1 && premise_forward_array == &face_barrier
+              && face_barrier.Transition.pResource == &alternate,
+          "a different canonical-matched resource face reaches the real legacy entry unchanged exactly once");
+      runtime::HookedNativePremiseEnhanced(list7, 1, &group);
+      check(premise_forwards == forwards_before_off + 4 && premise_forward_list == reinterpret_cast<uintptr_t>(list7)
+              && premise_forward_count == 1 && premise_forward_array == &group && texture.pResource == &alternate,
+          "canonical matching also preserves the original enhanced entry face and array in one real call");
+      probe::ObservePremiseCopy(list, &other, &alternate, true);
+      probe::FreezePremiseTag(tag);
+      frozen = probe::premise.snapshot;
+      const auto alternate_raw = reinterpret_cast<uintptr_t>(static_cast<ID3D12Resource*>(&alternate));
+      check(frozen.before[0].source == alternate_raw && frozen.before[0].resource_identity == tag.identity
+              && frozen.before[0].match == probe::PremiseMatchSource::CANONICAL
+              && frozen.before[0].legacy.Transition.pResource == &alternate
+              && frozen.before[1].source == alternate_raw && frozen.before[1].resource_identity == tag.identity
+              && frozen.before[1].match == probe::PremiseMatchSource::CANONICAL
+              && frozen.before[2].destination == alternate_raw && frozen.before[2].resource_identity == tag.identity
+              && frozen.before[2].match == probe::PremiseMatchSource::CANONICAL,
+          "legacy, enhanced and copy observations retain the incoming raw face plus its matching canonical identity");
+      check(alternate.queries != 0 && canonical.add_refs == 3 && canonical.releases == 3
+              && canonical.references == 1 && tagged.references == 1 && alternate.references == 1,
+          "standard identity queries return every temporary COM reference and never keep a resource alive");
+      face_barrier.Transition.pResource = &other;
+      texture.pResource = &other;
+      const auto sequence_before_other = probe::premise.sequence;
+      runtime::HookedNativePremiseBarrier(list, 1, &face_barrier);
+      runtime::HookedNativePremiseEnhanced(list7, 1, &group);
+      probe::ObservePremiseCopy(list, &alternate, &other, true);
+      check(probe::premise.sequence == sequence_before_other && other.queries != 0
+              && other.references == 1 && other.add_refs == other.releases,
+          "an unequal canonical identity is not captured by any resource observer and its temporary references are returned");
+      probe::ForgetPremiseResource(tag.native);
     }
     {
       Events events;

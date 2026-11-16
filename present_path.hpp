@@ -2893,18 +2893,33 @@ inline void STDMETHODCALLTYPE HookedNativePremiseBarrier(ID3D12GraphicsCommandLi
     std::optional<native_tag_source::PremiseRecording> recording;
     for (UINT index = 0; index < count; ++index) {
       const auto& barrier = barriers[index];
-      const auto pointer = [](auto* resource) { return reinterpret_cast<uintptr_t>(resource); };
-      const bool matches = (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && pointer(barrier.Transition.pResource) == watched)
-          || (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV && (barrier.UAV.pResource == nullptr || pointer(barrier.UAV.pResource) == watched))
-          || (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING
-              && (barrier.Aliasing.pResourceBefore == nullptr || barrier.Aliasing.pResourceAfter == nullptr
-                  || pointer(barrier.Aliasing.pResourceBefore) == watched || pointer(barrier.Aliasing.pResourceAfter) == watched));
-      if (!matches) continue;
+      auto kind = native_tag_source::PremiseKind::LEGACY;
+      native_tag_source::PremiseResourceMatch matched;
+      if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
+        matched = native_tag_source::MatchPremiseResource(barrier.Transition.pResource);
+      } else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
+        kind = native_tag_source::PremiseKind::UAV;
+        matched = (barrier.UAV.pResource == nullptr
+            ? native_tag_source::PremiseResourceMatch{.source = native_tag_source::PremiseMatchSource::GLOBAL}
+            : native_tag_source::MatchPremiseResource(barrier.UAV.pResource));
+      } else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
+        kind = native_tag_source::PremiseKind::ALIAS;
+        if (barrier.Aliasing.pResourceBefore == nullptr || barrier.Aliasing.pResourceAfter == nullptr) {
+          matched.source = native_tag_source::PremiseMatchSource::GLOBAL;
+        } else {
+          matched = native_tag_source::MatchPremiseResource(barrier.Aliasing.pResourceBefore);
+          if (!matched) {
+            matched = native_tag_source::MatchPremiseResource(barrier.Aliasing.pResourceAfter);
+          }
+        }
+      }
+      if (!matched) continue;
       if (!recording) {
         recording = native_tag_source::ReadPremiseRecording(list);
       }
-      native_tag_source::ObservePremiseEvent({.kind = native_tag_source::PremiseKind::LEGACY,
-          .list = reinterpret_cast<uintptr_t>(list), .recording = *recording, .source = watched, .legacy = barrier});
+      native_tag_source::ObservePremiseEvent({.kind = kind,
+          .list = reinterpret_cast<uintptr_t>(list), .recording = *recording, .source = matched.raw,
+          .resource_identity = matched.identity, .match = matched.source, .legacy = barrier});
     }
   });
 }
@@ -2921,12 +2936,14 @@ inline void STDMETHODCALLTYPE HookedNativePremiseEnhanced(ID3D12GraphicsCommandL
       if (groups[group].Type != D3D12_BARRIER_TYPE_TEXTURE) continue;
       for (UINT32 index = 0; index < groups[group].NumBarriers; ++index) {
         const auto& barrier = groups[group].pTextureBarriers[index];
-        if (reinterpret_cast<uintptr_t>(barrier.pResource) != watched) continue;
+        const auto matched = native_tag_source::MatchPremiseResource(barrier.pResource);
+        if (!matched) continue;
         if (!recording) {
           recording = native_tag_source::ReadPremiseRecording(list);
         }
         native_tag_source::ObservePremiseEvent({.kind = native_tag_source::PremiseKind::ENHANCED,
-            .list = reinterpret_cast<uintptr_t>(list), .recording = *recording, .source = watched, .enhanced = barrier});
+            .list = reinterpret_cast<uintptr_t>(list), .recording = *recording, .source = matched.raw,
+            .resource_identity = matched.identity, .match = matched.source, .enhanced = barrier});
       }
     }
   });

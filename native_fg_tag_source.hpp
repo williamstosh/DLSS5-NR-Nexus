@@ -11,7 +11,7 @@ namespace native_tag_source {
 struct PremiseRecording {
   uint64_t list = 0, generation = 0;
   uint32_t receipts = 0;
-  bool submitted = false, pending = true;
+  bool status_available = false, submitted = false, pending = true;
   uintptr_t fence = 0;
   uint64_t value = 0;
 };
@@ -24,7 +24,8 @@ inline PremiseRecording ReadPremiseRecording(uint64_t identity, uint64_t generat
   const auto generation = entry->second.generations.find(result.generation);
   if (generation == entry->second.generations.end()) return result;
   result.receipts = static_cast<uint32_t>(generation->second.submissions.size());
-  result.submitted = generation->second.status != nullptr && generation->second.status->submitted.load();
+  result.status_available = generation->second.status != nullptr;
+  result.submitted = result.status_available && generation->second.status->submitted.load();
   if (result.receipts == 1) {
     const auto& receipt = generation->second.submissions.front();
     result.pending = receipt.pending;
@@ -38,7 +39,13 @@ inline PremiseRecording ReadPremiseRecording(ID3D12CommandList* list) {
   const auto identity = submission::ListIdentity(list, false);
   return ((identity >> 63) != 0 ? PremiseRecording{} : ReadPremiseRecording(identity, 0));
 }
-enum class PremiseKind : uint32_t { TAG, LEGACY, ENHANCED, COPY, RESET, SUBMIT };
+enum class PremiseKind : uint32_t { TAG, LEGACY, ENHANCED, COPY, RESET, SUBMIT, UAV, ALIAS };
+enum class PremiseMatchSource : uint32_t { NONE, RAW, CANONICAL, GLOBAL };
+struct PremiseResourceMatch {
+  uintptr_t raw = 0, identity = 0;
+  PremiseMatchSource source = PremiseMatchSource::NONE;
+  explicit operator bool() const { return source != PremiseMatchSource::NONE; }
+};
 struct PremiseEvent {
   uint64_t sequence = 0;
   int64_t qpc = 0;
@@ -47,6 +54,8 @@ struct PremiseEvent {
   uintptr_t list = 0;
   PremiseRecording recording;
   uintptr_t source = 0, destination = 0;
+  uintptr_t resource_identity = 0;
+  PremiseMatchSource match = PremiseMatchSource::NONE;
   bool full = false;
   D3D12_RESOURCE_BARRIER legacy{};
   D3D12_TEXTURE_BARRIER enhanced{};
@@ -64,7 +73,7 @@ struct PremiseSnapshot {
   PremiseEvent tag;
   uint64_t return_sequence = 0;
   bool returned = false, success = false;
-  std::array<PremiseEvent, 5> before{};
+  std::array<PremiseEvent, 7> before{};
   PremiseEvent submitted_after_tag;
   const char* boundary = "unbound";
 };
@@ -73,13 +82,30 @@ struct PremiseState {
   uint64_t sequence = 0, epoch = 0;
   std::array<uint64_t, 2> barrier_calls{};
   PremiseSnapshot snapshot;
-  std::array<PremiseEvent, 5> live{};
+  std::array<PremiseEvent, 7> live{};
 };
 static PremiseState premise;
 
 inline uintptr_t PremiseNative() {
   std::shared_lock lock(premise.mutex);
   return premise.snapshot.native;
+}
+// Only actual typed API resource arguments enter here. NativeIdentity returns
+// a borrowed scalar after releasing its temporary QI reference, outside our lock.
+inline PremiseResourceMatch MatchPremiseResource(ID3D12Resource* resource) {
+  if (!NativePremiseEnabled() || resource == nullptr) return {};
+  uintptr_t watched = 0, identity = 0;
+  {
+    std::shared_lock lock(premise.mutex);
+    watched = premise.snapshot.native;
+    identity = premise.snapshot.identity;
+  }
+  if (watched == 0) return {};
+  const auto raw = reinterpret_cast<uintptr_t>(resource);
+  if (raw == watched) return {.raw = raw, .identity = identity, .source = PremiseMatchSource::RAW};
+  const auto canonical = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(resource));
+  if (canonical == 0 || canonical != identity) return {};
+  return {.raw = raw, .identity = canonical, .source = PremiseMatchSource::CANONICAL};
 }
 inline uintptr_t ObservePremiseBarrierCall(PremiseKind kind) {
   std::unique_lock lock(premise.mutex);
@@ -94,8 +120,13 @@ inline void ObservePremiseEvent(PremiseEvent event) {
   std::unique_lock lock(premise.mutex);
   auto& sample = premise.snapshot;
   if (sample.native == 0 || event.kind == PremiseKind::TAG) return;
-  if ((event.kind == PremiseKind::LEGACY || event.kind == PremiseKind::ENHANCED) && event.source != sample.native) return;
-  if (event.kind == PremiseKind::COPY && event.destination != sample.native) return;
+  if (event.kind == PremiseKind::LEGACY || event.kind == PremiseKind::ENHANCED || event.kind == PremiseKind::COPY
+      || event.kind == PremiseKind::UAV || event.kind == PremiseKind::ALIAS) {
+    const auto resource = (event.kind == PremiseKind::COPY ? event.destination : event.source);
+    const bool global = event.match == PremiseMatchSource::GLOBAL
+        && (event.kind == PremiseKind::UAV || event.kind == PremiseKind::ALIAS);
+    if (!global && resource != sample.native && (sample.identity == 0 || event.resource_identity != sample.identity)) return;
+  }
   if (event.kind == PremiseKind::SUBMIT && (event.recording.list == 0 || event.recording.generation == 0
       || event.recording.list != sample.tag.recording.list || event.recording.generation != sample.tag.recording.generation)) return;
   if ((event.kind == PremiseKind::RESET || event.kind == PremiseKind::SUBMIT) && event.list != sample.tag.list
@@ -162,11 +193,11 @@ inline void ObservePremiseReset(ID3D12GraphicsCommandList* list, bool success) {
 inline void ObservePremiseCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* source,
     ID3D12Resource* destination, bool full) {
   if (!NativePremiseEnabled()) return;
-  const auto watched = PremiseNative();
-  if (watched == 0 || reinterpret_cast<uintptr_t>(destination) != watched) return;
+  const auto matched = MatchPremiseResource(destination);
+  if (!matched) return;
   ObservePremiseEvent({.kind = PremiseKind::COPY, .list = reinterpret_cast<uintptr_t>(list),
       .recording = ReadPremiseRecording(list), .source = reinterpret_cast<uintptr_t>(source),
-      .destination = watched, .full = full});
+      .destination = matched.raw, .resource_identity = matched.identity, .match = matched.source, .full = full});
 }
 inline void ObservePremiseSubmit(ID3D12CommandQueue* queue, const std::vector<submission::PendingSubmission>& pending) {
   PremiseEvent target;
@@ -215,9 +246,15 @@ inline void AppendPremiseObservation(std::ostream& line) {
   const auto append = [&](const char* name, const PremiseEvent& event) {
     line << ' ' << name << "=[seq:" << event.sequence << ",qpc:" << event.qpc << ",thread:" << event.thread
          << ",list:" << event.list << ",recording:" << event.recording.list << '/' << event.recording.generation
-         << ",receipts:" << event.recording.receipts << ",submitted:" << event.recording.submitted
+         << ",receipts:" << event.recording.receipts << ",status_available:" << event.recording.status_available
+         << ",submitted:" << event.recording.submitted
          << ",pending:" << event.recording.pending << ",fence:" << event.recording.fence << ",value:" << event.recording.value;
-    if (event.kind == PremiseKind::LEGACY) {
+    const char* match = (event.match == PremiseMatchSource::RAW ? "raw"
+        : event.match == PremiseMatchSource::CANONICAL ? "canonical"
+        : event.match == PremiseMatchSource::GLOBAL ? "global" : "none");
+    line << ",source:" << event.source << ",destination:" << event.destination
+         << ",resource_identity:" << event.resource_identity << ",match:" << match;
+    if (event.kind == PremiseKind::LEGACY || event.kind == PremiseKind::UAV || event.kind == PremiseKind::ALIAS) {
       line << ",type:" << event.legacy.Type << ",flags:" << event.legacy.Flags;
       if (event.legacy.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
         line << ",subresource:" << event.legacy.Transition.Subresource << ",before:" << event.legacy.Transition.StateBefore
@@ -237,7 +274,7 @@ inline void AppendPremiseObservation(std::ostream& line) {
            << ",flags:" << barrier.Flags << ",range:" << range.IndexOrFirstMipLevel << '/' << range.NumMipLevels
            << '/' << range.FirstArraySlice << '/' << range.NumArraySlices << '/' << range.FirstPlane << '/' << range.NumPlanes;
     } else {
-      line << ",source:" << event.source << ",destination:" << event.destination << ",full:" << event.full << ",queue:" << event.queue;
+      line << ",full:" << event.full << ",queue:" << event.queue;
     }
     line << ']';
   };
