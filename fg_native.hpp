@@ -43,7 +43,8 @@ struct Stream {
   bool native_edit_reuse = false;
   uint64_t native_edit_frame = 0;
   uint64_t native_edit_source_generation = 0;
-  bool native_edit_source_is_tag_copy = false;
+  uint64_t native_edit_source_epoch = 0;
+  bool native_edit_source_is_tagged = false;
   ID3D12Resource* native_edit_ui_alpha = nullptr;
 #endif
   uint64_t native_pair_attempt_frame = 0;
@@ -1644,7 +1645,15 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
   unsigned long long frame_id = 0;
   if (NVSDK_NGX_FAILED(parameters->Get(NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID, &frame_id))) frame_id = 0;
 #if defined(NR_NEXUS_DEV_CONTROL)
-  const auto tagged_frame = native_tag_source::CurrentFrame(hudless, list);
+  uint64_t claimed_tag_epoch = 0;
+  if (index > 1) {
+    const auto previous = fg_service::streams.find({true, reinterpret_cast<uintptr_t>(owner)});
+    if (previous != fg_service::streams.end() && previous->second.native_edit_reuse
+        && previous->second.native_edit_source_is_tagged && previous->second.native_handle == handle) {
+      claimed_tag_epoch = previous->second.native_edit_source_epoch;
+    }
+  }
+  const auto tagged_frame = native_tag_source::CurrentFrame(hudless, list, claimed_tag_epoch);
   const bool native_tag_frame = tagged_frame.available;
   const auto native_frame = (native_tag_frame ? tagged_frame
       : fg::native_options::CurrentFrame(reinterpret_cast<uintptr_t>(owner->native_output_identity)));
@@ -1661,11 +1670,16 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
       && GetUIntIfPresent(parameters, NVSDK_NGX_DLSSG_Parameter_MvecJittered, &motion_jittered) && motion_jittered == 0;
   const auto native_source = created_feature_ids.find(handle);
   const bool native_edit_requested = edit_reuse_enabled.load() && edit_reuse_fg_experiment.load();
-  const bool native_edit_route = native_edit_requested && native_frame.available && frame_parameters
+  bool native_edit_route = native_edit_requested && native_frame.available && frame_parameters
       && native_source != created_feature_ids.end() && native_source->second == NVSDK_NGX_Feature_FrameGeneration
       && pair_plan.valid && !pair_plan.mixed && pair_plan.pass_count == 1 && !resolution_pair
       && !native_fg_public_off.load() && current_guides && !fg::xefg::Enabled()
       && !nr_adaptive_enabled.load();
+  if (native_edit_route && native_tag_frame && index == 1) {
+    // Claim this actual NGX input even when NR needs a warm-up. Tag return
+    // establishes identity; the SDK consumer list owns its GPU ordering.
+    native_edit_route = native_tag_source::ClaimFrame(native_frame, hudless, list);
+  }
   // Preserve the producer's uint32 identity including frame zero. Wrap is a
   // discontinuity to the cache, rather than an invented application clock.
   const uint64_t native_edit_sequence = (native_edit_route ? static_cast<uint64_t>(native_frame.frame) + 1 : 0);
@@ -1683,7 +1697,7 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
            << " epoch=" << native_frame.epoch << " generation=" << native_frame.generation
            << " parameters=" << frame_parameters << " index=" << declared_index
            << " real_guides=" << current_guides << " route=" << native_edit_route
-           << " source_provider=" << (native_tag_frame ? "tag_copy" : "sdk_scope")
+           << " source_provider=" << (native_tag_frame ? "tagged_resource" : "sdk_scope")
            << " tag_source_reason=" << tagged_frame.reason
            << " tag=[legacy:" << tag_observation.legacy_calls << ",framed:" << tag_observation.for_frame_calls
            << ",legacy_hudless:" << tag_observation.legacy_hudless_calls
@@ -1691,6 +1705,7 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
            << ",hudless:" << tag_observation.hudless_calls << ",scopes:" << tag_observation.scope_enters
            << ",copies:" << tag_observation.copy_calls << ",scoped:" << tag_observation.scoped_copies
            << ",matches:" << tag_observation.source_matches << ",published:" << tag_observation.publish_count
+           << ",claimed:" << tag_observation.claim_count << ",pending:" << tag_observation.query_pending
            << ",removed:" << tag_observation.removal_count << ",live:" << tag_observation.live_versions
            << ",framed_last:" << tag_observation.last_frame_bound << ",tag_token:" << tag_observation.tag_frame
            << ",tag_viewport:" << tag_observation.tag_viewport << ",token:" << tag_observation.frame
@@ -1701,6 +1716,7 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
            << '/' << tag_observation.recording_generation << ",hooks:" << tag_observation.hooks_ready
            << ",gate:" << tag_observation.gate_reason << ",scope:" << tag_observation.scope_reason
            << ",copy:" << tag_observation.copy_reason << ",finish:" << tag_observation.finish_reason
+           << ",claim:" << tag_observation.claim_reason << ",direct_block:" << tag_observation.direct_block_reason
            << ",remove:" << tag_observation.removal_reason << ",resets:" << tag_observation.reset_count << ']'
            << " hook_facts=" << fg::native_options::FrameHookFacts()
            << " sdk_ready=" << fg::native_options::ObservesPresentDecisions()
@@ -1801,14 +1817,22 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
 #if defined(NR_NEXUS_DEV_CONTROL)
   if (stream.native_edit_reuse != native_edit_route
       || (native_edit_route && (stream.native_edit_source_generation != native_frame.generation
-          || stream.native_edit_source_is_tag_copy != native_tag_frame))) {
+          || stream.native_edit_source_is_tagged != native_tag_frame))) {
     // A native frame-source transition cannot adopt a pre-existing model's
     // unguarded history or publish a cached image from the previous source.
     fg_service::Invalidate(&stream);
     stream.native_edit_reuse = native_edit_route;
     stream.native_edit_frame = 0;
+    stream.native_edit_source_epoch = 0;
     stream.native_edit_source_generation = native_frame.generation;
-    stream.native_edit_source_is_tag_copy = native_tag_frame;
+    stream.native_edit_source_is_tagged = native_tag_frame;
+  }
+  if (native_edit_route && native_tag_frame && stream.native_edit_frame == native_edit_sequence
+      && stream.native_edit_source_epoch != native_frame.epoch) {
+    // A replacement tag for the same token cannot borrow the old pixels.
+    fg_service::Invalidate(&stream);
+    diagnostic.reason = "native_tag_content_replaced";
+    return nullptr;
   }
 #endif
   const auto configuration = configuration_generation.load(std::memory_order_relaxed);
@@ -1894,7 +1918,8 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
       && stream.source_backbuffer == backbuffer && stream.source_hudless == hudless && stream.source_ui == ui;
 #if defined(NR_NEXUS_DEV_CONTROL)
   if (native_edit_route) {
-    repeated_frame = native_edit_sequence == stream.native_edit_frame && stream.cached != nullptr
+    repeated_frame = native_edit_sequence == stream.native_edit_frame
+        && (!native_tag_frame || native_frame.epoch == stream.native_edit_source_epoch) && stream.cached != nullptr
         && stream.result == fg::Result::PREPARED && stream.source_backbuffer == backbuffer
         && stream.source_hudless == hudless && stream.source_ui == ui && stream.native_edit_ui_alpha == ui_alpha;
     // MFG is read-only consumption of this identified base frame. A new
@@ -1947,6 +1972,7 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
         for (auto& role : stream.roles) ResetPresentStreamHistory(&role);
       }
       stream.native_edit_frame = native_edit_sequence;
+      stream.native_edit_source_epoch = native_frame.epoch;
     }
 #endif
     // A failed or invalidated pair cannot become a second attempt on the same
@@ -2085,7 +2111,7 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     }
 #if defined(NR_NEXUS_DEV_CONTROL)
     if (native_edit_route) {
-      const auto current_frame = (native_tag_frame ? native_tag_source::CurrentFrame(hudless, list)
+      const auto current_frame = (native_tag_frame ? native_tag_source::CurrentFrame(hudless, list, native_frame.epoch)
           : fg::native_options::CurrentFrame(reinterpret_cast<uintptr_t>(owner->native_output_identity)));
       if (!current_frame.available || current_frame.epoch != native_frame.epoch
           || current_frame.generation != native_frame.generation || current_frame.frame != native_frame.frame) {

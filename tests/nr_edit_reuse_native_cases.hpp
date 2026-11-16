@@ -229,7 +229,7 @@ int Run() {
     std::vector<uint8_t> source_ui(width * height * 4);
     bool initialized = false;
     bool clone_initialized = false;
-    enum class TagCopy { NONE, SUCCESS, FAILED, OVERWRITTEN };
+    enum class TagCopy { NONE, SUCCESS, FAILED, OVERWRITTEN, DIRECT, DIRECT_AMBIGUOUS };
     struct Request {
       uint32_t token = 0;
       bool reset = false;
@@ -281,7 +281,8 @@ int Run() {
         upload(motion.Get(), motion_values, before);
         initialized = true;
       }
-      auto* input_hudless = (request.tag_copy != TagCopy::NONE ? hudless_clone.Get() : hudless.Get());
+      const bool direct_tag = request.tag_copy == TagCopy::DIRECT || request.tag_copy == TagCopy::DIRECT_AMBIGUOUS;
+      auto* input_hudless = (request.tag_copy != TagCopy::NONE && !direct_tag ? hudless_clone.Get() : hudless.Get());
       parameters.Set(NVSDK_NGX_DLSSG_Parameter_HUDLess, input_hudless);
       parameters.Set(NVSDK_NGX_DLSSG_Parameter_Reset, request.reset ? 1u : 0u);
       parameters.Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, request.index);
@@ -319,38 +320,78 @@ int Run() {
       if (request.tag_copy != TagCopy::NONE) {
         const auto producer_thread = GetCurrentThreadId();
         if (request.update_source) {
-          FakeFrameToken frame;
-          frame.frame = request.token;
-          Check(frame_source::ObserveMarker(+[](sl::PCLMarker, const sl::FrameToken&) { return sl::Result::eOk; },
-                    sl::PCLMarker::ePresentStart, frame) == sl::Result::eOk,
-              "tag producer enters the actual successful Reflex marker observer");
-          {
-            const frame_source::SdkScope sdk_scope(output_identity);
-            sl::Resource resource(sl::ResourceType::eTex2d, hudless.Get(), NATIVE_INPUT_STATE);
-            const sl::ResourceTag tag(&resource, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eOnlyValidNow);
-            const sl::ViewportHandle viewport(0u);
-            tag_source::Scope tag_scope(gpu.list.Get(), static_cast<uint32_t>(frame),
-                static_cast<uint32_t>(viewport), &tag, 1);
-            gpu.Transition(hudless.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            gpu.Transition(hudless_clone.Get(), clone_initialized ? NATIVE_INPUT_STATE : D3D12_RESOURCE_STATE_COMMON,
-                D3D12_RESOURCE_STATE_COPY_DEST);
-            // Only the installed production CopyResource observer may bind
-            // this destination to the tag. Do not call ObserveCopy directly.
-            gpu.list->CopyResource(hudless_clone.Get(), hudless.Get());
-            gpu.Transition(hudless_clone.Get(), D3D12_RESOURCE_STATE_COPY_DEST, NATIVE_INPUT_STATE);
-            gpu.Transition(hudless.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, NATIVE_INPUT_STATE);
-            clone_initialized = true;
-            tag_scope.Finish(request.tag_copy != TagCopy::FAILED);
+          if (direct_tag) {
+            // UntilPresent does not create a clone producer. Complete the
+            // source uploads before the SDK receives the unchanged resource.
+            submit();
           }
-          Check(frame_source::ObserveMarker(+[](sl::PCLMarker, const sl::FrameToken&) { return sl::Result::eOk; },
-                    sl::PCLMarker::ePresentEnd, frame) == sl::Result::eOk,
-              "producer Present and Reflex scopes finish before deferred NGX consumption");
-          {
-            const addon::RuntimeLock lock(native::runtime_mutex);
-            Check(!tag_source::CurrentFrame(hudless_clone.Get(), proof_list.Get()).available,
-                "an unsubmitted or failed tag-copy cannot authorize a foreign recording");
+          const uint32_t pending_tags = (request.tag_copy == TagCopy::DIRECT_AMBIGUOUS ? 2u : 1u);
+          for (uint32_t pending = 0; pending < pending_tags; ++pending) {
+            FakeFrameToken frame;
+            frame.frame = request.token + pending;
+            Check(frame_source::ObserveMarker(+[](sl::PCLMarker, const sl::FrameToken&) { return sl::Result::eOk; },
+                      sl::PCLMarker::ePresentStart, frame) == sl::Result::eOk,
+                "tag producer enters the actual successful Reflex marker observer");
+            {
+              const frame_source::SdkScope sdk_scope(output_identity);
+              sl::Resource resource(sl::ResourceType::eTex2d, hudless.Get(), NATIVE_INPUT_STATE);
+              const sl::ResourceTag tag(&resource, sl::kBufferTypeHUDLessColor,
+                  direct_tag ? sl::ResourceLifecycle::eValidUntilPresent : sl::ResourceLifecycle::eOnlyValidNow);
+              const sl::ViewportHandle viewport(0u);
+              tag_source::Scope tag_scope(gpu.list.Get(), static_cast<uint32_t>(frame),
+                  static_cast<uint32_t>(viewport), &tag, 1);
+              if (!direct_tag) {
+                gpu.Transition(hudless.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                gpu.Transition(hudless_clone.Get(), clone_initialized ? NATIVE_INPUT_STATE : D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_DEST);
+                // Only the installed production CopyResource observer may bind
+                // this destination to the tag. Do not call ObserveCopy directly.
+                gpu.list->CopyResource(hudless_clone.Get(), hudless.Get());
+                gpu.Transition(hudless_clone.Get(), D3D12_RESOURCE_STATE_COPY_DEST, NATIVE_INPUT_STATE);
+                gpu.Transition(hudless.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, NATIVE_INPUT_STATE);
+                clone_initialized = true;
+              }
+              tag_scope.Finish(request.tag_copy != TagCopy::FAILED);
+            }
+            Check(frame_source::ObserveMarker(+[](sl::PCLMarker, const sl::FrameToken&) { return sl::Result::eOk; },
+                      sl::PCLMarker::ePresentEnd, frame) == sl::Result::eOk,
+                "producer Present and Reflex scopes finish before deferred NGX consumption");
+            if (request.tag_copy == TagCopy::DIRECT_AMBIGUOUS && pending == 0) {
+              uint64_t unclaimed_epoch = 0;
+              {
+                const addon::RuntimeLock lock(native::runtime_mutex);
+                const auto unique = tag_source::CurrentFrame(input_hudless, gpu.list.Get());
+                Check(unique.available && unique.frame == request.token
+                        && std::strcmp(unique.reason, "direct_tag_unique_unclaimed") == 0,
+                    "first direct tag is uniquely pending before a recorded overwrite");
+                unclaimed_epoch = unique.epoch;
+              }
+              gpu.Transition(backbuffer.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+              gpu.Transition(hudless.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_DEST);
+              gpu.list->CopyResource(hudless.Get(), backbuffer.Get());
+              gpu.Transition(hudless.Get(), D3D12_RESOURCE_STATE_COPY_DEST, NATIVE_INPUT_STATE);
+              gpu.Transition(backbuffer.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, NATIVE_INPUT_STATE);
+              source_hudless = source_back;
+              const auto overwrite_recording = submission::ObserveRecording(gpu.list.Get());
+              Check(overwrite_recording != nullptr && !overwrite_recording->submitted.load(),
+                  "the intervening direct-resource overwrite is recorded without a GPU submission");
+              {
+                const addon::RuntimeLock lock(native::runtime_mutex);
+                const auto overwritten = tag_source::CurrentFrame(input_hudless, gpu.list.Get());
+                Check(!overwritten.available && overwritten.epoch == unclaimed_epoch
+                        && std::strcmp(overwritten.reason, "direct_tag_unclaimed_overwrite") == 0,
+                    "unsubmitted overwrite invalidates but retains the unclaimed direct token");
+              }
+            }
           }
-          submit();
+          if (!direct_tag) {
+            {
+              const addon::RuntimeLock lock(native::runtime_mutex);
+              Check(!tag_source::CurrentFrame(hudless_clone.Get(), proof_list.Get()).available,
+                  "an unsubmitted or failed tag-copy cannot authorize a foreign recording");
+            }
+            submit();
+          }
           if (request.tag_copy == TagCopy::OVERWRITTEN) {
             gpu.Transition(backbuffer.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
             gpu.Transition(hudless_clone.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -368,10 +409,21 @@ int Run() {
                 "deferred NGX consumes on another thread with no producer TLS ticket");
             {
               const addon::RuntimeLock lock(native::runtime_mutex);
-              const auto tagged = tag_source::CurrentFrame(hudless_clone.Get(), gpu.list.Get());
-              const bool expected = request.tag_copy == TagCopy::SUCCESS;
+              uint64_t claimed_epoch = 0;
+              if (request.index > 1) {
+                const auto source = native::fg_service::streams.find({true, context});
+                Check(source != native::fg_service::streams.end(), "repeated MFG has an existing native owner");
+                claimed_epoch = source->second.native_edit_source_epoch;
+                Check(claimed_epoch != 0, "repeated MFG queries the production pair's claimed source epoch");
+              }
+              const auto tagged = tag_source::CurrentFrame(input_hudless, gpu.list.Get(), claimed_epoch);
+              const bool expected = request.tag_copy == TagCopy::SUCCESS || request.tag_copy == TagCopy::DIRECT;
               Check(tagged.available == expected && (!expected || tagged.frame == request.token),
-                  "only a successful unchanged completed clone retains its actual tagged FrameToken");
+                  "only a successful unique direct tag or unchanged completed clone retains its actual FrameToken");
+              if (request.tag_copy == TagCopy::DIRECT_AMBIGUOUS) {
+                Check(std::strcmp(tagged.reason, "tagged_resource_tokens_ambiguous") == 0,
+                    "two direct tokens are refused specifically for ambiguity rather than a missing source");
+              }
             }
             consume();
           } catch (...) {
@@ -415,10 +467,36 @@ int Run() {
           && std::memcmp(pixels.data(), source.data(), pixels.size()) == 0;
     };
     uint32_t token = 100;
+    bool direct_warmup_mfg_checked = false;
     const auto recover = [&](TagCopy tag_copy = TagCopy::NONE) {
       for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 12; ++attempt) {
         const auto observed = record({.token = ++token, .reset = true, .tag_copy = tag_copy});
         Check(observed.reuses == 0, "native recovery cannot reuse an invalidated edit anchor");
+        if (tag_copy == TagCopy::DIRECT && !direct_warmup_mfg_checked && !observed.replaced) {
+          uint64_t claimed_epoch = 0, native_frame = 0;
+          {
+            const addon::RuntimeLock lock(native::runtime_mutex);
+            const auto source = native::fg_service::streams.find({true, context});
+            Check(source != native::fg_service::streams.end() && source->second.native_edit_reuse
+                    && source->second.native_edit_source_is_tagged && source->second.native_edit_source_epoch != 0,
+                "direct warmup claims its tagged source before a final HUDLess cache exists");
+            claimed_epoch = source->second.native_edit_source_epoch;
+            native_frame = source->second.native_edit_frame;
+          }
+          const auto warmup_mfg = record({.token = token, .index = 2, .update_source = false, .tag_copy = TagCopy::DIRECT});
+          Check(!warmup_mfg.replaced && warmup_mfg.evaluates == 0 && warmup_mfg.reuses == 0,
+              "MFG immediately after direct index-one warmup does not record another NR evaluation");
+          {
+            const addon::RuntimeLock lock(native::runtime_mutex);
+            const auto source = native::fg_service::streams.find({true, context});
+            Check(source != native::fg_service::streams.end() && source->second.native_edit_reuse
+                    && source->second.native_edit_source_is_tagged
+                    && source->second.native_edit_source_epoch == claimed_epoch
+                    && source->second.native_edit_frame == native_frame,
+                "direct warmup MFG preserves the exact claimed epoch and tagged source mode");
+          }
+          direct_warmup_mfg_checked = true;
+        }
         if (observed.replaced && observed.evaluates == 1) return;
       }
       Check(false, "bounded native warmup reaches a one-model exact-alpha refresh");
@@ -550,6 +628,46 @@ int Run() {
           "failed or overwritten tag-copy rejects the old edit cache and preserves the current original BB");
       recover(TagCopy::SUCCESS);
     }
+    {
+      const addon::RuntimeLock lock(native::runtime_mutex);
+      tag_source::Reset();
+    }
+    recover(TagCopy::DIRECT);
+    Check(direct_warmup_mfg_checked, "direct source completes preparation after an observed warmup MFG turn");
+    const auto direct_refresh = record({.token = ++token, .reset = true, .tag_copy = TagCopy::DIRECT});
+    Check(direct_refresh.replaced && direct_refresh.evaluates == 1 && direct_refresh.reuses == 0
+            && direct_refresh.reset == 1,
+        "UntilPresent directly tagged original HUDLess refreshes on the deferred NGX thread without a clone");
+    auto direct_anchor = native::features.at(role_handle).slots[0].edit_reuse;
+    Check(direct_anchor != nullptr && direct_anchor->valid, "a directly tagged native input establishes its edit anchor");
+    const auto direct_anchor_generation = direct_anchor->anchor_generation;
+    const auto direct_reuse = record({.token = ++token, .tag_copy = TagCopy::DIRECT});
+    Check(direct_reuse.replaced && direct_reuse.evaluates == 0 && direct_reuse.reuses == 1
+            && matches(direct_reuse.consumed_back, source_back)
+            && matches(direct_reuse.consumed_hudless, source_hudless),
+        "next unique direct FrameToken reuses the current original HUDLess colors and alpha");
+    const auto direct_application_frame = stream.application_frame;
+    const auto direct_native_frame = stream.native_edit_frame;
+    const auto direct_epoch = stream.native_edit_source_epoch;
+    const auto direct_mfg = record({.token = token, .index = 2, .update_source = false, .tag_copy = TagCopy::DIRECT});
+    Check(direct_mfg.replaced && direct_mfg.evaluates == 0 && direct_mfg.reuses == 0
+            && stream.application_frame == direct_application_frame && stream.native_edit_frame == direct_native_frame
+            && stream.native_edit_source_epoch == direct_epoch && direct_anchor->anchor_generation == direct_anchor_generation,
+        "direct-tag MFG keeps its claimed epoch without advancing NR, source cadence or cache");
+    const auto direct_next = record({.token = ++token, .tag_copy = TagCopy::DIRECT});
+    Check(direct_next.replaced && direct_next.evaluates == 1 && direct_next.reuses == 0 && direct_next.reset == 0,
+        "the next real direct FrameToken refreshes after reuse without a false history Reset");
+    direct_anchor.reset();
+    const auto ambiguous_direct = record({.token = ++token, .tag_copy = TagCopy::DIRECT_AMBIGUOUS});
+    Check(!ambiguous_direct.replaced && ambiguous_direct.evaluates == 0 && ambiguous_direct.reuses == 0
+            && matches(ambiguous_direct.restored_back, source_back),
+        "a recorded overwrite cannot make a later direct token unique; ambiguity preserves the current BB");
+    ++token;
+    {
+      const addon::RuntimeLock lock(native::runtime_mutex);
+      tag_source::Reset();
+    }
+    recover(TagCopy::DIRECT);
     auto final_anchor = native::features.at(role_handle).slots[0].edit_reuse;
     Check(final_anchor != nullptr, "recovered native output owns its final private cache");
     std::weak_ptr<addon::edit_reuse::State> retired_anchor = final_anchor;
@@ -560,6 +678,8 @@ int Run() {
       tag_source::Reset();
       Check(!tag_source::CurrentFrame(hudless_clone.Get(), gpu.list.Get()).available,
           "tag-source retirement cannot expose a completed old clone ticket");
+      Check(!tag_source::CurrentFrame(hudless.Get(), gpu.list.Get()).available,
+          "tag-source retirement cannot expose an old directly tagged resource ticket");
       native::RetirePresentStream(nullptr);
       native::ForgetSourceHandleLocked(handle);
     }
@@ -577,6 +697,9 @@ int Run() {
                  " frame_source=Reflex_PresentStart_and_SDK_scope numeric_NGX_FrameID=absent"
                  " deferred_frame_source=tag_scope_MOCK_CopyResource_real cross_thread_after_PresentEnd=checked"
                  " deferred_refresh_reuse_refresh=1/0/1 tag_unsubmitted/failed/overwritten=denied"
+                 " direct_UntilPresent_no_clone=checked direct_refresh_reuse_refresh=1/0/1 direct_pending_ambiguity=denied"
+                 " direct_warmup_MFG_claim=stable"
+                 " direct_unclaimed_recorded_overwrite=invalidated_and_retained"
                  " refresh_reuse_refresh=1/0/1 repeated_MFG=stable current_color_alpha=checked"
                  " motion_rejection/reset/gap/off/missing_scope/FG_failure/retirement=checked"
                  " production_Execute_and_Fence=real NR=MOCK FG_consumer=readback no_game_or_visual_acceptance\n";

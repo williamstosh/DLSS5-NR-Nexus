@@ -13,7 +13,8 @@ struct Version {
   uint32_t viewport = 0;
   uint64_t epoch = 0;
   uint64_t generation = 0;
-  ID3D12Resource* clone = nullptr;  // Owned until exact-use retirement.
+  // Owned SDK clone, or original direct-tag resource; exact-use retirement.
+  ID3D12Resource* clone = nullptr;
   const void* identity = nullptr;
   const void* producer = nullptr;
   ID3D12GraphicsCommandList* list = nullptr;  // Identity only; never dereferenced.
@@ -24,6 +25,8 @@ struct Version {
   uint32_t copies = 0;
   bool published = false;
   bool valid = true;
+  bool direct = false;
+  bool claimed = false;
   const char* reason = "tag_copy_unobserved";
 };
 
@@ -40,6 +43,7 @@ struct Observation {
   uint64_t publish_count = 0;
   uint64_t removal_count = 0;
   uint64_t reset_count = 0;
+  uint64_t claim_count = 0;
   uint64_t sequence = 0;
   uint64_t tag_sequence = 0;
   uint64_t gate_sequence = 0;
@@ -49,6 +53,7 @@ struct Observation {
   uint64_t publish_sequence = 0;
   uint64_t removal_sequence = 0;
   uint64_t query_sequence = 0;
+  uint64_t claim_sequence = 0;
   uint32_t tag_frame = 0;
   uint32_t tag_viewport = 0;
   uint32_t frame = 0;
@@ -67,18 +72,24 @@ struct Observation {
   uint64_t copy_epoch = 0;
   uint64_t publish_epoch = 0;
   uint64_t removal_epoch = 0;
+  uint64_t claim_epoch = 0;
   uintptr_t removal_identity = 0;
   uintptr_t query_identity = 0;
   size_t live_versions = 0;
+  size_t query_pending = 0;
   bool last_frame_bound = false;
   bool hooks_ready = false;
   bool copy_full = false;
   bool finish_success = false;
+  bool query_direct = false;
+  bool direct_capacity_blocked = false;
   const char* gate_reason = "gate_unobserved";
   const char* scope_reason = "scope_unobserved";
   const char* copy_reason = "copy_unobserved";
   const char* finish_reason = "finish_unobserved";
   const char* removal_reason = "removal_unobserved";
+  const char* claim_reason = "claim_unobserved";
+  const char* direct_block_reason = "none";
 };
 
 struct State {
@@ -87,6 +98,8 @@ struct State {
   std::vector<std::pair<uint32_t, uint64_t>> viewports;
   uint64_t next_epoch = 0;
   uint64_t next_generation = 0;
+  bool direct_capacity_blocked = false;
+  const char* direct_unresolved_reason = nullptr;
   Observation observation;
 };
 static State state;
@@ -134,6 +147,10 @@ inline void NoteGate(const char* reason, ID3D12GraphicsCommandList* list, bool h
 inline Observation Snapshot() {
   auto observation = state.observation;
   observation.live_versions = state.versions.size();
+  observation.direct_capacity_blocked = state.direct_capacity_blocked;
+  if (state.direct_unresolved_reason != nullptr) {
+    observation.direct_block_reason = state.direct_unresolved_reason;
+  }
   return observation;
 }
 
@@ -153,11 +170,15 @@ struct Scope {
   const void* source_identity = nullptr;
   uint64_t epoch = 0;
   bool finished = false;
+  bool has_hudless = false;
+  bool direct_lifecycle = false;
 
   Scope(ID3D12GraphicsCommandList* list, uint32_t frame, uint32_t viewport,
       const sl::ResourceTag* tags, uint32_t count) {
     std::optional<RuntimeLock> lock;
-    if (!HoldingRuntimeLock()) lock.emplace(runtime_mutex);
+    if (!HoldingRuntimeLock()) {
+      lock.emplace(runtime_mutex);
+    }
     auto& observation = state.observation;
     ++observation.scope_enters;
     observation.scope_sequence = ++observation.sequence;
@@ -169,6 +190,7 @@ struct Scope {
     observation.recording_generation = 0;
     observation.scope_epoch = 0;
     observation.scope_reason = "scope_entered";
+    direct_lifecycle = std::ranges::any_of(state.versions, &Version::direct);
     previous = active;
     active = this;
 
@@ -190,8 +212,8 @@ struct Scope {
       }
       return;
     }
-    if (list == nullptr || tags == nullptr) {
-      observation.scope_reason = (list == nullptr ? "native_list_missing" : "tags_missing");
+    if (tags == nullptr) {
+      observation.scope_reason = "tags_missing";
       return;
     }
     const sl::ResourceTag* hudless = nullptr;
@@ -202,14 +224,22 @@ struct Scope {
         return;
       }
       hudless = &tags[index];
+      has_hudless = true;
       observation.lifecycle = static_cast<uint32_t>(hudless->lifecycle);
       observation.tag_native = (hudless->resource != nullptr
           ? reinterpret_cast<uintptr_t>(hudless->resource->native) : 0);
     }
     if (hudless == nullptr
         || (hudless->lifecycle != sl::ResourceLifecycle::eOnlyValidNow
-            && hudless->lifecycle != sl::ResourceLifecycle::eValidUntilEvaluate)) {
+            && hudless->lifecycle != sl::ResourceLifecycle::eValidUntilEvaluate
+            && hudless->lifecycle != sl::ResourceLifecycle::eValidUntilPresent)) {
       observation.scope_reason = (hudless == nullptr ? "hudless_tag_missing" : "tag_lifecycle_ineligible");
+      return;
+    }
+    const bool direct = hudless->lifecycle == sl::ResourceLifecycle::eValidUntilPresent;
+    direct_lifecycle = direct_lifecycle || direct;
+    if (!direct && list == nullptr) {
+      observation.scope_reason = "native_list_missing";
       return;
     }
     source = ToStreamlineResourceRef(*hudless);
@@ -231,17 +261,31 @@ struct Scope {
       observation.scope_reason = "source_shape_or_extent_ineligible";
       return;
     }
-    const auto recording = submission::RecordingIdentity(list);
-    observation.recording_list = recording.first;
-    observation.recording_generation = recording.second;
-    if (recording.first == 0 || (recording.first >> 63) != 0 || recording.second == 0) {
-      observation.scope_reason = "recording_identity_unavailable";
-      return;
+    std::pair<uint64_t, uint64_t> recording{};
+    if (!direct) {
+      recording = submission::RecordingIdentity(list);
+      observation.recording_list = recording.first;
+      observation.recording_generation = recording.second;
+      if (recording.first == 0 || (recording.first >> 63) != 0 || recording.second == 0) {
+        observation.scope_reason = "recording_identity_unavailable";
+        return;
+      }
     }
+    // A new tag reusing a consumed original resource cannot inherit the old
+    // pair's direct ticket. Unclaimed tokens survive, including ambiguity.
+    std::erase_if(state.versions, [&](Version& version) {
+      if (!version.direct || !version.claimed || version.identity != source_identity) return false;
+      NoteRemoval(version, "claimed_direct_resource_retagged");
+      RetirePresentResource(&version.clone);
+      return true;
+    });
     auto viewport_source = std::ranges::find(state.viewports, viewport,
         &std::pair<uint32_t, uint64_t>::first);
     if (viewport_source == state.viewports.end()) {
       if (state.viewports.size() == StreamlineViewportState::kFrames) {
+        if (direct) {
+          state.direct_capacity_blocked = true;
+        }
         observation.scope_reason = "viewport_capacity";
         return;
       }
@@ -249,9 +293,24 @@ struct Scope {
       viewport_source = std::prev(state.viewports.end());
     }
     if (state.versions.size() == StreamlineViewportState::kFrames) {
-      NoteRemoval(state.versions.front(), "version_capacity_evicted");
-      RetirePresentResource(&state.versions.front().clone);
-      state.versions.erase(state.versions.begin());
+      auto oldest = state.versions.begin();
+      if (direct) {
+        oldest = std::ranges::find_if(state.versions, [](const Version& version) {
+          return !version.direct || version.claimed;
+        });
+        if (oldest == state.versions.end()) {
+          state.direct_capacity_blocked = true;
+          observation.scope_reason = "unclaimed_direct_capacity";
+          return;
+        }
+      } else if (oldest->direct && !oldest->claimed) {
+        // Losing an unclaimed token must never make another direct token
+        // look unique. Clone admission retains its existing bounded policy.
+        state.direct_capacity_blocked = true;
+      }
+      NoteRemoval(*oldest, "version_capacity_evicted");
+      RetirePresentResource(&oldest->clone);
+      state.versions.erase(oldest);
     }
     epoch = ++state.next_epoch;
     state.versions.push_back({
@@ -259,33 +318,44 @@ struct Scope {
         .viewport = viewport,
         .epoch = epoch,
         .generation = viewport_source->second,
-        .producer = reinterpret_cast<const void*>(0xFFFC'0000'0000'0000ull | epoch),
+        .producer = (direct ? nullptr : reinterpret_cast<const void*>(0xFFFC'0000'0000'0000ull | epoch)),
         .list = list,
         .recording = recording,
-        .recording_status = submission::ObserveRecording(list),
+        .recording_status = (direct ? nullptr : submission::ObserveRecording(list)),
+        .direct = direct,
     });
+    if (direct) {
+      source.resource->AddRef();
+      state.versions.back().clone = source.resource;
+      state.versions.back().identity = source_identity;
+    }
     observation.scope_epoch = epoch;
-    observation.scope_reason = "copy_pending";
+    observation.scope_reason = (direct ? "direct_tag_pending" : "copy_pending");
   }
 
   void Finish(bool success) {
     if (finished) return;
     std::optional<RuntimeLock> lock;
-    if (!HoldingRuntimeLock()) lock.emplace(runtime_mutex);
+    if (!HoldingRuntimeLock()) {
+      lock.emplace(runtime_mutex);
+    }
     auto& observation = state.observation;
     observation.finish_sequence = ++observation.sequence;
     observation.finish_success = success;
     observation.finish_reason = (epoch == 0 ? "scope_ineligible" : "version_missing_at_finish");
     finished = true;
+    bool published = false;
     for (auto version = state.versions.begin(); version != state.versions.end(); ++version) {
       if (version->epoch != epoch) continue;
-      if (success && version->valid && version->copies == 1 && version->clone != nullptr) {
+      const bool content_observed = (version->direct ? version->copies == 0 : version->copies == 1);
+      if (success && version->valid && content_observed && version->clone != nullptr) {
         version->published = true;
-        version->reason = "tag_copy_producer_unfinished";
+        published = true;
+        version->reason = (version->direct ? "direct_tag_unclaimed" : "tag_copy_producer_unfinished");
         ++observation.publish_count;
         observation.publish_sequence = ++observation.sequence;
         observation.publish_epoch = version->epoch;
-        observation.finish_reason = "published";
+        observation.finish_reason = (version->direct ? "direct_published" : "published");
       } else {
         if (!success) {
           observation.finish_reason = "sdk_call_failed";
@@ -299,6 +369,11 @@ struct Scope {
         state.versions.erase(version);
       }
       break;
+    }
+    if (success && has_hudless && direct_lifecycle && !published) {
+      // A real successful tag which cannot be represented may have replaced
+      // SDK input. Do not grandfather a previous direct pair's resource ticket.
+      state.direct_unresolved_reason = "direct_tag_unresolved_successful_tag";
     }
     epoch = 0;
   }
@@ -317,7 +392,9 @@ inline void ObserveCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* source,
     ID3D12Resource* destination, bool full) {
   if (list == nullptr || destination == nullptr) return;
   std::optional<RuntimeLock> lock;
-  if (!HoldingRuntimeLock()) lock.emplace(runtime_mutex);
+  if (!HoldingRuntimeLock()) {
+    lock.emplace(runtime_mutex);
+  }
   auto& observation = state.observation;
   ++observation.copy_calls;
   observation.copy_sequence = ++observation.sequence;
@@ -334,6 +411,14 @@ inline void ObserveCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* source,
   std::erase_if(state.versions, [&](Version& version) {
     if (version.identity != destination_identity) return false;
     submission::TrackUse(list, version.clone);
+    if (version.direct && !version.claimed) {
+      // A recorded overwrite may execute after an older SDK consumer on a
+      // different queue. Keep the unresolved token so a later tag cannot
+      // become uniquely eligible just because this CPU copy was observed.
+      version.valid = false;
+      version.reason = "direct_tag_unclaimed_overwrite";
+      return false;
+    }
     NoteRemoval(version, "clone_overwritten");
     RetirePresentResource(&version.clone);
     return true;
@@ -352,6 +437,12 @@ inline void ObserveCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* source,
   const auto version = std::ranges::find(state.versions, scope->epoch, &Version::epoch);
   if (version == state.versions.end() || !version->valid) return;
   ++version->copies;
+  if (version->direct) {
+    version->valid = false;
+    version->reason = "direct_tag_unexpected_source_copy";
+    observation.copy_reason = version->reason;
+    return;
+  }
   if (!full || version->copies != 1 || list != version->list
       || submission::RecordingIdentity(list) != version->recording
       || destination_identity == scope->source_identity) {
@@ -393,7 +484,7 @@ inline void ObserveCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* source,
 inline void PreserveProof(const void* marker,
     const std::vector<submission::GenerationSubmission>& receipts) {
   for (auto& version : state.versions) {
-    if (version.producer != marker) continue;
+    if (version.direct || version.producer != marker) continue;
     if (receipts.size() != 1 || receipts.front().pending || receipts.front().fence.empty()
         || std::pair{receipts.front().list_identity, receipts.front().recording_generation} != version.recording) {
       version.valid = false;
@@ -407,22 +498,59 @@ inline void PreserveProof(const void* marker,
 
 // Caller holds runtime_mutex. No waits and no global-latest-frame fallback.
 inline fg::native_options::frame_source::Frame CurrentFrame(
-    ID3D12Resource* hudless, ID3D12GraphicsCommandList* list) {
+    ID3D12Resource* hudless, ID3D12GraphicsCommandList* list, uint64_t claimed_epoch = 0) {
   auto& observation = state.observation;
   observation.query_sequence = ++observation.sequence;
   observation.query_identity = 0;
+  observation.query_pending = 0;
+  observation.query_direct = false;
   fg::native_options::frame_source::Frame result{.reason = "tag_copy_source_unobserved"};
   if (hudless == nullptr || list == nullptr) return result;
   const auto identity = renodx::utils::directx::NativeIdentity(hudless);
   observation.query_identity = reinterpret_cast<uintptr_t>(identity);
   if (identity == nullptr) return result;
-  const auto version = std::ranges::find(state.versions, identity, &Version::identity);
+  auto version = state.versions.end();
+  size_t matching = 0;
+  for (auto candidate = state.versions.begin(); candidate != state.versions.end(); ++candidate) {
+    if (candidate->identity != identity) continue;
+    ++matching;
+    if (candidate->direct && !candidate->claimed) {
+      ++observation.query_pending;
+    }
+    if (claimed_epoch == 0 || claimed_epoch == candidate->epoch) {
+      version = candidate;
+    }
+  }
+  if (matching > 1) {
+    result.reason = "tagged_resource_tokens_ambiguous";
+    return result;
+  }
   if (version == state.versions.end()) return result;
+  observation.query_direct = version->direct;
   result.frame = version->frame;
   result.epoch = version->epoch;
   result.generation = version->generation;
   result.reason = version->reason;
   if (!version->valid || !version->published) return result;
+  if (version->direct) {
+    if (state.direct_unresolved_reason != nullptr) {
+      result.reason = state.direct_unresolved_reason;
+      return result;
+    }
+    if (state.direct_capacity_blocked) {
+      result.reason = "direct_tag_capacity_unresolved";
+      return result;
+    }
+    if (version->claimed != (claimed_epoch != 0)) {
+      result.reason = (version->claimed ? "direct_tag_requires_claimed_epoch" : "direct_tag_not_claimed");
+      return result;
+    }
+    // This is the actual NGX input resource, not a claim that tagging
+    // completed any GPU work. The caller retains NGX's consumer-list contract.
+    result.available = true;
+    result.reason = (version->claimed ? "direct_tag_claimed" : "direct_tag_unique_unclaimed");
+    return result;
+  }
   if (version->recording_status == nullptr
       || (version->recording_status->closed.load() && !version->recording_status->submitted.load())) {
     result.reason = "tag_copy_producer_discarded";
@@ -468,6 +596,33 @@ inline fg::native_options::frame_source::Frame CurrentFrame(
   return result;
 }
 
+// Caller holds runtime_mutex. Freeze only the exact ticket just inspected;
+// a second pending token on the same resource cannot be consumed by guessing.
+inline bool ClaimFrame(const fg::native_options::frame_source::Frame& frame,
+    ID3D12Resource* hudless, ID3D12GraphicsCommandList* list) {
+  auto& observation = state.observation;
+  observation.claim_sequence = ++observation.sequence;
+  observation.claim_epoch = frame.epoch;
+  observation.claim_reason = "frame_ticket_invalid";
+  if (!frame.available || frame.epoch == 0) return false;
+  const auto version = std::ranges::find(state.versions, frame.epoch, &Version::epoch);
+  if (version == state.versions.end()) return false;
+  const uint64_t preferred = (version->direct && !version->claimed ? 0 : frame.epoch);
+  const auto current = CurrentFrame(hudless, list, preferred);
+  if (!current.available || current.epoch != frame.epoch || current.frame != frame.frame
+      || current.generation != frame.generation) {
+    observation.claim_reason = "frame_ticket_changed_or_ambiguous";
+    return false;
+  }
+  // This reference can retire only after the actual consuming recording is
+  // discarded or all of its genuine submissions complete.
+  submission::TrackUse(list, version->clone);
+  version->claimed = true;
+  ++observation.claim_count;
+  observation.claim_reason = (version->direct ? "direct_claimed" : "clone_claimed");
+  return true;
+}
+
 // Caller holds runtime_mutex; an in-flight Scope can no longer publish after
 // its version is erased. Serial identities are never recycled by Reset.
 inline void Reset() {
@@ -478,6 +633,8 @@ inline void Reset() {
   }
   state.versions.clear();
   state.viewports.clear();
+  state.direct_capacity_blocked = false;
+  state.direct_unresolved_reason = nullptr;
 }
 
 }  // namespace native_tag_source

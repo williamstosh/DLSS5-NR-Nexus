@@ -22467,6 +22467,10 @@ inline sl::Result HookedStreamlineSetTagForFrame(
   std::optional<native_tag_source::Scope> tag_source;
   const bool has_hudless_tag = tags != nullptr && std::any_of(tags, tags + num_tags,
       [](const sl::ResourceTag& tag) { return tag.type == sl::kBufferTypeHUDLessColor; });
+  const bool has_direct_hudless = tags != nullptr && std::any_of(tags, tags + num_tags,
+      [](const sl::ResourceTag& tag) {
+        return tag.type == sl::kBufferTypeHUDLessColor && tag.lifecycle == sl::ResourceLifecycle::eValidUntilPresent;
+      });
   if (enabled.load() && edit_reuse_enabled.load() && edit_reuse_fg_experiment.load()
       && hook_point.load() == kHookPresent && !shutting_down.load() && has_hudless_tag && !fg::xefg::Enabled()) {
     tag_list.reset(NativeStreamlineTagList(command_buffer));
@@ -22476,10 +22480,11 @@ inline sl::Result HookedStreamlineSetTagForFrame(
       if (tag_list != nullptr) {
         hooks_ready = InstallCommandListStateHooks(tag_list.get()) && InstallMixedPresentCopyHooks(tag_list.get());
       }
-      native_tag_source::NoteGate(tag_list == nullptr ? "tag_list_unavailable"
+      native_tag_source::NoteGate(has_direct_hudless ? "direct_tag_no_copy_required"
+          : tag_list == nullptr ? "tag_list_unavailable"
           : hooks_ready ? "tag_hooks_ready" : "tag_hooks_unavailable", tag_list.get(), hooks_ready);
     }
-    if (hooks_ready) {
+    if (has_direct_hudless || hooks_ready) {
       tag_source.emplace(tag_list.get(), static_cast<uint32_t>(frame), static_cast<uint32_t>(viewport), tags, num_tags);
     }
   }
