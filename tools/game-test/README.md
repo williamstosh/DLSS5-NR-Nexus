@@ -230,6 +230,15 @@ NR 编辑复用静态对照使用 PowerShell 入口的 `-NrEditReuse 0|1`（逐�
 
 下列步骤会写本地输出；完整入口还会临时替换游戏文件并启动游戏。执行前核对进程、候选 manifest、目标安装和存档，并取得本轮实机授权。
 
+每轮实机按以下顺序处理限帧与同步，帧率收益、隔帧编辑和自适应验证使用同一口径；若场景本身需要限帧，记录所需上限及理由：
+
+1. 启动前记录游戏保存配置中的 `LimitFPS`、`VSync` 与相关同步选项，备份原文件、哈希和时间。复用已有本地 NVAPI DRS 工具的 `Inspect`，按实际游戏可执行文件核对全局与游戏配置的有效值、显式覆盖／继承来源和查询时间；旧快照只作历史证据。
+2. 临时解除游戏上限（巫师3直接 wrapper 显式传 `-UncapGameFps -RestoreInstallation`，将 `LimitFPS` 设为 `0`），关闭游戏 VSync，并用既有 `Off` 操作仅添加目标游戏的驱动限帧／VSync 关闭覆盖，保留全局及其他游戏。`-UncapGameFps` 只处理游戏限帧，不操作驱动或 VSync。原工具限定的游戏与原值不匹配时先核实，不套用其他场次的恢复值。
+3. 修改后以新的 `Inspect` 核实 DRS 有效值和来源；在本次运行的可用游戏状态／日志中核实读取值，再记录暖机后的真实 SDK 输出统计和帧间隔。配置写入、API 返回或历史快照不能代替运行时生效证据；没有可观测读取值时明确记为未确认。仍贴近上限时保留实际状态，不自行更改其他同步设置或将该场记为无约束性能对照。
+4. 正常退出后恢复原游戏文件并校验哈希及时间；执行既有 `Restore`，删除本轮临时驱动覆盖以恢复原继承。原本为显式值的场景须先确认工具支持按本轮备份精确恢复，不能用删除覆盖代替。再做新的 `Inspect`，核对原值、继承状态以及全局／其他配置未变。驱动恢复须单独核验，`-RestoreInstallation` 不负责它。
+
+输出 FPS 受限时保持不变，不能据此判定隔帧无收益或自适应无作用。分别报告完整 NR 链 GPU 耗时、刷新／复用帧节奏与同一来源的输出 FPS；已测局部 GPU 降耗仍有效，但不能直接换算整机帧率收益。缺少当场驱动快照时，后续读到的限帧只能作为解释线索，不回填旧场次的因果或性能结论。
+
 所有 smoke 游戏验收每轮都要显式指定本轮存档文件名（PowerShell 入口 -Save，Python 入口 --save）。入口会在启动前核验文件存在并记录存档身份；不使用 target 配置中的默认存档。
 
 ```powershell
@@ -271,7 +280,7 @@ IME 等交互专项可在 `menu` 场景显式传 `-CaptureHoldSeconds 900`，只
 XeFG 和 FSR FG；保持 HDR／分辨率。退出后完整恢复，日志须另外确认真实源 Feature 与运行路径。
 `-TelemetrySeconds 1` 可为短场景临时请求逐秒性能／阶段遥测，沿用完整恢复保护；默认不覆盖游戏现有值。
 
-固定场景的 XeFG 编辑复用成本对照可在同一候选下分别使用 `-NrEditReuse 0|1 -StartNrDisabled -XeFgGpuCapture -GpuTimers`，并通过既有 `-ControlMaskGpuSamples/-ControlMaskGpuSeconds/-ControlMaskGpuWarmupSeconds` 限定采样。采集器确认场景后开启 NR，等待 `control-mask-*.json` 的 `xefg_single_backbuffer_service` 终态，再关闭 NR 和退出；有效记录包含原色暂存至最终写回的 GPU 成本、刷新／复用身份及基础帧 Service 入口间隔。后者与 ReShade Present 入口间隔、XeFG SDK 输出帧计数均分别报告，不作为屏幕 scanout 测量。需要排除游戏上限时显式传 `-UncapGameFps`，仅将巫师3 `LimitFPS` 临时设为 unlimited；原文件整体备份并在退出后校验恢复。上述覆盖只允许完整恢复的测试会话，默认均不启用，测量窗口内不截图。
+固定场景的 XeFG 编辑复用成本对照可在同一候选下分别使用 `-NrEditReuse 0|1 -StartNrDisabled -XeFgGpuCapture -GpuTimers`，并通过既有 `-ControlMaskGpuSamples/-ControlMaskGpuSeconds/-ControlMaskGpuWarmupSeconds` 限定采样。采集器确认场景后开启 NR，等待 `control-mask-*.json` 的 `xefg_single_backbuffer_service` 终态，再关闭 NR 和退出；有效记录包含原色暂存至最终写回的 GPU 成本、刷新／复用身份及基础帧 Service 入口间隔。后者与 ReShade Present 入口间隔、XeFG SDK 输出帧计数均分别报告，不作为屏幕 scanout 测量。游戏和驱动限帧／同步按本节前置与恢复步骤处理；上述覆盖只允许完整恢复的测试会话，工具参数默认均不启用，测量窗口内不截图。
 仅指定的键会临时变化；Runtime 先核对版本和 SHA-256，与已安装文件相同则直接复用，
 不同才备份替换并在退出后恢复。恢复哈希核验完成且游戏／CrashReporter 已退出时自动删除冗余二进制备份，保留版本、哈希及回执；恢复未完成时继续保护备份。必须同时使用 `-RestoreInstallation`，不以创建
 参数日志代替实际网络确认或画质／性能验收。
