@@ -100,7 +100,7 @@ namespace renodx::addons::dlss5::screenshot {
 
 enum class RequestKind : uint32_t { FINAL_PRESENTATION, PRE_FG_SERVICE
 #if defined(NR_NEXUS_DEV_CONTROL)
-                                   , INLINE_RESTORE_ROI
+                                   , INLINE_RESTORE_ROI, FG_CONSUMER_ROI
 #endif
 };
 
@@ -118,6 +118,28 @@ struct CaptureRect {
 };
 
 #if defined(NR_NEXUS_DEV_CONTROL)
+struct FgConsumerContext {
+  uintptr_t feature_handle = 0;
+  uintptr_t parameters_identity = 0;
+  uint32_t module_slot = 0;
+  uint32_t mfg_index = 0;
+  bool mfg_index_available = false;
+  // Screenshot retirement clock only; this is not an FG source frame token.
+  uint64_t present_generation = 0;
+  // Derived from the selected typed input at Begin, never supplied as proof by a caller.
+  uintptr_t input_resource_identity = 0;
+  DXGI_FORMAT input_format = DXGI_FORMAT_UNKNOWN;
+  uint32_t input_width = 0, input_height = 0;
+  CaptureRect roi;
+};
+
+struct FgConsumerStatus {
+  std::string capture_id;
+  const char* status = "idle";
+  std::string reason;
+  uint64_t serial = 0;
+};
+
 struct InlineRestoreContext {
   bool d3d11_bridge = false, mixed = false, present = false;
   bool preparing = false, warmup = false, reset_sent = false;
@@ -383,6 +405,28 @@ struct InlineRestoreCapture : InlineRestoreFrame {
   std::vector<InlineRestoreFrame> frames;
 };
 
+struct FgConsumerCapture {
+  std::filesystem::path output_directory;
+  std::string capture_id;
+  uint64_t deadline_ms = 0;
+  FgConsumerContext context;
+  std::pair<uint64_t, uint64_t> recording;
+  std::shared_ptr<submission::RecordingStatus> recording_status;
+  uintptr_t backbuffer_identity = 0, hudless_identity = 0, output_identity = 0;
+  DXGI_FORMAT backbuffer_format = DXGI_FORMAT_UNKNOWN;
+  uint32_t backbuffer_width = 0, backbuffer_height = 0;
+  DXGI_FORMAT output_format = DXGI_FORMAT_UNKNOWN;
+  uint32_t output_width = 0, output_height = 0;
+  std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 2> output_footprints;
+  std::array<uint64_t, 2> output_plane_bytes{};
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT output_footprint{};
+  uint64_t output_bytes = 0;
+  bool input_hudless = false;
+  bool api_returned = false, api_succeeded = false;
+  uint32_t api_result = 0;
+  std::string reason;
+};
+
 inline std::span<const InlineRestoreFrame> InlineFrames(const InlineRestoreCapture& capture) {
   if (capture.tail_frame_count != 0) return capture.frames;
   return {&static_cast<const InlineRestoreFrame&>(capture), 1};
@@ -448,6 +492,7 @@ struct PendingCapture {
 #if defined(NR_NEXUS_DEV_CONTROL)
   std::optional<InlineRestoreCapture> inline_restore;
   std::optional<InlineRestoreFrame> bridge_model_stages;
+  std::optional<FgConsumerCapture> fg_consumer;
 #endif
   uint64_t service_serial = 0;
   uint64_t restore_config_epoch = 0;
@@ -556,6 +601,8 @@ inline std::atomic_bool inline_restore_active = false;
 inline std::atomic_uint64_t inline_restore_request_id = 0;
 inline std::optional<InlineRestoreCapture> requested_inline_restore;
 inline InlineRestoreStatus inline_restore_status;
+inline std::optional<FgConsumerCapture> requested_fg_consumer;
+inline FgConsumerStatus fg_consumer_status;
 #endif
 inline std::optional<HdrCapturePlan> configured_hdr_plan;
 inline std::deque<PendingCapture> hdr_in_flight;
@@ -1177,6 +1224,38 @@ inline bool StageSubmissionCompleted(PendingCapture* capture) {
     }
     return !proof->empty() && GpuLeaseCompleted(*proof);
   };
+  if (capture->fg_consumer) {
+    bool completed = capture->service_sealed && capture->pre_recorded;
+    if (capture->pre_recorded) {
+      completed = observe(capture->pre_nr_readback, &capture->pre_submission_proof) && completed;
+      completed = completed && capture->pre_submission_proof.waits.size() == 1;
+    }
+    if (capture->ready) {
+      completed = observe(capture->nr_output_readback, &capture->post_submission_proof) && completed;
+      completed = completed && capture->post_submission_proof.waits.size() == 1;
+    }
+    if (capture->pre_submission_proof.waits.size() > 1 || capture->post_submission_proof.waits.size() > 1) {
+      capture->fg_consumer->reason = "fg_consumer_copy_recording_replayed";
+      capture->required_planes_complete = false;
+      capture->aborted = true;
+    }
+    for (const auto* proof : {&capture->pre_submission_proof, &capture->post_submission_proof}) {
+      for (const auto& [fence, value] : proof->waits) {
+        if (fence.fence == nullptr || fence->GetCompletedValue() == UINT64_MAX) {
+          completed = false;
+          capture->fg_consumer->reason = "fg_consumer_copy_device_removed";
+        } else if (fence->GetCompletedValue() < value) {
+          completed = false;
+        }
+      }
+    }
+    for (auto& plane : capture->planes) {
+      if (plane.recorded) {
+        completed = observe(plane.readback, &plane.submission_proof) && completed;
+      }
+    }
+    return completed;
+  }
   bool completed = capture->pre_recorded && capture->ready;
   if (capture->inline_restore) {
     const auto& roi = *capture->inline_restore;
@@ -2252,6 +2331,133 @@ inline void ProcessJob(std::optional<PendingCapture> work) noexcept {
       ReleaseReadbacks(*work);
       return;
     }
+    if (work->fg_consumer) {
+      const auto& frame = *work->fg_consumer;
+      const auto& context = frame.context;
+      const bool completed = work->completion_proven && !work->metadata_only
+          && CaptureCompletionProven(*work) && StageSubmissionCompleted(&*work);
+      std::array<std::vector<uint8_t>, 2> raw;
+      std::array<std::string, 2> errors;
+      const std::array<const char*, 2> names{"input", "output_interpolated"};
+      const std::array<ID3D12Resource*, 2> readbacks{work->pre_nr_readback, work->nr_output_readback};
+      const std::array<bool, 2> recorded{work->pre_recorded, work->ready};
+      const std::array<DXGI_FORMAT, 2> formats{work->format, frame.output_format};
+      const std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 2> footprints{work->footprint, frame.output_footprint};
+      const std::array<uint64_t, 2> plane_bytes{work->total_bytes, frame.output_bytes};
+      for (size_t index = 0; index < raw.size(); ++index) {
+        if (!completed) {
+          errors[index] = "gpu_unconfirmed";
+        } else if (!recorded[index] || readbacks[index] == nullptr) {
+          errors[index] = "copy_not_recorded";
+        } else {
+          const size_t row_bytes = static_cast<size_t>(work->width) * DiagnosticPixelBytes(formats[index]);
+          raw[index].resize(row_bytes * work->height);
+          void* mapped = nullptr;
+          if (FAILED(readbacks[index]->Map(0, nullptr, &mapped))) {
+            raw[index].clear();
+            errors[index] = "readback_map_failed";
+          } else {
+            const bool unwritten = mapped == nullptr || Unwritten(mapped, plane_bytes[index]);
+            if (!unwritten) {
+              for (uint32_t row = 0; row < work->height; ++row) {
+                std::memcpy(raw[index].data() + row * row_bytes,
+                    static_cast<const uint8_t*>(mapped) + footprints[index].Offset + uint64_t(row) * footprints[index].Footprint.RowPitch,
+                    row_bytes);
+              }
+            }
+            readbacks[index]->Unmap(0, nullptr);
+            if (unwritten) {
+              raw[index].clear();
+              errors[index] = "unwritten_readback";
+            }
+          }
+        }
+      }
+      const bool valid = frame.api_returned && frame.api_succeeded && work->service_sealed
+          && !work->aborted && errors[0].empty() && errors[1].empty();
+      const std::string stem = frame.capture_id + "_" + std::to_string(work->serial);
+      std::ostringstream meta;
+      meta << "capture_schema=fg_consumer_roi_v1\ncapture_id=" << frame.capture_id
+           << "\ncapture_serial=" << work->serial << "\nfeature_handle=" << context.feature_handle
+           << "\nparameters_identity=" << context.parameters_identity << "\nmodule_slot=" << context.module_slot
+           << "\nmfg_index_available=" << context.mfg_index_available << "\nmfg_index=" << context.mfg_index
+           << "\nsource_frame_token_available=0\nlifecycle_present_generation=" << context.present_generation
+           << "\ncompletion_lifecycle_generation=" << work->completion_generation
+           << "\nrecording_list=" << frame.recording.first << "\nrecording_generation=" << frame.recording.second
+           << "\nrecording_submitted=" << (frame.recording_status && frame.recording_status->submitted.load())
+           << "\nrecording_retired=" << (frame.recording_status && frame.recording_status->closed.load())
+           << "\nbackbuffer_resource=" << frame.backbuffer_identity << "\nhudless_resource=" << frame.hudless_identity
+           << "\nbackbuffer_format_dxgi=" << frame.backbuffer_format
+           << "\nbackbuffer_width=" << frame.backbuffer_width << "\nbackbuffer_height=" << frame.backbuffer_height
+           << "\ninput_role=" << (frame.input_hudless ? "HUDLess" : "Backbuffer")
+           << "\ninput_resource=" << context.input_resource_identity << "\noutput_interpolated_resource=" << frame.output_identity
+           << "\noutput_interpolated_format_dxgi=" << frame.output_format
+           << "\noutput_interpolated_width=" << frame.output_width << "\noutput_interpolated_height=" << frame.output_height
+           << "\ninput_format_dxgi=" << context.input_format << "\nfull_width=" << context.input_width
+           << "\nfull_height=" << context.input_height << "\nroi_x=" << context.roi.x << "\nroi_y=" << context.roi.y
+           << "\nroi_width=" << context.roi.width << "\nroi_height=" << context.roi.height
+           << "\ninput_state_contract=NON_PIXEL_SHADER_RESOURCE\noutput_state_contract=UNORDERED_ACCESS"
+           << "\napi_returned=" << frame.api_returned << "\napi_result=" << frame.api_result
+           << "\napi_succeeded=" << frame.api_succeeded << "\nrecorded_copies_gpu_completed=" << completed
+           << "\nsingle_submission_receipts_verified="
+           << (work->pre_submission_proof.waits.size() == 1 && work->post_submission_proof.waits.size() == 1)
+           << "\nraw_input_output_copy_valid=" << valid
+           << "\ninterpolation_validity_flag_verified=0\npresentation_verified=0\ncolor_conversion=none\nreason=" << frame.reason << '\n';
+      const std::array<const GpuLease*, 2> proofs{&work->pre_submission_proof, &work->post_submission_proof};
+      for (size_t index = 0; index < raw.size(); ++index) {
+        uint64_t hash = 14695981039346656037ull;
+        for (uint8_t byte : raw[index]) {
+          hash = (hash ^ byte) * 1099511628211ull;
+        }
+        meta << names[index] << ".file=" << (raw[index].empty() ? "" : stem + "_" + names[index] + ".raw")
+             << '\n' << names[index] << ".bytes=" << raw[index].size()
+             << '\n' << names[index] << ".fnv1a64=" << hash
+             << '\n' << names[index] << ".error=" << errors[index]
+             << '\n' << names[index] << ".fence_count=" << proofs[index]->waits.size() << '\n';
+        for (size_t fence_index = 0; fence_index < proofs[index]->waits.size(); ++fence_index) {
+          const auto& [fence, value] = proofs[index]->waits[fence_index];
+          meta << names[index] << ".fence." << fence_index << ".identity=" << reinterpret_cast<uintptr_t>(fence.fence)
+               << '\n' << names[index] << ".fence." << fence_index << ".value=" << value << '\n';
+        }
+      }
+      const auto redacted = report::RedactText(meta.str(), report::SystemRedaction());
+      if (redacted.empty()) throw std::runtime_error("FG consumer metadata redaction failed");
+      std::filesystem::create_directories(frame.output_directory);
+      struct ExportCleanup {
+        std::vector<std::filesystem::path> files;
+        bool committed = false;
+        ~ExportCleanup() {
+          if (committed) return;
+          std::error_code error;
+          for (const auto& file : files) {
+            std::filesystem::remove(file, error);
+          }
+        }
+      } cleanup;
+      for (size_t index = 0; index < raw.size(); ++index) {
+        if (raw[index].empty()) continue;
+        const auto path = frame.output_directory / (stem + "_" + names[index] + ".raw");
+        cleanup.files.push_back(path);
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        output.write(reinterpret_cast<const char*>(raw[index].data()), raw[index].size());
+        output.close();
+        if (output.fail()) throw std::runtime_error("FG consumer raw write failed");
+      }
+      const auto meta_path = frame.output_directory / (stem + ".meta.txt");
+      cleanup.files.push_back(meta_path);
+      std::ofstream output(meta_path, std::ios::binary | std::ios::trunc);
+      output << redacted;
+      output.close();
+      if (output.fail()) throw std::runtime_error("FG consumer metadata write failed");
+      cleanup.committed = true;
+      record.meta = meta_path;
+      record.outcome = (valid ? "written" : "blocked");
+      record.reason = (valid ? "actual_consumer_input_and_OutputInterpolated_roi_written"
+                             : (frame.reason.empty() ? "consumer_copy_not_proven" : frame.reason));
+      PublishFinished(std::move(record));
+      ReleaseReadbacks(*work);
+      return;
+    }
 #endif
     if (!work->stage_planes && (work->aborted || !work->ready)) {
       if (work->aborted) {
@@ -2693,13 +2899,17 @@ inline void ProcessJob(std::optional<PendingCapture> work) noexcept {
   } catch (const std::exception& ex) {
     record.outcome = "exception";
 #if defined(NR_NEXUS_DEV_CONTROL)
-    if (work->inline_restore) record.reason = ex.what();
+    if (work->inline_restore || work->fg_consumer) {
+      record.reason = ex.what();
+    }
 #endif
     SafeLog(reshade::log::level::error, std::string("NR screenshot exception: ") + ex.what());
   } catch (...) {
     record.outcome = "exception";
 #if defined(NR_NEXUS_DEV_CONTROL)
-    if (work->inline_restore) record.reason = "unknown_export_exception";
+    if (work->inline_restore || work->fg_consumer) {
+      record.reason = "unknown_export_exception";
+    }
 #endif
     SafeLog(reshade::log::level::error, "NR screenshot unknown exception");
   }
@@ -3188,6 +3398,14 @@ inline void PreserveStageSubmissionProofs() {
 
 inline void Disarm() {
   std::scoped_lock lock(internal::state_mutex);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (internal::requested_fg_consumer) {
+    internal::requested_fg_consumer.reset();
+    internal::configured_hdr_plan.reset();
+    internal::fg_consumer_status.status = "cancelled";
+    internal::fg_consumer_status.reason = "request_disarmed";
+  }
+#endif
   if (internal::requested_kind.load() == RequestKind::PRE_FG_SERVICE) internal::configured_hdr_plan.reset();
   internal::capture_requested.store(false, std::memory_order_release);
   if (!internal::pending.has_value()) internal::stage_busy.store(false, std::memory_order_release);
@@ -3265,6 +3483,18 @@ inline bool RequestPreFgService(const HdrCapturePlan& plan) {
 // substitute a pre-tonemap NGX texture and call it a displayed NR off/on pair.
 inline void FailRequest(const char* outcome, const char* explanation) {
   std::scoped_lock lock(internal::state_mutex);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (internal::requested_kind.load() == RequestKind::FG_CONSUMER_ROI) {
+    internal::requested_fg_consumer.reset();
+    internal::configured_hdr_plan.reset();
+    internal::fg_consumer_status.status = outcome;
+    internal::fg_consumer_status.reason = explanation;
+    if (internal::pending && internal::pending->fg_consumer) {
+      internal::pending->service_sealed = true;
+      internal::pending->fg_consumer->reason = explanation;
+    }
+  }
+#endif
   if (internal::requested_kind.load() == RequestKind::PRE_FG_SERVICE) internal::configured_hdr_plan.reset();
   if (!internal::capture_requested.exchange(false, std::memory_order_acq_rel) && !internal::pending) return;
   if (internal::pending.has_value()) {
@@ -3357,7 +3587,11 @@ inline bool PrepareCapture(
     uint8_t hdr_mode,
     uint64_t generation,
     float linear_unit_nits = 80.f,
-    bool model_diagnostic = false) {
+    bool model_diagnostic = false
+#if defined(NR_NEXUS_DEV_CONTROL)
+    , uint64_t fg_consumer_request = 0
+#endif
+) {
   if (device == nullptr || source == nullptr || width == 0 || height == 0)
     return false;
   const D3D12_RESOURCE_DESC source_desc = source->GetDesc();
@@ -3381,8 +3615,18 @@ inline bool PrepareCapture(
 
   std::scoped_lock lock(internal::state_mutex);
   const bool prefg = internal::requested_kind.load() == RequestKind::PRE_FG_SERVICE;
-  const auto hdr_plan = ((hdr_mode != 0 || prefg) ? internal::configured_hdr_plan : std::nullopt);
+  const bool fg_consumer =
+#if defined(NR_NEXUS_DEV_CONTROL)
+      internal::requested_kind.load() == RequestKind::FG_CONSUMER_ROI;
+#else
+      false;
+#endif
+  const auto hdr_plan = ((hdr_mode != 0 || prefg || fg_consumer) ? internal::configured_hdr_plan : std::nullopt);
   if (prefg && (internal::pending || !internal::capture_requested.load() || !hdr_plan)) return false;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (fg_consumer && (fg_consumer_request == 0 || fg_consumer_request != internal::request_id.load()
+      || internal::pending || !internal::capture_requested.load() || !hdr_plan)) return false;
+#endif
   const bool capture_stages = stage_planes_enabled.load(std::memory_order_relaxed) || hdr_plan.has_value();
   if (hdr_plan) {
     const auto roi = hdr_plan->roi;
@@ -3414,6 +3658,17 @@ inline bool PrepareCapture(
     device->GetCopyableFootprints(&roi_desc, 0, 1, 0, &footprint, &rows, nullptr, &total_bytes);
     crop_x = roi.x; crop_y = roi.y; width = roi.width; height = roi.height;
   }
+  uint64_t post_readback_bytes = total_bytes;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (fg_consumer) {
+    auto maximum_output = source_desc;
+    maximum_output.Width = width;
+    maximum_output.Height = height;
+    maximum_output.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    device->GetCopyableFootprints(&maximum_output, 0, 1, 0, nullptr, nullptr, nullptr, &post_readback_bytes);
+    post_readback_bytes = std::max(post_readback_bytes, total_bytes);
+  }
+#endif
   if (capture_stages) {
     std::scoped_lock job_lock(internal::job_mutex);
     if (internal::pending.has_value() || (!hdr_plan && (internal::job.has_value()
@@ -3441,8 +3696,11 @@ inline bool PrepareCapture(
     // their growth transients; fixed slack covers profiles, streams and metadata.
     capture.cpu_export_bytes = static_cast<uint64_t>(width) * height * 128 + 262144 + capture.cpu_row_bytes;
     const auto allocation_bytes = internal::ReadbackAllocationBytes(device, total_bytes);
+    const auto post_allocation_bytes = (post_readback_bytes == total_bytes
+        ? allocation_bytes : internal::ReadbackAllocationBytes(device, post_readback_bytes));
     if (allocation_bytes > internal::MAX_STAGE_READBACK_BYTES / 2
-        || !capture.reservation->Reserve(allocation_bytes * 2)) {
+        || post_allocation_bytes > internal::MAX_STAGE_READBACK_BYTES / 2
+        || !capture.reservation->Reserve(allocation_bytes + post_allocation_bytes)) {
       internal::SafeLog(reshade::log::level::warning, "HDR capture refused: aggregate_readback_budget_exceeded");
       return false;
     }
@@ -3452,7 +3710,7 @@ inline bool PrepareCapture(
     }
   }
   capture.stage_planes = capture_stages;
-  capture.allocated_bytes = total_bytes * 2;
+  capture.allocated_bytes = total_bytes + post_readback_bytes;
   capture.model_diagnostic = model_diagnostic;
   capture.width = width;
   capture.height = height;
@@ -3471,8 +3729,8 @@ inline bool PrepareCapture(
   capture.serial = internal::capture_serial.fetch_add(1) + 1;
   capture.creation_generation = generation;
 
-  if (!internal::MakeReadbackBuffer(device, total_bytes, &capture.pre_nr_readback, !capture.stage_planes)
-      || !internal::MakeReadbackBuffer(device, total_bytes, &capture.nr_output_readback, !capture.stage_planes)) {
+  if (!internal::MakeReadbackBuffer(device, total_bytes, &capture.pre_nr_readback, !capture.stage_planes || fg_consumer)
+      || !internal::MakeReadbackBuffer(device, post_readback_bytes, &capture.nr_output_readback, !capture.stage_planes || fg_consumer)) {
     internal::ReleaseReadbacks(capture);
     return false;
   }
@@ -3503,7 +3761,13 @@ inline bool PrepareCapture(
     internal::QueueSequenceManifest();
   }
   internal::pending = std::move(capture);
-  if (prefg) internal::configured_hdr_plan.reset();
+  if (prefg || fg_consumer) internal::configured_hdr_plan.reset();
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (fg_consumer) {
+    internal::requested_fg_consumer.reset();
+    internal::capture_requested.store(false, std::memory_order_release);
+  }
+#endif
   if (capture_stages) internal::stage_busy.store(true, std::memory_order_release);
   internal::has_pending.store(true, std::memory_order_release);
   return true;
@@ -3518,6 +3782,12 @@ inline void RecordPreCopy(
   std::scoped_lock lock(internal::state_mutex);
   if (!internal::pending.has_value()) return;
   if (internal::pending->stage_planes && internal::pending->pre_recorded) return;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (internal::pending->fg_consumer
+      && (internal::pending->model_recording_list != command_list || internal::pending->service_sealed
+          || internal::pending->fg_consumer->recording != submission::RecordingIdentity(command_list)
+          || internal::pending->fg_consumer->context.input_resource_identity != reinterpret_cast<uintptr_t>(pre_nr_source))) return;
+#endif
   D3D12_TEXTURE_COPY_LOCATION dst{};
   dst.pResource = internal::pending->pre_nr_readback;
   dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
@@ -3543,6 +3813,9 @@ inline void RecordPostCopy(
   std::scoped_lock lock(internal::state_mutex);
   if (!internal::pending.has_value()) return;
   if (internal::pending->stage_planes && internal::pending->ready) return;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (internal::pending->fg_consumer) return;
+#endif
   D3D12_TEXTURE_COPY_LOCATION dst{};
   dst.pResource = internal::pending->nr_output_readback;
   dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
@@ -4362,6 +4635,249 @@ inline void EndPreFgCapture(ID3D12GraphicsCommandList* list, ID3D12Resource* bac
   }
 }
 
+#if defined(NR_NEXUS_DEV_CONTROL)
+inline bool WantsFgConsumerCapture() {
+  return IsArmed() && internal::requested_kind.load() == RequestKind::FG_CONSUMER_ROI;
+}
+
+inline FgConsumerStatus CopyFgConsumerStatus() {
+  std::scoped_lock lock(internal::state_mutex);
+  auto result = internal::fg_consumer_status;
+  std::scoped_lock finished_lock(internal::finished_mutex);
+  if (result.serial != 0 && internal::finished.serial == result.serial) {
+    result.status = internal::finished.outcome;
+    result.reason = internal::finished.reason;
+  }
+  return result;
+}
+
+inline bool RequestFgConsumerCapture(const std::filesystem::path& directory, const std::string& capture_id,
+                                    CaptureRect roi, std::string* reason = nullptr) {
+  const auto reject = [&](const char* text) {
+    if (reason != nullptr) {
+      *reason = text;
+    }
+    return false;
+  };
+  if (!directory.is_absolute() || capture_id.empty() || capture_id.size() > 80
+      || !std::all_of(capture_id.begin(), capture_id.end(), [](unsigned char c) {
+           return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
+         }) || roi.width == 0 || roi.height == 0 || roi.width > 256 || roi.height > 192
+      || roi.x > UINT32_MAX - roi.width || roi.y > UINT32_MAX - roi.height) return reject("invalid_consumer_roi_request");
+  std::scoped_lock lock(internal::state_mutex);
+  if (internal::capture_requested.load() || internal::pending || internal::stage_busy.load()
+      || internal::inline_restore_active.load() || internal::worker_busy.load() || internal::sequence.active
+      || !internal::hdr_in_flight.empty() || internal::aggregate_bytes.load() != 0
+      || internal::outstanding_jobs.load() != 0 || internal::retained_sets.load() != 0
+      || internal::sequence_manifest_dirty.load() || internal::sequence_manifest_busy.load()
+      || internal::sequence_manifest_failed.load()) return reject("capture_busy");
+  {
+    std::scoped_lock job_lock(internal::job_mutex);
+    if (internal::job) return reject("capture_busy");
+  }
+  internal::requested_fg_consumer = internal::FgConsumerCapture{
+      .output_directory = directory, .capture_id = capture_id, .deadline_ms = GetTickCount64() + 30'000,
+      .context = {.roi = roi}};
+  internal::fg_consumer_status = {.capture_id = capture_id, .status = "armed", .reason = "waiting_for_actual_fg_consumer"};
+  internal::configured_hdr_plan = HdrCapturePlan{.roi = roi};
+  internal::requested_kind.store(RequestKind::FG_CONSUMER_ROI);
+  internal::request_id.fetch_add(1);
+  internal::presents_while_armed.store(0);
+  internal::stage_busy.store(true);
+  internal::capture_requested.store(true, std::memory_order_release);
+  if (reason != nullptr) {
+    *reason = "capture_armed";
+  }
+  return true;
+}
+
+// Only the actual NGX FG wrapper calls this, with its typed Backbuffer/HUDLess
+// inputs already in the SDK's NON_PIXEL_SHADER_RESOURCE consumption state.
+inline uint64_t BeginFgConsumerCapture(ID3D12Device* device, ID3D12GraphicsCommandList* list,
+                                      ID3D12Resource* backbuffer, ID3D12Resource* hudless,
+                                      const FgConsumerContext& context) {
+  if (!WantsFgConsumerCapture()) return 0;
+  internal::FgConsumerCapture frame;
+  uint64_t consumer_request = 0;
+  {
+    std::scoped_lock lock(internal::state_mutex);
+    if (!internal::requested_fg_consumer || internal::pending) return 0;
+    frame = *internal::requested_fg_consumer;
+    consumer_request = internal::request_id.load();
+  }
+  const auto blocked = [consumer_request](const char* reason) {
+    std::scoped_lock lock(internal::state_mutex);
+    if (internal::request_id.load() != consumer_request || internal::pending || !internal::requested_fg_consumer) return uint64_t{0};
+    internal::requested_fg_consumer.reset();
+    internal::configured_hdr_plan.reset();
+    internal::capture_requested.store(false, std::memory_order_release);
+    internal::stage_busy.store(false);
+    internal::fg_consumer_status.status = "blocked";
+    internal::fg_consumer_status.reason = reason;
+    return uint64_t{0};
+  };
+  ID3D12Resource* input = (hudless != nullptr ? hudless : backbuffer);
+  if (GetTickCount64() >= frame.deadline_ms) return blocked("fg_consumer_request_expired");
+  if (device == nullptr || list == nullptr || input == nullptr || context.feature_handle == 0
+      || context.parameters_identity == 0) return blocked("fg_consumer_typed_input_or_identity_missing");
+  const auto desc = input->GetDesc();
+  const auto roi = frame.context.roi;
+  if ((desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT && desc.Format != DXGI_FORMAT_R10G10B10A2_UNORM)
+      || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1
+      || desc.SampleDesc.Count != 1 || desc.MipLevels != 1 || desc.Width > UINT32_MAX
+      || roi.x >= desc.Width || roi.y >= desc.Height
+      || roi.width > desc.Width - roi.x || roi.height > desc.Height - roi.y) return blocked("fg_consumer_input_format_or_roi_unsupported");
+  frame.recording = submission::RecordingIdentity(list);
+  frame.recording_status = submission::ObserveRecording(list);
+  if (frame.recording.first == 0 || (frame.recording.first >> 63) != 0 || !frame.recording_status
+      || frame.recording_status->closed.load()) return blocked("fg_consumer_recording_identity_unavailable");
+  frame.context = context;
+  frame.context.input_resource_identity = reinterpret_cast<uintptr_t>(input);
+  frame.context.input_format = desc.Format;
+  frame.context.input_width = static_cast<uint32_t>(desc.Width);
+  frame.context.input_height = desc.Height;
+  frame.context.roi = roi;
+  frame.backbuffer_identity = reinterpret_cast<uintptr_t>(backbuffer);
+  frame.hudless_identity = reinterpret_cast<uintptr_t>(hudless);
+  frame.input_hudless = hudless != nullptr;
+  if (backbuffer != nullptr) {
+    const auto backbuffer_desc = backbuffer->GetDesc();
+    frame.backbuffer_format = backbuffer_desc.Format;
+    frame.backbuffer_width = static_cast<uint32_t>(backbuffer_desc.Width);
+    frame.backbuffer_height = backbuffer_desc.Height;
+  }
+  for (size_t index = 0; index < frame.output_footprints.size(); ++index) {
+    auto output_desc = desc;
+    output_desc.Width = roi.width;
+    output_desc.Height = roi.height;
+    output_desc.Format = (index == 0 ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R10G10B10A2_UNORM);
+    device->GetCopyableFootprints(&output_desc, 0, 1, 0, &frame.output_footprints[index], nullptr, nullptr,
+        &frame.output_plane_bytes[index]);
+  }
+  if (!PrepareCapture(device, input, roi.x, roi.y, roi.width, roi.height, desc.Format,
+          desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM ? 2u : 1u, context.present_generation, 80.f, true, consumer_request)) {
+    return blocked("fg_consumer_readback_allocation_or_request_rejected");
+  }
+  uint64_t serial = 0;
+  {
+    std::scoped_lock lock(internal::state_mutex);
+    if (internal::request_id.load() != consumer_request) return 0;
+    if (!internal::pending || internal::pending->request_kind != RequestKind::FG_CONSUMER_ROI) {
+      internal::fg_consumer_status.status = "blocked";
+      internal::fg_consumer_status.reason = "fg_consumer_retired_before_input_copy";
+      return 0;
+    }
+    auto& capture = *internal::pending;
+    serial = capture.serial;
+    capture.fg_consumer = std::move(frame);
+    capture.model_recording_list = list;
+    internal::requested_fg_consumer.reset();
+    internal::capture_requested.store(false, std::memory_order_release);
+    internal::fg_consumer_status.status = "recording";
+    internal::fg_consumer_status.reason = "actual_fg_input_copy";
+    internal::fg_consumer_status.serial = serial;
+    if (capture.aborted) {
+      capture.service_sealed = true;
+      capture.fg_consumer->reason = "capture_aborted_before_input_copy";
+      internal::fg_consumer_status.status = "blocked";
+      internal::fg_consumer_status.reason = capture.fg_consumer->reason;
+      return 0;
+    }
+  }
+  D3D12_RESOURCE_BARRIER barrier{.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+      .Transition = {.pResource = input, .Subresource = 0,
+          .StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, .StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE}};
+  list->ResourceBarrier(1, &barrier);
+  RecordPreCopy(list, input);
+  std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+  list->ResourceBarrier(1, &barrier);
+  return serial;
+}
+
+// OutputInterpolated is the official typed texture, in the SDK's UAV state.
+// A successful API return alone does not establish generated-frame validity.
+inline bool EndFgConsumerCapture(uint64_t serial, ID3D12GraphicsCommandList* list,
+                                ID3D12Resource* output_interpolated, uint32_t api_result, bool api_succeeded) {
+  if (serial == 0) return false;
+  ID3D12Resource* readback = nullptr;
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+  CaptureRect roi;
+  {
+    std::scoped_lock lock(internal::state_mutex);
+    if (!internal::pending || !internal::pending->fg_consumer || internal::pending->serial != serial
+        || internal::pending->service_sealed) return false;
+    auto& capture = *internal::pending;
+    auto& frame = *capture.fg_consumer;
+    roi = frame.context.roi;
+    frame.api_returned = true;
+    frame.api_result = api_result;
+    frame.api_succeeded = api_succeeded;
+    frame.output_identity = reinterpret_cast<uintptr_t>(output_interpolated);
+    if (list == nullptr || capture.model_recording_list != list || submission::RecordingIdentity(list) != frame.recording) {
+      frame.reason = "fg_consumer_recording_changed";
+    } else if (!api_succeeded) {
+      frame.reason = "fg_consumer_api_failed";
+    } else if (output_interpolated == nullptr) {
+      frame.reason = "fg_consumer_OutputInterpolated_absent";
+    } else {
+      const auto desc = output_interpolated->GetDesc();
+      frame.output_format = desc.Format;
+      frame.output_width = static_cast<uint32_t>(desc.Width);
+      frame.output_height = desc.Height;
+      if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1
+          || desc.DepthOrArraySize != 1 || desc.MipLevels != 1
+          || (desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT && desc.Format != DXGI_FORMAT_R10G10B10A2_UNORM)
+          || roi.x >= desc.Width || roi.y >= desc.Height
+          || roi.width > desc.Width - roi.x || roi.height > desc.Height - roi.y) {
+        frame.reason = "fg_consumer_output_format_or_dimensions_unsupported";
+      } else if (frame.backbuffer_identity != 0 && (desc.Format != frame.backbuffer_format
+          || desc.Width != frame.backbuffer_width || desc.Height != frame.backbuffer_height)) {
+        frame.reason = "fg_consumer_output_Backbuffer_contract_mismatch";
+      } else {
+        const size_t index = (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 0 : 1);
+        frame.output_footprint = frame.output_footprints[index];
+        frame.output_bytes = frame.output_plane_bytes[index];
+        if (frame.output_bytes == 0 || frame.output_bytes > capture.nr_output_readback->GetDesc().Width) {
+          frame.reason = "fg_consumer_output_readback_capacity_rejected";
+        }
+      }
+    }
+    if (!frame.reason.empty()) {
+      capture.aborted = true;
+      capture.required_planes_complete = false;
+      capture.service_sealed = true;
+      internal::fg_consumer_status.status = "blocked";
+      internal::fg_consumer_status.reason = frame.reason;
+      return false;
+    }
+    readback = capture.nr_output_readback;
+    footprint = frame.output_footprint;
+  }
+  D3D12_RESOURCE_BARRIER barrier{.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+      .Transition = {.pResource = output_interpolated, .Subresource = 0,
+          .StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS, .StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE}};
+  list->ResourceBarrier(1, &barrier);
+  const D3D12_TEXTURE_COPY_LOCATION destination{.pResource = readback,
+      .Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, .PlacedFootprint = footprint};
+  const D3D12_TEXTURE_COPY_LOCATION source{.pResource = output_interpolated,
+      .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = 0};
+  const auto width = footprint.Footprint.Width;
+  const auto height = footprint.Footprint.Height;
+  const D3D12_BOX box{roi.x, roi.y, 0, roi.x + width, roi.y + height, 1};
+  list->CopyTextureRegion(&destination, 0, 0, 0, &source, &box);
+  submission::TrackUse(list, readback);
+  std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+  list->ResourceBarrier(1, &barrier);
+  std::scoped_lock lock(internal::state_mutex);
+  if (!internal::pending || internal::pending->serial != serial || !internal::pending->fg_consumer) return false;
+  internal::pending->ready = true;
+  internal::pending->service_sealed = true;
+  internal::fg_consumer_status.status = "waiting_gpu";
+  internal::fg_consumer_status.reason = "exact_recording_completion_pending";
+  return internal::pending->ready;
+}
+#endif
+
 // A helper's presentation window is not the evaluated game image. Copy
 // only addon-owned model buffers, whose states and equal extents are known;
 // the game's pre-SR Color is merely shader-readable, with no copy-state
@@ -4524,6 +5040,17 @@ inline void AbortPending() {
   CancelHdrSequence();
   std::scoped_lock lock(internal::state_mutex);
 #if defined(NR_NEXUS_DEV_CONTROL)
+  if (internal::requested_fg_consumer) {
+    internal::requested_fg_consumer.reset();
+    internal::configured_hdr_plan.reset();
+    internal::fg_consumer_status.status = "cancelled";
+    internal::fg_consumer_status.reason = "capture_aborted_before_claim";
+    internal::stage_busy.store(false);
+  }
+  if (internal::pending && internal::pending->fg_consumer) {
+    internal::pending->service_sealed = true;
+    internal::pending->fg_consumer->reason = "capture_aborted";
+  }
   if (internal::requested_inline_restore) {
     internal::requested_inline_restore.reset();
     internal::inline_restore_status.status = "failed";
@@ -4570,7 +5097,13 @@ inline void OnPresent(uint64_t generation, bool exact_proofs) noexcept {
     std::scoped_lock lock(internal::state_mutex);
     hdr_owned = internal::sequence.active || !internal::hdr_in_flight.empty()
                 || (internal::pending && internal::pending->hdr_plan);
+    bool consumer_call_open = false;
+#if defined(NR_NEXUS_DEV_CONTROL)
+    consumer_call_open = internal::pending && internal::pending->request_kind == RequestKind::FG_CONSUMER_ROI
+        && !internal::pending->service_sealed;
+#endif
     if (internal::pending && internal::pending->hdr_plan && generation > internal::pending->creation_generation
+        && (!consumer_call_open || generation >= internal::pending->creation_generation + internal::kExactSettlePresents)
         && (internal::pending->request_kind != RequestKind::PRE_FG_SERVICE || internal::pending->ready
             || internal::pending->aborted
             || generation >= internal::pending->creation_generation + internal::kExactSettlePresents)) {
@@ -4593,7 +5126,10 @@ inline void OnPresent(uint64_t generation, bool exact_proofs) noexcept {
       const bool submitted = internal::StageSubmissionCompleted(&*it);
       const bool releasable = internal::ReadbacksReleasable(*it);
       const bool timeout = generation >= it->lease_generation + internal::kExactSettlePresents;
-      const bool service_closed = it->request_kind != RequestKind::PRE_FG_SERVICE || it->service_sealed;
+      bool service_closed = it->request_kind != RequestKind::PRE_FG_SERVICE || it->service_sealed;
+#if defined(NR_NEXUS_DEV_CONTROL)
+      service_closed = service_closed && (it->request_kind != RequestKind::FG_CONSUMER_ROI || it->service_sealed);
+#endif
       if (it->exact && submitted && releasable && service_closed) {
         it->completion_proven = true; it->completion_generation = generation;
         hdr_ready.push_back(std::move(*it));
@@ -4631,7 +5167,14 @@ inline void OnPresent(uint64_t generation, bool exact_proofs) noexcept {
     if (internal::presents_while_armed.fetch_add(1, std::memory_order_relaxed) + 1
         > internal::kArmTimeoutPresents) {
       internal::presents_while_armed.store(0, std::memory_order_relaxed);
-      FailRequest("no_nr_frame", "no eligible capture frame arrived within 600 presents");
+#if defined(NR_NEXUS_DEV_CONTROL)
+      if (internal::requested_kind.load() == RequestKind::FG_CONSUMER_ROI) {
+        FailRequest("blocked", "no actual FG consumer arrived within 600 presents");
+      } else
+#endif
+      {
+        FailRequest("no_nr_frame", "no eligible capture frame arrived within 600 presents");
+      }
     }
   } else {
     internal::presents_while_armed.store(0, std::memory_order_relaxed);

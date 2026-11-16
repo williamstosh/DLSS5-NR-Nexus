@@ -47,6 +47,11 @@ struct Context {
   uint32_t height = 0;
   bool source_generation_available = false;
   uint64_t source_generation = 0;
+  // One successful Upscaled source write, including a cache-only write.
+  bool inline_edit_reuse = false;
+  uint64_t source_handle = 0;
+  uint64_t source_sequence = 0;
+  uint32_t reset_reasons = 0;
   bool api_returned = false;
   bool ngx_accepted = false;
   bool xefg_service = false;
@@ -87,6 +92,7 @@ struct Summary {
   char reason[96] = {};
   char error[96] = {};
   bool xefg_service = false;
+  bool inline_edit_reuse = false;
 };
 
 // Assigned before capture configuration; callback lifetime belongs to the existing screenshot worker.
@@ -259,13 +265,16 @@ inline void Tick(int64_t now_ns) {
 inline uint64_t Reserve(const Context& context, uint64_t timer_sequence, int64_t now_ns) {
   if (!Enabled() || (context.stage != static_cast<uint32_t>(stage_plan::Stage::UPSCALED)
                      && context.stage != static_cast<uint32_t>(stage_plan::Stage::PRESENT))) return 0;
+  if (context.inline_edit_reuse && context.stage != static_cast<uint32_t>(stage_plan::Stage::UPSCALED)) return 0;
   Tick(now_ns);
   uint64_t token = 0;
   bool wake = false;
   {
     auto& s = internal::state;
     std::unique_lock lock(s.mutex);
-    if (!s.armed || context.xefg_service != s.summary.xefg_service) return 0;
+    if (!s.armed || context.xefg_service != s.summary.xefg_service
+        || (context.inline_edit_reuse && context.xefg_service)) return 0;
+    if (s.summary.active && context.inline_edit_reuse != s.summary.inline_edit_reuse) return 0;
     if (!s.summary.active) {
       try {
         s.rows.reserve(s.summary.capacity);
@@ -274,6 +283,7 @@ inline uint64_t Reserve(const Context& context, uint64_t timer_sequence, int64_t
         return 0;
       }
       s.summary.capture_id = ++s.next_capture;
+      s.summary.inline_edit_reuse = context.inline_edit_reuse;
       s.summary.started_ns = now_ns;
       s.summary.active = true;
       s.summary.export_state = ExportState::PENDING;
@@ -322,13 +332,25 @@ inline void Observe(const gpu_timers::Stats& stats, uint64_t token) {
     if (row.token != token || row.state != internal::RowState::PENDING) return;
     row.gpu_state = stats.state;
     --s.summary.in_flight;
+    const auto& context = row.context;
+    bool output_valid = context.api_returned && context.ngx_accepted;
+    if (context.xefg_service) {
+      output_valid = context.output_ready;
+    }
+    if (context.inline_edit_reuse) {
+      const bool calls_match = (context.reuse
+          ? context.model_evaluates == 0 && !context.api_returned && !context.ngx_accepted
+          : context.model_evaluates == 1 && context.api_returned && context.ngx_accepted);
+      output_valid = context.output_ready && context.source_generation_available
+          && context.source_handle != 0 && context.source_generation != 0 && context.source_sequence != 0
+          && context.refresh != context.reuse && calls_match;
+    }
     if (row.timer_sequence == 0) {
       row.state = internal::RowState::DROPPED;
       ++s.summary.dropped;
     } else if (stats.valid && stats.state == gpu_timers::SampleState::VALID && stats.samples == 1
                 && stats.sequence == row.timer_sequence
-                && (row.context.xefg_service ? row.context.output_ready
-                                             : row.context.api_returned && row.context.ngx_accepted)) {
+                && output_valid) {
       row.state = internal::RowState::VALID;
       row.stats = stats;
       row.stats.queue = nullptr;
@@ -431,6 +453,11 @@ inline void ProcessPending(const std::filesystem::path& directory, const report:
         if (c.source_generation_available) {
           event["context"]["source_generation"] = c.source_generation;
         }
+        if (c.inline_edit_reuse) {
+          event["inline_chain"] = {{"source_handle", c.source_handle}, {"source_sequence", c.source_sequence},
+                                   {"reset_reasons", c.reset_reasons}, {"model_evaluates", c.model_evaluates},
+                                   {"refresh", c.refresh}, {"reuse", c.reuse}, {"output_ready", c.output_ready}};
+        }
         if (c.xefg_service) {
           event["context"] = {{"runtime_version", c.runtime_version}, {"requested_model", c.requested_model},
                               {"stage", stage_plan::Name(static_cast<stage_plan::Stage>(c.stage))},
@@ -471,7 +498,9 @@ inline void ProcessPending(const std::filesystem::path& directory, const report:
       }
       Json document{{"schema", "control_mask_capture_v1"}, {"status", "terminal"}, {"capture_id", summary.capture_id},
                     {"time_basis", "started_ns/recorded_ns are CPU recording times; ended_ns/measured_ns are CPU stop/observation times on steady_clock, not absolute GPU timestamps"},
-                     {"eval_scope", (summary.xefg_service
+                     {"eval_scope", (summary.inline_edit_reuse
+                         ? "eval span includes cache apply/composed motion or NR Evaluate; actual calls are inline_chain.model_evaluates"
+                         : summary.xefg_service
                          ? "core eval span includes cache apply/composed motion or NR Evaluate; actual calls are xefg.model_evaluates"
                          : "mask_generation+NR_Evaluate; not an independent mask duration")},
                     {"count_scope", "Disabled, warmup, duplicate-reservation and target-drain evaluates are excluded from event counts. timeout counts EXPIRED rejections plus window expiry; window_timed_out identifies the latter. Terminal means export ended, not necessarily target reached."},
@@ -487,6 +516,11 @@ inline void ProcessPending(const std::filesystem::path& directory, const report:
         document["scope"] = "xefg_single_backbuffer_service";
         document["service_timing_scope"] = "GPU service_total spans current-color staging through ProcessInline and final private-color writeback; total/eval retain their core-chain meanings; staging/writeback are the outer intervals";
         document["service_interval_scope"] = "CPU monotonic Service entry intervals between consecutive application frames in this stream; not display/generated-frame intervals or Service call durations";
+      }
+      if (summary.inline_edit_reuse) {
+        document["scope"] = "native_upscaled_inline_chain";
+        document["chain_timing_scope"] = "GPU total spans copy-in through the successful full source writeback, for refresh and reuse; model API fields remain false when no model was invoked";
+        document["pairing_scope"] = "Pair only adjacent source_sequence values from the same source_handle/source_generation with refresh then reuse and zero reset_reasons; these are source-chain GPU costs, not output or scanout frame times";
       }
       std::string text;
       error = "terminal_redaction_failed";

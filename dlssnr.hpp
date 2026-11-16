@@ -120,8 +120,10 @@
 #include "ui/text_input.hpp"
 #include "submission_tracker.hpp"
 #include "edit_reuse.hpp"
-#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+#if defined(NR_NEXUS_DEV_CONTROL)
 #include "nr_fg_output_marker.hpp"
+#endif
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
 #include "nr_fg_output_probe.hpp"
 #endif
 #include "control_mask_execution.hpp"
@@ -889,7 +891,7 @@ struct FinalResources {
   std::shared_ptr<submission::RecordingStatus> control_mask_recording;
   mutable std::shared_ptr<submission::RecordingStatus> recording;
   mutable bool tracked_recording = false;
-#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+#if defined(NR_NEXUS_DEV_CONTROL)
   std::shared_ptr<fg_output_marker::State> fg_output_marker;
 #endif
   // HDR worksets (rc5): `decoded` IS `original` (one reference each), one
@@ -2686,9 +2688,8 @@ inline std::atomic_bool edit_reuse_adaptive_experiment{false};
 #if defined(NR_NEXUS_DEV_CONTROL)
 inline std::atomic_bool edit_reuse_fg_experiment{false};
 #endif
-#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
-// A dedicated validation build only. All access is under runtime_mutex, and
-// the normal experiment's OFF/released gate owns rearming this finite window.
+#if defined(NR_NEXUS_DEV_CONTROL)
+// Explicit, transient DEV request. All access is under runtime_mutex.
 struct FgOutputMarkerWindow {
   struct Binding {
     uintptr_t source = 0;
@@ -2699,6 +2700,7 @@ struct FgOutputMarkerWindow {
     bool operator==(const Binding&) const = default;
   } binding;
   static constexpr uint32_t MAX_FRAMES = 128;
+  static constexpr int64_t MAX_DURATION_NS = 3'000'000'000;
   uint64_t request_generation = 0;
   uint32_t recorded = 0;
   uint32_t refreshes = 0;
@@ -2706,34 +2708,35 @@ struct FgOutputMarkerWindow {
   uint64_t first_sequence = 0;
   uint64_t last_sequence = 0;
   int64_t last_recorded_ns = 0;
+  int64_t armed_ns = 0;
   bool enabled = false;
   bool bound = false;
   bool stopped = false;
   const char* reason = "disabled";
 
-  void SetEnabled(bool requested) {
-    if (requested == enabled) return;
+  void Arm(int64_t now) {
     const auto generation = request_generation + 1;
-    if (requested) {
-      *this = {.request_generation = generation, .enabled = true, .reason = "armed"};
-    } else {
-      request_generation = generation;
-      enabled = false;
-      stopped = true;
-      reason = "disabled";
-    }
+    *this = {.request_generation = generation, .armed_ns = now, .enabled = true, .reason = "armed"};
   }
 
-  bool Admit(const Binding& current, bool sdk_ready) {
+  void Stop(const char* failure) {
+    enabled = false;
+    stopped = true;
+    reason = failure;
+  }
+
+  bool Admit(const Binding& current, bool route_ready, int64_t now) {
     if (!enabled || stopped) return false;
-    if (bound && binding != current) {
-      stopped = true;
-      reason = "source_or_environment_changed";
+    if (now < armed_ns || now - armed_ns >= MAX_DURATION_NS) {
+      Stop("time_limit");
       return false;
     }
-    if (!sdk_ready) {
-      stopped = bound;
-      reason = "sdk_display_probe_unavailable";
+    if (bound && binding != current) {
+      Stop("source_or_environment_changed");
+      return false;
+    }
+    if (!route_ready) {
+      Stop("fg_environment_unavailable");
       return false;
     }
     if (!bound) {
@@ -2753,14 +2756,16 @@ struct FgOutputMarkerWindow {
     }
     last_sequence = sequence;
     last_recorded_ns = now;
-    stopped = recorded == MAX_FRAMES;
-    reason = stopped ? "source_frame_limit" : "recording";
+    if (recorded == MAX_FRAMES) {
+      Stop("source_frame_limit");
+    } else {
+      reason = "recording";
+    }
   }
 
   void StopSource(uintptr_t source, uint64_t generation, const char* failure) {
-    if (bound && !stopped && binding.source == source && binding.source_generation == generation) {
-      stopped = true;
-      reason = failure;
+    if (enabled && !stopped && (!bound || (binding.source == source && binding.source_generation == generation))) {
+      Stop(failure);
     }
   }
 };
@@ -5330,7 +5335,7 @@ inline const std::vector<const void*>& CollectWorksetGpuObjects(const FinalResou
       if (res.norm_scale != nullptr) objects.push_back(res.norm_scale);
     }
     if (res.descriptors != nullptr) objects.push_back(res.descriptors);
-#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+#if defined(NR_NEXUS_DEV_CONTROL)
     if (res.fg_output_marker != nullptr) {
       objects.push_back(res.fg_output_marker.get());
       for (auto* object : res.fg_output_marker->Objects()) {
@@ -13819,6 +13824,21 @@ inline bool RecordInline(
       && gpu_timers_enabled.load(std::memory_order_relaxed)
       && control_mask_capture_route_eligible;
   const bool control_mask_requested = control_mask_enabled.load(std::memory_order_relaxed);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  const auto inline_capture_environment = (control_mask_capture_eligible && edit_reuse_fg_experiment.load()
+      ? ReadEditReuseFgEnvironmentLocked() : EditReuseFgEnvironment{});
+#endif
+  const bool inline_edit_capture =
+#if defined(NR_NEXUS_DEV_CONTROL)
+      control_mask_capture_eligible && !control_mask_requested && present == nullptr && bridge_source == nullptr
+      && inline_capture_environment.available && inline_capture_environment.provider == 1
+      && !D3D11OnlySession() && !direct_api.borrowed_core_context
+      && execution_stage == stage_plan::Stage::UPSCALED && hook_point.load() == kHookUpscaled
+      && !plan.mixed && plan.group_count == 1 && group.begin == 0 && requested_stack == 1
+      && !nr_adaptive_enabled.load() && !adaptive.enabled && nr_input_width == width && nr_input_height == height;
+#else
+      false;
+#endif
   const bool control_mask_eligible = control_mask_requested
       && control_mask_route_eligible;
   if (control_mask_requested && !control_mask_route_eligible
@@ -14872,6 +14892,10 @@ inline bool RecordInline(
   // the model from a rule-3 bypass frame whose passes only copied through.
   bool model_evaluated = false;
   bool edit_reused = false;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  uint32_t inline_capture_calls = 0, inline_capture_reset_reasons = 0;
+  bool inline_capture_api_returned = false, inline_capture_accepted = false;
+#endif
   edit_reuse::Inputs edit_inputs;
   // Strengths of the last EXECUTED pass, consumed by the v6 pedestal and
   // commit dispatches after the loop.
@@ -15261,6 +15285,14 @@ inline bool RecordInline(
         Transition(command_list, edit_cache->composed_motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
       }
+#if defined(NR_NEXUS_DEV_CONTROL)
+      if (inline_edit_capture) {
+        ++inline_capture_calls;
+        inline_capture_api_returned = nr_returned;
+        inline_capture_accepted = nr_returned && NVSDK_NGX_SUCCEED(nr_result);
+        inline_capture_reset_reasons = (feature.slots[pass].model_reset ? feature.slots[pass].model_reset_reasons : 0);
+      }
+#endif
       if (pass_control_mask_eligible) {
         FinishControlMaskEvaluation(command_list, res, feature.slots[pass]);
         const uint32_t model_bucket = feature.slots[pass].nr_preset == 2u ? 1u : 0u;
@@ -15277,7 +15309,7 @@ inline bool RecordInline(
           Log(accepted ? reshade::log::level::info : reshade::log::level::error, message.str());
         }
       }
-      if (control_mask_capture_eligible) {
+      if (control_mask_capture_eligible && !inline_edit_capture) {
         const auto& slot = feature.slots[pass];
         control_mask_capture::Context context{
             .requested_model = slot.nr_preset,
@@ -15359,7 +15391,7 @@ inline bool RecordInline(
           ++edit_cache->anchor_generation;
         } else {
           ++edit_reuse_fallbacks;
-#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+#if defined(NR_NEXUS_DEV_CONTROL)
           fg_output_marker_window.StopSource(reinterpret_cast<uintptr_t>(handle), feature.source_generation,
               "source_anchor_capture_failed");
 #endif
@@ -15871,7 +15903,7 @@ inline bool RecordInline(
           feature.slots[0].pending_reset = true;
           feature.slots[0].pending_reset_reasons |= kResetRecovery;
           ++edit_reuse_fallbacks;
-#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+#if defined(NR_NEXUS_DEV_CONTROL)
           fg_output_marker_window.StopSource(reinterpret_cast<uintptr_t>(handle), feature.source_generation,
               "source_original_selection_failed");
 #endif
@@ -15879,23 +15911,22 @@ inline bool RecordInline(
           Transition(command_list, output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, output_rest, 0u);
         }
       }
-#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
-      if (edit_reuse_fg_inline_route && edit_reuse_route_eligible && !adaptive.preparing
+#if defined(NR_NEXUS_DEV_CONTROL)
+      if (fg_output_marker_window.enabled && !fg_output_marker_window.stopped
+          && (edit_reuse_fg_inline_route || edit_reuse_xefg_route) && edit_reuse_route_eligible && !adaptive.preparing
           && executed + 1 == static_cast<int32_t>(requested_stack) && !NVSDK_NGX_FAILED(stack_failure)
           && (model_evaluated || edit_reused) && feature.slots[0].edit_reuse != nullptr
           && feature.slots[0].edit_reuse->valid) {
-        const auto probe = fg_output_probe::CopySnapshot();
-        bool sdk_ready = edit_fg_environment.provider == 1 && probe.native.active;
-        if (edit_fg_environment.provider == 2) {
-          for (const auto& context : probe.xefg) {
-            sdk_ready |= context.registered && context.debug_applied && !context.stopped
-                && context.context_identity == edit_fg_environment.context;
-          }
+        auto marker_environment = edit_fg_environment;
+        if (edit_reuse_xefg_route) {
+          marker_environment = ReadEditReuseFgEnvironmentLocked();
         }
+        const bool route_ready = marker_environment.available
+            && marker_environment.provider == (edit_reuse_xefg_route ? 2u : 1u);
         if (fg_output_marker_window.Admit(
                 {.source = reinterpret_cast<uintptr_t>(handle), .source_generation = feature.source_generation,
-                    .provider = edit_fg_environment.provider, .context = edit_fg_environment.context,
-                    .environment_generation = edit_fg_environment.generation}, sdk_ready)) {
+                    .provider = marker_environment.provider, .context = marker_environment.context,
+                    .environment_generation = marker_environment.generation}, route_ready, SteadyNowNs())) {
           if (res.fg_output_marker == nullptr) {
             res.fg_output_marker = std::make_shared<fg_output_marker::State>();
           }
@@ -15904,11 +15935,10 @@ inline bool RecordInline(
           const auto result = fg_output_marker::Record(device, command_list, res.fg_output_marker.get(),
               res.decoded, width, height, res.hdr_mode, edit_reused);
           if (result == fg_output_marker::Result::RECORDED) {
-            fg_output_marker_window.Recorded(edit_reused, feature.sr_sequence, SteadyNowNs());
+            fg_output_marker_window.Recorded(edit_reused, edit_reuse_sequence, SteadyNowNs());
           } else {
-            fg_output_marker_window.stopped = true;
-            fg_output_marker_window.reason = result == fg_output_marker::Result::NOT_SUPPORTED
-                ? "marker_contract_not_supported" : "marker_recording_failed";
+            fg_output_marker_window.Stop(result == fg_output_marker::Result::NOT_SUPPORTED
+                ? "marker_contract_not_supported" : "marker_recording_failed");
           }
         }
       }
@@ -16033,12 +16063,38 @@ inline bool RecordInline(
                           frame_divisor, v6_pedestal_cap, v6_dark_gate, feature, look_chain.settings, frame,
                           executed, executed >= 0 && !NVSDK_NGX_FAILED(stack_failure));
   }
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (inline_edit_capture && !NVSDK_NGX_FAILED(stack_failure) && executed + 1 == static_cast<int32_t>(requested_stack)
+      && (inline_capture_calls != 0 || edit_reused)) {
+    const auto& slot = feature.slots[0];
+    control_mask_capture::Context context{
+        .requested_model = slot.nr_preset, .stage = static_cast<uint32_t>(execution_stage),
+        .auto_mask = slot.model_sent[4] != 0.f, .style = slot.model_sent[0],
+        .intensity = slot.model_intensity_sent, .local_tone = slot.model_sent[1],
+        .sent_structure = slot.model_sent[7], .sent_skin = slot.model_sent[8],
+        .width = nr_input_width, .height = nr_input_height,
+        .source_generation_available = feature.source_generation != 0, .source_generation = feature.source_generation,
+        .inline_edit_reuse = true, .source_handle = reinterpret_cast<uintptr_t>(handle), .source_sequence = feature.sr_sequence,
+        .reset_reasons = inline_capture_reset_reasons,
+        .api_returned = inline_capture_api_returned, .ngx_accepted = inline_capture_accepted,
+        .model_evaluates = inline_capture_calls, .refresh = inline_capture_calls != 0, .reuse = edit_reused, .output_ready = true};
+    std::snprintf(context.runtime_version, sizeof(context.runtime_version), "%s", direct_runtime_requirements.file_version.c_str());
+    if (timers_active && gpu_timers::internal::current.active) {
+      auto& timing = gpu_timers::internal::segments[gpu_timers::internal::current.idx];
+      timing.diagnostic_token = control_mask_capture::Reserve(context, timing.sequence, gpu_timers::NowNs());
+    } else {
+      const auto token = control_mask_capture::Reserve(context, 0, gpu_timers::NowNs());
+      control_mask_capture::Observe(gpu_timers::Stats{
+          .state = gpu_timers::SampleState::PROOF_UNAVAILABLE, .measured_ns = gpu_timers::NowNs()}, token);
+    }
+  }
+#endif
   if (timers_active) {
     gpu_timers::End(command_list);
   }
   device->Release();
   if (NVSDK_NGX_FAILED(stack_failure)) {
-#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+#if defined(NR_NEXUS_DEV_CONTROL)
     fg_output_marker_window.StopSource(reinterpret_cast<uintptr_t>(handle), feature.source_generation,
         "source_model_failed");
 #endif
@@ -18175,6 +18231,26 @@ inline ID3D12Resource* PreFgResource(const NVSDK_NGX_Parameter* parameters, cons
 }
 
 #if defined(NR_NEXUS_DEV_CONTROL)
+inline uint64_t BeginNativeFgConsumerCapture(ID3D12GraphicsCommandList* list,
+    const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* parameters, uint32_t slot) {
+  if (!screenshot::WantsFgConsumerCapture()) return 0;
+  screenshot::FgConsumerContext context{
+      .feature_handle = reinterpret_cast<uintptr_t>(handle), .parameters_identity = reinterpret_cast<uintptr_t>(parameters),
+      .module_slot = slot};
+  context.mfg_index_available = GetUIntIfPresent(parameters, NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, &context.mfg_index);
+  {
+    RuntimeLock lock(runtime_mutex);
+    context.present_generation = present_generation;  // Screenshot retirement clock, never an FG frame identity.
+  }
+  Microsoft::WRL::ComPtr<ID3D12Device> device;
+  if (list != nullptr) {
+    list->GetDevice(IID_PPV_ARGS(&device));
+  }
+  auto* backbuffer = PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_Backbuffer);
+  auto* hudless = PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_HUDLess);
+  return screenshot::BeginFgConsumerCapture(device.Get(), list, backbuffer, hudless, context);
+}
+
 inline edit_fg_observation::Ticket ObserveEditNativeFg(ID3D12GraphicsCommandList* command_list,
     const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* parameters, uint32_t slot, bool c_export) {
   const auto generation = edit_fg_observation::CaptureGeneration();
@@ -21078,6 +21154,8 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
 #if defined(NR_NEXUS_DEV_CONTROL)
   const auto edit_fg_ticket = (frame_generation && source_scope.owner && !nested_in_c_wrapper && !InsideDirectCall()
       ? ObserveEditNativeFg(command_list, handle, parameters, Slot, false) : edit_fg_observation::Ticket{});
+  const auto fg_consumer_serial = (frame_generation && source_scope.owner && !nested_in_c_wrapper && !InsideDirectCall()
+      ? BeginNativeFgConsumerCapture(command_list, handle, parameters, Slot) : 0);
 #endif
   const NVSDK_NGX_Result result = [&] {
     const NgxRuntimeCommandScope runtime_scope;
@@ -21095,6 +21173,11 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
     if (edit_fg_ticket.call_id != 0) {
       const auto edit_fg_return_ns = edit_fg_observation::NowNs();
       edit_fg_observation::RecordResult(edit_fg_ticket, static_cast<uint32_t>(result), edit_fg_return_ns);
+    }
+    if (fg_consumer_serial != 0) {
+      screenshot::EndFgConsumerCapture(fg_consumer_serial, command_list,
+          PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_OutputInterpolated),
+          static_cast<uint32_t>(result), NVSDK_NGX_SUCCEED(result));
     }
 #endif
     inside_game_evaluate_wrapper = outer;
@@ -21350,6 +21433,8 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
 #if defined(NR_NEXUS_DEV_CONTROL)
   const auto edit_fg_ticket = (frame_generation && source_scope.owner && !InsideDirectCall()
       ? ObserveEditNativeFg(command_list, handle, parameters, Slot, true) : edit_fg_observation::Ticket{});
+  const auto fg_consumer_serial = (frame_generation && source_scope.owner && !InsideDirectCall()
+      ? BeginNativeFgConsumerCapture(command_list, handle, parameters, Slot) : 0);
 #endif
   inside_game_evaluate_wrapper = true;
   ComputeStateEnvelope state_envelope(
@@ -21366,6 +21451,11 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
     if (edit_fg_ticket.call_id != 0) {
       const auto edit_fg_return_ns = edit_fg_observation::NowNs();
       edit_fg_observation::RecordResult(edit_fg_ticket, static_cast<uint32_t>(result), edit_fg_return_ns);
+    }
+    if (fg_consumer_serial != 0) {
+      screenshot::EndFgConsumerCapture(fg_consumer_serial, command_list,
+          PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_OutputInterpolated),
+          static_cast<uint32_t>(result), NVSDK_NGX_SUCCEED(result));
     }
     return result;
 #else

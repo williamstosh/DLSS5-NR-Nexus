@@ -713,6 +713,19 @@
         "maximum gateway counters, the complete existing trace and its original receipt fit the unchanged pipe limit");
     std::printf("Native gateway summary bytes=%zu; full status plus receipt bytes=%zu\n",
         native_evaluate.dump().size(), maximum.dump().size());
+    const auto saved_marker = runtime::fg_output_marker_window;
+    runtime::fg_output_marker_window = {.binding = {.source = UINTPTR_MAX, .source_generation = UINT64_MAX,
+        .provider = UINT64_MAX, .context = UINTPTR_MAX, .environment_generation = UINT64_MAX},
+        .request_generation = UINT64_MAX, .recorded = UINT32_MAX, .refreshes = UINT32_MAX, .reuses = UINT32_MAX,
+        .first_sequence = UINT64_MAX, .last_sequence = UINT64_MAX, .armed_ns = INT64_MAX};
+    const auto marker_projection = control::Execute({{"id", "marker-budget"}, {"op", "fg_output_marker"}, {"action", "status"}});
+    runtime::fg_output_marker_window = saved_marker;
+    auto marker_combined = maximum;
+    marker_combined["receipt"] = marker_projection;
+    check(marker_projection.dump().size() < 2048
+            && marker_combined.dump().size() < renodx::addons::dlss5::dev_control_pipe::internal::MAX_FRAME_BYTES
+            && marker_combined["state"]["edit_reuse"]["fg_observation"]["events"].size() == serialized_events,
+        "maximum marker scalars and the complete existing status trace fit without duplicating or truncating events");
     runtime::edit_reuse_fg_experiment = false;
     check(!control::Snapshot()["edit_reuse"].contains("native_evaluate"),
         "disabling the experiment removes the additional diagnostics without clearing retained observations");
@@ -811,49 +824,147 @@
   }
 #if defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
 #include "nr_fg_output_probe_cases.hpp"
+#endif
   {
     runtime::FgOutputMarkerWindow marker;
     const runtime::FgOutputMarkerWindow::Binding source{
         .source = 11, .source_generation = 2, .provider = 2, .context = 33, .environment_generation = 4};
-    check(!marker.Admit(source, true), "output marker is disabled in an unarmed validation build");
-    marker.SetEnabled(true);
-    check(!marker.Admit(source, false) && !marker.bound && !marker.stopped,
-        "unobserved SDK display configuration does not bind or record a source");
+    constexpr int64_t started = 1'000;
+    check(!marker.Admit(source, true, started), "output marker is disabled in an unarmed normal DEV build");
+    marker.Arm(started);
     for (uint32_t frame = 0; frame < marker.MAX_FRAMES; ++frame) {
-      check(marker.Admit(source, true), "bounded marker admits the same proven source and environment");
-      marker.Recorded((frame & 1) != 0, frame + 100, frame + 1);
+      check(marker.Admit(source, true, started + frame), "bounded marker admits the same source and FG environment without SDK debug state");
+      marker.Recorded((frame & 1) != 0, frame + 100, started + frame);
     }
     check(marker.stopped && marker.recorded == 128 && marker.refreshes == 64 && marker.reuses == 64
-            && marker.first_sequence == 100 && marker.last_sequence == 227 && !marker.Admit(source, true),
+            && marker.first_sequence == 100 && marker.last_sequence == 227 && !marker.Admit(source, true, started + 128),
         "output marker stops at 128 source writes with distinct refresh and reuse counters");
-    marker.SetEnabled(true);
-    check(!marker.Admit(source, true), "an unchanged experiment request cannot restart an exhausted window");
-    marker.SetEnabled(false);
-    marker.SetEnabled(true);
-    check(marker.recorded == 0 && marker.Admit(source, true), "explicit OFF to ON rearms a fresh marker window");
+    marker.Arm(started);
+    check(marker.recorded == 0 && marker.Admit(source, true, started), "a new explicit arm request starts a fresh marker window");
     auto successor = source;
     ++successor.source_generation;
-    check(!marker.Admit(successor, true) && marker.stopped && !marker.Admit(source, true),
+    check(!marker.Admit(successor, true, started) && marker.stopped && !marker.Admit(source, true, started),
         "source generation changes permanently stop the current window");
-    marker.SetEnabled(false);
-    marker.SetEnabled(true);
-    check(marker.Admit(source, true), "new request admits its first source");
+    marker.Arm(started);
+    check(marker.Admit(source, true, started), "new request admits its first source");
     ++successor.context;
-    check(!marker.Admit(successor, true), "a different FG context cannot inherit the source marker window");
-    marker.SetEnabled(false);
-    marker.SetEnabled(true);
-    check(marker.Admit(source, true) && !marker.Admit(source, false) && marker.stopped,
-        "loss of the SDK display receipt stops a bound window without retrying");
-    marker.SetEnabled(false);
-    marker.SetEnabled(true);
-    check(marker.Admit(source, true), "failure test binds the actual source");
-    marker.StopSource(source.source + 1, source.source_generation, "unrelated_failure");
-    check(marker.Admit(source, true), "a failure in another source does not stop the bound source");
+    check(!marker.Admit(successor, true, started), "a different FG context cannot inherit the source marker window");
+    marker.Arm(started);
+    check(marker.Admit(source, true, started) && !marker.Admit(source, false, started) && marker.stopped,
+        "loss of the actual FG environment stops a bound window without SDK debug dependencies");
+    marker.Arm(started);
+    check(!marker.Admit(source, true, started + marker.MAX_DURATION_NS) && marker.stopped && !marker.enabled
+            && std::string_view(marker.reason) == "time_limit" && marker.recorded == 0,
+        "a request expires at three seconds even when it has not written its first source frame");
+    marker.Arm(started);
     marker.StopSource(source.source, source.source_generation, "source_model_failed");
-    check(marker.stopped && !marker.Admit(source, true),
+    check(marker.stopped && !marker.bound && !marker.Admit(source, true, started),
+        "a source failure before the first write cancels the short marker request");
+    marker.Arm(started);
+    check(marker.Admit(source, true, started), "failure test binds the actual source");
+    marker.StopSource(source.source + 1, source.source_generation, "unrelated_failure");
+    check(marker.Admit(source, true, started), "a failure in another source does not stop the bound source");
+    marker.StopSource(source.source, source.source_generation, "source_model_failed");
+    check(marker.stopped && !marker.Admit(source, true, started),
         "a bound source failure cannot resume its marker after the model later recovers");
   }
-#endif
+  {
+    namespace screenshot = renodx::addons::dlss5::screenshot;
+    struct RestoreMarkerControl {
+      runtime::FgOutputMarkerWindow marker = runtime::fg_output_marker_window;
+      decltype(runtime::created_feature_ids) handles;
+      Json request = control::last_request, receipt = control::last_receipt;
+      bool enabled = runtime::enabled.exchange(true), reuse = runtime::edit_reuse_enabled.exchange(true);
+      bool experiment = runtime::edit_reuse_fg_experiment.exchange(true);
+      bool public_off = runtime::native_fg_public_off.exchange(false);
+      bool xefg_sdk = xefg::internal::sdk_detours_enabled.exchange(false);
+      bool xefg_owns = xefg::internal::owns_stream.exchange(false);
+      uint32_t hook = runtime::hook_point.exchange(runtime::kHookUpscaled);
+      runtime::NativeFgDeclaration declaration = runtime::native_fg_declaration.exchange(runtime::NativeFgDeclaration::kOn);
+      RestoreMarkerControl() {
+        handles.swap(runtime::created_feature_ids);
+        runtime::created_feature_ids.emplace(reinterpret_cast<const NVSDK_NGX_Handle*>(0xF60011), NVSDK_NGX_Feature_FrameGeneration);
+        runtime::fg_output_marker_window = {};
+      }
+      ~RestoreMarkerControl() {
+        handles.swap(runtime::created_feature_ids);
+        runtime::fg_output_marker_window = marker;
+        control::last_request = request;
+        control::last_receipt = receipt;
+        runtime::enabled = enabled;
+        runtime::edit_reuse_enabled = reuse;
+        runtime::edit_reuse_fg_experiment = experiment;
+        runtime::native_fg_public_off = public_off;
+        xefg::internal::sdk_detours_enabled = xefg_sdk;
+        xefg::internal::owns_stream = xefg_owns;
+        runtime::hook_point = hook;
+        runtime::native_fg_declaration = declaration;
+      }
+    } restore_marker_control;
+    const auto writes_before_marker = configuration_writes;
+    const auto process_identity = control::ProcessIdentityState();
+    auto progress = control::Execute({{"id", "marker-default"}, {"op", "fg_output_marker"}, {"action", "status"}});
+    check(progress["ok"] && !progress["marker"]["enabled"].get<bool>()
+            && progress["state"] == process_identity && process_identity.size() == 2
+            && process_identity["pid"] == GetCurrentProcessId() && process_identity["process_created"].is_string(),
+        "normal DEV exposes an independent compact marker query with default OFF");
+    const Json arm{{"id", "marker-arm"}, {"op", "fg_output_marker"}, {"action", "arm"}};
+    const auto armed = control::Execute(arm);
+    check(armed["ok"] && armed["status"] == "armed" && armed["marker"]["duration_ms"] == 3000
+            && armed["marker"]["frame_limit"] == 128 && armed["state"] == process_identity,
+        "the explicit marker operation arms a running native Upscaled experiment without stopping NR or touching SDK display modes");
+    runtime::fg_output_marker_window.Recorded(false, 123, runtime::SteadyNowNs());
+    check(control::Execute(arm) == armed && runtime::fg_output_marker_window.recorded == 1,
+        "same-id marker replay returns the original receipt without restarting the finite window");
+    progress = control::Execute({{"id", "marker-progress"}, {"op", "fg_output_marker"}, {"action", "status"}});
+    check(progress["marker"]["recorded"] == 1 && progress["marker"]["refreshes"] == 1
+            && control::last_receipt == armed && progress.dump().size() < 2048,
+        "marker progress is live, compact and does not replace the cached mutation receipt");
+    const auto reused_id = control::Execute({{"id", "marker-arm"}, {"op", "fg_output_marker"}, {"action", "stop"}});
+    check(!reused_id["ok"].get<bool>() && reused_id["reason"] == "request_id_reused" && reused_id["state"] == process_identity,
+        "a reused marker mutation id cannot change its original action");
+    const auto stopped = control::Execute({{"id", "marker-stop"}, {"op", "fg_output_marker"}, {"action", "stop"}});
+    check(stopped["ok"] && !runtime::fg_output_marker_window.enabled && runtime::fg_output_marker_window.stopped
+            && stopped["state"] == process_identity,
+        "an explicit stop cancels the marker while NR remains running");
+    runtime::hook_point = runtime::kHookPresent;
+    const auto blocked = control::Execute({{"id", "marker-native-present"}, {"op", "fg_output_marker"}, {"action", "arm"}});
+    check(!blocked["ok"].get<bool>() && blocked["reason"] == "marker_route_unavailable"
+            && !runtime::fg_output_marker_window.enabled && blocked["state"] == process_identity,
+        "native Present does not gain marker admission from the diagnostic operation");
+    runtime::hook_point = runtime::kHookUpscaled;
+    runtime::enabled = false;
+    const auto inactive = control::Execute({{"id", "marker-nr-off"}, {"op", "fg_output_marker"}, {"action", "arm"}});
+    check(inactive["reason"] == "nr_x2_not_running" && inactive["state"] == process_identity,
+        "an inactive NR chain cannot arm the marker");
+    const auto invalid_action = control::Execute({{"id", "marker-invalid"}, {"op", "fg_output_marker"}, {"action", "invalid"}});
+    check(!invalid_action["ok"].get<bool>() && invalid_action["reason"] == "invalid_marker_action"
+            && invalid_action["state"] == process_identity,
+        "a rejected marker action retains the client's minimal process identity contract");
+    const auto consumer_status = control::Execute({{"id", "consumer-status"}, {"op", "fg_consumer_capture"}, {"action", "status"}});
+    check(consumer_status["ok"] && consumer_status["capture"].is_object()
+            && consumer_status["state"] == process_identity && consumer_status.dump().size() < 2048,
+        "consumer progress reuses the same compact native process identity envelope");
+    Json consumer{{"id", "consumer-bad-roi"}, {"op", "fg_consumer_capture"}, {"action", "arm"},
+        {"output_directory", "D:/nr-consumer-cpu"}, {"capture_id", "cpu-consumer"},
+        {"roi", {{"x", -1}, {"y", 0}, {"width", 128}, {"height", 64}}}};
+    const auto bad_roi = control::Execute(consumer);
+    check(!bad_roi["ok"].get<bool>() && bad_roi["reason"] == "invalid_consumer_request"
+            && bad_roi["state"] == process_identity && !screenshot::WantsFgConsumerCapture(),
+        "malformed ROI coordinates cannot arm a consumer request or start GPU work");
+    runtime::enabled = true;
+    runtime::hook_point = runtime::kHookPresent;
+    consumer["id"] = "consumer-native-present";
+    consumer["roi"]["x"] = 0;
+    const auto consumer_blocked = control::Execute(consumer);
+    check(!consumer_blocked["ok"].get<bool>() && consumer_blocked["reason"] == "native_consumer_route_unavailable"
+            && consumer_blocked["state"] == process_identity && !screenshot::WantsFgConsumerCapture(),
+        "the consumer operation does not admit native Present or claim a source frame");
+    check(configuration_writes == writes_before_marker
+            && !control::Snapshot()["edit_reuse"].contains("fg_output_marker")
+            && !control::Snapshot()["edit_reuse"].contains("fg_consumer_capture"),
+        "marker requests do not persist settings or enlarge the ordinary status body");
+  }
   Json receipt{{"scope", "CPU production configuration and status adapters with synthetic ReShade cache; no GPU, NGX or game"},
       {"checks", checks}, {"configuration_writes", configuration_writes}, {"final", control::Snapshot()}};
   std::ofstream("dev-control-runtime.json") << receipt.dump(2);

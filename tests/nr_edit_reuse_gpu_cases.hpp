@@ -1144,26 +1144,123 @@ int Run() {
       Check(native_environment.available && native_environment.provider == 1
                 && native_environment.context == reinterpret_cast<uintptr_t>(fg_handle),
           "successful On declaration and a unique known FG handle expose environment metadata only");
-      Check(frame(1) == 1 && native::features.at(owner).slots[0].edit_reuse == nullptr,
-          "the default Off admission still declines x2 while the MOCK FG environment is On");
-      native::edit_reuse_fg_experiment = true;
-      const auto first_on_calls = frame(0);
-      const auto first_on_cache = native::features.at(owner).slots[0].edit_reuse;
-      std::cout << "OBS DEV On first anchor: model_calls=" << first_on_calls << " reset=" << model_resets.back()
-                << " cache=" << (first_on_cache != nullptr) << '\n';
-      Check(first_on_calls == 1 && first_on_cache != nullptr && first_on_cache->valid
-                && first_on_cache->contract[32] == 1
-                && first_on_cache->source_sequence == native::features.at(owner).sr_sequence,
-          "DEV On establishes a fresh fixed-size SR anchor while preserving already-continuous NR History");
-      const auto on_reuses = native::edit_reuse_reuses.load();
-      Check(frame(0) == 0 && native::edit_reuse_reuses.load() == on_reuses + 1,
-          "DEV On reuses exactly once despite ordinary observed FG input");
-      const auto on_final = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-      submit_commands("DEV On neutral output readback");
-      const auto on_bytes = on_final.Pixels();
-      Check(std::memcmp(on_bytes.data(), source_values.data(), on_bytes.size()) == 0,
-          "DEV On neutral edit preserves the current SR RGB and alpha exactly");
-      Check(frame(0) == 1, "DEV On refreshes on the next base frame after that reuse");
+      {
+        namespace cap = addon::control_mask_capture;
+        namespace timers = addon::gpu_timers;
+        Check(!cap::Enabled() && !cap::CapturePending() && !cap::WorkPending(), "inline WARP fixture owns the idle capture singleton");
+        struct RestoreInlineCapture {
+          decltype(cap::wake_worker) wake = cap::wake_worker;
+          decltype(timers::raw_observer) observer = timers::raw_observer;
+          bool profiling = native::gpu_timers_enabled.exchange(true);
+          int64_t stable = native::comparison_stable_after_ns[1];
+          ~RestoreInlineCapture() {
+            cap::Stop("fixture_complete", false);
+            {
+              std::unique_lock lock(cap::internal::state.mutex);
+              auto& state = cap::internal::state;
+              state.summary = {};
+              state.rows.clear();
+              state.armed = false;
+              state.marker_needed = false;
+              state.terminal_needed = false;
+            }
+            cap::internal::capture_pending = false;
+            cap::internal::work_pending = false;
+            cap::wake_worker = wake;
+            timers::raw_observer = observer;
+            native::gpu_timers_enabled = profiling;
+            native::comparison_stable_after_ns[1] = stable;
+          }
+        } restore_inline_capture;
+        timers::Poll(true, false);
+        cap::wake_worker = +[] { return true; };  // No export worker or filesystem in this recording fixture.
+        timers::raw_observer = cap::Observe;
+        native::comparison_stable_after_ns[1] = 0;
+        Check(cap::Configure(4, 30, 0, 4), "baseline and x2 share one finite existing capture request");
+        const auto timed_frame = [&](int reset) {
+          const auto sequence = timers::internal::next_sequence;
+          const auto calls = frame(reset, false);
+          const auto found = std::find_if(std::begin(timers::internal::segments), std::end(timers::internal::segments),
+              [&](const auto& segment) { return segment.recorded && segment.sequence == sequence + 1; });
+          Check(found != std::end(timers::internal::segments) && found->diagnostic_token != 0,
+              "a successful production source write reserves exactly one complete-chain timer context");
+          const auto timer_sequence = found->sequence;
+          Check(SUCCEEDED(gpu.list->Close()), "inline capture recording close");
+          ID3D12CommandList* lists[]{gpu.list.Get()};
+          gpu.queue->ExecuteCommandLists(1, lists);
+          gpu.submission_pending = true;
+          Check(SUCCEEDED(gpu.queue->Signal(gpu.fence.Get(), ++gpu.serial)), "inline capture real completion signal");
+          HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+          Check(event != nullptr, "inline capture completion event");
+          const auto armed = gpu.fence->SetEventOnCompletion(gpu.serial, event);
+          const auto wait = (SUCCEEDED(armed) ? WaitForSingleObject(event, 10000) : WAIT_FAILED);
+          CloseHandle(event);
+          Check(wait == WAIT_OBJECT_0 && SUCCEEDED(gpu.device->GetDeviceRemovedReason()), "inline capture bounded healthy WARP completion");
+          gpu.submission_pending = false;
+          Check(SUCCEEDED(gpu.allocator->Reset()) && SUCCEEDED(gpu.list->Reset(gpu.allocator.Get(), nullptr)),
+              "inline capture completed list reset");
+          native::DrainRetiredResources(true);
+          timers::Poll(true, false);
+          submission::PruneCompletedGenerations();
+          gpu.uploads.clear();
+          gpu.retained_resources.clear();
+          {
+            std::shared_lock lock(cap::internal::state.mutex);
+            const auto& rows = cap::internal::state.rows;
+            const auto sample = std::find_if(rows.begin(), rows.end(), [&](const auto& row) {
+              return row.timer_sequence == timer_sequence;
+            });
+            Check(sample != rows.end() && sample->state == cap::internal::RowState::VALID && sample->stats.valid
+                      && sample->stats.sequence == timer_sequence && sample->stats.samples == 1,
+                "the existing raw observer receives actual completed chain timestamps");
+          }
+          return calls;
+        };
+        native::edit_reuse_fg_experiment = true;
+        native::edit_reuse_enabled = false;
+        Check(timed_frame(1) == 1 && native::features.at(owner).slots[0].edit_reuse == nullptr,
+            "the baseline runs ordinary NR while the MOCK FG environment is On");
+        native::edit_reuse_enabled = true;
+        const auto first_on_calls = timed_frame(0);
+        const auto first_on_cache = native::features.at(owner).slots[0].edit_reuse;
+        std::cout << "OBS DEV On first anchor: model_calls=" << first_on_calls << " reset=" << model_resets.back()
+                  << " cache=" << (first_on_cache != nullptr) << '\n';
+        Check(first_on_calls == 1 && first_on_cache != nullptr && first_on_cache->valid
+                  && first_on_cache->contract[32] == 1
+                  && first_on_cache->source_sequence == native::features.at(owner).sr_sequence,
+            "DEV On establishes a fresh fixed-size SR anchor while preserving already-continuous NR History");
+        const auto on_reuses = native::edit_reuse_reuses.load();
+        Check(timed_frame(0) == 0 && native::edit_reuse_reuses.load() == on_reuses + 1,
+            "DEV On reuses exactly once despite ordinary observed FG input");
+        const auto on_final = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        submit_commands("DEV On neutral output readback");
+        const auto on_bytes = on_final.Pixels();
+        Check(std::memcmp(on_bytes.data(), source_values.data(), on_bytes.size()) == 0,
+            "DEV On neutral edit preserves the current SR RGB and alpha exactly");
+        Check(timed_frame(0) == 1, "DEV On refreshes on the next base frame after that reuse");
+        const auto summary = cap::GetSummary();
+        Check(summary.inline_edit_reuse && !summary.xefg_service && summary.recorded == 4
+                  && summary.valid == 4 && summary.rejected == 0 && summary.dropped == 0,
+            "one baseline and refresh/reuse/refresh each publish one real completed inline sample");
+        std::shared_lock lock(cap::internal::state.mutex);
+        const auto& rows = cap::internal::state.rows;
+        Check(rows.size() == 4, "neither the NR branch nor a mirrored source creates an extra capture reservation");
+        for (size_t index = 0; index < rows.size(); ++index) {
+          const auto& context = rows[index].context;
+          const bool reused = index == 2;
+          Check(context.inline_edit_reuse && context.output_ready && context.source_handle == reinterpret_cast<uintptr_t>(owner)
+                    && context.source_generation_available && context.source_generation == native::features.at(owner).source_generation
+                    && context.source_sequence != 0 && context.model_evaluates == (reused ? 0u : 1u)
+                    && context.reuse == reused && context.refresh != reused
+                    && context.api_returned != reused && context.ngx_accepted != reused
+                    && (!reused || context.reset_reasons == 0),
+              "actual source identity, model calls, API returns and zero-reset reuse remain distinct");
+          if (index != 0) {
+            Check(context.source_sequence == rows[index - 1].context.source_sequence + 1,
+                "capture cadence follows true source frames across baseline and x2");
+          }
+        }
+      }
       {
         auto other_output = uav_texture(16, 16, DXGI_FORMAT_R16G16B16A16_FLOAT);
         gpu.Transition(other_output.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);

@@ -95,11 +95,22 @@ native颜色记录包含Backbuffer、HUDLess、UI及UIAlpha的身份。XeFG区�
 专用输出验证构建同时定义`NR_NEXUS_DEV_CONTROL`与`NR_NEXUS_TEST_FG_OUTPUT_PROBE`时，
 `state.edit_reuse.fg_output_probe`报告实际SDK诊断调用回执：XeFG按真实模块／context调用仅显示生成帧及生成帧标记，
 native在游戏本次已知版本的On选项中加入官方生成帧显示标志，保留调用方对象和其他字段。
-此构建在实验开启后最多128个合格源帧插入局部识别图案，区分刷新／复用；只处理完成Resolve后的线性RGBA16F，保留alpha、ROI外画面及原缓存锚点。
-源或FG环境变化、诊断回执失效和资源准备失败均停止本次标记。它使用工作集的实际提交与退休，普通DEV与正式构建不启用。
+局部识别图案独立于SDK显示诊断，普通DEV构建通过`fg_output_marker`的`action=arm|stop|status`显式控制；开启实验本身不启动标记。
+标记最多覆盖128个合格源帧及3秒，区分刷新／复用；支持完成写回后的RGBA16F scRGB和RGB10A2 HDR10/PQ，保留alpha、ROI外画面及原缓存锚点。
+源或FG环境变化、时间／帧数到限和资源准备失败均停止本次标记；关闭实验也会停止。它使用工作集的实际提交与退休，正式构建不包含此入口。
 此专用构建的`fg_observation.events`仅序列化前16项并报告`serialized_event_limit`，给SDK回执保留管道空间；完整事件数量仍单独记录。
-SDK成功和标记录制不等于屏幕像素确认，XeFG生成失败还可能显示应用帧。专用软件像素验证沿用
+SDK成功和标记录制不等于屏幕像素确认，XeFG生成失败还可能显示应用帧。软件像素验证沿用
 `tools/run-tests.ps1 -Suite fg-native -NativeCase nr-fg-output-marker -SoftwareOnly -UiPreview None`，使用当前生成的shader；不运行游戏或模型。
+
+普通DEV另有一次性`fg_consumer_capture`：`action=arm`要求当前NR开启、native FG环境和Upscaled入口，
+提供绝对`output_directory`、1–80位ASCII字母数字／下划线／连字符的`capture_id`及`roi={x,y,width,height}`（最多256×192）；`action=status`读取终态。
+它在真实NGX调用前捕获typed主颜色（优先HUDLess），返回后捕获typed `OutputInterpolated`，两者独立记录格式和尺寸。
+只有实际录制、单次提交、Fence完成和读回写入证明齐备才导出有效raw；metadata区分API返回、GPU完成、插帧有效标志及展示状态。
+当前读回不核验插帧有效标志或展示，`written`只表示这两块实际资源的ROI已完成复制。定向验证入口为`-NativeCase fg-consumer-capture -SoftwareOnly`。
+
+同一DEV实验的native Upscaled单颜色、单Pass、固定尺寸路径可通过现有`NRControlMaskGpuCapture*`入口记录完整刷新／复用链GPU耗时，
+导出的`scope=native_upscaled_inline_chain`与原ControlMask、XeFG service计时分开；逐帧基线也须开启实验并关闭`NREditReuse`。
+按相同来源／代次的相邻刷新与复用比较成本，不能把NR调用次数减半直接当成总链成本减半。
 
 DEV 两档 x2 另可接纳与当前 D3D12 源、真实来源链与 XeFG proxy 的嵌套 Present 关联及 context 代次绑定的成功
 `SetEnabled(false)`。它保持原生 FG 声明不变；Unknown 自身不能准入。`state.edit_reuse.xefg_off_sources`

@@ -41,12 +41,16 @@ inline Json Identity() {
           {"edit_reuse_adaptive_evidence", "requested_enabled_not_activation"}}}};
 }
 
-inline Json Snapshot() {
+inline Json ProcessIdentityState() {
   FILETIME created{}, exited{}, kernel{}, user{};
   const bool process_known = GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user) != FALSE;
-  Json state{{"pid", GetCurrentProcessId()},
-      {"process_created", process_known ? Json(std::to_string((uint64_t{created.dwHighDateTime} << 32) | created.dwLowDateTime)) : Json(nullptr)},
-      {"version", kAddonVersion}, {"available", false}, {"reason", "runtime_busy"}};
+  return {{"pid", GetCurrentProcessId()},
+      {"process_created", process_known ? Json(std::to_string((uint64_t{created.dwHighDateTime} << 32) | created.dwLowDateTime)) : Json(nullptr)}};
+}
+
+inline Json Snapshot() {
+  auto state = ProcessIdentityState();
+  state.update({{"version", kAddonVersion}, {"available", false}, {"reason", "runtime_busy"}});
   const auto roi = screenshot::GetInlineRestoreStatus();
   state["inline_restore_roi"] = {{"capture_id", roi.capture_id}, {"status", roi.status},
       {"reason", roi.reason}, {"serial", roi.serial}};
@@ -460,7 +464,7 @@ inline Json Snapshot() {
           {"source_generation", marker.binding.source_generation}, {"provider", marker.binding.provider},
           {"context", marker.binding.context}, {"environment_generation", marker.binding.environment_generation},
           {"roi_position", "source_width/4,source_height/3"}, {"roi_size", {128, 64}},
-          {"encoding", "linear_FP16_after_resolve_alpha_preserved"}}}};
+          {"encoding", "scRGB_FP16_or_PQ_RGB10A2_after_commit_alpha_preserved"}}}};
 #endif
   return state;
 }
@@ -477,6 +481,41 @@ inline Json Execute(const Json& request) {
   if (operation == request.end() || !operation->is_string()) {
     return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "invalid_operation"}};
   }
+  const bool marker_operation = *operation == "fg_output_marker";
+  const bool consumer_operation = *operation == "fg_consumer_capture";
+  const bool compact_operation = marker_operation || consumer_operation;
+  const auto consumer_snapshot = []() {
+    const auto capture = screenshot::CopyFgConsumerStatus();
+    return Json{{"capture_id", capture.capture_id}, {"status", capture.status},
+        {"reason", capture.reason}, {"serial", capture.serial}};
+  };
+  const auto marker_snapshot = []() {
+    const auto& marker = fg_output_marker_window;
+    const auto now = SteadyNowNs();
+    return Json{{"request_generation", marker.request_generation}, {"enabled", marker.enabled},
+        {"bound", marker.bound}, {"stopped", marker.stopped}, {"reason", marker.reason},
+        {"expired", marker.enabled && (now < marker.armed_ns || now - marker.armed_ns >= marker.MAX_DURATION_NS)},
+        {"frame_limit", marker.MAX_FRAMES}, {"duration_ms", marker.MAX_DURATION_NS / 1'000'000},
+        {"recorded", marker.recorded}, {"refreshes", marker.refreshes}, {"reuses", marker.reuses},
+        {"first_sequence", marker.first_sequence}, {"last_sequence", marker.last_sequence},
+        {"source", marker.binding.source}, {"source_generation", marker.binding.source_generation},
+        {"provider", marker.binding.provider}, {"context", marker.binding.context},
+        {"environment_generation", marker.binding.environment_generation},
+        {"evidence", "marker_recording_not_GPU_completion_or_FG_pixels"}};
+  };
+  if (marker_operation && request.value("action", Json(nullptr)) == "status") {
+    RuntimeTryLock lock(runtime_mutex);
+    if (!lock.owns_lock()) {
+      return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "runtime_busy"},
+          {"state", ProcessIdentityState()}};
+    }
+    return {{"id", *id}, {"ok", true}, {"status", "observed"}, {"marker", marker_snapshot()},
+        {"state", ProcessIdentityState()}};
+  }
+  if (consumer_operation && request.value("action", Json(nullptr)) == "status") {
+    return {{"id", *id}, {"ok", true}, {"status", "observed"}, {"capture", consumer_snapshot()},
+        {"state", ProcessIdentityState()}};
+  }
   if (*operation == "status") {
     auto state = Snapshot();
     return {{"id", *id}, {"ok", true}, {"status", "observed"}, {"state", state},
@@ -487,27 +526,36 @@ inline Json Execute(const Json& request) {
   if (*operation != "set" && *operation != "adaptive_feature_experiment"
       && *operation != "bridge_adaptive_experiment" && *operation != "edit_reuse_adaptive_experiment"
       && *operation != "edit_reuse_fg_experiment"
+      && !compact_operation
       && *operation != "inline_restore_roi") {
     return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "invalid_operation"}};
   }
   if (last_request.is_object() && last_request["id"] == *id) {
     if (request == last_request) return last_receipt;
+    if (compact_operation) {
+      return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "request_id_reused"},
+          {"state", ProcessIdentityState()}};
+    }
     return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "request_id_reused"}};
   }
   Json response{{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "invalid_setting"},
       {"message", ""}, {"changes", Json::object()}};
   const auto finish = [&]() {
-    response["state"] = Snapshot();
-    if (response["state"].value("available", false)) {
-      // Status can contain both the current state and this cached receipt.
-      // Keep bounded events in the current status, rather than duplicating
-      // them into every mutation receipt under the same 64 KiB pipe limit.
-      auto& observed = response["state"]["edit_reuse"]["fg_observation"];
-      observed["events"] = Json::array();
-      observed["events_in_status_only"] = true;
-      response["state"]["edit_reuse"].erase("native_evaluate");
+    if (compact_operation) {
+      response["state"] = ProcessIdentityState();
+    } else {
+      response["state"] = Snapshot();
+      if (response["state"].value("available", false)) {
+        // Status can contain both the current state and this cached receipt.
+        // Keep bounded events in the current status, rather than duplicating
+        // them into every mutation receipt under the same 64 KiB pipe limit.
+        auto& observed = response["state"]["edit_reuse"]["fg_observation"];
+        observed["events"] = Json::array();
+        observed["events_in_status_only"] = true;
+        response["state"]["edit_reuse"].erase("native_evaluate");
+      }
+      response["identity"] = response["state"].value("identity", Json(nullptr));
     }
-    response["identity"] = response["state"].value("identity", Json(nullptr));
     last_request = request;
     last_receipt = response;
     Log(reshade::log::level::info, NR_NEXUS_NAME " development control: id=" + id->get<std::string>()
@@ -517,6 +565,86 @@ inline Json Execute(const Json& request) {
   const bool configuration_busy = shutting_down.load() || slider_pending != nullptr || stage_edit::pending || resolution_edit::pending
       || stage_edit_request.setting != nullptr || !resolution_edit_request.empty() || profile_ui::Busy()
       || profile_ui::pending_action != profile_ui::Action::NONE || preset_ui::manager_geometry.was_open;
+  if (consumer_operation) {
+    response["reason"] = "invalid_consumer_request";
+    const auto directory = request.find("output_directory");
+    const auto capture_id = request.find("capture_id");
+    const auto roi = request.find("roi");
+    if (request.value("action", Json(nullptr)) != "arm"
+        || directory == request.end() || !directory->is_string()
+        || capture_id == request.end() || !capture_id->is_string() || roi == request.end() || !roi->is_object()) return finish();
+    for (const char* key : {"x", "y", "width", "height"}) {
+      const auto value = roi->find(key);
+      if (value == roi->end() || !value->is_number_integer() || *value < 0 || *value > UINT32_MAX) return finish();
+    }
+    if (configuration_busy) {
+      response["reason"] = "configuration_busy";
+      return finish();
+    }
+    bool route_ready = false;
+    {
+      RuntimeTryLock lock(runtime_mutex);
+      if (!lock.owns_lock()) {
+        response["reason"] = "runtime_busy";
+      } else {
+        const auto environment = ReadEditReuseFgEnvironmentLocked();
+        route_ready = enabled.load() && hook_point.load() == kHookUpscaled
+            && environment.available && environment.provider == 1;
+        response["reason"] = "native_consumer_route_unavailable";
+      }
+    }
+    if (route_ready) {
+      try {
+        const auto& utf8_directory = directory->get_ref<const std::string&>();
+        std::string reason;
+        const bool armed = screenshot::RequestFgConsumerCapture(
+            std::filesystem::path(std::u8string(utf8_directory.begin(), utf8_directory.end())),
+            capture_id->get_ref<const std::string&>(),
+            {.x = (*roi)["x"].get<uint32_t>(), .y = (*roi)["y"].get<uint32_t>(),
+                .width = (*roi)["width"].get<uint32_t>(), .height = (*roi)["height"].get<uint32_t>()}, &reason);
+        response["ok"] = armed;
+        response["status"] = (armed ? "armed" : "rejected");
+        response["reason"] = reason;
+      } catch (...) {
+        response["reason"] = "invalid_consumer_request";
+      }
+    }
+    response["capture"] = consumer_snapshot();
+    return finish();
+  }
+  if (marker_operation) {
+    const auto action = request.find("action");
+    response["reason"] = "invalid_marker_action";
+    if (action == request.end() || !action->is_string() || (*action != "arm" && *action != "stop")) return finish();
+    {
+      RuntimeTryLock lock(runtime_mutex);
+      if (!lock.owns_lock()) {
+        response["reason"] = "runtime_busy";
+      } else {
+        if (*action == "stop") {
+          fg_output_marker_window.Stop("explicit_stop");
+          response.update({{"ok", true}, {"status", "stopped"}, {"reason", "marker_stopped"}});
+        } else if (configuration_busy) {
+          response["reason"] = "configuration_busy";
+        } else if (!enabled.load() || !edit_reuse_enabled.load()) {
+          response["reason"] = "nr_x2_not_running";
+        } else {
+          const auto environment = ReadEditReuseFgEnvironmentLocked();
+          const bool route = (environment.provider == 1 && hook_point.load() == kHookUpscaled
+                  && edit_reuse_fg_experiment.load())
+              || (environment.provider == 2 && hook_point.load() == kHookPresent);
+          if (!environment.available || !route) {
+            response["reason"] = "marker_route_unavailable";
+          } else {
+            fg_output_marker_window.Arm(SteadyNowNs());
+            response.update({{"ok", true}, {"status", "armed"}, {"reason", "marker_requested"}});
+          }
+        }
+        response["marker"] = marker_snapshot();
+      }
+    }
+    return finish();
+  }
   if (*operation == "inline_restore_roi") {
     response["reason"] = "invalid_output_directory";
     const auto directory = request.find("output_directory");
@@ -585,9 +713,9 @@ inline Json Execute(const Json& request) {
           requested_flag->store(requested);
           if (fg_experiment && !unchanged) {
             edit_fg_observation::SetEnabled(requested);
-#if defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
-            fg_output_marker_window.SetEnabled(requested);
-#endif
+            if (!requested) {
+              fg_output_marker_window.Stop("fg_experiment_disabled");
+            }
           }
         } else {
           const auto requested = static_cast<AdaptiveFeatureMode>(value->get<uint32_t>());

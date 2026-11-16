@@ -53,6 +53,43 @@ class ClientTests(unittest.TestCase):
         self.assertNotEqual(*[r['id'] for r in self.transport.requests])
         self.assertEqual(dev.NamedPipeTransport(42).path, r'\\.\pipe\nr-nexus-dev-42')
 
+    def test_compact_marker_replies_preserve_the_native_process_identity_contract(self):
+        for action, accepted, status in (('arm', True, 'armed'), ('stop', True, 'stopped'),
+                                         ('status', True, 'observed'), ('invalid', False, 'rejected')):
+            with self.subTest(action=action):
+                def compact(request):
+                    return dict(id=request['id'], ok=accepted, status=status,
+                                state=dict(pid=42, process_created='123'),
+                                marker=dict(recorded=0, frame_limit=128, duration_ms=3000))
+                client = self.client(compact)
+                deadline = time.monotonic() + 1
+                request = dict(id='marker-' + action, op='fg_output_marker', action=action)
+                actual = (client._request(request, deadline) if action == 'status'
+                          else client._mutation(request, deadline))
+                self.assertEqual(actual['state'], dict(pid=42, process_created='123'))
+                self.assertEqual(actual['ok'], accepted)
+                self.assertEqual(actual['status'], status)
+                self.assertEqual(self.transport.requests, [request])
+                self.assertEqual(self.transport.deadlines, [deadline])
+                self.assertNotIn('settings', actual['state'])
+
+    def test_compact_marker_replies_reject_missing_or_mismatched_identity(self):
+        identities = (None, {}, dict(pid=42), dict(pid=43, process_created='123'),
+                      dict(pid=42, process_created='wrong'), dict(pid=True, process_created='123'))
+        for accepted in (True, False):
+            for identity in identities:
+                with self.subTest(accepted=accepted, identity=identity):
+                    def compact(request):
+                        result = dict(id=request['id'], ok=accepted,
+                                      status='observed' if accepted else 'rejected', marker={})
+                        if identity is not None:
+                            result['state'] = identity
+                        return result
+                    client = self.client(compact)
+                    with self.assertRaisesRegex(dev.ProtocolError, 'process identity mismatch'):
+                        client._request(dict(id='marker-identity', op='fg_output_marker', action='status'),
+                                        time.monotonic() + 1)
+
     def test_confirmation_is_explicit_and_uses_exact_proposal_with_new_id(self):
         def proposal(request):
             result = response(request)

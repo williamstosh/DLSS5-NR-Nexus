@@ -12,7 +12,7 @@ param(
     [string]$DetoursLibrary,
     [string]$PythonExecutable,
     [ValidateSet('Auto','Quick','Full','None')][string]$UiPreview = 'Auto',
-    [ValidateSet('inline-restore-roi','control-mask','control-mask-safety','control-mask-safety-hardware','control-mask-capture','control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','control-mask-native-ngx-fg','gpu-pass-diagnostics','native-required-menu','native-owner-idle','native-options-resume','native-options-delayed','native-guide-contract','present-guide-models','adaptive-fg-service','adaptive-inline','vulkan-recorded-use-contract','native-present-decision','trace-metadata','stage-chain','stage-resolution','stage-resolution-hardware','same-stage-resolution','same-stage-resolution-hardware','render-stage-resolution','render-stage-resolution-hardware','present-stage-resolution','present-stage-resolution-hardware','native-prefg-resolution','native-prefg-resolution-hardware','native-frame-identity','same-stage-model-pair','same-stage-mixed-pair','source-lifecycle','feature-switch','feature-switch-hardware','f5-mixed','present-chain','present-chain-hardware','present-chain-scrgb','present-chain-hdr10','native-full','native-full-hardware','nr-edit-reuse-contracts','nr-edit-reuse-xefg-contracts','nr-edit-reuse-native-contracts','native-frame-source','nr-fg-output-marker')]
+    [ValidateSet('inline-restore-roi','control-mask','control-mask-safety','control-mask-safety-hardware','control-mask-capture','control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','control-mask-native-ngx-fg','gpu-pass-diagnostics','native-required-menu','native-owner-idle','native-options-resume','native-options-delayed','native-guide-contract','present-guide-models','adaptive-fg-service','adaptive-inline','vulkan-recorded-use-contract','native-present-decision','trace-metadata','stage-chain','stage-resolution','stage-resolution-hardware','same-stage-resolution','same-stage-resolution-hardware','render-stage-resolution','render-stage-resolution-hardware','present-stage-resolution','present-stage-resolution-hardware','native-prefg-resolution','native-prefg-resolution-hardware','native-frame-identity','same-stage-model-pair','same-stage-mixed-pair','source-lifecycle','feature-switch','feature-switch-hardware','f5-mixed','present-chain','present-chain-hardware','present-chain-scrgb','present-chain-hdr10','native-full','native-full-hardware','nr-edit-reuse-contracts','nr-edit-reuse-xefg-contracts','nr-edit-reuse-native-contracts','native-frame-source','nr-fg-output-marker','fg-consumer-capture')]
     [string[]]$NativeCase = @(),
     [switch]$VulkanNativeNgx,
     [string]$NativeNgxProjectIdPath,
@@ -169,8 +169,8 @@ foreach ($item in $Suite) {
         if ($item -eq 'fg-native' -and (@($NativeCase | Where-Object { $_ -in @('inline-restore-roi','nr-edit-reuse-contracts','nr-edit-reuse-native-contracts','native-frame-source') }).Count -gt 0)) {
             $arguments += '/DNR_NEXUS_DEV_CONTROL'
         }
-        if ($item -eq 'fg-native' -and $NativeCase -contains 'nr-fg-output-marker') {
-            $arguments += @('/DNR_NEXUS_DEV_CONTROL','/DNR_NEXUS_TEST_FG_OUTPUT_PROBE')
+        if ($item -eq 'fg-native' -and @($NativeCase | Where-Object { $_ -in @('nr-fg-output-marker','fg-consumer-capture') }).Count -gt 0) {
+            $arguments += '/DNR_NEXUS_DEV_CONTROL'
         }
         if ($item -eq 'vulkan-control-mask') { $arguments += "/I$VulkanIncludeDirectory" }
         $link += @('user32.lib','gdi32.lib','ole32.lib','psapi.lib')
@@ -311,6 +311,21 @@ foreach ($item in $Suite) {
                     } finally {
                         if (Test-Path -LiteralPath $runtimeLink) { Remove-Item -LiteralPath $runtimeLink -Force }
                         if ($srRuntimeLink -and (Test-Path -LiteralPath $srRuntimeLink)) { Remove-Item -LiteralPath $srRuntimeLink -Force }
+                    }
+                } elseif ($case -eq 'fg-consumer-capture') {
+                    $consumerPassed = $false
+                    try {
+                        Invoke-TestProcess $exe $directory $case @("--$case") -DeferFailureCleanup
+                        $consumerPassed = $true
+                    } finally {
+                        $consumerRaw = Join-Path $directory 'fg-consumer-evidence'
+                        if (Test-Path -LiteralPath $consumerRaw) {
+                            @(Get-ChildItem -LiteralPath $consumerRaw -Filter '*.raw' -File | ForEach-Object {
+                                Register-TestDisposable -Directory $directory -Path $_.FullName -Kind 'fg-consumer-raw'
+                                @{path=[IO.Path]::GetRelativePath($directory, $_.FullName); bytes=$_.Length; sha256=(Get-FileHash -LiteralPath $_.FullName).Hash}
+                            }) | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $directory 'fg-consumer-raw-inputs.json') -Encoding utf8
+                        }
+                        if (-not $consumerPassed) { Complete-TestOutput $directory -Outcome Failed }
                     }
                 } else {
                     Invoke-TestProcess $exe $directory $case @("--$case")

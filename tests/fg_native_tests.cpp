@@ -742,8 +742,9 @@ int RunNativeRequiredMenuTest() {
 #include "gpu_timer_cases.hpp"
 #include "control_mask_gpu_cases.hpp"
 #include "nr_edit_reuse_gpu_cases.hpp"
-#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+#if defined(NR_NEXUS_DEV_CONTROL)
 #include "nr_fg_output_marker_gpu_cases.hpp"
+#include "fg_consumer_capture_cases.hpp"
 #endif
 #include "nr_edit_reuse_xefg_cases.hpp"
 #include "control_mask_capture_cases.hpp"
@@ -756,8 +757,9 @@ int RunNativeRequiredMenuTest() {
 #endif
 
 int main(int argc, char** argv) {
-#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+#if defined(NR_NEXUS_DEV_CONTROL)
   if (argc == 2 && std::strcmp(argv[1], "--nr-fg-output-marker") == 0) return nr_fg_output_marker_gpu_cases::Run();
+  if (argc == 2 && std::strcmp(argv[1], "--fg-consumer-capture") == 0) return fg_consumer_capture_cases::Run();
 #endif
 #if defined(NR_NEXUS_DEV_CONTROL)
   if (argc == 2 && std::strcmp(argv[1], "--native-frame-source") == 0) return native_fg_frame_cases::Run();
