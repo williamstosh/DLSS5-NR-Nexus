@@ -2406,7 +2406,11 @@ inline void OnNativeFgOptions(bool mode_enabled) noexcept {
   edit_fg_observation::StopEnvironment(1, 0);
 #endif
   if (mode_enabled) {
-    if (was_off) RequestHistoryReset(HistoryResetSource::kRecreate);
+    // A declaration alone does not change Upscaled inputs. An existing FG
+    // owner retains its reset and submission-display invalidation behavior.
+    if (was_off && native_fg_owns.load(std::memory_order_acquire)) {
+      RequestHistoryReset(HistoryResetSource::kRecreate);
+    }
     return;
   }
   // Options may be called while an NGX wrapper holds runtime_mutex. The
@@ -13859,49 +13863,47 @@ inline bool RecordInline(
 #if defined(NR_NEXUS_DEV_CONTROL)
   else if (edit_output_contract != nullptr) edit_off = EditReuseXefgOffLocked(handle, feature.source_generation);
 #endif
+  bool edit_reuse_fixed_inline_route = false;
 #if defined(NR_NEXUS_DEV_CONTROL)
   EditReuseFgEnvironment edit_fg_environment;
-  bool edit_reuse_fg_inline_route = false;
-  if (edit_reuse_requested && edit_reuse_fg_experiment.load() && present == nullptr && bridge_source == nullptr
-      && hook_point.load() == kHookUpscaled && successful_sr_device == device
-      && !nr_adaptive_enabled.load() && !adaptive.enabled && nr_input_width == width && nr_input_height == height
-      && !native_fg_owns.load() && !fg::xefg::OwnsStream() && !auto_fg_fallback_active.load()) {
-    const auto created = create_contracts.find(handle);
-    const auto source = UniqueD3D12SourceLocked(created != create_contracts.end()
-        ? reinterpret_cast<uintptr_t>(created->second.source_device12_identity.Get()) : 0);
-    if (created != create_contracts.end() && created->second.source_type_confirmed
-        && feature.source_type_confirmed && feature.source_generation != 0
-        && created->second.source_generation == feature.source_generation
-        && source.handle == reinterpret_cast<uintptr_t>(handle) && source.generation == feature.source_generation) {
-      edit_fg_environment = ReadEditReuseFgEnvironmentLocked();
-      edit_reuse_fg_inline_route = edit_fg_environment.available;
-      if (!edit_fg_environment.available) {
-        edit_fg_observation::StopEnvironment(1, 0);
-        edit_fg_observation::StopEnvironment(2, 0);
-      }
-    }
-  }
+  bool edit_reuse_dev_inline_route = false;
 #endif
-  bool edit_reuse_fixed_inline_route = false;
   if (edit_reuse_requested && present == nullptr && bridge_source == nullptr
-      && !nr_adaptive_enabled.load() && !adaptive.enabled && nr_input_width == width && nr_input_height == height
-      && native_fg_declaration.load() != NativeFgDeclaration::kOn) {
+      && hook_point.load() == kHookUpscaled && successful_sr_device == device
+      && !nr_adaptive_enabled.load() && !adaptive.enabled && nr_input_width == width && nr_input_height == height) {
     const auto created = create_contracts.find(handle);
     edit_reuse_fixed_inline_route = created != create_contracts.end() && created->second.source_type_confirmed
         && feature.source_type_confirmed && feature.source_generation != 0
         && created->second.source_generation == feature.source_generation;
-  }
-  const bool edit_reuse_inline_route =
 #if defined(NR_NEXUS_DEV_CONTROL)
-      edit_reuse_fg_inline_route ||
+    if (edit_reuse_fixed_inline_route && edit_reuse_fg_experiment.load()
+        && (native_fg_declaration.load() == NativeFgDeclaration::kOn || fg::xefg::Enabled())
+        && !native_fg_owns.load() && !fg::xefg::OwnsStream() && !auto_fg_fallback_active.load()) {
+      const auto source = UniqueD3D12SourceLocked(
+          reinterpret_cast<uintptr_t>(created->second.source_device12_identity.Get()));
+      edit_reuse_dev_inline_route = source.handle == reinterpret_cast<uintptr_t>(handle)
+          && source.generation == feature.source_generation;
+      if (edit_reuse_dev_inline_route) {
+        edit_fg_environment = ReadEditReuseFgEnvironmentLocked();
+        if (!edit_fg_environment.available) {
+          edit_fg_observation::StopEnvironment(1, 0);
+          edit_fg_observation::StopEnvironment(2, 0);
+        }
+      }
+    }
 #endif
-      present == nullptr
+  }
+  const bool edit_reuse_inline_route = present == nullptr
       && hook_point.load() == kHookUpscaled && successful_sr_device == device
-      && (edit_reuse_fixed_inline_route || (nr_adaptive_enabled.load()
-          && (edit_reuse_current_native_off || (edit_off.available
-              && native_fg_declaration.load() != NativeFgDeclaration::kOn))))
-      && !native_fg_owns.load() && !fg::xefg::Enabled() && !fg::xefg::OwnsStream()
-      && !auto_fg_fallback_active.load() && !mixed_present_fg_seen.load();
+      && !native_fg_owns.load() && !fg::xefg::OwnsStream() && !auto_fg_fallback_active.load()
+      && (
+#if defined(NR_NEXUS_DEV_CONTROL)
+          edit_reuse_dev_inline_route ||
+#endif
+          (!fg::xefg::Enabled() && !mixed_present_fg_seen.load()
+              && ((edit_reuse_fixed_inline_route && native_fg_declaration.load() != NativeFgDeclaration::kOn)
+                  || (nr_adaptive_enabled.load() && (edit_reuse_current_native_off
+                      || (edit_off.available && native_fg_declaration.load() != NativeFgDeclaration::kOn))))));
   const bool edit_reuse_xefg_route = present != nullptr && present->xefg_edit_reuse_frame != 0
       && hook_point.load() == kHookPresent && !present->d3d11_bridge
       && present->domain == present_restore_scope::Domain::PRE_FG_BACKBUFFER
@@ -14001,12 +14003,7 @@ inline bool RecordInline(
   const auto retire_edit_reuse = [&] {
     auto& slot = feature.slots[0];
     if (slot.edit_reuse == nullptr) return;
-    if (slot.edit_reuse->reused || slot.edit_reuse->source_sequence + 1 != edit_reuse_sequence
-#if defined(NR_NEXUS_DEV_CONTROL)
-        // Inline On keys use provider 1/2; Off uses zero or a captured context pointer.
-        || (present == nullptr && (slot.edit_reuse->contract[32] == 1 || slot.edit_reuse->contract[32] == 2))
-#endif
-    ) {
+    if (slot.edit_reuse->reused || slot.edit_reuse->source_sequence + 1 != edit_reuse_sequence) {
       slot.pending_reset = true;
       slot.pending_reset_reasons |= kResetRecovery;
     }
@@ -14852,32 +14849,20 @@ inline bool RecordInline(
         std::bit_cast<uint32_t>(norm_attack_stops.load()), std::bit_cast<uint32_t>(norm_release_stops.load()),
         std::bit_cast<uint32_t>(norm_slew_stops.load()), norm_cut_aware.load(),
         std::bit_cast<uint32_t>(proxy_anchor_nits.load()),
-        // Inline SDK-Off reuse is also bound to the observed source/proxy
-        // lifetime; repeated Disable calls do not change these stable keys.
+        // Only adaptive SDK-Off reuse depends on the source/proxy receipt.
+        // Fixed-size inline history is independent of FG diagnostics.
         (present != nullptr ? present->restore_config_epoch :
-#if defined(NR_NEXUS_DEV_CONTROL)
-            edit_reuse_fg_inline_route ? edit_fg_environment.provider :
-#endif
-            edit_off.context_identity),
+            (edit_reuse_adaptive_route ? edit_off.context_identity : 0)),
         (present != nullptr ? std::bit_cast<uint32_t>(frame_divisor) :
-#if defined(NR_NEXUS_DEV_CONTROL)
-            edit_reuse_fg_inline_route ? edit_fg_environment.context :
-#endif
-            edit_off.epoch),
+            (edit_reuse_adaptive_route ? edit_off.epoch : 0)),
         (present != nullptr ? static_cast<uint32_t>(frame.ui_correction) :
-#if defined(NR_NEXUS_DEV_CONTROL)
-            edit_reuse_fg_inline_route ? edit_fg_environment.generation :
-#endif
-            edit_off.source_link_generation),
+            (edit_reuse_adaptive_route ? edit_off.source_link_generation : 0)),
         static_cast<uint32_t>(output_desc.Format), hdr_mode, v6_encoding, nr_input_width, nr_input_height};
     if (auto& cache = feature.slots[0].edit_reuse; cache != nullptr) {
-#if defined(NR_NEXUS_DEV_CONTROL)
-      if (present == nullptr && (edit_reuse_fg_inline_route || cache->contract[32] == 1 || cache->contract[32] == 2)
-          && cache->contract != edit_contract) {
+      if (present == nullptr && cache->contract != edit_contract) {
         feature.slots[0].pending_reset = true;
         feature.slots[0].pending_reset_reasons |= kResetRecovery;
       }
-#endif
       if (cache->width != nr_input_width || cache->height != nr_input_height
           || cache->output_width != width || cache->output_height != height || cache->motion_width != frame.motion_width
           || cache->motion_height != frame.motion_height) {
@@ -15923,7 +15908,7 @@ inline bool RecordInline(
       }
 #if defined(NR_NEXUS_DEV_CONTROL)
       if (fg_output_marker_window.enabled && !fg_output_marker_window.stopped
-          && (edit_reuse_fg_inline_route || edit_reuse_xefg_route) && edit_reuse_route_eligible && !adaptive.preparing
+          && (edit_reuse_dev_inline_route || edit_reuse_xefg_route) && edit_reuse_route_eligible && !adaptive.preparing
           && executed + 1 == static_cast<int32_t>(requested_stack) && !NVSDK_NGX_FAILED(stack_failure)
           && (model_evaluated || edit_reused) && feature.slots[0].edit_reuse != nullptr
           && feature.slots[0].edit_reuse->valid) {
@@ -16160,7 +16145,7 @@ inline bool RecordInline(
     return true;
   }
 #if defined(NR_NEXUS_DEV_CONTROL)
-  if (edit_reuse_fg_inline_route && edit_reuse_route_eligible && !adaptive.preparing
+  if (edit_reuse_dev_inline_route && edit_fg_environment.available && edit_reuse_route_eligible && !adaptive.preparing
       && stage_scope.complete && (edit_reused || model_evaluated)) {
     if (const auto generation = edit_fg_observation::CaptureGeneration(true); generation != 0) {
       try {
