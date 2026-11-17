@@ -6,9 +6,17 @@
 
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
 #include <array>
+#include <atomic>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#include <cstring>
+#include <vector>
+#include <fstream>
+#include <iterator>
+#include <d3d12sdklayers.h>
+#include <screenshot.hpp>
+#include "d3d12_test_gpu.hpp"
 
 #include <nr_xefg_present_probe.hpp>
 
@@ -17,20 +25,36 @@ namespace probe = renodx::addons::dlss5::xefg_present_probe;
 inline int Run() {
   struct Restore {
     probe::Snapshot saved = probe::CopySnapshot();
+    probe::Calibration saved_calibration = probe::CopyCalibration();
+    probe::CaptureCallbacks saved_callbacks = probe::capture_callbacks;
+    probe::ControlJob saved_control = probe::CopyControl();
     Restore() {
       std::unique_lock lock(probe::probe_state.mutex);
       probe::probe_state.snapshot = {};
+      probe::calibration = {};
+      probe::control_job = {};
     }
     ~Restore() {
+      const auto deadline = GetTickCount64() + 5000;
+      while (probe::ControlBusy(probe::CopyControl()) && GetTickCount64() < deadline) {
+        Sleep(1);
+      }
+      probe::Snapshot retired;
       std::unique_lock lock(probe::probe_state.mutex);
+      retired = std::move(probe::probe_state.snapshot);
       probe::probe_state.snapshot = saved;
+      probe::calibration = saved_calibration;
+      probe::capture_callbacks = saved_callbacks;
+      probe::control_job = saved_control;
     }
   } restore;
   try {
     uint32_t checks = 0;
     const auto check = [&](bool value, const char* message) {
       ++checks;
-      if (!value) throw std::runtime_error(message);
+      if (!value) {
+        throw std::runtime_error(message);
+      }
     };
     const probe::InitKey key{.slot = 1, .module = 0x1000, .handle = 0x2000, .factory = 0x3000, .window = 0x4000};
     const probe::Candidate candidate{.swapchain = 0x5000, .queue = 0x6000, .device = 0x7000,
@@ -207,7 +231,299 @@ inline int Run() {
     check(probe::CopySnapshot().stopped && probe::BeginInit(key) == 0
             && probe::BeginPresent(candidate.swapchain, 0, 1, 0).serial == 0,
         "Stop invalidates pending and live generations without calling SDK debug or GPU work");
+    {
+      std::unique_lock lock(probe::probe_state.mutex);
+      probe::probe_state.snapshot = {};
+      probe::calibration = {};
+    }
+    static int32_t debug_result = 7;
+    static std::atomic_uint32_t debug_calls = 0, last_enabled = 99, debug_thread = 0;
+    static std::atomic_bool debug_block = false;
+    static bool tag_only = true;
+    auto debug_key = key;
+    debug_key.module_path = "SYNTHETIC_XEFG_MODULE";
+    debug_key.debug = +[](void*, int32_t feature, uint32_t enabled, void*) {
+      ++debug_calls;
+      tag_only &= feature == 1;
+      last_enabled = enabled;
+      debug_thread = GetCurrentThreadId();
+      const auto deadline = GetTickCount64() + 2000;
+      while (debug_block.load() && GetTickCount64() < deadline) {
+        Sleep(1);
+      }
+      return debug_result;
+    };
+    serial = begin(debug_key);
+    created(serial, candidate);
+    context(serial);
+    probe::FinishInit(serial, 0);
+    probe::Target target{.slot = key.slot, .module = key.module, .handle = key.handle,
+        .init_serial = serial, .context = 0x9000, .context_generation = serial, .buffer_generation = 1};
+    namespace shot = renodx::addons::dlss5::screenshot;
+    uint64_t request_sequence = 0;
+    const auto wait_control = [&](uint64_t job_id) {
+      const auto deadline = GetTickCount64() + 5000;
+      for (;;) {
+        const auto value = probe::CopyControl();
+        if (value.job_id == job_id && value.finished) return value;
+        if (GetTickCount64() >= deadline) {
+          check(false, "the bounded substitute control job must return");
+        }
+        Sleep(1);
+      }
+    };
+    const auto control = [&](probe::ControlAction action, bool enabled = false, uint32_t samples = 8, uint32_t duration = 1000) {
+      const auto job_id = probe::QueueControl("cpu-control-" + std::to_string(++request_sequence), action, target, enabled, samples, duration);
+      check(job_id != 0 && shot::ScheduleXefgControl(), "control is queued on the existing screenshot worker");
+      return wait_control(job_id).accepted;
+    };
+    check(!probe::EstablishBaseline(target), "Present-side direct SDK entry is rejected");
+    debug_block = true;
+    const auto blocked_id = probe::QueueControl("blocked-baseline", probe::ControlAction::BASELINE, target);
+    check(blocked_id != 0 && shot::ScheduleXefgControl(), "a blocking SDK substitute does not block queue submission");
+    const auto entry_deadline = GetTickCount64() + 1000;
+    while (!probe::CopyControl().sdk_entered && GetTickCount64() < entry_deadline) {
+      Sleep(1);
+    }
+    const auto entered = probe::CopyControl();
+    const auto blocked_status = renodx::addons::dlss5::internal::dev_control::Execute({{"id", "blocked-status"},
+        {"op", "xefg_present_probe"}, {"action", "status"}});
+    check(entered.sdk_entered && !entered.sdk_returned && !entered.finished
+            && entered.worker_thread != GetCurrentThreadId() && entered.sdk_entered_thread == entered.worker_thread
+            && blocked_status["probe"]["control"]["job_id"] == blocked_id,
+        "status returns during SDK entry and records the actual independent worker thread");
+    check(probe::QueueControl("blocked-baseline", probe::ControlAction::BASELINE, target) == blocked_id,
+        "duplicate request IDs return the original control job without reentering SDK");
+    check(probe::QueueControl("cancel-entered", probe::ControlAction::STOP, target) == blocked_id
+            && !probe::CopyControl().finished, "entered SDK calls remain in flight after cancellation");
+    debug_block = false;
+    const auto returned = wait_control(blocked_id);
+    check(returned.sdk_returned && returned.api_result_available && returned.result == 7
+            && returned.sdk_returned_thread == entered.worker_thread && debug_calls == 1 && debug_thread == entered.worker_thread,
+        "exact SDK entry and return receipts preserve warning success and a single invocation");
+    const auto rejected_calls = debug_calls.load();
+    for (uint32_t rejection = 0; rejection < 3; ++rejection) {
+      const auto job_id = probe::QueueControl("pre-entry-" + std::to_string(rejection), probe::ControlAction::BASELINE, target);
+      {
+        std::unique_lock lock(probe::probe_state.mutex);
+        if (rejection == 0) {
+          probe::control_job.cancel_requested = true;
+        } else if (rejection == 1) {
+          probe::control_job.deadline_ms = 0;
+        } else {
+          ++probe::control_job.target.context_generation;
+        }
+      }
+      check(job_id != 0 && shot::ScheduleXefgControl(), "a rejected pre-entry job is still acknowledged asynchronously");
+      const auto rejected = wait_control(job_id);
+      const auto expected = rejection == 0 ? probe::ControlPhase::CANCELLED
+          : rejection == 1 ? probe::ControlPhase::EXPIRED : probe::ControlPhase::REJECTED;
+      check(!rejected.sdk_entered && !rejected.accepted && rejected.phase == expected && debug_calls == rejected_calls,
+          "cancelled, expired and old-generation work never enters SDK");
+    }
+    check(control(probe::ControlAction::BASELINE) && probe::CopyCalibration().baseline_result == 7 && last_enabled == 0,
+        "explicit false establishes a known test baseline and preserves positive SDK warning success");
+    const auto calls_before_status = debug_calls.load();
+    const auto status = renodx::addons::dlss5::internal::dev_control::Execute({{"id", "xefg-status-cpu"},
+        {"op", "xefg_present_probe"}, {"action", "status"}});
+    check(status["state"].contains("pid") && status["state"].contains("process_created")
+            && status["probe"]["bindings"][0]["module_path"] == debug_key.module_path
+            && status.dump().size() < 65536 && debug_calls == calls_before_status,
+        "metadata status remains read-only, compact, process-bound and tied to the observed module path");
+    check(control(probe::ControlAction::ARM, true) && last_enabled == 1, "TAG-only On arm preserves the controlled baseline");
+    check(!control(probe::ControlAction::BASELINE), "an active TAG window cannot replace its baseline");
+    {
+      std::unique_lock lock(probe::probe_state.mutex);
+      probe::calibration.active = false;
+      probe::calibration.restore_pending = true;
+    }
+    check(!control(probe::ControlAction::BASELINE), "an inactive window with pending restoration cannot overwrite its baseline");
+    check(control(probe::ControlAction::POLL) && !probe::CopyCalibration().restore_pending && !probe::CopyCalibration().tag_enabled
+            && probe::CopyCalibration().restore_result == 7 && last_enabled == 0,
+        "explicit poll restores known false while retaining the actual warning result");
+    debug_result = -91;
+    check(!control(probe::ControlAction::ARM, true, 1), "failed SDK TAG call cannot arm a capture");
+    debug_result = 7;
+    check(control(probe::ControlAction::POLL) && tag_only, "failed arm also restores only TAG, never SHOW");
+    const std::array<shot::CaptureRect, 2> rois{{{.x = 256, .y = 256, .width = 128, .height = 64},
+        {.x = 0, .y = 0, .width = 256, .height = 128}}};
+    check(shot::ValidateXefgRois(rois), "two different bounded ROI dimensions are supported");
+    auto overlap = rois;
+    overlap[1] = overlap[0];
+    check(!shot::ValidateXefgRois(overlap), "overlapping ROI requests are rejected");
+    probe::CopyContext invalid{.target = target, .window_generation = probe::CopyCalibration().generation,
+        .swapchain = candidate.swapchain, .queue = candidate.queue + 1, .index = 0};
+    check(!probe::FrameCurrent(invalid), "wrong queue cannot validate an output sample");
+    invalid.queue = candidate.queue;
+    ++invalid.target.context_generation;
+    check(!probe::FrameCurrent(invalid), "wrong context generation cannot validate an output sample");
     std::cout << "PASS xefg-present-probe CPU/MOCK checks=" << checks << " evidence=" << probe::kEvidence << '\n';
+
+    // WARP exercises the production PRESENT copy boundary on an owned texture.
+    // SDK, context routing and original Present results remain CPU substitutes.
+    reshade::internal::get_reshade_module_handle(GetModuleHandleW(nullptr));
+    Microsoft::WRL::ComPtr<ID3D12Debug> debug;
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
+      debug->EnableDebugLayer();
+    }
+    d3d12_test::Gpu gpu(false);
+    Microsoft::WRL::ComPtr<ID3D12InfoQueue> info;
+    gpu.device.As(&info);
+    check(info != nullptr, "WARP dual ROI requires Debug Layer messages");
+    const auto source = gpu.Texture(1024, 768, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_PRESENT);
+    auto transfer = gpu.CreateTextureTransfer(source.Get());
+    std::vector<uint8_t> input(1024 * 768 * 8);
+    for (size_t index = 0; index < input.size(); ++index) {
+      input[index] = static_cast<uint8_t>(index * 17 + index / 67);
+    }
+    gpu.Transition(source.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+    gpu.UploadTexture(source.Get(), transfer, input.data(), input.size(), 1024 * 8);
+    gpu.Transition(source.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+    gpu.Submit();
+    auto owner = std::make_shared<probe::QueueOwner>();
+    owner->queue = gpu.queue;
+    owner->device = gpu.device;
+    auto warp_candidate = candidate;
+    warp_candidate.queue = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(gpu.queue.Get()));
+    warp_candidate.device = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(gpu.device.Get()));
+    warp_candidate.owner = owner;
+    serial = begin(debug_key);
+    created(serial, warp_candidate);
+    context(serial);
+    probe::FinishInit(serial, 0);
+    target.init_serial = target.context_generation = serial;
+    target.buffer_generation = 1;
+    check(control(probe::ControlAction::BASELINE), "WARP fixture binds a synthetic SDK baseline");
+    const auto directory = std::filesystem::current_path() / ("xefg-present-evidence-" + std::to_string(GetCurrentProcessId()));
+    check(std::filesystem::create_directory(directory), "WARP writer owns a new empty output leaf");
+    std::cout << "XEFG_PRESENT_WRITER_OUTPUT " << directory.string() << '\n';
+    check(shot::RequestXefgCapture(directory, "warp_memory_only", rois, 1),
+        "WARP fixture requests a local-only dual ROI capture");
+    check(shot::ReserveXefgRecording() && !shot::ReserveXefgRecording(), "busy reservation prevents duplicate GPU object creation");
+    auto packet = std::make_shared<probe::CopyPacket>();
+    packet->owner = owner;
+    check(SUCCEEDED(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&packet->allocator)))
+            && SUCCEEDED(gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, packet->allocator.Get(), nullptr, IID_PPV_ARGS(&packet->list)))
+            && SUCCEEDED(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&packet->fence))), "WARP copy packet");
+    probe::CopyContext copied{.target = target, .window_generation = probe::CopyCalibration().generation, .native_serial = 41,
+        .swapchain = warp_candidate.swapchain, .queue = warp_candidate.queue, .buffer = reinterpret_cast<uintptr_t>(source.Get()),
+        .index = 0, .width = 1024, .height = 768, .format = DXGI_FORMAT_R16G16B16A16_FLOAT};
+    const auto capture_serial = shot::PrepareXefgPresent(copied, packet, source.Get());
+    shot::ReleaseXefgRecording();
+    check(capture_serial != 0, "production presenter records same-resource different-size ROI copies");
+    check(SUCCEEDED(packet->list->Close()), "WARP copy close");
+    Microsoft::WRL::ComPtr<ID3D12Fence> gate;
+    check(SUCCEEDED(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)))
+            && SUCCEEDED(gpu.queue->Wait(gate.Get(), 1)), "WARP delayed completion gate");
+    struct ReleaseGate {
+      ID3D12Fence* fence;
+      ~ReleaseGate() {
+        if (fence != nullptr) {
+          fence->Signal(1);
+        }
+      }
+    } release_gate{gate.Get()};
+    ID3D12CommandList* lists[]{packet->list.Get()};
+    const auto reservations = renodx::addons::dlss5::submission::BeginSubmission(1, lists);
+    gpu.queue->ExecuteCommandLists(1, lists);
+    packet->signal_result = gpu.queue->Signal(packet->fence.Get(), 1);
+    check(SUCCEEDED(packet->signal_result), "WARP exact copy Signal");
+    packet->submitted = packet->signaled = true;
+    renodx::addons::dlss5::submission::CompleteSubmission(reservations, packet->fence.Get(), 1);
+    packet->Poll();
+    check(!packet->IsCompleted() && !packet->IsRetired(), "an incomplete Fence cannot release or validate the capture");
+    check(SUCCEEDED(gate->Signal(1)), "release WARP test gate");
+    release_gate.fence = nullptr;
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    check(event != nullptr && SUCCEEDED(packet->fence->SetEventOnCompletion(1, event)), "WARP fixture Fence event");
+    const auto waited = WaitForSingleObject(event, 10000);
+    CloseHandle(event);
+    check(waited == WAIT_OBJECT_0, "bounded test-only wait, never used by the production Present callback");
+    packet->Poll();
+    check(packet->IsCompleted() && packet->IsRetired(), "completed packet discards replayable recording before retirement");
+    shot::ReturnXefgPresent(capture_serial, S_FALSE);
+    shot::PreserveStageSubmissionProofs();
+    renodx::addons::dlss5::submission::PruneCompletedGenerations();
+    std::optional<shot::internal::PendingCapture> export_capture;
+    {
+      std::scoped_lock lock(shot::internal::state_mutex);
+      auto& capture = *shot::internal::pending;
+      check(shot::internal::StageSubmissionCompleted(&capture) && shot::internal::ReadbacksReleasable(capture),
+          "both readbacks have exact completed, non-replayable submission proof");
+      const std::array<ID3D12Resource*, 2> readbacks{capture.pre_nr_readback, capture.nr_output_readback};
+      for (size_t plane = 0; plane < 2; ++plane) {
+        const auto roi = rois[plane];
+        void* mapped = nullptr;
+        check(SUCCEEDED(readbacks[plane]->Map(0, nullptr, &mapped)), "WARP ROI map");
+        bool equal = true;
+        for (uint32_t row = 0; row < roi.height; ++row) {
+          equal &= std::memcmp(static_cast<const uint8_t*>(mapped) + capture.xefg_present->footprints[plane].Offset
+                  + uint64_t(row) * capture.xefg_present->footprints[plane].Footprint.RowPitch,
+              input.data() + (size_t(roi.y + row) * 1024 + roi.x) * 8, roi.width * 8) == 0;
+        }
+        readbacks[plane]->Unmap(0, nullptr);
+        check(equal, "different-size ROI bytes equal their exact source rectangles");
+      }
+      capture.lease_taken = capture.exact = capture.completion_proven = true;
+      capture.completion_generation = 2;
+      export_capture = std::move(capture);
+      shot::internal::pending.reset();
+      shot::internal::has_pending.store(false);
+    }
+    shot::internal::outstanding_jobs.fetch_add(1);
+    shot::internal::worker_busy.store(true);
+    // Execute the same production worker job on this offline test thread.
+    // The native Present callback always hands off and never calls ProcessJob.
+    shot::internal::ProcessJob(std::move(export_capture));
+    const auto stem = "warp_memory_only_" + std::to_string(capture_serial);
+    const auto meta_path = directory / (stem + ".meta.txt");
+    std::ifstream meta_file(meta_path, std::ios::binary);
+    const std::string metadata{std::istreambuf_iterator<char>(meta_file), std::istreambuf_iterator<char>()};
+    check(metadata.find("capture_schema=xefg_native_present_roi_v1\n") != std::string::npos
+            && metadata.find("native_present_serial=41\n") != std::string::npos
+            && metadata.find("buffer=" + std::to_string(copied.buffer) + "\n") != std::string::npos
+            && metadata.find("capture_serial=" + std::to_string(capture_serial) + "\n") != std::string::npos
+            && metadata.find("api_result=1\n") != std::string::npos
+            && metadata.find("raw_copy_valid=1\n") != std::string::npos
+            && metadata.find("classification=Unknown\n") != std::string::npos
+            && metadata.find("marker_contribution=NotMeasured\n") != std::string::npos,
+        "production writer binds both ROI to the same buffer/serial/HRESULT without classifying TAG or absent NR markers");
+    std::array<std::filesystem::path, 3> outputs{directory / (stem + "_nr_roi.raw"), directory / (stem + "_sdk_roi.raw"), meta_path};
+    for (size_t plane = 0; plane < 2; ++plane) {
+      const auto roi = rois[plane];
+      std::ifstream file(outputs[plane], std::ios::binary);
+      const std::vector<uint8_t> bytes{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+      bool equal = bytes.size() == size_t(roi.width) * roi.height * 8;
+      for (uint32_t row = 0; row < roi.height && equal; ++row) {
+        equal = std::memcmp(bytes.data() + size_t(row) * roi.width * 8,
+            input.data() + (size_t(roi.y + row) * 1024 + roi.x) * 8, roi.width * 8) == 0;
+      }
+      check(equal, "production worker exports each different-size ROI as exact tight native-format bytes");
+    }
+    check(shot::CopyXefgCaptureStatus().written == 1 && shot::CopyXefgCaptureStatus().blocked == 0,
+        "writer terminal counters identify one actual completed export");
+    meta_file.close();
+    for (const auto& file : outputs) {
+      check(std::filesystem::remove(file), "remove only the fixture's three known output files");
+    }
+    check(std::filesystem::remove(directory), "remove the fixture's own empty output leaf");
+    shot::CloseXefgRequest();
+    check(shot::CopyXefgCaptureStatus().drained && !shot::internal::stage_busy.load(), "capture gate releases only after the owner drains");
+    gpu.Transition(source.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    gpu.RecordTextureReadback(source.Get(), transfer);
+    gpu.Transition(source.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+    gpu.Submit();
+    check(gpu.ReadTexture(transfer) == input, "capture restores PRESENT and never writes source pixels");
+    for (UINT64 index = 0; index < info->GetNumStoredMessages(); ++index) {
+      SIZE_T bytes = 0;
+      info->GetMessage(index, nullptr, &bytes);
+      std::vector<uint8_t> storage(bytes);
+      auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+      info->GetMessage(index, message, &bytes);
+      check(message->Severity != D3D12_MESSAGE_SEVERITY_ERROR && message->Severity != D3D12_MESSAGE_SEVERITY_CORRUPTION,
+          message->pDescription);
+    }
+    std::cout << "PASS xefg-present-probe WARP dual ROI bytes, PRESENT restore, exact Fence retirement; SDK/Present=MOCK classification=Unknown\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "FAIL xefg-present-probe CPU/MOCK: " << error.what() << '\n';

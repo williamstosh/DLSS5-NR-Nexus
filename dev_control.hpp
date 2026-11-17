@@ -482,11 +482,8 @@ inline Json Execute(const Json& request) {
     return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "invalid_operation"}};
   }
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
-  if (*operation == "xefg_present_probe") {
-    if (request.value("action", Json(nullptr)) != "status") {
-      return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "read_only_probe"},
-          {"state", ProcessIdentityState()}};
-    }
+  const bool xefg_operation = *operation == "xefg_present_probe";
+  const auto xefg_snapshot = [&]() {
     const auto observed = xefg_present_probe::CopySnapshot();
     Json bindings = Json::array(), events = Json::array();
     for (const auto& binding : observed.bindings) {
@@ -497,6 +494,8 @@ inline Json Execute(const Json& request) {
       }
       bindings.push_back({{"init_serial", binding.init_serial}, {"slot", binding.key.slot}, {"module", binding.key.module},
           {"handle", binding.key.handle}, {"factory", binding.key.factory}, {"hwnd", binding.key.window},
+          {"module_path", binding.key.module_path}, {"module_path_available", !binding.key.module_path.empty()},
+          {"width", binding.created.width}, {"height", binding.created.height}, {"format_dxgi", binding.created.format},
           {"application_swapchain", binding.key.application_swapchain}, {"context", binding.context},
           {"context_epoch", binding.context_epoch}, {"context_generation", binding.context_generation},
           {"native_swapchain", binding.created.swapchain}, {"create_queue", binding.created.queue},
@@ -519,21 +518,61 @@ inline Json Execute(const Json& request) {
           {"buffer_index", event.index}, {"flags", event.flags}, {"result", event.result}, {"reason", event.reason}});
     }
     const auto& pending = observed.pending;
-    return {{"id", *id}, {"ok", true}, {"status", "observed"}, {"state", ProcessIdentityState()},
-        {"probe", {{"enabled", true}, {"stopped", observed.stopped}, {"evidence", xefg_present_probe::kEvidence},
-            {"present_serial_kind", "api_call_not_physical_frame_or_source_id"}, {"gpu_copy_enabled", false}, {"sdk_debug_called", false},
+    const auto calibration = xefg_present_probe::CopyCalibration();
+    const auto control = xefg_present_probe::CopyControl();
+    constexpr std::array<const char*, 4> control_actions{"baseline", "arm", "poll", "stop"};
+    constexpr std::array<const char*, 8> control_phases{"idle", "queued", "waiting_lifecycle", "sdk_entered",
+        "returned", "cancelled", "expired", "rejected"};
+    const auto capture = screenshot::CopyXefgCaptureStatus();
+    return Json{{"enabled", true}, {"stopped", observed.stopped}, {"evidence", xefg_present_probe::kEvidence},
+            {"present_serial_kind", "api_call_not_physical_frame_or_source_id"},
+            {"gpu_copy_enabled", calibration.active}, {"sdk_debug_called", calibration.api_sequence != 0},
             {"pending", {{"active", pending.active}, {"init_serial", pending.serial}, {"slot", pending.key.slot},
                 {"module", pending.key.module}, {"handle", pending.key.handle}, {"factory", pending.key.factory}, {"hwnd", pending.key.window},
                 {"owner_thread", pending.owner_thread}, {"candidates", pending.candidates}, {"creates_inflight", pending.creates_inflight},
                 {"ambiguous", pending.ambiguous}, {"factory_hooks_ready", pending.factory_hooks_ready}}},
             {"rejected_creates", observed.rejected_creates}, {"stale_returns", observed.stale_returns}, {"overflow", observed.overflow},
             {"event_capacity", observed.events.size()}, {"event_sequence", observed.sequence}, {"bindings", std::move(bindings)},
-            {"events", std::move(events)}}}};
+            {"events", std::move(events)},
+            {"control", {{"job_id", control.job_id}, {"request_id", control.request_id},
+                {"action", control_actions[static_cast<size_t>(control.action)]},
+                {"phase", control_phases[static_cast<size_t>(control.phase)]}, {"finished", control.finished},
+                {"accepted", control.accepted}, {"cancel_requested", control.cancel_requested},
+                {"sdk_entered", control.sdk_entered}, {"sdk_returned", control.sdk_returned},
+                {"api_result_available", control.api_result_available}, {"result", control.result},
+                {"queued_thread", control.queued_thread}, {"worker_thread", control.worker_thread},
+                {"lifecycle_thread", control.lifecycle_thread}, {"sdk_entered_thread", control.sdk_entered_thread},
+                {"sdk_returned_thread", control.sdk_returned_thread}, {"queued_ms", control.queued_ms},
+                {"waiting_ms", control.waiting_ms}, {"lifecycle_ms", control.lifecycle_ms},
+                {"sdk_entered_ms", control.sdk_entered_ms}, {"sdk_returned_ms", control.sdk_returned_ms},
+                {"finished_ms", control.finished_ms}, {"reason", control.reason},
+                {"target", {{"slot", control.target.slot}, {"module", control.target.module}, {"handle", control.target.handle},
+                    {"init_serial", control.target.init_serial}, {"context", control.target.context},
+                    {"context_generation", control.target.context_generation}, {"buffer_generation", control.target.buffer_generation}}}}},
+            {"calibration", {{"init_serial", calibration.target.init_serial}, {"baseline_known", calibration.baseline_known},
+                {"baseline_value", false}, {"previous_state", "Unknown"}, {"original_restore", "NotClaimed"},
+                {"baseline_result", calibration.baseline_result}, {"tag_result", calibration.tag_result},
+                {"restore_result", calibration.restore_result}, {"tag_enabled", calibration.tag_enabled},
+                {"active", calibration.active}, {"restore_pending", calibration.restore_pending}, {"cancelled", calibration.cancelled},
+                {"generation", calibration.generation}, {"api_sequence", calibration.api_sequence},
+                {"requested", calibration.requested}, {"attempted", calibration.attempted}, {"accepted", calibration.accepted},
+                {"submitted", calibration.submitted}, {"deadline_ms", calibration.deadline_ms},
+                {"reason", calibration.reason}, {"classification", "Unknown"}}},
+            {"capture", {{"capture_id", capture.capture_id}, {"status", capture.status}, {"reason", capture.reason},
+                {"recorded", capture.recorded}, {"written", capture.written}, {"blocked", capture.blocked},
+                {"last_serial", capture.last_serial}, {"drained", capture.drained}}}};
+  };
+  if (xefg_operation && request.value("action", Json(nullptr)) == "status") {
+    return {{"id", *id}, {"ok", true}, {"status", "observed"}, {"state", ProcessIdentityState()}, {"probe", xefg_snapshot()}};
   }
 #endif
   const bool marker_operation = *operation == "fg_output_marker";
   const bool consumer_operation = *operation == "fg_consumer_capture";
-  const bool compact_operation = marker_operation || consumer_operation;
+  const bool compact_operation = marker_operation || consumer_operation
+#if defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+      || xefg_operation
+#endif
+      ;
   const auto consumer_snapshot = []() {
     const auto capture = screenshot::CopyFgConsumerStatus();
     return Json{{"capture_id", capture.capture_id}, {"status", capture.status},
@@ -615,6 +654,96 @@ inline Json Execute(const Json& request) {
   const bool configuration_busy = shutting_down.load() || slider_pending != nullptr || stage_edit::pending || resolution_edit::pending
       || stage_edit_request.setting != nullptr || !resolution_edit_request.empty() || profile_ui::Busy()
       || profile_ui::pending_action != profile_ui::Action::NONE || preset_ui::manager_geometry.was_open;
+#if defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+  if (xefg_operation) {
+    response["reason"] = "invalid_calibration_request";
+    const auto complete = [&]() {
+      response["probe"] = xefg_snapshot();
+      return finish();
+    };
+    const auto queue = [&](xefg_present_probe::ControlAction action, const xefg_present_probe::Target& target,
+                           bool tag_enabled = false, uint32_t samples = 0, uint32_t duration_ms = 0) {
+      const auto job_id = xefg_present_probe::QueueControl(id->get_ref<const std::string&>(), action, target,
+          tag_enabled, samples, duration_ms);
+      if (job_id == 0) {
+        response.update({{"ok", false}, {"status", "blocked"}, {"reason", "control_busy_or_stopped"}});
+        return false;
+      }
+      const bool scheduled = screenshot::ScheduleXefgControl();
+      const auto control = xefg_present_probe::CopyControl();
+      const bool entered = control.cancel_requested && control.sdk_entered && !control.finished;
+      response.update({{"ok", scheduled && !entered}, {"status", scheduled && !entered ? "queued" : "blocked"},
+          {"job_id", job_id}, {"reason", !scheduled ? "worker_unavailable" : entered ? "sdk_call_in_flight" : "control_job_queued"}});
+      return scheduled && !entered;
+    };
+    const auto action = request.value("action", Json(nullptr));
+    if (action == "poll" || action == "stop") {
+      const auto current = xefg_present_probe::CopyCalibration();
+      const auto control = xefg_present_probe::CopyControl();
+      const auto target = (xefg_present_probe::ControlBusy(control) ? control.target : current.target);
+      if (!request.contains("init_serial") || !request["init_serial"].is_number_unsigned()
+          || target.init_serial == 0 || request["init_serial"].get<uint64_t>() != target.init_serial) return complete();
+      if (action == "stop") {
+        screenshot::CancelXefgCapture("explicit_async_stop");
+      }
+      queue(action == "stop" ? xefg_present_probe::ControlAction::STOP : xefg_present_probe::ControlAction::POLL, target);
+      return complete();
+    }
+    if (action != "baseline" && action != "arm") return complete();
+    const auto object = request.find("target");
+    if (object == request.end() || !object->is_object()) return complete();
+    for (const char* key : {"slot", "module", "handle", "init_serial", "context", "context_generation", "buffer_generation"}) {
+      const auto value = object->find(key);
+      if (value == object->end() || !value->is_number_unsigned()) return complete();
+    }
+    if ((*object)["slot"] > 1) return complete();
+    const xefg_present_probe::Target target{.slot = (*object)["slot"].get<uint32_t>(),
+        .module = (*object)["module"].get<uintptr_t>(), .handle = (*object)["handle"].get<uintptr_t>(),
+        .init_serial = (*object)["init_serial"].get<uint64_t>(), .context = (*object)["context"].get<uintptr_t>(),
+        .context_generation = (*object)["context_generation"].get<uint64_t>(), .buffer_generation = (*object)["buffer_generation"].get<uint64_t>()};
+    if (xefg_present_probe::ControlBusy(xefg_present_probe::CopyControl())) {
+      response["reason"] = "control_busy";
+      return complete();
+    }
+    if (configuration_busy || enabled.load() || !disabled_resources_released.load() || !screenshot::CopyXefgCaptureStatus().drained) {
+      response["reason"] = "nr_off_and_idle_required";
+      return complete();
+    }
+    if (action == "baseline") {
+      queue(xefg_present_probe::ControlAction::BASELINE, target);
+      return complete();
+    }
+    if (!request.contains("tag_enabled") || !request["tag_enabled"].is_boolean()
+        || !request.contains("samples") || !request["samples"].is_number_unsigned() || request["samples"] < 1 || request["samples"] > 8
+        || !request.contains("duration_ms") || !request["duration_ms"].is_number_unsigned()
+        || request["duration_ms"] < 100 || request["duration_ms"] > 3000
+        || !request.contains("output_directory") || !request["output_directory"].is_string()
+        || !request.contains("capture_id") || !request["capture_id"].is_string()) return complete();
+    std::array<screenshot::CaptureRect, 2> rois{};
+    size_t index = 0;
+    for (const char* name : {"nr_roi", "sdk_roi"}) {
+      const auto roi = request.find(name);
+      if (roi == request.end() || !roi->is_object()) return complete();
+      for (const char* key : {"x", "y", "width", "height"}) {
+        if (!roi->contains(key) || !(*roi)[key].is_number_unsigned() || (*roi)[key] > UINT32_MAX) return complete();
+      }
+      rois[index++] = {.x = (*roi)["x"].get<uint32_t>(), .y = (*roi)["y"].get<uint32_t>(),
+          .width = (*roi)["width"].get<uint32_t>(), .height = (*roi)["height"].get<uint32_t>()};
+    }
+    const auto& directory = request["output_directory"].get_ref<const std::string&>();
+    if (!screenshot::RequestXefgCapture(std::filesystem::path(std::u8string(directory.begin(), directory.end())),
+        request["capture_id"].get_ref<const std::string&>(), rois, present_generation)) return complete();
+    xefg_present_probe::ConfigureCapture({.prepare = screenshot::PrepareXefgPresent, .returned = screenshot::ReturnXefgPresent,
+        .install = +[](ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list) {
+          return InstallCommandListStateHooks(list) && InstallQueueCompletionHooks(queue) && queue_tracking_active.load();
+        }, .cancel = screenshot::CancelXefgCapture, .ready = screenshot::ReserveXefgRecording, .release = screenshot::ReleaseXefgRecording});
+    if (!queue(xefg_present_probe::ControlAction::ARM, target, request["tag_enabled"].get<bool>(),
+        request["samples"].get<uint32_t>(), request["duration_ms"].get<uint32_t>())) {
+      screenshot::CancelXefgCapture("control_queue_rejected");
+    }
+    return complete();
+  }
+#endif
   if (consumer_operation) {
     response["reason"] = "invalid_consumer_request";
     const auto directory = request.find("output_directory");

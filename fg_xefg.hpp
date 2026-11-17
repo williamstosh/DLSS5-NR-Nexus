@@ -1933,7 +1933,7 @@ struct SdkHooks {
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
     const std::lock_guard present_probe_lifecycle(xefg_present_probe::lifecycle_mutex);
     xefg_present_probe::InitScope present_probe_init(static_cast<uint32_t>(Index),
-        reinterpret_cast<uintptr_t>(modules[Index].module), handle, nullptr, nullptr,
+        modules[Index].module, handle, nullptr, nullptr,
         (parameters != nullptr ? parameters->application_swapchain : nullptr));
 #endif
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
@@ -1976,7 +1976,7 @@ struct SdkHooks {
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
     const std::lock_guard present_probe_lifecycle(xefg_present_probe::lifecycle_mutex);
     xefg_present_probe::InitScope present_probe_init(static_cast<uint32_t>(Index),
-        reinterpret_cast<uintptr_t>(modules[Index].module), handle, factory, window,
+        modules[Index].module, handle, factory, window,
         (parameters != nullptr ? parameters->application_swapchain : nullptr));
 #endif
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
@@ -2460,6 +2460,7 @@ struct SdkHooks {
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
     const std::lock_guard present_probe_lifecycle(xefg_present_probe::lifecycle_mutex);
     xefg_present_probe::Observe([&] {
+      xefg_present_probe::RestoreForHandle(static_cast<uint32_t>(Index), reinterpret_cast<uintptr_t>(handle));
       xefg_present_probe::Invalidate(static_cast<uint32_t>(Index), reinterpret_cast<uintptr_t>(handle), "context_destroying");
     });
 #endif
@@ -2469,6 +2470,11 @@ struct SdkHooks {
     if (!stopped.load()) PinRuntimeCallback();
     InvalidateBridgeOff(handle, "context_destroying", true);
     const auto status = reinterpret_cast<int32_t (*)(void*)>(modules[Index].real[8])(handle);
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+    xefg_present_probe::Observe([&] {
+      xefg_present_probe::ContextDestroyed(static_cast<uint32_t>(Index), reinterpret_cast<uintptr_t>(handle), status);
+    });
+#endif
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
     fg_output_probe::DestroyXefg(static_cast<uint32_t>(Index), reinterpret_cast<uintptr_t>(handle), status);
 #endif
@@ -2786,6 +2792,11 @@ inline void Stop() noexcept {
   for (size_t index = 0; index < internal::modules.size(); ++index) {
     const auto& slot = internal::modules[index];
     if (!slot.installed) continue;
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+    // An entered synchronous SDK call cannot be cancelled. Keep its lifecycle
+    // forwarding guards until process exit; the pinned worker retains code.
+    if (xefg_present_probe::ControlBusy(xefg_present_probe::CopyControl())) continue;
+#endif
     const auto detours = (index == 0 ? internal::SdkDetours<0>() : internal::SdkDetours<1>());
     for (size_t i = 0; i < detours.size(); ++i) {
       if (slot.real[i] != nullptr) detour_guard::Neutralize(&slot.real[i], detours[i], slot.records[i]);
