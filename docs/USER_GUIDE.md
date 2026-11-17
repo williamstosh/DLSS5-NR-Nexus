@@ -451,7 +451,7 @@ Present 显示以下选项。兼容的 Pre-FG 先增强游戏帧再交给 FG；�
 
 《巫师3》HDR10/PQ＋XeFG 的静态场景已确认隔帧调用；动态画质与帧节奏仍待实际场景验收。光照突然变化时可能短暂回到原色，NR 色调变化也可能延后一帧。出现拖影、明暗跳变或微卡顿时关闭此项。日志中的 `NR edit reuse` 表示实际发生复用。
 
-后续开发版还包含默认关闭的 FG On 实验：真实 SR 的 Upscaled 路径，以及原生 DLSS FG 的 Present 路径。原生 Present 限定模型 B、单层、固定100%，已接入 HDR10/PQ 的去 HUD 画面与精确透明度合成输入，以保留游戏 HUD。这两条 DEV 路径尚未进入普通安装包；生成帧画面、动态画质与微卡顿仍待验收。
+开发分支允许上述固定尺寸 Upscaled 路径在 FG 状态尚未识别时继续隔帧；仍须有已确认的成功 SR 输入和可写输出，且未被 FG 接管。此变化尚未进入已发布安装包。开发版还包含默认关闭的 FG On 实验：真实 SR 的 Upscaled 路径，以及原生 DLSS FG 的 Present 路径。原生 Present 限定模型 B、单层、固定100%，已接入 HDR10/PQ 的去 HUD 画面与精确透明度合成输入，以保留游戏 HUD。这两条 DEV 路径尚未进入普通安装包；生成帧画面、动态画质与微卡顿仍待验收。
 
 <a id="zh-paths"></a>
 #### 可用组合
@@ -1013,7 +1013,7 @@ The ordinary package supports two restricted native DX12 paths: Upscaled with FG
 
 HDR10/PQ x2 reuse has been confirmed in a static The Witcher 3 XeFG scene; dynamic image quality and frame pacing still need acceptance in the intended scene. Sudden lighting changes may briefly restore the original color, and changes in NR's tone may lag by one frame. Disable this option if you see ghosting, brightness shifts or microstutter. An `NR edit reuse` log entry confirms actual reuse.
 
-The development branch also includes disabled-by-default FG On experiments for real-SR Upscaled and native DLSS FG Present. Native Present requires model B, one pass and fixed 100% resolution; it handles HDR10/PQ HUD-less color and exact alpha composition inputs to preserve the game's HUD. These two DEV paths are not included in the ordinary package. Generated-frame appearance, dynamic image quality and microstutter still await acceptance.
+The development branch allows the fixed-size Upscaled path above to keep reusing edits while FG status is unidentified, provided successful SR input and writable output are confirmed and FG has not taken ownership. This change is not yet in a released package. The development branch also includes disabled-by-default FG On experiments for real-SR Upscaled and native DLSS FG Present. Native Present requires model B, one pass and fixed 100% resolution; it handles HDR10/PQ HUD-less color and exact alpha composition inputs to preserve the game's HUD. These two DEV paths are not included in the ordinary package. Generated-frame appearance, dynamic image quality and microstutter still await acceptance.
 
 <a id="en-paths"></a>
 #### Compatible combinations

@@ -599,6 +599,9 @@ int Run() {
     native::intensity = 1.f;
     native::preset = 2;
     native::edit_reuse_enabled = true;
+#if defined(NR_NEXUS_DEV_CONTROL)
+    native::edit_reuse_fg_experiment = false;
+#endif
     native::direct_api.module = GetModuleHandleW(nullptr);
     native::direct_api.create = CreateModel;
     native::direct_api.evaluate = NeutralModel;
@@ -687,6 +690,106 @@ int Run() {
           "production neutral reuse returns exact current half-float source and alpha");
     Check(frame(0) == 1, "the second following base frame refreshes rather than reusing a second time");
     Check(frame(1) == 1 && frame(1) == 1, "successive explicit Reset frames both run NR");
+    {
+      native::direct_api.evaluate = ConstantModel;
+      auto& feature = native::features.at(owner);
+      const auto source_generation = feature.source_generation;
+      const auto configuration = native::configuration_generation.load();
+      auto reset_epoch = native::history_reset_epoch.load();
+      const auto models = native::nr_features_created;
+      const auto worksets = native::worksets_created;
+      const auto model = feature.slots[0].handle;
+      const auto anchor = feature.slots[0].edit_reuse;
+      auto anchor_generation = anchor->anchor_generation;
+      const auto reuses = native::edit_reuse_reuses.load();
+      const auto fallbacks = native::edit_reuse_fallbacks.load();
+      std::vector<uint8_t> refresh_pixels, anchor_pixels;
+      const std::array declarations{native::NativeFgDeclaration::kOff, native::NativeFgDeclaration::kUnknown,
+          native::NativeFgDeclaration::kUnknown, native::NativeFgDeclaration::kOff, native::NativeFgDeclaration::kOff};
+      for (size_t index = 0; index < declarations.size(); ++index) {
+        // Change only the declaration pair; no Options callback, owner handoff or source recreation.
+        native::native_fg_public_off = declarations[index] == native::NativeFgDeclaration::kOff;
+        native::native_fg_declaration = declarations[index];
+        const bool refresh = index % 2 == 0;
+        const auto reuse_count = anchor->reuse_count;
+        const auto calls = frame(index == 0 ? 1 : 0);
+        if (index == 0) {
+          reset_epoch = native::history_reset_epoch.load();
+        }
+        std::cout << "OBS fixed-size Off/Unknown frame=" << index + 1
+                  << " declaration=" << (native::native_fg_public_off.load() ? "Off" : "Unknown")
+                  << " model_calls=" << calls << " expected=" << (refresh ? 1 : 0)
+                  << " reuses=" << native::edit_reuse_reuses.load() - reuses << '\n';
+        Check(calls == (refresh ? 1u : 0u), "Off/Unknown/Off preserves actual model cadence 1/0/1/0/1");
+        Check(feature.source_generation == source_generation && native::configuration_generation.load() == configuration
+                  && native::history_reset_epoch.load() == reset_epoch && feature.slots[0].handle == model
+                  && feature.slots[0].edit_reuse == anchor && native::nr_features_created == models
+                  && native::worksets_created == worksets && native::edit_reuse_fallbacks.load() == fallbacks,
+              "declaration-only changes preserve the live source, model, workset and edit cache");
+        if (refresh) {
+          Check(model_resets.back() == (index == 0 ? 1 : 0), "declaration-only changes add no NR History Reset");
+          ++anchor_generation;
+          anchor_pixels = read_buffer(anchor->anchor.Get());
+        } else {
+          Check(anchor->reuse_count == reuse_count + 1 && read_buffer(anchor->anchor.Get()) == anchor_pixels,
+                "Off/Unknown reuse preserves the exact nonzero refresh anchor");
+        }
+        Check(anchor->valid && anchor->anchor_generation == anchor_generation
+                  && native::edit_reuse_reuses.load() == reuses + (index + 1) / 2,
+              "only refresh advances the anchor generation and each adjacent frame reuses once");
+        auto final = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        submit_commands("Off/Unknown nonzero output readback");
+        const auto pixels = final.Pixels();
+        if (refresh) {
+          refresh_pixels = pixels;
+        }
+        bool nonneutral = false;
+        for (size_t pixel = 0; pixel < source_values.size() / 4; ++pixel) {
+          for (size_t channel = 0; channel < 3; ++channel) {
+            uint16_t refreshed, actual;
+            std::memcpy(&refreshed, refresh_pixels.data() + (pixel * 4 + channel) * 2, 2);
+            std::memcpy(&actual, pixels.data() + (pixel * 4 + channel) * 2, 2);
+            Check(std::fabs(DirectX::PackedVector::XMConvertHalfToFloat(actual)
+                      - DirectX::PackedVector::XMConvertHalfToFloat(refreshed)) < .003f,
+                  "Off/Unknown reuse reads back the refreshed nonzero RGB edit");
+            nonneutral |= std::fabs(DirectX::PackedVector::XMConvertHalfToFloat(actual)
+                - DirectX::PackedVector::XMConvertHalfToFloat(source_values[pixel * 4 + channel])) > .05f;
+          }
+          Check(std::memcmp(pixels.data() + pixel * 8 + 6, source_values.data() + pixel * 4 + 3, 2) == 0,
+                "Off/Unknown refresh and reuse preserve original alpha exactly");
+        }
+        Check(nonneutral, "Off/Unknown output contains a distinguishable nonzero edit");
+      }
+      native::native_fg_public_off = false;
+      native::native_fg_declaration = native::NativeFgDeclaration::kUnknown;
+      native::create_contracts.at(owner).source_type_confirmed = false;
+      const auto rejected_reuses = native::edit_reuse_reuses.load();
+      Check(frame(0) == 1 && native::edit_reuse_reuses.load() == rejected_reuses && feature.slots[0].edit_reuse == nullptr,
+            "Unknown FG cannot authorize an unconfirmed source");
+      native::create_contracts.at(owner).source_type_confirmed = true;
+      Check(frame(1) == 1, "the confirmed source recovers its own anchor under Unknown FG");
+      ++native::create_contracts.at(owner).source_generation;
+      Check(frame(0) == 1 && native::edit_reuse_reuses.load() == rejected_reuses && feature.slots[0].edit_reuse == nullptr,
+            "Unknown FG cannot authorize a mismatched source generation");
+      native::create_contracts.at(owner).source_generation = source_generation;
+      Check(frame(1) == 1, "matching source generation restores refresh under Unknown FG");
+      native::native_fg_owns = true;
+      frame(0);
+      Check(native::edit_reuse_reuses.load() == rejected_reuses && feature.slots[0].edit_reuse == nullptr,
+            "Unknown FG cannot cross actual native Present-service ownership");
+      native::native_fg_owns = false;
+      Check(frame(1) == 1, "Upscaled ownership recovers with a refresh under Unknown FG");
+      native::native_fg_declaration = native::NativeFgDeclaration::kOn;
+      Check(frame(0) == 1
+                && native::edit_reuse_reuses.load() == rejected_reuses && feature.slots[0].edit_reuse == nullptr,
+            "fixed-size Off/Unknown admission leaves explicit On behind its existing experiment gate");
+      native::native_fg_public_off = true;
+      native::native_fg_declaration = native::NativeFgDeclaration::kOff;
+      native::direct_api.evaluate = NeutralModel;
+      Check(frame(1) == 1, "restore the neutral model with an explicit source Reset after the declaration contrast");
+      std::cout << "PASS fixed-size Off/Unknown/Off: model_calls=1/0/1/0/1, nonzero RGB, exact alpha,"
+                   " stable source/model/workset, unchanged reuse anchor and no declaration Reset; evidence=WARP+MOCK\n";
+    }
     native::intensity = .75f;
     native::configuration_generation.fetch_add(1);
     const auto before_settings_reuses = native::edit_reuse_reuses.load();
@@ -1000,15 +1103,15 @@ int Run() {
       checked_frame(0, 0);
       Check(native::nr_features_created == models && native::worksets_created == allocations,
             "upper/lower/upper reuse creates no additional model or adaptive workset");
+      native::native_fg_public_off = false;
+      native::native_fg_declaration = native::NativeFgDeclaration::kUnknown;
+      checked_frame(0, 1);
+      Check(feature.slots[0].edit_reuse == nullptr && !feature.adaptive_session->paired_sampling,
+            "Unknown without a public Off receipt never admits two-tier reuse");
 #if defined(NR_NEXUS_DEV_CONTROL)
       {
         namespace xefg = addon::fg::xefg;
         namespace xi = xefg::internal;
-        native::native_fg_public_off = false;
-        native::native_fg_declaration = native::NativeFgDeclaration::kUnknown;
-        checked_frame(0, 1);
-        Check(feature.slots[0].edit_reuse == nullptr && !feature.adaptive_session->paired_sampling,
-              "Unknown without a public Off receipt never admits two-tier reuse");
         // Only the receipt is MOCK here. Public Enable/link acceptance is
         // exercised by fg_xefg_tests; recording, shaders and retirement use WARP.
         const bool stopped = xi::stopped.exchange(false);
@@ -1061,10 +1164,10 @@ int Run() {
         xi::state.contexts.clear();
         xi::sdk_detours_enabled = sdk_enabled;
         xi::stopped = stopped;
-        native::native_fg_public_off = true;
-        native::native_fg_declaration = native::NativeFgDeclaration::kOff;
       }
 #endif
+      native::native_fg_public_off = true;
+      native::native_fg_declaration = native::NativeFgDeclaration::kOff;
       native::edit_reuse_adaptive_experiment = false;
       const auto reuses = native::edit_reuse_reuses.load();
       checked_frame(0, 1);

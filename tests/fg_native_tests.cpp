@@ -773,7 +773,10 @@ int main(int argc, char** argv) {
   if (argc == 2 && std::strcmp(argv[1], "--inline-restore-roi") == 0) return inline_restore_roi_cases::Run();
 #endif
   if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-xefg-contracts") == 0) return nr_edit_reuse_xefg_cases::Run();
-  if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-contracts") == 0) return nr_edit_reuse_gpu_cases::Run();
+  if (argc == 2 && (std::strcmp(argv[1], "--nr-edit-reuse-contracts") == 0
+                   || std::strcmp(argv[1], "--nr-edit-reuse-contracts-public") == 0)) {
+    return nr_edit_reuse_gpu_cases::Run();
+  }
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-inline") == 0) return adaptive_inline_cases::Run();
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-fg-service") == 0) return adaptive_fg_service_cases::Run();
 #if defined(NR_NEXUS_TEST_NATIVE_NGX)

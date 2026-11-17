@@ -13851,8 +13851,8 @@ inline bool RecordInline(
   stage_stats.width = width;
   stage_stats.height = height;
   const bool edit_reuse_requested = edit_reuse_enabled.load(std::memory_order_relaxed);
-  // Tier preparation can yield to a public FG call. Recheck its receipt at
-  // reuse admission, while retaining the unchanged native-Off gate.
+  // Tier preparation can yield to a public FG call. Recheck the Off receipt
+  // required by adaptive reuse at admission.
   const bool edit_reuse_current_native_off = native_fg_public_off.load()
       && native_fg_declaration.load() == NativeFgDeclaration::kOff;
   if (edit_reuse_current_native_off) edit_off = {};
@@ -13882,14 +13882,24 @@ inline bool RecordInline(
     }
   }
 #endif
+  bool edit_reuse_fixed_inline_route = false;
+  if (edit_reuse_requested && present == nullptr && bridge_source == nullptr
+      && !nr_adaptive_enabled.load() && !adaptive.enabled && nr_input_width == width && nr_input_height == height
+      && native_fg_declaration.load() != NativeFgDeclaration::kOn) {
+    const auto created = create_contracts.find(handle);
+    edit_reuse_fixed_inline_route = created != create_contracts.end() && created->second.source_type_confirmed
+        && feature.source_type_confirmed && feature.source_generation != 0
+        && created->second.source_generation == feature.source_generation;
+  }
   const bool edit_reuse_inline_route =
 #if defined(NR_NEXUS_DEV_CONTROL)
       edit_reuse_fg_inline_route ||
 #endif
       present == nullptr
       && hook_point.load() == kHookUpscaled && successful_sr_device == device
-      && (edit_reuse_current_native_off || (edit_off.available && nr_adaptive_enabled.load()
-          && native_fg_declaration.load() != NativeFgDeclaration::kOn))
+      && (edit_reuse_fixed_inline_route || (nr_adaptive_enabled.load()
+          && (edit_reuse_current_native_off || (edit_off.available
+              && native_fg_declaration.load() != NativeFgDeclaration::kOn))))
       && !native_fg_owns.load() && !fg::xefg::Enabled() && !fg::xefg::OwnsStream()
       && !auto_fg_fallback_active.load() && !mixed_present_fg_seen.load();
   const bool edit_reuse_xefg_route = present != nullptr && present->xefg_edit_reuse_frame != 0
