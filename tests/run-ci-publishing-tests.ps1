@@ -41,10 +41,11 @@ try {
         }
     }
     $definitions = @('NR_NEXUS_DEV_CONTROL','NR_NEXUS_IME_DIAGNOSTICS','RENODX_DLSS5_DEBUG',
-        'NR_NEXUS_TEST_FG_OUTPUT_PROBE','NR_NEXUS_TEST_NATIVE_NGX','NR_NEXUS_TEST_COLD_CPU_TRACE',
+        'NR_NEXUS_TEST_FG_OUTPUT_PROBE','NR_NEXUS_TEST_XEFG_PRESENT_PROBE','NR_NEXUS_TEST_NATIVE_NGX','NR_NEXUS_TEST_COLD_CPU_TRACE',
         'NR_NEXUS_TEST_SUBMISSION_FAILURE','NR_NEXUS_DEV_CONTROL_PIPE_TEST_EXE','NR_NEXUS_TEST_WARP_ONLY')
     $arguments = @($definitions | ForEach-Object { "/D$_" }) + @('/D NR_NEXUS_DEV_CONTROL=1',
-        '/D "NR_NEXUS_DEV_CONTROL=1"','/DNR_NEXUS_TEST_FG_OUTPUT_PROBE=0','"/DNR_NEXUS_TEST_FG_OUTPUT_PROBE=1"')
+        '/D "NR_NEXUS_DEV_CONTROL=1"','/DNR_NEXUS_TEST_FG_OUTPUT_PROBE=0','"/DNR_NEXUS_TEST_FG_OUTPUT_PROBE=1"',
+        '/DNR_NEXUS_TEST_XEFG_PRESENT_PROBE=0')
     foreach ($define in $arguments) {
         Reset-Fixture
         [IO.File]::WriteAllText($command, $validCommand + $define, [Text.Encoding]::Unicode)
@@ -55,7 +56,7 @@ try {
     Assert-Rejected 'missing actual addon compiler command' 'actual Release addon.cpp'
     foreach ($marker in @('inline_restore_roi','inline_restore_roi_v1','mafia-same-frame-roi',
         'unsupported_inline_restore_contract','bridge_adaptive_experiment','edit_reuse_adaptive_experiment',
-        'edit_reuse_fg_experiment','fg_output_probe','sdk_display_configuration_and_marker_recording_not_output_pixels',
+        'edit_reuse_fg_experiment','fg_output_probe','xefg_present_probe','sdk_display_configuration_and_marker_recording_not_output_pixels',
         'linear_FP16_after_resolve_alpha_preserved','xefgSwapChainEnableDebugFeature','NR Nexus IME diagnostics')) {
         foreach ($encoding in @([Text.Encoding]::ASCII,[Text.Encoding]::Unicode)) {
             Reset-Fixture

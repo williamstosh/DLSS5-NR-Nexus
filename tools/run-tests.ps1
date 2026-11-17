@@ -12,7 +12,7 @@ param(
     [string]$DetoursLibrary,
     [string]$PythonExecutable,
     [ValidateSet('Auto','Quick','Full','None')][string]$UiPreview = 'Auto',
-    [ValidateSet('inline-restore-roi','control-mask','control-mask-safety','control-mask-safety-hardware','control-mask-capture','control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','control-mask-native-ngx-fg','gpu-pass-diagnostics','native-required-menu','native-owner-idle','native-options-resume','native-options-delayed','native-guide-contract','present-guide-models','adaptive-fg-service','adaptive-inline','vulkan-recorded-use-contract','native-present-decision','trace-metadata','stage-chain','stage-resolution','stage-resolution-hardware','same-stage-resolution','same-stage-resolution-hardware','render-stage-resolution','render-stage-resolution-hardware','present-stage-resolution','present-stage-resolution-hardware','native-prefg-resolution','native-prefg-resolution-hardware','native-frame-identity','same-stage-model-pair','same-stage-mixed-pair','source-lifecycle','feature-switch','feature-switch-hardware','f5-mixed','present-chain','present-chain-hardware','present-chain-scrgb','present-chain-hdr10','native-full','native-full-hardware','nr-edit-reuse-contracts','nr-edit-reuse-xefg-contracts','nr-edit-reuse-native-contracts','native-frame-source','nr-fg-output-marker','fg-consumer-capture')]
+    [ValidateSet('inline-restore-roi','control-mask','control-mask-safety','control-mask-safety-hardware','control-mask-capture','control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','control-mask-native-ngx-fg','gpu-pass-diagnostics','native-required-menu','native-owner-idle','native-options-resume','native-options-delayed','native-guide-contract','present-guide-models','adaptive-fg-service','adaptive-inline','vulkan-recorded-use-contract','native-present-decision','trace-metadata','stage-chain','stage-resolution','stage-resolution-hardware','same-stage-resolution','same-stage-resolution-hardware','render-stage-resolution','render-stage-resolution-hardware','present-stage-resolution','present-stage-resolution-hardware','native-prefg-resolution','native-prefg-resolution-hardware','native-frame-identity','same-stage-model-pair','same-stage-mixed-pair','source-lifecycle','feature-switch','feature-switch-hardware','f5-mixed','present-chain','present-chain-hardware','present-chain-scrgb','present-chain-hdr10','native-full','native-full-hardware','nr-edit-reuse-contracts','nr-edit-reuse-xefg-contracts','nr-edit-reuse-native-contracts','native-frame-source','nr-fg-output-marker','fg-consumer-capture','xefg-present-probe')]
     [string[]]$NativeCase = @(),
     [switch]$VulkanNativeNgx,
     [string]$NativeNgxProjectIdPath,
@@ -169,8 +169,11 @@ foreach ($item in $Suite) {
         if ($item -eq 'fg-native' -and (@($NativeCase | Where-Object { $_ -in @('inline-restore-roi','nr-edit-reuse-contracts','nr-edit-reuse-native-contracts','native-frame-source') }).Count -gt 0)) {
             $arguments += '/DNR_NEXUS_DEV_CONTROL'
         }
-        if ($item -eq 'fg-native' -and @($NativeCase | Where-Object { $_ -in @('nr-fg-output-marker','fg-consumer-capture') }).Count -gt 0) {
+        if ($item -eq 'fg-native' -and @($NativeCase | Where-Object { $_ -in @('nr-fg-output-marker','fg-consumer-capture','xefg-present-probe') }).Count -gt 0) {
             $arguments += '/DNR_NEXUS_DEV_CONTROL'
+        }
+        if ($item -eq 'fg-native' -and $NativeCase -contains 'xefg-present-probe') {
+            $arguments += '/DNR_NEXUS_TEST_XEFG_PRESENT_PROBE'
         }
         if ($item -eq 'vulkan-control-mask') { $arguments += "/I$VulkanIncludeDirectory" }
         $link += @('user32.lib','gdi32.lib','ole32.lib','psapi.lib')

@@ -755,8 +755,14 @@ int RunNativeRequiredMenuTest() {
 #include "native_fg_frame_cases.hpp"
 #include "nr_edit_reuse_native_cases.hpp"
 #endif
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+#include "nr_xefg_present_probe_cases.hpp"
+#endif
 
 int main(int argc, char** argv) {
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+  if (argc == 2 && std::strcmp(argv[1], "--xefg-present-probe") == 0) return nr_xefg_present_probe_cases::Run();
+#endif
 #if defined(NR_NEXUS_DEV_CONTROL)
   if (argc == 2 && std::strcmp(argv[1], "--nr-fg-output-marker") == 0) return nr_fg_output_marker_gpu_cases::Run();
   if (argc == 2 && std::strcmp(argv[1], "--fg-consumer-capture") == 0) return fg_consumer_capture_cases::Run();

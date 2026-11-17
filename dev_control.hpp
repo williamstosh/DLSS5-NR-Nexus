@@ -481,6 +481,56 @@ inline Json Execute(const Json& request) {
   if (operation == request.end() || !operation->is_string()) {
     return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "invalid_operation"}};
   }
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+  if (*operation == "xefg_present_probe") {
+    if (request.value("action", Json(nullptr)) != "status") {
+      return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "read_only_probe"},
+          {"state", ProcessIdentityState()}};
+    }
+    const auto observed = xefg_present_probe::CopySnapshot();
+    Json bindings = Json::array(), events = Json::array();
+    for (const auto& binding : observed.bindings) {
+      if (binding.init_serial == 0) continue;
+      Json queues = Json::array();
+      for (uint32_t index = 0; index < std::min<uint32_t>(binding.buffer_count, xefg_present_probe::kMaxBuffers); ++index) {
+        queues.push_back(binding.queues[index]);
+      }
+      bindings.push_back({{"init_serial", binding.init_serial}, {"slot", binding.key.slot}, {"module", binding.key.module},
+          {"handle", binding.key.handle}, {"factory", binding.key.factory}, {"hwnd", binding.key.window},
+          {"application_swapchain", binding.key.application_swapchain}, {"context", binding.context},
+          {"context_epoch", binding.context_epoch}, {"context_generation", binding.context_generation},
+          {"native_swapchain", binding.created.swapchain}, {"create_queue", binding.created.queue},
+          {"device", binding.created.device}, {"native_method_module", binding.created.method_module},
+          {"hooks_ready", binding.created.hooks_ready}, {"buffer_count", binding.buffer_count},
+          {"buffer_generation", binding.buffer_generation}, {"present_queues", std::move(queues)},
+          {"live", binding.live}, {"bound", binding.bound}, {"resizing", binding.resizing}, {"reason", binding.reason},
+          {"present_api_calls", binding.present_calls}, {"successful_present_api_calls", binding.successful_present_calls},
+          {"test_api_calls", binding.test_calls}, {"last_present_serial", binding.last_present_serial},
+          {"last_present_index", binding.last_present_index}, {"last_present_result", binding.last_present_result}});
+    }
+    constexpr std::array<const char*, 8> names{"init_begin", "init_return", "create_return", "present_before", "present_return",
+        "resize_before", "resize_return", "invalidated"};
+    const auto count = std::min<uint64_t>(observed.sequence, observed.events.size());
+    for (uint64_t sequence = observed.sequence - count + 1; sequence <= observed.sequence && count != 0; ++sequence) {
+      const auto& event = observed.events[(sequence - 1) % observed.events.size()];
+      events.push_back({{"kind", names[static_cast<size_t>(event.kind)]}, {"sequence", event.sequence},
+          {"init_serial", event.init_serial}, {"buffer_generation", event.buffer_generation}, {"present_serial", event.present_serial},
+          {"swapchain", event.swapchain}, {"queue", event.queue}, {"thread_id", event.thread_id}, {"method", event.method},
+          {"buffer_index", event.index}, {"flags", event.flags}, {"result", event.result}, {"reason", event.reason}});
+    }
+    const auto& pending = observed.pending;
+    return {{"id", *id}, {"ok", true}, {"status", "observed"}, {"state", ProcessIdentityState()},
+        {"probe", {{"enabled", true}, {"stopped", observed.stopped}, {"evidence", xefg_present_probe::kEvidence},
+            {"present_serial_kind", "api_call_not_physical_frame_or_source_id"}, {"gpu_copy_enabled", false}, {"sdk_debug_called", false},
+            {"pending", {{"active", pending.active}, {"init_serial", pending.serial}, {"slot", pending.key.slot},
+                {"module", pending.key.module}, {"handle", pending.key.handle}, {"factory", pending.key.factory}, {"hwnd", pending.key.window},
+                {"owner_thread", pending.owner_thread}, {"candidates", pending.candidates}, {"creates_inflight", pending.creates_inflight},
+                {"ambiguous", pending.ambiguous}, {"factory_hooks_ready", pending.factory_hooks_ready}}},
+            {"rejected_creates", observed.rejected_creates}, {"stale_returns", observed.stale_returns}, {"overflow", observed.overflow},
+            {"event_capacity", observed.events.size()}, {"event_sequence", observed.sequence}, {"bindings", std::move(bindings)},
+            {"events", std::move(events)}}}};
+  }
+#endif
   const bool marker_operation = *operation == "fg_output_marker";
   const bool consumer_operation = *operation == "fg_consumer_capture";
   const bool compact_operation = marker_operation || consumer_operation;

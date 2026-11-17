@@ -43,6 +43,9 @@
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
 #include "nr_fg_output_probe.hpp"
 #endif
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+#include "nr_xefg_present_probe.hpp"
+#endif
 
 namespace renodx::addons::dlss5::fg::xefg {
 
@@ -740,6 +743,12 @@ inline void ReleaseFrames(Context* context) {
 #if defined(NR_NEXUS_DEV_CONTROL)
   edit_fg_observation::StopEnvironment(2, reinterpret_cast<uintptr_t>(context));
   context->fg_environment_generation = ++state.fg_environment_generation;
+#if defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+  xefg_present_probe::Observe([&] {
+    xefg_present_probe::UpdateContext(reinterpret_cast<uintptr_t>(context), context->epoch,
+        context->fg_environment_generation);
+  });
+#endif
 #if defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
   fg_output_probe::UpdateXefg(reinterpret_cast<uintptr_t>(context), context->epoch,
       context->fg_environment_generation);
@@ -836,6 +845,9 @@ inline void Initialize(void* handle, ID3D12CommandQueue* queue, const abi::Init*
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
                         , uint32_t probe_sdk_slot = UINT32_MAX
 #endif
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+                        , uint64_t present_probe_serial = 0
+#endif
                         ) {
   if (handle == nullptr || queue == nullptr || parameters == nullptr) return;
   auto context = std::make_shared<Context>();
@@ -872,6 +884,13 @@ inline void Initialize(void* handle, ID3D12CommandQueue* queue, const abi::Init*
     state.retired_contexts.push_back(it->second);
   }
   state.contexts[handle] = std::move(context);
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+  xefg_present_probe::Observe([&] {
+    const auto& registered = state.contexts.at(handle);
+    xefg_present_probe::ContextInitialized(present_probe_serial, reinterpret_cast<uintptr_t>(registered.get()),
+        registered->epoch, registered->fg_environment_generation);
+  });
+#endif
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
   lock.unlock();
   if (probe_sdk_slot < 2) {
@@ -1911,6 +1930,12 @@ inline std::array<SdkSlot, 2> modules;
 template <size_t Index>
 struct SdkHooks {
   static int32_t Init(void* handle, ID3D12CommandQueue* queue, const abi::Init* parameters) {
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+    const std::lock_guard present_probe_lifecycle(xefg_present_probe::lifecycle_mutex);
+    xefg_present_probe::InitScope present_probe_init(static_cast<uint32_t>(Index),
+        reinterpret_cast<uintptr_t>(modules[Index].module), handle, nullptr, nullptr,
+        (parameters != nullptr ? parameters->application_swapchain : nullptr));
+#endif
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
     const std::lock_guard probe_lifecycle(fg_output_probe::xefg_lifecycle_mutex);
     const fg_output_probe::XefgInitScope probe_init(static_cast<uint32_t>(Index), reinterpret_cast<uintptr_t>(handle));
@@ -1929,6 +1954,9 @@ struct SdkHooks {
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
                    , (probe_init.owner ? static_cast<uint32_t>(Index) : UINT32_MAX)
 #endif
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+                   , present_probe_init.serial
+#endif
                    );
       } catch (...) { PublishResult(Result::FAILED); }
     }
@@ -1937,11 +1965,20 @@ struct SdkHooks {
       fg_output_probe::FinishXefgInit(static_cast<uint32_t>(Index), reinterpret_cast<uintptr_t>(handle), status);
     }
 #endif
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+    present_probe_init.Finish(status);
+#endif
     return status;
   }
   static int32_t InitDesc(void* handle, HWND window, const DXGI_SWAP_CHAIN_DESC1* description,
                           const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen, ID3D12CommandQueue* queue,
                           IDXGIFactory2* factory, const abi::Init* parameters) {
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+    const std::lock_guard present_probe_lifecycle(xefg_present_probe::lifecycle_mutex);
+    xefg_present_probe::InitScope present_probe_init(static_cast<uint32_t>(Index),
+        reinterpret_cast<uintptr_t>(modules[Index].module), handle, factory, window,
+        (parameters != nullptr ? parameters->application_swapchain : nullptr));
+#endif
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
     const std::lock_guard probe_lifecycle(fg_output_probe::xefg_lifecycle_mutex);
     const fg_output_probe::XefgInitScope probe_init(static_cast<uint32_t>(Index), reinterpret_cast<uintptr_t>(handle));
@@ -1961,6 +1998,9 @@ struct SdkHooks {
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
                    , (probe_init.owner ? static_cast<uint32_t>(Index) : UINT32_MAX)
 #endif
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+                   , present_probe_init.serial
+#endif
                    );
       } catch (...) { PublishResult(Result::FAILED); }
     }
@@ -1968,6 +2008,9 @@ struct SdkHooks {
     if (probe_init.owner) {
       fg_output_probe::FinishXefgInit(static_cast<uint32_t>(Index), reinterpret_cast<uintptr_t>(handle), status);
     }
+#endif
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+    present_probe_init.Finish(status);
 #endif
     return status;
   }
@@ -2414,6 +2457,12 @@ struct SdkHooks {
     return status;
   }
   static int32_t Destroy(void* handle) {
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+    const std::lock_guard present_probe_lifecycle(xefg_present_probe::lifecycle_mutex);
+    xefg_present_probe::Observe([&] {
+      xefg_present_probe::Invalidate(static_cast<uint32_t>(Index), reinterpret_cast<uintptr_t>(handle), "context_destroying");
+    });
+#endif
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
     const std::lock_guard probe_lifecycle(fg_output_probe::xefg_lifecycle_mutex);
 #endif
@@ -2719,6 +2768,9 @@ inline uint64_t SubmittedFrames() noexcept {
 }
 
 inline void Stop() noexcept {
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+  xefg_present_probe::Observe([] { xefg_present_probe::Stop(); });
+#endif
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
   fg_output_probe::StopXefg();
 #endif
