@@ -27,6 +27,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -1913,11 +1914,15 @@ inline bool InstallProxy(IUnknown* object, HMODULE sdk_module) {
   return false;
 }
 
-inline constexpr std::array<const char*, 10> EXPORTS{
+inline constexpr std::array EXPORTS{
     "xefgSwapChainD3D12InitFromSwapChain", "xefgSwapChainD3D12InitFromSwapChainDesc",
     "xefgSwapChainD3D12GetSwapChainPtr", "xefgSwapChainD3D12TagFrameResource", "xefgSwapChainTagFrameConstants",
     "xefgSwapChainSetPresentId", "xefgSwapChainSetEnabled", "xefgSwapChainSetUiCompositionState", "xefgSwapChainDestroy",
-    "xefgSwapChainSetNumInterpolatedFrames"};
+    "xefgSwapChainSetNumInterpolatedFrames"
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+    , "xefgSwapChainEnableDebugFeature"
+#endif
+};
 struct SdkSlot {
   HMODULE module = nullptr;
   std::array<void*, EXPORTS.size()> real{};
@@ -2513,6 +2518,37 @@ struct SdkHooks {
     }
     return status;
   }
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+  static int32_t Debug(void* handle, int32_t feature, uint32_t enabled, void* argument) {
+    if (!stopped.load()) {
+      PinRuntimeCallback();
+    }
+    const auto caller_address = reinterpret_cast<uintptr_t>(_ReturnAddress());
+    xefg_present_probe::DebugCall ticket;
+    xefg_present_probe::Observe([&] {
+      HMODULE caller_module = nullptr;
+      std::string caller_path;
+      if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+              reinterpret_cast<LPCWSTR>(caller_address), &caller_module)) {
+        wchar_t path[512]{};
+        const auto length = GetModuleFileNameW(caller_module, path, static_cast<DWORD>(std::size(path)));
+        if (length != 0 && length < std::size(path)) {
+          const auto bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, path, static_cast<int>(length), nullptr, 0, nullptr, nullptr);
+          if (bytes > 0 && bytes <= 256) {
+            caller_path.resize(bytes);
+            WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, path, static_cast<int>(length), caller_path.data(), bytes, nullptr, nullptr);
+          }
+        }
+      }
+      ticket = xefg_present_probe::BeginDebug(static_cast<uint32_t>(Index),
+          reinterpret_cast<uintptr_t>(modules[Index].module), reinterpret_cast<uintptr_t>(handle), feature, enabled, argument,
+          caller_address, reinterpret_cast<uintptr_t>(caller_module), caller_path);
+    });
+    const auto result = reinterpret_cast<xefg_present_probe::DebugFn>(modules[Index].real[10])(handle, feature, enabled, argument);
+    xefg_present_probe::Observe([&] { xefg_present_probe::FinishDebug(ticket, result); });
+    return result;
+  }
+#endif
 };
 
 template <size_t Index>
@@ -2521,7 +2557,11 @@ inline std::array<void*, EXPORTS.size()> SdkDetours() {
       reinterpret_cast<void*>(&SdkHooks<Index>::GetSwapchain), reinterpret_cast<void*>(&SdkHooks<Index>::Resource),
       reinterpret_cast<void*>(&SdkHooks<Index>::Constants), reinterpret_cast<void*>(&SdkHooks<Index>::PresentId),
       reinterpret_cast<void*>(&SdkHooks<Index>::Enable), reinterpret_cast<void*>(&SdkHooks<Index>::UiState),
-      reinterpret_cast<void*>(&SdkHooks<Index>::Destroy), reinterpret_cast<void*>(&SdkHooks<Index>::NumInterpolated)};
+      reinterpret_cast<void*>(&SdkHooks<Index>::Destroy), reinterpret_cast<void*>(&SdkHooks<Index>::NumInterpolated)
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+      , reinterpret_cast<void*>(&SdkHooks<Index>::Debug)
+#endif
+  };
 }
 }  // namespace internal
 
@@ -2864,7 +2904,13 @@ inline void Poll(bool force_discovery = true) {
         available += exports[i] != nullptr;
         // Older public runtimes always interpolate UI and have no dynamic
         // composition setter. Absence keeps the documented disabled default.
-        if (i != 7 && i != 9) complete &= exports[i] != nullptr;
+        if (i != 7 && i != 9
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+            && i != 10
+#endif
+        ) {
+          complete &= exports[i] != nullptr;
+        }
       }
       if (!complete) break;
       HMODULE pinned = nullptr;

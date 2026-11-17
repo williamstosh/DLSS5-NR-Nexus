@@ -492,6 +492,9 @@ inline Json Execute(const Json& request) {
       for (uint32_t index = 0; index < std::min<uint32_t>(binding.buffer_count, xefg_present_probe::kMaxBuffers); ++index) {
         queues.push_back(binding.queues[index]);
       }
+      const auto& tag = binding.tag_control;
+      const bool tag_generation = binding.live && binding.bound && !binding.resizing
+          && tag.context_generation == binding.context_generation && tag.buffer_generation == binding.buffer_generation;
       bindings.push_back({{"init_serial", binding.init_serial}, {"slot", binding.key.slot}, {"module", binding.key.module},
           {"handle", binding.key.handle}, {"factory", binding.key.factory}, {"hwnd", binding.key.window},
           {"module_path", binding.key.module_path}, {"module_path_available", !binding.key.module_path.empty()},
@@ -502,6 +505,14 @@ inline Json Execute(const Json& request) {
           {"device", binding.created.device}, {"native_method_module", binding.created.method_module},
           {"hooks_ready", binding.created.hooks_ready}, {"buffer_count", binding.buffer_count},
           {"buffer_generation", binding.buffer_generation}, {"present_queues", std::move(queues)},
+          {"tag_control", {{"same_generation", tag_generation}, {"entered", tag.entered}, {"returned", tag.returned},
+              {"external_calls", tag.external_calls}, {"external_false_calls", tag.external_false_calls},
+              {"conflicts", tag.conflicts}, {"own_true_call", tag.own_true_call}, {"own_window_conflicts", tag.own_window_conflicts},
+              {"last_entry", tag.last_entry}, {"last_return", tag.last_return}, {"tag_in_flight", tag.in_flight},
+              {"value_available", tag_generation && tag.value_available},
+              {"observed_value", tag_generation && tag.value_available ? Json(tag.enabled) : Json(nullptr)},
+              {"own_on_window_valid", tag_generation && tag.value_available && tag.enabled && tag.in_flight == 0
+                  && tag.own_true_call != 0 && tag.own_window_conflicts == 0}}},
           {"live", binding.live}, {"bound", binding.bound}, {"resizing", binding.resizing}, {"reason", binding.reason},
           {"present_api_calls", binding.present_calls}, {"successful_present_api_calls", binding.successful_present_calls},
           {"test_api_calls", binding.test_calls}, {"last_present_serial", binding.last_present_serial},
@@ -518,6 +529,24 @@ inline Json Execute(const Json& request) {
           {"buffer_index", event.index}, {"flags", event.flags}, {"result", event.result}, {"reason", event.reason}});
     }
     const auto& pending = observed.pending;
+    const auto& debug = observed.debug_calls;
+    Json debug_calls = Json::array();
+    const auto debug_count = std::min<uint64_t>(debug.entered, debug.calls.size());
+    for (uint64_t call_id = debug.entered - debug_count + 1; call_id <= debug.entered && debug_count != 0; ++call_id) {
+      const auto& call = debug.calls[(call_id - 1) % debug.calls.size()];
+      debug_calls.push_back({{"call_id", call.call_id}, {"enter_sequence", call.enter_sequence},
+          {"return_sequence", call.return_sequence}, {"feature", call.feature}, {"value", call.value}, {"argument", call.argument},
+          {"own_job_id", call.own_job_id}, {"source", call.own_job_id != 0 ? "nexus_apply_tag" : "external"},
+          {"caller_address", call.caller_address}, {"caller_module", call.caller_module},
+          {"caller_path", call.caller_path}, {"caller_path_available", !call.caller_path.empty()},
+          {"native_present_serial", call.native_present_serial},
+          {"entered_ms", call.entered_ms}, {"returned_ms", call.returned_ms},
+          {"entered_thread", call.entered_thread}, {"returned_thread", call.returned_thread},
+          {"returned", call.returned}, {"result", call.result},
+          {"target", {{"slot", call.target.slot}, {"module", call.target.module}, {"handle", call.target.handle},
+              {"init_serial", call.target.init_serial}, {"context", call.target.context},
+              {"context_generation", call.target.context_generation}, {"buffer_generation", call.target.buffer_generation}}}});
+    }
     const auto calibration = xefg_present_probe::CopyCalibration();
     const auto control = xefg_present_probe::CopyControl();
     constexpr std::array<const char*, 4> control_actions{"baseline", "arm", "poll", "stop"};
@@ -534,6 +563,11 @@ inline Json Execute(const Json& request) {
             {"rejected_creates", observed.rejected_creates}, {"stale_returns", observed.stale_returns}, {"overflow", observed.overflow},
             {"event_capacity", observed.events.size()}, {"event_sequence", observed.sequence}, {"bindings", std::move(bindings)},
             {"events", std::move(events)},
+            {"debug_calls", {{"scope", "observed_export_calls_not_getter_or_pixels"},
+                {"capacity", debug.calls.size()}, {"sequence", debug.sequence}, {"entered", debug.entered},
+                {"returned", debug.returned}, {"in_flight", debug.in_flight}, {"overwritten", debug.overwritten},
+                {"overwritten_unreturned", debug.overwritten_unreturned}, {"stale_returns", debug.stale_returns},
+                {"calls", std::move(debug_calls)}}},
             {"control", {{"job_id", control.job_id}, {"request_id", control.request_id},
                 {"action", control_actions[static_cast<size_t>(control.action)]},
                 {"phase", control_phases[static_cast<size_t>(control.phase)]}, {"finished", control.finished},

@@ -19,15 +19,18 @@
 #include "d3d12_test_gpu.hpp"
 
 #include <nr_xefg_present_probe.hpp>
+#include <fg_xefg.hpp>
 
 namespace nr_xefg_present_probe_cases {
 namespace probe = renodx::addons::dlss5::xefg_present_probe;
+namespace sdk = renodx::addons::dlss5::fg::xefg::internal;
 inline int Run() {
   struct Restore {
     probe::Snapshot saved = probe::CopySnapshot();
     probe::Calibration saved_calibration = probe::CopyCalibration();
     probe::CaptureCallbacks saved_callbacks = probe::capture_callbacks;
     probe::ControlJob saved_control = probe::CopyControl();
+    sdk::SdkSlot saved_sdk = sdk::modules[1];
     Restore() {
       std::unique_lock lock(probe::probe_state.mutex);
       probe::probe_state.snapshot = {};
@@ -46,6 +49,7 @@ inline int Run() {
       probe::calibration = saved_calibration;
       probe::capture_callbacks = saved_callbacks;
       probe::control_job = saved_control;
+      sdk::modules[1] = saved_sdk;
     }
   } restore;
   try {
@@ -238,21 +242,27 @@ inline int Run() {
     }
     static int32_t debug_result = 7;
     static std::atomic_uint32_t debug_calls = 0, last_enabled = 99, debug_thread = 0;
+    static std::atomic_int32_t last_feature = 0;
+    static std::atomic_uintptr_t last_argument = 0;
     static std::atomic_bool debug_block = false;
     static bool tag_only = true;
     auto debug_key = key;
     debug_key.module_path = "SYNTHETIC_XEFG_MODULE";
-    debug_key.debug = +[](void*, int32_t feature, uint32_t enabled, void*) {
+    sdk::modules[1].module = reinterpret_cast<HMODULE>(key.module);
+    sdk::modules[1].real[10] = reinterpret_cast<void*>(+[](void*, int32_t feature, uint32_t enabled, void* argument) -> int32_t {
       ++debug_calls;
       tag_only &= feature == 1;
       last_enabled = enabled;
+      last_feature = feature;
+      last_argument = reinterpret_cast<uintptr_t>(argument);
       debug_thread = GetCurrentThreadId();
       const auto deadline = GetTickCount64() + 2000;
       while (debug_block.load() && GetTickCount64() < deadline) {
         Sleep(1);
       }
       return debug_result;
-    };
+    });
+    debug_key.debug = sdk::SdkHooks<1>::Debug;
     serial = begin(debug_key);
     created(serial, candidate);
     context(serial);
@@ -372,6 +382,60 @@ inline int Run() {
     invalid.queue = candidate.queue;
     ++invalid.target.context_generation;
     check(!probe::FrameCurrent(invalid), "wrong context generation cannot validate an output sample");
+    check(control(probe::ControlAction::ARM, true), "the observation fixture establishes its own successful true call");
+    auto tag = binding(serial).tag_control;
+    check(tag.value_available && tag.enabled && tag.own_true_call != 0 && tag.own_window_conflicts == 0 && tag.in_flight == 0,
+        "an uncontested own true return is identified by its exact control job");
+    const auto before_other = probe::CopySnapshot().debug_calls.entered;
+    check(sdk::SdkHooks<1>::Debug(reinterpret_cast<void*>(key.handle + 1), 1, 0, nullptr) == 7
+            && probe::CopySnapshot().debug_calls.entered == before_other && binding(serial).tag_control.own_window_conflicts == 0,
+        "another handle is forwarded without contaminating the bound TAG observation");
+    debug_block = true;
+    std::jthread external([&] { sdk::SdkHooks<1>::Debug(reinterpret_cast<void*>(key.handle), 1, 0, nullptr); });
+    const auto conflict_deadline = GetTickCount64() + 1000;
+    while (binding(serial).tag_control.in_flight == 0 && GetTickCount64() < conflict_deadline) {
+      Sleep(1);
+    }
+    tag = binding(serial).tag_control;
+    check(tag.in_flight == 1 && !tag.value_available && tag.own_window_conflicts != 0,
+        "an unreturned external false invalidates the observed On window immediately");
+    const auto retained_conflicts = tag.conflicts;
+    const std::string maximum_caller_path(256, '\\');
+    for (uint32_t index = 0; index < 32; ++index) {
+      const auto unrelated_feature = probe::BeginDebug(key.slot, key.module, key.handle, 2, 1, nullptr, 1, 2, maximum_caller_path);
+      probe::FinishDebug(unrelated_feature, 0);
+    }
+    check(probe::CopySnapshot().debug_calls.overwritten_unreturned != 0
+            && probe::CopySnapshot().debug_calls.in_flight == 1 && binding(serial).tag_control.in_flight == 1,
+        "ring rollover cannot erase an unreturned TAG call or its conflict evidence");
+    debug_block = false;
+    external.join();
+    tag = binding(serial).tag_control;
+    check(tag.in_flight == 0 && tag.value_available && !tag.enabled && tag.external_false_calls == 1 && tag.conflicts != 0
+            && probe::CopyCalibration().active,
+        "external false success invalidates control evidence without changing capture or competing with the SDK");
+    int argument = 123;
+    debug_result = -321;
+    check(sdk::SdkHooks<1>::Debug(reinterpret_cast<void*>(key.handle), 2, UINT32_MAX, &argument) == -321
+            && last_feature == 2 && last_enabled == UINT32_MAX && last_argument == reinterpret_cast<uintptr_t>(&argument),
+        "the actual debug wrapper forwards feature/value/argument and original failure result exactly");
+    debug_result = 7;
+    const auto observation_status = renodx::addons::dlss5::internal::dev_control::Execute({{"id", "debug-observation-status"},
+        {"op", "xefg_present_probe"}, {"action", "status"}});
+    check(probe::CopySnapshot().debug_calls.overwritten != 0 && binding(serial).tag_control.conflicts == retained_conflicts
+            && !observation_status["probe"]["bindings"][0]["tag_control"]["own_on_window_valid"].get<bool>()
+            && observation_status.dump().size() < 65536,
+        "bounded observation rollover preserves cumulative conflict evidence and compact read-only status");
+    check(control(probe::ControlAction::STOP), "observation tests restore only their known test baseline");
+    const auto old_debug = probe::BeginDebug(key.slot, key.module, key.handle, 1, 1, nullptr);
+    probe::UpdateContext(target.context, 2, target.context_generation + 1);
+    const auto stale_debug = probe::CopySnapshot().debug_calls.stale_returns;
+    probe::FinishDebug(old_debug, 0);
+    check(probe::CopySnapshot().debug_calls.stale_returns == stale_debug + 1,
+        "a debug return cannot carry observed TAG state into another context generation");
+    // WARP creates a fresh context using the same synthetic handle.
+    probe::Invalidate(key.slot, key.handle, "cpu_fixture_destroying");
+    probe::ContextDestroyed(key.slot, key.handle, S_OK);
     std::cout << "PASS xefg-present-probe CPU/MOCK checks=" << checks << " evidence=" << probe::kEvidence << '\n';
 
     // WARP exercises the production PRESENT copy boundary on an owned texture.

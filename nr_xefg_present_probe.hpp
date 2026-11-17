@@ -74,6 +74,40 @@ struct Event {
   int32_t result = 0;
   const char* reason = "unobserved";
 };
+struct Target {
+  uint32_t slot = UINT32_MAX;
+  uintptr_t module = 0, handle = 0;
+  uint64_t init_serial = 0;
+  uintptr_t context = 0;
+  uint64_t context_generation = 0, buffer_generation = 0;
+};
+struct DebugCall {
+  uint64_t call_id = 0, enter_sequence = 0, return_sequence = 0;
+  Target target;
+  int32_t feature = 0;
+  uint32_t value = 0;
+  uintptr_t argument = 0;
+  uint64_t own_job_id = 0;
+  uintptr_t caller_address = 0, caller_module = 0;
+  std::string caller_path;
+  uint64_t native_present_serial = 0;
+  uint64_t entered_ms = 0, returned_ms = 0;
+  uint32_t entered_thread = 0, returned_thread = 0;
+  bool returned = false;
+  int32_t result = E_PENDING;
+};
+struct DebugSnapshot {
+  uint64_t sequence = 0, entered = 0, returned = 0, in_flight = 0;
+  uint64_t overwritten = 0, overwritten_unreturned = 0, stale_returns = 0;
+  std::array<DebugCall, 24> calls{};
+};
+struct TagControl {
+  uint64_t context_generation = 0, buffer_generation = 0;
+  uint64_t entered = 0, returned = 0, external_calls = 0, external_false_calls = 0;
+  uint64_t conflicts = 0, own_true_call = 0, own_window_conflicts = 0, last_entry = 0, last_return = 0;
+  uint32_t in_flight = 0;
+  bool value_available = false, enabled = false;
+};
 struct Binding {
   InitKey key;
   uint64_t init_serial = 0;
@@ -89,6 +123,7 @@ struct Binding {
   int32_t last_present_result = 0;
   bool live = false, bound = false, resizing = false;
   const char* reason = "unobserved";
+  TagControl tag_control;
 };
 struct Snapshot {
   bool stopped = false;
@@ -97,13 +132,7 @@ struct Snapshot {
   PendingInit pending;
   std::array<Binding, 4> bindings{};
   std::array<Event, 24> events{};
-};
-struct Target {
-  uint32_t slot = UINT32_MAX;
-  uintptr_t module = 0, handle = 0;
-  uint64_t init_serial = 0;
-  uintptr_t context = 0;
-  uint64_t context_generation = 0, buffer_generation = 0;
+  DebugSnapshot debug_calls;
 };
 struct Calibration {
   Target target;
@@ -204,6 +233,13 @@ static CaptureCallbacks capture_callbacks;
 static ControlJob control_job;
 static uint64_t control_sequence = 0;
 static thread_local uint64_t executing_control_job = 0;
+struct OwnDebugRequest {
+  Target target;
+  uint64_t job_id = 0;
+  uint32_t value = 0;
+  bool consumed = false;
+};
+static thread_local OwnDebugRequest* own_debug_request = nullptr;
 struct ProbeState {
   std::shared_mutex mutex;
   Snapshot snapshot;
@@ -657,6 +693,99 @@ inline void ConfigureCapture(CaptureCallbacks callbacks) {
   std::unique_lock lock(probe_state.mutex);
   capture_callbacks = callbacks;
 }
+inline DebugCall BeginDebug(uint32_t slot, uintptr_t module, uintptr_t handle, int32_t feature,
+                            uint32_t value, void* argument, uintptr_t caller_address = 0,
+                            uintptr_t caller_module = 0, const std::string& caller_path = {}) {
+  std::unique_lock lock(probe_state.mutex);
+  auto& snapshot = probe_state.snapshot;
+  if (snapshot.stopped) return {};
+  for (auto& binding : snapshot.bindings) {
+    if (!binding.live || !binding.bound || binding.resizing || binding.key.slot != slot
+        || binding.key.module != module || binding.key.handle != handle) continue;
+    auto& debug = snapshot.debug_calls;
+    DebugCall call{.call_id = ++debug.entered, .enter_sequence = ++debug.sequence,
+        .target = {.slot = slot, .module = module, .handle = handle, .init_serial = binding.init_serial,
+            .context = binding.context, .context_generation = binding.context_generation, .buffer_generation = binding.buffer_generation},
+        .feature = feature, .value = value, .argument = reinterpret_cast<uintptr_t>(argument),
+        .caller_address = caller_address, .caller_module = caller_module, .caller_path = caller_path,
+        .native_present_serial = binding.last_present_serial,
+        .entered_ms = GetTickCount64(), .entered_thread = GetCurrentThreadId()};
+    if (own_debug_request != nullptr && !own_debug_request->consumed && feature == 1
+        && value == own_debug_request->value && Matches(binding, own_debug_request->target)) {
+      call.own_job_id = own_debug_request->job_id;
+      own_debug_request->consumed = true;
+    }
+    auto& retained = debug.calls[(call.call_id - 1) % debug.calls.size()];
+    if (retained.call_id != 0) {
+      ++debug.overwritten;
+      debug.overwritten_unreturned += !retained.returned;
+    }
+    retained = call;
+    ++debug.in_flight;
+    auto& tag = binding.tag_control;
+    if (tag.context_generation != binding.context_generation || tag.buffer_generation != binding.buffer_generation) {
+      tag = {.context_generation = binding.context_generation, .buffer_generation = binding.buffer_generation};
+    }
+    ++tag.entered;
+    if (call.own_job_id == 0) {
+      ++tag.external_calls;
+    }
+    if (feature == 1) {
+      if (call.own_job_id != 0 && value != 0) {
+        tag.own_true_call = call.call_id;
+        tag.own_window_conflicts = 0;
+      }
+      if (tag.in_flight != 0) {
+        ++tag.conflicts;
+        ++tag.own_window_conflicts;
+      }
+      if (tag.own_true_call != 0 && call.call_id > tag.own_true_call && value == 0) {
+        tag.conflicts += call.own_job_id == 0;
+        ++tag.own_window_conflicts;
+      }
+      if (call.own_job_id == 0 && value == 0) {
+        ++tag.external_false_calls;
+      }
+      ++tag.in_flight;
+      tag.last_entry = call.call_id;
+      tag.value_available = false;
+    }
+    return call;
+  }
+  return {};
+}
+inline void FinishDebug(const DebugCall& ticket, int32_t result) {
+  if (ticket.call_id == 0) return;
+  std::unique_lock lock(probe_state.mutex);
+  auto& snapshot = probe_state.snapshot;
+  auto& debug = snapshot.debug_calls;
+  const auto sequence = ++debug.sequence;
+  ++debug.returned;
+  --debug.in_flight;
+  auto& retained = debug.calls[(ticket.call_id - 1) % debug.calls.size()];
+  if (retained.call_id == ticket.call_id) {
+    retained.return_sequence = sequence;
+    retained.returned_ms = GetTickCount64();
+    retained.returned_thread = GetCurrentThreadId();
+    retained.returned = true;
+    retained.result = result;
+  }
+  for (auto& binding : snapshot.bindings) {
+    if (!Matches(binding, ticket.target) || !binding.bound || binding.resizing) continue;
+    auto& tag = binding.tag_control;
+    ++tag.returned;
+    if (ticket.feature == 1) {
+      --tag.in_flight;
+      tag.last_return = ticket.call_id;
+      tag.value_available = tag.in_flight == 0 && tag.last_entry == ticket.call_id && result >= 0;
+      if (tag.value_available) {
+        tag.enabled = ticket.value != 0;
+      }
+    }
+    return;
+  }
+  ++debug.stale_returns;
+}
 inline bool ApplyTag(const Target& target, bool enabled, int32_t* result, bool generations = true) {
   if (executing_control_job == 0) {
     *result = E_ACCESSDENIED;
@@ -690,6 +819,15 @@ inline bool ApplyTag(const Target& target, bool enabled, int32_t* result, bool g
     control_job.reason = "sdk_entered";
   }
   // Feature 1 is TAG_INTERPOLATED_FRAMES. No SHOW call or assumed initial value.
+  OwnDebugRequest request{.target = {.slot = selected.key.slot, .module = selected.key.module,
+      .handle = selected.key.handle, .init_serial = selected.init_serial, .context = selected.context,
+      .context_generation = selected.context_generation, .buffer_generation = selected.buffer_generation},
+      .job_id = executing_control_job, .value = enabled ? 1u : 0u};
+  struct OwnCallScope {
+    OwnDebugRequest* previous = own_debug_request;
+    explicit OwnCallScope(OwnDebugRequest* request) { own_debug_request = request; }
+    ~OwnCallScope() { own_debug_request = previous; }
+  } own_call(&request);
   *result = selected.key.debug(reinterpret_cast<void*>(selected.key.handle), 1, enabled ? 1u : 0u, nullptr);
   std::unique_lock lock(probe_state.mutex);
   ++calibration.api_sequence;
