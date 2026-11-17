@@ -330,6 +330,21 @@ inline int Run() {
             && status["probe"]["bindings"][0]["module_path"] == debug_key.module_path
             && status.dump().size() < 65536 && debug_calls == calls_before_status,
         "metadata status remains read-only, compact, process-bound and tied to the observed module path");
+    static_assert(probe::kMaxBuffers == 8 && probe::kMaxSamplesPerWindow == 64);
+    const auto calls_before_bounds = debug_calls.load();
+    for (const auto [samples, duration] : std::array<std::array<uint32_t, 2>, 4>{{
+             {0, 1000}, {65, 1000}, {64, 99}, {64, 3001}}}) {
+      check(!control(probe::ControlAction::ARM, true, samples, duration)
+              && debug_calls == calls_before_bounds && !probe::CopyCalibration().active,
+          "zero/65 samples and out-of-range duration remain rejected before SDK entry");
+    }
+    check(control(probe::ControlAction::ARM, true, 64, 3000) && probe::CopyCalibration().requested == 64,
+        "64 samples and the existing maximum duration are accepted in one continuous TAG window");
+    check(control(probe::ControlAction::STOP) && !probe::CopyCalibration().restore_pending,
+        "the larger window still uses the existing explicit baseline restoration");
+    check(control(probe::ControlAction::ARM, true, 1, 100) && probe::CopyCalibration().requested == 1,
+        "one sample and the existing minimum duration remain accepted");
+    check(control(probe::ControlAction::STOP), "the minimum window restores its known baseline");
     check(control(probe::ControlAction::ARM, true) && last_enabled == 1, "TAG-only On arm preserves the controlled baseline");
     check(!control(probe::ControlAction::BASELINE), "an active TAG window cannot replace its baseline");
     {

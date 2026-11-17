@@ -30,6 +30,7 @@ namespace renodx::addons::dlss5::xefg_present_probe {
 using Microsoft::WRL::ComPtr;
 inline constexpr const char* kEvidence = "metadata_not_pixels_or_completion";
 inline constexpr size_t kMaxBuffers = 8;
+inline constexpr uint32_t kMaxSamplesPerWindow = 64;
 enum class Kind : uint8_t { INIT_BEGIN, INIT_RETURN, CREATE_RETURN, PRESENT_BEFORE, PRESENT_RETURN, RESIZE_BEFORE, RESIZE_RETURN, INVALIDATED };
 using DebugFn = int32_t (*)(void*, int32_t, uint32_t, void*);
 struct QueueOwner {
@@ -756,7 +757,7 @@ inline bool Arm(const Target& target, bool tag_enabled, uint32_t samples, uint32
   if (executing_control_job == 0) return false;
   const std::lock_guard lifecycle(lifecycle_mutex);
   const auto before = CopyCalibration();
-  if (!before.baseline_known || before.active || before.restore_pending || samples == 0 || samples > 8
+  if (!before.baseline_known || before.active || before.restore_pending || samples == 0 || samples > kMaxSamplesPerWindow
       || duration_ms < 100 || duration_ms > 3000 || before.target.init_serial != target.init_serial
       || before.target.slot != target.slot || before.target.module != target.module || before.target.handle != target.handle
       || before.target.context != target.context) return false;

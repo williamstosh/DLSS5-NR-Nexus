@@ -714,7 +714,8 @@ inline Json Execute(const Json& request) {
       return complete();
     }
     if (!request.contains("tag_enabled") || !request["tag_enabled"].is_boolean()
-        || !request.contains("samples") || !request["samples"].is_number_unsigned() || request["samples"] < 1 || request["samples"] > 8
+        || !request.contains("samples") || !request["samples"].is_number_unsigned()
+        || request["samples"] < 1 || request["samples"] > xefg_present_probe::kMaxSamplesPerWindow
         || !request.contains("duration_ms") || !request["duration_ms"].is_number_unsigned()
         || request["duration_ms"] < 100 || request["duration_ms"] > 3000
         || !request.contains("output_directory") || !request["output_directory"].is_string()
