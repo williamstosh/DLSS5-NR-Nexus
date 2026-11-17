@@ -387,6 +387,100 @@
       "request ids cannot inject log lines");
   check(control::Execute({{"id", "unknown-op"}, {"op", "reset"}})["reason"] == "invalid_operation",
       "the development interface has no generic arbitrary command dispatch");
+  {
+    const auto* source = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xD3C090});
+    auto [entry, inserted] = runtime::features.try_emplace(source);
+    check(inserted, "the reset fixture owns a distinct synthetic source without creating a device");
+    auto& feature = entry->second;
+    feature.slots[0].handle = reinterpret_cast<NVSDK_NGX_Handle*>(uintptr_t{0xD3C091});
+    feature.slots[0].failed = true;
+    feature.slots[0].fail_count = 3;
+    feature.render_session = std::make_shared<runtime::FeatureState>();
+    feature.render_session->slots[0].handle = reinterpret_cast<NVSDK_NGX_Handle*>(uintptr_t{0xD3C092});
+    runtime::codec_pipeline.preparation_failed = true;
+    runtime::direct_runtime_failed = true;
+    runtime::processed_outputs[nullptr] = {source};
+    runtime::processed_render_outputs[nullptr] = {source};
+    runtime::streamline_viewports.try_emplace(90);
+    const auto before = runtime::configuration_generation.load();
+    const auto epoch = runtime::history_reset_epoch.load();
+    const auto resets = runtime::history_reset_counts[static_cast<size_t>(runtime::HistoryResetSource::kRecreate)].load();
+    const auto retired = runtime::retired_nr_features.size();
+    const bool retirement_pending = runtime::nr_retirement_pending.load();
+    const auto writes = configuration_writes;
+    const auto settings = control::Snapshot()["settings"];
+    const Json request{{"id", "reset-on"}, {"op", "reset_nr"}};
+    const auto accepted = control::Execute(request);
+    check(accepted["ok"] && accepted["status"] == "accepted" && accepted["reason"] == "nr_reset_requested"
+            && accepted["evidence"] == "reset_requested_not_model_or_gpu_completion"
+            && accepted["configuration_generation_before"] == before
+            && accepted["configuration_generation_after"] == before + 1,
+        "the dedicated reset acknowledges one production recreation request without claiming model or GPU completion");
+    check(runtime::configuration_generation == before + 1 && runtime::history_reset_epoch == epoch + 1
+            && runtime::history_reset_counts[static_cast<size_t>(runtime::HistoryResetSource::kRecreate)] == resets + 1
+            && !runtime::codec_pipeline.preparation_failed && !runtime::direct_runtime_failed
+            && !feature.slots[0].failed && feature.slots[0].fail_count == 0,
+        "the real RecreateFeatures advances history once and clears the codec, runtime and slot failure latches");
+    check(feature.slots[0].handle == nullptr && feature.render_session == nullptr
+            && runtime::retired_nr_features.size() == retired + 2
+            && runtime::retired_nr_features[retired].handle == reinterpret_cast<NVSDK_NGX_Handle*>(uintptr_t{0xD3C092})
+            && runtime::retired_nr_features[retired + 1].handle == reinterpret_cast<NVSDK_NGX_Handle*>(uintptr_t{0xD3C091})
+            && runtime::processed_outputs.empty() && runtime::processed_render_outputs.empty()
+            && runtime::streamline_viewports.empty(),
+        "the real reset retires both render and main slots and clears the processed-output history");
+    check(configuration_writes == writes && accepted["state"]["settings"] == settings
+            && accepted["state"]["configuration_generation"] == before + 1,
+        "reset preserves every setting and does not write the configuration cache");
+    check(control::Execute(request) == accepted && runtime::configuration_generation == before + 1
+            && runtime::history_reset_epoch == epoch + 1 && runtime::retired_nr_features.size() == retired + 2,
+        "same-id reset replay returns its original receipt without another real recreation");
+    const auto queried = control::Execute({{"id", "reset-query"}, {"op", "status"}, {"query_id", "reset-on"}});
+    check(queried["receipt"] == accepted, "a lost reset receipt remains queryable by its original id");
+    auto invalid = request;
+    invalid["value"] = true;
+    check(control::Execute(invalid)["reason"] == "request_id_reused", "a reset id cannot be reused with different content");
+    for (const char* field : {"key", "value", "confirm", "query_id", "action", "unexpected"}) {
+      invalid = {{"id", "reset-extra-" + std::string(field)}, {"op", "reset_nr"}, {field, true}};
+      const auto rejected = control::Execute(invalid);
+      check(!rejected["ok"].get<bool>() && rejected["reason"] == "invalid_reset_request"
+              && rejected.contains("configuration_generation_before") && rejected.contains("configuration_generation_after")
+              && rejected["configuration_generation_before"] == before + 1
+              && rejected["configuration_generation_after"] == before + 1,
+          "reset rejects all additional request fields and reports the unchanged generation");
+    }
+    runtime::slider_pending = &runtime::kSetAdaptiveTargetFps;
+    const auto busy = control::Execute({{"id", "reset-busy"}, {"op", "reset_nr"}});
+    check(!busy["ok"].get<bool>() && busy["reason"] == "configuration_busy"
+            && busy.contains("configuration_generation_before") && busy.contains("configuration_generation_after")
+            && busy["configuration_generation_before"] == before + 1
+            && busy["configuration_generation_after"] == before + 1,
+        "an existing UI configuration transaction retains ownership over reset");
+    runtime::slider_pending = nullptr;
+    native_window_fixture::foreground_process = 0;
+    const auto unfocused = control::Execute({{"id", "reset-unfocused"}, {"op", "reset_nr"}});
+    check(!unfocused["ok"].get<bool>() && unfocused["reason"] == "not_foreground"
+            && unfocused.contains("configuration_generation_before") && unfocused.contains("configuration_generation_after")
+            && unfocused["configuration_generation_before"] == before + 1
+            && unfocused["configuration_generation_after"] == before + 1,
+        "reset rejects a missing or foreign foreground process without moving the real foreground");
+    native_window_fixture::foreground_process = GetCurrentProcessId();
+    check(control::Execute({{"id", 42}, {"op", "reset_nr"}})["reason"] == "invalid_request_id"
+            && runtime::configuration_generation == before + 1 && runtime::history_reset_epoch == epoch + 1
+            && runtime::retired_nr_features.size() == retired + 2 && configuration_writes == writes,
+        "rejected reset requests cannot advance history, retire slots or write configuration");
+    runtime::enabled = false;
+    const auto off = control::Execute({{"id", "reset-off"}, {"op", "reset_nr"}});
+    check(off["ok"] && off["status"] == "accepted" && !runtime::enabled
+            && !off["state"]["settings"]["NeuralUplift"].get<bool>()
+            && runtime::configuration_generation == before + 2 && runtime::history_reset_epoch == epoch + 2
+            && runtime::history_reset_counts[static_cast<size_t>(runtime::HistoryResetSource::kRecreate)] == resets + 2
+            && configuration_writes == writes,
+        "reset while NR is off still uses the UI recreation contract once without enabling NR");
+    runtime::enabled = true;
+    runtime::features.erase(source);
+    runtime::retired_nr_features.resize(retired);
+    runtime::nr_retirement_pending = retirement_pending;
+  }
   const auto unchanged_generation = runtime::configuration_generation.load();
   check(set("NRHookPoint", 0u)["status"] == "unchanged" && runtime::configuration_generation == unchanged_generation,
       "repeating the current stage is an acknowledged no-op without recreation");

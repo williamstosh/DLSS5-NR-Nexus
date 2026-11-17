@@ -295,6 +295,11 @@ class Client:
         request = dict(id=str(uuid.uuid4()), op='adaptive_feature_experiment', mode=mode)
         return self._mutation(request, deadline)
 
+    def reset_nr(self, *, deadline=None):
+        """Request the UI-equivalent NR reset; model and GPU completion require later observations."""
+        deadline = deadline if deadline is not None else time.monotonic() + self.timeout
+        return self._mutation(dict(id=str(uuid.uuid4()), op='reset_nr'), deadline)
+
     def bridge_adaptive_experiment(self, enabled, *, deadline=None):
         """Request the DEV Bridge experiment; acceptance does not establish source activation."""
         if type(enabled) is not bool:
@@ -340,7 +345,7 @@ def main():
     parser.add_argument('--query-id', help='status only: look up an uncertain original request receipt')
     parser.add_argument('--confirm', action='store_true', help='Explicitly approve a returned configuration proposal')
     parser.add_argument('--tail-frames', type=int, help='inline-restore-roi only: capture 2–48 consecutive evaluations at the character ROI')
-    parser.add_argument('op', choices=('status', 'set', 'inline-restore-roi'))
+    parser.add_argument('op', choices=('status', 'set', 'reset-nr', 'inline-restore-roi'))
     parser.add_argument('key', nargs='?')
     parser.add_argument('value', nargs='?', help='JSON typed value')
     args = parser.parse_args()
@@ -364,6 +369,10 @@ def main():
             if not args.key or args.value is not None or args.query_id or args.confirm:
                 parser.error('inline-restore-roi requires one output directory and no setting or confirmation')
             response = client.inline_restore_roi(args.key, tail_frames=args.tail_frames)
+        elif args.op == 'reset-nr':
+            if args.key is not None or args.value is not None or args.query_id is not None or args.confirm:
+                parser.error('reset-nr accepts no setting, query or confirmation')
+            response = client.reset_nr()
         else:
             if args.key or args.value or args.confirm:
                 parser.error('status accepts no setting or confirmation')

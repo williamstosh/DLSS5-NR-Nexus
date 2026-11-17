@@ -649,6 +649,7 @@ inline Json Execute(const Json& request) {
   if (*operation != "set" && *operation != "adaptive_feature_experiment"
       && *operation != "bridge_adaptive_experiment" && *operation != "edit_reuse_adaptive_experiment"
       && *operation != "edit_reuse_fg_experiment"
+      && *operation != "reset_nr"
       && !compact_operation
       && *operation != "inline_restore_roi") {
     return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "invalid_operation"}};
@@ -663,7 +664,13 @@ inline Json Execute(const Json& request) {
   }
   Json response{{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "invalid_setting"},
       {"message", ""}, {"changes", Json::object()}};
+  if (*operation == "reset_nr") {
+    response["configuration_generation_before"] = configuration_generation.load();
+  }
   const auto finish = [&]() {
+    if (*operation == "reset_nr") {
+      response["configuration_generation_after"] = configuration_generation.load();
+    }
     if (compact_operation) {
       response["state"] = ProcessIdentityState();
     } else {
@@ -688,6 +695,24 @@ inline Json Execute(const Json& request) {
   const bool configuration_busy = shutting_down.load() || slider_pending != nullptr || stage_edit::pending || resolution_edit::pending
       || stage_edit_request.setting != nullptr || !resolution_edit_request.empty() || profile_ui::Busy()
       || profile_ui::pending_action != profile_ui::Action::NONE || preset_ui::manager_geometry.was_open;
+  if (*operation == "reset_nr") {
+    response["reason"] = "invalid_reset_request";
+    if (request.size() != 2) return finish();
+    if (configuration_busy) {
+      response["reason"] = "configuration_busy";
+      return finish();
+    }
+    DWORD foreground_process = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &foreground_process);
+    if (foreground_process != GetCurrentProcessId()) {
+      response["reason"] = "not_foreground";
+      return finish();
+    }
+    RecreateFeatures();
+    response.update({{"ok", true}, {"status", "accepted"}, {"reason", "nr_reset_requested"},
+        {"evidence", "reset_requested_not_model_or_gpu_completion"}});
+    return finish();
+  }
 #if defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
   if (xefg_operation) {
     response["reason"] = "invalid_calibration_request";

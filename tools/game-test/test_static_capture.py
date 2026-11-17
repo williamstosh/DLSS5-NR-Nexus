@@ -55,7 +55,7 @@ class StaticCaptureTests(unittest.TestCase):
         self.window = dict(pid=42, hwnd=7, created=123, path=str(install / 'synthetic-game.exe'))
         self.target = dict(executable=self.window['path'], capture_hold_seconds=10, run_timeout=14,
                            capture_script=str(self.script), capture_script_sha256=static_capture.sha(self.script),
-                           static_capture=dict(hold_seconds=10, exit_reserve_seconds=3,
+                           static_capture=dict(ui_validation=True, hold_seconds=10, exit_reserve_seconds=3,
                                                stage_timeout_seconds=2, startup_exit_seconds=4))
         self.save_target()
         write(self.run / 'owned-process.json', self.window)
@@ -115,7 +115,8 @@ class StaticCaptureTests(unittest.TestCase):
         self.assertEqual(target['run_timeout'], 900)
         self.assertEqual(target['capture_hold_seconds'], 600)
         self.assertEqual(target['static_capture'], dict(hold_seconds=600, exit_reserve_seconds=60,
-                                                      stage_timeout_seconds=60, startup_exit_seconds=300))
+                                                      stage_timeout_seconds=60, startup_exit_seconds=300,
+                                                      dev_control=True, ui_validation=False))
         self.assertEqual(target['existing'], 'unchanged')
         with self.assertRaises(FileExistsError):
             static_capture.prepare_target(source, source)
@@ -131,6 +132,41 @@ class StaticCaptureTests(unittest.TestCase):
 
     def test_capture_cli_rejects_budget_flags_that_only_prepare_a_target(self):
         with mock.patch.object(sys, 'argv', ['static_capture.py', str(self.run), '--hold-seconds', '600']), \
+                mock.patch.object(sys, 'stderr', new=io.StringIO()), \
+                mock.patch.object(static_capture, 'capture') as capture:
+            with self.assertRaises(SystemExit) as error:
+                static_capture.main()
+        self.assertEqual(error.exception.code, 2)
+        capture.assert_not_called()
+
+    def test_prepare_ui_validation_is_explicit_and_default_drops_legacy_manual_mode(self):
+        source = self.root / 'source.json'
+        write(source, dict(static_capture=dict(dev_control=False, ui_validation=True)))
+        scripted = static_capture.prepare_target(source, self.root / 'scripted.json')
+        self.assertEqual(static_capture.development_options(scripted), (True, None))
+        self.assertIs(scripted['static_capture']['ui_validation'], False)
+        manual = static_capture.prepare_target(source, self.root / 'ui.json', ui_validation=True)
+        self.assertEqual(static_capture.development_options(manual), (False, None))
+        self.assertIs(manual['static_capture']['ui_validation'], True)
+        with self.assertRaisesRegex(ValueError, 'cannot be combined'):
+            static_capture.prepare_target(source, self.root / 'invalid.json',
+                                          development_control=True, ui_validation=True)
+        self.assertFalse((self.root / 'invalid.json').exists())
+
+    def test_undeclared_manual_stage_and_cleanup_fail_before_observation(self):
+        self.target['static_capture'].pop('ui_validation')
+        self.save_target()
+        for request in (dict(label='render', expected_stage='Render'),
+                        dict(completed=True, nr_off=True, overlay_closed=True)):
+            with self.subTest(request=request):
+                self.request(**request)
+                self.assert_failed('require explicit static_capture.ui_validation=true')
+                (self.run / 'capture-failed.json').unlink()
+        self.desktop.capture.assert_not_called()
+        self.desktop.require_foreground.assert_not_called()
+
+    def test_ui_validation_cli_is_preparation_only(self):
+        with mock.patch.object(sys, 'argv', ['static_capture.py', str(self.run), '--ui-validation']), \
                 mock.patch.object(sys, 'stderr', new=io.StringIO()), \
                 mock.patch.object(static_capture, 'capture') as capture:
             with self.assertRaises(SystemExit) as error:
@@ -183,7 +219,7 @@ class StaticCaptureTests(unittest.TestCase):
 
     def test_first_request_after_sixty_seconds_keeps_its_stage_and_cleanup_budgets(self):
         self.target.update(capture_hold_seconds=600, run_timeout=900,
-                           static_capture=dict(hold_seconds=600, exit_reserve_seconds=60,
+                           static_capture=dict(ui_validation=True, hold_seconds=600, exit_reserve_seconds=60,
                                                stage_timeout_seconds=60, startup_exit_seconds=300))
         self.save_target()
         self.actions = {61: lambda: self.request(label='render', expected_stage='Render'),
@@ -348,7 +384,7 @@ class StaticCaptureTests(unittest.TestCase):
 
     def test_confirmation_click_without_actual_stage_never_confirms(self):
         self.target.update(capture_hold_seconds=600, run_timeout=900,
-                           static_capture=dict(hold_seconds=600, exit_reserve_seconds=60,
+                           static_capture=dict(ui_validation=True, hold_seconds=600, exit_reserve_seconds=60,
                                                stage_timeout_seconds=60, startup_exit_seconds=300))
         self.save_target()
         self.request(label='render', expected_stage='Render', confirmation_required=True, confirmation_completed=True)
@@ -379,7 +415,7 @@ class StaticCaptureTests(unittest.TestCase):
 
     def test_stage_gap_wait_and_cleanup_stay_sixty_seconds_after_late_handoff(self):
         self.target.update(capture_hold_seconds=600, run_timeout=900,
-                           static_capture=dict(hold_seconds=600, exit_reserve_seconds=60,
+                           static_capture=dict(ui_validation=True, hold_seconds=600, exit_reserve_seconds=60,
                                                stage_timeout_seconds=60, startup_exit_seconds=300))
         self.save_target()
         repeat = lambda: self.request(label='render', expected_stage='Render')
@@ -395,7 +431,7 @@ class StaticCaptureTests(unittest.TestCase):
 
     def test_no_initial_request_is_bound_by_total_collection_and_cleanup_deadlines(self):
         self.target.update(capture_hold_seconds=600, run_timeout=900,
-                           static_capture=dict(hold_seconds=600, exit_reserve_seconds=60,
+                           static_capture=dict(ui_validation=True, hold_seconds=600, exit_reserve_seconds=60,
                                                stage_timeout_seconds=60, startup_exit_seconds=300))
         self.save_target()
         states = []
@@ -438,6 +474,7 @@ class StaticCaptureTests(unittest.TestCase):
 
     def enable_development(self, stages=None):
         self.target['static_capture']['dev_control'] = True
+        self.target['static_capture']['ui_validation'] = False
         if stages is not None:
             self.target['static_capture']['stages'] = stages
         self.save_target()
@@ -468,6 +505,22 @@ class StaticCaptureTests(unittest.TestCase):
         target = static_capture.prepare_target(source, self.root / 'dev-target.json', development_control=True)
         self.assertIs(target['static_capture']['dev_control'], True)
         self.assertEqual(source.read_bytes(), before)
+
+    def test_development_unavailable_fails_before_waiting_and_never_falls_back(self):
+        self.enable_development()
+        self.request(label='render', expected_stage='Render')
+        for unavailable in (TimeoutError('pipe absent'),
+                            dict(ok=False, status='rejected', state={}),
+                            dict(ok=True, status='observed', state=dict(available=False))):
+            with self.subTest(unavailable=unavailable):
+                self.client.status.side_effect = (unavailable if isinstance(unavailable, Exception)
+                                                   else lambda **kw: unavailable)
+                self.assert_failed('Development control unavailable')
+                (self.run / 'capture-failed.json').unlink()
+        self.client.set.assert_not_called()
+        self.desktop.capture.assert_not_called()
+        self.desktop.require_foreground.assert_not_called()
+        self.assertEqual(self.elapsed, 0)
 
     def test_prepared_copy_preserves_explicit_development_stages_from_source(self):
         stages = [dict(label=str(i), expected_stage='Render') for i in range(3)]

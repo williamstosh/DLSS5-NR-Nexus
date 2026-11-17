@@ -117,6 +117,15 @@ inline void ObservedTextWrapped(const char* fmt, ...) {
 }
 }  // namespace ImGui
 namespace native_window_fixture {
+#if defined(NR_NEXUS_DEV_CONTROL)
+inline DWORD foreground_process = GetCurrentProcessId();
+inline DWORD WINAPI WindowThreadProcessId(HWND, LPDWORD process) {
+  if (process != nullptr) {
+    *process = foreground_process;
+  }
+  return GetCurrentThreadId();
+}
+#endif
 inline BOOL WINAPI Show(HWND window, int command) {
   return ShowWindow(window, GetDlgItem(window, 1001) != nullptr ? SW_HIDE : command);
 }
@@ -137,9 +146,13 @@ inline BOOL WINAPI Foreground(HWND window) {
 #define SetClipboardData clipboard_fixture::Set
 #define ShowWindow native_window_fixture::Show
 #define SetForegroundWindow native_window_fixture::Foreground
+#if defined(NR_NEXUS_DEV_CONTROL)
+#define GetWindowThreadProcessId native_window_fixture::WindowThreadProcessId
+#endif
 #undef IMGUI_VERSION_NUM
 #include "ui/runtime_monitor.hpp"
 #include "dlssnr.hpp"
+#undef GetWindowThreadProcessId
 #undef ShowWindow
 #undef SetForegroundWindow
 #undef OpenClipboard

@@ -105,6 +105,44 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(confirmed['confirm'], dict(identity=response(initial)['identity'], changes={'NRPasses': 2}))
         self.assertEqual(self.transport.deadlines[-2], self.transport.deadlines[-1])
 
+    def test_reset_nr_has_no_setting_or_confirmation_parameters(self):
+        client = self.client()
+        deadline = time.monotonic() + 1
+        actual = client.reset_nr(deadline=deadline)
+        self.assertEqual(self.transport.requests, [dict(id=actual['id'], op='reset_nr')])
+        self.assertEqual(self.transport.deadlines, [deadline])
+        for arguments in ({'key': 'NeuralUplift'}, {'value': True}, {'confirm': True}, {'mode': 1}):
+            with self.subTest(arguments=arguments), self.assertRaises(TypeError):
+                client.reset_nr(**arguments)
+        with self.assertRaises(TypeError):
+            client.reset_nr(True)
+        self.assertEqual(len(self.transport.requests), 1)
+
+    def test_lost_reset_receipt_only_queries_the_original_request(self):
+        for recover in (True, False):
+            with self.subTest(recover=recover):
+                original = {}
+                def action(request):
+                    if request['op'] == 'reset_nr':
+                        original.update(request)
+                        raise OSError('synthetic reset response disconnect')
+                    result = response(request)
+                    result['receipt'] = dict(response(original), status='accepted') if recover else None
+                    return result
+                client = self.client(action)
+                deadline = time.monotonic() + 1
+                if recover:
+                    actual = client.reset_nr(deadline=deadline)
+                    self.assertEqual(actual['id'], original['id'])
+                    self.assertEqual(actual['status'], 'accepted')
+                else:
+                    with self.assertRaises(dev.OutcomeUnknown) as error:
+                        client.reset_nr(deadline=deadline)
+                    self.assertEqual(error.exception.request_id, original['id'])
+                self.assertEqual(self.transport.requests, [original,
+                    dict(id=self.transport.requests[-1]['id'], op='status', query_id=original['id'])])
+                self.assertEqual(self.transport.deadlines, [deadline, deadline])
+
     def test_adaptive_feature_experiment_has_a_dedicated_integer_request_and_shared_deadline(self):
         client = self.client()
         deadline = time.monotonic() + 1
@@ -377,6 +415,28 @@ class ClientTests(unittest.TestCase):
 
 
 class JournalCliTests(unittest.TestCase):
+    def test_reset_cli_uses_the_real_client_encoding_and_rejects_extra_parameters(self):
+        original_client = dev.Client
+        transport = Transport(lambda request: dict(response(request), status='accepted'))
+
+        def client(pid, created, **kwargs):
+            return original_client(pid, created, transport=transport, identity_probe=lambda _: '123', **kwargs)
+
+        base = ['dev_control.py', '--pid', '42', '--process-created', '123']
+        with mock.patch.object(sys, 'argv', base + ['reset-nr']), \
+                mock.patch.object(dev, 'Client', side_effect=client), mock.patch('builtins.print'):
+            self.assertEqual(dev.main(), 0)
+        self.assertEqual(transport.requests, [dict(id=transport.requests[0]['id'], op='reset_nr')])
+        transport.requests.clear()
+        for extra in (['NeuralUplift'], ['NeuralUplift', 'true'], [''], ['--confirm'],
+                      ['--query-id', 'original'], ['--tail-frames', '2']):
+            with self.subTest(extra=extra), mock.patch.object(sys, 'argv', base + ['reset-nr'] + extra), \
+                    mock.patch.object(dev, 'Client', side_effect=client), mock.patch.object(sys, 'stderr'), \
+                    self.assertRaises(SystemExit) as error:
+                dev.main()
+            self.assertEqual(error.exception.code, 2)
+        self.assertEqual(transport.requests, [])
+
     def observe_timeout(self, action, clock=None):
         original_client = dev.Client
         transport = Transport(action)
@@ -488,6 +548,19 @@ class NativeTransportMockTests(unittest.TestCase):
         self.assertEqual(native.output, struct.pack('<I', 2) + b'{}')
         self.assertEqual(native.open_flags, 0x40000000)
         self.assertIn(7, native.closed)
+
+    def test_reset_nr_encodes_one_parameterless_native_mutation(self):
+        reply = dict(id='reset-wire', ok=True, status='accepted', reason='nr_reset_requested',
+                     evidence='reset_requested_not_model_or_gpu_completion',
+                     configuration_generation_before=7, configuration_generation_after=8,
+                     state=dict(pid=42, process_created='123'))
+        native = FakeKernel(json.dumps(reply).encode())
+        client = dev.Client(42, '123', identity_probe=lambda _: '123')
+        with mock.patch.object(dev, '_kernel', return_value=native), \
+                mock.patch.object(dev.uuid, 'uuid4', return_value='reset-wire'):
+            self.assertEqual(client.reset_nr(), reply)
+        payload = b'{"id":"reset-wire","op":"reset_nr"}'
+        self.assertEqual(native.output, struct.pack('<I', len(payload)) + payload)
 
     def test_read_size_cap_and_wrong_server_pid_are_rejected(self):
         native = FakeKernel()

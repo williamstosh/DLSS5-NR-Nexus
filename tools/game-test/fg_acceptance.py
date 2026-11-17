@@ -12,6 +12,7 @@ import time
 
 import desktop
 from runner import ROOT, dump, stamp, local_output_root
+from static_capture import development_client
 
 
 def select_hdr_target(display, target):
@@ -96,19 +97,48 @@ def capture(run, nr_off_control=False, check_addon_menu=False):
             retained_overlays='NVIDIA and OptiScaler FPS per user'))
         if rejected:
             raise RuntimeError('Unexpected add-on or RTSS remains')
-        desktop.KEYS['F6'] = 0x40
-        stages = ([('hdr-control-nr-off', 30, None)] if nr_off_control else
-            [('hdr-nr-on', 15, 'off'), ('hdr-nr-off', 22, 'on'), ('hdr-nr-on-restored', 18, None)])
-        for label, seconds, next_state in stages:
+        def record(kind, **values):
+            events.append(dict(time=stamp(), action=kind, **values))
+
+        client = None
+        if not nr_off_control:
+            client = development_client(window, record)
+            try:
+                observed = client.status(deadline=time.monotonic() + 3)
+            except (OSError, TimeoutError) as error:
+                raise RuntimeError('Development control unavailable; NR comparison not executed') from error
+            snapshot = observed.get('state', {})
+            if (observed.get('ok') is not True or observed.get('status') != 'observed'
+                    or snapshot.get('available') is False
+                    or type(snapshot.get('settings', {}).get('NeuralUplift')) is not bool):
+                raise RuntimeError('Development control unavailable; NR comparison not executed')
+
+        stages = ([('hdr-control-nr-off', 30, False)] if nr_off_control else
+            [('hdr-nr-on', 15, True), ('hdr-nr-off', 22, False), ('hdr-nr-on-restored', 18, True)])
+        for label, seconds, target_state in stages:
+            if client:
+                if (not desktop.same_process(window)
+                        or desktop.u.GetForegroundWindow() != window['hwnd']):
+                    raise RuntimeError('Game identity changed or lost foreground before scripted NR setting')
+                deadline = time.monotonic() + 3
+                response = client.set('NeuralUplift', target_state, deadline=deadline)
+                if response.get('ok') is not True or response.get('status') not in ('applied', 'unchanged'):
+                    raise RuntimeError(f'Development NeuralUplift setting failed: {response.get("status")}')
+                if (response.get('state', {}).get('available') is not False
+                        and response.get('state', {}).get('settings', {}).get('NeuralUplift') is not target_state):
+                    raise RuntimeError('Development NeuralUplift receipt does not match requested state')
+                readback = client.status(deadline=deadline)
+                if (readback.get('ok') is not True or readback.get('status') != 'observed'
+                        or readback.get('state', {}).get('available') is False
+                        or readback.get('state', {}).get('settings', {}).get('NeuralUplift') is not target_state):
+                    raise RuntimeError('Development NeuralUplift readback does not match requested state')
+                record('dev_control_set', key='NeuralUplift', intended_state=target_state,
+                       response=response, readback=readback)
             time.sleep(seconds)
             if not desktop.same_process(window):
                 raise RuntimeError('Game identity changed; comparison stopped')
             desktop.capture(window, run / (label + '.png'), activate=False)
             events.append(dict(time=stamp(), action='capture', name=label))
-            if next_state:
-                game_input_attempted = True
-                desktop.key(window, 'F6', .25, activate=False)
-                events.append(dict(time=stamp(), action='F6', intended_state=next_state))
         if not nr_off_control:
             game_input_attempted = True
             desktop.key(window, 'D', .3, activate=False)
