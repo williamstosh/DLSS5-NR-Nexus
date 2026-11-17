@@ -183,6 +183,29 @@ int Run() {
         Check(stream.fence->GetCompletedValue() >= stream.submitted
                   && SUCCEEDED(gpu.device->GetDeviceRemovedReason()), "healthy XeFG service Fence");
       };
+      const auto read_buffer = [&](ID3D12Resource* resource) {
+        const auto bytes = static_cast<size_t>(resource->GetDesc().Width);
+        auto readback = gpu.Buffer(bytes, D3D12_HEAP_TYPE_READBACK);
+        gpu.Transition(resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        gpu.list->CopyBufferRegion(readback.Get(), 0, resource, 0, bytes);
+        gpu.Transition(resource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        gpu.Submit();
+        const D3D12_RANGE range{0, bytes};
+        uint8_t* mapped = nullptr;
+        Check(SUCCEEDED(readback->Map(0, &range, reinterpret_cast<void**>(&mapped))), "XeFG anchor readback map");
+        std::vector<uint8_t> pixels(mapped, mapped + bytes);
+        const D3D12_RANGE no_writes{0, 0};
+        readback->Unmap(0, &no_writes);
+        return pixels;
+      };
+      const auto read_output = [&](ID3D12Resource* backbuffer) {
+        auto readback = gpu.CreateTextureTransfer(backbuffer);
+        gpu.Transition(backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        gpu.RecordTextureReadback(backbuffer, readback);
+        gpu.Transition(backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+        gpu.Submit();
+        return gpu.ReadTexture(readback);
+      };
       std::vector<uint16_t> source(width * height * 4);
       std::vector<uint32_t> source_pq(width * height);
       // Independent double-precision ST.2084 and D65 primary transforms. These
@@ -284,12 +307,7 @@ int Run() {
         Observation observed{.result = xefg::CurrentResult(), .evaluates = model_calls - before_calls,
             .reuses = native::edit_reuse_reuses.load() - before_reuses,
             .reset = (model_calls != before_calls ? model_resets.back() : -1)};
-        auto readback = gpu.CreateTextureTransfer(backbuffer.Get());
-        gpu.Transition(backbuffer.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        gpu.RecordTextureReadback(backbuffer.Get(), readback);
-        gpu.Transition(backbuffer.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
-        gpu.Submit();
-        observed.pixels = gpu.ReadTexture(readback);
+        observed.pixels = read_output(backbuffer.Get());
         native::DrainRetiredResources(true);
         return observed;
       };
@@ -330,31 +348,108 @@ int Run() {
       Check(mature, "single Backbuffer XeFG cache submits a mock-model refresh");
       auto& stream = native::fg_service::streams.at({false, context});
       const auto owner = stream.roles[0].Handle();
-      Check(frame(true).evaluates == 1, "explicit XeFG Reset refreshes the mock NR model");
+      const auto reference_source_frame = source_frame;
+      std::array<Observation, 5> reference;
+      for (uint32_t index = 0; index < reference.size(); ++index) {
+        reference[index] = frame(index == 0);
+        Check(reference[index].result == fg::Result::SUBMITTED
+                  && reference[index].evaluates == (index % 2 == 0 ? 1u : 0u)
+                  && reference[index].reuses == (index % 2 == 0 ? 0u : 1u)
+                  && reference[index].reset == (index == 0 ? 1 : (index % 2 == 0 ? 0 : -1)),
+              "stable native Off establishes reference XeFG cadence 1/0/1/0/1");
+      }
+      // Replay only the deterministic input colors after the same Reset prefix;
+      // real present IDs and application frames remain strictly increasing.
+      source_frame = reference_source_frame;
+      const auto baseline = frame(true);
+      Check(baseline.evaluates == 1 && baseline.reuses == 0 && baseline.reset == 1,
+            "explicit XeFG Reset refreshes the mock NR model");
+      Check(baseline.pixels == reference[0].pixels, "matching Reset prefixes deliver identical XeFG reference RGBA");
       auto anchor = native::features.at(owner).slots[0].edit_reuse;
       Check(anchor != nullptr && anchor->valid, "XeFG single Backbuffer establishes an edit anchor");
-      const auto generation = anchor->anchor_generation;
-      const auto old_model_frame = stream.last_model_frame[0];
-      const auto application_frame = session.context->application_frame;
-      const auto before_duplicate_calls = model_calls;
-      const auto before_duplicate_reuses = native::edit_reuse_reuses.load();
-      const auto before_duplicate_submissions = stream.submitted;
-      session.Present(present_id);
-      Check(session.context->application_frame == application_frame && stream.application_frame == application_frame
-                && model_calls == before_duplicate_calls && native::edit_reuse_reuses.load() == before_duplicate_reuses
-                && stream.submitted == before_duplicate_submissions && anchor->anchor_generation == generation,
-            "same public presentID advances neither application cadence, model calls, reuse nor submission");
-      const auto reused = frame(false);
-      Check(reused.result == fg::Result::SUBMITTED && reused.evaluates == 0 && reused.reuses == 1,
-            "two XeFG base frames use one mock-model Evaluate");
-      Check(anchor == native::features.at(owner).slots[0].edit_reuse && anchor->anchor_generation == generation
-                && stream.last_model_frame[0] == old_model_frame
-                && stream.last_output_frame[0] == session.context->application_frame,
-            "reuse advances delivered source output while retaining the actual model frame and anchor");
+      const auto contract = anchor->contract;
+      const auto source_generation = native::features.at(owner).source_generation;
+      const auto model = native::features.at(owner).slots[0].handle;
+      const auto models = native::nr_features_created;
+      const auto worksets = native::worksets_created;
+      const auto reset_epoch = native::history_reset_epoch.load();
+      const auto configuration = native::configuration_generation.load();
+      const auto context_epoch = session.context->epoch;
+      auto generation = anchor->anchor_generation;
+      auto anchor_pixels = read_buffer(anchor->anchor.Get());
       if (pq) {
-        check_pq_output(reused, true);
-      } else {
-        Check(source_matches(reused.pixels), "neutral XeFG reuse returns this frame's new half-float color and alpha exactly");
+        check_pq_output(baseline, false);
+      }
+      const auto check_duplicate = [&](const Observation& observed) {
+        const auto application_frame = session.context->application_frame;
+        const auto calls = model_calls;
+        const auto reuses = native::edit_reuse_reuses.load();
+        const auto submissions = stream.submitted;
+        const auto sequence = anchor->source_sequence;
+        const auto reuse_count = anchor->reuse_count;
+        const auto model_frame = stream.last_model_frame[0];
+        const auto output_frame = stream.last_output_frame[0];
+        session.Present(present_id);
+        Check(session.context->application_frame == application_frame && stream.application_frame == application_frame
+                  && model_calls == calls && native::edit_reuse_reuses.load() == reuses && stream.submitted == submissions
+                  && anchor->anchor_generation == generation && anchor->source_sequence == sequence
+                  && anchor->reuse_count == reuse_count && stream.last_model_frame[0] == model_frame
+                  && stream.last_output_frame[0] == output_frame && read_buffer(anchor->anchor.Get()) == anchor_pixels,
+              "same public presentID advances neither application cadence, model, reuse, anchor nor service submission");
+        ComPtr<ID3D12Resource> current;
+        Check(SUCCEEDED(session.proxy->GetBuffer(session.proxy->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&current))),
+              "duplicate XeFG Present retains its actual proxy Backbuffer");
+        Check(read_output(current.Get()) == observed.pixels, "duplicate presentID preserves the already delivered RGBA output");
+      };
+      native::OnNativeFgOptions(true);
+      check_duplicate(baseline);
+      // XeFG owns the color source throughout; these actual native callbacks
+      // change only unrelated declarations and must not migrate its NR history.
+      for (uint32_t index = 1; index < 5; ++index) {
+        const bool native_on = index < 3;
+        native::OnNativeFgOptions(native_on);
+        const bool refresh = index % 2 == 0;
+        const auto old_model_frame = stream.last_model_frame[0];
+        const auto reuse_count = anchor->reuse_count;
+        const auto observed = frame(false);
+        std::cout << "OBS XeFG native-declaration format=" << (pq ? "PQ" : "scRGB")
+                  << " frame=" << index + 1 << " native=" << (native_on ? "On" : "Off")
+                  << " model_calls=" << observed.evaluates << " reuses=" << observed.reuses << '\n';
+        Check(observed.result == fg::Result::SUBMITTED && observed.evaluates == (refresh ? 1u : 0u)
+                  && observed.reuses == (refresh ? 0u : 1u) && observed.reset == (refresh ? 0 : -1),
+              "unrelated native Off/On/Off preserves XeFG model cadence 1/0/1/0/1 without extra Reset");
+        Check(!native::native_fg_owns.load() && xefg::Enabled() && xefg::OwnsStream()
+                  && native::native_fg_declaration.load() == (native_on ? native::NativeFgDeclaration::kOn
+                                                                        : native::NativeFgDeclaration::kOff)
+                  && session.context->epoch == context_epoch && stream.epoch == context_epoch
+                  && native::features.at(owner).source_generation == source_generation
+                  && native::features.at(owner).slots[0].handle == model
+                  && native::features.at(owner).slots[0].edit_reuse == anchor && anchor->contract == contract
+                  && native::history_reset_epoch.load() == reset_epoch && native::configuration_generation.load() == configuration
+                  && native::nr_features_created == models && native::worksets_created == worksets
+                  && !native::features.contains(stream.roles[1].Handle()),
+              "native declarations preserve XeFG source, role, contract, model, workset and actual ownership");
+        if (refresh) {
+          ++generation;
+          anchor_pixels = read_buffer(anchor->anchor.Get());
+          Check(stream.last_model_frame[0] == session.context->application_frame,
+                "XeFG model frame advances only on refresh");
+        } else {
+          Check(anchor->reuse_count == reuse_count + 1 && read_buffer(anchor->anchor.Get()) == anchor_pixels
+                    && stream.last_model_frame[0] == old_model_frame,
+                "native declaration changes preserve exact XeFG anchor bytes on reuse");
+        }
+        Check(anchor->valid && anchor->anchor_generation == generation
+                  && stream.last_output_frame[0] == session.context->application_frame,
+              "every new XeFG source delivers output while only refresh advances its anchor generation");
+        Check(observed.pixels == reference[index].pixels,
+              "native declaration changes preserve exact XeFG RGBA against the same stable-declaration input sequence");
+        if (pq) {
+          check_pq_output(observed, !refresh);
+        } else if (!refresh) {
+          Check(source_matches(observed.pixels), "native declaration changes preserve exact current scRGB color and alpha");
+        }
+        check_duplicate(observed);
       }
       ComPtr<ID3D12Resource> backbuffer;
       Check(SUCCEEDED(session.proxy->GetBuffer(session.proxy->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&backbuffer))),
@@ -363,12 +458,6 @@ int Run() {
         for (const auto& resource : binding.resources) {
           Check(resource.Get() != backbuffer.Get(), "cache bindings retain private current-original surfaces rather than DXGI Backbuffer");
         }
-      }
-      const auto refreshed = frame(false);
-      Check(refreshed.result == fg::Result::SUBMITTED && refreshed.evaluates == 1 && refreshed.reuses == 0
-                && refreshed.reset == 0, "third consecutive XeFG source refreshes without a false Reset after reuse");
-      if (pq) {
-        check_pq_output(refreshed, false);
       }
       Check(frame(false).reuses == 1, "XeFG can reuse the refreshed anchor exactly once");
       const auto reset = frame(true);
@@ -471,7 +560,8 @@ int Run() {
     std::cout << "PASS XeFG x2 single Backbuffer evidence=WARP+MOCK SR=MOCK NR=MOCK XeFG=MOCK"
                  " formats=scRGB/HDR10-PQ nonneutral_PQ=CPU_reference packed_RGBA=exact_on_rejection"
                  " depth=scRGB:R32_FLOAT/PQ:R32G8X24_TYPELESS_plane0"
-                 " source_updates=per_base_frame duplicate_present_id=stable refresh_reuse_refresh=1/0/1"
+                 " source_updates=per_base_frame native_declarations=Off/On/Off cadence=1/0/1/0/1"
+                 " duplicate_present_id=stable_RGBA/anchor/model/reuse/submission anchor_bytes=immutable_on_reuse"
                  " reset/guides/gap/failure/retirement=checked interpolation=not_executed\n";
     return 0;
   } catch (const std::exception& error) {
