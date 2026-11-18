@@ -1365,6 +1365,7 @@ inline void OnNativeFgFeatureReleased(const NVSDK_NGX_Handle* handle) {
 #if defined(NR_NEXUS_DEV_CONTROL)
   if (const auto source = created_feature_ids.find(handle);
       source != created_feature_ids.end() && source->second == NVSDK_NGX_Feature_FrameGeneration) {
+    native_ui_alpha_observation::EndScope("fg_handle_released");
     native_tag_source::Reset();
   }
 #endif

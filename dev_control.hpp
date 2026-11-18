@@ -481,6 +481,23 @@ inline Json Execute(const Json& request) {
   if (operation == request.end() || !operation->is_string()) {
     return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "invalid_operation"}};
   }
+  if (*operation == "native_ui_alpha_preflight") {
+    const auto action = request.find("action");
+    if (action == request.end() || !action->is_string()
+        || (*action != "arm" && *action != "status" && *action != "stop")) {
+      return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "invalid_action"}};
+    }
+    const bool nr_disabled = !enabled.load() && !shutting_down.load();
+    if (*action == "arm" && !nr_disabled) {
+      return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "requires_nr_disabled"}};
+    }
+    auto result = native_ui_alpha_observation::Control(action->get_ref<const std::string&>(), nr_disabled);
+    result["id"] = *id;
+    result["ok"] = true;
+    result["status"] = "observed";
+    result["state"] = ProcessIdentityState();
+    return result;
+  }
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
   const bool xefg_operation = *operation == "xefg_present_probe";
   const auto xefg_snapshot = [&]() {

@@ -129,6 +129,7 @@
 #include "control_mask_execution.hpp"
 #include "fg_xefg.hpp"
 #include "fg_native_options.hpp"
+#include "native_fg_ui_alpha_observation.hpp"
 #include "screenshot.hpp"
 #include "edit_trace.hpp"
 #include "gpu_timers.hpp"
@@ -20614,8 +20615,23 @@ inline void STDMETHODCALLTYPE HookedQueueExecuteCommandLists(
       pending_submissions = submission::BeginSubmission(count, command_lists);
     }
   });
+#if defined(NR_NEXUS_DEV_CONTROL)
+  const auto ui_alpha_generation = native_ui_alpha_observation::Active();
+  if (ui_alpha_generation != 0 && !enabled.load()) {
+    GuardHook([&] {
+      native_ui_alpha_observation::ObserveExecute(ui_alpha_generation, queue, count, command_lists, "entry");
+    });
+  }
+#endif
   const auto ordered = control_mask_execution::ExecuteOrdered(queue, count, command_lists,
       reinterpret_cast<QueueExecuteCommandListsFn>(real_queue_execute_command_lists));
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (ui_alpha_generation != 0 && !enabled.load()) {
+    GuardHook([&] {
+      native_ui_alpha_observation::ObserveExecute(ui_alpha_generation, queue, count, command_lists, "return");
+    });
+  }
+#endif
   if (ordered.unsafe_lists != 0
       && control_mask_order_failures.fetch_add(ordered.unsafe_lists, std::memory_order_relaxed) == 0) {
     Log(reshade::log::level::warning,
@@ -21247,6 +21263,68 @@ inline NVSDK_NGX_Result PassSourceOther(Real&& real) {
   return result;
 }
 
+#if defined(NR_NEXUS_DEV_CONTROL)
+// Caller holds runtime_mutex at the same input boundary as RunNativePreFg.
+// The observation is available with NR off and sees only the typed getters.
+inline native_ui_alpha_observation::ConsumerCall ObserveNativeUiAlphaInput(
+    ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle,
+    const NVSDK_NGX_Parameter* parameters, uint32_t slot) {
+  using namespace native_ui_alpha_observation;
+  const auto generation = Active();
+  if (generation == 0 || enabled.load() || parameters == nullptr) return {};
+  const auto created = created_feature_ids.find(handle);
+  if (created == created_feature_ids.end() || created->second != NVSDK_NGX_Feature_FrameGeneration) return {};
+  if (list != nullptr && InstallCommandListStateHooks(list)) {
+    auto* native = list;
+    const bool proxy = renodx::utils::directx::NativeFromReShadeProxy(&native);
+    if (proxy == cmd_hooks_on_reshade_proxy.load(std::memory_order_relaxed)) {
+      submission::RecordingIdentity(list);
+    }
+  }
+  const auto integer = [&](const char* key) -> Json {
+    uint32_t value = 0;
+    return GetUIntIfPresent(parameters, key, &value) ? Json(value) : Json(nullptr);
+  };
+  const auto real = [&](const char* key) -> Json {
+    float value = 0.f;
+    return GetFloatIfPresent(parameters, key, value) && std::isfinite(value) ? Json(value) : Json(nullptr);
+  };
+  const auto rect = [&](const char* x, const char* y, const char* width, const char* height) {
+    return Json::array({integer(x), integer(y), integer(width), integer(height)});
+  };
+  const auto ui_recomposition = native_fg_ui_recomposition.find(handle);
+  const auto& sdk = fg::native_options::frame_source::sdk_binding;
+  const auto sdk_frame = fg::native_options::CurrentFrame(sdk.output);
+  return {generation, Emit(generation, {
+      {"kind", "consumer"}, {"fg_handle", reinterpret_cast<uintptr_t>(handle)}, {"ngx_slot", slot},
+      {"recording", Recording(generation, list)}, {"sdk_scope_output", sdk.active ? sdk.output : 0},
+      {"sdk_scope_token", sdk_frame.available ? Json(sdk_frame.frame) : Json(nullptr)},
+      {"sdk_scope_reason", sdk_frame.reason},
+      {"bb", Resource(GetD3D12Resource(parameters, NVSDK_NGX_DLSSG_Parameter_Backbuffer))},
+      {"hudless", Resource(GetD3D12Resource(parameters, NVSDK_NGX_DLSSG_Parameter_HUDLess))},
+      {"ui", Resource(GetD3D12Resource(parameters, NVSDK_NGX_DLSSG_Parameter_UI))},
+      {"ui_alpha", Resource(GetD3D12Resource(parameters, NVSDK_NGX_DLSSG_Parameter_UIAlpha))},
+      {"depth", Resource(GetD3D12Resource(parameters, NVSDK_NGX_DLSSG_Parameter_Depth))},
+      {"motion", Resource(GetD3D12Resource(parameters, NVSDK_NGX_DLSSG_Parameter_MVecs))},
+      {"ui_recomposition", ui_recomposition == native_fg_ui_recomposition.end()
+          ? Json(nullptr) : Json(static_cast<uint32_t>(ui_recomposition->second))},
+      {"alpha_subrect", rect(NVSDK_NGX_DLSSG_Parameter_UIAlphaSubrectBaseX, NVSDK_NGX_DLSSG_Parameter_UIAlphaSubrectBaseY,
+           NVSDK_NGX_DLSSG_Parameter_UIAlphaSubrectWidth, NVSDK_NGX_DLSSG_Parameter_UIAlphaSubrectHeight)},
+      {"bb_subrect", rect(NVSDK_NGX_DLSSG_Parameter_BackbufferSubrectBaseX, NVSDK_NGX_DLSSG_Parameter_BackbufferSubrectBaseY,
+           NVSDK_NGX_DLSSG_Parameter_BackbufferSubrectWidth, NVSDK_NGX_DLSSG_Parameter_BackbufferSubrectHeight)},
+      {"depth_subrect", rect(NVSDK_NGX_DLSSG_Parameter_DepthSubrectBaseX, NVSDK_NGX_DLSSG_Parameter_DepthSubrectBaseY,
+           NVSDK_NGX_DLSSG_Parameter_DepthSubrectWidth, NVSDK_NGX_DLSSG_Parameter_DepthSubrectHeight)},
+      {"motion_subrect", rect(NVSDK_NGX_DLSSG_Parameter_MVecsSubrectBaseX, NVSDK_NGX_DLSSG_Parameter_MVecsSubrectBaseY,
+           NVSDK_NGX_DLSSG_Parameter_MVecsSubrectWidth, NVSDK_NGX_DLSSG_Parameter_MVecsSubrectHeight)},
+      {"jitter", Json::array({real(NVSDK_NGX_DLSSG_Parameter_JitterOffsetX), real(NVSDK_NGX_DLSSG_Parameter_JitterOffsetY)})},
+      {"motion_scale", Json::array({real(NVSDK_NGX_DLSSG_Parameter_MvecScaleX), real(NVSDK_NGX_DLSSG_Parameter_MvecScaleY)})},
+      {"mfg_index", integer(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex)},
+      {"no_game_frame", integer(NVSDK_NGX_DLSSG_Parameter_NotRenderingGameFrames)},
+      {"evidence", "typed_CPU_arguments_before_NR"}}, true)};
+}
+
+#endif
+
 template <int Slot>
 inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
     ID3D12GraphicsCommandList* command_list,
@@ -21356,6 +21434,9 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
   bool prefg_backbuffer_replaced = false;
   bool prefg_owner = false;
   bool frame_generation = false;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  native_ui_alpha_observation::ConsumerCall ui_alpha_call;
+#endif
   if (!nested_in_c_wrapper && !InsideDirectCall()) {
 #if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
     ColdCpuTraceScope lock_trace("runtime_mutex.acquire.pre_source");
@@ -21381,6 +21462,11 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
     frame_generation =
         handle != nullptr && FrameGenerationEvaluate(handle, parameters);
     if (frame_generation) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+      if (source_scope.owner && native_ui_alpha_observation::Active() != 0) {
+        GuardHook([&] { ui_alpha_call = ObserveNativeUiAlphaInput(command_list, handle, parameters, Slot); });
+      }
+#endif
       mixed_present_fg_seen.store(true);
       ObservePresentFrameGeneration(parameters);
       // Streamline applies options at a later application Present. A valid
@@ -21464,6 +21550,9 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
     const auto result = real(command_list, handle, parameters, callback);
 #if defined(NR_NEXUS_DEV_CONTROL)
     evaluate_observation.Finish(static_cast<uint32_t>(result));
+    if (ui_alpha_call.entry != 0) {
+      GuardHook([&] { ui_alpha_call.Finish(static_cast<uint32_t>(result)); });
+    }
     if (edit_fg_ticket.call_id != 0) {
       const auto edit_fg_return_ns = edit_fg_observation::NowNs();
       edit_fg_observation::RecordResult(edit_fg_ticket, static_cast<uint32_t>(result), edit_fg_return_ns);
@@ -21662,6 +21751,9 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
   bool prefg_backbuffer_replaced = false;
   bool prefg_owner = false;
   bool frame_generation = false;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  native_ui_alpha_observation::ConsumerCall ui_alpha_call;
+#endif
   if (!InsideDirectCall()) {
     RuntimeLock lock(runtime_mutex);
     if (source_scope.owner) {
@@ -21680,6 +21772,11 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
     frame_generation =
         handle != nullptr && FrameGenerationEvaluate(handle, parameters);
     if (frame_generation) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+      if (source_scope.owner && native_ui_alpha_observation::Active() != 0) {
+        GuardHook([&] { ui_alpha_call = ObserveNativeUiAlphaInput(command_list, handle, parameters, Slot); });
+      }
+#endif
       mixed_present_fg_seen.store(true);
       ObservePresentFrameGeneration(parameters);
       // Streamline applies options at a later application Present. A valid
@@ -21748,6 +21845,9 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
         reinterpret_cast<uintptr_t>(handle), reinterpret_cast<uintptr_t>(command_list));
     const auto result = real(command_list, handle, parameters, callback);
     evaluate_observation.Finish(static_cast<uint32_t>(result));
+    if (ui_alpha_call.entry != 0) {
+      GuardHook([&] { ui_alpha_call.Finish(static_cast<uint32_t>(result)); });
+    }
     if (edit_fg_ticket.call_id != 0) {
       const auto edit_fg_return_ns = edit_fg_observation::NowNs();
       edit_fg_observation::RecordResult(edit_fg_ticket, static_cast<uint32_t>(result), edit_fg_return_ns);
@@ -22838,7 +22938,20 @@ inline sl::Result HookedStreamlineSetTag(
     }
 #endif
   }
-  return real_streamline_set_tag(viewport, tags, num_tags, command_buffer);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  const auto generation = native_ui_alpha_observation::Active();
+#endif
+  const auto result = real_streamline_set_tag(viewport, tags, num_tags, command_buffer);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (generation != 0 && !enabled.load()) {
+    GuardHook([&] {
+      native_ui_alpha_observation::Emit(generation, {{"kind", "legacy_tag"},
+          {"viewport", static_cast<uint32_t>(viewport)}, {"original_count", num_tags},
+          {"result", static_cast<int32_t>(result)}, {"evidence", "tokenless_tag_CPU_return"}});
+    });
+  }
+#endif
+  return result;
 }
 
 #if defined(NR_NEXUS_DEV_CONTROL)
@@ -22906,6 +23019,60 @@ inline sl::Result HookedStreamlineSetTagForFrame(
       nullptr, [](ID3D12GraphicsCommandList* list) { if (list != nullptr) list->Release(); });
   std::optional<native_tag_source::Scope> tag_source;
   native_tag_source::PremiseHooks premise_hooks;
+  using UiAlphaCopy = native_ui_alpha_observation::TagCopy;
+  UiAlphaCopy ui_alpha_copy;
+  native_ui_alpha_observation::Json ui_alpha_tags;
+  auto ui_alpha_generation = native_ui_alpha_observation::Active();
+  if (ui_alpha_generation != 0 && enabled.load()) ui_alpha_generation = 0;
+  bool ui_alpha_hooks_ready = false;
+  bool ui_alpha_tags_incomplete = num_tags > 16;
+  if (ui_alpha_generation != 0 && tags != nullptr) {
+    GuardHook([&] {
+      using namespace native_ui_alpha_observation;
+      uint32_t alpha_tags = 0;
+      for (uint32_t i = 0; i < num_tags && i < 16; ++i) {
+        const auto& tag = tags[i];
+        ui_alpha_tags_incomplete |= tag.next != nullptr;
+        const char* role = nullptr;
+        switch (tag.type) {
+          case sl::kBufferTypeBackbuffer: role = "bb"; break;
+          case sl::kBufferTypeHUDLessColor: role = "hudless"; break;
+          case sl::kBufferTypeUIAlpha: role = "ui_alpha"; break;
+          case sl::kBufferTypeUIColorAndAlpha: role = "ui"; break;
+          case sl::kBufferTypeDepth: role = "depth"; break;
+          case sl::kBufferTypeMotionVectors: role = "motion"; break;
+          default: continue;
+        }
+        const auto ref = ToStreamlineResourceRef(tag);
+        ui_alpha_tags.push_back({{"role", role}, {"resource", Resource(ref.resource)},
+            {"lifetime", static_cast<uint32_t>(tag.lifecycle)}, {"declared_state", ref.state},
+            {"extent", {ref.extent.left, ref.extent.top, ref.extent.width, ref.extent.height}}});
+        if (tag.type != sl::kBufferTypeUIAlpha) continue;
+        ++alpha_tags;
+        if (ref.resource == nullptr || (tag.lifecycle != sl::ResourceLifecycle::eOnlyValidNow
+            && tag.lifecycle != sl::ResourceLifecycle::eValidUntilEvaluate)) continue;
+        const auto desc = ref.resource->GetDesc();
+        if (ref.extent.left == 0 && ref.extent.top == 0
+            && ref.extent.width == desc.Width && ref.extent.height == desc.Height) {
+          ui_alpha_copy.source = renodx::utils::directx::NativeIdentity(ref.resource);
+        }
+      }
+      if (alpha_tags != 1 || ui_alpha_tags_incomplete) ui_alpha_copy.source = nullptr;
+      if (ui_alpha_copy.source != nullptr) {
+        tag_list.reset(NativeStreamlineTagList(command_buffer));
+        ui_alpha_copy.list = tag_list.get();
+        if (ui_alpha_copy.list != nullptr) {
+          RuntimeLock lock(runtime_mutex);
+          ui_alpha_hooks_ready = InstallMixedPresentCopyHooks(ui_alpha_copy.list, true);
+          if (ui_alpha_hooks_ready && InstallCommandListStateHooks(ui_alpha_copy.list)
+              && !cmd_hooks_on_reshade_proxy.load(std::memory_order_relaxed)) {
+            ui_alpha_copy.recording = submission::RecordingIdentity(ui_alpha_copy.list);
+            if ((ui_alpha_copy.recording.first >> 63) != 0) ui_alpha_copy.recording = {};
+          }
+        }
+      }
+    });
+  }
   const bool has_hudless_tag = tags != nullptr && std::any_of(tags, tags + num_tags,
       [](const sl::ResourceTag& tag) { return tag.type == sl::kBufferTypeHUDLessColor; });
   const bool has_direct_hudless = tags != nullptr && std::any_of(tags, tags + num_tags,
@@ -22930,8 +23097,31 @@ inline sl::Result HookedStreamlineSetTagForFrame(
       tag_source.emplace(tag_list.get(), static_cast<uint32_t>(frame), static_cast<uint32_t>(viewport), tags, num_tags, premise_hooks);
     }
   }
-  const auto result = real_streamline_set_tag_for_frame(frame, viewport, tags, num_tags, command_buffer);
+  const auto result = [&] {
+    const native_ui_alpha_observation::CopyScope scope(ui_alpha_hooks_ready ? &ui_alpha_copy : nullptr);
+    return real_streamline_set_tag_for_frame(frame, viewport, tags, num_tags, command_buffer);
+  }();
   if (tag_source) tag_source->Finish(result == sl::Result::eOk);
+  if (!ui_alpha_tags.empty() || (ui_alpha_generation != 0 && num_tags > 16)) {
+    GuardHook([&] {
+      using namespace native_ui_alpha_observation;
+      const bool success = result == sl::Result::eOk;
+      Json copy;
+      if (success && ui_alpha_copy.eligible
+          && submission::RecordingIdentity(ui_alpha_copy.list) == ui_alpha_copy.recording) {
+        copy = {{"source", reinterpret_cast<uintptr_t>(ui_alpha_copy.source)},
+            {"destination", ui_alpha_copy.destination}, {"subresource", 0},
+            {"recording", Recording(ui_alpha_generation, ui_alpha_copy.list)}};
+      }
+      Emit(ui_alpha_generation, {{"kind", success ? "tag" : "tag_failed"},
+          {"token", static_cast<uint32_t>(frame)}, {"viewport", static_cast<uint32_t>(viewport)},
+          {"tag_gateway", reinterpret_cast<uintptr_t>(real_streamline_set_tag_for_frame)},
+          {"original_count", num_tags}, {"tag_inventory_incomplete", ui_alpha_tags_incomplete},
+          {"roles", std::move(ui_alpha_tags)}, {"copy_hook_available", ui_alpha_hooks_ready},
+          {"matching_copy_calls", ui_alpha_copy.matches}, {"native_copy", std::move(copy)},
+          {"result", static_cast<int32_t>(result)}, {"evidence", "recorded_CPU_arguments_only"}});
+    });
+  }
   return result;
 #else
   return real_streamline_set_tag_for_frame(
@@ -33780,6 +33970,7 @@ inline void OnDestroyDevice(reshade::api::device* device) {
 // a field log would show it by.
 inline void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) {
 #if defined(NR_NEXUS_DEV_CONTROL)
+  native_ui_alpha_observation::EndScope("swapchain_lifecycle_changed");
   fg::xefg::ForgetBridgeSourceSwapchain(reinterpret_cast<uintptr_t>(swapchain));
 #endif
   if (swapchain != nullptr) {

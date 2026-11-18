@@ -11,6 +11,7 @@
 #include <exception>
 #include <iostream>
 #include <memory>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -714,6 +715,185 @@ int Run() {
       tag_source::Reset();
     }
     recover(TagCopy::DIRECT);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    {
+      using Json = native::dev_control::Json;
+      const auto control = [](const char* action) {
+        return native::dev_control::Execute(
+            {{"id", "warp-ui-alpha"}, {"op", "native_ui_alpha_preflight"}, {"action", action}});
+      };
+      const auto events_since = [](size_t start) {
+        constexpr std::string_view prefix = "NR_UIALPHA ";
+        std::vector<Json> events;
+        for (size_t i = start; i < captured_logs.size(); ++i) {
+          const std::string_view message = captured_logs[i].second;
+          if (message.starts_with(prefix)) events.push_back(Json::parse(message.substr(prefix.size())));
+        }
+        return events;
+      };
+      auto alpha = gpu.Texture(width, height, DXGI_FORMAT_R8_UNORM);
+      auto alpha_clone = gpu.Texture(width, height, DXGI_FORMAT_R8_UNORM, NATIVE_INPUT_STATE);
+      const std::vector<uint8_t> alpha_pixels(width * height, 0x93);
+      upload(alpha.Get(), alpha_pixels, D3D12_RESOURCE_STATE_COMMON);
+      const auto alpha_identity = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(alpha.Get()));
+      const auto clone_identity = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(alpha_clone.Get()));
+
+      struct TagRequest {
+        uint32_t copies = 0;
+        bool partial = false;
+        sl::Result result = sl::Result::eOk;
+      } sdk_request;
+      constexpr uint32_t alpha_viewport = 17;
+      uint32_t events_before_tag = 0;
+      uint32_t forwarded_tags = 0;
+      const auto sdk_tag = [&](const sl::FrameToken& frame, const sl::ViewportHandle& viewport,
+                               const sl::ResourceTag* tags, uint32_t count, sl::CommandBuffer* command_buffer) {
+        Check(static_cast<uint32_t>(frame) == token && static_cast<uint32_t>(viewport) == alpha_viewport
+                && count == 1 && tags != nullptr && tags[0].type == sl::kBufferTypeUIAlpha
+                && tags[0].resource != nullptr && tags[0].resource->native == alpha.Get()
+                && command_buffer == gpu.list.Get(),
+            "original SL tag receives the unmodified R8 resource and list");
+        auto* list = static_cast<ID3D12GraphicsCommandList*>(command_buffer);
+        for (uint32_t copy = 0; copy < sdk_request.copies; ++copy) {
+          gpu.Transition(alpha.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+          gpu.Transition(alpha_clone.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_DEST);
+          if (sdk_request.partial) {
+            const D3D12_TEXTURE_COPY_LOCATION from{.pResource = alpha.Get(), .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            const D3D12_TEXTURE_COPY_LOCATION to{.pResource = alpha_clone.Get(), .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            const D3D12_BOX box{0, 0, 0, width - 1, height, 1};
+            list->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
+          } else {
+            list->CopyResource(alpha_clone.Get(), alpha.Get());
+          }
+          gpu.Transition(alpha_clone.Get(), D3D12_RESOURCE_STATE_COPY_DEST, NATIVE_INPUT_STATE);
+          gpu.Transition(alpha.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, NATIVE_INPUT_STATE);
+        }
+        Check(control("status").at("events") == events_before_tag, "Alpha tag stays unpublished inside original SL call");
+        ++forwarded_tags;
+        return sdk_request.result;
+      };
+
+      auto preflight_parameters = parameters;
+      ID3D12Resource* expected_alpha = nullptr;
+      const auto check_parameters = [&](const NVSDK_NGX_Parameter* block) {
+        Check(block == &preflight_parameters
+                && native::GetD3D12Resource(block, NVSDK_NGX_DLSSG_Parameter_UIAlpha) == expected_alpha
+                && native::GetD3D12Resource(block, NVSDK_NGX_DLSSG_Parameter_UI) == nullptr
+                && native::GetD3D12Resource(block, NVSDK_NGX_DLSSG_Parameter_Backbuffer) == backbuffer.Get()
+                && native::GetD3D12Resource(block, NVSDK_NGX_DLSSG_Parameter_HUDLess) == hudless.Get()
+                && native::GetD3D12Resource(block, NVSDK_NGX_DLSSG_Parameter_Depth) == depth.Get()
+                && native::GetD3D12Resource(block, NVSDK_NGX_DLSSG_Parameter_MVecs) == motion.Get(),
+            "Alpha preflight preserves the original NGX block and typed input roles");
+      };
+      uint32_t forwarded_evaluates = 0;
+      const auto sdk_evaluate = [&](ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* feature,
+                                    const NVSDK_NGX_Parameter* block) {
+        Check(list == gpu.list.Get() && feature == handle, "original NGX receives the same FG handle and recording");
+        check_parameters(block);
+        ++forwarded_evaluates;
+        return NVSDK_NGX_Result_Success;
+      };
+      static thread_local decltype(sdk_tag)* original_tag = nullptr;
+      static thread_local decltype(sdk_evaluate)* original_evaluate = nullptr;
+      funnel_accounting_tests::Restore substitutions;
+      substitutions.Value(&original_tag);
+      substitutions.Value(&original_evaluate);
+      substitutions.Value(&native::real_streamline_set_tag_for_frame);
+      substitutions.Value(&native::ngx_slot_real[0].evaluate);
+      substitutions.Atomic(&native::enabled);
+      substitutions.Atomic(&native::last_present_steady_ns);
+      substitutions.actions.emplace_back([&] {
+        const addon::RuntimeLock lock(native::runtime_mutex);
+        native::streamline_viewports.erase(alpha_viewport);
+      });
+      original_tag = &sdk_tag;
+      original_evaluate = &sdk_evaluate;
+      native::real_streamline_set_tag_for_frame = +[](const sl::FrameToken& frame, const sl::ViewportHandle& viewport,
+          const sl::ResourceTag* tags, uint32_t count, sl::CommandBuffer* command_buffer) {
+        return (*original_tag)(frame, viewport, tags, count, command_buffer);
+      };
+      native::ngx_slot_real[0].evaluate = reinterpret_cast<void*>(+[](ID3D12GraphicsCommandList* list,
+          const NVSDK_NGX_Handle* feature, const NVSDK_NGX_Parameter* block, PFN_NVSDK_NGX_ProgressCallback) {
+        return (*original_evaluate)(list, feature, block);
+      });
+      native::enabled = false;
+      native::last_present_steady_ns = native::SteadyNowNs();
+      const auto armed = control("arm");
+      Check(armed.at("ok") == true && armed.at("active") == true, "public control arms NR-off Alpha preflight");
+      const auto before_model_calls = model_calls;
+
+      const auto run_tag = [&](TagRequest request) {
+        sdk_request = request;
+        FakeFrameToken frame;
+        frame.frame = ++token;
+        const auto lifetime = (request.copies == 0 ? sl::ResourceLifecycle::eValidUntilPresent : sl::ResourceLifecycle::eOnlyValidNow);
+        sl::Resource resource(sl::ResourceType::eTex2d, alpha.Get(), NATIVE_INPUT_STATE);
+        const sl::ResourceTag tag(&resource, sl::kBufferTypeUIAlpha, lifetime);
+        events_before_tag = control("status").at("events").get<uint32_t>();
+        const auto start = captured_logs.size();
+        Check(native::HookedStreamlineSetTagForFrame(frame, sl::ViewportHandle(alpha_viewport), &tag, 1, gpu.list.Get())
+                  == request.result,
+            "UIAlpha tag wrapper preserves the original SDK result");
+        const auto events = events_since(start);
+        Check(events.size() == 1, "UIAlpha tag emits one observation after the SDK return");
+        const auto& event = events.front();
+        const auto& role = event.at("roles").at(0);
+        const bool success = request.result == sl::Result::eOk;
+        Check(event.at("token") == frame.frame && event.at("generation") == armed.at("generation")
+                && event.at("kind") == (success ? "tag" : "tag_failed")
+                && event.at("result") == static_cast<int32_t>(request.result)
+                && event.at("matching_copy_calls") == request.copies
+                && event.at("evidence") == "recorded_CPU_arguments_only"
+                && role.at("role") == "ui_alpha" && role.at("lifetime") == static_cast<uint32_t>(lifetime)
+                && role.at("resource").at("identity") == alpha_identity,
+            "UIAlpha tag preserves the token, original texture and CPU metadata");
+        const auto& copy = event.at("native_copy");
+        if (success && request.copies == 1 && !request.partial) {
+          const auto recording = addon::submission::RecordingIdentity(gpu.list.Get());
+          Check(copy.at("source") == alpha_identity && copy.at("destination") == clone_identity
+                  && copy.at("subresource") == 0 && copy.at("recording").at("id") == recording.first
+                  && copy.at("recording").at("generation") == recording.second,
+              "successful unique full R8 copy records the actual source, destination and list generation");
+        } else {
+          Check(copy.is_null(), "duplicate, partial, failed and direct tags publish no copy version");
+        }
+      };
+      const auto consume_alpha = [&](ID3D12Resource* resource, uintptr_t identity) {
+        expected_alpha = resource;
+        preflight_parameters.Set(NVSDK_NGX_DLSSG_Parameter_UIAlpha, resource);
+        const auto start = captured_logs.size();
+        Check(native::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), handle, &preflight_parameters, nullptr)
+                  == NVSDK_NGX_Result_Success,
+            "UIAlpha preflight forwards the original NGX result");
+        check_parameters(&preflight_parameters);
+        const auto events = events_since(start);
+        Check(events.size() == 2 && events[0].at("kind") == "consumer"
+                && events[0].at("ui_alpha").at("identity") == identity
+                && events[0].at("ui_alpha").at("format") == static_cast<uint32_t>(DXGI_FORMAT_R8_UNORM)
+                && events[0].at("sdk_scope_token").is_null()
+                && events[1].at("kind") == "consumer_return" && events[1].at("entry") == events[0].at("sequence"),
+            "NGX records the original typed R8 input without assigning a token outside SDK scope");
+      };
+
+      run_tag({.copies = 1});
+      consume_alpha(alpha_clone.Get(), clone_identity);
+      const auto cloned_pixels = Capture(gpu, alpha_clone.Get(), NATIVE_INPUT_STATE);
+      run_tag({.copies = 2});
+      run_tag({.copies = 1, .partial = true});
+      run_tag({.copies = 1, .result = sl::Result::eErrorComputeFailed});
+      run_tag({});
+      run_tag({});
+      consume_alpha(alpha.Get(), alpha_identity);
+      const auto stopped = control("stop");
+      Check(stopped.at("ok") == true && stopped.at("active") == false && stopped.at("consumer_calls") == 2
+              && forwarded_tags == 6 && forwarded_evaluates == 2 && model_calls == before_model_calls,
+          "UIAlpha preflight is bounded and never invokes NR");
+      submit();
+      Check(cloned_pixels.Pixels() == alpha_pixels, "the original full R8 copy completes on WARP");
+      std::cout << "PASS native UIAlpha preflight evidence=WARP+MOCK_SDK full_R8_readback=checked"
+                   " copy_publication=checked direct_two_tokens=metadata_only NGX_parameters=unchanged\n";
+    }
+#endif
     auto final_anchor = native::features.at(role_handle).slots[0].edit_reuse;
     Check(final_anchor != nullptr, "recovered native output owns its final private cache");
     std::weak_ptr<addon::edit_reuse::State> retired_anchor = final_anchor;

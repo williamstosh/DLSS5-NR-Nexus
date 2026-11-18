@@ -1145,7 +1145,7 @@ inline void PreservePresentCaptureProof(
 // The legacy barrier and full-copy observers are defined with the existing
 // copy Detours, after the guide and stream storage they update.
 inline bool InstallPresentSourceHooks(ID3D12GraphicsCommandList* list);
-inline bool InstallMixedPresentCopyHooks(ID3D12GraphicsCommandList* list);
+inline bool InstallMixedPresentCopyHooks(ID3D12GraphicsCommandList* list, bool ui_alpha_only = false);
 
 inline void CapturePresentGuides(
     ID3D12GraphicsCommandList* command_list,
@@ -3144,6 +3144,7 @@ inline std::shared_mutex mixed_copy_hook_mutex;
 inline bool mixed_copy_hooks_installed = false;
 
 #if defined(NR_NEXUS_DEV_CONTROL)
+inline std::atomic_bool ui_alpha_only_copy_hooks = false;
 using NativePremiseBarrierFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
 using NativePremiseEnhancedFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList7*, UINT32, const D3D12_BARRIER_GROUP*);
 inline NativePremiseBarrierFn real_premise_barrier = nullptr;
@@ -3277,6 +3278,10 @@ inline void STDMETHODCALLTYPE HookedMixedCopyResource(ID3D12GraphicsCommandList*
   CallbackScope callback;
   if (callback) GuardHook([&] { ObservePresentSourceCopy(list, source, destination, true); });
 #if defined(NR_NEXUS_DEV_CONTROL)
+  if (auto* tag = native_ui_alpha_observation::TagCopy::active) {
+    GuardHook([&] { tag->Record(list, source, destination, true); });
+  }
+  if (ui_alpha_only_copy_hooks.load(std::memory_order_relaxed)) return;
   GuardHook([&] { native_tag_source::ObservePremiseCopy(list, source, destination, true); });
   GuardHook([&] { native_tag_source::ObserveCopy(list, source, destination, true); });
 #endif
@@ -3295,14 +3300,23 @@ inline void STDMETHODCALLTYPE HookedMixedCopyRegion(ID3D12GraphicsCommandList* l
   CallbackScope callback;
   if (callback) GuardHook([&] { ObservePresentSourceCopy(list, source->pResource, destination->pResource, full); });
 #if defined(NR_NEXUS_DEV_CONTROL)
+  if (auto* tag = native_ui_alpha_observation::TagCopy::active) {
+    GuardHook([&] { tag->Record(list, source->pResource, destination->pResource, full); });
+  }
+  if (ui_alpha_only_copy_hooks.load(std::memory_order_relaxed)) return;
   GuardHook([&] { native_tag_source::ObservePremiseCopy(list, source->pResource, destination->pResource, false); });
   GuardHook([&] { native_tag_source::ObserveCopy(list, source->pResource, destination->pResource, full); });
 #endif
   GuardHook([&] { ObserveMixedPresentCopy(list, source->pResource, destination->pResource, full); });
 }
-inline bool InstallMixedPresentCopyHooks(ID3D12GraphicsCommandList* list) {
+inline bool InstallMixedPresentCopyHooks(ID3D12GraphicsCommandList* list, [[maybe_unused]] bool ui_alpha_only) {
   std::lock_guard lock(mixed_copy_hook_mutex);
-  if (mixed_copy_hooks_installed) return true;
+  if (mixed_copy_hooks_installed) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (!ui_alpha_only) ui_alpha_only_copy_hooks.store(false, std::memory_order_relaxed);
+#endif
+    return true;
+  }
   renodx::utils::directx::NativeFromReShadeProxy(&list);
   auto** table = *reinterpret_cast<void***>(list);
   real_mixed_copy_resource = reinterpret_cast<MixedCopyResourceFn>(table[kCmdSlotCopyResource]);
@@ -3315,6 +3329,11 @@ inline bool InstallMixedPresentCopyHooks(ID3D12GraphicsCommandList* list) {
     DetourTransactionAbort();
     return false;
   }
+#if defined(NR_NEXUS_DEV_CONTROL)
+  // Attaching for the bounded tag probe must not activate the old tag observer
+  // on unrelated copies. Its normal callers can enable that observer later.
+  ui_alpha_only_copy_hooks.store(ui_alpha_only, std::memory_order_relaxed);
+#endif
   mixed_copy_hooks_installed = DetourTransactionCommit() == NO_ERROR;
   return mixed_copy_hooks_installed;
 }
@@ -3333,7 +3352,12 @@ inline void UnhookMixedPresentCopyHooks() {
     DetourTransactionAbort();
     return;
   }
-  if (DetourTransactionCommit() == NO_ERROR) mixed_copy_hooks_installed = false;
+  if (DetourTransactionCommit() == NO_ERROR) {
+    mixed_copy_hooks_installed = false;
+#if defined(NR_NEXUS_DEV_CONTROL)
+    ui_alpha_only_copy_hooks.store(false, std::memory_order_relaxed);
+#endif
+  }
 }
 
 // Retain only the latest completed copy submission and reject any other
@@ -4738,6 +4762,16 @@ inline void RunPresentPath(
 inline void OnNativePresentObserved(IDXGISwapChain* swapchain, UINT flags,
                                     fg::native_options::PresentPhase phase) noexcept {
   if ((flags & DXGI_PRESENT_TEST) != 0) return;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (const auto generation = native_ui_alpha_observation::Active(); generation != 0 && !enabled.load()) {
+    GuardHook([&] {
+      const auto identity = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(swapchain));
+      native_ui_alpha_observation::Emit(generation, {{"kind", "sdk_present"},
+          {"phase", static_cast<uint32_t>(phase)}, {"sdk_scope_output", identity},
+          {"evidence", "CPU_Present_only"}});
+    });
+  }
+#endif
   if (phase == fg::native_options::PresentPhase::SDK_BEGIN) {
     native_passthrough_identity = nullptr;
     native_passthrough_input = {};
