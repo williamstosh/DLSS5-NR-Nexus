@@ -272,6 +272,60 @@ int Run() {
           "RG32 composed motion retains finite 80000 raw units for an in-bounds 0.8-pixel displacement");
     std::cout << "PASS edit reuse WARP shader: untouched refresh validity, full sentinel overwrite, known edit, scaled reprojection, edge/depth/color rejection, neutral exact RGBA\n";
 
+    // A fractional shift over texture detail can match the warped reference
+    // exactly while differing from every individual tap.
+    std::fill(depth_values.begin(), depth_values.end(), .5f);
+    for (size_t pixel = 0; pixel < motion_values.size() / 2; ++pixel) {
+      motion_values[pixel * 2] = -.25f;
+    }
+    for (uint32_t pixel = 0; pixel < width * height; ++pixel) {
+      const float source_luminance = (pixel % width % 2 == 0 ? .125f : .5f);
+      for (uint32_t channel = 0; channel < 3; ++channel) {
+        proxy_values[pixel * 4 + channel] = encode(source_luminance);
+        neural_values[pixel * 4 + channel] = encode(1.5f * source_luminance);
+      }
+    }
+    upload(depth.Get(), depth_values, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, guide_width * 4);
+    upload(proxy.Get(), proxy_values, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, width * 16);
+    upload(neural.Get(), neural_values, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, width * 16);
+    Check(reuse::Record(gpu.device.Get(), gpu.list.Get(), &state, inputs, reuse::Phase::CAPTURE),
+          "capture an edited texture before a half-pixel shift");
+    const float warped_reference = .3125f;
+    const float half_confidence_ratio = .5f * (std::exp2(-.125f) + std::exp2(-.375f));
+    const float lighter = warped_reference / half_confidence_ratio;
+    const float darker = warped_reference * half_confidence_ratio;
+    for (uint32_t pixel = 0; pixel < width * height; ++pixel) {
+      for (uint32_t channel = 0; channel < 3; ++channel) {
+        float current = warped_reference;
+        if (pixel == 4) current = .75f;
+        if (pixel == 5) current = lighter;
+        if (pixel == 6) current = darker;
+        if (pixel == 7 && channel == 0) current *= std::exp2(.38f);
+        proxy_values[pixel * 4 + channel] = encode(current);
+      }
+    }
+    depth_values[guide_width + 2] = .9f;
+    upload(depth.Get(), depth_values, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, guide_width * 4);
+    upload(proxy.Get(), proxy_values, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, width * 16);
+    upload(motion.Get(), motion_values, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, guide_width * 8);
+    planes = apply();
+    std::array<float, 4> shifted_edit{};
+    std::memcpy(shifted_edit.data(), planes.first.data() + 2 * 16, 16);
+    Check(std::fabs(shifted_edit[0] - encode(1.5f * warped_reference)) < 3e-5f
+              && shifted_edit[3] == .375f,
+          "the matching bilinear color of translated detail keeps its edit and current alpha");
+    for (const size_t rejected : {size_t{4}, size_t{7}, size_t{2 * width + 4}}) {
+      Check(std::memcmp(planes.second.data() + rejected * 16, original_values.data() + rejected * 4, 16) == 0,
+            "real color discontinuity and same-color depth reveal keep bit-exact original RGBA");
+    }
+    for (size_t pixel = 5; pixel <= 6; ++pixel) {
+      const float current = (pixel == 5 ? lighter : darker);
+      std::array<float, 4> attenuated{};
+      std::memcpy(attenuated.data(), planes.first.data() + pixel * 16, 16);
+      Check(std::fabs(attenuated[0] - encode(current * std::sqrt(1.5f))) < 3e-5f && attenuated[3] == .375f,
+            "small moving color changes ease the edit symmetrically and preserve current alpha");
+    }
+
     for (const bool low_grid : {false, true}) {
       constexpr uint32_t code_width = 1024, alpha_count = 4;
       const uint32_t work_width = (low_grid ? 768u : code_width);

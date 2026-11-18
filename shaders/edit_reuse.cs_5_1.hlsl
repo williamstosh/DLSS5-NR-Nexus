@@ -9,7 +9,7 @@ Texture2D<float2> Motion : register(t2);
 Texture2D<float> Depth : register(t3);
 Texture2D<float4> Original : register(t4);
 RWTexture2D<float4> Target : register(u0);
-// 32 bytes/pixel: float4(log2 edit RGB, valid guide), float4(log2 floored P RGB, depth).
+// 32 bytes/pixel: float4(log2 edit RGB, valid guide), float4(linear P RGB, depth).
 RWByteAddressBuffer Anchor : register(u1);
 RWByteAddressBuffer PreviousMotion : register(u2);  // float2 render-pixel displacement
 RWByteAddressBuffer Validity : register(u3);        // uint 0 invalid, 1 valid
@@ -28,7 +28,8 @@ cbuffer ReuseConstants : register(b0) {
 };
 
 static const float kEditFloor = 1.0 / 1024.0;
-static const float kReferenceLimit = 0.125;  // stops, max per channel
+static const float kReferenceFullConfidence = exp2(-0.125);  // max channel difference, in stops
+static const float kReferenceZeroConfidence = exp2(-0.375);
 
 [numthreads(8, 8, 1)]
 void main(uint3 dispatch_id : SV_DispatchThreadID) {
@@ -102,7 +103,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     const uint3 reference_exponent = asuint(reference) & 0x7f800000u;
     const bool valid = guide_valid && all(reference_exponent != 0x7f800000u);
     Anchor.Store4(index * 32u, asuint(float4(edit, valid ? 1.0 : 0.0)));
-    Anchor.Store4(index * 32u + 16u, asuint(float4(log_reference, depth)));
+    Anchor.Store4(index * 32u + 16u, asuint(float4(reference, depth)));
     return;
   }
   const float2 d = (Motion.Load(int3(guide, 0)) * MotionScale + AnchorRasterDelta) * float2(Size) / float2(MotionSize);
@@ -111,23 +112,30 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
       && isfinite(depth) && all(isfinite(reference)) && all(reference >= kEditFloor);
   float3 edit = 0.0;
   if (valid) {
-    const float3 log_reference = log2(max(reference, kEditFloor));
     const uint2 lo = uint2(floor(previous));
     const uint2 hi = min(lo + 1u, Size - 1u);
     const uint2 taps[4] = {lo, uint2(hi.x, lo.y), uint2(lo.x, hi.y), hi};
     const float2 f = frac(previous);
     const float weights[4] = {(1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y};
+    float3 warped_reference = 0.0;
     for (uint tap = 0u; tap < 4u; ++tap) {
       if (weights[tap] <= 0.0) continue;
       const uint address = (taps[tap].y * Size.x + taps[tap].x) * 32u;
       const float4 cached_edit = asfloat(Anchor.Load4(address));
       const float4 cached = asfloat(Anchor.Load4(address + 16u));
-      const float3 change = abs(log_reference - cached.rgb);
       valid = valid && cached_edit.a > 0.5 && all(isfinite(cached)) && all(isfinite(cached_edit))
-          && abs(depth - cached.a) <= 0.01 + 0.02 * abs(depth)
-          && all(change <= kReferenceLimit);
+          && abs(depth - cached.a) <= 0.01 + 0.02 * abs(depth);
       edit += weights[tap] * cached_edit.rgb;
+      warped_reference += weights[tap] * cached.rgb;
     }
+    // Match the same bilinear footprint used for the edit. Testing each tap
+    // against the current pixel rejects correctly warped high-contrast detail.
+    const float3 comparison = max(warped_reference, kEditFloor);
+    const float3 match = min(reference, comparison) / max(reference, comparison);
+    const float weakest_channel = min(match.r, min(match.g, match.b));
+    // A small color mismatch should fade the edit instead of punching a
+    // hole. Large changes still select the exact current color below.
+    edit *= smoothstep(kReferenceZeroConfidence, kReferenceFullConfidence, weakest_channel);
   }
   // A neutral edit selects the untouched source at the final boundary rather
   // than relying on a codec round trip to reproduce half-float source bits.

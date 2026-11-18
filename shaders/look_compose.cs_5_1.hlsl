@@ -62,17 +62,17 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   float aM;
   float4 current = BandValues(pixel, x, peak, trough, aM);
 #if defined(NR_EDIT_REUSE_CAPTURE)
-  // Match the standalone CAPTURE's guide lookup and log-reference layout.
+  // Match the standalone CAPTURE's guide lookup and linear reference layout.
   const float2 guide_position = (float2(dispatch_id.xy) + 0.5) * float2(AnchorGuideSize) / float2(NrSize) + AnchorGuideOffset;
   const bool guide_valid = all(guide_position >= 0.0) && all(guide_position < float2(AnchorGuideSize));
   const uint2 guide_texel = uint2(clamp(floor(guide_position), 0.0, float2(AnchorGuideSize - 1u)));
   const float depth = AnchorDepth.Load(int3(guide_texel, 0));
-  // Test the unfloored proxy's exponent before putting the log layout in the anchor.
+  // Test the unfloored proxy's exponent before publishing the anchor.
   const uint3 proxy_exponent = asuint(x.p) & 0x7f800000u;
   const bool anchor_valid = guide_valid && all(proxy_exponent != 0x7f800000u);
   const uint address = (dispatch_id.y * NrSize.x + dispatch_id.x) * 32u;
   EditAnchor.Store4(address, asuint(float4(x.e, anchor_valid ? 1.0 : 0.0)));
-  EditAnchor.Store4(address + 16u, asuint(float4(x.lp, depth)));
+  EditAnchor.Store4(address + 16u, asuint(float4(x.p, depth)));
 #endif
   float3 c = x.c;
 
