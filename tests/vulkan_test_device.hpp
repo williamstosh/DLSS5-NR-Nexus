@@ -366,7 +366,13 @@ class Device final : public DeviceApiStubs {
           if (range.type == reshade::api::descriptor_type::texture_unordered_access_view) {
             type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
           }
-          bindings.push_back({range.binding, type, range.count, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
+          // Only the first ReShade binding is an array. The rest use consecutive bindings.
+          const uint32_t array_size = std::min(range.array_size, range.count);
+          if (array_size == 0) continue;
+          bindings.push_back({range.binding, type, array_size, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
+          for (uint32_t i = array_size; i < range.count; ++i) {
+            bindings.push_back({range.binding + i - array_size + 1, type, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
+          }
         }
       } else if (param.type == reshade::api::pipeline_layout_param_type::push_constants) {
         push_ranges.push_back({VK_SHADER_STAGE_COMPUTE_BIT, param.push_constants.binding * 4,

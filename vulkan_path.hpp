@@ -357,6 +357,7 @@ struct RetiredLookHistory {
 };
 struct RetiredNrHandle {
   NVSDK_NGX_Handle* handle = nullptr;
+  NVSDK_NGX_Parameter* parameters = nullptr;
   uint64_t use_id = 0;
 };
 using LookHistoryVk = BasicLookHistory<LookHistoryImage>;
@@ -1715,8 +1716,22 @@ inline void DestroyLookHistoryImage(reshade::api::device* device,
   if (image.image.handle != 0) device->destroy_resource(image.image);
 }
 
+// Keep the retired handle and its parameter block together until its last
+// recording can no longer use it. A new Create starts with a clean block.
+inline void RetireNrHandle(Feature* feature, uint32_t pass) {
+  NrFeatureSlot& slot = feature->slots[pass];
+  if (slot.handle != nullptr) {
+    feature->retired_nr.push_back({slot.handle, slot.parameters, feature->nr_use[pass]});
+    slot.handle = nullptr;
+    slot.parameters = nullptr;
+    live_nr_features.fetch_sub(1, std::memory_order_relaxed);
+  }
+  feature->nr_use[pass] = 0;
+}
+
 // Caller holds runtime_mutex. A reset/freed command buffer cannot replay its
-// old recording; until then even a completed submission is still a live use.
+// old recording, regardless of whether it executed. Until then even a
+// completed submission is still a live use.
 inline void DrainRetiredFeature(Feature* feature) {
   // Keep is the same retained-resource comparison on Vulkan as on D3D12:
   // completed recordings permit reuse, but frees wait for feature teardown.
@@ -1749,6 +1764,7 @@ inline void DrainRetiredFeature(Feature* feature) {
       DirectCallScope direct;
       runtime.release(it->handle);
     }
+    bridge::DestroyOwnedParameters(it->parameters);
     it = feature->retired_nr.erase(it);
   }
 }
@@ -1790,19 +1806,14 @@ inline void FreeFeatureNr(Feature* feature, bool release_nr = true) {
   feature->commit_view = {};
   feature->commit_cleared = false;
   for (uint32_t pass = 0; pass < kMaxNrPasses; ++pass) {
-    NrFeatureSlot& slot = feature->slots[pass];
-    if (slot.handle != nullptr) {
-      feature->retired_nr.push_back({slot.handle, feature->nr_use[pass]});
-      live_nr_features.fetch_sub(1, std::memory_order_relaxed);
-    }
-    slot.handle = nullptr;
-    feature->nr_use[pass] = 0;
+    RetireNrHandle(feature, pass);
   }
-  if (release_nr) {
-    DirectCallScope direct;
-    for (const RetiredNrHandle& retired : feature->retired_nr) {
+  for (const RetiredNrHandle& retired : feature->retired_nr) {
+    if (release_nr) {
+      DirectCallScope direct;
       runtime.release(retired.handle);
     }
+    bridge::DestroyOwnedParameters(retired.parameters);
   }
   feature->retired_nr.clear();
   for (NrFeatureSlot& slot : feature->slots) {
@@ -2121,13 +2132,8 @@ inline NrDeclineReason ProcessNr(VkCommandBuffer command_buffer,
       || feature.nr_hdr_mode != hdr_mode
       || feature.configuration != configuration_generation.load()) {
     for (uint32_t pass = 0; pass < kMaxNrPasses; ++pass) {
+      RetireNrHandle(&feature, pass);
       NrFeatureSlot& slot = feature.slots[pass];
-      if (slot.handle != nullptr) {
-        feature.retired_nr.push_back({slot.handle, feature.nr_use[pass]});
-        slot.handle = nullptr;
-        live_nr_features.fetch_sub(1, std::memory_order_relaxed);
-      }
-      feature.nr_use[pass] = 0;
       slot.failed = false;
       slot.fail_count = 0;
     }
@@ -2146,7 +2152,16 @@ inline NrDeclineReason ProcessNr(VkCommandBuffer command_buffer,
     NrFeatureSlot& slot = feature.slots[pass];
     // The runtime exports no Vulkan parameter allocator; the block is the
     // addon's own, as on the D3D12 path without a public core (OwnedParameters).
-    if (slot.parameters == nullptr) bridge::AllocateOwnedParameters(&slot.parameters);
+    if (slot.parameters == nullptr) {
+      const auto allocated = bridge::AllocateOwnedParameters(&slot.parameters);
+      if (NVSDK_NGX_FAILED(allocated)) {
+        last_result = static_cast<uint32_t>(allocated);
+        slot.failed = true;
+        slot.failed_ns = SteadyNowNs();
+        Log(reshade::log::level::error, "could not allocate Vulkan NR parameters (failure_backoff)");
+        return false;
+      }
+    }
     const uint32_t requested = (pass == 0 || pass_preset[pass - 1].load() == 0
                                    ? preset.load() : pass_preset[pass - 1].load());
     slot.nr_preset = nr_model::ResolvePreset(requested, 0, direct_runtime_requirements.dual_models);
@@ -2690,6 +2705,8 @@ inline NrDeclineReason ProcessNr(VkCommandBuffer command_buffer,
       transition(ref, resource_usage::copy_source);
       transition(write, resource_usage::copy_dest);
       cmd->copy_texture_region(images[ref], 0, nullptr, images[write], 0, nullptr);
+      // The HDR commit can still sample the original after a zero-strength pass.
+      transition(ref, resource_usage::shader_resource);
       transition(write, resource_usage::shader_resource);
       continue;
     }
@@ -2795,6 +2812,10 @@ inline NrDeclineReason ProcessNr(VkCommandBuffer command_buffer,
     if (NVSDK_NGX_FAILED(result)) {
       // The output is untouched (the passes before this one wrote only
       // scratch images), so the frame keeps the game's image.
+      RestoreComputeState(cmd);
+      LatchNrStackFailure(feature.slots, pass);
+      RetireNrHandle(&feature, pass);
+      feature.look_history[pass].valid = false;
       static std::atomic_bool logged{false};
       if (!logged.exchange(true)) {
         char text[160];
@@ -2804,7 +2825,6 @@ inline NrDeclineReason ProcessNr(VkCommandBuffer command_buffer,
                  static_cast<uint32_t>(result), pass + 1);
         Log(reshade::log::level::error, text);
       }
-      RestoreComputeState(cmd);
       return NrDeclineReason::kFailureBackoff;
     }
     nr_passes.fetch_add(1, std::memory_order_relaxed);

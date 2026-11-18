@@ -358,6 +358,10 @@ foreach ($item in $Suite) {
                 Invoke-TestProcess $exe $directory 'adaptive-inline' @('--adaptive-inline')
                 Invoke-TestProcess $exe $directory 'present-guide-models' @('--present-guide-models')
             }
+            if ($item -eq 'vulkan-control-mask') {
+                Invoke-TestProcess $exe $directory 'evaluate-recovery' @('--evaluate-recovery')
+                Invoke-TestProcess $exe $directory 'evaluate-recovery-hdr' @('--evaluate-recovery-hdr')
+            }
         }
         if ($item -eq 'vulkan-control-mask' -and $VulkanNativeNgx) {
             $runtimeLink = Join-Path $directory 'nvngx_dlssnr.dll'

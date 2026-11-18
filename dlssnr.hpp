@@ -5811,6 +5811,18 @@ inline void ReleaseFeatureStates() {
 constexpr int64_t kFeatureRetryFirstNs = 1'000'000'000;
 constexpr int64_t kFeatureRetryMaxNs = 30'000'000'000;
 
+inline void LatchNrStackFailure(NrFeatureSlot* slots, uint32_t failed_pass) {
+  NrFeatureSlot& failed = slots[failed_pass];
+  failed.failed = true;
+  failed.failed_ns = SteadyNowNs();
+  // Earlier passes keep their history. Later passes missed this input and
+  // must reset the next time they evaluate.
+  for (uint32_t pass = failed_pass + 1; pass < kMaxNrPasses; ++pass) {
+    slots[pass].pending_reset = true;
+    slots[pass].pending_reset_reasons |= kResetRecovery;
+  }
+}
+
 inline bool FeatureFailureExpired(const NrFeatureSlot& slot) {
   if (slot.fail_count == 0) return true;
   return SteadyNowNs() - slot.failed_ns
@@ -16235,19 +16247,8 @@ inline bool RecordInline(
         failed_resources.nr_output_state,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     failed_resources.nr_output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    NrFeatureSlot& failed_slot = feature.slots[failed_pass];
-    failed_slot.failed = true;
-    failed_slot.failed_ns = SteadyNowNs();
+    LatchNrStackFailure(feature.slots, failed_pass);
     ReleaseNrSlot(feature, failed_pass, true);
-    // The chain broke mid-stack: passes after the failure skipped an input
-    // frame, so their temporal history is discontinuous - mark them to
-    // reset on the next attempt (the failed slot resets itself via
-    // pending_reset when recreated).  Passes before the failure evaluated
-    // normally and keep their history.
-    for (uint32_t later = failed_pass + 1; later < kMaxNrPasses; ++later) {
-      feature.slots[later].pending_reset = true;
-      feature.slots[later].pending_reset_reasons |= kResetRecovery;
-    }
     LogNrStackFailure(stack_failure, failed_pass, requested_stack, false);
     // Do not abort the capture here: a failed evaluate (e.g. an intermediate
     // reflection denoise) should let the next evaluate in the same frame
@@ -17807,19 +17808,8 @@ inline bool RecordInlinePreSR(
         failed_resources.nr_output_state,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     failed_resources.nr_output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    NrFeatureSlot& failed_slot = feature.slots[failed_pass];
-    failed_slot.failed = true;
-    failed_slot.failed_ns = SteadyNowNs();
+    LatchNrStackFailure(feature.slots, failed_pass);
     ReleaseNrSlot(feature, failed_pass, true);
-    // The chain broke mid-stack: passes after the failure skipped an input
-    // frame, so their temporal history is discontinuous - mark them to
-    // reset on the next attempt (the failed slot resets itself via
-    // pending_reset when recreated).  Passes before the failure evaluated
-    // normally and keep their history.
-    for (uint32_t later = failed_pass + 1; later < kMaxNrPasses; ++later) {
-      feature.slots[later].pending_reset = true;
-      feature.slots[later].pending_reset_reasons |= kResetRecovery;
-    }
     LogNrStackFailure(stack_failure, failed_pass, requested_stack, true);
     if (timers_active) {
       gpu_timers::End(command_list);
