@@ -1847,6 +1847,9 @@ inline std::atomic_uint64_t ngx_entry_release[kMaxNgxSlots];
 inline std::atomic_uint64_t device_create_list_entries{0};
 inline std::atomic_uint64_t queue_submit_entries{0};
 inline std::atomic_bool present_base_capture_active = false;
+// Guide slots keep the current capture, the next capture and copies still in use.
+inline constexpr uint32_t kPresentGuideSets = 4;
+inline std::atomic<ID3D12GraphicsCommandList*> present_source_lists[kPresentGuideSets]{};
 
 // Only the actual queue for the live ordinary Present ring is observed.
 // Game submits may forward concurrently. Present takes the exclusive side
@@ -19273,7 +19276,15 @@ inline HRESULT STDMETHODCALLTYPE HookedCmdReset(
       // completion proofs - see submission_tracker.hpp), and the shadow
       // records the deterministic post-Reset baseline (PSO = the argument,
       // everything else unbound) instead of dropping to unknown.
-      submission::OnCommandListReset(command_list);
+      const auto* native_list = submission::OnCommandListReset(command_list);
+      // End observations of this recording, including Resets through a
+      // proxy. A sealed source keeps its original submission receipt.
+      for (auto& watched : present_source_lists) {
+        auto* list = watched.load(std::memory_order_relaxed);
+        if (list == native_list) {
+          watched.compare_exchange_strong(list, nullptr, std::memory_order_release, std::memory_order_relaxed);
+        }
+      }
       WriteShadowBaseline(command_list, initial_state, "ResetBaseline");
     } else {
       // A failed Reset leaves the list state undefined from the observer's
@@ -20493,11 +20504,56 @@ inline void ResolveQueueCompletionLocked(ID3D12CommandQueue* queue) {
   }
 }
 
+// A submit can reach the driver after the Present observer that it saw has
+// already been replaced. Register entry before reading that observer. These
+// buckets cover only CPU calls in flight; their locks never span a driver call.
+struct PendingQueueExecute {
+  struct Bucket {
+    std::shared_mutex mutex;
+    PendingQueueExecute* first = nullptr;
+  };
+
+  static Bucket& ForQueue(ID3D12CommandQueue* queue) {
+    static Bucket buckets[16];
+    return buckets[(reinterpret_cast<uintptr_t>(queue) / alignof(void*)) % std::size(buckets)];
+  }
+
+  explicit PendingQueueExecute(ID3D12CommandQueue* queue) : queue(queue) {
+    if (queue == nullptr) return;
+    auto& bucket = ForQueue(queue);
+    const std::lock_guard lock(bucket.mutex);
+    previous_link = &bucket.first;
+    next = bucket.first;
+    if (next != nullptr) {
+      next->previous_link = &next;
+    }
+    bucket.first = this;
+  }
+
+  PendingQueueExecute(const PendingQueueExecute&) = delete;
+  PendingQueueExecute& operator=(const PendingQueueExecute&) = delete;
+
+  ~PendingQueueExecute() {
+    if (queue == nullptr) return;
+    const std::lock_guard lock(ForQueue(queue).mutex);
+    *previous_link = next;
+    if (next != nullptr) {
+      next->previous_link = previous_link;
+    }
+  }
+
+  ID3D12CommandQueue* const queue;
+  PendingQueueExecute* next = nullptr;
+  PendingQueueExecute** previous_link = nullptr;
+};
+
 inline void STDMETHODCALLTYPE HookedQueueExecuteCommandLists(
     ID3D12CommandQueue* queue,
     UINT count,
     ID3D12CommandList* const* command_lists) {
   queue_submit_entries.fetch_add(1, std::memory_order_relaxed);
+  const PendingQueueExecute pending{
+      committing_present_queue == nullptr ? queue : nullptr};
   std::shared_ptr<PresentQueueOrder> present_order;
   if (committing_present_queue == nullptr && queue == observed_present_queue.load(std::memory_order_acquire)) {
     present_order = present_queue_order.load(std::memory_order_acquire);

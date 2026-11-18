@@ -152,11 +152,6 @@ inline constexpr uint32_t kPresentRing = 8;
 // present[slot_timeouts=]), and presents stop waiting until a slot is free
 // on its own, so a stuck queue costs one timeout, not one per present.
 inline constexpr DWORD kPresentSlotWaitMs = 100;
-// Four capture sets: the newest (the next present's), one the game may be
-// copying into, one a present on the GPU may still read, and the one a
-// present read last, which a capture never overwrites (NextPresentCaptureSet)
-// so a present always has a complete capture to fall back on.
-inline constexpr uint32_t kPresentGuideSets = 4;
 inline constexpr uintptr_t kPresentGuideMarkerPrefix = 0xFFFF'0000'0000'0000ull;
 
 inline bool IsPresentGuideMarker(const void* marker) {
@@ -562,7 +557,6 @@ inline PresentGuideSet present_guide_sets[kPresentGuideSets];
 inline uint64_t present_capture_serial = 0;
 inline std::unordered_map<const void*, PresentStream> present_streams;
 inline uint64_t present_base_epoch_serial = 0;
-inline std::atomic<ID3D12GraphicsCommandList*> present_source_lists[kPresentGuideSets]{};
 
 // The raw detours only inspect the specific native lists that carry an
 // open SR-to-backbuffer proof. Unrelated draws never enter runtime_mutex.
@@ -3811,8 +3805,19 @@ inline void RunPresentPath(
         stream.base_frame_epoch = ++present_base_epoch_serial;
       }
       if (observed_present_queue.load(std::memory_order_relaxed) != native_queue) {
-        present_queue_order.store(std::make_shared<PresentQueueOrder>(native_queue), std::memory_order_release);
-        observed_present_queue.store(native_queue, std::memory_order_release);
+        auto order = std::make_shared<PresentQueueOrder>(native_queue);
+        auto& pending = PendingQueueExecute::ForQueue(native_queue);
+        const std::lock_guard pending_lock(pending.mutex);
+        auto* execute = pending.first;
+        while (execute != nullptr && execute->queue != native_queue) {
+          execute = execute->next;
+        }
+        // An Execute that already entered may still enqueue a later write.
+        // Start a fresh observer only after the associated queue's calls drain.
+        if (execute == nullptr) {
+          present_queue_order.store(std::move(order), std::memory_order_release);
+          observed_present_queue.store(native_queue, std::memory_order_release);
+        }
       }
     }
     if (!stream.mixed_buffers.empty()) {

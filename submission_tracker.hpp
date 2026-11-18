@@ -256,14 +256,15 @@ inline void TrackUse(ID3D12CommandList* list, const void* resource) {
 
 // Reset hook: the recorded generation can never be replayed or submitted
 // again; earlier submissions of it may still be executing, so it releases
-// only once they completed. A new generation begins implicitly.
-inline void OnCommandListReset(ID3D12CommandList* list) {
-  if (list == nullptr) return;
+// only once they completed. A new generation begins implicitly. Return the
+// borrowed native alias so raw command observers can end the same recording.
+inline ID3D12CommandList* OnCommandListReset(ID3D12CommandList* list) {
+  if (list == nullptr) return nullptr;
   const uint64_t key = ListIdentity(list, false);
   ID3D12CommandList* const native = DestroyAlias(list);
   std::lock_guard<std::mutex> lock(tracker_mutex);
   const auto it = tracked_lists.find(key);
-  if (it == tracked_lists.end()) return;
+  if (it == tracked_lists.end()) return native;
   ListState& state = it->second;
   RememberAliasLocked(list, key, state);
   if (native != list) RememberAliasLocked(native, key, state);
@@ -279,6 +280,7 @@ inline void OnCommandListReset(ID3D12CommandList* list) {
     generations_outstanding.fetch_add(1, std::memory_order_relaxed);
   }
   ++state.current;
+  return native;
 }
 
 // Destruction (final Release observed): replay is impossible, so open

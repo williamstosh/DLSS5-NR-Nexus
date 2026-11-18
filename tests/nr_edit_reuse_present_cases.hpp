@@ -5,11 +5,15 @@
 #pragma once
 
 #include <DirectXPackedVector.h>
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include <utils/hash.hpp>
@@ -104,6 +108,46 @@ struct Observed {
   uint64_t ring_submissions = 0;
   uint32_t calls = 0;
   uint32_t creates = 0;
+};
+
+struct ParkedExecute {
+  static constexpr DWORD TIMEOUT_MS = 5000;
+  static inline ParkedExecute* active = nullptr;
+  using Event = std::unique_ptr<void, decltype(&CloseHandle)>;
+
+  ID3D12CommandQueue* const queue;
+  ID3D12CommandList* const writer;
+  void* const original = native::real_queue_execute_command_lists;
+  const Event entered{CreateEventW(nullptr, TRUE, FALSE, nullptr), &CloseHandle};
+  const Event release{CreateEventW(nullptr, TRUE, FALSE, nullptr), &CloseHandle};
+  DWORD release_wait = WAIT_FAILED;
+  std::atomic_bool forwarded = false;
+
+  ParkedExecute(ID3D12CommandQueue* native_queue, ID3D12CommandList* writer_list) : queue(native_queue), writer(writer_list) {
+    Check(entered && release && original != nullptr, "Present x2 can park a native Execute at its trampoline");
+    active = this;
+    native::real_queue_execute_command_lists = reinterpret_cast<void*>(Forward);
+  }
+
+  ~ParkedExecute() {
+    native::real_queue_execute_command_lists = original;
+    active = nullptr;
+  }
+
+  static void STDMETHODCALLTYPE Forward(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists) {
+    auto& gate = *active;
+    const bool parked_writer = queue == gate.queue && count == 1 && lists != nullptr && lists[0] == gate.writer;
+    if (parked_writer) {
+      if (!SetEvent(gate.entered.get())) return;
+      gate.release_wait = WaitForSingleObject(gate.release.get(), TIMEOUT_MS);
+      // A fixture timeout must never leave a GPU submission referencing resources being unwound.
+      if (gate.release_wait != WAIT_OBJECT_0) return;
+    }
+    reinterpret_cast<native::QueueExecuteCommandListsFn>(gate.original)(queue, count, lists);
+    if (parked_writer) {
+      gate.forwarded.store(true);
+    }
+  }
 };
 
 }  // namespace nr_edit_reuse_present_cases
@@ -366,8 +410,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
       }
       Check(NVSDK_NGX_SUCCEED(result) && sr_handle != nullptr, "Present x2 wrapped game SR Create");
     };
-    const auto record = [&](bool reset = false, bool jitter = true, bool overwrite = false,
-                            ID3D12Resource* destination = nullptr) {
+    const auto evaluate_sr = [&](bool reset, bool jitter) {
       if (!native_ngx) {
         upload(color.Get(), game_pixel, NATIVE_INPUT_STATE);
       }
@@ -388,6 +431,10 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
         result = native::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), sr_handle, evaluate_parameters, nullptr);
       }
       Check(NVSDK_NGX_SUCCEED(result), "Present x2 wrapped game SR Evaluate succeeds");
+    };
+    const auto record = [&](bool reset = false, bool jitter = true, bool overwrite = false,
+                            ID3D12Resource* destination = nullptr) {
+      evaluate_sr(reset, jitter);
       auto* target = (destination != nullptr ? destination : back());
       // The game list supplies the native transitions and the complete
       // delivery. Its one Execute is the only submission before the callback.
@@ -767,6 +814,138 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     create_source();
     warm(false);
 
+    bool preserves_cross_epoch_writer = false;
+    {
+      native::enabled = false;
+      event();
+      const auto epoch_off = native::present_streams.at(&output).base_frame_epoch;
+      {
+        // Retire previous Present recordings so the edit-ordering mutex doesn't serialize these two game calls.
+        const addon::RuntimeLock lock(native::runtime_mutex);
+        Check(native::ReleasePresentRing(), "Present x2 cross-epoch test retires the completed private ring");
+        native::PruneCompletedSubmissionUses();
+        Check(addon::control_mask_execution::ReleaseIfIdle(), "Present x2 cross-epoch test starts without edit-ordering records");
+      }
+      ComPtr<ID3D12CommandAllocator> writer_allocator;
+      ComPtr<ID3D12GraphicsCommandList> writer;
+      Check(SUCCEEDED(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&writer_allocator)))
+                && SUCCEEDED(gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, writer_allocator.Get(),
+                                                           nullptr, IID_PPV_ARGS(&writer))),
+            "Present x2 cross-epoch writer uses a separate native list");
+      const auto game_list = gpu.list;
+      auto* const current_buffer = back();
+      gpu.list = writer;
+      const auto produced = stages::Capture(gpu, current_buffer, PRESENT);
+      upload(current_buffer, OVERWRITE_PIXEL, PRESENT);
+      const auto written = stages::Capture(gpu, current_buffer, PRESENT);
+      // The producer's fence cleanup runs while this writer is still parked.
+      const auto writer_uploads = std::exchange(gpu.retained_resources, {});
+      gpu.list = game_list;
+      Check(SUCCEEDED(writer->Close()), "Present x2 cross-epoch writer closes");
+
+      const auto cpu_first = native::queue_submit_entries.load();
+      constexpr Pixel PRODUCER_PIXEL{0x3600, 0x3a00, 0x3400, 0x3b00};
+      uint64_t epoch_enabled = 0;
+      uint64_t producer_fence = 0;
+      {
+        ParkedExecute gate(gpu.queue.Get(), writer.Get());
+        std::jthread old_submit([&] {
+          ID3D12CommandList* lists[]{writer.Get()};
+          native::HookedQueueExecuteCommandLists(gpu.queue.Get(), 1, lists);
+        });
+        Check(WaitForSingleObject(gate.entered.get(), ParkedExecute::TIMEOUT_MS) == WAIT_OBJECT_0
+                  && native::queue_submit_entries.load() == cpu_first + 1,
+              "Present x2 old Execute reaches the native trampoline before enabling observation");
+        native::enabled = true;
+        event();
+        epoch_enabled = native::present_streams.at(&output).base_frame_epoch;
+        Check(back() == current_buffer, "Present x2 producer and old writer target the same current DXGI buffer");
+        game_pixel = PRODUCER_PIXEL;
+        record(true);
+        submit();
+        game_pixel = GAME_PIXEL;
+        producer_fence = gpu.serial;
+        Check(native::queue_submit_entries.load() == cpu_first + 2
+                  && gpu.fence->GetCompletedValue() == producer_fence && !gate.forwarded.load(),
+              "Present x2 producer executes and completes while the older hook call is parked");
+        Check(SetEvent(gate.release.get()), "Present x2 releases the older hook call after the producer fence");
+        old_submit.join();
+        Check(gate.release_wait == WAIT_OBJECT_0 && gate.forwarded.load(), "Present x2 older Execute really forwards");
+      }
+      finish();
+      const auto writer_fence = gpu.fence->GetCompletedValue();
+      const auto all_pixels = [&](const stages::Snapshot& snapshot, Pixel expected) {
+        const auto bytes = snapshot.Pixels();
+        const std::vector pixels(size * size, expected);
+        return bytes.size() == pixels.size() * sizeof(Pixel)
+            && std::memcmp(bytes.data(), pixels.data(), bytes.size()) == 0;
+      };
+      Check(all_pixels(produced, PRODUCER_PIXEL), "Present x2 old list reads the new SR pixels immediately before its overwrite");
+      Check(writer_fence > producer_fence && all_pixels(written, OVERWRITE_PIXEL),
+            "Present x2 late native Execute writes every expected FP16 pixel before OnPresent");
+
+      const auto before_present = stats();
+      event();
+      const auto after_present = stats();
+      const auto pixels = read_back();
+      const size_t preserved = std::ranges::count(pixels, OVERWRITE_PIXEL);
+      preserves_cross_epoch_writer = preserved == pixels.size() && after_present.calls == before_present.calls
+          && after_present.outputs == before_present.outputs && after_present.ring_submissions == before_present.ring_submissions
+          && after_present.consumed_serial == before_present.consumed_serial && after_present.refreshes == before_present.refreshes
+          && after_present.reuses == before_present.reuses && after_present.history_sequence == before_present.history_sequence;
+      std::cout << "PRESENT_X2_CROSS_EPOCH cpu=old_hook,enable,producer,old_forward gpu=producer,writer"
+                << " epoch=" << epoch_off << ',' << epoch_enabled << " fences=" << producer_fence << ',' << writer_fence
+                << " calls=" << after_present.calls - before_present.calls
+                << " outputs=" << after_present.outputs - before_present.outputs
+                << " history=" << before_present.history_sequence << ',' << after_present.history_sequence
+                << " producer_pixels=" << size * size << '/' << size * size
+                << " writer_pixels_before=" << size * size << '/' << size * size
+                << " writer_pixels_after=" << preserved << '/' << pixels.size()
+                << " preserved=" << preserves_cross_epoch_writer << std::endl;
+      swap();
+    }
+
+    bool reset_observer_bypassed = false;
+    {
+      evaluate_sr(false, true);
+      const auto source_recording = addon::submission::RecordingIdentity(gpu.list.Get());
+      Check(native::IsPresentSourceList(gpu.list.Get()), "Present x2 successful SR arms its list without a final Backbuffer copy");
+      Check(SUCCEEDED(gpu.list->Close()), "close the source-only command recording before native Reset");
+      reopen();
+      const auto recycled_recording = addon::submission::RecordingIdentity(gpu.list.Get());
+      Check(recycled_recording.first == source_recording.first && recycled_recording.second != source_recording.second,
+            "Present x2 native Reset starts an unrelated recording on the very same list");
+
+      // Exercise the observer shared by the native Draw and Dispatch detours. A bounded wait
+      // under the lock lets a regressed observer finish after release and report its contention.
+      const std::unique_ptr<void, decltype(&CloseHandle)> started(CreateEventW(nullptr, TRUE, FALSE, nullptr), &CloseHandle);
+      Check(started != nullptr, "Present x2 source observer test start event");
+      const auto lock_before = addon::runtime_lock_contended.load();
+      constexpr DWORD OBSERVER_TIMEOUT_MS = 1000;
+      DWORD observer_wait = WAIT_FAILED;
+      std::jthread observer;
+      {
+        const addon::RuntimeLock hold(native::runtime_mutex);
+        observer = std::jthread([&, list = gpu.list.Get()] {
+          SetEvent(started.get());
+          native::ObservePresentSourceWork(list, false);
+        });
+        Check(WaitForSingleObject(started.get(), OBSERVER_TIMEOUT_MS) == WAIT_OBJECT_0,
+              "Present x2 recycled-list observer worker starts");
+        observer_wait = WaitForSingleObject(observer.native_handle(), OBSERVER_TIMEOUT_MS);
+      }
+      observer.join();
+      const auto contentions = addon::runtime_lock_contended.load() - lock_before;
+      reset_observer_bypassed = observer_wait == WAIT_OBJECT_0 && contentions == 0;
+      std::cout << "PRESENT_X2_RESET_OBSERVER recording=" << source_recording.first << ':' << source_recording.second
+                << ',' << recycled_recording.first << ':' << recycled_recording.second
+                << " lock_wait_result=" << observer_wait << " deadline_ms=" << OBSERVER_TIMEOUT_MS
+                << " runtime_lock_contentions=" << contentions << " bypassed=" << reset_observer_bypassed << std::endl;
+      Check(SUCCEEDED(gpu.list->Close()), "close unrelated post-Reset recording before the next base");
+      finish();
+      reopen();
+    }
+
     model_parameter_observer = {};
     native::present_frames = 0;
     before = stats();
@@ -799,9 +978,16 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
         Check(message->Severity > D3D12_MESSAGE_SEVERITY_ERROR, message->pDescription);
       }
     }
+    if (!preserves_cross_epoch_writer) {
+      std::cerr << "FAIL Present x2 cross-epoch writer must preserve its pixels without NR output, history, or model work\n";
+    }
+    if (!reset_observer_bypassed) {
+      std::cerr << "FAIL Present x2 recycled recording must bypass the Draw/Dispatch source observer runtime lock\n";
+    }
+    if (!preserves_cross_epoch_writer || !reset_observer_bypassed) return 1;
     std::cout << "PASS ordinary D3D12 Present x2 WARP+MOCK: prepared/output, 1/0/1/0 pixels, duplicate, "
                  "wrong buffer, discarded producer, missing jitter, late writes, failed model, "
-                 "XeFG ownership, DXGI resize and legacy Every Present\n";
+                 "XeFG ownership, DXGI resize, cross-epoch writer, recycled list and legacy Every Present\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "FAIL ordinary Present x2: " << error.what() << '\n';
