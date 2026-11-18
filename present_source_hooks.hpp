@@ -79,6 +79,12 @@ inline bool InstallPresentSourceHooks(ID3D12GraphicsCommandList* list) {
   list->QueryInterface(IID_PPV_ARGS(&list6));
   list->QueryInterface(IID_PPV_ARGS(&list7));
   list->QueryInterface(IID_PPV_ARGS(&list10));
+  // The source watch compares the native list pointer before entering any
+  // shared state. Distinct extended-interface faces cannot use that proof.
+  if ((list4 != nullptr && static_cast<ID3D12GraphicsCommandList*>(list4.Get()) != list)
+      || (list6 != nullptr && static_cast<ID3D12GraphicsCommandList*>(list6.Get()) != list)
+      || (list7 != nullptr && static_cast<ID3D12GraphicsCommandList*>(list7.Get()) != list)
+      || (list10 != nullptr && static_cast<ID3D12GraphicsCommandList*>(list10.Get()) != list)) return false;
   const auto ray_tracing = (list4 != nullptr ? entries(list4.Get()) : nullptr);
   const std::array targets{base[Draw::slot], base[DrawIndexed::slot], base[Dispatch::slot], base[CopyTiles::slot],
       base[Barriers::slot], base[Bundle::slot], base[ClearUInt::slot], base[ClearFloat::slot], base[Discard::slot],

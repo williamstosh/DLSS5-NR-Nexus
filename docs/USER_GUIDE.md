@@ -455,7 +455,7 @@ F6 立即提示开关操作，随后状态更新为正在检查、正常运行�
 
 普通原生 **D3D12 Present x2** 是尚未发布的开发功能。打开同一个 x2 开关，在**处理与兼容性 → 介入点**选择 **Present**，再在 **FG 高级设置 → FG 帧处理策略**（Generated frames／Present Frames）选择**游戏帧**（Game frames only，`NRPresentFrames=1`）。NR 只处理当前 FP16 scRGB Backbuffer 的颜色。复用要求模型 B、单层、固定 100% 呈现分辨率，并关闭调整 NR 的外观、细节稳定、区域遮罩和自适应分辨率。
 
-插件须确认该帧的 DLSS 超分辨率（SR）已成功运行，取得同一帧的两轴 jitter 偏移及匹配的真实深度和运动矢量，并确认 SR 输出整幅复制到本次呈现的 Backbuffer 后未被改写。缺少同帧证据时保留本帧游戏原画。要恢复默认的逐呈现帧 NR，可改回**每帧**（Every present，`NRPresentFrames=0`）。也可关闭 x2，按当前帧处理策略运行常规 NR。普通 Present x2 尚未进行游戏内测试。
+插件须确认该帧的 DLSS 超分辨率（SR）已成功运行，取得同一帧的两轴 jitter 偏移及匹配的深度和运动矢量，并验证 SR 输出在呈现队列最后一次游戏提交的同一命令列表中整幅复制到当前 Backbuffer。证据不足时保留本帧游戏原画。要恢复默认的逐呈现帧 NR，可改回**每帧**（Every present，`NRPresentFrames=0`）。也可关闭 x2，按当前帧处理策略运行常规 NR。普通 Present x2 已用真实 NVIDIA Runtime 和 GPU 离线验证，游戏内表现仍待验收。
 
 开发分支允许上述固定尺寸 Upscaled 路径在 FG 状态尚未识别时继续隔帧；仍须有已确认的成功 SR 输入和可写输出，且未被 FG 接管。此变化尚未进入已发布安装包。
 
@@ -1025,7 +1025,7 @@ HDR10/PQ x2 reuse has been confirmed in a static The Witcher 3 XeFG scene; dynam
 
 Ordinary native **D3D12 Present x2** is an unreleased development feature. Enable the same x2 toggle, choose **Present** under **Processing & compatibility → Hook point**, then select **Game frames** (Game frames only, `NRPresentFrames=1`) under **FG advanced settings → FG frame processing policy** (Generated frames / Present Frames). NR works on the current FP16 scRGB backbuffer as its sole colour input. Reuse requires model B, one pass, a fixed 100% of the presentation resolution, and Adjust NR's look, Detail stability, Region mask and Adaptive resolution turned off.
 
-The add-on requires a successful DLSS Super Resolution (SR) evaluation, both jitter offsets, and matching real depth and motion vectors from that frame. It verifies that the complete SR output was copied to the backbuffer being presented and that the copy was left intact. Without same-frame evidence, it keeps the game's original image. Select **Every frame** (Every present, `NRPresentFrames=0`) to restore the default NR processing on each present, or turn off x2 to use regular NR with the current frame policy. Ordinary Present x2 has yet to be tested in-game.
+The add-on requires a successful DLSS Super Resolution (SR) evaluation, both jitter offsets, and matching depth and motion vectors from that frame. It verifies that the presentation queue's latest game submission used the same command list to copy the complete SR output to the current backbuffer. Without that evidence, it keeps the game's original image. Select **Every frame** (Every present, `NRPresentFrames=0`) to restore the default NR processing on each present, or turn off x2 to use regular NR with the current frame policy. Ordinary Present x2 has been verified offline with the NVIDIA runtime on real hardware. In-game performance and image quality still need validation.
 
 The development branch allows the fixed-size Upscaled path above to keep reusing edits while FG status is unidentified, provided successful SR input and writable output are confirmed and FG has not taken ownership. This change is not yet in a released package.
 

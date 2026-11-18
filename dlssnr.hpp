@@ -1846,13 +1846,27 @@ inline std::atomic_uint64_t ngx_entry_release[kMaxNgxSlots];
 // `shadow[sigs=]`, so these two complete the set.
 inline std::atomic_uint64_t device_create_list_entries{0};
 inline std::atomic_uint64_t queue_submit_entries{0};
-inline std::atomic_uint64_t queue_submit_exits{0};
 inline std::atomic_bool present_base_capture_active = false;
-inline std::recursive_mutex present_base_submit_mutex;
 
-inline bool PresentBaseSubmissionCurrent(uint64_t entry) {
-  return queue_submit_entries.load() == entry && queue_submit_exits.load() == entry;
-}
+// Only the actual queue for the live ordinary Present ring is observed.
+// Game submits may forward concurrently. Present takes the exclusive side
+// briefly to verify the tail and enqueue its private list without overtaking
+// application work on this queue.
+struct PresentQueueOrder {
+  explicit PresentQueueOrder(ID3D12CommandQueue* value) : queue(value) {}
+
+  ID3D12CommandQueue* const queue;
+  std::shared_mutex submit_mutex;
+  std::atomic_uint64_t entered{0};
+  std::atomic_uint64_t returned{0};
+  // An isolated submission publishes these under the shared lock. The next
+  // isolated submit starts after returned advances; readers take it exclusive.
+  uint64_t producer_entry = 0;
+  uint64_t producer_value = 0;
+};
+inline std::atomic<ID3D12CommandQueue*> observed_present_queue = nullptr;
+inline std::atomic<std::shared_ptr<PresentQueueOrder>> present_queue_order;
+inline thread_local PresentQueueOrder* committing_present_queue = nullptr;
 
 // Built-in defaults - the single source of truth for every user setting.  The
 // setting atomics below initialize from these, LoadConfiguration falls back
@@ -3656,8 +3670,6 @@ inline void CapturePresentGuides11(
     const NVSDK_NGX_Parameter* parameters);
 inline void PreservePresentCaptureProof(
     const void* marker, const std::vector<submission::GenerationSubmission>& submissions);
-// Queue detours precede the Present provenance storage.
-inline void ObservePresentBaseSubmission(uint64_t entry, UINT list_count);
 // The native service owns its frame cache in fg_native.hpp, included after
 // retirement; this callback preserves an exact producer receipt before prune.
 inline void PreserveNativePreFgProof(
@@ -20485,13 +20497,33 @@ inline void STDMETHODCALLTYPE HookedQueueExecuteCommandLists(
     ID3D12CommandQueue* queue,
     UINT count,
     ID3D12CommandList* const* command_lists) {
-  std::unique_lock present_order(present_base_submit_mutex, std::defer_lock);
+  queue_submit_entries.fetch_add(1, std::memory_order_relaxed);
+  std::shared_ptr<PresentQueueOrder> present_order;
+  if (committing_present_queue == nullptr && queue == observed_present_queue.load(std::memory_order_acquire)) {
+    present_order = present_queue_order.load(std::memory_order_acquire);
+    if (present_order != nullptr && present_order->queue != queue) {
+      present_order.reset();
+    }
+  }
   struct SubmissionScope {
-    const uint64_t entry = queue_submit_entries.fetch_add(1) + 1;
-    ~SubmissionScope() { queue_submit_exits.fetch_add(1); }
+    PresentQueueOrder* order;
+    std::shared_lock<std::shared_mutex> lock;
+    uint64_t entry = 0;
+    bool isolated = false;
+
+    explicit SubmissionScope(PresentQueueOrder* value) : order(value) {
+      if (order == nullptr) return;
+      lock = std::shared_lock(order->submit_mutex);
+      entry = order->entered.fetch_add(1) + 1;
+      isolated = order->returned.load() == entry - 1;
+    }
+    ~SubmissionScope() {
+      if (order != nullptr) {
+        order->returned.fetch_add(1);
+      }
+    }
   };
-  const SubmissionScope submit;
-  if (present_base_capture_active.load()) present_order.lock();
+  const SubmissionScope present_submit(present_order.get());
   // Phase 1 of the exact submission proof (v6 audit issue 01): reserve
   // pending submission slots on the submitted lists' current recording
   // generations BEFORE forwarding.  The reservation exists before this call
@@ -20616,7 +20648,11 @@ inline void STDMETHODCALLTYPE HookedQueueExecuteCommandLists(
     // never guessed.
     submission::CompleteSubmission(
         pending_submissions, completion_fence.fence, completion_value);
-    ObservePresentBaseSubmission(submit.entry, count);
+    if (present_submit.isolated && count == 1 && !completion_fence.empty()
+        && present_order->entered.load() == present_submit.entry) {
+      present_order->producer_entry = present_submit.entry;
+      present_order->producer_value = completion_value;
+    }
 #if defined(NR_NEXUS_DEV_CONTROL)
     if (NativePremiseEnabled()) {
       if (auto observe = native_premise_submit.load()) {
@@ -21348,8 +21384,10 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
   // injection would double-run are dedup-skipped inside ProcessInline.
   ComputeStateEnvelope state_envelope(
       (!nested_in_c_wrapper && !InsideDirectCall()) ? command_list : nullptr);
-  if (source_scope.owner) {
-    ObservePresentSourceWork(command_list, false);
+  if (source_scope.owner && present_base_capture_active.load(std::memory_order_relaxed)) {
+    auto* native_list = command_list;
+    renodx::utils::directx::NativeFromReShadeProxy(&native_list);
+    ObservePresentSourceWork(native_list, false);
   }
 #if defined(NR_NEXUS_DEV_CONTROL)
   const auto edit_fg_ticket = (frame_generation && source_scope.owner && !nested_in_c_wrapper && !InsideDirectCall()
@@ -21640,8 +21678,10 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
   inside_game_evaluate_wrapper = true;
   ComputeStateEnvelope state_envelope(
       InsideDirectCall() ? nullptr : command_list);
-  if (source_scope.owner) {
-    ObservePresentSourceWork(command_list, false);
+  if (source_scope.owner && present_base_capture_active.load(std::memory_order_relaxed)) {
+    auto* native_list = command_list;
+    renodx::utils::directx::NativeFromReShadeProxy(&native_list);
+    ObservePresentSourceWork(native_list, false);
   }
   const NVSDK_NGX_Result result = [&] {
     const NgxRuntimeCommandScope runtime_scope;

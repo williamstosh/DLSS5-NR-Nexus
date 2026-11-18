@@ -204,7 +204,7 @@ int RunNativeOptionsResumeTest(bool delayed_options = false);
 int RunNativeGuideContractTest();
 int RunPresentGuideModelsTest(bool native_ngx = false, const char* project_id_path = nullptr);
 int RunNativePresentDecisionTest();
-int RunNrEditReusePresentContracts();
+int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_only = false);
 
 int RunNativeRequiredMenuTest() {
   try {
@@ -776,7 +776,12 @@ int main(int argc, char** argv) {
 #endif
   if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-xefg-contracts") == 0) return nr_edit_reuse_xefg_cases::Run();
   if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-render-contracts") == 0) return nr_edit_reuse_render_cases::Run();
-  if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-present-contracts") == 0) return RunNrEditReusePresentContracts();
+  if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-present-contracts") == 0) {
+    return RunNrEditReusePresentContracts(nullptr);
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-present-diagnostic") == 0) {
+    return RunNrEditReusePresentContracts(nullptr, true);
+  }
   if (argc == 2 && (std::strcmp(argv[1], "--nr-edit-reuse-contracts") == 0
                    || std::strcmp(argv[1], "--nr-edit-reuse-contracts-public") == 0)) {
     return nr_edit_reuse_gpu_cases::Run();
@@ -784,6 +789,9 @@ int main(int argc, char** argv) {
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-inline") == 0) return adaptive_inline_cases::Run();
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-fg-service") == 0) return adaptive_fg_service_cases::Run();
 #if defined(NR_NEXUS_TEST_NATIVE_NGX)
+  if (argc == 3 && std::strcmp(argv[1], "--nr-edit-reuse-present-native") == 0) {
+    return RunNrEditReusePresentContracts(argv[2]);
+  }
   if (argc == 3 && std::strcmp(argv[1], "--nr-edit-reuse-cost") == 0) {
     return control_mask_gpu_cases::RunNativeNgx(
         argv[2], false, renodx::addons::dlss5::internal::kControlMaskRgb, false, false, false, false, false, false, true);
