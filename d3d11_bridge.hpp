@@ -1625,6 +1625,11 @@ inline bool RunBridge(ID3D11DeviceContext* context,
       return;
     }
     strict_delivery |= adaptive_bridge;
+    if (!strict_delivery && !pre && present == nullptr) {
+      // Let the original SR run while the CPU records NR. The input fence
+      // below still orders the shared copies after SR on this context.
+      bridge.context11->Flush();
+    }
     if (FAILED(slot.allocator->Reset())
         || FAILED(slot.list->Reset(slot.allocator, nullptr))) {
       bridge_skew.fetch_add(1, std::memory_order_relaxed);
