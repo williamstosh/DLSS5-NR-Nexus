@@ -1213,7 +1213,8 @@ class ScriptBackendTests(unittest.TestCase):
     def test_script_backend_ocr_is_limited_to_intro_and_title_before_bridge(self):
         for title in ('读取游戏 新游戏 退出游戏',
                       '读 取 游 戏 退 出 游 戏 游 戏 模 组 更 新 亮 点',
-                      '读取游戏 设置 游戏模组 制作人员 退出游戏'):
+                      '读取游戏 设置 游戏模组 制作人员 退出游戏',
+                      '重制版v5，01C NR GPU不可用 设置 游戏模组 更新亮点 制作人员 退 出 游 戏 CD PROJEKT RED'):
             with self.subTest(title=title), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 session = runner.Session(dict(executable=str(root / 'game.exe'), logs=[],
@@ -1244,6 +1245,8 @@ class ScriptBackendTests(unittest.TestCase):
                 ('script', ' '.join(runner.PAUSE_MENU)),
                 ('script', '读取游戏 游戏模组 退出游戏'),
                 ('script', '读取游戏 更新亮点 制作人员 退出游戏'),
+                ('script', '设置 游戏模组 制作人员 退出游戏'),
+                ('desktop', '设置 游戏模组 更新亮点 制作人员 退出游戏'),
                 ('desktop', '读取游戏 游戏模组 更新亮点 退出游戏'),
                 ('desktop', '读取游戏 游戏模组 制作人员 退出游戏')):
             with self.subTest(backend=backend, text=text), tempfile.TemporaryDirectory() as directory:
