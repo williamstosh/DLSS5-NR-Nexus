@@ -6119,6 +6119,8 @@ inline void ReleaseCodecPipeline() {
   ReleaseCom(codec_pipeline.encode_v6);
   ReleaseCom(codec_pipeline.linearize);
   ReleaseCom(codec_pipeline.root_signature);
+  ReleaseCom(codec_pipeline.look.compose_anchor);
+  ReleaseCom(codec_pipeline.look.anchor_root_signature);
   ReleaseCom(codec_pipeline.look.compose);
   ReleaseCom(codec_pipeline.look.band);
   ReleaseCom(codec_pipeline.look.upsample);
@@ -9788,7 +9790,8 @@ inline void BindCodecV6(
 template <size_t N>
 inline uint32_t RingSlot(
     ID3D12Resource* (&views)[N], const ID3D12Resource* resource,
-    std::atomic_uint64_t* recycled, std::atomic_uint64_t* full, const char* consequence) {
+    std::atomic_uint64_t* recycled = nullptr, std::atomic_uint64_t* full = nullptr,
+    const char* consequence = nullptr) {
   uint32_t ring = 0;
   while (ring < N && views[ring] != nullptr && views[ring] != resource) ++ring;
   const bool proofs = queue_tracking_active.load();
@@ -9797,16 +9800,37 @@ inline uint32_t RingSlot(
     while (ring < N && !submission::ResourceReleasable(views[ring])) ++ring;
     if (ring < N) {
       ReleaseCom(views[ring]);
-      recycled->fetch_add(1, std::memory_order_relaxed);
+      if (recycled != nullptr) {
+        recycled->fetch_add(1, std::memory_order_relaxed);
+      }
     }
   }
-  if (ring == N && full->fetch_add(1, std::memory_order_relaxed) == 0) {
+  if (ring == N && full != nullptr && full->fetch_add(1, std::memory_order_relaxed) == 0) {
     Log(reshade::log::level::warning,
         std::string("a view ring is full and no entry is provably idle")
             + (proofs ? "" : " (the queue hooks are not live, so none can be)") + ": "
             + consequence + " on such frames (counted as ring_full)");
   }
   return ring;
+}
+
+inline uint32_t PrepareDepthView(
+    ID3D12Device* device, ID3D12GraphicsCommandList* command_list, FinalResources& resources,
+    ID3D12Resource* depth, DXGI_FORMAT view_format, uint32_t ring) {
+  const uint32_t descriptor = kDescriptorControlMaskDepthSrv + ring;
+  if (resources.control_mask_depth_views[ring] == nullptr) {
+    depth->AddRef();
+    resources.control_mask_depth_views[ring] = depth;
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Format = view_format;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Texture2D.MipLevels = 1;
+    device->CreateShaderResourceView(depth, &view, DescriptorHeapSlot(
+        resources.descriptors->GetCPUDescriptorHandleForHeapStart(), descriptor, resources.descriptor_size));
+  }
+  submission::TrackUse(command_list, depth);
+  return descriptor;
 }
 
 inline bool DispatchControlMask(
@@ -9900,19 +9924,8 @@ inline bool DispatchControlMask(
       1, DescriptorHeapSlot(heap_start, kDescriptorControlMaskUav, resources.descriptor_size));
   uint32_t depth_descriptor = kDescriptorControlMaskDepthNullSrv;
   if (depth_usable) {
-    if (resources.control_mask_depth_views[depth_ring] == nullptr) {
-      depth->AddRef();
-      resources.control_mask_depth_views[depth_ring] = depth;
-      D3D12_SHADER_RESOURCE_VIEW_DESC depth_srv{};
-      depth_srv.Format = ControlMaskDepthViewFormat(depth_desc.Format);
-      depth_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-      depth_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-      depth_srv.Texture2D.MipLevels = 1;
-      device->CreateShaderResourceView(depth, &depth_srv,
-          DescriptorHeapSlot(heap_cpu, kDescriptorControlMaskDepthSrv + depth_ring, resources.descriptor_size));
-    }
-    submission::TrackUse(command_list, depth);
-    depth_descriptor = kDescriptorControlMaskDepthSrv + depth_ring;
+    depth_descriptor = PrepareDepthView(
+        device, command_list, resources, depth, ControlMaskDepthViewFormat(depth_desc.Format), depth_ring);
   }
   command_list->SetComputeRootDescriptorTable(
       3, DescriptorHeapSlot(heap_start, depth_descriptor, resources.descriptor_size));
@@ -10470,6 +10483,7 @@ struct LookRoute {
   // The compose wrote N' for this pass: the restores measure NR's own lift
   // from the codec set's unshaped N (RunBlackLevelRestore, the v6 reduce).
   bool shaped = false;
+  bool anchor_captured = false;
 };
 
 // The look history's per-frame decision, shared by D3D12's RunLookStage and
@@ -10560,6 +10574,7 @@ inline LookRoute RunLookStage(
 #if defined(NR_NEXUS_DEV_CONTROL)
     , uint64_t bridge_model_capture_serial = 0
 #endif
+    , const edit_reuse::Inputs* anchor_inputs = nullptr
 ) {
   const uint32_t codec_set = pass * kCodecSrvSetStride;
   const LookRoute unchanged{
@@ -10719,10 +10734,48 @@ inline LookRoute RunLookStage(
   look::Settings shaping = settings;
   if (!temporal) shaping.stabilize = 0;
   const look::Constants constants = look::MakeConstants(shaping, look_frame);
+  look::AnchorCapture capture;
+  auto& pipeline = codec_pipeline.look;
+  if (anchor_inputs != nullptr && temporal && !codec_pipeline.incremental_preparation
+      && anchor_inputs->width == res.input_width && anchor_inputs->height == res.input_height) {
+    if (!pipeline.compose_anchor_attempted) {
+      pipeline.compose_anchor_attempted = true;
+      ID3DBlob* serialized = nullptr;
+      ID3DBlob* errors = nullptr;
+      const HRESULT result = look::SerializeRootSignature(
+          renodx::utils::directx::pD3D12SerializeRootSignature, &serialized, &errors, true);
+      if (CreateRootSignature(
+              device, result, serialized, errors, &pipeline.anchor_root_signature,
+              L"" NR_NEXUS_NAME " look compose anchor root",
+              "look compose anchor root serialization failed: ", "look compose anchor root creation failed: ")) {
+        CreateCodecPipelineState(
+            device, __look_compose_anchor, &pipeline.compose_anchor,
+            L"" NR_NEXUS_NAME " look compose anchor", "look compose anchor", pipeline.anchor_root_signature);
+      }
+    }
+    if (pipeline.compose_anchor != nullptr) {
+      const uint32_t ring = RingSlot(res.control_mask_depth_views, anchor_inputs->depth);
+      if (ring < kControlMaskDepthRingSize) {
+        const uint32_t depth_descriptor = PrepareDepthView(
+            device, command_list, res, anchor_inputs->depth, anchor_inputs->depth_view_format, ring);
+        capture = {
+            .depth = DescriptorHeapSlot(heap_gpu, depth_descriptor, res.descriptor_size),
+            .anchor = slot.edit_reuse->anchor->GetGPUVirtualAddress(),
+            .constants = {
+                .guide_size = {anchor_inputs->motion_width, anchor_inputs->motion_height},
+                .guide_offset = {anchor_inputs->raster_offset_x, anchor_inputs->raster_offset_y},
+            },
+        };
+      }
+    }
+  }
   Transition(
       command_list, res.look_output, res.look_output_state,
       D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-  look::RecordCompose(command_list, codec_pipeline.look, bindings, constants);
+  // PREPARE tracked the cache. The temporal pre-barrier and Compose's
+  // post-barrier order its anchor write against earlier and later reuse.
+  const bool anchor_captured = capture.anchor != 0;
+  look::RecordCompose(command_list, pipeline, bindings, constants, anchor_captured ? &capture : nullptr);
   Transition(
       command_list, res.look_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -10736,7 +10789,7 @@ inline LookRoute RunLookStage(
   if (!transport) {
     gpu_timers::Mark(command_list, gpu_timers::PassLookEnd(pass));
     return {kDescriptorLookSet + codec_set, res.input_width, res.input_height,
-            res.input_width, res.input_height, true};
+            res.input_width, res.input_height, true, anchor_captured};
   }
   for (ID3D12Resource* surface : {res.look_up_proxy, res.look_up_neural}) {
     Transition(
@@ -10752,7 +10805,7 @@ inline LookRoute RunLookStage(
   look_transport_passes.fetch_add(1, std::memory_order_relaxed);
   gpu_timers::Mark(command_list, gpu_timers::PassLookEnd(pass));
   return {kDescriptorTransportSet + codec_set, res.width, res.height, res.width,
-          res.height, true};
+          res.height, true, anchor_captured};
 }
 
 inline bool SubrectFits(
@@ -13627,8 +13680,8 @@ inline EditReuseRecording RecordEditReuseBeforeEvaluate(
   recorded.cache = cache.get();
   if (!cache->valid) return recorded;
   if (!cache->reused) {
-    recorded.reused = edit_reuse::Record(device, list, recorded.cache, recorded.inputs, edit_reuse::Phase::APPLY)
-        && edit_reuse::Record(device, list, recorded.cache, recorded.inputs, edit_reuse::Phase::SNAPSHOT_MOTION);
+    recorded.reused = edit_reuse::Record(device, list, recorded.cache, recorded.inputs,
+                                        edit_reuse::Phase::APPLY_AND_SNAPSHOT_MOTION);
     if (recorded.reused) {
       cache->reused = true;
       cache->source_sequence = sequence;
@@ -13651,9 +13704,11 @@ inline EditReuseRecording RecordEditReuseBeforeEvaluate(
 }
 
 inline void CaptureEditReuse(
-    ID3D12Device* device, ID3D12GraphicsCommandList* list, const EditReuseRecording& recorded, uint64_t sequence) {
+    ID3D12Device* device, ID3D12GraphicsCommandList* list, const EditReuseRecording& recorded,
+    uint64_t sequence, bool captured_in_look = false) {
   auto* cache = recorded.cache;
-  cache->valid = edit_reuse::Record(device, list, cache, recorded.inputs, edit_reuse::Phase::CAPTURE);
+  cache->valid = captured_in_look
+      || edit_reuse::Record(device, list, cache, recorded.inputs, edit_reuse::Phase::CAPTURE);
   cache->reused = false;
   cache->source_sequence = sequence;
   if (cache->valid) {
@@ -15482,6 +15537,16 @@ inline bool RecordInline(
       if (benchmark_expected_reuse && !edit.reused) benchmark_frame->expected_reuse_failed = true;
 #endif
     }
+    const bool capture_edit_in_look = !edit.reused && edit.cache != nullptr && edit_reuse_fixed_inline_route;
+    const auto capture_edit = [&](bool captured_in_look) {
+      CaptureEditReuse(device, command_list, edit, edit_reuse_sequence, captured_in_look);
+#if defined(NR_NEXUS_DEV_CONTROL)
+      if (!edit.cache->valid) {
+        fg_output_marker_window.StopSource(reinterpret_cast<uintptr_t>(handle), feature.source_generation,
+            "source_anchor_capture_failed");
+      }
+#endif
+    };
     if (edit.reused) {
       UavBarrier(command_list, res.nr_output);
       Transition(command_list, res.nr_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -15705,14 +15770,8 @@ inline bool RecordInline(
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
       }
       res.nr_output_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-      if (edit.cache != nullptr) {
-        CaptureEditReuse(device, command_list, edit, edit_reuse_sequence);
-#if defined(NR_NEXUS_DEV_CONTROL)
-        if (!edit.cache->valid) {
-          fg_output_marker_window.StopSource(reinterpret_cast<uintptr_t>(handle), feature.source_generation,
-              "source_anchor_capture_failed");
-        }
-#endif
+      if (edit.cache != nullptr && !capture_edit_in_look) {
+        capture_edit(false);
       }
       if (edit_reuse_route_eligible) {
         if (edit_reuse_present_route && recording != nullptr) {
@@ -15778,13 +15837,18 @@ inline bool RecordInline(
 #if defined(NR_NEXUS_DEV_CONTROL)
           , bridge_model_serial
 #endif
+          , capture_edit_in_look ? &edit.inputs : nullptr
       );
+    }
+    if (capture_edit_in_look) {
+      capture_edit(route.anchor_captured);
     }
 #if defined(NR_NEXUS_DEV_CONTROL)
     if (benchmark_frame != nullptr) {
       auto& sample = benchmark_frame->passes[pass];
       sample.look = route.shaped;
       sample.detail_temporal = look_stability_passes.load() != benchmark_detail_before;
+      sample.refresh_capture_fused = route.anchor_captured;
       if (edit.reused) {
         const auto& slot = feature.slots[pass];
         sample.auto_mask = slot.model_sent[4] != 0.f;

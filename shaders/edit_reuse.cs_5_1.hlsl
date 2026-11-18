@@ -9,7 +9,7 @@ Texture2D<float2> Motion : register(t2);
 Texture2D<float> Depth : register(t3);
 Texture2D<float4> Original : register(t4);
 RWTexture2D<float4> Target : register(u0);
-// 32 bytes/pixel: float4(log2 edit RGB, valid guide), float4(linear P RGB, depth).
+// 32 bytes/pixel: float4(log2 edit RGB, valid guide), float4(log2 floored P RGB, depth).
 RWByteAddressBuffer Anchor : register(u1);
 RWByteAddressBuffer PreviousMotion : register(u2);  // float2 render-pixel displacement
 RWByteAddressBuffer Validity : register(u3);        // uint 0 invalid, 1 valid
@@ -81,6 +81,11 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     if (!valid) Target[pixel] = Original.Load(int3(pixel, 0));
     return;
   }
+  // APPLY reads current Motion. It does not consume PreviousMotion until the next frame.
+  if (Phase == 6u && all(pixel < MotionSize)) {
+    const uint address = (pixel.y * MotionSize.x + pixel.x) * 8u;
+    PreviousMotion.Store2(address, asuint(Motion.Load(int3(pixel, 0)) * MotionScale));
+  }
   if (any(pixel >= Size)) return;
   const uint index = pixel.y * Size.x + pixel.x;
   const float2 guide_offset = (ColorUsesGuideRaster != 0u ? 0.0 : RasterOffset);
@@ -92,9 +97,12 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   const float3 reference = SrgbDecode(encoded.rgb);
   if (Phase == 0u) {
     const float3 neural = SrgbDecode(Neural.Load(int3(pixel, 0)).rgb);
-    const float3 edit = log2(max(neural, kEditFloor)) - log2(max(reference, kEditFloor));
-    Anchor.Store4(index * 32u, asuint(float4(edit, guide_valid ? 1.0 : 0.0)));
-    Anchor.Store4(index * 32u + 16u, asuint(float4(reference, depth)));
+    const float3 log_reference = log2(max(reference, kEditFloor));
+    const float3 edit = log2(max(neural, kEditFloor)) - log_reference;
+    const uint3 reference_exponent = asuint(reference) & 0x7f800000u;
+    const bool valid = guide_valid && all(reference_exponent != 0x7f800000u);
+    Anchor.Store4(index * 32u, asuint(float4(edit, valid ? 1.0 : 0.0)));
+    Anchor.Store4(index * 32u + 16u, asuint(float4(log_reference, depth)));
     return;
   }
   const float2 d = (Motion.Load(int3(guide, 0)) * MotionScale + AnchorRasterDelta) * float2(Size) / float2(MotionSize);
@@ -103,6 +111,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
       && isfinite(depth) && all(isfinite(reference)) && all(reference >= kEditFloor);
   float3 edit = 0.0;
   if (valid) {
+    const float3 log_reference = log2(max(reference, kEditFloor));
     const uint2 lo = uint2(floor(previous));
     const uint2 hi = min(lo + 1u, Size - 1u);
     const uint2 taps[4] = {lo, uint2(hi.x, lo.y), uint2(lo.x, hi.y), hi};
@@ -113,7 +122,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
       const uint address = (taps[tap].y * Size.x + taps[tap].x) * 32u;
       const float4 cached_edit = asfloat(Anchor.Load4(address));
       const float4 cached = asfloat(Anchor.Load4(address + 16u));
-      const float3 change = abs(log2(max(reference, kEditFloor)) - log2(max(cached.rgb, kEditFloor)));
+      const float3 change = abs(log_reference - cached.rgb);
       valid = valid && cached_edit.a > 0.5 && all(isfinite(cached)) && all(isfinite(cached_edit))
           && abs(depth - cached.a) <= 0.01 + 0.02 * abs(depth)
           && all(change <= kReferenceLimit);

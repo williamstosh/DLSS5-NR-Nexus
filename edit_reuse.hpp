@@ -8,6 +8,7 @@
 #include <d3d12.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstdint>
@@ -27,6 +28,7 @@ enum class Phase : uint32_t {
   SNAPSHOT_MOTION = 3,
   SELECT_ORIGINAL = 4,
   PREPARE = 5,
+  APPLY_AND_SNAPSHOT_MOTION = 6,
 };
 
 struct Inputs {
@@ -261,7 +263,9 @@ inline bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list,
   list->SetComputeRootSignature(state->root.Get());
   list->SetPipelineState(state->pipeline.Get());
   auto gpu = binding->heap->GetGPUDescriptorHandleForHeapStart();
-  gpu.ptr += static_cast<UINT64>(phase) * 7ull * stride;
+  const bool apply_and_snapshot = phase == Phase::APPLY_AND_SNAPSHOT_MOTION;
+  const auto dispatch_phase = apply_and_snapshot ? Phase::APPLY : phase;
+  gpu.ptr += static_cast<UINT64>(dispatch_phase) * 7ull * stride;
   list->SetComputeRootDescriptorTable(0, gpu);
   list->SetComputeRootDescriptorTable(1, {gpu.ptr + 5ull * stride});
   list->SetComputeRootDescriptorTable(2, {gpu.ptr + 6ull * stride});
@@ -277,11 +281,13 @@ inline bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list,
       std::bit_cast<uint32_t>(inputs.anchor_raster_delta_x), std::bit_cast<uint32_t>(inputs.anchor_raster_delta_y)};
   list->SetComputeRoot32BitConstants(6, 16, constants.data(), 0);
   const bool motion_phase = phase == Phase::MOTION || phase == Phase::SNAPSHOT_MOTION;
-  const uint32_t dispatch_width = (motion_phase ? inputs.motion_width
-      : (phase == Phase::SELECT_ORIGINAL ? output_width : inputs.width));
-  const uint32_t dispatch_height = (motion_phase ? inputs.motion_height
-      : (phase == Phase::SELECT_ORIGINAL ? output_height : inputs.height));
-  list->Dispatch((dispatch_width + 7) / 8, (dispatch_height + 7) / 8, 1);
+  const uint32_t dispatch_width = motion_phase ? inputs.motion_width
+      : (phase == Phase::SELECT_ORIGINAL ? output_width : inputs.width);
+  const uint32_t dispatch_height = motion_phase ? inputs.motion_height
+      : (phase == Phase::SELECT_ORIGINAL ? output_height : inputs.height);
+  const uint32_t covered_width = apply_and_snapshot ? std::max(dispatch_width, inputs.motion_width) : dispatch_width;
+  const uint32_t covered_height = apply_and_snapshot ? std::max(dispatch_height, inputs.motion_height) : dispatch_height;
+  list->Dispatch((covered_width + 7) / 8, (covered_height + 7) / 8, 1);
   list->ResourceBarrier(1, &barrier);
   return true;
 }

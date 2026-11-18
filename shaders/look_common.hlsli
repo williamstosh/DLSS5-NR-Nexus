@@ -102,6 +102,9 @@ static const float kMidGain = 1.0;
 // The network's edit at one NR pixel (section 2 of the plan).
 struct Edit {
   float3 n;   // linear network output
+#if defined(NR_EDIT_REUSE_CAPTURE)
+  float3 p;   // unfloored proxy for the anchor validity check
+#endif
   float3 lp;  // log2 of the linear input, floored
   float3 e;   // per-channel edit, stops
   float a;    // achromatic edit: w-weighted mean of e
@@ -113,6 +116,9 @@ struct Edit {
 Edit ReadEdit(int2 pixel) {
   Edit x;
   const float3 p = SrgbDecode(Proxy.Load(int3(pixel, 0)).rgb);
+#if defined(NR_EDIT_REUSE_CAPTURE)
+  x.p = p;
+#endif
   x.n = SrgbDecode(Neural.Load(int3(pixel, 0)).rgb);
   x.lp = log2(max(p, kRatioFloor));
   x.e = log2(max(x.n, kRatioFloor)) - x.lp;
