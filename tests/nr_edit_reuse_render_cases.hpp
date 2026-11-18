@@ -153,6 +153,7 @@ int Run() {
     native::intensity = 1.f;
     native::preset = 2;
     native::edit_reuse_enabled = true;
+    native::monitor_requested = true;
     native::direct_api.module = GetModuleHandleW(nullptr);
     native::direct_api.create = stage_execution_cases::Create;
     native::direct_api.evaluate = EvaluateStampedModel;
@@ -364,9 +365,21 @@ int Run() {
           "game Reset refreshes the edit with current-frame motion");
 
     const FrameInput shifted{.jitter_x = .5f, .split_motion = true};
+    const auto render_anchor = native::features.at(handle).slots[0].edit_reuse;
+    const auto look_stabilized = native::look_stability_passes.load();
+    native::detail_stability = 0;
+    native::nr_follow_input_res = true;
+    native::nr_resolution_scale = .75f;
     native::native_fg_declaration = native::NativeFgDeclaration::kOn;
     const auto reuse = frame(shifted);
-    Check(reuse.model_calls == 0 && reuse.swapped_color, "game SR receives the reused edit across an FG declaration change");
+    Check(reuse.model_calls == 0 && reuse.swapped_color
+              && native::features.at(handle).slots[0].edit_reuse == render_anchor
+              && native::look_stability_passes.load() == look_stabilized,
+          "Render Auto detail and following matching guides keep the Off/full-size x2 anchor across an FG declaration change");
+    const auto& observed_reuse = native::features.at(handle).edit_reuse_monitor[0];
+    Check(observed_reuse.delivery == native::EditReuseDelivery::REUSED && observed_reuse.recording != nullptr
+              && observed_reuse.recording->submitted.load(),
+          "the real SR wrapper publishes delivery for the measured Render reuse");
     const auto& refresh_timer = refresh.completed_timer;
     const auto& reuse_timer = reuse.completed_timer;
     Check(refresh.timer_published && refresh_timer.valid && refresh_timer.queue == gpu.queue.Get()
@@ -390,11 +403,13 @@ int Run() {
           "SR pixels witness same-raster guide sampling and the jitter-corrected edit address");
 
     native::native_fg_declaration = native::NativeFgDeclaration::kUnknown;
+    native::nr_follow_input_res = false;
+    native::nr_resolution_scale = std::nextafter(1.f, 0.f);
     const auto composed_refresh = frame({});
     Check(composed_refresh.model_calls == 1 && composed_refresh.swapped_color && model_resets.back() == 0
               && composed_motion.format == DXGI_FORMAT_R32G32_FLOAT && composed_motion.width == RENDER_SIZE
-              && composed_motion.height == RENDER_SIZE,
-          "following refresh feeds separate composed motion to the real NR call with History preserved");
+              && composed_motion.height == RENDER_SIZE && native::features.at(handle).slots[0].edit_reuse == render_anchor,
+          "a scale rounded to the same applied grid preserves History and the following refresh receives composed motion");
     const auto mv_bytes = composed_motion.Pixels();
     MotionPixel composed{};
     std::memcpy(composed.data(), mv_bytes.data() + (edge - 2) * sizeof(MotionPixel), sizeof(composed));
@@ -432,6 +447,10 @@ int Run() {
     const auto sr_failure = frame({.reset = 1, .sr_result = NVSDK_NGX_Result_FAIL_InvalidParameter});
     Check(sr_failure.model_calls == 1 && sr_failure.swapped_color,
           "SR failure restoration is exercised with an actual replacement Color");
+    const auto& observed_failure = native::features.at(handle).edit_reuse_monitor[0];
+    Check(observed_failure.delivery == native::EditReuseDelivery::NONE
+              && observed_failure.reason == native::EditReuseBlock::SR_FAILED,
+          "a rejected real SR publishes the failure and never promotes its Render recording to delivered output");
     const auto after_sr_failure = frame({});
     Check(after_sr_failure.model_calls == 1 && after_sr_failure.swapped_color && model_resets.back() == 1
               && composed_motion.readback == nullptr,

@@ -2979,8 +2979,26 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     guides->read_value = slot->value;
   }
   if (base_frame) {
-    if (!signaled || !recording.output_ready || !recording.group_complete
-        || (!recording.model_recorded && !recording.edit_reused)) {
+    const bool delivered = signaled && recording.output_ready && recording.group_complete
+        && (recording.model_recorded || recording.edit_reused);
+    if ((delivered || (signaled && recording.edit_monitor_delivery == EditReuseDelivery::ORIGINAL))
+        && recording.edit_monitor_delivery != EditReuseDelivery::NONE && guides != nullptr) {
+      const auto source = features.find(guides->source_handle);
+      auto* const backbuffer = GetD3D12Resource(&block, NVSDK_NGX_Parameter_Output);
+      if (source != features.end() && source->second.source_generation == target.diagnostic_source_generation
+          && backbuffer != nullptr) {
+        const auto desc = backbuffer->GetDesc();
+        auto observed = ObserveEditReuseMonitorFrame(source->second, direct_device, stage_plan::Stage::PRESENT,
+            static_cast<uint32_t>(desc.Width), desc.Height);
+        observed.delivery_epoch = target.base_frame_epoch;
+        observed.surface = renodx::utils::directx::NativeIdentity(backbuffer);
+        observed.delivery = recording.edit_monitor_delivery;
+        observed.reason = recording.edit_monitor_reason;
+        observed.handed_off = observed.surface != nullptr;
+        if (observed.handed_off) PublishEditReuseMonitorFrame(&source->second, nullptr, std::move(observed));
+      }
+    }
+    if (!delivered) {
       ResetPresentStreamHistory(&stream);
       return false;
     }

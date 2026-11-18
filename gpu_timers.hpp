@@ -167,6 +167,9 @@ struct Segment {
   uint32_t color_role = 0;  // 0: ordinary chain, 1: FG backbuffer, 2: FG HUDLess.
   gpu_comparison::Sample comparison;
   uint64_t diagnostic_token = 0;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  uint64_t benchmark_token = 0;
+#endif
   adaptive_resolution::Frame adaptive;
   bool service_scope = false;
   ID3D12GraphicsCommandList* service_list = nullptr;  // Borrowed only while current.active.
@@ -222,6 +225,9 @@ inline uint64_t device_session = 0;
 // Optional experiment consumer; observes the original, unaveraged completion
 // result. A token belongs to the recording, never to the current configuration.
 inline void (*raw_observer)(const Stats&, uint64_t) = nullptr;
+#if defined(NR_NEXUS_DEV_CONTROL)
+inline void (*benchmark_observer)(const Stats&, uint64_t) = nullptr;
+#endif
 // Dedicated HUD history is dormant until the visible trend view requests it.
 // Producers and the UI drain hold runtime_mutex; only the enable flag crosses
 // callbacks without that lock. Overflow is reported as a history gap.
@@ -388,13 +394,20 @@ inline void Reject(const Segment& s, SampleState state) {
         .paired = s.adaptive.paired, .pair_first_frame = s.adaptive.pair_first_frame,
         .sampling_generation = s.adaptive.sampling_generation}, NowNs());
   }
-  if (s.measure && s.diagnostic_token != 0 && raw_observer != nullptr && state != SampleState::PENDING) {
+  if (s.measure && state != SampleState::PENDING && ((s.diagnostic_token != 0 && raw_observer != nullptr)
+#if defined(NR_NEXUS_DEV_CONTROL)
+      || (s.benchmark_token != 0 && benchmark_observer != nullptr)
+#endif
+      )) {
     Stats rejected{.width = s.width, .height = s.height, .passes = s.passes,
                    .state = state, .sequence = s.sequence, .measured_ns = NowNs(),
                    .identity = s.comparison.identity,
                    .recorded_ns = static_cast<int64_t>(s.comparison.recorded_ns)};
     std::memcpy(rejected.path, s.path, sizeof(rejected.path));
-    raw_observer(rejected, s.diagnostic_token);
+    if (s.diagnostic_token != 0 && raw_observer != nullptr) raw_observer(rejected, s.diagnostic_token);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (s.benchmark_token != 0 && benchmark_observer != nullptr) benchmark_observer(rejected, s.benchmark_token);
+#endif
   }
   if (!s.measure) {
     if (state != SampleState::PENDING) {
@@ -547,6 +560,9 @@ inline bool Publish(const Segment& s, bool log, const void* queue) {
   if (s.diagnostic_token != 0 && raw_observer != nullptr) {
     raw_observer(next, s.diagnostic_token);
   }
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (s.benchmark_token != 0 && benchmark_observer != nullptr) benchmark_observer(next, s.benchmark_token);
+#endif
   if (superseded) return false;
   QueueMonitorSample(next);
   if (s.comparison.sequence != 0 && ComparisonActive()) {
@@ -756,6 +772,9 @@ inline bool Begin(
   s.passes = {};
   s.comparison = {};
   s.diagnostic_token = 0;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  s.benchmark_token = 0;
+#endif
   s.adaptive = {};
   s.service_scope = service_scope;
   s.service_list = (service_scope ? command_list : nullptr);

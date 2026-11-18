@@ -1270,6 +1270,10 @@ int main(int argc, char** argv) {
                 && Read("NRPass3Preset") == std::to_string(runtime::pass_preset[1].load())
                 && Read("NRPass4Preset") == std::to_string(runtime::pass_preset[2].load()),
             "production persistence saves raw model choices, not runtime fallback values");
+      runtime::stack_passes = 2;
+      runtime::direct_runtime_requirements.dual_models = true;
+      runtime::preset = 1;
+      runtime::pass_preset[0] = 0;
       const uint64_t generation = runtime::configuration_generation.load();
       runtime::kSetPreset.Commit(2.f);
       runtime::kSetPassPreset[0].Commit(1.f);
@@ -1277,6 +1281,25 @@ int main(int argc, char** argv) {
             "main and per-pass model changes each trigger production feature recreation");
       runtime::kSetPassPreset[0].Commit(0.f);
       Check(runtime::pass_preset[0] == 0 && Read("NRPass2Preset") == "0", "inherit reset is persisted");
+      const auto equivalent_generation = runtime::configuration_generation.load();
+      const auto equivalent_reset = runtime::history_reset_epoch.load();
+      const auto equivalent_restore = runtime::present_restore_configuration.epoch;
+      runtime::kSetPreset.Commit(0.f);
+      Check(Read("NRPreset") == "0" && runtime::configuration_generation.load() == equivalent_generation
+                && runtime::history_reset_epoch.load() == equivalent_reset
+                && runtime::present_restore_configuration.epoch == equivalent_restore,
+            "B to Auto persists the new choice and preserves both active B histories");
+      runtime::kSetPassPreset[0].Commit(2.f);
+      Check(Read("NRPass2Preset") == "2" && runtime::configuration_generation.load() == equivalent_generation,
+            "explicit B and inherited B share a creation request");
+      std::string model_preset_error;
+      Check(runtime::preset_ui::Apply(
+                {.scope = renodx::addons::dlss5::presets::Scope::QUALITY, .settings = {{"NRPreset", 2}}},
+                false, false, &model_preset_error, false, nullptr, true)
+                && Read("NRPreset") == "2" && runtime::configuration_generation.load() == equivalent_generation
+                && runtime::history_reset_epoch.load() == equivalent_reset
+                && runtime::present_restore_configuration.epoch == equivalent_restore,
+            "applying the equivalent Auto to B preset preserves the resolved model, history and restore identities");
       renodx::addons::dlss5::bridge::OwnedParameters parameters;
       for (uint32_t selected : {1u, 2u}) {
         runtime::SetNrCreateParameters(&parameters, 640, 360, 640, 360, 0, false, selected);

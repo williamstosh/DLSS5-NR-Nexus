@@ -12,7 +12,7 @@ inline Json last_receipt;
 
 inline bool Allowed(std::string_view key) {
   constexpr std::string_view base[] = {
-      "NeuralUplift", "NRDisableRelease", "NRHookPoint", "NRPasses", "NRFollowInputRes", "NRResolutionScale",
+      "NeuralUplift", "NRDisableRelease", "NRHookPoint", "NRPasses", "NRFollowInputRes", "NRResolutionScale", "NREditReuse",
       "NRAdaptiveEnabled", "NRAdaptiveTargetFPS", "NRAdaptiveMinScale", "NRAdaptiveLevelCount", "NRAdaptiveLimitedResidency",
       "NRControlMaskEnabled",
       "NRControlMaskMode", "NRControlMaskBlendMode", "NRControlMaskRed", "NRControlMaskGreen",
@@ -619,7 +619,8 @@ inline Json Execute(const Json& request) {
 #endif
   const bool marker_operation = *operation == "fg_output_marker";
   const bool consumer_operation = *operation == "fg_consumer_capture";
-  const bool compact_operation = marker_operation || consumer_operation
+  const bool benchmark_operation = *operation == "sr_benchmark";
+  const bool compact_operation = marker_operation || consumer_operation || benchmark_operation
 #if defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
       || xefg_operation
 #endif
@@ -654,6 +655,10 @@ inline Json Execute(const Json& request) {
   }
   if (consumer_operation && request.value("action", Json(nullptr)) == "status") {
     return {{"id", *id}, {"ok", true}, {"status", "observed"}, {"capture", consumer_snapshot()},
+        {"state", ProcessIdentityState()}};
+  }
+  if (benchmark_operation && request.value("action", Json(nullptr)) == "status") {
+    return {{"id", *id}, {"ok", true}, {"status", "observed"}, {"capture", control_mask_capture::benchmark::Status()},
         {"state", ProcessIdentityState()}};
   }
   if (*operation == "status") {
@@ -712,6 +717,60 @@ inline Json Execute(const Json& request) {
   const bool configuration_busy = shutting_down.load() || slider_pending != nullptr || stage_edit::pending || resolution_edit::pending
       || stage_edit_request.setting != nullptr || !resolution_edit_request.empty() || profile_ui::Busy()
       || profile_ui::pending_action != profile_ui::Action::NONE || preset_ui::manager_geometry.was_open;
+  if (benchmark_operation) {
+    namespace benchmark = control_mask_capture::benchmark;
+    const auto action = request.value("action", Json(nullptr));
+    const auto environment = [] {
+      const auto xefg = fg::xefg::QueryEnabledContext();
+      int64_t xefg_last_proxy_present_ns = 0;
+      {
+        // ObserveXeFG runs at the real proxy Present return, even on a failed or OFF status.
+        std::shared_lock lock(output_framerate::internal::state.mutex);
+        xefg_last_proxy_present_ns = output_framerate::internal::state.xefg_ns;
+      }
+      return Json{{"sampled_ns", SteadyNowNs()}, {"native_fg_calls", benchmark::native_fg_calls.load()},
+          {"native_fg_successes", benchmark::native_fg_successes.load()},
+          {"native_fg_declaration", static_cast<uint32_t>(native_fg_declaration.load())},
+          {"native_fg_owns", native_fg_owns.load()}, {"xefg_enabled", fg::xefg::Enabled()},
+          {"xefg_owns", fg::xefg::OwnsStream()}, {"xefg_context", xefg.context_identity},
+          {"xefg_context_state", xefg.reason}, {"xefg_nr_submissions", fg::xefg::SubmittedFrames()},
+          {"xefg_last_proxy_present_ns", xefg_last_proxy_present_ns}};
+    };
+    const auto settings = [] {
+      auto captured = preset_ui::Capture(presets::Scope::FULL, Json::object()).settings;
+      captured["NeuralUplift"] = enabled.load();
+      captured["NREditReuse"] = edit_reuse_enabled.load();
+      return captured;
+    };
+    response["reason"] = "invalid_benchmark_request";
+    bool applied = false;
+    if (action == "arm") {
+      const auto frames = request.find("max_frames");
+      const auto seconds = request.find("seconds");
+      if (frames == request.end() || seconds == request.end() || !frames->is_number_unsigned()
+          || !seconds->is_number_unsigned() || *frames < 1 || *frames > 8192 || *seconds < 1 || *seconds > 180) return finish();
+      if (configuration_busy || !gpu_timers_enabled.load() || !queue_tracking_active.load()) {
+        response["reason"] = configuration_busy ? "configuration_busy" : "requires_gpu_timers_and_queue_tracking";
+        return finish();
+      }
+      applied = benchmark::Arm(frames->get<uint32_t>(), seconds->get<uint32_t>(), environment(), settings());
+    } else if (action == "mark") {
+      const auto label = request.find("label");
+      if (label == request.end() || !label->is_string()) return finish();
+      const auto& value = label->get_ref<const std::string&>();
+      if (value.empty() || value.size() > 32 || !std::all_of(value.begin(), value.end(), [](unsigned char c) {
+            return std::isalnum(c) || c == '-' || c == '_';
+          })) return finish();
+      applied = benchmark::Mark(value, environment(), settings());
+    } else if (action == "stop") {
+      applied = benchmark::Stop("requested_stop", environment());
+    } else {
+      return finish();
+    }
+    response.update({{"ok", applied}, {"status", applied ? "accepted" : "rejected"},
+        {"reason", applied ? "benchmark_request_accepted" : "benchmark_state_conflict"}, {"capture", benchmark::Status()}});
+    return finish();
+  }
   if (*operation == "reset_nr") {
     response["reason"] = "invalid_reset_request";
     if (request.size() != 2) return finish();

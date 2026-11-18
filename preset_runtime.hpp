@@ -464,11 +464,14 @@ inline bool Apply(const presets::Document& document, bool compatibility, bool re
   Json writes = Json::object();
   SettingEffect effect = SettingEffect::kNone;
   bool restart = false;
+  bool non_model_change = false;
+  const auto previous_model_requests = ActiveNrModelRequests();
   for (auto& row : changes) {
     const auto* setting = FindSetting(row.key);
     writes[row.key] = row.after;
-    if (setting != nullptr) {
-      effect = (std::max)(effect, setting->effect);
+    if (setting == nullptr || !setting->IsModelSelection()) {
+      non_model_change = true;
+      if (setting != nullptr) effect = (std::max)(effect, setting->effect);
     }
     if (row.key == "NRPresentSdrRestorePolicy") {
       if (!present_sdr_restore_config_writable.load()) {
@@ -621,12 +624,14 @@ inline bool Apply(const presets::Document& document, bool compatibility, bool re
       }
     }
   }
-  if (!changes.empty()) {
+  const bool model_requests_changed = previous_model_requests != ActiveNrModelRequests();
+  if (non_model_change || model_requests_changed) {
     ++present_restore_configuration.epoch;
   }
   policy_lock.unlock();
   config_lock.unlock();
-  if (effect == SettingEffect::kRecreate || (enabled.load() && std::any_of(changes.begin(), changes.end(), [](const auto& row) { return row.key == "NeuralUplift"; }))) {
+  if (model_requests_changed || effect == SettingEffect::kRecreate
+      || (enabled.load() && std::any_of(changes.begin(), changes.end(), [](const auto& row) { return row.key == "NeuralUplift"; }))) {
     RecreateFeaturesLocked();
   } else if (effect == SettingEffect::kHistory) {
     RequestHistoryReset();

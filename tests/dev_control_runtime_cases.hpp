@@ -379,7 +379,19 @@
   }
   runtime::PublishAdaptiveStatus(saved_adaptive);
   check(set("EnableHooks", 0)["reason"] == "invalid_setting", "startup hook policy stays outside the control whitelist");
-  check(set("NREditReuse", true)["reason"] == "invalid_setting", "the existing x2 INI setting stays outside the DEV whitelist");
+  check(set("NREditReuse", 1)["reason"] == "invalid_value", "x2 requires a JSON boolean");
+  {
+    const bool previous = runtime::edit_reuse_enabled.load();
+    const auto reset_epoch = runtime::history_reset_epoch.load();
+    const auto toggle = set("NREditReuse", !previous);
+    check(toggle["ok"] && toggle["changes"].size() == 1
+            && toggle["state"]["settings"]["NREditReuse"] == !previous
+            && runtime::edit_reuse_enabled.load() == !previous
+            && runtime::history_reset_epoch.load() == reset_epoch + 1,
+        "the live x2 toggle commits the existing setting and resets history");
+    check(set("NREditReuse", previous)["ok"] && runtime::edit_reuse_enabled.load() == previous,
+        "the same operation restores the initial x2 setting");
+  }
   check(set("NRHookPoint", 3)["reason"] == "invalid_value", "invalid hook is rejected before mutation");
   check(set("NeuralUplift", 1)["reason"] == "invalid_value", "booleans require JSON booleans");
   check(set("NRPasses", 0)["reason"] == "invalid_value", "zero pass count is rejected");

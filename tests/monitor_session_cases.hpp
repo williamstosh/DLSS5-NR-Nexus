@@ -40,6 +40,47 @@ void RunMonitorSessionCases(const Check& check, const Frame& frame) {
     check(false, "monitor session cases require an initialized idle ImGui context and no runtime lock");
     return;
   }
+  {
+    using Delivery = r::EditReuseDelivery;
+    using Block = r::EditReuseBlock;
+    const auto stage = addon::stage_plan::Stage::RENDER;
+    const auto now = r::SteadyNowNs();
+    std::array<r::EditReuseMonitorFrame, 2> observations{};
+    auto reused = r::EditReuseMonitorFrame{
+        .delivery = Delivery::REUSED, .stage = stage, .configuration = r::configuration_generation.load(),
+        .reset_epoch = r::history_reset_epoch.load(), .source_generation = 7, .sequence = 41,
+        .delivery_epoch = 3, .recorded_ns = now};
+    observations[0] = reused;
+    check(r::ReadDeliveredEditReuse(observations, 7, 41, stage, now).delivery == Delivery::NONE,
+          "recording a skipped evaluate alone leaves x2 waiting for delivery");
+    reused.handed_off = true;
+    r::StoreEditReuseMonitorFrame(&observations, reused);
+    check(r::ReadDeliveredEditReuse(observations, 7, 41, stage, now).delivery == Delivery::REUSED,
+          "a delivered frame with a skipped evaluate shows x2 active");
+    auto next = reused;
+    next.sequence = 42;
+    next.delivery = Delivery::REFRESH;
+    r::StoreEditReuseMonitorFrame(&observations, next);
+    check(r::ReadDeliveredEditReuse(observations, 7, 42, stage, now).delivery == Delivery::REUSED,
+          "an adjacent refresh keeps current evidence of the delivered reuse");
+    ++next.delivery_epoch;
+    r::StoreEditReuseMonitorFrame(&observations, next);
+    check(r::ReadDeliveredEditReuse(observations, 7, 42, stage, now).delivery == Delivery::NONE,
+          "a new delivery epoch cannot borrow old x2 evidence");
+    next.delivery = Delivery::PER_FRAME;
+    next.reason = Block::MASK;
+    r::StoreEditReuseMonitorFrame(&observations, next);
+    const auto fallback = r::ReadDeliveredEditReuse(observations, 7, 42, stage, now);
+    check(fallback.delivery == Delivery::PER_FRAME && fallback.reason == Block::MASK,
+          "an actual per-frame fallback replaces x2 and retains its reason");
+    next.delivery = Delivery::ORIGINAL;
+    next.reason = Block::SELECT_ORIGINAL;
+    r::StoreEditReuseMonitorFrame(&observations, next);
+    check(r::ReadDeliveredEditReuse(observations, 7, 42, stage, now).delivery == Delivery::ORIGINAL,
+          "a delivered original frame is distinct from per-frame NR");
+    check(r::ReadDeliveredEditReuse(observations, 8, 42, stage, now).delivery == Delivery::NONE,
+          "a different source generation cannot inherit an x2 outcome");
+  }
   const auto fixture_directory = std::filesystem::current_path();
   std::array<wchar_t, 32768> appdata{};
   const auto appdata_length = GetEnvironmentVariableW(L"LOCALAPPDATA", appdata.data(),

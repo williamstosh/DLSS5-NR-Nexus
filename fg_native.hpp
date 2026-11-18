@@ -34,6 +34,7 @@ struct Stream {
   uint64_t submitted = 0;
   uint64_t epoch = 0;
   uint64_t application_frame = 0;
+  std::array<EditReuseMonitorFrame, 2> edit_reuse_monitor;
   uint64_t native_serial = 0;
   uint64_t native_display_epoch = 0;
   uint64_t native_configuration = 0;
@@ -1306,6 +1307,16 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
       return stream.result;
     }
     stream.result = fg::Result::SUBMITTED;
+    if (recordings[0].edit_monitor_delivery != EditReuseDelivery::NONE && nr_input.hudless == nullptr) {
+      const auto surface = renodx::utils::directx::NativeIdentity(input.backbuffer);
+      StoreEditReuseMonitorFrame(&stream.edit_reuse_monitor, {
+          .delivery = recordings[0].edit_monitor_delivery, .reason = recordings[0].edit_monitor_reason,
+          .stage = stage_plan::Stage::PRESENT, .configuration = configuration_generation.load(),
+          .reset_epoch = history_reset_epoch.load(), .source_generation = input.epoch,
+          .sequence = input.application_frame, .delivery_epoch = input.epoch, .recorded_ns = SteadyNowNs(),
+          .device = renodx::utils::directx::NativeIdentity(device), .surface = surface,
+          .output_width = input.color_width, .output_height = input.color_height, .handed_off = surface != nullptr});
+    }
     PublishPresentRestoreOwner(present_restore_scope::Domain::PRE_FG_BACKBUFFER,
         target.restore_decision.reason, target.restore_contract_compatible,
         input.application_frame, target.restore_config_epoch, "fg_service_submitted");

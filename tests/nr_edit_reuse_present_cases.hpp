@@ -466,8 +466,9 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     const auto unchanged_pixels = [&](const std::vector<Pixel>& pixels, Pixel expected) {
       Check(pixels == std::vector(size * size, expected), "Present x2 untouched backbuffer has exact game pixels");
     };
-    const auto warm = [&](bool require_prepared) {
+    const auto warm = [&](bool require_prepared, uint32_t resize_from = 0) {
       bool prepared = false;
+      bool delivered_while_settling = false;
       for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8; ++attempt) {
         const auto before = stats();
         present_frame();
@@ -475,10 +476,20 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
         const auto pixels = read_back();
         swap();
         if (after.outputs != before.outputs) {
+          const auto& work = native::stage_telemetry[static_cast<size_t>(addon::stage_plan::Stage::PRESENT)];
           Check(after.outputs == before.outputs + 1 && after.calls == before.calls + 1
-                    && after.refreshes == before.refreshes + 1 && after.reuses == before.reuses
                     && after.consumed_serial > before.consumed_serial,
-                "first accepted Present after a cold start or handoff refreshes");
+                "first accepted Present records one model call and consumes its own guide serial");
+          if (resize_from != 0 && work.work_width == resize_from && work.work_height == resize_from) {
+            Check(after.refreshes == before.refreshes && after.reuses == before.reuses && after.anchor_generation == 0,
+                  "resize settle delivers per-frame NR without a low-grid x2 anchor");
+            delivered_while_settling = true;
+            continue;
+          }
+          Check(work.work_width == size && work.work_height == size
+                    && after.refreshes == before.refreshes + 1 && after.reuses == before.reuses,
+                "first accepted full-grid Present after a cold start or handoff refreshes");
+          Check(resize_from == 0 || delivered_while_settling, "resize exercises the old committed grid before refreshing");
           Check(!require_prepared || prepared, "cold start observes a real prepared-only submission");
           return;
         }
@@ -801,6 +812,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     for (auto& buffer : output.buffers) {
       buffer.Reset();
     }
+    const uint32_t resize_from = size;
     size = 24;
     const HRESULT resized = output.swapchain->ResizeBuffers(static_cast<UINT>(output.buffers.size()), size, size, FORMAT, 0);
     if (FAILED(resized)) {
@@ -812,7 +824,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     no_output(before, stats(), "resized swapchain cannot consume the old producer or edit history");
     Check(native::HookedReleaseFeatureSlot<0>(sr_handle) == NVSDK_NGX_Result_Success, "release original game SR before resize rebind");
     create_source();
-    warm(false);
+    warm(false, resize_from);
 
     bool preserves_cross_epoch_writer = false;
     {
