@@ -937,9 +937,13 @@ int Run() {
       const auto saved_style = native::style.load();
       const auto saved_skin = native::skin_structure_strength.load();
       const auto saved_skin_independent = native::skin_independent.load();
+      const auto saved_runtime = native::direct_runtime_requirements;
+      native::direct_runtime_requirements.file_version = "310.8.0.0";
+      native::direct_runtime_requirements.dual_models = false;
       native::preset = 1;
       native::detail_stability = 0;
       native::use_auto_mask = true;
+      native::control_mask_enabled = true;
       native::style = 2;
       native::skin_structure_strength = .8f;
       native::skin_independent = true;
@@ -953,7 +957,7 @@ int Run() {
                   && native::GetUInt(block, "DLSSNR.Style") == 2u
                   && native::GetFloat(block, "DLSSNR.Intensity") == 1.f
                   && native::GetFloat(block, "DLSSNR.SkinStructureStrength") == .8f,
-              "A refresh sends the configured steering and in-model AutoMask with no external ControlMask");
+              "legacy A refresh sends the configured steering and AutoMask while the Region Mask request is declined");
         model_motion = native::GetD3D12Resource(block, "DLSSNR.MVec");
       };
       Check(frame(1) == 0, "A keeps the existing feature maturation frame");
@@ -976,7 +980,7 @@ int Run() {
       submit_commands("A with active Look motion and reveal upload");
       Check(frame(0) == 0 && native::mixed_present_fg_seen.load() && native::edit_reuse_reuses.load() == before_a_reuses + 1
                 && native::edit_reuse_fallbacks.load() == before_a_fallbacks,
-            "an old FG observation leaves successful fixed Upscaled A eligible for reuse");
+            "legacy A reuses on fixed Upscaled despite a declined Region Mask request and an old FG observation");
       Check(slot.look_history.valid && slot.look_history.written != refresh_history
                 && native::look_stability_passes.load() == stabilized + 2
                 && native::look_history_restarts.load() == restarts
@@ -1013,9 +1017,11 @@ int Run() {
 
       model_parameter_observer = {};
       native::direct_api.evaluate = NeutralModel;
+      native::direct_runtime_requirements = saved_runtime;
       native::preset = 2;
       native::detail_stability = 1;
       native::use_auto_mask = false;
+      native::control_mask_enabled = false;
       native::style = saved_style;
       native::skin_structure_strength = saved_skin;
       native::skin_independent = saved_skin_independent;

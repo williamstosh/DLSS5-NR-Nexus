@@ -451,6 +451,20 @@ int Run() {
         }
         check_duplicate(observed);
       }
+      // Another source owns adaptive residency, so this Present stays on its
+      // original fixed chain even though the menu requests adaptive sizing.
+      Check(native::EnsureLookPipeline(gpu.device.Get()), "warm Look pipelines before requesting adaptive residency");
+      const auto resident = std::make_shared<addon::adaptive_resolution::Session>();
+      native::adaptive_resident_session = resident;
+      native::nr_adaptive_enabled = true;
+      const auto fixed = frame(false);
+      const auto& feature = native::features.at(owner);
+      Check(fixed.result == fg::Result::SUBMITTED && fixed.evaluates == 0 && fixed.reuses == 1
+                && feature.adaptive_cache == nullptr && feature.slots[0].edit_reuse == anchor
+                && anchor->anchor_generation == generation && read_buffer(anchor->anchor.Get()) == anchor_pixels,
+            "an unacquired adaptive request preserves the fixed XeFG workset and reuse anchor");
+      native::nr_adaptive_enabled = false;
+      native::adaptive_resident_session.reset();
       ComPtr<ID3D12Resource> backbuffer;
       Check(SUCCEEDED(session.proxy->GetBuffer(session.proxy->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&backbuffer))),
             "inspect XeFG Backbuffer ownership");
@@ -459,7 +473,9 @@ int Run() {
           Check(resource.Get() != backbuffer.Get(), "cache bindings retain private current-original surfaces rather than DXGI Backbuffer");
         }
       }
-      Check(frame(false).reuses == 1, "XeFG can reuse the refreshed anchor exactly once");
+      const auto next = frame(false);
+      Check(next.evaluates == 1 && next.reuses == 0 && next.reset == 0,
+            "XeFG refreshes after exactly one reuse even when the dormant adaptive request is turned off again");
       const auto reset = frame(true);
       Check(reset.evaluates == 1 && reset.reuses == 0 && reset.reset == 1, "explicit Reset interrupts XeFG reuse cadence");
       anchor.reset();

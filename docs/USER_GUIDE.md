@@ -453,7 +453,7 @@ F6 立即提示开关操作，随后状态更新为正在检查、正常运行�
 
 **开发版 Render** 沿用同一个 x2 开关，并在**处理与兼容性 → 介入点**选择**渲染（Render）**。在已确认的 D3D12 DLSS 超分辨率（SR）路径上，NR 在 SR 前处理画面，SR 仍在每个基础帧运行。当前路径使用 FP16 HDR 和单层 NR，实际工作格点须覆盖原渲染尺寸。游戏须提供匹配的全幅颜色、深度和有效运动矢量，并显式提供两轴 jitter 偏移。运动矢量须排除 jitter。细节稳定的 Auto 按 Render 的实际效果处理。启用 Ray Reconstruction 时，兼容回退仍走 Upscaled 路径。Render x2 的游戏内动态画质仍待验收。
 
-普通原生 **D3D12 Present x2** 是尚未发布的开发功能。打开同一个 x2 开关，在**处理与兼容性 → 介入点**选择 **Present**，再在 **FG 高级设置 → FG 帧处理策略**（Generated frames／Present Frames）选择**游戏帧**（Game frames only，`NRPresentFrames=1`）。NR 只处理当前 FP16 scRGB Backbuffer 的颜色。复用要求模型 B、单层、固定 100% 呈现分辨率，并关闭调整 NR 的外观、细节稳定、区域遮罩和自适应分辨率。
+普通原生 **D3D12 Present x2** 是尚未发布的开发功能。打开同一个 x2 开关，在**处理与兼容性 → 介入点**选择 **Present**，再在 **FG 高级设置 → FG 帧处理策略**（Generated frames／Present Frames）选择**游戏帧**（Game frames only，`NRPresentFrames=1`）。NR 使用当前 FP16 scRGB Backbuffer 的颜色。复用要求实际使用模型 A 或 B、单层及覆盖完整画面的固定工作尺寸。即使请求了自适应分辨率，仍使用固定工作尺寸的帧也可复用。实际切档和绑定区域遮罩的帧沿用各自的处理方式。
 
 插件须确认该帧的 DLSS 超分辨率（SR）已成功运行，取得同一帧的两轴 jitter 偏移及匹配的深度和运动矢量，并验证 SR 输出在呈现队列最后一次游戏提交的同一命令列表中整幅复制到当前 Backbuffer。证据不足时保留本帧游戏原画。要恢复默认的逐呈现帧 NR，可改回**每帧**（Every present，`NRPresentFrames=0`）。也可关闭 x2，按当前帧处理策略运行常规 NR。普通 Present x2 已用真实 NVIDIA Runtime 和 GPU 离线验证，游戏内表现仍待验收。
 
@@ -461,7 +461,7 @@ F6 立即提示开关操作，随后状态更新为正在检查、正常运行�
 
 开发版的玩家监视器会显示 x2 请求与当前交付。未确认复用时会显示等待、逐帧 NR 或保留原画，并附上已观察的原因。
 
-开发版还包含默认关闭的 FG On 组合实验，覆盖真实 SR 后的 Upscaled，以及原生 DLSS FG 消费前的 Present。Upscaled DEV 实验在 SR 来源、工作尺寸与输出归属不变时，遇到 FG 状态信息暂缺或无接管的 FG 开关切换也会保留隔帧历史。原生 Pre-FG Present 限定模型 B、单层、固定100%，已接入 HDR10/PQ 的去 HUD 画面与精确透明度合成输入，以保留游戏 HUD。这两条 DEV 路径尚未进入普通安装包；生成帧画面、动态画质与微卡顿仍待验收。
+开发版还包含默认关闭的 FG On 组合实验，覆盖真实 SR 后的 Upscaled，以及原生 DLSS FG 消费前的 Present。Upscaled 实验在 SR 来源、工作尺寸和输出归属相同的情况下，可以跨 FG 状态变化保留隔帧历史。原生 Pre-FG Present 的 HDR10/PQ 去 HUD 编辑和透明度合成已有开发接线，游戏里的同帧输入与消费顺序仍待验证。两条实验路径目前仅用于开发验证。生成帧画面、动态画质与微卡顿仍待验收。
 
 <a id="zh-paths"></a>
 #### 可用组合
@@ -1025,7 +1025,7 @@ HDR10/PQ x2 reuse has been confirmed in a static The Witcher 3 XeFG scene; dynam
 
 **Render in development builds** uses the same x2 toggle. Choose **Render** under **Processing & compatibility → Hook point**. On a confirmed D3D12 DLSS Super Resolution (SR) path, NR processes the image before SR, which still runs on every base frame. This path uses FP16 HDR and one NR pass whose working grid matches the render size. The game must supply matching full-frame colour, depth and valid motion vectors, plus both jitter offsets. Motion vectors must exclude jitter. Detail Stability Auto follows its effective Render setting. With Ray Reconstruction, NR still uses the compatible Upscaled path. Dynamic image quality for Render x2 still needs in-game validation.
 
-Ordinary native **D3D12 Present x2** is an unreleased development feature. Enable the same x2 toggle, choose **Present** under **Processing & compatibility → Hook point**, then select **Game frames** (Game frames only, `NRPresentFrames=1`) under **FG advanced settings → FG frame processing policy** (Generated frames / Present Frames). NR works on the current FP16 scRGB backbuffer as its sole colour input. Reuse requires model B, one pass, a fixed 100% of the presentation resolution, and Adjust NR's look, Detail stability, Region mask and Adaptive resolution turned off.
+Ordinary native **D3D12 Present x2** is an unreleased development feature. Enable the same x2 toggle, choose **Present** under **Processing & compatibility → Hook point**, then select **Game frames** (Game frames only, `NRPresentFrames=1`) under **FG advanced settings → FG frame processing policy** (Generated frames / Present Frames). NR uses the colour in the current FP16 scRGB backbuffer. Reuse requires one pass using model A or B at the fixed full-frame working size. A frame can reuse edits while Adaptive resolution is requested if it still uses that fixed size. Frames that switch adaptive tiers or bind a Region Mask follow their usual processing paths.
 
 The add-on requires a successful DLSS Super Resolution (SR) evaluation, both jitter offsets, and matching depth and motion vectors from that frame. It verifies that the presentation queue's latest game submission used the same command list to copy the complete SR output to the current backbuffer. Without that evidence, it keeps the game's original image. Select **Every frame** (Every present, `NRPresentFrames=0`) to restore the default NR processing on each present, or turn off x2 to use regular NR with the current frame policy. Ordinary Present x2 has been verified offline with the NVIDIA runtime on real hardware. In-game performance and image quality still need validation.
 
@@ -1033,7 +1033,7 @@ The add-on requires a successful DLSS Super Resolution (SR) evaluation, both jit
 
 The monitor in development builds shows the x2 request and current delivery. When reuse is pending or unavailable, it reports waiting, per-frame NR or original colour with the observed reason.
 
-The development branch also includes disabled-by-default FG On experiments for Upscaled after actual SR and Present before native DLSS FG consumes the frame. The Upscaled DEV experiment preserves edit history across missing FG status information and FG toggles without a takeover while the SR source, working size and output ownership stay unchanged. Native Pre-FG Present requires model B, one pass and fixed 100% resolution; it handles HDR10/PQ HUD-less color and exact alpha composition inputs to preserve the game's HUD. These two DEV paths are not included in the ordinary package. Generated-frame appearance, dynamic image quality and microstutter still await acceptance.
+The development branch also includes disabled-by-default FG On experiments for Upscaled after actual SR and Present before native DLSS FG consumes the frame. The Upscaled experiment can preserve edit history across FG status changes when the SR source, working size and output ownership are the same. Native Pre-FG Present has experimental support for editing HDR10/PQ HUD-less colour and recombining it with alpha. Same-frame inputs and consumption order still need in-game verification. Both paths are for development testing. Generated-frame appearance, dynamic image quality and microstutter still await acceptance.
 
 <a id="en-paths"></a>
 #### Compatible combinations

@@ -13567,8 +13567,7 @@ inline bool EditReuseInputsEligible(
       && std::abs(current.jitter_x) <= 0.5f && std::abs(current.jitter_y) <= 0.5f
       && std::isfinite(current.motion_scale_x) && std::isfinite(current.motion_scale_y)
       && current.motion_scale_x != 0.f && current.motion_scale_y != 0.f
-      && motion_scale_x_multiplier.load() == 1.f && motion_scale_y_multiplier.load() == 1.f
-      && nr_model::SupportsControlMask(direct_runtime_requirements.file_version);
+      && motion_scale_x_multiplier.load() == 1.f && motion_scale_y_multiplier.load() == 1.f;
 }
 
 inline bool CanCommitFullSizeEditReuse(
@@ -14254,8 +14253,9 @@ inline bool RecordInline(
 #if defined(NR_NEXUS_DEV_CONTROL)
   else if (edit_output_contract != nullptr) edit_off = EditReuseXefgOffLocked(handle, feature.source_generation);
 #endif
-  const bool edit_reuse_fixed_workset = present == nullptr && UsesFixedEditReuseWorkset(feature, adaptive);
-  const bool edit_reuse_fixed_inline_route = edit_reuse_requested && edit_reuse_fixed_workset && bridge_source == nullptr
+  const bool edit_reuse_fixed_workset = UsesFixedEditReuseWorkset(feature, adaptive);
+  const bool edit_reuse_fixed_inline_route = edit_reuse_requested && edit_reuse_fixed_workset
+      && present == nullptr && bridge_source == nullptr
       && execution_stage == stage_plan::Stage::UPSCALED && hook_point.load() == kHookUpscaled
       && successful_sr_device == device
       && !native_fg_owns.load() && !fg::xefg::OwnsStream() && !auto_fg_fallback_active.load()
@@ -14357,9 +14357,8 @@ inline bool RecordInline(
 #if defined(NR_NEXUS_DEV_CONTROL)
   if (edit_reuse_native_route) edit_reuse_sequence = present->native_edit_reuse_frame;
 #endif
-  const bool edit_reuse_fixed_present_workset = present != nullptr && !nr_adaptive_enabled.load() && !adaptive.enabled;
   bool edit_reuse_route_eligible = edit_reuse_contract_eligible && !adaptive.preparing && !prepare_models_only
-      && (((edit_reuse_fixed_workset || edit_reuse_fixed_present_workset)
+      && ((edit_reuse_fixed_workset
            && (edit_reuse_fixed_bilinear || CanCommitFullSizeEditReuse(feature, width, height, nr_input_width, nr_input_height)))
           || edit_reuse_adaptive_route);
   if (adaptive.session != nullptr && !adaptive.preparing) {
@@ -14388,7 +14387,7 @@ inline bool RecordInline(
     if (edit_monitor.device != nullptr || monitor_present_delivery) {
       if (plan.mixed || group.begin != 0 || group.count != 1) edit_monitor.reason = EditReuseBlock::PASSES;
       else if (control_mask_eligible) edit_monitor.reason = EditReuseBlock::MASK;
-      else if (adaptive.enabled) edit_monitor.reason = EditReuseBlock::ADAPTIVE;
+      else if (!edit_reuse_fixed_workset) edit_monitor.reason = EditReuseBlock::ADAPTIVE;
       else if (!edit_reuse_fixed_inline_route && !edit_reuse_present_route && !edit_reuse_xefg_route) {
         edit_monitor.reason = EditReuseBlock::ROUTE;
       }
