@@ -1322,7 +1322,7 @@ inline void PreserveNativePreFgProof(
 #if defined(NR_NEXUS_DEV_CONTROL)
   native_tag_source::PreserveProof(marker, submissions);
 #endif
-  if (screenshot::WantsFinalPresent() || experimental_present_chain.load()) {
+  if (IsPresentGuideMarker(marker) || screenshot::WantsFinalPresent() || experimental_present_chain.load()) {
     PreservePresentCaptureProof(marker, submissions);
   }
   // An opt-out must still retain the previous producer's exact receipt so

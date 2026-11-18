@@ -157,6 +157,11 @@ inline constexpr DWORD kPresentSlotWaitMs = 100;
 // present read last, which a capture never overwrites (NextPresentCaptureSet)
 // so a present always has a complete capture to fall back on.
 inline constexpr uint32_t kPresentGuideSets = 4;
+inline constexpr uintptr_t kPresentGuideMarkerPrefix = 0xFFFF'0000'0000'0000ull;
+
+inline bool IsPresentGuideMarker(const void* marker) {
+  return (reinterpret_cast<uintptr_t>(marker) & kPresentGuideMarkerPrefix) == kPresentGuideMarkerPrefix;
+}
 // A capture older than this many game frames (presents times the stream's
 // frame generation multiplier) AND older than kPresentGuideMaxAgeNs no longer
 // describes the image (a menu or a loading screen without DLSS).  Through
@@ -401,6 +406,21 @@ inline std::atomic_bool renodx_mod_loaded{false};
 inline std::atomic<const char*> present_white_logged{nullptr};
 inline std::atomic<float> present_white_logged_nits{0.f};
 
+struct PresentBaseFrame {
+  const void* source = nullptr;  // The game owns its SR output; identity only.
+  std::pair<uint64_t, uint64_t> recording;
+  uint64_t swapchain_epoch = 0;
+  const void* backbuffer = nullptr;
+  uint64_t sequence = 0;
+  uint64_t source_generation = 0;
+  uint64_t configuration = 0;
+  uint64_t submit_count = 0;
+  bool source_ready = false;
+  bool sealed = false;
+  bool competing_recording = false;
+  bool attempted = false;
+};
+
 struct PresentGuideSet {
   bool mixed_predecessor = false;
   ID3D12Resource* motion = nullptr;
@@ -423,6 +443,7 @@ struct PresentGuideSet {
   FenceRef completed_fence;
   uint64_t completed_value = 0;
   bool completed_multiple_queues = false;
+  PresentBaseFrame base_frame;
   // The capture's guide contract (dims, subrects, motion scale, flags, the
   // game's Reset) and the DLSS output it describes.
   FeatureState contract;
@@ -456,6 +477,9 @@ struct PresentRing {
 // Streamline path keys its synthetic streams the same way; never
 // dereferenced).
 struct PresentStream {
+  // Only this swapchain's current, submitted, final full-surface copy can
+  // supply the ordinary x2 route. The identity expires with its buffers.
+  uint64_t base_frame_epoch = 0;
   // Identity-only target inventory. Do not retain DXGI buffers across resize.
   std::vector<const void*> mixed_buffers;
   const void* mixed_queue = nullptr;
@@ -537,6 +561,22 @@ inline PresentRing present_ring;
 inline PresentGuideSet present_guide_sets[kPresentGuideSets];
 inline uint64_t present_capture_serial = 0;
 inline std::unordered_map<const void*, PresentStream> present_streams;
+inline uint64_t present_base_epoch_serial = 0;
+inline std::atomic_uint64_t present_base_single_submit = 0;
+
+inline void ObservePresentBaseSubmission(uint64_t entry, UINT list_count) {
+  if (list_count == 1 && present_base_capture_active.load(std::memory_order_relaxed)) {
+    present_base_single_submit.store(entry, std::memory_order_relaxed);
+  }
+}
+
+inline bool WantsPresentBaseFrames() {
+  return enabled.load(std::memory_order_relaxed)
+      && hook_point.load(std::memory_order_relaxed) == kHookPresent
+      && edit_reuse_enabled.load(std::memory_order_relaxed)
+      && present_frames.load(std::memory_order_relaxed) == 1
+      && stack_passes.load(std::memory_order_relaxed) == 1;
+}
 // One observed FG-only stream. Interleaved identities restart admission;
 // equal-size views remain ambiguous until exactly one swapchain matches.
 // Only identity comparisons use these pointers, under runtime_mutex.
@@ -695,6 +735,12 @@ inline void ResetPresentStreamHistory(PresentStream* stream, uint32_t reason = k
   }
 }
 
+inline void InvalidatePresentBaseFrames(PresentStream* stream) {
+  if (stream->base_frame_epoch == 0) return;
+  stream->base_frame_epoch = 0;
+  ResetPresentStreamHistory(stream, kResetSourceChange);
+}
+
 // Caller holds runtime_mutex.
 inline void RetirePresentStream(const void* swapchain) {
   const auto it = present_streams.find(swapchain);
@@ -784,6 +830,7 @@ inline void RetirePreFgCompose() {
 // runtime_mutex; true once all of it is released.
 inline bool RetireIdlePresentPath() {
   if (!ReleasePresentRing()) return false;
+  present_base_capture_active.store(false, std::memory_order_relaxed);
   while (!present_streams.empty()) RetirePresentStream(present_streams.begin()->first);
   for (PresentGuideSet& set : present_guide_sets) {
     RetirePresentResource(&set.motion);
@@ -803,6 +850,7 @@ inline bool RetireIdlePresentPath() {
 // released.  Caller holds runtime_mutex.
 inline bool ReleasePresentPath() {
   if (!ReleasePresentRing()) return false;
+  present_base_capture_active.store(false, std::memory_order_relaxed);
   for (auto& [_, stream] : present_streams) {
     OnNativePresentStreamRetired(&stream);
     owner_resident_nr_handles.erase(stream.Handle());
@@ -959,7 +1007,8 @@ inline PresentGuideSet* NextPresentCaptureSet() {
   }
   PresentGuideSet* target = nullptr;
   for (PresentGuideSet& set : present_guide_sets) {
-    if (&set == last_read || (done != UINT64_MAX && set.read_value > done)) continue;
+    if (&set == last_read || (done != UINT64_MAX && set.read_value > done)
+        || (WantsPresentBaseFrames() && !set.d3d11 && !submission::ResourceReleasable(set.marker))) continue;
     if (target == nullptr || set.serial < target->serial) target = &set;
   }
   if (target == nullptr) present_capture_busy.fetch_add(1, std::memory_order_relaxed);
@@ -989,6 +1038,7 @@ inline void StampPresentCapture(PresentGuideSet* set, const FeatureState& contra
   set->completed_fence = {};
   set->completed_value = 0;
   set->completed_multiple_queues = false;
+  set->base_frame = {};
   present_captures.fetch_add(1, std::memory_order_relaxed);
   // Global capture totals include other devices and viewports. Only this
   // stream's API/device/output shape can be its cadence denominator. Two
@@ -1060,9 +1110,10 @@ inline void PreservePresentCaptureProof(
     }
   }
   for (PresentGuideSet& set : present_guide_sets) {
-    if (set.serial == 0 || set.marker != marker
-        || (set.comparison_request == 0 && !set.mixed_predecessor)) continue;
-    if (set.mixed_predecessor && submissions.size() != 1) set.completed_multiple_queues = true;
+    if (set.serial == 0 || set.marker != marker) continue;
+    if ((set.mixed_predecessor || set.base_frame.source != nullptr) && submissions.size() != 1) {
+      set.completed_multiple_queues = true;
+    }
     for (const submission::GenerationSubmission& proof : submissions) {
       if (set.completed_fence.empty()) set.completed_fence = proof.fence;
       if (set.completed_fence.fence != proof.fence.fence) {
@@ -1075,12 +1126,17 @@ inline void PreservePresentCaptureProof(
   }
 }
 
+// The legacy barrier and full-copy observers are defined with the existing
+// copy Detours, after the guide and stream storage they update.
+inline bool InstallPresentSourceHooks(ID3D12GraphicsCommandList* list);
+inline bool InstallMixedPresentCopyHooks(ID3D12GraphicsCommandList* list);
+
 inline void CapturePresentGuides(
     ID3D12GraphicsCommandList* command_list,
     const NVSDK_NGX_Handle* handle,
     const NVSDK_NGX_Parameter* parameters,
     D3D12_RESOURCE_STATES motion_state,
-    D3D12_RESOURCE_STATES depth_state, bool mixed_predecessor) {
+    D3D12_RESOURCE_STATES depth_state, bool mixed_predecessor, bool successful_dlss_sr) {
   ID3D12Resource* const output = GetD3D12Resource(parameters, NVSDK_NGX_Parameter_Output);
   // One capture per evaluate chain, admitted like an after-path pass: a real
   // NGX entry owns the stream, so the same slEvaluateFeature's Streamline
@@ -1093,6 +1149,14 @@ inline void CapturePresentGuides(
   if (output != nullptr && !mixed_predecessor) {
     if (!AdmitOutputPass(output, handle)) return;
     RecordOutputPass(output, handle);
+    if (successful_dlss_sr && WantsPresentBaseFrames() && present_base_capture_active.load(std::memory_order_relaxed)) {
+      const auto identity = renodx::utils::directx::NativeIdentity(output);
+      for (auto& set : present_guide_sets) {
+        if (set.base_frame.source == identity || set.base_frame.backbuffer == identity) {
+          set.base_frame = {};
+        }
+      }
+    }
   }
   if (!mixed_predecessor) CountNrDecline(NrDeclineReason::kPresentHook);
   // XeFG consumes its SDK tags. Pause ordinary source-list copies through
@@ -1123,6 +1187,38 @@ inline void CapturePresentGuides(
   if (!CompletePresentContract(handle, static_cast<uint32_t>(color_desc.Width),
                                color_desc.Height, &contract)) {
     return;
+  }
+  PresentBaseFrame base_frame;
+  const uint64_t submit_count = queue_submit_entries.load();
+  if (successful_dlss_sr && !mixed_predecessor && WantsPresentBaseFrames()
+      && PresentBaseSubmissionCurrent(submit_count)
+      && std::ranges::any_of(present_streams, [](const auto& entry) { return entry.second.base_frame_epoch != 0; })
+      && submission::list_identity_fallbacks.load(std::memory_order_relaxed) == 0) {
+    const auto source = features.find(handle);
+    if (source != features.end() && source->second.source_feature == kFeatureDlss
+        && EditReuseSourceConfirmed(handle, source->second) && source->second.sr_sequence != 0
+        && output_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && output_desc.MipLevels == 1
+        && output_desc.DepthOrArraySize == 1 && output_desc.SampleDesc.Count == 1
+        && output_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT
+        && (output_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0
+        && !contract.output_subrects_enabled && contract.output_x == 0 && contract.output_y == 0
+        && contract.declared_output_width == output_desc.Width && contract.declared_output_height == output_desc.Height
+        && output != motion && output != depth && contract.has_jitter
+        && std::isfinite(contract.jitter_x) && std::isfinite(contract.jitter_y)
+        && std::abs(contract.jitter_x) <= 0.5f && std::abs(contract.jitter_y) <= 0.5f
+        && std::isfinite(contract.motion_scale_x) && std::isfinite(contract.motion_scale_y)
+        && contract.motion_scale_x != 0.f && contract.motion_scale_y != 0.f
+        && ((contract.create_flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) != 0
+            || (motion_desc.Width == output_desc.Width && motion_desc.Height == output_desc.Height))
+        && command_list->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT
+        && queue_tracking_active.load(std::memory_order_relaxed)
+        && InstallMixedPresentCopyHooks(command_list) && InstallPresentSourceHooks(command_list)) {
+      base_frame = {.source = renodx::utils::directx::NativeIdentity(output),
+          .recording = submission::RecordingIdentity(command_list),
+          .sequence = source->second.sr_sequence, .source_generation = source->second.source_generation,
+          .configuration = configuration_generation.load(std::memory_order_relaxed),
+          .submit_count = submit_count};
+    }
   }
   PresentGuideSet* const target = NextPresentCaptureSet();
   if (target == nullptr) return;
@@ -1201,8 +1297,11 @@ inline void CapturePresentGuides(
   StampPresentCapture(target, contract, static_cast<uint32_t>(output_desc.Width),
                       output_desc.Height, false);
   target->mixed_predecessor = mixed_predecessor;
-  target->marker = reinterpret_cast<const void*>(
-      0xFFFF'0000'0000'0000ull | target->serial);
+  target->base_frame = base_frame;
+  if (target->base_frame.source != nullptr) {
+    present_base_capture_active.store(true, std::memory_order_relaxed);
+  }
+  target->marker = reinterpret_cast<const void*>(kPresentGuideMarkerPrefix | target->serial);
   submission::TrackUse(command_list, target->motion);
   submission::TrackUse(command_list, target->depth);
   submission::TrackUse(command_list, target->marker);
@@ -2735,21 +2834,28 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
   auto* motion = GetD3D12Resource(&block, NVSDK_NGX_Parameter_MotionVectors);
   auto* depth = GetD3D12Resource(&block, NVSDK_NGX_Parameter_Depth);
   const bool mixed = target.stage_execution_plan != nullptr;
+  const bool base_frame = target.base_frame_sequence != 0;
+  const uint64_t base_submission = (base_frame ? guides->base_frame.submit_count + 1 : 0);
   target.independent_resolution_pair = target.independent_resolution_pair
       && stream.fg_multiplier == 1 && present_fg_multiplier.load(std::memory_order_relaxed) == 1
       && !present_prefg_active.load(std::memory_order_relaxed)
       && !present_prefg_upscaled_active.load(std::memory_order_relaxed);
   const bool independent_pair = PresentResolutionPairAllowed(target);
   const auto* const handle = stream.Handle(neutral_model);
+  bool recording_started = false;
   bool submitted = false;
   NrRecording recording;
   const auto cancel = [&](int*) {
-    if ((!mixed && !independent_pair) || submitted) return;
+    if ((!mixed && !independent_pair && !base_frame) || !recording_started || submitted) return;
     // CPU-side NGX/state ledgers may have advanced even if Close failed.
     // Discard the recording and retire its private state before another try.
     submission::OnCommandListReset(slot->list);
     if (auto feature = features.find(handle); feature != features.end()) {
       ReleaseAllNrSlots(feature->second, true);
+      if (base_frame) {
+        ReleaseCom(feature->second.norm.commit);
+        feature->second.norm = {};
+      }
     }
     RetireWorkset({handle, reinterpret_cast<const ID3D12Resource*>(&stream)});
     ResetPresentStreamHistory(&stream);
@@ -2762,6 +2868,7 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     LogPresent(reshade::log::level::error, "a present command list could not be reset");
     return false;
   }
+  recording_started = true;
   submission::OnCommandListReset(slot->list);
   // Our own list has no host state for the restore-target gate to wait on.
   gate_ever_opened.store(true, std::memory_order_relaxed);
@@ -2771,8 +2878,12 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     const int64_t started_ns = SteadyNowNs();
     const auto previous_capture_serial = screenshot::PendingModelCaptureSerial(slot->list);
     // From here ProcessInline names the terminal.
-    ProcessInline(slot->list, handle, &block, &touched, &target,
-        mixed ? &recording : nullptr);
+    const bool accepted = ProcessInline(slot->list, handle, &block, &touched, &target,
+        (mixed || base_frame) ? &recording : nullptr);
+    if (base_frame && !accepted) {
+      slot->list->Close();
+      return false;
+    }
     const auto capture_serial = screenshot::PendingModelCaptureSerial(slot->list);
     if (capture_serial != 0 && capture_serial != previous_capture_serial) {
       const auto capture_guide = [&](const char* name, ID3D12Resource* resource) {
@@ -2805,6 +2916,16 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
                " the game's image");
     return false;
   }
+  std::unique_lock present_order(present_base_submit_mutex, std::defer_lock);
+  // Keep the final receipt check and the actual Execute in the same order
+  // as the game queue detour. A submit that was already in flight invalidates
+  // the claim; a new one cannot overtake this Execute.
+  if (base_frame && recording.model_invoked && !recording.output_ready) return false;
+  if (base_frame && (!present_order.try_lock() || !PresentBaseSubmissionCurrent(base_submission))) {
+    ++edit_reuse_fallbacks;
+    CountNrDecline(NrDeclineReason::kPresentBaseUnproven);
+    return false;
+  }
   // After the capture's copies: only this queue's own tokens are left here,
   // the others were proven complete above.
   for (const auto& [fence, value] : waits) {
@@ -2813,10 +2934,11 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
   }
   // Add-on work recorded earlier through ReShade's immediate list keeps its
   // place ahead of NR.
-  if (queue != nullptr) queue->flush_immediate_command_list();
+  if (queue != nullptr && !base_frame) queue->flush_immediate_command_list();
   ID3D12CommandList* list = slot->list;
   renodx::utils::directx::NativeFromReShadeProxy(&list);
   native_queue->ExecuteCommandLists(1, &list);
+  if (present_order.owns_lock()) present_order.unlock();
   submitted = true;
   slot->value = ++present_ring.submitted;
   const bool signaled = SUCCEEDED(native_queue->Signal(present_ring.fence, slot->value));
@@ -2824,9 +2946,22 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     mixed_present_last_fence = FenceRef(present_ring.fence);
     mixed_present_last_value = slot->value;
   }
-  ++stream.nr_presents;
   if (guides != nullptr) {
     guides->read_value = slot->value;
+  }
+  if (base_frame) {
+    if (!signaled || !recording.output_ready || !recording.group_complete
+        || (!recording.model_recorded && !recording.edit_reused)) {
+      ResetPresentStreamHistory(&stream);
+      return false;
+    }
+    if (recording.edit_refreshed) ++edit_reuse_refreshes;
+    if (recording.reused_edit != nullptr) {
+      ObserveEditReuse(recording.reused_edit, target.swapchain_format, target.hdr_mode, recording.edit_reuse_encoding);
+    }
+  }
+  ++stream.nr_presents;
+  if (guides != nullptr) {
     stream.consumed_serial = guides->serial;
     present_guides_real.fetch_add(1, std::memory_order_relaxed);
   } else {
@@ -2856,6 +2991,129 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
 // installed before the first candidate SR output is handed back to the game.
 inline void ObserveMixedPresentCopy(ID3D12GraphicsCommandList* list,
     ID3D12Resource* source, ID3D12Resource* destination, bool full = true);
+
+// The runtime and debug layer may forward through another hooked entry
+// point on an internal list. Observe the application's outer command.
+inline thread_local uint32_t present_command_depth = 0;
+struct PresentCommandScope {
+  const bool outermost = (present_command_depth++ == 0);
+  ~PresentCommandScope() { --present_command_depth; }
+};
+
+inline void ObservePresentSourceBarriers(ID3D12GraphicsCommandList* list, UINT count,
+                                         const D3D12_RESOURCE_BARRIER* barriers) {
+  if (!present_base_capture_active.load(std::memory_order_relaxed) || !WantsPresentBaseFrames()
+      || barriers == nullptr || SuppressCommandStateObservation()) return;
+  RuntimeLock lock(runtime_mutex);
+  const auto recording = submission::RecordingIdentity(list);
+  for (UINT i = 0; i < count; ++i) {
+    const auto& barrier = barriers[i];
+    if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
+      const auto before = renodx::utils::directx::NativeIdentity(barrier.Aliasing.pResourceBefore);
+      const auto after = renodx::utils::directx::NativeIdentity(barrier.Aliasing.pResourceAfter);
+      for (auto& set : present_guide_sets) {
+        auto& frame = set.base_frame;
+        if (frame.source != nullptr && (before == nullptr || after == nullptr || before == frame.source
+            || after == frame.source || before == frame.backbuffer || after == frame.backbuffer)) {
+          submission::TrackUse(list, set.marker);
+          if (frame.recording == recording) frame = {};
+          else frame.competing_recording = true;
+        }
+      }
+      continue;
+    }
+    if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) continue;
+    const auto& transition = barrier.Transition;
+    const auto resource = renodx::utils::directx::NativeIdentity(transition.pResource);
+    const bool full = barrier.Flags == D3D12_RESOURCE_BARRIER_FLAG_NONE
+        && (transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES || transition.Subresource == 0);
+    for (auto& set : present_guide_sets) {
+      auto& frame = set.base_frame;
+      if (resource == nullptr || (frame.source != resource && frame.backbuffer != resource)) continue;
+      if (frame.recording != recording) {
+        // A competing recording must never disappear from the proof merely
+        // because the original producer has already finished its copy.
+        submission::TrackUse(list, set.marker);
+        frame.competing_recording = true;
+      } else if (frame.backbuffer == resource) {
+        if (full && !frame.sealed && transition.StateBefore == D3D12_RESOURCE_STATE_COPY_DEST
+            && transition.StateAfter == D3D12_RESOURCE_STATE_PRESENT) {
+          frame.sealed = true;
+        } else {
+          frame = {};
+        }
+      } else if (frame.backbuffer == nullptr) {
+        if (full && !frame.source_ready && transition.StateBefore == D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+            && transition.StateAfter == D3D12_RESOURCE_STATE_COPY_SOURCE) {
+          frame.source_ready = true;
+        } else {
+          frame = {};
+        }
+      }
+    }
+  }
+}
+
+inline void ObservePresentSourceWork(ID3D12GraphicsCommandList* list, bool unknown_layout) {
+  if (!present_base_capture_active.load(std::memory_order_relaxed) || !WantsPresentBaseFrames()
+      || SuppressCommandStateObservation()) return;
+  RuntimeLock lock(runtime_mutex);
+  const auto recording = submission::RecordingIdentity(list);
+  for (auto& set : present_guide_sets) {
+    auto& frame = set.base_frame;
+    if (frame.source != nullptr && frame.recording == recording && (unknown_layout || !frame.source_ready)) {
+      // Before the SR output leaves UAV state, an unclassified draw or
+      // dispatch can write it without a transition. Afterward the sealed
+      // backbuffer can only be written via a new transition or a copy.
+      frame = {};
+    }
+  }
+}
+
+#include "present_source_hooks.hpp"
+
+inline void ObservePresentSourceCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* source,
+                                     ID3D12Resource* destination, bool full) {
+  if (!present_base_capture_active.load(std::memory_order_relaxed) || !WantsPresentBaseFrames()
+      || source == nullptr || destination == nullptr || SuppressCommandStateObservation()) return;
+  RuntimeLock lock(runtime_mutex);
+  const auto input = renodx::utils::directx::NativeIdentity(source);
+  const auto output = renodx::utils::directx::NativeIdentity(destination);
+  if (input == nullptr || output == nullptr || input == output) return;
+  const auto recording = submission::RecordingIdentity(list);
+  PresentStream* target = nullptr;
+  for (auto& [_, stream] : present_streams) {
+    if (stream.base_frame_epoch == 0
+        || std::ranges::find(stream.mixed_buffers, output) == stream.mixed_buffers.end()) continue;
+    if (target != nullptr) return;
+    target = &stream;
+  }
+  for (auto& set : present_guide_sets) {
+    auto& frame = set.base_frame;
+    if (frame.source == output || frame.backbuffer == output) {
+      if (frame.recording == recording) frame = {};
+      else frame.competing_recording = true;
+      continue;
+    }
+    if (target == nullptr || !full || !frame.source_ready || frame.source != input
+        || frame.recording != recording || frame.backbuffer != nullptr) continue;
+    const auto from = source->GetDesc();
+    const auto to = destination->GetDesc();
+    if (from.Width != to.Width || from.Height != to.Height || from.Format != to.Format
+        || to.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || to.MipLevels != 1
+        || to.DepthOrArraySize != 1 || to.SampleDesc.Count != 1
+        || (to.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) != 0) continue;
+    for (auto& other : present_guide_sets) {
+      if (&other != &set && other.base_frame.backbuffer == output
+          && other.base_frame.swapchain_epoch == target->base_frame_epoch) {
+        other.base_frame = {};
+      }
+    }
+    frame.backbuffer = output;
+    frame.swapchain_epoch = target->base_frame_epoch;
+  }
+}
+
 using MixedCopyResourceFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12Resource*, ID3D12Resource*);
 using MixedCopyRegionFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, const D3D12_TEXTURE_COPY_LOCATION*,
     UINT, UINT, UINT, const D3D12_TEXTURE_COPY_LOCATION*, const D3D12_BOX*);
@@ -2863,14 +3121,6 @@ inline MixedCopyResourceFn real_mixed_copy_resource = nullptr;
 inline MixedCopyRegionFn real_mixed_copy_region = nullptr;
 inline std::shared_mutex mixed_copy_hook_mutex;
 inline bool mixed_copy_hooks_installed = false;
-
-// Runtime/debug-layer forwarding can call a second hooked copy method on an
-// internal list. It belongs to the outer API operation, not another producer.
-inline thread_local uint32_t mixed_copy_forward_depth = 0;
-struct MixedCopyForwardScope {
-  const bool outermost = (mixed_copy_forward_depth++ == 0);
-  ~MixedCopyForwardScope() { --mixed_copy_forward_depth; }
-};
 
 #if defined(NR_NEXUS_DEV_CONTROL)
 using NativePremiseBarrierFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
@@ -3000,9 +3250,11 @@ inline void UnhookNativePremiseBarriers() {
 
 inline void STDMETHODCALLTYPE HookedMixedCopyResource(ID3D12GraphicsCommandList* list,
     ID3D12Resource* destination, ID3D12Resource* source) {
-  const MixedCopyForwardScope copy_scope;
+  const PresentCommandScope copy_scope;
   real_mixed_copy_resource(list, destination, source);
   if (!copy_scope.outermost) return;
+  CallbackScope callback;
+  if (callback) GuardHook([&] { ObservePresentSourceCopy(list, source, destination, true); });
 #if defined(NR_NEXUS_DEV_CONTROL)
   GuardHook([&] { native_tag_source::ObservePremiseCopy(list, source, destination, true); });
   GuardHook([&] { native_tag_source::ObserveCopy(list, source, destination, true); });
@@ -3012,13 +3264,15 @@ inline void STDMETHODCALLTYPE HookedMixedCopyResource(ID3D12GraphicsCommandList*
 inline void STDMETHODCALLTYPE HookedMixedCopyRegion(ID3D12GraphicsCommandList* list,
     const D3D12_TEXTURE_COPY_LOCATION* destination, UINT x, UINT y, UINT z,
     const D3D12_TEXTURE_COPY_LOCATION* source, const D3D12_BOX* box) {
-  const MixedCopyForwardScope copy_scope;
+  const PresentCommandScope copy_scope;
   real_mixed_copy_region(list, destination, x, y, z, source, box);
   if (!copy_scope.outermost) return;
   if (source == nullptr || destination == nullptr) return;
   const bool full = x == 0 && y == 0 && z == 0 && box == nullptr
       && source->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && source->SubresourceIndex == 0
       && destination->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && destination->SubresourceIndex == 0;
+  CallbackScope callback;
+  if (callback) GuardHook([&] { ObservePresentSourceCopy(list, source->pResource, destination->pResource, full); });
 #if defined(NR_NEXUS_DEV_CONTROL)
   GuardHook([&] { native_tag_source::ObservePremiseCopy(list, source->pResource, destination->pResource, false); });
   GuardHook([&] { native_tag_source::ObserveCopy(list, source->pResource, destination->pResource, full); });
@@ -3044,6 +3298,7 @@ inline bool InstallMixedPresentCopyHooks(ID3D12GraphicsCommandList* list) {
   return mixed_copy_hooks_installed;
 }
 inline void UnhookMixedPresentCopyHooks() {
+  UnhookPresentSourceHooks();
 #if defined(NR_NEXUS_DEV_CONTROL)
   UnhookNativePremiseBarriers();
 #endif
@@ -3350,6 +3605,77 @@ inline bool RunMixedPresent(ID3D12CommandQueue* queue, reshade::api::command_que
   return SubmitPresentGroup(queue, api_queue, slot, stream, block, guides, target, false, {});
 }
 
+inline bool RunPresentBaseFrame(ID3D12CommandQueue* native_queue, reshade::api::command_queue* queue,
+                                PresentSlot* slot, PresentStream& stream, ID3D12Resource* back,
+                                PresentTarget target) {
+  const auto backbuffer = renodx::utils::directx::NativeIdentity(back);
+  const auto reject = [&] {
+    ResetPresentStreamHistory(&stream);
+    ++edit_reuse_fallbacks;
+    CountNrDecline(NrDeclineReason::kPresentBaseUnproven);
+    return false;
+  };
+  if (target.hdr_mode != 1 || target.hdr_color_space != reshade::api::color_space::scrgb
+      || diagnostics::GuideMode(target.diagnostic.guides, present_guides.load()) == kPresentGuidesNever
+      || backbuffer == nullptr || native_queue == nullptr || stream.base_frame_epoch == 0) return reject();
+
+  PresentGuideSet* guides = nullptr;
+  for (auto& set : present_guide_sets) {
+    if (set.serial == 0 || set.base_frame.swapchain_epoch != stream.base_frame_epoch
+        || set.base_frame.backbuffer != backbuffer) continue;
+    if (guides != nullptr) return reject();
+    guides = &set;
+  }
+  if (guides == nullptr) return reject();
+  auto& frame = guides->base_frame;
+  // A late producer cannot reopen a frame that this Present already declined.
+  const bool repeated = std::exchange(frame.attempted, true);
+  const auto source = features.find(guides->source_handle);
+  if (!frame.sealed || frame.competing_recording || guides->completed_multiple_queues
+      || frame.configuration != configuration_generation.load(std::memory_order_relaxed)
+      || source == features.end() || source->second.source_generation != frame.source_generation
+      || source->second.sr_sequence != frame.sequence
+      || stream.mixed_queue != renodx::utils::directx::NativeIdentity(native_queue)) return reject();
+  if (repeated) {
+    CountNrDecline(NrDeclineReason::kPresentRepeat);
+    return guides->serial == stream.consumed_serial && PresentBaseSubmissionCurrent(frame.submit_count + 2);
+  }
+  if (!PresentBaseSubmissionCurrent(frame.submit_count + 1)
+      || frame.submit_count + 1 != present_base_single_submit.load(std::memory_order_relaxed)) return reject();
+
+  // Only one native submission may intervene after this SR. Together with
+  // the one-list copy and its exact receipt this excludes intervening writers
+  // on other lists, even if they share a queue or a batch fence value.
+  std::vector<std::pair<FenceRef, uint64_t>> receipts;
+  if (submission::UseSubmissionTokens(guides->marker, &receipts) == submission::UseSubmission::kUnsubmitted) return reject();
+  if (!guides->completed_fence.empty()) receipts.emplace_back(guides->completed_fence, guides->completed_value);
+  if (receipts.size() != 1 || receipts.front().second == 0
+      || !submission::OnlyRecordingUses(guides->marker, frame.recording)) return reject();
+  {
+    std::shared_lock lock(queue_completion_mutex);
+    const auto own = queue_completions.find(native_queue);
+    if (own == queue_completions.end() || own->second.fence != receipts.front().first.fence
+        || receipts.front().first->GetCompletedValue() == UINT64_MAX) {
+      lock.unlock();
+      return reject();
+    }
+  }
+
+  const auto& contract = guides->contract;
+  auto& block = FillPresentBlock(&stream, back, guides->motion, guides->depth, contract,
+      guides->output_width, guides->output_height, 1.f, contract.frame_reset, false, guides->source_handle);
+  block.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, contract.jitter_x);
+  block.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, contract.jitter_y);
+  target.workset_key = reinterpret_cast<const ID3D12Resource*>(&stream);
+  target.guide_serial = guides->serial;
+  target.base_frame_sequence = frame.sequence;
+  target.base_frame_epoch = frame.swapchain_epoch;
+  target.diagnostic_source_generation = frame.source_generation;
+  target.diagnostic_source_feature = kFeatureDlss;
+  target.guide_mode = kPresentGuidesRequired;
+  return SubmitPresentGroup(native_queue, queue, slot, stream, block, guides, target, false, {});
+}
+
 inline void RunPresentPath(
     reshade::api::command_queue* queue, reshade::api::swapchain* swapchain,
     bool auto_fallback = false, bool deferred = false) {
@@ -3361,6 +3687,8 @@ inline void RunPresentPath(
       && stack_passes.load() == 2 && pass_stage[0].load() == 3
       && swapchain != nullptr && swapchain->get_device() != nullptr
       && swapchain->get_device()->get_api() == reshade::api::device_api::d3d12;
+  const bool ordinary_base_frames = !auto_fallback && WantsPresentBaseFrames()
+      && !screenshot::WantsFinalPresent() && !fg::xefg::OwnsStream();
   // Resolve unsupported requests before the route's early return: Vulkan
   // and the D3D11 foreign/off routes never satisfy PresentHookServes().
   // A helper's small control-window swapchain is not its evaluated game
@@ -3406,8 +3734,17 @@ inline void RunPresentPath(
       }
     }
   }
-  if (fg::xefg::OwnsStream()) return;
-  if (mixed && queue != nullptr && swapchain != nullptr && swapchain->get_device() != nullptr
+  if (fg::xefg::OwnsStream()) {
+    if (present_base_capture_active.load(std::memory_order_relaxed)) {
+      RuntimeLock lock(runtime_mutex);
+      for (auto& [_, stream] : present_streams) {
+        InvalidatePresentBaseFrames(&stream);
+      }
+      present_base_capture_active.store(false, std::memory_order_relaxed);
+    }
+    return;
+  }
+  if ((mixed || ordinary_base_frames) && queue != nullptr && swapchain != nullptr && swapchain->get_device() != nullptr
       && swapchain->get_device()->get_api() == reshade::api::device_api::d3d12) {
     RuntimeLock lock(runtime_mutex);
     auto& stream = present_streams[swapchain];
@@ -3419,9 +3756,11 @@ inline void RunPresentPath(
         if (resource != nullptr) buffers.push_back(renodx::utils::directx::NativeIdentity(resource));
       }
     }
+    if (buffers.size() != count || std::ranges::find(buffers, nullptr) != buffers.end()) buffers.clear();
     auto* native_queue = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
     const void* identity = renodx::utils::directx::NativeIdentity(native_queue);
     if (stream.mixed_buffers != buffers || stream.mixed_queue != identity) {
+      InvalidatePresentBaseFrames(&stream);
       stream.mixed_capture = 0;
       stream.mixed_sources = 0;
       stream.mixed_buffers = std::move(buffers);
@@ -3436,7 +3775,10 @@ inline void RunPresentPath(
       stream.mixed_write_ambiguous = false;
       stream.mixed_write_foreign = false;
     }
-    if (count != 0 && count <= 16) {
+    if (ordinary_base_frames && !deferred && !stream.mixed_buffers.empty() && stream.base_frame_epoch == 0) {
+      stream.base_frame_epoch = ++present_base_epoch_serial;
+    }
+    if (!stream.mixed_buffers.empty()) {
       auto* resource = reinterpret_cast<ID3D12Resource*>(swapchain->get_back_buffer(0).handle);
       const auto desc = resource->GetDesc();
       stream.mixed_width = static_cast<uint32_t>(desc.Width);
@@ -3444,6 +3786,15 @@ inline void RunPresentPath(
       stream.mixed_format = desc.Format;
       stream.mixed_device = renodx::utils::directx::NativeIdentity(
           reinterpret_cast<IUnknown*>(swapchain->get_device()->get_native()));
+    }
+  }
+  if (!ordinary_base_frames && present_base_capture_active.load(std::memory_order_relaxed)) {
+    RuntimeLock lock(runtime_mutex);
+    if (!WantsPresentBaseFrames()) {
+      for (auto& [_, stream] : present_streams) InvalidatePresentBaseFrames(&stream);
+      present_base_capture_active.store(false, std::memory_order_relaxed);
+    } else if (const auto stream = present_streams.find(swapchain); stream != present_streams.end()) {
+      InvalidatePresentBaseFrames(&stream->second);
     }
   }
   if (!PresentHookServes(false) && !auto_fallback && !mixed) {
@@ -3851,6 +4202,7 @@ inline void RunPresentPath(
       if (input.identity == stream.native_output_identity
           && input.owner == &stream && input.route_id == stream.native_route_id
           && input.backbuffer == back && input.marker != nullptr && input.serial != 0) {
+        InvalidatePresentBaseFrames(&stream);
         std::vector<std::pair<FenceRef, uint64_t>> tokens;
         const auto proof = submission::UseSubmissionTokens(input.marker, &tokens);
         const ID3D12Fence* own_fence = nullptr;
@@ -3883,10 +4235,14 @@ inline void RunPresentPath(
       // application image will generate frames or go straight to Present.
       native_deferred_present = {.queue = queue, .swapchain = swapchain,
           .identity = base_identity, .route_id = stream.native_route_id, .auto_fallback = auto_fallback};
+      InvalidatePresentBaseFrames(&stream);
       return;
     }
   }
-  if (!native_passthrough && YieldPresentToNativeFg()) return;
+  if (!native_passthrough && YieldPresentToNativeFg()) {
+    InvalidatePresentBaseFrames(&stream);
+    return;
+  }
   // Only this final-Present route can interpret its own skipped work as a
   // display gap. Native FG's normal bypass above is already served pre-FG.
   struct GapCount {
@@ -3977,7 +4333,8 @@ inline void RunPresentPath(
       std::unique_lock lock(present_restore_effective.mutex);
       present_restore_effective.status = "pre_fg_served_hold";
     }
-    gap.ran = true;
+    InvalidatePresentBaseFrames(&stream);
+    gap.ran = !ordinary_base_frames;
     CountNrDecline(NrDeclineReason::kPresentPreFg);
     return;
   }
@@ -3987,7 +4344,8 @@ inline void RunPresentPath(
   if (!d3d11 && present_prefg_upscaled_active.load(std::memory_order_relaxed)) {
     PublishPresentRestoreOwner(present_restore_scope::Domain::UPSCALED_FALLBACK,
         present_restore_scope::Reason::INACTIVE_DOMAIN, true, 0, 0, "upscaled_fallback_serves_present_idle");
-    gap.ran = true;
+    InvalidatePresentBaseFrames(&stream);
+    gap.ran = !ordinary_base_frames;
     CountNrDecline(NrDeclineReason::kPresentFormat);
     return;
   }
@@ -4063,7 +4421,23 @@ inline void RunPresentPath(
   // tokens on any other queue's fence must already be complete (Cross-queue
   // captures above).  A queue the tracker has not seen submit yet has no
   // fence, so every token is another queue's.
-  auto* const native_queue = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
+  auto* native_queue = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
+  if (!d3d11 && ordinary_base_frames && WantsPresentBaseFrames()
+      && !fg::xefg::OwnsStream() && !screenshot::WantsFinalPresent()) {
+    if (native_passthrough || deferred) {
+      InvalidatePresentBaseFrames(&stream);
+      ++edit_reuse_fallbacks;
+      CountNrDecline(NrDeclineReason::kPresentBaseUnproven);
+      return;
+    }
+    renodx::utils::directx::NativeFromReShadeProxy(&native_queue);
+    // ReShade work queued by an earlier add-on can have changed the image.
+    // Flush it before checking how many submissions followed this SR.
+    queue->flush_immediate_command_list();
+    gap.ran = RunPresentBaseFrame(native_queue, queue, slot, stream, back, target);
+    return;
+  }
+  InvalidatePresentBaseFrames(&stream);
   const bool comparing_clean_frame = screenshot::WantsFinalPresent()
       && screenshot::internal::requires_passthrough_frame.load(std::memory_order_acquire);
   const uint32_t guides_mode = diagnostics::GuideMode(
@@ -4101,9 +4475,10 @@ inline void RunPresentPath(
       if (!d3d11) {
         if (submission::UseSubmissionTokens(set.marker, &tokens)
             == submission::UseSubmission::kUnsubmitted) continue;
-        if (comparing_clean_frame && !set.completed_fence.empty()) {
+        if (!set.completed_fence.empty()) {
           tokens.emplace_back(set.completed_fence, set.completed_value);
         }
+        if (tokens.empty()) continue;
       }
       bool in_flight = false;
       bool foreign_queue = comparing_clean_frame && set.completed_multiple_queues;

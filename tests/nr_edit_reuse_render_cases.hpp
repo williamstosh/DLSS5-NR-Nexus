@@ -18,6 +18,7 @@
 // Included after the native GPU fixture and its model substitutes.
 namespace nr_edit_reuse_render_cases {
 namespace addon = renodx::addons::dlss5;
+namespace timers = addon::gpu_timers;
 using stage_execution_cases::Capture;
 using stage_execution_cases::Snapshot;
 
@@ -146,7 +147,7 @@ int Run() {
     native::control_mask_enabled = false;
     native::use_auto_mask = false;
     native::cost_meter_enabled = false;
-    native::gpu_timers_enabled = false;
+    native::gpu_timers_enabled = true;
     native::transfer_strength = 1.f;
     native::color_strength = 1.f;
     native::intensity = 1.f;
@@ -232,6 +233,9 @@ int Run() {
       uint64_t model_calls = 0;
       bool swapped_color = false;
       std::vector<ColorPixel> sr_tile;
+      uint64_t timer_sequence = 0;
+      bool timer_published = false;
+      timers::Stats completed_timer;
     };
     uint32_t application_frames = 0;
     const auto frame = [&](const FrameInput& input, bool submit = true) {
@@ -258,20 +262,70 @@ int Run() {
       sr_consumer = &consumer;
       composed_motion = {};
       const auto before = model_calls;
+      const auto timer_sequence_before = timers::internal::next_sequence;
       gpu.list->ClearState(nullptr);
       const auto status = native::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), handle, &parameters, nullptr);
       sr_consumer = nullptr;
       Check(consumer.calls == 1 && status == input.sr_result, "wrapper calls game SR once and propagates its return");
       Check(native::GetD3D12Resource(&parameters, NVSDK_NGX_Parameter_Color) == color.Get(),
             "wrapper restores the original Color binding on return from SR");
+      FrameResult result{.model_calls = model_calls - before, .swapped_color = consumer.swapped_color};
+      const timers::Segment* timer = nullptr;
+      if (timers::internal::next_sequence != timer_sequence_before) {
+        timer = &timers::internal::segments[timers::internal::current.idx];
+        Check(timer->recorded && timer->measure && std::strcmp(timer->path, "preSR") == 0
+                  && timer->sequence == timer_sequence_before + 1 && timers::internal::mapped != nullptr
+                  && timers::internal::mapped[timer->base + timers::kSlotFrameStart] == timers::kUnwritten,
+              "PreSR wrapper recorded one unresolved production timestamp segment");
+        result.timer_sequence = timer->sequence;
+      }
       if (!submit) {
         gpu.Retain(consumer.motion.readback.Get());
-        return FrameResult{.model_calls = model_calls - before, .swapped_color = consumer.swapped_color};
+        return result;
       }
       const auto original = Capture(gpu, color.Get(), NATIVE_INPUT_STATE);
       const auto output = Capture(gpu, sr_output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-      gpu.Submit();
+      // Use the production queue/list hooks and preserve their receipts before polling the timer.
+      Check(SUCCEEDED(gpu.list->Close()), "close Render wrapper recording");
+      ID3D12CommandList* lists[]{gpu.list.Get()};
+      gpu.queue->ExecuteCommandLists(1, lists);
+      Check(SUCCEEDED(gpu.queue->Signal(gpu.fence.Get(), ++gpu.serial)), "signal Render wrapper completion");
+      HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+      Check(event != nullptr, "Render wrapper completion event");
+      const auto signal = gpu.fence->SetEventOnCompletion(gpu.serial, event);
+      const auto wait = (SUCCEEDED(signal) ? WaitForSingleObject(event, 10000) : WAIT_FAILED);
+      CloseHandle(event);
+      const auto completed_fence = gpu.fence->GetCompletedValue();
+      Check(wait == WAIT_OBJECT_0 && completed_fence != UINT64_MAX && completed_fence >= gpu.serial,
+            "Render wrapper recording completes on the GPU fence");
+      Check(SUCCEEDED(gpu.allocator->Reset()) && SUCCEEDED(gpu.list->Reset(gpu.allocator.Get(), nullptr)),
+            "close Render wrapper submission generation against replay");
       native::DrainRetiredResources(true);
+      const auto published_before = timers::stage_published[0];
+      if (timer != nullptr) {
+        Check(timer->proof == timers::SampleState::VALID
+                  && timers::internal::mapped[timer->base + timers::kSlotFrameStart] != timers::kUnwritten,
+              "Render timer has a single-execution receipt and the GPU resolved its timestamp");
+      }
+      timers::Poll(true, false);
+      result.timer_published = timers::stage_published[0] != published_before;
+      if (timer != nullptr) {
+        const auto& complete = timers::completed_stats[0];
+        const auto& sample = (complete.sequence == result.timer_sequence ? complete : timers::stage_stats[0]);
+        if (complete.sequence == result.timer_sequence) {
+          result.completed_timer = complete;
+        }
+        std::cout << "OBS Render timer frame=" << application_frames << " seq=" << result.timer_sequence
+                  << " calls=" << result.model_calls << " swapped=" << result.swapped_color
+                  << " sr_result=" << status << " fence=" << completed_fence << " resolved=1 exact=1"
+                  << " eval_start=" << ((timer->written >> timers::PassEvalStart(0)) & 1)
+                  << " eval_end=" << ((timer->written >> timers::PassEvalEnd(0)) & 1)
+                  << " published=" << result.timer_published << " complete=" << result.completed_timer.valid
+                  << " total_us=" << sample.total_us << " eval_us=" << sample.eval_us
+                  << " own_us=" << sample.own_us << " state=" << timers::StateText(sample.state) << '\n';
+      }
+      gpu.uploads.clear();
+      gpu.retained_resources.clear();
       const auto original_bytes = original.Pixels();
       const auto sr_motion_bytes = consumer.motion.Pixels();
       Check(original_bytes.size() == source.size() * sizeof(ColorPixel)
@@ -292,8 +346,8 @@ int Run() {
       if (!consumer.swapped_color) {
         Check(tile == source, "SR pass-through consumes exact current source pixels");
       }
-      return FrameResult{.model_calls = model_calls - before, .swapped_color = consumer.swapped_color,
-                         .sr_tile = std::move(tile)};
+      result.sr_tile = std::move(tile);
+      return result;
     };
 
     const auto warm = [&] {
@@ -313,6 +367,17 @@ int Run() {
     native::native_fg_declaration = native::NativeFgDeclaration::kOn;
     const auto reuse = frame(shifted);
     Check(reuse.model_calls == 0 && reuse.swapped_color, "game SR receives the reused edit across an FG declaration change");
+    const auto& refresh_timer = refresh.completed_timer;
+    const auto& reuse_timer = reuse.completed_timer;
+    Check(refresh.timer_published && refresh_timer.valid && refresh_timer.queue == gpu.queue.Get()
+              && refresh_timer.total_us > 0 && refresh_timer.eval_us > 0
+              && refresh_timer.eval_us == refresh_timer.passes[0].eval_us,
+          "Render refresh publishes a complete GPU sample with the NR model time");
+    Check(reuse.timer_published && reuse_timer.valid && reuse_timer.queue == gpu.queue.Get()
+              && reuse_timer.total_us > 0 && reuse_timer.passes[0].total_us > 0
+              && reuse_timer.eval_us == 0 && reuse_timer.passes[0].eval_us == 0
+              && reuse_timer.own_us == reuse_timer.total_us,
+          "Render reuse publishes the full GPU cost and zero NR Evaluate time");
     const size_t edge = 6 * RENDER_SIZE + EDIT_EDGE;
     const auto red = [](const ColorPixel& pixel) { return DirectX::PackedVector::XMConvertHalfToFloat(pixel[0]); };
     const float left = red(refresh.sr_tile[edge - 1]);

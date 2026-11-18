@@ -141,6 +141,7 @@ struct PassStats {
   uint32_t total_us = 0;
   bool look_measured = false;
   SampleState state = SampleState::NOT_EXECUTED;
+  bool edit_reused = false;
 };
 
 struct Segment {
@@ -476,10 +477,12 @@ inline bool Publish(const Segment& s, bool log, const void* queue) {
     auto& layer = next.passes[pass];
     layer = s.passes[pass];
     if ((s.written >> PassEncodeStart(pass) & 1) == 0) continue;
+    const bool valid_evaluate = (layer.edit_reused
+        ? (s.written >> PassEvalStart(pass) & 1) == 0 && has_span(PassEncodeEnd(pass), PassEvalEnd(pass))
+        : has_span(PassEncodeEnd(pass), PassEvalStart(pass)) && has_span(PassEvalStart(pass), PassEvalEnd(pass)));
     if (layer.width == 0 || layer.height == 0
         || !has_span(PassEncodeStart(pass), PassEncodeEnd(pass))
-        || !has_span(PassEncodeEnd(pass), PassEvalStart(pass))
-        || !has_span(PassEvalStart(pass), PassEvalEnd(pass))
+        || !valid_evaluate
         || !has_span(PassEvalEnd(pass), PassResolveEnd(pass))
         || q[PassEncodeStart(pass)] < q[kSlotFrameStart]
         || q[PassResolveEnd(pass)] > q[kSlotCopyBackEnd]
@@ -490,7 +493,7 @@ inline bool Publish(const Segment& s, bool log, const void* queue) {
       return false;
     }
     layer.encode_us = delta_us(PassEncodeStart(pass), PassEncodeEnd(pass));
-    layer.eval_us = delta_us(PassEvalStart(pass), PassEvalEnd(pass));
+    layer.eval_us = (layer.edit_reused ? 0u : delta_us(PassEvalStart(pass), PassEvalEnd(pass)));
     layer.resolve_us = delta_us(PassEvalEnd(pass), PassResolveEnd(pass));
     layer.look_us = delta_us(PassEvalEnd(pass), PassLookEnd(pass));
     layer.look_measured = (s.written >> PassLookEnd(pass) & 1) != 0;
@@ -800,6 +803,14 @@ inline void Mark(ID3D12GraphicsCommandList* command_list, uint32_t slot) {
   s.written |= uint64_t{1} << slot;
 }
 
+inline void MarkEditReuse(ID3D12GraphicsCommandList* command_list, uint32_t pass) {
+  if (!internal::current.active || pass >= kTimerMaxPasses) return;
+  // This boundary ends Apply/Snapshot and starts resolve. The full pass
+  // includes that GPU work; there is no NGX Evaluate interval to publish.
+  internal::segments[internal::current.idx].passes[pass].edit_reused = true;
+  Mark(command_list, PassEvalEnd(pass));
+}
+
 // Flags the current segment as a zero-strength passthrough frame: it resolves
 // and frees the ring slot, but never publishes stats (the chain recorded no
 // work worth timing).
@@ -942,11 +953,12 @@ inline void Poll(bool exact_proofs, bool log) {
             && (s.written & (uint64_t{1} << kSlotFrameStart)) != 0;
         for (uint32_t pass = 0; pass < std::min(s.pass_count, kTimerMaxPasses); ++pass) {
           const auto& layer = s.passes[pass];
+          const uint64_t eval_start = uint64_t{1} << PassEvalStart(pass);
           const uint64_t required = (uint64_t{1} << PassEncodeStart(pass))
-              | (uint64_t{1} << PassEncodeEnd(pass)) | (uint64_t{1} << PassEvalStart(pass))
+              | (uint64_t{1} << PassEncodeEnd(pass)) | (layer.edit_reused ? 0 : eval_start)
               | (uint64_t{1} << PassEvalEnd(pass)) | (uint64_t{1} << PassResolveEnd(pass));
           if (layer.id != s.pass_begin + pass || layer.width == 0 || layer.height == 0
-              || (s.written & required) != required) {
+              || (s.written & required) != required || (layer.edit_reused && (s.written & eval_start) != 0)) {
             complete = false;
           }
         }

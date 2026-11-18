@@ -14,9 +14,10 @@ namespace renodx::addons::dlss5::ui::lang {
 inline constexpr Translation kKo[] = {
     {"x2 edit reuse (experimental)", "x2 편집 재사용(실험적)"},
     {"Refresh NR once per two base frames and reproject its edit onto the next frame to reduce GPU work. Upscaling still runs every frame; x2 is separate from the FG multiplier. Turn off if motion, lighting or frame pacing looks worse.", "기본 프레임 두 개마다 NR을 한 번 갱신하고 편집 결과를 다음 프레임에 재투영하여 GPU 작업을 줄입니다. 업스케일링은 매 프레임 실행되며 x2는 FG 배율과 별개입니다. 움직임, 조명 또는 프레임 간격이 나빠지면 끄세요."},
-    {"D3D12 supports Render before DLSS SR, Upscaled with FG off, and Present with XeFG single Backbuffer and UI Composition off.", "D3D12에서는 DLSS SR 전의 Render, FG를 끈 Upscaled, 단일 XeFG Backbuffer를 사용하고 UI Composition을 끈 Present를 지원합니다."},
+    {"D3D12 x2 supports Render before SR, Upscaled with FG off, and XeFG Present (single Backbuffer, UI Composition off). Ordinary Present needs Game frames and a verified same-frame source.", "D3D12의 x2는 SR 이전 Render, FG를 끈 Upscaled, XeFG Present(단일 Backbuffer, UI Composition 끔)를 지원합니다. 일반 Present에서는 ‘게임 프레임’ 설정이 필요하며, 동일 프레임의 소스가 확인되어야 합니다."},
     {"Requires NR 310.9.16.0, model B, one Pass, fixed 100%, HDR FP16 (XeFG also supports HDR10/PQ), and compatible depth and motion. Turn off Adjust NR's look, Detail stability, Region mask and Adaptive resolution.", "NR 310.9.16.0, 모델 B, 1패스, 고정 100%, HDR FP16(XeFG는 HDR10/PQ도 지원) 및 호환되는 깊이와 모션이 필요합니다. NR 모양 조정, 디테일 안정화, 영역 마스크 및 적응형 해상도를 끄세요."},
-    {"When reuse conditions are unmet, NR keeps its per-frame path. Invalid reprojected pixels keep the current picture.", "재사용 조건이 충족되지 않으면 NR은 프레임별 처리를 유지합니다. 재투영이 유효하지 않은 픽셀은 현재 화면을 유지합니다."},
+    {"Could not verify the game frame for x2 edit reuse", "x2 편집 재사용에 필요한 게임 프레임을 확인하지 못했습니다."},
+    {"Render, Upscaled and XeFG Present use per-frame NR if reuse is unavailable. Ordinary Present keeps the original frame without a verified same-frame source. Invalid reprojected pixels keep their current color.", "재사용할 수 없으면 Render, Upscaled 및 XeFG Present는 프레임마다 NR을 실행합니다. 일반 Present는 같은 프레임의 소스를 확인할 수 없으면 원본 프레임을 유지합니다. 재투영이 유효하지 않은 픽셀은 현재 색상을 유지합니다."},
     {"Motion attenuation", "움직임 감쇠"},
     {"Reduce R in moving areas, including camera motion. Disabled or unavailable motion leaves the other region-mask settings active.", "카메라 움직임을 포함하여 움직이는 영역의 R을 줄입니다. 움직임이 비활성화되었거나 사용할 수 없는 경우에도 다른 영역 마스크 설정은 유지됩니다."},
     {"Motion fade start", "움직임 감쇠 시작"},

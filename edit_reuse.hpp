@@ -56,6 +56,9 @@ struct Inputs {
   ID3D12Resource* motion = nullptr;
   ID3D12Resource* depth = nullptr;
   ID3D12Resource* original = nullptr;
+  // An ordinary Present backbuffer is borrowed for ordered work on its
+  // presentation queue. ResizeBuffers requires all addon COM refs released.
+  uint64_t borrowed_original_epoch = 0;
   ID3D12Resource* decoded = nullptr;
   DXGI_FORMAT depth_view_format = DXGI_FORMAT_R32_FLOAT;
 };
@@ -63,6 +66,8 @@ struct Inputs {
 struct Binding {
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;
   std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 6> resources;
+  ID3D12Resource* borrowed_original = nullptr;  // Identity only.
+  uint64_t borrowed_original_epoch = 0;
 };
 
 // One immutable geometry and one x2 anchor per source Feature/Stage. The
@@ -174,11 +179,16 @@ inline bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list,
       || state->motion_width != inputs.motion_width || state->motion_height != inputs.motion_height) return false;
   const std::array<ID3D12Resource*, 6> resources{
       inputs.proxy, inputs.neural, inputs.motion, inputs.depth, inputs.original, inputs.decoded};
+  constexpr size_t kOriginal = 4;
+  const bool borrow_original = inputs.borrowed_original_epoch != 0;
   for (const auto* resource : resources) if (resource == nullptr) return false;
   Binding* binding = nullptr;
   for (auto& entry : state->bindings) {
-    bool same = true;
-    for (size_t index = 0; index < resources.size(); ++index) same &= entry.resources[index].Get() == resources[index];
+    bool same = entry.borrowed_original_epoch == inputs.borrowed_original_epoch;
+    for (size_t index = 0; index < resources.size(); ++index) {
+      const auto* previous = (borrow_original && index == kOriginal ? entry.borrowed_original : entry.resources[index].Get());
+      same &= previous == resources[index];
+    }
     if (same) {
       binding = &entry;
       break;
@@ -202,7 +212,11 @@ inline bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list,
           .NumDescriptors = 5 * 7, .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
       if (FAILED(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&binding->heap)))) return false;
     }
-    for (size_t index = 0; index < resources.size(); ++index) binding->resources[index] = resources[index];
+    binding->borrowed_original = (borrow_original ? inputs.original : nullptr);
+    binding->borrowed_original_epoch = inputs.borrowed_original_epoch;
+    for (size_t index = 0; index < resources.size(); ++index) {
+      binding->resources[index] = (borrow_original && index == kOriginal ? nullptr : resources[index]);
+    }
     auto cpu = binding->heap->GetCPUDescriptorHandleForHeapStart();
     // t0 proxy, t1 neural, t2 motion, t3 depth, t4 original.
     constexpr std::array<uint32_t, 5> active_srvs{

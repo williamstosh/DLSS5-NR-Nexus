@@ -1130,6 +1130,10 @@ struct PresentTarget {
   uint32_t sdr_restore_effective_mode = 0;
   std::array<float, kMaxNrPasses> pass_color_strength{};
   uint64_t guide_serial = 0;
+  // Ordinary Present supplies this only after matching the copied SR output,
+  // its guides and the actual backbuffer to one ordered submission.
+  uint64_t base_frame_sequence = 0;
+  uint64_t base_frame_epoch = 0;
   // Granted only by XeFG's tagged, single-backbuffer service. Its private
   // Output contains this base frame's original color before NR runs.
   uint64_t xefg_edit_reuse_frame = 0;
@@ -1842,6 +1846,13 @@ inline std::atomic_uint64_t ngx_entry_release[kMaxNgxSlots];
 // `shadow[sigs=]`, so these two complete the set.
 inline std::atomic_uint64_t device_create_list_entries{0};
 inline std::atomic_uint64_t queue_submit_entries{0};
+inline std::atomic_uint64_t queue_submit_exits{0};
+inline std::atomic_bool present_base_capture_active = false;
+inline std::recursive_mutex present_base_submit_mutex;
+
+inline bool PresentBaseSubmissionCurrent(uint64_t entry) {
+  return queue_submit_entries.load() == entry && queue_submit_exits.load() == entry;
+}
 
 // Built-in defaults - the single source of truth for every user setting.  The
 // setting atomics below initialize from these, LoadConfiguration falls back
@@ -3626,12 +3637,16 @@ inline void NgxLifecycleTick();
 // The Present hook point's evaluate side (present_path.hpp), called by the
 // evaluate hooks under runtime_mutex after the game's real evaluate.
 inline bool PresentTakesEvaluate();
+inline bool WantsPresentBaseFrames();
+// The wrapper must invalidate a still-writable source before calling NGX,
+// whose command traffic is hidden from the regular observation hooks.
+inline void ObservePresentSourceWork(ID3D12GraphicsCommandList* list, bool unknown_layout);
 inline void CapturePresentGuides(
     ID3D12GraphicsCommandList* command_list,
     const NVSDK_NGX_Handle* handle,
     const NVSDK_NGX_Parameter* parameters,
     D3D12_RESOURCE_STATES motion_state,
-    D3D12_RESOURCE_STATES depth_state, bool mixed_predecessor = false);
+    D3D12_RESOURCE_STATES depth_state, bool mixed_predecessor = false, bool successful_dlss_sr = false);
 // NGX wrappers precede the Present storage needed by the B1 handoff.
 inline bool ProcessMixedPresentPredecessor(ID3D12GraphicsCommandList* list,
     const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* parameters, bool* touched);
@@ -3641,6 +3656,8 @@ inline void CapturePresentGuides11(
     const NVSDK_NGX_Parameter* parameters);
 inline void PreservePresentCaptureProof(
     const void* marker, const std::vector<submission::GenerationSubmission>& submissions);
+// Queue detours precede the Present provenance storage.
+inline void ObservePresentBaseSubmission(uint64_t entry, UINT list_count);
 // The native service owns its frame cache in fg_native.hpp, included after
 // retirement; this callback preserves an exact producer receipt before prune.
 inline void PreserveNativePreFgProof(
@@ -13323,9 +13340,13 @@ struct NrRecording {
   bool prepared = false;
   bool model_invoked = false;
   bool edit_reused = false;
+  bool edit_refreshed = false;
   bool model_recorded = false;
   bool output_ready = false;
   bool group_complete = false;
+  // Ordinary Present publishes edit counters after its separate submission.
+  edit_reuse::State* reused_edit = nullptr;
+  uint32_t edit_reuse_encoding = 0;
   // Set immediately before each NGX model call, including a call that later
   // returns failure. This keeps service diagnostics distinct from successful
   // pass completion.
@@ -13468,7 +13489,7 @@ inline EditReuseRecording RecordEditReuseBeforeEvaluate(
     ID3D12Device* device, ID3D12GraphicsCommandList* list, NrFeatureSlot* slot,
     const FinalResources& res, const EvaluationContract& frame, ID3D12Resource* original,
     DXGI_FORMAT depth_format, uint32_t work_width, uint32_t work_height, uint64_t sequence,
-    const std::array<uint64_t, 40>& contract, bool color_uses_guide_raster) {
+    const std::array<uint64_t, 40>& contract, bool color_uses_guide_raster, uint64_t borrowed_original_epoch = 0) {
   auto& cache = slot->edit_reuse;
   if (cache == nullptr) {
     cache = std::make_shared<edit_reuse::State>();
@@ -13486,7 +13507,8 @@ inline EditReuseRecording RecordEditReuseBeforeEvaluate(
       .anchor_raster_delta_x = (color_uses_guide_raster ? cache->anchor_raster_offset_x - frame.jitter_x : 0.f),
       .anchor_raster_delta_y = (color_uses_guide_raster ? cache->anchor_raster_offset_y - frame.jitter_y : 0.f),
       .proxy = res.proxy, .neural = res.nr_output, .motion = frame.motion, .depth = frame.depth,
-      .original = original, .decoded = res.decoded, .depth_view_format = ControlMaskDepthViewFormat(depth_format)}};
+      .original = original, .borrowed_original_epoch = borrowed_original_epoch, .decoded = res.decoded,
+      .depth_view_format = ControlMaskDepthViewFormat(depth_format)}};
   if (!edit_reuse::Record(device, list, cache.get(), recorded.inputs, edit_reuse::Phase::PREPARE)) {
     ++edit_reuse_fallbacks;
     RetireEditReuse(slot, sequence);
@@ -14100,13 +14122,15 @@ inline bool RecordInline(
       && present->source_color == nullptr;
 #endif
   const bool edit_reuse_prefg_route = edit_reuse_xefg_route || edit_reuse_native_route;
+  const bool edit_reuse_present_route = present != nullptr && present->base_frame_epoch != 0;
   // PQ stays in the existing Present codec: decode and convert to BT.709
   // before the sRGB model proxy, then commit back to HDR10 after reuse.
   const bool edit_reuse_hdr10 = edit_reuse_prefg_route && hdr_mode == 2
       && output_desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM
       && present->units.encoding == codec::Encoding::Pq && present->units.absolute
       && present->units.unit_nits == 10000.f && present->units.bt2020 && present->hdr_encoding == 4u;
-  const bool edit_reuse_contract_eligible = edit_reuse_requested && (edit_reuse_inline_route || edit_reuse_prefg_route)
+  const bool edit_reuse_contract_eligible = edit_reuse_requested
+      && (edit_reuse_inline_route || edit_reuse_prefg_route || edit_reuse_present_route)
       && !control_mask_requested
       && output_rect.x == 0 && output_rect.y == 0 && width == output_desc.Width && height == output_desc.Height
       && EditReuseInputsEligible(plan, group, current, output_desc, motion_desc, depth_desc, hdr_mode, edit_reuse_hdr10);
@@ -14131,6 +14155,9 @@ inline bool RecordInline(
       && edit_tiers->tiers[0].ready && edit_tiers->tiers[1].ready
       && AdaptiveTierUsable(*edit_tiers, *adaptive.session, 0) && AdaptiveTierUsable(*edit_tiers, *adaptive.session, 1);
   uint64_t edit_reuse_sequence = (present != nullptr ? present->xefg_edit_reuse_frame : feature.sr_sequence);
+  if (edit_reuse_present_route) {
+    edit_reuse_sequence = present->base_frame_sequence;
+  }
 #if defined(NR_NEXUS_DEV_CONTROL)
   if (edit_reuse_native_route) edit_reuse_sequence = present->native_edit_reuse_frame;
 #endif
@@ -14994,7 +15021,8 @@ inline bool RecordInline(
     } else if (edit_reuse_adaptive_route) {
       route_contract = {edit_off.context_identity, edit_off.epoch, edit_off.source_link_generation};
     }
-    edit_contract = PrepareEditReuseHistory(&feature.slots[0], frame, res, feature.source_generation,
+    edit_contract = PrepareEditReuseHistory(&feature.slots[0], frame, res,
+        (edit_reuse_present_route ? present->diagnostic_source_generation : feature.source_generation),
         edit_reuse_sequence, chain_reset_epoch, nr_input_width, nr_input_height, output_desc.Format, v6_encoding,
         route_contract, present == nullptr);
   }
@@ -15231,16 +15259,16 @@ inline bool RecordInline(
         res.nr_output_state,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     res.nr_output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    // The existing per-pass evaluation segment includes ControlMask generation
-    // when enabled, so its off/on delta captures the added GPU dispatch.
-    if (timers_active) {
+    if (timers_active && !edit_reuse_route_eligible) {
+      // Preserve the per-frame evaluation span, including ControlMask work.
       gpu_timers::Mark(command_list, gpu_timers::PassEvalStart(pass));
     }
     NVSDK_NGX_Result nr_result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
     bool nr_returned = false;
     if (edit_reuse_route_eligible) {
       edit = RecordEditReuseBeforeEvaluate(device, command_list, &feature.slots[0], res, frame, output,
-          depth_desc.Format, nr_input_width, nr_input_height, edit_reuse_sequence, edit_contract, false);
+          depth_desc.Format, nr_input_width, nr_input_height, edit_reuse_sequence, edit_contract, false,
+          (edit_reuse_present_route ? present->base_frame_epoch : 0));
     }
     if (edit.reused) {
       UavBarrier(command_list, res.nr_output);
@@ -15249,9 +15277,12 @@ inline bool RecordInline(
       res.nr_output_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
       edit_reused = true;
       if (timers_active) {
-        gpu_timers::Mark(command_list, gpu_timers::PassEvalEnd(pass));
+        gpu_timers::MarkEditReuse(command_list, pass);
       }
     } else {
+      if (timers_active && edit_reuse_route_eligible) {
+        gpu_timers::Mark(command_list, gpu_timers::PassEvalStart(pass));
+      }
       const ControlMaskParameters mask_parameters =
           ResolveControlMaskParameters(group.begin + pass);
       const uint32_t mask_mode = mask_parameters.mode;
@@ -15462,7 +15493,11 @@ inline bool RecordInline(
 #endif
       }
       if (edit_reuse_route_eligible) {
-        ++edit_reuse_refreshes;
+        if (edit_reuse_present_route && recording != nullptr) {
+          recording->edit_refreshed = true;
+        } else {
+          ++edit_reuse_refreshes;
+        }
       }
     }
 #if defined(NR_NEXUS_DEV_CONTROL)
@@ -15967,6 +16002,9 @@ inline bool RecordInline(
           feature.slots[0].pending_reset = true;
           feature.slots[0].pending_reset_reasons |= kResetRecovery;
           ++edit_reuse_fallbacks;
+          if (edit_reuse_present_route) {
+            edit_reused = false;
+          }
 #if defined(NR_NEXUS_DEV_CONTROL)
           fg_output_marker_window.StopSource(reinterpret_cast<uintptr_t>(handle), feature.source_generation,
               "source_original_selection_failed");
@@ -16243,7 +16281,12 @@ inline bool RecordInline(
     PublishAdaptiveStatus(adaptive.session->status);
   }
   if (edit_reused) {
-    ObserveEditReuse(edit.cache, output_desc.Format, hdr_mode, v6_encoding);
+    if (edit_reuse_present_route && recording != nullptr) {
+      recording->reused_edit = edit.cache;
+      recording->edit_reuse_encoding = v6_encoding;
+    } else {
+      ObserveEditReuse(edit.cache, output_desc.Format, hdr_mode, v6_encoding);
+    }
     if (recording != nullptr) {
       recording->edit_reused = true;
       recording->output_ready = true;
@@ -17623,7 +17666,11 @@ inline bool RecordInlinePreSR(
     }
     UavBarrier(command_list, res.nr_output);
     if (timers_active) {
-      gpu_timers::Mark(command_list, gpu_timers::PassEvalEnd(pass));
+      if (edit.reused) {
+        gpu_timers::MarkEditReuse(command_list, pass);
+      } else {
+        gpu_timers::Mark(command_list, gpu_timers::PassEvalEnd(pass));
+      }
     }
     Transition(
         command_list,
@@ -20438,7 +20485,13 @@ inline void STDMETHODCALLTYPE HookedQueueExecuteCommandLists(
     ID3D12CommandQueue* queue,
     UINT count,
     ID3D12CommandList* const* command_lists) {
-  queue_submit_entries.fetch_add(1, std::memory_order_relaxed);
+  std::unique_lock present_order(present_base_submit_mutex, std::defer_lock);
+  struct SubmissionScope {
+    const uint64_t entry = queue_submit_entries.fetch_add(1) + 1;
+    ~SubmissionScope() { queue_submit_exits.fetch_add(1); }
+  };
+  const SubmissionScope submit;
+  if (present_base_capture_active.load()) present_order.lock();
   // Phase 1 of the exact submission proof (v6 audit issue 01): reserve
   // pending submission slots on the submitted lists' current recording
   // generations BEFORE forwarding.  The reservation exists before this call
@@ -20563,6 +20616,7 @@ inline void STDMETHODCALLTYPE HookedQueueExecuteCommandLists(
     // never guessed.
     submission::CompleteSubmission(
         pending_submissions, completion_fence.fence, completion_value);
+    ObservePresentBaseSubmission(submit.entry, count);
 #if defined(NR_NEXUS_DEV_CONTROL)
     if (NativePremiseEnabled()) {
       if (auto observe = native_premise_submit.load()) {
@@ -21294,6 +21348,9 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
   // injection would double-run are dedup-skipped inside ProcessInline.
   ComputeStateEnvelope state_envelope(
       (!nested_in_c_wrapper && !InsideDirectCall()) ? command_list : nullptr);
+  if (source_scope.owner) {
+    ObservePresentSourceWork(command_list, false);
+  }
 #if defined(NR_NEXUS_DEV_CONTROL)
   const auto edit_fg_ticket = (frame_generation && source_scope.owner && !nested_in_c_wrapper && !InsideDirectCall()
       ? ObserveEditNativeFg(command_list, handle, parameters, Slot, false) : edit_fg_observation::Ticket{});
@@ -21402,10 +21459,11 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
   // at the present (present_path.hpp).  When the present path cannot serve
   // (starved presents, an unusable swapchain) the after path below runs.
   if (fg::xefg::OwnsStream() || PresentTakesEvaluate()) {
+    if (!source_scope.owner && WantsPresentBaseFrames()) return result;
     CapturePresentGuides(
         command_list, handle, parameters,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, false, source_scope.owner);
     return result;
   }
   // Without a complete restore target the injected binds would be the last
@@ -21582,6 +21640,9 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
   inside_game_evaluate_wrapper = true;
   ComputeStateEnvelope state_envelope(
       InsideDirectCall() ? nullptr : command_list);
+  if (source_scope.owner) {
+    ObservePresentSourceWork(command_list, false);
+  }
   const NVSDK_NGX_Result result = [&] {
     const NgxRuntimeCommandScope runtime_scope;
 #if defined(NR_NEXUS_DEV_CONTROL)
@@ -21660,10 +21721,11 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
   // at the present (present_path.hpp).  When the present path cannot serve
   // (starved presents, an unusable swapchain) the after path below runs.
   if (fg::xefg::OwnsStream() || PresentTakesEvaluate()) {
+    if (!source_scope.owner && WantsPresentBaseFrames()) return result;
     CapturePresentGuides(
         command_list, handle, parameters,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, false, source_scope.owner);
     return result;
   }
   if (!state_envelope.Admit(
@@ -23688,6 +23750,7 @@ inline constexpr const char* kSkipReasonText[] = {
     ui::text::kResolutionBackend,
     "NR could not set up its working images",
     "NR could not set up its working images",
+    "Could not verify the game frame for x2 edit reuse",
 };
 // i18n: end
 // A new eligible decline without a player phrase fails the build: the panel
@@ -33631,6 +33694,7 @@ inline void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) 
       stream->second.mixed_copy_marker = nullptr;
       stream->second.mixed_capture = 0;
       stream->second.mixed_sources = 0;
+      InvalidatePresentBaseFrames(&stream->second);
     }
   }
   if (resize || swapchain == nullptr) return;

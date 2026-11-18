@@ -14,9 +14,10 @@ namespace renodx::addons::dlss5::ui::lang {
 inline constexpr Translation kZhHant[] = {
     {"x2 edit reuse (experimental)", "隔幀編輯重用 x2（實驗）"},
     {"Refresh NR once per two base frames and reproject its edit onto the next frame to reduce GPU work. Upscaling still runs every frame; x2 is separate from the FG multiplier. Turn off if motion, lighting or frame pacing looks worse.", "每兩個基礎幀更新一次 NR，並將編輯重新投影到下一幀，以降低 GPU 工作量。超解析度仍逐幀執行；x2 與 FG 倍率分開。若移動、光照或畫面節奏變差，請關閉。"},
-    {"D3D12 supports Render before DLSS SR, Upscaled with FG off, and Present with XeFG single Backbuffer and UI Composition off.", "D3D12 支援 DLSS SR 前的 Render、關閉 FG 的 Upscaled，以及使用 XeFG 單 Backbuffer 且關閉 UI Composition 的 Present。"},
+    {"D3D12 x2 supports Render before SR, Upscaled with FG off, and XeFG Present (single Backbuffer, UI Composition off). Ordinary Present needs Game frames and a verified same-frame source.", "D3D12 支援 SR 前的 Render、關閉 FG 的 Upscaled，以及 XeFG Present（單 Backbuffer，關閉 UI Composition）。一般 Present 需選擇「遊戲幀」，且須確認同幀來源。"},
     {"Requires NR 310.9.16.0, model B, one Pass, fixed 100%, HDR FP16 (XeFG also supports HDR10/PQ), and compatible depth and motion. Turn off Adjust NR's look, Detail stability, Region mask and Adaptive resolution.", "需要 NR 310.9.16.0、模型 B、單 Pass、固定 100%、HDR FP16（XeFG 另支援 HDR10/PQ），以及相容的深度和動態輸入。請關閉調整 NR 的外觀、細節穩定、區域遮罩和自適應解析度。"},
-    {"When reuse conditions are unmet, NR keeps its per-frame path. Invalid reprojected pixels keep the current picture.", "不符合重用條件時，NR 沿用逐幀路徑。重新投影無效的像素保留目前畫面的原始色彩。"},
+    {"Could not verify the game frame for x2 edit reuse", "無法確認供 x2 隔幀重用的同幀來源"},
+    {"Render, Upscaled and XeFG Present use per-frame NR if reuse is unavailable. Ordinary Present keeps the original frame without a verified same-frame source. Invalid reprojected pixels keep their current color.", "無法重用時，Render、Upscaled 和 XeFG Present 使用逐幀 NR。一般 Present 無法確認同幀來源時保留原畫。重新投影無效的像素保留目前的原始色彩。"},
     {"Motion attenuation", "運動衰減"},
     {"Reduce R in moving areas, including camera motion. Disabled or unavailable motion leaves the other region-mask settings active.", "降低運動區域的 R，包括相機運動。停用或缺少有效運動輸入時，區域遮罩的其他設定仍然生效。"},
     {"Motion fade start", "運動淡出起點"},

@@ -204,6 +204,7 @@ int RunNativeOptionsResumeTest(bool delayed_options = false);
 int RunNativeGuideContractTest();
 int RunPresentGuideModelsTest(bool native_ngx = false, const char* project_id_path = nullptr);
 int RunNativePresentDecisionTest();
+int RunNrEditReusePresentContracts();
 
 int RunNativeRequiredMenuTest() {
   try {
@@ -775,6 +776,7 @@ int main(int argc, char** argv) {
 #endif
   if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-xefg-contracts") == 0) return nr_edit_reuse_xefg_cases::Run();
   if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-render-contracts") == 0) return nr_edit_reuse_render_cases::Run();
+  if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-present-contracts") == 0) return RunNrEditReusePresentContracts();
   if (argc == 2 && (std::strcmp(argv[1], "--nr-edit-reuse-contracts") == 0
                    || std::strcmp(argv[1], "--nr-edit-reuse-contracts-public") == 0)) {
     return nr_edit_reuse_gpu_cases::Run();
@@ -4050,6 +4052,8 @@ struct PresentRingFaceProbe final : reshade::api::swapchain {
 };
 }  // namespace
 
+#include "nr_edit_reuse_present_cases.hpp"
+
 int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
   try {
     const HMODULE test_module = GetModuleHandleW(nullptr);
@@ -4136,7 +4140,10 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
       Check(wait == WAIT_OBJECT_0, "Present models bounded GPU completion");
       Check(SUCCEEDED(gpu.allocator->Reset()), "Present models allocator reset");
       Check(SUCCEEDED(gpu.list->Reset(gpu.allocator.Get(), nullptr)), "Present models list reset");
-      submission::PruneCompletedGenerations();
+      {
+        const renodx::addons::dlss5::RuntimeLock lock(native::runtime_mutex);
+        native::PruneCompletedSubmissionUses();
+      }
       gpu.uploads.clear();
     };
     submit();
