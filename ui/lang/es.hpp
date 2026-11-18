@@ -24,6 +24,7 @@ inline constexpr Translation kEs[] = {
     {"Per-frame NR", "NR en cada fotograma"},
     {"Original frame", "Fotograma original"},
     {"Waiting for first valid frame", "Esperando el primer fotograma válido"},
+    {"The source of the current HDR10 frame is unconfirmed.", "No se ha confirmado el origen del fotograma HDR10 actual."},
     {"The current chain has multiple passes.", "La cadena actual tiene varias pasadas."},
     {"An external region mask is active.", "Hay una máscara de región externa activa."},
     {"Adaptive resolution owns the current frame.", "La resolución adaptativa controla el fotograma actual."},

@@ -472,6 +472,8 @@ struct PresentRing {
 // Streamline path keys its synthetic streams the same way; never
 // dereferenced).
 struct PresentStream {
+  PresentEditReuseMonitor edit_reuse_monitor;
+  uint64_t base_frame_attempt = 0;
   // Only this swapchain's current, submitted, final full-surface copy can
   // supply the ordinary x2 route. The identity expires with its buffers.
   uint64_t base_frame_epoch = 0;
@@ -742,7 +744,16 @@ inline void ResetPresentStreamHistory(PresentStream* stream, uint32_t reason = k
   }
 }
 
+inline void PublishPresentBaseRejection(PresentStream* stream, const void* backbuffer,
+                                        reshade::api::color_space color_space) {
+  const auto reason = (color_space == reshade::api::color_space::hdr10_pq
+      ? PresentEditReuseRejection::HDR10_SOURCE_UNCONFIRMED : PresentEditReuseRejection::SOURCE_UNCONFIRMED);
+  stream->edit_reuse_monitor.Reject(stream->device_identity, backbuffer, stream->base_frame_epoch,
+      stream->base_frame_attempt, reason, SteadyNowNs(), configuration_generation.load(), history_reset_epoch.load());
+}
+
 inline void InvalidatePresentBaseFrames(PresentStream* stream) {
+  stream->edit_reuse_monitor.Reset(stream->base_frame_epoch);
   if (stream->base_frame_epoch == 0) return;
   for (auto& set : present_guide_sets) {
     if (set.base_frame.swapchain_epoch == stream->base_frame_epoch) {
@@ -2943,6 +2954,7 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     if (!present_order || base_order->entered.load() != guides->base_frame.queue_entry) {
       ++edit_reuse_fallbacks;
       CountNrDecline(NrDeclineReason::kPresentBaseUnproven);
+      PublishPresentBaseRejection(&stream, guides->base_frame.backbuffer, target.hdr_color_space);
       return false;
     }
   }
@@ -2995,13 +3007,16 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
         observed.delivery = recording.edit_monitor_delivery;
         observed.reason = recording.edit_monitor_reason;
         observed.handed_off = observed.surface != nullptr;
-        if (observed.handed_off) PublishEditReuseMonitorFrame(&source->second, nullptr, std::move(observed));
+        if (observed.handed_off) {
+          PublishEditReuseMonitorFrame(&source->second, nullptr, std::move(observed));
+        }
       }
     }
     if (!delivered) {
       ResetPresentStreamHistory(&stream);
       return false;
     }
+    stream.edit_reuse_monitor.Deliver(target.base_frame_epoch, stream.base_frame_attempt);
     if (recording.edit_refreshed) ++edit_reuse_refreshes;
     if (recording.reused_edit != nullptr) {
       ObserveEditReuse(recording.reused_edit, target.swapchain_format, target.hdr_mode, recording.edit_reuse_encoding);
@@ -3673,10 +3688,12 @@ inline bool RunPresentBaseFrame(ID3D12CommandQueue* native_queue, reshade::api::
                                 PresentTarget target) {
   const auto backbuffer = renodx::utils::directx::NativeIdentity(back);
   const auto order = present_queue_order.load(std::memory_order_acquire);
+  ++stream.base_frame_attempt;
   const auto reject = [&] {
     ResetPresentStreamHistory(&stream);
     ++edit_reuse_fallbacks;
     CountNrDecline(NrDeclineReason::kPresentBaseUnproven);
+    PublishPresentBaseRejection(&stream, backbuffer, target.hdr_color_space);
     return false;
   };
   if (target.hdr_mode != 1 || target.hdr_color_space != reshade::api::color_space::scrgb
@@ -3704,7 +3721,9 @@ inline bool RunPresentBaseFrame(ID3D12CommandQueue* native_queue, reshade::api::
       || stream.mixed_queue != renodx::utils::directx::NativeIdentity(native_queue)) return reject();
   if (repeated) {
     CountNrDecline(NrDeclineReason::kPresentRepeat);
-    return guides->serial == stream.consumed_serial && order->entered.load() == frame.queue_entry;
+    if (guides->serial == stream.consumed_serial && order->entered.load() == frame.queue_entry) return true;
+    PublishPresentBaseRejection(&stream, backbuffer, target.hdr_color_space);
+    return false;
   }
   // DXGI permits writes to this backbuffer only on its associated queue.
   // Require the exact producer to be that queue's isolated one-list tail.
@@ -3844,6 +3863,7 @@ inline void RunPresentPath(
     }
     if (ordinary_base_frames && !deferred && native_queue != nullptr && !stream.mixed_buffers.empty()) {
       if (stream.base_frame_epoch == 0) {
+        stream.edit_reuse_monitor.Reset();
         stream.base_frame_epoch = ++present_base_epoch_serial;
       }
       if (observed_present_queue.load(std::memory_order_relaxed) != native_queue) {
@@ -4513,6 +4533,8 @@ inline void RunPresentPath(
       InvalidatePresentBaseFrames(&stream);
       ++edit_reuse_fallbacks;
       CountNrDecline(NrDeclineReason::kPresentBaseUnproven);
+      ++stream.base_frame_attempt;
+      PublishPresentBaseRejection(&stream, renodx::utils::directx::NativeIdentity(back), target.hdr_color_space);
       return;
     }
     renodx::utils::directx::NativeFromReShadeProxy(&native_queue);

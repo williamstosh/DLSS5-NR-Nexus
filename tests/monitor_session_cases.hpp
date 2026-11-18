@@ -81,6 +81,98 @@ void RunMonitorSessionCases(const Check& check, const Frame& frame) {
     check(r::ReadDeliveredEditReuse(observations, 8, 42, stage, now).delivery == Delivery::NONE,
           "a different source generation cannot inherit an x2 outcome");
   }
+  {
+    using Delivery = r::EditReuseDelivery;
+    using Rejection = addon::PresentEditReuseRejection;
+    constexpr auto stage = addon::stage_plan::Stage::PRESENT;
+    const uint64_t configuration = r::configuration_generation.load();
+    const uint64_t reset_epoch = r::history_reset_epoch.load();
+    const auto now = r::SteadyNowNs();
+    const int device_a = 0, device_b = 0, swapchain_a = 0, swapchain_b = 0;
+    const int buffer_a0 = 0, buffer_a1 = 0, buffer_b0 = 0, buffer_b1 = 0;
+    const std::vector<const void*> buffers_a{&buffer_a0, &buffer_a1}, buffers_b{&buffer_b0, &buffer_b1};
+    const addon::RuntimeLock lock(r::runtime_mutex);
+    auto& stream_a = r::present_streams[&swapchain_a];
+    auto& stream_b = r::present_streams[&swapchain_b];
+    stream_a.mixed_device = stream_b.mixed_device = &device_a;
+    stream_a.mixed_buffers = buffers_a;
+    stream_b.mixed_buffers = buffers_b;
+    stream_a.base_frame_epoch = 11;
+    stream_b.base_frame_epoch = 12;
+    const auto read = [&](const void* device, const std::vector<const void*>& buffers) {
+      return r::ReadMonitorPresentEditReuse(device, buffers, now, [&](const r::EditReuseMonitorFrame& frame) {
+        return frame.stage == stage && frame.device == device
+            && std::ranges::find(buffers, frame.surface) != buffers.end();
+      });
+    };
+    const auto* handle_a = stream_a.Handle();
+    const auto* handle_b = stream_b.Handle();
+    for (const auto* stream : {&stream_a, &stream_b}) {
+      const auto* handle = stream->Handle();
+      auto& created = r::create_contracts[handle];
+      auto& source = r::features[handle];
+      created.source_type_confirmed = source.source_type_confirmed = true;
+      created.source_generation = source.source_generation = 7;
+      source.sr_sequence = 41;
+      r::StoreEditReuseMonitorFrame(&source.edit_reuse_monitor, {
+          .delivery = Delivery::REUSED, .stage = stage, .configuration = configuration, .reset_epoch = reset_epoch,
+          .source_generation = 7, .sequence = 41, .delivery_epoch = stream->base_frame_epoch, .recorded_ns = now - 3,
+          .device = &device_a, .surface = stream->mixed_buffers[0], .handed_off = true});
+    }
+    check(read(&device_a, buffers_a).delivery == Delivery::REUSED
+              && read(&device_a, buffers_b).delivery == Delivery::REUSED,
+          "two swapchains sharing a device read their own delivered x2 evidence");
+
+    auto& observed = stream_a.edit_reuse_monitor;
+    observed.Reject(&device_a, &buffer_a1, 11, 21, Rejection::HDR10_SOURCE_UNCONFIRMED,
+        now - 2, configuration, reset_epoch);
+    const auto rejected = read(&device_a, buffers_a);
+    check(rejected.rejection == Rejection::HDR10_SOURCE_UNCONFIRMED && rejected.delivery == Delivery::NONE
+              && r::features.at(handle_a).sr_sequence == 41,
+          "an unclaimed Present rejection replaces active x2 without changing successful SR or claiming delivery");
+    check(read(&device_b, buffers_a).rejection == Rejection::NONE
+              && read(&device_a, {&buffer_a0, &buffer_b1}).rejection == Rejection::NONE
+              && read(&device_a, buffers_b).delivery == Delivery::REUSED
+              && read(&device_a, buffers_b).rejection == Rejection::NONE,
+          "the rejection cannot follow another device, buffer inventory or swapchain");
+    observed.Deliver(12, 22);
+    observed.Deliver(11, 20);
+    check(read(&device_a, buffers_a).rejection == Rejection::HDR10_SOURCE_UNCONFIRMED,
+          "an older attempt or different generation cannot replace the current rejection");
+
+    auto& source = r::features.at(handle_a);
+    auto refresh = source.edit_reuse_monitor[0];
+    refresh.sequence = ++source.sr_sequence;
+    refresh.recorded_ns = now - 1;
+    refresh.surface = &buffer_a0;
+    refresh.delivery = Delivery::REFRESH;
+    r::StoreEditReuseMonitorFrame(&source.edit_reuse_monitor, refresh);
+    observed.Deliver(11, 22);
+    const auto refreshed = read(&device_a, buffers_a);
+    check(refreshed.rejection == Rejection::NONE && refreshed.delivery == Delivery::NONE,
+          "next real delivery clears the rejection without reviving pre-rejection x2 on a refresh");
+    refresh.sequence = ++source.sr_sequence;
+    refresh.recorded_ns = now;
+    refresh.delivery = Delivery::REUSED;
+    r::StoreEditReuseMonitorFrame(&source.edit_reuse_monitor, refresh);
+    check(read(&device_a, buffers_a).delivery == Delivery::REUSED,
+          "newly delivered reuse can become active after the rejection");
+    observed.Reject(&device_a, &buffer_a0, 11, 23, Rejection::SOURCE_UNCONFIRMED,
+        now, configuration, reset_epoch);
+    check(read(&device_a, buffers_a).rejection == Rejection::SOURCE_UNCONFIRMED,
+          "a later unclaimed attempt can report a new rejection reason");
+    ++stream_a.base_frame_epoch;
+    const auto rebuilt = read(&device_a, buffers_a);
+    check(rebuilt.rejection == Rejection::NONE && rebuilt.delivery == Delivery::NONE,
+          "a rebuilt swapchain cannot read the previous generation's rejection or delivery");
+    observed.Reset();
+    r::features.erase(handle_a);
+    r::features.erase(handle_b);
+    r::create_contracts.erase(handle_a);
+    r::create_contracts.erase(handle_b);
+    r::present_streams.erase(&swapchain_a);
+    r::present_streams.erase(&swapchain_b);
+  }
   const auto fixture_directory = std::filesystem::current_path();
   std::array<wchar_t, 32768> appdata{};
   const auto appdata_length = GetEnvironmentVariableW(L"LOCALAPPDATA", appdata.data(),
@@ -816,6 +908,13 @@ void RunMonitorSessionCases(const Check& check, const Frame& frame) {
   const auto& hit = r::RefreshMonitorSnapshot(true);
   check(hit.refreshes == refreshes_after_refresh && identity_reads == reads_after_refresh,
         "a cache hit does not reread GPU identities or repeat snapshot collection");
+  r::monitor_snapshot.edit_reuse_revision = addon::present_edit_reuse_monitor_revision.load();
+  r::monitor_snapshot.monitor.current_conclusion = ui::Tr(ui::text::kEditReuseMonitorHdr10SourceUnconfirmed);
+  r::monitor_snapshot.monitor.edit_reuse_effective = ui::Tr(ui::text::kEditReuseMonitorOriginal);
+  addon::present_edit_reuse_monitor_revision.fetch_add(1);
+  const auto deferred_edit = refresh_while_locked(false);
+  check(deferred_edit.monitor.current_conclusion.empty() && deferred_edit.monitor.edit_reuse_effective.empty(),
+        "a replaced Present result drops the cached HDR10 headline even while the runtime lock is held");
   seed_old_display();
   r::monitor_snapshot.valid_until_ns = r::SteadyNowNs() - 1;
   r::monitor_snapshot.attempted_ns = r::SteadyNowNs();

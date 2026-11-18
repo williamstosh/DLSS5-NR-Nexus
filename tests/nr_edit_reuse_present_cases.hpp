@@ -491,6 +491,8 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
                 "first accepted full-grid Present after a cold start or handoff refreshes");
           Check(resize_from == 0 || delivered_while_settling, "resize exercises the old committed grid before refreshing");
           Check(!require_prepared || prepared, "cold start observes a real prepared-only submission");
+          Check(native::present_streams.at(&output).edit_reuse_monitor.reason == addon::PresentEditReuseRejection::NONE,
+                "the verified delivery replaces the stream's early rejection");
           return;
         }
         no_output(before, after, "prepared-only Present leaves actual output and consumed serial unchanged");
@@ -645,6 +647,10 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     submit();
     event();
     no_output(before, stats(), "a later write in the same producer list replaces the sealed base");
+    const auto& rejected = native::present_streams.at(&output).edit_reuse_monitor;
+    Check(rejected.reason == addon::PresentEditReuseRejection::SOURCE_UNCONFIRMED
+              && rejected.backbuffer == renodx::utils::directx::NativeIdentity(back()),
+          "the late write publishes a source rejection for the current backbuffer");
     unchanged_pixels(read_back(), OVERWRITE_PIXEL);
     swap();
 

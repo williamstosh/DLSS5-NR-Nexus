@@ -180,6 +180,7 @@ inline constexpr const char* kEditReuseMonitorActive = "x2 active";
 inline constexpr const char* kEditReuseMonitorPerFrame = "Per-frame NR";
 inline constexpr const char* kEditReuseMonitorOriginal = "Original frame";
 inline constexpr const char* kEditReuseMonitorWaiting = "Waiting for first valid frame";
+inline constexpr const char* kEditReuseMonitorHdr10SourceUnconfirmed = "The source of the current HDR10 frame is unconfirmed.";
 inline constexpr const char* kFgUnknownMultiplierTip = "FG activity and multiplier are separate observations. Native FG/XeFG can bypass Present cadence sampling; an unknown multiplier does not mean FG is off.";
 
 inline constexpr const char* kHookTips[] = {kHookRenderTip, kHookUpscaledTip, kHookPresentTip};

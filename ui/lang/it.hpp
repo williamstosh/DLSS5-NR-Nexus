@@ -24,6 +24,7 @@ inline constexpr Translation kIt[] = {
     {"Per-frame NR", "NR a ogni fotogramma"},
     {"Original frame", "Fotogramma originale"},
     {"Waiting for first valid frame", "In attesa del primo fotogramma valido"},
+    {"The source of the current HDR10 frame is unconfirmed.", "La sorgente del fotogramma HDR10 corrente non è stata confermata."},
     {"The current chain has multiple passes.", "La catena attuale ha più passaggi."},
     {"An external region mask is active.", "È attiva una maschera regione esterna."},
     {"Adaptive resolution owns the current frame.", "La risoluzione adattativa gestisce il fotogramma attuale."},

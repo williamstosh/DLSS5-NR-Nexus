@@ -24,6 +24,7 @@ inline constexpr Translation kZhHans[] = {
     {"Per-frame NR", "逐帧 NR"},
     {"Original frame", "保留原画"},
     {"Waiting for first valid frame", "等待首个有效帧"},
+    {"The source of the current HDR10 frame is unconfirmed.", "当前 HDR10 成图来源未确认。"},
     {"The current chain has multiple passes.", "当前处理链启用了多个 Pass。"},
     {"An external region mask is active.", "外部区域遮罩已启用。"},
     {"Adaptive resolution owns the current frame.", "当前帧由自适应分辨率控制。"},

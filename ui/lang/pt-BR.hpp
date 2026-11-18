@@ -24,6 +24,7 @@ inline constexpr Translation kPtBr[] = {
     {"Per-frame NR", "NR a cada quadro"},
     {"Original frame", "Quadro original"},
     {"Waiting for first valid frame", "Aguardando o primeiro quadro válido"},
+    {"The source of the current HDR10 frame is unconfirmed.", "A origem do quadro HDR10 atual ainda não foi confirmada."},
     {"The current chain has multiple passes.", "A cadeia atual tem várias passagens."},
     {"An external region mask is active.", "Uma máscara de região externa está ativa."},
     {"Adaptive resolution owns the current frame.", "A resolução adaptativa controla o quadro atual."},

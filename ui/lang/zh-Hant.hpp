@@ -24,6 +24,7 @@ inline constexpr Translation kZhHant[] = {
     {"Per-frame NR", "逐幀 NR"},
     {"Original frame", "保留原畫"},
     {"Waiting for first valid frame", "等待首個有效幀"},
+    {"The source of the current HDR10 frame is unconfirmed.", "目前 HDR10 成圖的來源尚未確認。"},
     {"The current chain has multiple passes.", "目前的處理鏈啟用了多個 Pass。"},
     {"An external region mask is active.", "外部區域遮罩已啟用。"},
     {"Adaptive resolution owns the current frame.", "目前影格由自適應解析度控制。"},

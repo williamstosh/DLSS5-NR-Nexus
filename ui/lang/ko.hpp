@@ -24,6 +24,7 @@ inline constexpr Translation kKo[] = {
     {"Per-frame NR", "프레임마다 NR"},
     {"Original frame", "원본 프레임"},
     {"Waiting for first valid frame", "첫 유효 프레임을 기다리는 중"},
+    {"The source of the current HDR10 frame is unconfirmed.", "현재 HDR10 프레임의 출처가 확인되지 않았습니다."},
     {"The current chain has multiple passes.", "현재 처리 체인에 여러 패스가 있습니다."},
     {"An external region mask is active.", "외부 영역 마스크가 활성화되어 있습니다."},
     {"Adaptive resolution owns the current frame.", "적응형 해상도가 현재 프레임을 처리하고 있습니다."},

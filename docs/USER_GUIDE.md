@@ -459,7 +459,7 @@ F6 立即提示开关操作，随后状态更新为正在检查、正常运行�
 
 **开发版 Upscaled** 按实际创建的单层模型和工作尺寸判断 x2。受支持的 Runtime 可使用模型 A、B 或解析到同一模型的 Auto。生效的外观和细节稳定可随刷新和复用一起执行。在工作格点小于输出且只需普通双线性恢复时，可沿用 x2。当前颜色须来自已确认的成功 SR，并仍可在该次调用中写回。实际绑定的区域遮罩、低格外观传输和需要逐帧采样的模式继续逐帧运行。
 
-开发版的玩家监视器会显示 x2 请求与当前交付。未确认复用时会显示等待、逐帧 NR 或保留原画，并附上已观察的原因。
+开发版的玩家监视器会显示 x2 请求与实际交付。等待、逐帧 NR 或保留原画时会显示已知原因。普通 Present 无法确认当前 HDR10 成图来源时，会保留原画并显示「当前 HDR10 成图来源未确认」。
 
 开发版还包含默认关闭的 FG On 组合实验，覆盖真实 SR 后的 Upscaled，以及原生 DLSS FG 消费前的 Present。Upscaled 实验在 SR 来源、工作尺寸和输出归属相同的情况下，可以跨 FG 状态变化保留隔帧历史。原生 Pre-FG Present 的 HDR10/PQ 去 HUD 编辑和透明度合成已有开发接线，游戏里的同帧输入与消费顺序仍待验证。两条实验路径目前仅用于开发验证。生成帧画面、动态画质与微卡顿仍待验收。
 
@@ -1031,7 +1031,7 @@ The add-on requires a successful DLSS Super Resolution (SR) evaluation, both jit
 
 **Upscaled in development builds** evaluates x2 using the actual model request and NR work size for one pass. The supported runtime can use model A, model B or Auto resolving to the same model. Active Look and Detail Stability can run on both refresh and reuse frames. A smaller grid can use x2 when the output only needs the standard bilinear resolve. The current colour must come from a confirmed successful SR call and still be writable in that call. A bound Region Mask, Look transport from a smaller grid, and modes that require per-frame samples continue to run every frame.
 
-The monitor in development builds shows the x2 request and current delivery. When reuse is pending or unavailable, it reports waiting, per-frame NR or original colour with the observed reason.
+The monitor in development builds shows the x2 request and actual delivery. It gives the known reason when waiting, running NR every frame, or keeping the original image. If ordinary Present cannot verify the source of the current HDR10 frame, it keeps the original image and shows that reason.
 
 The development branch also includes disabled-by-default FG On experiments for Upscaled after actual SR and Present before native DLSS FG consumes the frame. The Upscaled experiment can preserve edit history across FG status changes when the SR source, working size and output ownership are the same. Native Pre-FG Present has experimental support for editing HDR10/PQ HUD-less colour and recombining it with alpha. Same-frame inputs and consumption order still need in-game verification. Both paths are for development testing. Generated-frame appearance, dynamic image quality and microstutter still await acceptance.
 

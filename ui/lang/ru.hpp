@@ -24,6 +24,7 @@ inline constexpr Translation kRu[] = {
     {"Per-frame NR", "NR на каждом кадре"},
     {"Original frame", "Исходный кадр"},
     {"Waiting for first valid frame", "Ожидание первого допустимого кадра"},
+    {"The source of the current HDR10 frame is unconfirmed.", "Источник текущего кадра HDR10 не подтверждён."},
     {"The current chain has multiple passes.", "Текущая цепочка содержит несколько проходов."},
     {"An external region mask is active.", "Активна внешняя маска области."},
     {"Adaptive resolution owns the current frame.", "Текущим кадром управляет адаптивное разрешение."},

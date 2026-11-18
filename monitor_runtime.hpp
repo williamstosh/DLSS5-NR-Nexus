@@ -15,6 +15,7 @@ struct MonitorSnapshot {
   std::string execution;
   unsigned warnings = 0;
   uint64_t key = 0;
+  uint64_t edit_reuse_revision = 0;
   int64_t sampled_ns = 0;
   int64_t attempted_ns = 0;
   int64_t valid_until_ns = INT64_MAX;
@@ -189,16 +190,19 @@ inline uint64_t MonitorSnapshotKey() {
 struct MonitorEditReuseResult {
   EditReuseDelivery delivery = EditReuseDelivery::NONE;
   EditReuseBlock reason = EditReuseBlock::NONE;
+  PresentEditReuseRejection rejection = PresentEditReuseRejection::NONE;
 };
 
 inline MonitorEditReuseResult ReadDeliveredEditReuse(
     const std::array<EditReuseMonitorFrame, 2>& frames, uint64_t source_generation,
-    uint64_t sequence, stage_plan::Stage stage, int64_t now) {
+    uint64_t sequence, stage_plan::Stage stage, int64_t now,
+    uint64_t delivery_epoch = 0, int64_t rejected_ns = 0) {
   const auto is_current = [&](const EditReuseMonitorFrame& frame) {
     return frame.stage == stage && frame.source_generation == source_generation
         && frame.configuration == configuration_generation.load() && frame.reset_epoch == history_reset_epoch.load()
+        && (delivery_epoch == 0 || frame.delivery_epoch == delivery_epoch) && frame.recorded_ns > rejected_ns
         && frame.sequence != 0 && frame.sequence <= sequence && sequence - frame.sequence <= 1
-        && frame.recorded_ns > 0 && now >= frame.recorded_ns
+        && now >= frame.recorded_ns
         && now - frame.recorded_ns <= ui::RecentHealthWindow::kStaleNs;
   };
   const auto delivered = [](const EditReuseMonitorFrame& frame) {
@@ -229,6 +233,37 @@ inline MonitorEditReuseResult ReadDeliveredEditReuse(
     return {.delivery = previous.delivery, .reason = previous.reason};
   }
   return {};
+}
+
+template <typename MatchesRuntime>
+inline MonitorEditReuseResult ReadMonitorPresentEditReuse(const void* device, const std::vector<const void*>& buffers,
+    int64_t now, const MatchesRuntime& matches_runtime) {
+  if (device == nullptr || buffers.empty() || std::ranges::find(buffers, nullptr) != buffers.end()) return {};
+  const PresentStream* selected = nullptr;
+  for (const auto& [_, stream] : present_streams) {
+    if (stream.mixed_device != device || !std::ranges::equal(stream.mixed_buffers, buffers)) continue;
+    if (selected != nullptr) return {};
+    selected = &stream;
+  }
+  if (selected == nullptr) return {};
+  const auto generation = selected->base_frame_epoch;
+  const auto& attempt = selected->edit_reuse_monitor;
+  const bool attempt_current = attempt.rejected_ns > 0 && attempt.generation == generation && attempt.device == device
+      && attempt.configuration == configuration_generation.load() && attempt.reset_epoch == history_reset_epoch.load()
+      && std::ranges::find(buffers, attempt.backbuffer) != buffers.end();
+  if (attempt_current && attempt.reason != PresentEditReuseRejection::NONE) return {.rejection = attempt.reason};
+  if (generation == 0) return {};
+
+  const FeatureState* source = nullptr;
+  for (const auto& [handle, feature] : features) {
+    const auto& latest = feature.edit_reuse_monitor[0];
+    if (latest.delivery_epoch != generation || !EditReuseSourceConfirmed(handle, feature) || !matches_runtime(latest)) continue;
+    if (source != nullptr) return {};
+    source = &feature;
+  }
+  if (source == nullptr) return {};
+  return ReadDeliveredEditReuse(source->edit_reuse_monitor, source->source_generation, source->sr_sequence,
+      stage_plan::Stage::PRESENT, now, generation, attempt_current ? attempt.rejected_ns : 0);
 }
 
 inline void InvalidateMonitorDisplay() {
@@ -305,7 +340,10 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
   cached.card.frame_ms = cached.monitor.card.frame_ms = (frame_current ? frame.interval_ms : 0.f);
   const auto key = MonitorSnapshotKey();
   const bool changed = key != cached.key;
-  if (!changed && (!need_monitor || cached.complete) && now <= cached.valid_until_ns && now >= cached.attempted_ns
+  const bool edit_reuse_changed = need_monitor && cached.edit_reuse_revision
+      != present_edit_reuse_monitor_revision.load(std::memory_order_acquire);
+  if (!changed && !edit_reuse_changed && (!need_monitor || cached.complete)
+      && now <= cached.valid_until_ns && now >= cached.attempted_ns
       && now - cached.attempted_ns < kMonitorRefreshNs) return cached;
   if (changed || now > cached.valid_until_ns
       || (cached.sampled_ns != 0 && now - cached.sampled_ns > ui::RecentHealthWindow::kStaleNs)) {
@@ -323,8 +361,16 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
 #endif
   RuntimeTryLock lock(runtime_mutex);
   if (!lock.owns_lock()) {
+    if (edit_reuse_changed) {
+      cached.monitor.current_conclusion.clear();
+      cached.monitor.edit_reuse_effective.clear();
+      cached.monitor.edit_reuse_reason.clear();
+    }
     ++cached.deferred;
     return cached;
+  }
+  if (need_monitor) {
+    cached.edit_reuse_revision = present_edit_reuse_monitor_revision.load(std::memory_order_relaxed);
   }
   now = SteadyNowNs();
   cached.attempted_ns = now;
@@ -547,18 +593,22 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
         auto* const api_device = runtime->get_device();
         const auto device = renodx::utils::directx::NativeIdentity(reinterpret_cast<IUnknown*>(api_device->get_native()));
         const auto geometry = api_device->get_resource_desc(runtime->get_back_buffer(0)).texture;
+        std::vector<const void*> buffers;
+        if (stage == stage_plan::Stage::PRESENT) {
+          const auto count = runtime->get_back_buffer_count();
+          buffers.reserve(count);
+          for (uint32_t index = 0; index < count; ++index) {
+            buffers.push_back(renodx::utils::directx::NativeIdentity(
+                reinterpret_cast<IUnknown*>(runtime->get_back_buffer(index).handle)));
+          }
+        }
         const auto matches_runtime = [&](const EditReuseMonitorFrame& frame) {
           if (frame.stage != stage || frame.device != device || device == nullptr
               || frame.recorded_ns <= 0 || now < frame.recorded_ns
               || now - frame.recorded_ns > ui::RecentHealthWindow::kStaleNs
               || frame.output_width != geometry.width || frame.output_height != geometry.height) return false;
           if (stage != stage_plan::Stage::PRESENT) return true;
-          if (frame.surface == nullptr) return false;
-          for (uint32_t index = 0; index < runtime->get_back_buffer_count(); ++index) {
-            if (frame.surface == renodx::utils::directx::NativeIdentity(
-                    reinterpret_cast<IUnknown*>(runtime->get_back_buffer(index).handle))) return true;
-          }
-          return false;
+          return frame.surface != nullptr && std::ranges::find(buffers, frame.surface) != buffers.end();
         };
         if (stage == stage_plan::Stage::PRESENT && fg::xefg::OwnsStream()) {
           const fg_service::Stream* selected = nullptr;
@@ -572,6 +622,10 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
           }
           if (selected != nullptr) observed = ReadDeliveredEditReuse(
               selected->edit_reuse_monitor, selected->epoch, selected->application_frame, stage, now);
+        } else if (stage == stage_plan::Stage::PRESENT) {
+          if (!native_fg_owns.load()) {
+            observed = ReadMonitorPresentEditReuse(device, buffers, now, matches_runtime);
+          }
         } else {
           const FeatureState* selected = nullptr;
           for (const auto& [handle, source] : features) {
@@ -582,8 +636,7 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
             }
             selected = &source;
           }
-          if (stage == stage_plan::Stage::PRESENT && native_fg_owns.load()) selected = nullptr;
-          if (stage != stage_plan::Stage::PRESENT && selected != nullptr) {
+          if (selected != nullptr) {
             const auto latest = features.find(last_source_plan.source_handle);
             if (last_source_plan.source_released || latest == features.end() || &latest->second != selected
                 || selected->source_generation != last_source_plan.source_generation
@@ -597,11 +650,21 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
               selected->edit_reuse_monitor, selected->source_generation, selected->sr_sequence, stage, now);
         }
       }
-      switch (observed.delivery) {
-        case EditReuseDelivery::REUSED: monitor.edit_reuse_effective = ui::Tr(ui::text::kEditReuseMonitorActive); break;
-        case EditReuseDelivery::PER_FRAME: monitor.edit_reuse_effective = ui::Tr(ui::text::kEditReuseMonitorPerFrame); break;
-        case EditReuseDelivery::ORIGINAL: monitor.edit_reuse_effective = ui::Tr(ui::text::kEditReuseMonitorOriginal); break;
-        default: monitor.edit_reuse_effective = ui::Tr(ui::text::kEditReuseMonitorWaiting); break;
+      if (observed.rejection != PresentEditReuseRejection::NONE) {
+        monitor.edit_reuse_effective = ui::Tr(ui::text::kEditReuseMonitorOriginal);
+        monitor.edit_reuse_reason = ui::Tr((observed.rejection == PresentEditReuseRejection::HDR10_SOURCE_UNCONFIRMED
+            ? ui::text::kEditReuseMonitorHdr10SourceUnconfirmed : "Could not verify the game frame for x2 edit reuse"));
+        if (observed.rejection == PresentEditReuseRejection::HDR10_SOURCE_UNCONFIRMED
+            && card.id == ui::CardId::kStreamlineSetting) {
+          monitor.current_conclusion.swap(monitor.edit_reuse_reason);
+        }
+      } else {
+        switch (observed.delivery) {
+          case EditReuseDelivery::REUSED: monitor.edit_reuse_effective = ui::Tr(ui::text::kEditReuseMonitorActive); break;
+          case EditReuseDelivery::PER_FRAME: monitor.edit_reuse_effective = ui::Tr(ui::text::kEditReuseMonitorPerFrame); break;
+          case EditReuseDelivery::ORIGINAL: monitor.edit_reuse_effective = ui::Tr(ui::text::kEditReuseMonitorOriginal); break;
+          default: monitor.edit_reuse_effective = ui::Tr(ui::text::kEditReuseMonitorWaiting); break;
+        }
       }
       switch (observed.reason) {
         case EditReuseBlock::PASSES: monitor.edit_reuse_reason = ui::Tr("The current chain has multiple passes."); break;

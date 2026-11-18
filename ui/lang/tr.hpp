@@ -24,6 +24,7 @@ inline constexpr Translation kTr[] = {
     {"Per-frame NR", "Her karede NR"},
     {"Original frame", "Özgün kare"},
     {"Waiting for first valid frame", "İlk geçerli kare bekleniyor"},
+    {"The source of the current HDR10 frame is unconfirmed.", "Geçerli HDR10 karesinin kaynağı doğrulanamadı."},
     {"The current chain has multiple passes.", "Geçerli zincirde birden fazla geçiş var."},
     {"An external region mask is active.", "Harici bir bölge maskesi etkin."},
     {"Adaptive resolution owns the current frame.", "Geçerli kareyi uyarlanabilir çözünürlük yönetiyor."},

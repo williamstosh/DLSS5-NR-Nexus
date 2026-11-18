@@ -24,6 +24,7 @@ inline constexpr Translation kDe[] = {
     {"Per-frame NR", "NR in jedem Frame"},
     {"Original frame", "Originalbild"},
     {"Waiting for first valid frame", "Warten auf den ersten gültigen Frame"},
+    {"The source of the current HDR10 frame is unconfirmed.", "Die Quelle des aktuellen HDR10-Bildes ist nicht bestätigt."},
     {"The current chain has multiple passes.", "Die aktuelle Verarbeitungskette hat mehrere Durchläufe."},
     {"An external region mask is active.", "Eine externe Bereichsmaske ist aktiv."},
     {"Adaptive resolution owns the current frame.", "Die adaptive Auflösung steuert den aktuellen Frame."},

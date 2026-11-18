@@ -24,6 +24,7 @@ inline constexpr Translation kSl[] = {
     {"Per-frame NR", "NR na vsaki sličici"},
     {"Original frame", "Izvirna sličica"},
     {"Waiting for first valid frame", "Čakanje na prvo veljavno sličico"},
+    {"The source of the current HDR10 frame is unconfirmed.", "Vir trenutnega kadra HDR10 ni potrjen."},
     {"The current chain has multiple passes.", "Trenutna veriga ima več prehodov."},
     {"An external region mask is active.", "Aktivna je zunanja maska območja."},
     {"Adaptive resolution owns the current frame.", "Trenutno sličico upravlja prilagodljiva ločljivost."},

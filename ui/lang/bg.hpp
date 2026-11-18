@@ -24,6 +24,7 @@ inline constexpr Translation kBg[] = {
     {"Per-frame NR", "NR на всеки кадър"},
     {"Original frame", "Оригинален кадър"},
     {"Waiting for first valid frame", "Изчакване на първия валиден кадър"},
+    {"The source of the current HDR10 frame is unconfirmed.", "Източникът на текущия HDR10 кадър не е потвърден."},
     {"The current chain has multiple passes.", "Текущата верига има повече от един проход."},
     {"An external region mask is active.", "Активна е външна маска на областта."},
     {"Adaptive resolution owns the current frame.", "Адаптивната резолюция управлява текущия кадър."},

@@ -24,6 +24,7 @@ inline constexpr Translation kJa[] = {
     {"Per-frame NR", "フレームごとに NR"},
     {"Original frame", "元のフレーム"},
     {"Waiting for first valid frame", "最初の有効なフレームを待機中"},
+    {"The source of the current HDR10 frame is unconfirmed.", "現在の HDR10 フレームの出所を確認できていません。"},
     {"The current chain has multiple passes.", "現在の処理チェーンには複数のパスがあります。"},
     {"An external region mask is active.", "外部の領域マスクが有効です。"},
     {"Adaptive resolution owns the current frame.", "現在のフレームは適応解像度で処理されています。"},

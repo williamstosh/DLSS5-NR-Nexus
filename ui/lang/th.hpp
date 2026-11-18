@@ -24,6 +24,7 @@ inline constexpr Translation kTh[] = {
     {"Per-frame NR", "NR ทุกเฟรม"},
     {"Original frame", "เฟรมต้นฉบับ"},
     {"Waiting for first valid frame", "กำลังรอเฟรมแรกที่ใช้ได้"},
+    {"The source of the current HDR10 frame is unconfirmed.", "ยังไม่ได้ยืนยันแหล่งที่มาของเฟรม HDR10 ปัจจุบัน"},
     {"The current chain has multiple passes.", "สายการประมวลผลปัจจุบันมีหลาย Pass"},
     {"An external region mask is active.", "มาสก์พื้นที่ภายนอกกำลังทำงาน"},
     {"Adaptive resolution owns the current frame.", "เฟรมปัจจุบันอยู่ภายใต้การควบคุมของความละเอียดแบบปรับอัตโนมัติ"},
