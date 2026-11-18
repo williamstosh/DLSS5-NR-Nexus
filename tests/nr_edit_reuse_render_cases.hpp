@@ -36,6 +36,9 @@ struct FrameInput {
   bool has_jitter_y = true;
   bool split_motion = false;
   NVSDK_NGX_Result sr_result = NVSDK_NGX_Result_Success;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  bool nested_cpp = false;
+#endif
 };
 
 struct SrConsumer {
@@ -90,8 +93,23 @@ NVSDK_NGX_Result NVSDK_CONV EvaluateSr(ID3D12GraphicsCommandList* list, const NV
   list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
   model_gpu->Transition(output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   model_gpu->Transition(color, D3D12_RESOURCE_STATE_COPY_SOURCE, color_state);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (consumer.input.nested_cpp) return NVSDK_NGX_Result_Success;
+#endif
   return consumer.input.sr_result;
 }
+
+#if defined(NR_NEXUS_DEV_CONTROL)
+static int64_t nested_sr_return_ns = 0;
+
+NVSDK_NGX_Result NVSDK_CONV MirrorSr(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle,
+                                   const NVSDK_NGX_Parameter* parameters, PFN_NVSDK_NGX_ProgressCallback callback) {
+  Check(NVSDK_NGX_SUCCEED(native::HookedEvaluateFeatureSlot<1>(list, handle, parameters, callback)),
+      "nested Render SR returns success");
+  nested_sr_return_ns = timers::NowNs();
+  return sr_consumer->input.sr_result;
+}
+#endif
 
 NVSDK_NGX_Result NVSDK_CONV EvaluateStampedModel(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle,
                                                const NVSDK_NGX_Parameter* parameters,
@@ -265,7 +283,19 @@ int Run() {
       const auto before = model_calls;
       const auto timer_sequence_before = timers::internal::next_sequence;
       gpu.list->ClearState(nullptr);
+#if defined(NR_NEXUS_DEV_CONTROL)
+      if (input.nested_cpp) {
+        native::ngx_slot_real[0].evaluate = reinterpret_cast<void*>(MirrorSr);
+        native::ngx_slot_real[1].evaluate = reinterpret_cast<void*>(EvaluateSr);
+      }
+#endif
       const auto status = native::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), handle, &parameters, nullptr);
+#if defined(NR_NEXUS_DEV_CONTROL)
+      if (input.nested_cpp) {
+        native::ngx_slot_real[0].evaluate = reinterpret_cast<void*>(EvaluateSr);
+        native::ngx_slot_real[1].evaluate = nullptr;
+      }
+#endif
       sr_consumer = nullptr;
       Check(consumer.calls == 1 && status == input.sr_result, "wrapper calls game SR once and propagates its return");
       Check(native::GetD3D12Resource(&parameters, NVSDK_NGX_Parameter_Color) == color.Get(),
@@ -472,6 +502,73 @@ int Run() {
           "discard recovery refreshes a new anchor without motion from the abandoned reuse");
     const auto reuse_after_discard = frame(shifted);
     Check(reuse_after_discard.model_calls == 0 && reuse_after_discard.swapped_color, "new anchor resumes reuse after discard");
+
+#if defined(NR_NEXUS_DEV_CONTROL)
+    namespace benchmark = addon::control_mask_capture::benchmark;
+    using benchmark::Delivery;
+    timers::benchmark_observer = benchmark::ObserveTiming;
+    native::control_mask_use_core_context = false;
+    Check(benchmark::Arm(8, 30, nullptr, nullptr), "arm the Render source benchmark");
+    uint32_t benchmark_frames = 0;
+    const auto measure = [&](Delivery delivery, bool nr_enabled, bool reuse_enabled) {
+      native::enabled = nr_enabled;
+      native::edit_reuse_enabled = reuse_enabled;
+      const auto recording = submission::RecordingIdentity(gpu.list.Get());
+      const auto result = frame({.reset = delivery == Delivery::kRefresh ? 1 : 0, .nested_cpp = true});
+      std::shared_lock lock(benchmark::state.mutex);
+      ++benchmark_frames;
+      Check(benchmark::state.rows.size() == benchmark_frames && benchmark::state.frame_count == benchmark_frames,
+          "each successful outer Render SR adds one row despite the nested export");
+      const auto& row = benchmark::state.rows.back();
+      const auto& sample = row.frame;
+      Check(row.wrapper_finalized && sample.sr_success_ns >= nested_sr_return_ns && sample.delivery == delivery
+                && sample.source_sequence == benchmark_frames && sample.source_handle == reinterpret_cast<uintptr_t>(handle)
+                && sample.source_generation == native::features.at(handle).source_generation
+                && sample.input_width == RENDER_SIZE && sample.input_height == RENDER_SIZE
+                && sample.output_width == SR_SIZE && sample.output_height == SR_SIZE,
+            "the outer successful SR finalizes the actual source and input/output dimensions");
+      Check(sample.recording != nullptr && sample.recording->list == recording.first
+                && sample.recording->generation == recording.second && sample.recording->completed_healthy,
+            "the source proves GPU completion on its exact recording");
+      const bool reused = delivery == Delivery::kReuse;
+      const auto calls = (nr_enabled && !reused ? 1u : 0u);
+      Check(result.model_calls == calls && result.swapped_color == nr_enabled && sample.nr_enabled == nr_enabled,
+          "the source receives the Render stand-in on enabled frames and the original Color when off");
+      if (!nr_enabled) {
+        Check(sample.stage == benchmark::Stage::kUnobserved && sample.passes_recorded == 0 && !row.timing.valid,
+            "NR Off retains source proof without an NR timing or stage claim");
+        return;
+      }
+      const auto& pass = sample.passes[0];
+      Check(sample.stage == benchmark::Stage::kRender && sample.reuse_requested == reuse_enabled
+                && sample.pre_sr_color_bound && sample.original_color_restored && sample.original_selection_recorded == reused
+                && sample.passes_recorded == 1 && pass.width == RENDER_SIZE && pass.height == RENDER_SIZE
+                && pass.calls == calls && pass.accepted == calls,
+            "Render evidence identifies working size, actual calls, original selection and restored binding");
+      Check(row.timing.valid && row.timing.sequence == result.timer_sequence
+                && std::strcmp(row.timing.path, "preSR") == 0 && row.timing.recorded_ns < sample.sr_success_ns
+                && (row.timing.passes[0].eval_us == 0) == reused,
+            "the successful outer source owns the corresponding completed Pre-SR GPU timing");
+    };
+    measure(Delivery::kOff, false, false);
+    measure(Delivery::kPerFrame, true, false);
+    measure(Delivery::kRefresh, true, true);
+    measure(Delivery::kReuse, true, true);
+    measure(Delivery::kPerFrame, true, false);
+    frame({.sr_result = NVSDK_NGX_Result_FAIL_InvalidParameter, .nested_cpp = true});
+    {
+      std::shared_lock lock(benchmark::state.mutex);
+      Check(benchmark::state.frame_count == benchmark_frames && benchmark::state.sources.size() == 1
+                && benchmark::state.sources[0].attempts == benchmark_frames + 1 && benchmark::state.sources[0].failures == 1
+                && benchmark::state.rows.back().frame.sr_success_ns == 0,
+            "an outer SR failure excludes the provisional Render row despite successful inner SR");
+    }
+    Check(benchmark::Stop("fixture_complete", nullptr, true), "stop the Render source benchmark");
+    benchmark::Tick(timers::NowNs(), false);
+    benchmark::write_pending = false;
+    timers::benchmark_observer = nullptr;
+    std::cout << "PASS Render sr_benchmark_v1 source, timing, Color and crossover evidence\n";
+#endif
 
     model_parameter_observer = {};
     native::ngx_slot_real[0].evaluate = nullptr;

@@ -202,6 +202,7 @@ inline bool WriteExclusive(const std::filesystem::path& path, const std::string&
 namespace benchmark {
 
 enum class Delivery : uint8_t { kOff, kPassthrough, kPartial, kPerFrame, kRefresh, kReuse, kFallbackRefresh };
+enum class Stage : uint8_t { kUnobserved, kUpscaled, kRender };
 
 struct Pass {
   uint32_t model = 0;
@@ -241,6 +242,10 @@ struct Frame {
   bool expected_reuse_failed = false;
   bool original_selection_failed = false;
   Delivery delivery = Delivery::kPassthrough;
+  Stage stage = Stage::kUnobserved;
+  bool pre_sr_color_bound = false;
+  bool original_color_restored = false;
+  bool original_selection_recorded = false;
   const char* fallback_reason = nullptr;  // Static diagnostic text.
   std::array<Pass, gpu_timers::kTimerMaxPasses> passes{};
   std::shared_ptr<submission::RecordingStatus> recording;
@@ -406,8 +411,21 @@ struct Scope {
     return recording_identity.first != 0 && recording_identity == submission::RecordingIdentity(list);
   }
 
+  // The Render timer is recorded before the real SR call can submit the list.
+  Frame* ReserveRender(Frame observation, ID3D12CommandList* list) noexcept {
+    try {
+      if (observation.source_handle != source_handle || !MatchesRecording(list)) return nullptr;
+      std::unique_lock lock(state.mutex);
+      if (!active.load() || frame.token != 0) return nullptr;
+      if (ReserveLocked(std::move(observation), list, true)) return &frame;
+    } catch (...) {
+      // A failed diagnostic allocation must not interrupt the game evaluate.
+    }
+    return nullptr;
+  }
+
   void Observe(Frame observation, bool owner, bool success, ID3D12CommandList* list, bool track_queue) {
-    if (!owner && !success) return;
+    if (!owner && (!success || frame.stage == Stage::kRender)) return;
     if (success && (!MatchesRecording(list)
                     || (frame.token != 0 && frame.source_generation != observation.source_generation))) {
       if (!owner) return;
@@ -439,21 +457,10 @@ struct Scope {
         return;
       }
     }
-    if (frame.token == 0) {
-      if (state.rows.size() == state.capacity) {
-        lock.unlock();
-        Stop("frame_capacity_reached");
-        return;
-      }
-      if (track_queue) {
-        observation.recording = submission::ObserveRecording(list);
-        submission::TrackUse(list, observation.recording.get());
-      }
-      frame = observation;
-      frame.token = ++state.last_token;
-      frame.sr_success_ns = 0;
-      state.rows.emplace_back();
-      current = &frame;
+    if (frame.token == 0 && !ReserveLocked(observation, list, track_queue)) {
+      lock.unlock();
+      Stop("frame_capacity_reached");
+      return;
     }
     if (!owner) return;
     frame.sr_success_ns = observation.sr_success_ns;
@@ -468,8 +475,29 @@ struct Scope {
     frame.output_width = observation.output_width;
     frame.output_height = observation.output_height;
     frame.output_format = observation.output_format;
+    if (frame.stage == Stage::kRender && frame.delivery != Delivery::kPassthrough
+        && (!frame.pre_sr_color_bound || !frame.original_color_restored)) {
+      frame.delivery = Delivery::kPassthrough;
+      frame.fallback_reason = (frame.pre_sr_color_bound ? "pre_sr_original_color_not_restored"
+                                                       : "pre_sr_color_not_bound");
+    }
     state.rows[frame.token - state.first_token].frame = frame;
     ++state.frame_count;
+  }
+
+ private:
+  bool ReserveLocked(Frame observation, ID3D12CommandList* list, bool track_queue) {
+    if (state.rows.size() == state.capacity) return false;
+    if (track_queue) {
+      observation.recording = submission::ObserveRecording(list);
+      submission::TrackUse(list, observation.recording.get());
+    }
+    state.rows.emplace_back();
+    frame = std::move(observation);
+    frame.token = ++state.last_token;
+    frame.sr_success_ns = 0;
+    current = &frame;
+    return true;
   }
 };
 
@@ -496,7 +524,7 @@ inline void Export(const std::filesystem::path& directory, const report::Redacti
       document = {{"schema", "sr_benchmark_v1"}, {"status", "terminal"}, {"pid", GetCurrentProcessId()},
           {"capture_id", state.capture_id}, {"started_ns", state.started_ns}, {"ended_ns", state.ended_ns},
           {"time_basis", "steady_clock_ns; source timestamps are taken immediately after the outer NGX return"},
-          {"gpu_scope", "NR copy-in through immediate writeback; source_gpu only proves the original SR recording completed"},
+          {"gpu_scope", "NR start through Upscaled writeback or Render stand-in copy; source_gpu proves SR recording completion"},
           {"reason", state.reason}, {"phases", state.phases}, {"fg_at_stop", state.ended_environment}};
     }
     document["sources"] = Json::array();
@@ -522,6 +550,7 @@ inline void Export(const std::filesystem::path& directory, const report::Redacti
         }
       }
       Json timing = {{"state", gpu_timers::StateText(t.state)}, {"sequence", t.sequence}, {"valid", t.valid},
+          {"path", t.path[0] == '\0' ? Json(nullptr) : Json(t.path)}, {"recorded_ns", t.recorded_ns},
           {"samples", t.samples}, {"observed_ns", t.measured_ns}, {"total_us", t.valid ? Json(t.total_us) : Json(nullptr)},
           {"commit_us", t.valid ? Json(t.commit_us) : Json(nullptr)}, {"copies_us", t.valid ? Json(t.copies_us) : Json(nullptr)}};
       Json passes = Json::array();
@@ -538,12 +567,17 @@ inline void Export(const std::filesystem::path& directory, const report::Redacti
             {"gpu", timed ? Json{{"encode_us", g.encode_us}, {"eval_us", g.eval_us}, {"resolve_us", g.resolve_us},
                                  {"look_us", g.look_us}, {"total_us", g.total_us}} : Json(nullptr)}});
       }
+      constexpr const char* stages[] = {nullptr, "upscaled", "render"};
       document["frames"].push_back({{"source_handle", f.source_handle}, {"source_generation", f.source_generation},
           {"source_sequence", f.source_sequence}, {"sr_success_ns", f.sr_success_ns}, {"sr_result", f.sr_result},
           {"phase_index", f.phase}, {"phase", document["phases"][f.phase]["label"]},
           {"sr_input_size", {f.input_width, f.input_height}}, {"sr_output_size", {f.output_width, f.output_height}},
           {"sr_output_format", f.output_format}, {"motion_size", {f.motion_width, f.motion_height}},
           {"nr_enabled", f.nr_enabled}, {"reuse_requested", f.reuse_requested},
+          {"nr_stage", f.stage == Stage::kUnobserved ? Json(nullptr) : Json(stages[static_cast<size_t>(f.stage)])},
+          {"pre_sr", f.stage == Stage::kRender ? Json{{"color_bound", f.pre_sr_color_bound},
+              {"original_color_restored", f.original_color_restored},
+              {"original_selection_recorded", f.original_selection_recorded}} : Json(nullptr)},
           {"delivery", row.wrapper_finalized ? Json(deliveries[static_cast<size_t>(f.delivery)]) : Json(nullptr)},
           {"fallback_reason", f.fallback_reason == nullptr ? Json(nullptr) : Json(f.fallback_reason)},
           {"passes_requested", f.passes_requested}, {"passes", std::move(passes)},

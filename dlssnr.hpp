@@ -14985,6 +14985,7 @@ inline bool RecordInline(
   auto* benchmark_frame = sr_benchmark::current;
   if (benchmark_frame != nullptr
       && (present != nullptr || bridge_source != nullptr || execution_stage != stage_plan::Stage::UPSCALED
+          || benchmark_frame->stage == sr_benchmark::Stage::kRender
           || benchmark_frame->source_handle != reinterpret_cast<uintptr_t>(handle)
           || benchmark_frame->source_generation != feature.source_generation
           || !sr_benchmark::current_scope->MatchesRecording(command_list))) {
@@ -14992,6 +14993,7 @@ inline bool RecordInline(
   }
   const auto benchmark_fallbacks_before = benchmark_frame == nullptr ? 0 : edit_reuse_fallbacks.load();
   if (benchmark_frame != nullptr) {
+    benchmark_frame->stage = sr_benchmark::Stage::kUpscaled;
     benchmark_frame->nr_enabled = true;
     benchmark_frame->reuse_requested = edit_reuse_requested;
     benchmark_frame->passes_requested = requested_stack;
@@ -16771,7 +16773,18 @@ struct PreSrSwap {
   const NVSDK_NGX_Handle* monitor_source = nullptr;
   ID3D12GraphicsCommandList* monitor_list = nullptr;
   EditReuseMonitorFrame monitor_frame;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  control_mask_capture::benchmark::Frame* benchmark_frame = nullptr;
+#endif
 };
+
+#if defined(NR_NEXUS_DEV_CONTROL)
+inline void ObserveSrBenchmarkRenderInput(const NVSDK_NGX_Parameter* parameters, const PreSrSwap& swap) {
+  if (swap.benchmark_frame != nullptr && swap.color != nullptr) {
+    swap.benchmark_frame->pre_sr_color_bound = GetD3D12Resource(parameters, NVSDK_NGX_Parameter_Color) == swap.result;
+  }
+}
+#endif
 
 inline void RestorePreSrColor(
     const NVSDK_NGX_Parameter* game_parameters,
@@ -16781,6 +16794,12 @@ inline void RestorePreSrColor(
         const_cast<NVSDK_NGX_Parameter*>(game_parameters),
         NVSDK_NGX_Parameter_Color,
         swap.color);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (swap.benchmark_frame != nullptr) {
+      swap.benchmark_frame->original_color_restored =
+          GetD3D12Resource(game_parameters, NVSDK_NGX_Parameter_Color) == swap.color;
+    }
+#endif
     swap.color = nullptr;
   }
   if (swap.monitor_source == nullptr && (sr_succeeded || swap.edit_source == nullptr)) return;
@@ -17622,6 +17641,20 @@ inline bool RecordInlinePreSR(
   // and SDR.
   const bool timers_active = BeginChainTimers(command_list, device, "preSR", width, height, group);
   if (timers_active) BindComparisonContext(feature, current, hdr_mode, width, height, color_desc.Format, plan);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  namespace sr_benchmark = control_mask_capture::benchmark;
+  if (tracked_sr_call && !adaptive.preparing && !plan.mixed && sr_benchmark::current_scope != nullptr
+      && feature.source_feature == kFeatureDlss && EditReuseSourceConfirmed(handle, feature)) {
+    swap.benchmark_frame = sr_benchmark::current_scope->ReserveRender({.source_handle = reinterpret_cast<uintptr_t>(handle),
+        .source_generation = feature.source_generation, .motion_width = frame.motion_width, .motion_height = frame.motion_height,
+        .passes_requested = requested_stack, .nr_enabled = true, .reuse_requested = edit_reuse_requested,
+        .stage = sr_benchmark::Stage::kRender, .fallback_reason = "nr_prepare_or_passthrough"}, command_list);
+  }
+  auto* const benchmark_frame = swap.benchmark_frame;
+  if (benchmark_frame != nullptr && timers_active) {
+    gpu_timers::internal::segments[gpu_timers::internal::current.idx].benchmark_token = benchmark_frame->token;
+  }
+#endif
 
   if (res.hdr_mode != 0) {
     // v6 linearize: the game's own color (SRV by the NGX contract, same
@@ -17934,6 +17967,18 @@ inline bool RecordInlinePreSR(
         command_list->SetComputeRoot32BitConstants(2, 1, &kAreaEncode, 16);
       }
     }
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (benchmark_frame != nullptr) {
+      const auto global_pass = group.begin + pass;
+      auto& sample = benchmark_frame->passes[pass];
+      sample.model = feature.slots[pass].nr_preset;
+      sample.width = nr_input_width;
+      sample.height = nr_input_height;
+      sample.detail_stability = (global_pass != 0 && !pass_look_result[global_pass - 1].follow.load()
+          ? pass_look_result[global_pass - 1].detail_stability.load() : detail_stability.load());
+      benchmark_frame->passes_recorded = pass + 1;
+    }
+#endif
     if (timers_active) {
       gpu_timers::SetPass(pass, group.begin + pass, feature.slots[pass].nr_preset,
                           nr_input_width, nr_input_height, nr_input_width, nr_input_height);
@@ -17960,8 +18005,17 @@ inline bool RecordInlinePreSR(
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     res.nr_output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     if (edit_reuse_eligible) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+      const bool expected_reuse = benchmark_frame != nullptr && previous_edit != nullptr
+          && previous_edit->valid && !previous_edit->reused;
+#endif
       edit = RecordEditReuseBeforeEvaluate(device, command_list, &feature.slots[0], res, frame, color,
           depth_desc.Format, nr_input_width, nr_input_height, edit_sequence, edit_contract, true);
+#if defined(NR_NEXUS_DEV_CONTROL)
+      if (expected_reuse && !edit.reused) {
+        benchmark_frame->expected_reuse_failed = true;
+      }
+#endif
     }
     if (!edit.reused) {
       const ControlMaskParameters mask_parameters =
@@ -18034,6 +18088,18 @@ inline bool RecordInlinePreSR(
       if (pass_control_mask_eligible) {
         FinishControlMaskEvaluation(command_list, res, feature.slots[pass]);
       }
+#if defined(NR_NEXUS_DEV_CONTROL)
+      if (benchmark_frame != nullptr) {
+        const auto& slot = feature.slots[pass];
+        auto& sample = benchmark_frame->passes[pass];
+        ++sample.calls;
+        sample.accepted += nr_returned && NVSDK_NGX_SUCCEED(nr_result);
+        sample.reset_reasons = (slot.model_reset ? slot.model_reset_reasons : 0);
+        sample.auto_mask = slot.model_sent[4] != 0.f;
+        sample.external_mask = pass_control_mask_eligible;
+        sample.intensity = slot.model_intensity_sent;
+      }
+#endif
       ObserveNrEvaluation(stage_plan::Stage::RENDER, handle, feature, feature.slots[pass], group.begin + pass, nr_result, plan, nullptr, nr_returned);
       last_result = static_cast<uint32_t>(nr_result);
       if (NVSDK_NGX_FAILED(nr_result)) {
@@ -18064,8 +18130,23 @@ inline bool RecordInlinePreSR(
       }
       ++edit_reuse_refreshes;
     }
+#if defined(NR_NEXUS_DEV_CONTROL)
+    const auto benchmark_detail_before = (benchmark_frame == nullptr ? 0 : look_stability_passes.load());
+#endif
     const LookRoute route = RunLookStage(
         command_list, device, res, feature.slots[pass], pass, look_chain, frame, group.begin, edit.reused);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (benchmark_frame != nullptr) {
+      auto& sample = benchmark_frame->passes[pass];
+      sample.look = route.shaped;
+      sample.detail_temporal = look_stability_passes.load() != benchmark_detail_before;
+      if (edit.reused) {
+        const auto& slot = feature.slots[pass];
+        sample.auto_mask = slot.model_sent[4] != 0.f;
+        sample.intensity = slot.model_intensity_sent;
+      }
+    }
+#endif
     Transition(
         command_list,
         write_surface,
@@ -18174,6 +18255,11 @@ inline bool RecordInlinePreSR(
     LogNrStackFailure(stack_failure, failed_pass, requested_stack, true);
     swap.monitor_frame.delivery = EditReuseDelivery::ORIGINAL;
     swap.monitor_frame.reason = EditReuseBlock::NR_FAILED;
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (benchmark_frame != nullptr) {
+      benchmark_frame->fallback_reason = "nr_evaluate_failed";
+    }
+#endif
     if (timers_active) {
       gpu_timers::End(command_list);
     }
@@ -18336,6 +18422,11 @@ inline bool RecordInlinePreSR(
     ++edit_reuse_fallbacks;
     swap.monitor_frame.delivery = EditReuseDelivery::ORIGINAL;
     swap.monitor_frame.reason = EditReuseBlock::SELECT_ORIGINAL;
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (benchmark_frame != nullptr) {
+      benchmark_frame->fallback_reason = "select_original_failed";
+    }
+#endif
     RetireEditReuse(&feature.slots[0], edit_sequence);
     if (timers_active) {
       gpu_timers::MarkBypassed();
@@ -18344,6 +18435,11 @@ inline bool RecordInlinePreSR(
     device->Release();
     return false;
   }
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (benchmark_frame != nullptr) {
+    benchmark_frame->original_selection_recorded = edit.reused;
+  }
+#endif
   Transition(
       command_list,
       final_surface,
@@ -18439,6 +18535,26 @@ inline bool RecordInlinePreSR(
     device->Release();
     return true;
   }
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (benchmark_frame != nullptr) {
+    using sr_benchmark::Delivery;
+    benchmark_frame->fallback_reason = nullptr;
+    if (!stage_scope.complete) {
+      benchmark_frame->delivery = Delivery::kPartial;
+      benchmark_frame->fallback_reason = "partial_pass_stack";
+    } else if (edit.reused) {
+      benchmark_frame->delivery = Delivery::kReuse;
+    } else if (!edit_reuse_requested) {
+      benchmark_frame->delivery = Delivery::kPerFrame;
+    } else if (!edit_reuse_eligible || benchmark_frame->expected_reuse_failed || edit.cache == nullptr || !edit.cache->valid) {
+      benchmark_frame->delivery = Delivery::kFallbackRefresh;
+      benchmark_frame->fallback_reason = (!edit_reuse_eligible ? "edit_reuse_ineligible"
+          : benchmark_frame->expected_reuse_failed ? "reuse_apply_failed" : "edit_reuse_recording_failed");
+    } else {
+      benchmark_frame->delivery = Delivery::kRefresh;
+    }
+  }
+#endif
   for (auto& slot : feature.slots) slot.fail_count = 0;
   uint64_t count = 0;
   if (adaptive.session != nullptr && adaptive.session->settings.limited_residency && !adaptive.preparing
@@ -21852,6 +21968,10 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
   bool frame_generation = false;
 #if defined(NR_NEXUS_DEV_CONTROL)
   native_ui_alpha_observation::ConsumerCall ui_alpha_call;
+  std::optional<control_mask_capture::benchmark::Scope> sr_benchmark;
+  if (source_scope.owner && control_mask_capture::benchmark::active.load()) {
+    GuardHook([&] { sr_benchmark.emplace(reinterpret_cast<uintptr_t>(handle), command_list); });
+  }
 #endif
   if (!nested_in_c_wrapper && !InsideDirectCall()) {
 #if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
@@ -21953,10 +22073,6 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
   const auto fg_consumer_serial = (frame_generation && source_scope.owner && !nested_in_c_wrapper && !InsideDirectCall()
       ? BeginNativeFgConsumerCapture(command_list, handle, parameters, Slot) : 0);
   int64_t sr_benchmark_return_ns = 0;
-  std::optional<control_mask_capture::benchmark::Scope> sr_benchmark;
-  if (source_scope.owner && control_mask_capture::benchmark::active.load()) {
-    GuardHook([&] { sr_benchmark.emplace(reinterpret_cast<uintptr_t>(handle), command_list); });
-  }
 #endif
   const NVSDK_NGX_Result result = [&] {
     const NgxRuntimeCommandScope runtime_scope;
@@ -21968,6 +22084,9 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
 #endif
     const bool outer = inside_game_evaluate_wrapper;
     if (control_mask_use_core_context.load()) inside_game_evaluate_wrapper = true;
+#if defined(NR_NEXUS_DEV_CONTROL)
+    ObserveSrBenchmarkRenderInput(parameters, pre_sr);
+#endif
     const auto result = real(command_list, handle, parameters, callback);
 #if defined(NR_NEXUS_DEV_CONTROL)
     if (source_scope.owner ? sr_benchmark.has_value() : control_mask_capture::benchmark::current_scope != nullptr) {
@@ -22183,6 +22302,10 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
   bool frame_generation = false;
 #if defined(NR_NEXUS_DEV_CONTROL)
   native_ui_alpha_observation::ConsumerCall ui_alpha_call;
+  std::optional<control_mask_capture::benchmark::Scope> sr_benchmark;
+  if (source_scope.owner && control_mask_capture::benchmark::active.load()) {
+    GuardHook([&] { sr_benchmark.emplace(reinterpret_cast<uintptr_t>(handle), command_list); });
+  }
 #endif
   if (!InsideDirectCall()) {
     RuntimeLock lock(runtime_mutex);
@@ -22258,10 +22381,6 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
   const auto fg_consumer_serial = (frame_generation && source_scope.owner && !InsideDirectCall()
       ? BeginNativeFgConsumerCapture(command_list, handle, parameters, Slot) : 0);
   int64_t sr_benchmark_return_ns = 0;
-  std::optional<control_mask_capture::benchmark::Scope> sr_benchmark;
-  if (source_scope.owner && control_mask_capture::benchmark::active.load()) {
-    GuardHook([&] { sr_benchmark.emplace(reinterpret_cast<uintptr_t>(handle), command_list); });
-  }
 #endif
   inside_game_evaluate_wrapper = true;
   ComputeStateEnvelope state_envelope(
@@ -22278,6 +22397,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
         edit_reuse_enabled.load() && edit_reuse_fg_experiment.load() && !InsideDirectCall(),
         frame_generation, Slot, true, false,
         reinterpret_cast<uintptr_t>(handle), reinterpret_cast<uintptr_t>(command_list));
+    ObserveSrBenchmarkRenderInput(parameters, pre_sr);
     const auto result = real(command_list, handle, parameters, callback);
     if (source_scope.owner ? sr_benchmark.has_value() : control_mask_capture::benchmark::current_scope != nullptr) {
       sr_benchmark_return_ns = SteadyNowNs();
