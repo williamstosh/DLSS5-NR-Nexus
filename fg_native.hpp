@@ -18,6 +18,9 @@ struct Slot {
   ID3D12DescriptorHeap* color_heap = nullptr;
   bool color_inputs_prepared = false;
   bool pipeline_pending = false;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  bool native_edit_fixed_workset = false;
+#endif
   uint64_t fence_value = 0;
   bool quarantined = false;
 };
@@ -41,7 +44,8 @@ struct Stream {
   uint64_t native_options_generation = 0;
   bool native_resolution_pair = false;
 #if defined(NR_NEXUS_DEV_CONTROL)
-  bool native_edit_reuse = false;
+  bool native_edit_source = false;
+  bool native_edit_history = false;
   uint64_t native_edit_frame = 0;
   uint64_t native_edit_source_generation = 0;
   uint64_t native_edit_source_epoch = 0;
@@ -133,6 +137,9 @@ inline bool PrepareCapture(ID3D12GraphicsCommandList* list) noexcept {
 // history. Rebuild the feature and workset, including their GPU state ledger.
 inline void Invalidate(Stream* stream) {
   stream->adaptive_role_unavailable = false;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  stream->native_edit_history = false;
+#endif
   stream->cached = nullptr;
   stream->native_pair_producer_marker = nullptr;
   stream->native_pair_completion = {};
@@ -390,6 +397,9 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
   *recordings = {};
   slot->color_inputs_prepared = false;
   slot->pipeline_pending = false;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  slot->native_edit_fixed_workset = false;
+#endif
   const PipelinePreparationScope pipeline_scope;
   if (!enabled.load(std::memory_order_relaxed)) return fg::Result::NOT_SERVED;
   if (nr_adaptive_enabled.load(std::memory_order_relaxed) || codec_pipeline.incremental_preparation) {
@@ -689,8 +699,24 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
       && backbuffer_desc.Width == input.color_width && backbuffer_desc.Height == input.color_height;
   bool native_edit_reuse_frame = false;
 #if defined(NR_NEXUS_DEV_CONTROL)
-  native_edit_reuse_frame = stream->native && native_parameters != nullptr
-      && base.native_edit_reuse_frame != 0 && real_guides && !coupled_ui;
+  auto fixed_workset = stream->adaptive_frame;
+  if (stream->native && native_parameters != nullptr && base.native_edit_reuse_frame != 0
+      && real_guides && !coupled_ui) {
+    if (const auto resident = adaptive_resident_session.lock();
+        fixed_workset.enabled && resident != nullptr && resident != fixed_workset.session) {
+      // SelectAdaptiveTier falls back to the manual upper for each role when
+      // a different session owns residency. Keep its per-role selection intact.
+      fixed_workset.enabled = false;
+      fixed_workset.slot = 0;
+    }
+    native_edit_reuse_frame = !fixed_workset.enabled && !fixed_workset.preparing && fixed_workset.slot == 0;
+  }
+  if (native_edit_reuse_frame && !stream->native_edit_history) {
+    for (auto& role : stream->roles) {
+      if (features.contains(role.Handle())) ResetPresentStreamHistory(&role, kResetSourceChange);
+    }
+  }
+  stream->native_edit_history = native_edit_reuse_frame;
 #endif
   const bool edit_reuse_frame = xefg_edit_reuse_frame || native_edit_reuse_frame;
   // Cache descriptors retain their sources. Stage the current original in
@@ -755,6 +781,9 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     target.ui_correction = i == 0 && base.ui_correction;
     target.guide_serial = (real_guides ? input.application_frame + 1 : 0u);
     target.xefg_edit_reuse_frame = (xefg_edit_reuse_frame ? input.application_frame : 0u);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (!native_edit_reuse_frame) target.native_edit_reuse_frame = 0;
+#endif
     target.domain = (i == 0 ? present_restore_scope::Domain::PRE_FG_BACKBUFFER
                             : present_restore_scope::Domain::PRE_FG_HUDLESS);
     target.original_identity = reinterpret_cast<uintptr_t>(i == 0 ? input.backbuffer : input.hudless);
@@ -955,6 +984,23 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     // Both consumed roles must represent the same refresh/reuse phase.
     return fg::Result::FAILED;
   }
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (native_edit_reuse_frame) {
+    // Bind duplicate delivery to the worksets that actually produced this
+    // base's colors. Exact-alpha composition may have recorded only HUDLess.
+    slot->native_edit_fixed_workset = true;
+    for (uint32_t i = 0; i < recordings->size(); ++i) {
+      if (!(*recordings)[i].output_ready) continue;
+      const auto feature = features.find(stream->roles[i].Handle());
+      if (feature == features.end() || !UsesFixedEditReuseWorkset(feature->second, fixed_workset)
+          || (stream->adaptive_frame.enabled && feature->second.adaptive_cache != nullptr)
+          || feature->second.input_width != input.color_width || feature->second.input_height != input.color_height) {
+        slot->native_edit_fixed_workset = false;
+        break;
+      }
+    }
+  }
+#endif
   // Composition can consume only HUDLess; a failed composition falls back to
   // two model colors. Freeze the actual complete role set before submission.
   uint32_t measured_roles = 0;
@@ -1339,11 +1385,7 @@ inline void PreserveNativePreFgProof(
   // An opt-out must still retain the previous producer's exact receipt so
   // a same-frame rollback never treats a pruned recording as unproven work.
   for (auto& [key, stream] : fg_service::streams) {
-    bool protected_producer = stream.native_resolution_pair;
-#if defined(NR_NEXUS_DEV_CONTROL)
-    protected_producer |= stream.native_edit_reuse;
-#endif
-    if (!protected_producer || marker != stream.native_pair_producer_marker) continue;
+    if (stream.native_pair_producer_marker == nullptr || marker != stream.native_pair_producer_marker) continue;
     if (submissions.empty()) {
       stream.native_pair_discarded = true;
       continue;
@@ -1712,7 +1754,7 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
   uint64_t claimed_tag_epoch = (diagnostic.tag_input_claimed ? diagnostic.tag_input_frame.epoch : 0);
   if (index > 1) {
     const auto previous = fg_service::streams.find({true, reinterpret_cast<uintptr_t>(owner)});
-    if (previous != fg_service::streams.end() && previous->second.native_edit_reuse
+    if (previous != fg_service::streams.end() && previous->second.native_edit_source
         && previous->second.native_edit_source_is_tagged && previous->second.native_handle == handle) {
       claimed_tag_epoch = previous->second.native_edit_source_epoch;
     }
@@ -1732,22 +1774,21 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
       && GetFloatIfPresent(parameters, NVSDK_NGX_DLSSG_Parameter_MvecScaleX, motion_scale_x)
       && GetFloatIfPresent(parameters, NVSDK_NGX_DLSSG_Parameter_MvecScaleY, motion_scale_y)
       && GetUIntIfPresent(parameters, NVSDK_NGX_DLSSG_Parameter_MvecJittered, &motion_jittered) && motion_jittered == 0;
-  const auto native_source = created_feature_ids.find(handle);
+  const auto source_feature = created_feature_ids.find(handle);
   const bool native_edit_requested = edit_reuse_enabled.load() && edit_reuse_fg_experiment.load();
-  bool native_edit_route = native_edit_requested && native_frame.available && frame_parameters
-      && native_source != created_feature_ids.end() && native_source->second == NVSDK_NGX_Feature_FrameGeneration
+  bool native_edit_source = native_edit_requested && native_frame.available && frame_parameters
+      && source_feature != created_feature_ids.end() && source_feature->second == NVSDK_NGX_Feature_FrameGeneration
       && pair_plan.valid && !pair_plan.mixed && pair_plan.pass_count == 1 && !resolution_pair
-      && !native_fg_public_off.load() && current_guides && !fg::xefg::Enabled()
-      && !nr_adaptive_enabled.load();
-  if (native_edit_route && native_tag_frame && index == 1) {
-    native_edit_route = diagnostic.tag_input_claimed
+      && !native_fg_public_off.load() && current_guides && !fg::xefg::Enabled();
+  if (native_edit_source && native_tag_frame && index == 1) {
+    native_edit_source = diagnostic.tag_input_claimed
         && tagged_frame.epoch == diagnostic.tag_input_frame.epoch
         && tagged_frame.frame == diagnostic.tag_input_frame.frame
         && tagged_frame.generation == diagnostic.tag_input_frame.generation;
   }
   // Preserve the producer's uint32 identity including frame zero. Wrap is a
   // discontinuity to the cache, rather than an invented application clock.
-  const uint64_t native_edit_sequence = (native_edit_route ? static_cast<uint64_t>(native_frame.frame) + 1 : 0);
+  const uint64_t native_edit_sequence = (native_edit_source ? static_cast<uint64_t>(native_frame.frame) + 1 : 0);
   if (native_edit_requested) {
     static int64_t last_observation_ns = 0;
     static uint32_t observations = 0;
@@ -1761,7 +1802,7 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
            << " reason=" << native_frame.reason << " token=" << native_frame.frame
            << " epoch=" << native_frame.epoch << " generation=" << native_frame.generation
            << " parameters=" << frame_parameters << " index=" << declared_index
-           << " real_guides=" << current_guides << " route=" << native_edit_route
+           << " real_guides=" << current_guides << " route=" << native_edit_source
            << " source_provider=" << (native_tag_frame ? "tagged_resource" : "sdk_scope")
            << " tag_source_reason=" << tagged_frame.reason
            << " tag=[legacy:" << tag_observation.legacy_calls << ",framed:" << tag_observation.for_frame_calls
@@ -1922,19 +1963,19 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     fg_service::native_bindings[handle] = context;
   }
 #if defined(NR_NEXUS_DEV_CONTROL)
-  if (stream.native_edit_reuse != native_edit_route
-      || (native_edit_route && (stream.native_edit_source_generation != native_frame.generation
+  if (stream.native_edit_source != native_edit_source
+      || (native_edit_source && (stream.native_edit_source_generation != native_frame.generation
           || stream.native_edit_source_is_tagged != native_tag_frame))) {
-    // A native frame-source transition cannot adopt a pre-existing model's
-    // unguarded history or publish a cached image from the previous source.
-    fg_service::Invalidate(&stream);
-    stream.native_edit_reuse = native_edit_route;
+    // Source changes invalidate fixed edit history. Adaptive worksets keep
+    // their own history across missing or changed SDK token scopes.
+    if (stream.native_edit_history) fg_service::Invalidate(&stream);
+    stream.native_edit_source = native_edit_source;
     stream.native_edit_frame = 0;
     stream.native_edit_source_epoch = 0;
     stream.native_edit_source_generation = native_frame.generation;
     stream.native_edit_source_is_tagged = native_tag_frame;
   }
-  if (native_edit_route && native_tag_frame && stream.native_edit_frame == native_edit_sequence
+  if (native_edit_source && native_tag_frame && stream.native_edit_frame == native_edit_sequence
       && stream.native_edit_source_epoch != native_frame.epoch) {
     // A replacement tag for the same token cannot borrow the old pixels.
     fg_service::Invalidate(&stream);
@@ -1952,11 +1993,7 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     }
     return true;
   };
-  bool protected_producer = stream.native_resolution_pair;
-#if defined(NR_NEXUS_DEV_CONTROL)
-  protected_producer |= stream.native_edit_reuse;
-#endif
-  if (protected_producer && stream.native_pair_producer_marker != nullptr) {
+  if (stream.native_pair_producer_marker != nullptr) {
     const bool same_recording = stream.native_pair_recording == submission::RecordingIdentity(list);
     std::vector<std::pair<FenceRef, uint64_t>> proofs;
     const auto proof = submission::UseSubmissionTokens(stream.native_pair_producer_marker, &proofs);
@@ -1977,14 +2014,14 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
       diagnostic.reason = "producer_discarded_replayed_or_unfinished";
       bool same_frame = frame_id == stream.source_frame_id;
 #if defined(NR_NEXUS_DEV_CONTROL)
-      if (stream.native_edit_reuse) same_frame = native_edit_sequence == stream.native_edit_frame;
+      if (stream.native_edit_source) same_frame = native_edit_sequence == stream.native_edit_frame;
 #endif
       if (same_frame || (!proofs.empty() && !completed_producer)) return nullptr;
       fg_service::Invalidate(&stream);
     }
     bool cached_same_frame = stream.native_resolution_pair && frame_id == stream.source_frame_id;
 #if defined(NR_NEXUS_DEV_CONTROL)
-    cached_same_frame |= stream.native_edit_reuse && native_edit_sequence == stream.native_edit_frame;
+    cached_same_frame |= stream.native_edit_source && native_edit_sequence == stream.native_edit_frame;
 #endif
     if (stream.cached != nullptr && cached_same_frame
         && (stream.native_resolution_pair != resolution_pair || stream.native_configuration != configuration
@@ -2024,15 +2061,15 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
       && stream.cached != nullptr && stream.result == fg::Result::PREPARED
       && stream.source_backbuffer == backbuffer && stream.source_hudless == hudless && stream.source_ui == ui;
 #if defined(NR_NEXUS_DEV_CONTROL)
-  if (native_edit_route) {
-    repeated_frame = native_edit_sequence == stream.native_edit_frame
+  if (native_edit_source) {
+    const bool same_native_frame = native_edit_sequence == stream.native_edit_frame
         && (!native_tag_frame || native_frame.epoch == stream.native_edit_source_epoch) && stream.cached != nullptr
         && stream.result == fg::Result::PREPARED && stream.source_backbuffer == backbuffer
         && stream.source_hudless == hudless && stream.source_ui == ui && stream.native_edit_ui_alpha == ui_alpha;
-    // MFG is read-only consumption of this identified base frame. A new
-    // token with index > 1 never borrows the preceding base's cached pixels.
-    if (index > 1 && !repeated_frame) return nullptr;
-    if (native_edit_sequence == stream.native_edit_frame && !repeated_frame) return nullptr;
+    // Only the identified base's completed fixed worksets can use the x2
+    // delivery path. Adaptive output still needs its normal frame identity.
+    repeated_frame = same_native_frame && (stream.cached->native_edit_fixed_workset || repeated_frame);
+    if ((index > 1 || native_edit_sequence == stream.native_edit_frame) && !repeated_frame) return nullptr;
   }
 #endif
   if (index > 1 || repeated_frame) {
@@ -2052,7 +2089,7 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     // this invocation withdraws its guides or declares no game frame.
     bool cached_real_guides = stream.roles[0].real_guides;
 #if defined(NR_NEXUS_DEV_CONTROL)
-    if (native_edit_route) {
+    if (native_edit_source) {
       // Exact-alpha composition may have delivered only a HUDLess NR role;
       // a reuse frame also has no newly recorded model to count as its role.
       cached_real_guides = false;
@@ -2074,8 +2111,9 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     }
   } else {
 #if defined(NR_NEXUS_DEV_CONTROL)
-    if (native_edit_route) {
-      if (stream.native_edit_frame != 0 && native_edit_sequence != stream.native_edit_frame + 1) {
+    if (native_edit_source) {
+      if (stream.native_edit_history && stream.native_edit_frame != 0
+          && native_edit_sequence != stream.native_edit_frame + 1) {
         for (auto& role : stream.roles) ResetPresentStreamHistory(&role);
       }
       stream.native_edit_frame = native_edit_sequence;
@@ -2088,7 +2126,7 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     if (stream.native_pair_attempt_frame != 0 && frame_id <= stream.native_pair_attempt_frame) return nullptr;
     bool protect_recording = resolution_pair;
 #if defined(NR_NEXUS_DEV_CONTROL)
-    protect_recording |= native_edit_route;
+    protect_recording |= native_edit_source;
 #endif
     if (protect_recording) {
       diagnostic.reason = "first_index_not_one";
@@ -2096,7 +2134,7 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
       if (resolution_pair) stream.native_pair_attempt_frame = frame_id;
     }
 #if defined(NR_NEXUS_DEV_CONTROL)
-    if (native_edit_route) {
+    if (native_edit_source) {
       // Latch this base's own Reset before freezing the epoch below. Record
       // must not mistake that expected change for an external invalidation.
       FeatureState game_frame;
@@ -2200,10 +2238,10 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     PresentTarget target = owner->prefg_target;
     target.native_prefg_resolution_pair = resolution_pair;
 #if defined(NR_NEXUS_DEV_CONTROL)
-    target.game_frame_observed = native_edit_route;
+    target.game_frame_observed = native_edit_source;
     // Coupled opaque-UI inputs retain their current per-frame service. This
     // first native route preserves exact-alpha composition or independent roles.
-    if (native_edit_route && !fg_service::NeedsNativeColorCoupling(input, parameters, ui_recomposition)) {
+    if (native_edit_source && !fg_service::NeedsNativeColorCoupling(input, parameters, ui_recomposition)) {
       target.native_edit_reuse_frame = native_edit_sequence;
     }
 #endif
@@ -2217,7 +2255,7 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
       envelope.MarkInjectionCommandsRecorded();
     }
 #if defined(NR_NEXUS_DEV_CONTROL)
-    if (native_edit_route) {
+    if (native_edit_source) {
       const auto current_frame = (native_tag_frame ? native_tag_source::CurrentFrame(hudless, list, native_frame.epoch)
           : fg::native_options::CurrentFrame(reinterpret_cast<uintptr_t>(owner->native_output_identity)));
       if (!current_frame.available || current_frame.epoch != native_frame.epoch
@@ -2252,12 +2290,16 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     fg_service::CopyColor(list, slot->original_backbuffer, input_state, backbuffer, input_state);
     stream.cached = slot;
     stream.native_resolution_pair = resolution_pair;
-    stream.native_pair_recording = submission::RecordingIdentity(list);
     stream.native_pair_resolutions = pair_resolutions;
-    stream.native_pair_completion = {};
-    stream.native_pair_completion_value = 0;
-    stream.native_pair_discarded = false;
-    stream.native_pair_replayed = false;
+    if (!protect_recording) {
+      // This output supersedes the protected producer without inheriting its receipt.
+      stream.native_pair_producer_marker = nullptr;
+      stream.native_pair_recording = {};
+      stream.native_pair_completion = {};
+      stream.native_pair_completion_value = 0;
+      stream.native_pair_discarded = false;
+      stream.native_pair_replayed = false;
+    }
     stream.source_backbuffer = backbuffer;
     stream.source_hudless = hudless;
     stream.source_ui = ui;

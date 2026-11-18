@@ -519,7 +519,7 @@ int Run() {
           {
             const addon::RuntimeLock lock(native::runtime_mutex);
             const auto source = native::fg_service::streams.find({true, context});
-            Check(source != native::fg_service::streams.end() && source->second.native_edit_reuse
+            Check(source != native::fg_service::streams.end() && source->second.native_edit_source
                     && source->second.native_edit_source_is_tagged && source->second.native_edit_source_epoch != 0,
                 "direct warmup claims its tagged source before a final HUDLess cache exists");
             claimed_epoch = source->second.native_edit_source_epoch;
@@ -531,7 +531,7 @@ int Run() {
           {
             const addon::RuntimeLock lock(native::runtime_mutex);
             const auto source = native::fg_service::streams.find({true, context});
-            Check(source != native::fg_service::streams.end() && source->second.native_edit_reuse
+            Check(source != native::fg_service::streams.end() && source->second.native_edit_source
                     && source->second.native_edit_source_is_tagged
                     && source->second.native_edit_source_epoch == claimed_epoch
                     && source->second.native_edit_frame == native_frame,
@@ -550,7 +550,7 @@ int Run() {
     auto& stream = native::fg_service::streams.at({true, context});
     const auto* role_handle = stream.roles[1].Handle();
     auto anchor = native::features.at(role_handle).slots[0].edit_reuse;
-    Check(stream.native_edit_reuse && stream.native_edit_frame == static_cast<uint64_t>(token) + 1
+    Check(stream.native_edit_source && stream.native_edit_frame == static_cast<uint64_t>(token) + 1
             && anchor != nullptr && anchor->valid && target.xefg_edit_reuse_frame == 0,
         "native service derives a private edit anchor from the observed token without a XeFG marker");
     for (const auto& binding : anchor->bindings) {
@@ -587,6 +587,90 @@ int Run() {
     Check(reset.replaced && reset.evaluates == 1 && reset.reuses == 0 && reset.reset == 1,
         "explicit native Reset interrupts the x2 reuse phase");
     anchor.reset();
+
+    {
+      Check(native::EnsureLookPipeline(gpu.device.Get()), "warm Look pipelines before Adaptive admission");
+      const auto fixed_anchor = native::features.at(role_handle).slots[0].edit_reuse;
+      const auto resident = std::make_shared<addon::adaptive_resolution::Session>();
+      native::adaptive_resident_session = resident;
+      native::nr_adaptive_enabled = true;
+      native::nr_adaptive_selected_levels = 2;
+      const auto fixed = record({.token = ++token});
+      const auto& fixed_role = native::features.at(role_handle);
+      Check(fixed.replaced && fixed.evaluates == 0 && fixed.reuses == 1
+              && fixed_role.adaptive_cache == nullptr && fixed_role.slots[0].edit_reuse == fixed_anchor
+              && fixed_role.input_width == width && fixed_role.input_height == height,
+          "an unacquired Adaptive request retains the current native fixed HUDLess workset and reuses its anchor");
+      const auto fixed_mfg = record({.token = token, .index = 2, .update_source = false});
+      Check(fixed_mfg.replaced && fixed_mfg.evaluates == 0 && fixed_mfg.reuses == 0,
+          "MFG re-delivers the identified fixed output without advancing edit history");
+
+      native::adaptive_resident_session.reset();
+      const auto next_mfg = record({.token = token + 1, .index = 2, .update_source = false});
+      Check(!next_mfg.replaced && next_mfg.evaluates == 0 && next_mfg.reuses == 0,
+          "a new base token cannot re-deliver the previous fixed slot while Adaptive can acquire residency");
+      const auto preparing = record({.token = ++token});
+      Check(preparing.reuses == 0 && stream.adaptive_frame.slot == 0
+              && native::features.at(role_handle).adaptive_cache != nullptr
+              && native::features.at(role_handle).slots[0].edit_reuse == nullptr,
+          "actual Adaptive preparation stays on the upper tier and retires the fixed edit anchor");
+      for (uint32_t attempt = 0; attempt < 16 && !stream.adaptive_session->TargetReady(); ++attempt) {
+        Check(record({.token = ++token}).reuses == 0, "preparing Adaptive tiers cannot publish x2 reuse");
+      }
+      Check(stream.adaptive_session->TargetReady() && stream.adaptive_session->ladder.count == 2,
+          "two native Adaptive tiers become ready through normal recording and Fence completion");
+      stream.adaptive_session->Request(1, native::SteadyNowNs());
+      const auto switched = record({.token = ++token});
+      const auto& switched_role = native::features.at(role_handle);
+      const auto switched_size = stream.adaptive_session->ladder.sizes[1][0];
+      Check(switched.replaced && switched.evaluates > 0 && switched.reuses == 0
+              && stream.adaptive_frame.slot == 1 && switched_role.adaptive_cache != nullptr
+              && switched_role.adaptive_cache->active == 1
+              && switched_role.input_width == switched_size.width && switched_role.input_height == switched_size.height
+              && switched_size.width < width && switched_role.slots[0].edit_reuse == nullptr,
+          "native Adaptive switch delivers the actual smaller HUDLess tier without creating an edit anchor");
+      const auto switched_mfg = record({.token = token, .index = 2, .update_source = false});
+      Check(!switched_mfg.replaced && switched_mfg.evaluates == 0 && switched_mfg.reuses == 0,
+          "an Adaptive output without a conventional frame identity cannot use the fixed x2 duplicate path");
+      const auto switched_cache = switched_role.adaptive_cache;
+      const auto* switched_slot = stream.cached;
+      std::vector<std::pair<addon::FenceRef, uint64_t>> proofs;
+      Check(stream.native_pair_producer_marker == switched_slot->original_backbuffer
+              && submission::UseSubmissionTokens(switched_slot->original_backbuffer, &proofs)
+                  == submission::UseSubmission::kComplete
+              && !stream.native_pair_completion.empty(),
+          "the pruned Adaptive producer retains its completed Fence receipt");
+      // Keep the old color slot busy without recording another use of its producer marker.
+      native::fg_service::CopyColor(proof_list.Get(), hudless_clone.Get(), D3D12_RESOURCE_STATE_COMMON,
+          switched_slot->color[0], NATIVE_INPUT_STATE);
+      const auto no_token = record({.token = ++token, .source_scope = false});
+      Check(no_token.replaced && no_token.evaluates > 0 && no_token.reuses == 0
+              && stream.cached != switched_slot && stream.source_frame_id == 0
+              && native::features.at(role_handle).adaptive_cache == switched_cache && switched_cache->active == 1,
+          "withdrawing the SDK token keeps the completed Adaptive tier and its ordinary per-frame delivery");
+      Check(SUCCEEDED(proof_list->Close()) && SUCCEEDED(proof_list->Reset(proof_allocator.Get(), nullptr)),
+          "discard the foreign color recording after the tokenless producer rotates slots");
+      const auto next_no_token = record({.token = ++token, .source_scope = false});
+      Check(next_no_token.replaced && next_no_token.evaluates > 0 && next_no_token.reuses == 0
+              && native::features.at(role_handle).adaptive_cache == switched_cache && switched_cache->active == 1,
+          "second tokenless Adaptive frame evaluates and delivers after the prior producer was pruned");
+      Check(stream.native_pair_producer_marker == nullptr && stream.native_pair_completion.empty(),
+          "ordinary tokenless delivery leaves no protected producer receipt");
+      native::nr_adaptive_enabled = false;
+      native::nr_adaptive_selected_levels = 0;
+      recover();
+      const auto& recovered_role = native::features.at(role_handle);
+      const auto recovered_anchor = recovered_role.slots[0].edit_reuse;
+      Check(recovered_role.adaptive_cache == nullptr && recovered_anchor != nullptr && recovered_anchor->valid,
+          "fixed admission after Adaptive and missing tokens creates a fresh anchor");
+      const auto recovered_reuse = record({.token = ++token});
+      Check(recovered_reuse.replaced && recovered_reuse.evaluates == 0 && recovered_reuse.reuses == 1
+              && native::features.at(role_handle).slots[0].edit_reuse == recovered_anchor,
+          "the next fixed token reuses the recovered anchor");
+      const auto recovered_mfg = record({.token = token, .index = 2, .update_source = false});
+      Check(recovered_mfg.replaced && recovered_mfg.evaluates == 0 && recovered_mfg.reuses == 0,
+          "the recovered fixed producer retains its exact pruned receipt for repeated MFG");
+    }
 
     native::direct_api.evaluate = nr_edit_reuse_xefg_cases::EditedModel;
     nr_edit_reuse_xefg_cases::model_pixels.resize(width * height * 4);
@@ -625,7 +709,7 @@ int Run() {
     native::direct_api.evaluate = nr_edit_reuse_gpu_cases::NeutralModel;
     recover();
     const auto no_scope = record({.token = ++token, .source_scope = false});
-    Check(no_scope.reuses == 0 && !native::fg_service::streams.at({true, context}).native_edit_reuse,
+    Check(no_scope.reuses == 0 && !native::fg_service::streams.at({true, context}).native_edit_source,
         "missing native SDK scope returns to the existing full-rate path and cannot consume a previous edit anchor");
     recover();
     native::OnNativeFgOptions(false);
@@ -928,6 +1012,8 @@ int Run() {
                  " direct_unclaimed_recorded_overwrite=invalidated_and_retained"
                  " direct_owner_unavailable=claimed_and_tracked_without_NR"
                  " refresh_reuse_refresh=1/0/1 repeated_MFG=stable current_color_alpha=checked"
+                 " adaptive_unacquired=0_evaluate/1_reuse adaptive_preparation_and_switch=no_x2"
+                 " adaptive_tokenless_after_prune=two_delivered fixed_recovery=refresh/reuse/MFG"
                  " motion_rejection/reset/gap/off/missing_scope/FG_failure/retirement=checked"
                  " production_Execute_and_Fence=real NR=MOCK FG_consumer=readback no_game_or_visual_acceptance\n";
     return 0;
