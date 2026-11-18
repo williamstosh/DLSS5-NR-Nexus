@@ -46,6 +46,11 @@ struct Inputs {
   float raster_offset_y = 0.f;
   float previous_motion_offset_x = 0.f;
   float previous_motion_offset_y = 0.f;
+  // Pre-SR color shares the guides' jittered raster. In that case the
+  // anchor lookup also needs the displacement between the two color grids.
+  bool color_uses_guide_raster = false;
+  float anchor_raster_delta_x = 0.f;
+  float anchor_raster_delta_y = 0.f;
   ID3D12Resource* proxy = nullptr;
   ID3D12Resource* neural = nullptr;
   ID3D12Resource* motion = nullptr;
@@ -83,6 +88,8 @@ struct State {
   uint64_t allocated_bytes = 0;
   float motion_offset_x = 0.f;
   float motion_offset_y = 0.f;
+  float anchor_raster_offset_x = 0.f;
+  float anchor_raster_offset_y = 0.f;
   bool valid = false;
   bool reused = false;
 };
@@ -249,10 +256,11 @@ inline bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list,
   list->SetComputeRootUnorderedAccessView(5, state->validity->GetGPUVirtualAddress());
   const std::array<uint32_t, 16> constants{inputs.width, inputs.height, inputs.motion_width, inputs.motion_height,
       std::bit_cast<uint32_t>(inputs.motion_scale_x), std::bit_cast<uint32_t>(inputs.motion_scale_y),
-      static_cast<uint32_t>(phase), 0,
+      static_cast<uint32_t>(phase), inputs.color_uses_guide_raster ? 1u : 0u,
       std::bit_cast<uint32_t>(inputs.raster_offset_x), std::bit_cast<uint32_t>(inputs.raster_offset_y),
       std::bit_cast<uint32_t>(inputs.previous_motion_offset_x), std::bit_cast<uint32_t>(inputs.previous_motion_offset_y),
-      output_width, output_height, 0, 0};
+      output_width, output_height,
+      std::bit_cast<uint32_t>(inputs.anchor_raster_delta_x), std::bit_cast<uint32_t>(inputs.anchor_raster_delta_y)};
   list->SetComputeRoot32BitConstants(6, 16, constants.data(), 0);
   const bool motion_phase = phase == Phase::MOTION || phase == Phase::SNAPSHOT_MOTION;
   const uint32_t dispatch_width = (motion_phase ? inputs.motion_width

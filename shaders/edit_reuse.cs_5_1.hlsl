@@ -20,11 +20,11 @@ cbuffer ReuseConstants : register(b0) {
   uint2 MotionSize;
   float2 MotionScale;
   uint Phase;
-  uint Padding;
+  uint ColorUsesGuideRaster;
   float2 RasterOffset;
   float2 PreviousMotionOffset;
   uint2 OutputSize;
-  uint2 OutputPadding;
+  float2 AnchorRasterDelta;
 };
 
 static const float kEditFloor = 1.0 / 1024.0;
@@ -83,7 +83,8 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   }
   if (any(pixel >= Size)) return;
   const uint index = pixel.y * Size.x + pixel.x;
-  const float2 guide_position = (float2(pixel) + 0.5) * float2(MotionSize) / float2(Size) + RasterOffset;
+  const float2 guide_offset = (ColorUsesGuideRaster != 0u ? 0.0 : RasterOffset);
+  const float2 guide_position = (float2(pixel) + 0.5) * float2(MotionSize) / float2(Size) + guide_offset;
   const bool guide_valid = all(guide_position >= 0.0) && all(guide_position < float2(MotionSize));
   const uint2 guide = uint2(clamp(floor(guide_position), 0.0, float2(MotionSize - 1u)));
   const float depth = Depth.Load(int3(guide, 0));
@@ -96,7 +97,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     Anchor.Store4(index * 32u + 16u, asuint(float4(reference, depth)));
     return;
   }
-  const float2 d = Motion.Load(int3(guide, 0)) * MotionScale * float2(Size) / float2(MotionSize);
+  const float2 d = (Motion.Load(int3(guide, 0)) * MotionScale + AnchorRasterDelta) * float2(Size) / float2(MotionSize);
   const float2 previous = float2(pixel) + d;
   bool valid = guide_valid && all(isfinite(previous)) && all(previous >= 0.0) && all(previous <= float2(Size - 1u))
       && isfinite(depth) && all(isfinite(reference)) && all(reference >= kEditFloor);

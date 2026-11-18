@@ -14,7 +14,7 @@ namespace renodx::addons::dlss5::ui::lang {
 inline constexpr Translation kZhHans[] = {
     {"x2 edit reuse (experimental)", "隔帧编辑复用 x2（实验）"},
     {"Refresh NR once per two base frames and reproject its edit onto the next frame to reduce GPU work. Upscaling still runs every frame; x2 is separate from the FG multiplier. Turn off if motion, lighting or frame pacing looks worse.", "每两个基础帧刷新一次 NR，并将编辑重投影到下一帧，以降低 GPU 工作量。超分辨率仍逐帧运行；x2 与 FG 倍率分开。若运动、光照或帧节奏变差，请关闭。"},
-    {"D3D12: Upscaled with FG off, or Present with XeFG single Backbuffer and UI Composition off. Native DLSS FG edit reuse is still in development.", "D3D12：支持 FG 关闭时的 Upscaled，或 XeFG 单 Backbuffer 且关闭 UI Composition 的 Present。原生 DLSS FG 隔帧编辑复用仍在开发中。"},
+    {"D3D12 supports Render before DLSS SR, Upscaled with FG off, and Present with XeFG single Backbuffer and UI Composition off.", "D3D12 支持 DLSS SR 前的 Render、关闭 FG 的 Upscaled，以及使用 XeFG 单 Backbuffer 且关闭 UI Composition 的 Present。"},
     {"Requires NR 310.9.16.0, model B, one Pass, fixed 100%, HDR FP16 (XeFG also supports HDR10/PQ), and compatible depth and motion. Turn off Adjust NR's look, Detail stability, Region mask and Adaptive resolution.", "需要 NR 310.9.16.0、模型 B、单 Pass、固定 100%、HDR FP16（XeFG 另支持 HDR10/PQ），以及兼容的深度和运动输入。请关闭调整 NR 的外观、细节稳定、区域遮罩和自适应分辨率。"},
     {"When reuse conditions are unmet, NR keeps its per-frame path. Invalid reprojected pixels keep the current picture.", "不满足复用条件时，NR 沿用逐帧路径。重投影无效的像素保留当前画面原色。"},
     {"Motion attenuation", "运动衰减"},

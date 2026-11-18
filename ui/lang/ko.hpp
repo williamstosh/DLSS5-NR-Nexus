@@ -14,7 +14,7 @@ namespace renodx::addons::dlss5::ui::lang {
 inline constexpr Translation kKo[] = {
     {"x2 edit reuse (experimental)", "x2 편집 재사용(실험적)"},
     {"Refresh NR once per two base frames and reproject its edit onto the next frame to reduce GPU work. Upscaling still runs every frame; x2 is separate from the FG multiplier. Turn off if motion, lighting or frame pacing looks worse.", "기본 프레임 두 개마다 NR을 한 번 갱신하고 편집 결과를 다음 프레임에 재투영하여 GPU 작업을 줄입니다. 업스케일링은 매 프레임 실행되며 x2는 FG 배율과 별개입니다. 움직임, 조명 또는 프레임 간격이 나빠지면 끄세요."},
-    {"D3D12: Upscaled with FG off, or Present with XeFG single Backbuffer and UI Composition off. Native DLSS FG edit reuse is still in development.", "D3D12: FG를 끈 Upscaled 또는 단일 XeFG Backbuffer를 사용하고 UI Composition을 끈 Present에서 사용할 수 있습니다. 네이티브 DLSS FG의 편집 재사용은 개발 중입니다."},
+    {"D3D12 supports Render before DLSS SR, Upscaled with FG off, and Present with XeFG single Backbuffer and UI Composition off.", "D3D12에서는 DLSS SR 전의 Render, FG를 끈 Upscaled, 단일 XeFG Backbuffer를 사용하고 UI Composition을 끈 Present를 지원합니다."},
     {"Requires NR 310.9.16.0, model B, one Pass, fixed 100%, HDR FP16 (XeFG also supports HDR10/PQ), and compatible depth and motion. Turn off Adjust NR's look, Detail stability, Region mask and Adaptive resolution.", "NR 310.9.16.0, 모델 B, 1패스, 고정 100%, HDR FP16(XeFG는 HDR10/PQ도 지원) 및 호환되는 깊이와 모션이 필요합니다. NR 모양 조정, 디테일 안정화, 영역 마스크 및 적응형 해상도를 끄세요."},
     {"When reuse conditions are unmet, NR keeps its per-frame path. Invalid reprojected pixels keep the current picture.", "재사용 조건이 충족되지 않으면 NR은 프레임별 처리를 유지합니다. 재투영이 유효하지 않은 픽셀은 현재 화면을 유지합니다."},
     {"Motion attenuation", "움직임 감쇠"},

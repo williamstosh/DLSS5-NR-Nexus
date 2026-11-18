@@ -356,6 +356,11 @@ Resolve、Commit 和最终回填；测试平面读回与查询结果拷贝在计
 不由调用减半推导 FPS。质量差异保留为测量，动态画质仍需人工验收。
 Standard 收尾与上一实验相同；分析器定向测试为 `test_nr_edit_cache_analysis.py`。
 
+Render 的 `-NativeCase nr-edit-reuse-render-contracts -SoftwareOnly` 经生产 NGX 包装入口核对 SR 收到的像素、
+Color 恢复、抖动重投影，以及只交给 NR 的组合 MV。真实 SR／NR 检查沿用上面的 `nr-edit-reuse-cache` 命令及四项 NGX 输入，
+设置 `$env:NR_NEXUS_TEST_NR_CACHE_ROUTE = 'render'`，运行结束后恢复该环境变量。
+`nr-edit-reuse-render.json` 记录 SR 前 Color 与 SR 输出的校验值，以及调用、Reset 和完成 Fence。
+
 XeFG 的 SDK hooks、Service 准入与生命周期通过 `-NativeCase nr-edit-reuse-xefg-contracts`
 单独验证（WARP＋MOCK；SR、NR、XeFG 均为替身，不执行插帧）。它覆盖重复 present ID、
 刷新／复用／刷新、当前 RGBA、Reset、缺 guides、忙碌跳帧、模型失败恢复和缓存退休，

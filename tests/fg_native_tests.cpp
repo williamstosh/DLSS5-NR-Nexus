@@ -742,6 +742,7 @@ int RunNativeRequiredMenuTest() {
 #include "gpu_timer_cases.hpp"
 #include "control_mask_gpu_cases.hpp"
 #include "nr_edit_reuse_gpu_cases.hpp"
+#include "nr_edit_reuse_render_cases.hpp"
 #if defined(NR_NEXUS_DEV_CONTROL)
 #include "nr_fg_output_marker_gpu_cases.hpp"
 #include "fg_consumer_capture_cases.hpp"
@@ -773,6 +774,7 @@ int main(int argc, char** argv) {
   if (argc == 2 && std::strcmp(argv[1], "--inline-restore-roi") == 0) return inline_restore_roi_cases::Run();
 #endif
   if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-xefg-contracts") == 0) return nr_edit_reuse_xefg_cases::Run();
+  if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-render-contracts") == 0) return nr_edit_reuse_render_cases::Run();
   if (argc == 2 && (std::strcmp(argv[1], "--nr-edit-reuse-contracts") == 0
                    || std::strcmp(argv[1], "--nr-edit-reuse-contracts-public") == 0)) {
     return nr_edit_reuse_gpu_cases::Run();

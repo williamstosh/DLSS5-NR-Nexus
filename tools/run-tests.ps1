@@ -12,7 +12,7 @@ param(
     [string]$DetoursLibrary,
     [string]$PythonExecutable,
     [ValidateSet('Auto','Quick','Full','None')][string]$UiPreview = 'Auto',
-    [ValidateSet('inline-restore-roi','control-mask','control-mask-safety','control-mask-safety-hardware','control-mask-capture','control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','control-mask-native-ngx-fg','gpu-pass-diagnostics','native-required-menu','native-owner-idle','native-options-resume','native-options-delayed','native-guide-contract','present-guide-models','adaptive-fg-service','adaptive-inline','vulkan-recorded-use-contract','native-present-decision','trace-metadata','stage-chain','stage-resolution','stage-resolution-hardware','same-stage-resolution','same-stage-resolution-hardware','render-stage-resolution','render-stage-resolution-hardware','present-stage-resolution','present-stage-resolution-hardware','native-prefg-resolution','native-prefg-resolution-hardware','native-frame-identity','same-stage-model-pair','same-stage-mixed-pair','source-lifecycle','feature-switch','feature-switch-hardware','f5-mixed','present-chain','present-chain-hardware','present-chain-scrgb','present-chain-hdr10','native-full','native-full-hardware','nr-edit-reuse-contracts','nr-edit-reuse-contracts-public','nr-edit-reuse-xefg-contracts','nr-edit-reuse-native-contracts','native-frame-source','nr-fg-output-marker','fg-consumer-capture','xefg-present-probe')]
+    [ValidateSet('inline-restore-roi','control-mask','control-mask-safety','control-mask-safety-hardware','control-mask-capture','control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','control-mask-native-ngx-fg','gpu-pass-diagnostics','native-required-menu','native-owner-idle','native-options-resume','native-options-delayed','native-guide-contract','present-guide-models','adaptive-fg-service','adaptive-inline','vulkan-recorded-use-contract','native-present-decision','trace-metadata','stage-chain','stage-resolution','stage-resolution-hardware','same-stage-resolution','same-stage-resolution-hardware','render-stage-resolution','render-stage-resolution-hardware','present-stage-resolution','present-stage-resolution-hardware','native-prefg-resolution','native-prefg-resolution-hardware','native-frame-identity','same-stage-model-pair','same-stage-mixed-pair','source-lifecycle','feature-switch','feature-switch-hardware','f5-mixed','present-chain','present-chain-hardware','present-chain-scrgb','present-chain-hdr10','native-full','native-full-hardware','nr-edit-reuse-contracts','nr-edit-reuse-contracts-public','nr-edit-reuse-render-contracts','nr-edit-reuse-xefg-contracts','nr-edit-reuse-native-contracts','native-frame-source','nr-fg-output-marker','fg-consumer-capture','xefg-present-probe')]
     [string[]]$NativeCase = @(),
     [switch]$VulkanNativeNgx,
     [string]$NativeNgxProjectIdPath,
@@ -63,7 +63,10 @@ if ($BuildOnly -and @($Suite | Where-Object { $_ -in @('config','constants','lif
     throw '-BuildOnly requires explicitly selecting native/policy/scope/fg-xefg/fg-native/bridge-motion suites.'
 }
 if ($NativeCase.Count -and $Suite -notcontains 'fg-native') { throw '-NativeCase requires -Suite fg-native (or all).' }
-if (@($NativeCase | Where-Object { $_ -in @('nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-jitter') }).Count -and -not $BuildOnly -and -not $PythonExecutable) {
+$renderEditCache = $env:NR_NEXUS_TEST_NR_CACHE_ROUTE -ceq 'render' -and $NativeCase -contains 'nr-edit-reuse-cache'
+if (@($NativeCase | Where-Object {
+            $_ -in @('nr-edit-reuse-history','nr-edit-reuse-jitter') -or ($_ -eq 'nr-edit-reuse-cache' -and -not $renderEditCache)
+        }).Count -and -not $BuildOnly -and -not $PythonExecutable) {
     throw 'NR edit experiments require -PythonExecutable with NumPy and Pillow for paired analysis before raw cleanup.'
 }
 if ($VulkanNativeNgx -and $Suite -notcontains 'vulkan-control-mask') { throw '-VulkanNativeNgx requires -Suite vulkan-control-mask (or all).' }
@@ -94,6 +97,9 @@ if ($usesNativeNgx) {
     }
     if ($bridgeNativeNgx -and (-not $NativeNgxSrRuntimePath -or -not (Test-Path -LiteralPath $NativeNgxSrRuntimePath -PathType Leaf))) {
         throw 'Bridge native NGX requires the existing SR Runtime via -NativeNgxSrRuntimePath.'
+    }
+    if ($renderEditCache -and (-not $NativeNgxSrRuntimePath -or -not (Test-Path -LiteralPath $NativeNgxSrRuntimePath -PathType Leaf))) {
+        throw 'Native NGX Render x2 requires the existing SR Runtime via -NativeNgxSrRuntimePath.'
     }
 }
 if ($BridgeCase -and $Suite -notcontains 'bridge-motion') { throw '-BridgeCase requires -Suite bridge-motion (or all).' }
@@ -271,7 +277,8 @@ foreach ($item in $Suite) {
                             }
                             & $PythonExecutable (Join-Path $PSScriptRoot 'offline/sr_jitter.py') --input $directory
                             if ($LASTEXITCODE -ne 0) { throw 'SR jitter calibration failed or is inconclusive; see sr-jitter-analysis.json.' }
-                        } elseif ($case -in @('nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost')) {
+                        } elseif ($case -in @('nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost') -and
+                                  -not ($renderEditCache -and $case -eq 'nr-edit-reuse-cache')) {
                             $cacheCostExperiment = $case -eq 'nr-edit-reuse-cost'
                             $cacheExperiment = $case -in @('nr-edit-reuse-cache','nr-edit-reuse-cost')
                             $conditionVariable = if ($cacheExperiment) { 'NR_NEXUS_TEST_NR_CACHE_CONDITION' } else { 'NR_NEXUS_TEST_NR_HISTORY_CONDITION' }
