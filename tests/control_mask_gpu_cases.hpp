@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <set>
 #include <shared_mutex>
 #include <span>
@@ -2755,6 +2756,12 @@ inline const d3d12_test::TextureTransfer* native_motion_sr_readback = nullptr;
 inline const d3d12_test::TextureTransfer* native_motion_proxy_readback = nullptr;
 inline const d3d12_test::TextureTransfer* native_motion_neural_readback = nullptr;
 inline uint32_t native_motion_sr_calls = 0;
+struct NativeRenderSrInput {
+  ID3D12Resource* original = nullptr;
+  const d3d12_test::TextureTransfer* readback = nullptr;
+  bool bound_stand_in = false;
+};
+inline NativeRenderSrInput* native_render_sr_input = nullptr;
 // Only the history experiment overrides NR guides; SR always consumes its
 // original per-frame parameters and owns a separate SDK history.
 inline ID3D12Resource* native_history_motion = nullptr;
@@ -3072,6 +3079,19 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeHostEvaluate(
     }
   }
   ++native_motion_sr_calls;
+  if (native_render_sr_input != nullptr) {
+    auto& input = *native_render_sr_input;
+    auto* color = addon::GetD3D12Resource(parameters, NVSDK_NGX_Parameter_Color);
+    const auto workset = addon::worksets.find({handle, input.original, true});
+    if (color != nullptr && color != input.original && workset != addon::worksets.end()
+        && color == workset->second.pre_sr_color) {
+      input.bound_stand_in = true;
+      native_motion_gpu->Retain(color);
+      native_motion_gpu->Transition(color, addon::kPreSrReadable, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      native_motion_gpu->RecordTextureReadback(color, *input.readback);
+      native_motion_gpu->Transition(color, D3D12_RESOURCE_STATE_COPY_SOURCE, addon::kPreSrReadable);
+    }
+  }
 #if defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
   addon::ColdCpuTraceScope sdk_trace("SDK.SREvaluateFeature");
 #endif
@@ -3536,7 +3556,9 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     const char* cache_route_environment = (cache_test ? std::getenv("NR_NEXUS_TEST_NR_CACHE_ROUTE") : nullptr);
     const std::string cache_route = (cache_cost ? (cache_two_tiers ? "inline" : "xefg-record")
         : (cache_route_environment != nullptr ? cache_route_environment : "inline"));
-    Check(cache_route == "inline" || cache_route == "xefg-record", "known NR cache recording route");
+    Check(cache_route == "inline" || cache_route == "xefg-record" || cache_route == "render",
+          "known NR cache recording route");
+    const bool render_cache_test = cache_route == "render";
     const bool xefg_cache_test = cache_test && cache_route == "xefg-record";
     const char* cache_format_environment = (cache_test ? std::getenv("NR_NEXUS_TEST_NR_CACHE_FORMAT") : nullptr);
     const std::string cache_format = (cache_cost ? "scrgb"
@@ -3722,13 +3744,14 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     }
     addon::enabled = !jitter_test;
     addon::hooks_enabled = true;
-    addon::hook_point = (xefg_cache_test ? addon::kHookPresent : (single_stage ? addon::kHookUpscaled : addon::kHookRender));
+    addon::hook_point = (xefg_cache_test ? addon::kHookPresent
+        : (single_stage && !render_cache_test ? addon::kHookUpscaled : addon::kHookRender));
     addon::stack_passes = (single_stage ? 1 : 2);
     addon::pass_stage[0] = (xefg_cache_test ? 0u : 2u);
     addon::configuration_generation.fetch_add(1);
     addon::nr_follow_input_res = false;
     addon::nr_resolution_scale = 1.f;
-    if (cache_cost && !cache_two_tiers) {
+    if (render_cache_test || (cache_cost && !cache_two_tiers)) {
       addon::nr_adaptive_enabled = false;
     }
     addon::look_mode = false;
@@ -3864,7 +3887,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     }
     const auto* nr_owner = (xefg_cache_test ? cache_stream.roles[0].Handle() : owner);
     const auto* nr_workset_key = (xefg_cache_test
-        ? reinterpret_cast<const ID3D12Resource*>(&cache_stream.roles[0]) : output.Get());
+        ? reinterpret_cast<const ID3D12Resource*>(&cache_stream.roles[0]) : (render_cache_test ? color.Get() : output.Get()));
     const auto record_xefg = [&] {
       // Exercise production Record and private-color writeback. SDK/Service
       // admission is covered by WARP+MOCK. PQ input construction submits the
@@ -4346,10 +4369,10 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         Check(feature.slots[0].via_core && addon::direct_api.borrowed_core_context == !motion_test,
               "motion uses the production owned backend; legacy toggle/cost use borrowed Core");
         Check(native_runtime_results[0] == NVSDK_NGX_Result_Success
-                  && native_runtime_masks[0] == addon::worksets.at({nr_owner, nr_workset_key, false}).control_mask,
+                  && native_runtime_masks[0] == addon::worksets.at({nr_owner, nr_workset_key, render_cache_test}).control_mask,
               "initial native frame binds and evaluates its production mask");
         production_chain_completed = true;
-        if (cost || sequence_test) continue;
+        if (cost || (sequence_test && !render_cache_test)) continue;
         break;
       }
       Check(feature.render_session != nullptr
@@ -4472,6 +4495,80 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     nlohmann::json motion_report;
     nlohmann::json history_report;
     nlohmann::json jitter_report;
+    nlohmann::json render_report;
+    std::vector<uint8_t> render_reset_output;
+    if (render_cache_test) {
+      const auto* source_bytes = reinterpret_cast<const uint8_t*>(color_data.data());
+      const auto source_size = color_data.size() * sizeof(uint16_t);
+      const auto source_crc = renodx::utils::hash::ComputeCRC32(source_bytes, source_size);
+      auto stand_in_readback = gpu.CreateTextureTransfer(color.Get());
+      auto sr_readback = gpu.CreateTextureTransfer(output.Get());
+      render_report = runtime_identity();
+      render_report.update({{"evidence", "NATIVE_GPU+NATIVE_NGX"}, {"stage", "Render"},
+          {"requested_model", "B"}, {"internal_model", "unknown"}, {"format", "RGBA16F scRGB"},
+          {"render_size", {render_width, render_height}}, {"output_size", {width, height}},
+          {"jitter", {0.f, 0.f}}, {"motion", "zero non-jittered MVLowRes; scale 1,1"},
+          {"source_crc32", source_crc}, {"prefix_frames", cost_prefix}, {"frames", nlohmann::json::array()}});
+
+      // Frame 3 resets a fresh anchor that would otherwise be eligible for reuse.
+      constexpr std::array resets{1, 0, 0, 1, 0};
+      constexpr std::array expected_refresh{true, false, true, true, false};
+      for (size_t frame = 0; frame < resets.size(); ++frame) {
+        parameters.Set(NVSDK_NGX_Parameter_Reset, resets[frame]);
+        const auto refreshes = addon::edit_reuse_refreshes.load();
+        const auto reuses = addon::edit_reuse_reuses.load();
+        native_motion_sr_calls = 0;
+        native_runtime_masks.clear();
+        native_runtime_results.clear();
+        native_runtime_resets.clear();
+        NativeRenderSrInput input{.original = color.Get(), .readback = &stand_in_readback};
+        native_render_sr_input = &input;
+        native_motion_sr_readback = &sr_readback;
+        addon::ngx_slot_real[0].evaluate = reinterpret_cast<void*>(ObserveNativeHostEvaluate);
+        const auto sr_result = addon::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), owner, &parameters, nullptr);
+        addon::ngx_slot_real[0].evaluate = nullptr;
+        native_motion_sr_readback = nullptr;
+        native_render_sr_input = nullptr;
+        const bool color_restored = addon::GetD3D12Resource(&parameters, NVSDK_NGX_Parameter_Color) == color.Get();
+        gpu.Transition(color.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        gpu.RecordTextureReadback(color.Get(), color_transfer);
+        gpu.Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        gpu.Submit();
+        addon::DrainRetiredResources(true);
+
+        const auto completed = gpu.fence->GetCompletedValue();
+        const auto device_status = gpu.device->GetDeviceRemovedReason();
+        nlohmann::json sample{{"frame", frame}, {"source_reset", resets[frame]}, {"sr_calls", native_motion_sr_calls},
+            {"sr_result", static_cast<uint32_t>(sr_result)}, {"sr_bound_stand_in", input.bound_stand_in},
+            {"color_restored", color_restored}, {"nr_results", native_runtime_results}, {"nr_resets", native_runtime_resets},
+            {"refreshes", addon::edit_reuse_refreshes.load() - refreshes}, {"reuses", addon::edit_reuse_reuses.load() - reuses},
+            {"fence", gpu.serial}, {"completed_fence", completed}, {"device_status", device_status}};
+        std::cout << "Render x2 " << sample.dump() << std::endl;
+        Check(completed >= gpu.serial && completed != UINT64_MAX && SUCCEEDED(device_status),
+              "Render x2 SR/NR recording completes on a healthy GPU");
+        Check(NVSDK_NGX_SUCCEED(sr_result) && native_motion_sr_calls == 1 && input.bound_stand_in && color_restored,
+              "Render x2 calls real SR once with this workset's stand-in and restores the original Color");
+        const auto original = gpu.ReadTexture(color_transfer);
+        Check(original.size() == source_size && std::memcmp(original.data(), source_bytes, source_size) == 0,
+              "Render x2 preserves the original Color bytes");
+        const auto stand_in = gpu.ReadTexture(stand_in_readback);
+        const auto sr_output = gpu.ReadTexture(sr_readback);
+        sample["stand_in_crc32"] = renodx::utils::hash::ComputeCRC32(stand_in.data(), stand_in.size());
+        sample["sr_output_crc32"] = renodx::utils::hash::ComputeCRC32(sr_output.data(), sr_output.size());
+        Check(expected_refresh[frame]
+                  ? (native_runtime_results.size() == 1 && NVSDK_NGX_SUCCEED(native_runtime_results.front())
+                     && sample["refreshes"] == 1 && sample["reuses"] == 0)
+                  : (native_runtime_results.empty() && sample["refreshes"] == 0 && sample["reuses"] == 1),
+              "Render x2 alternates real NR and reuse, with a fresh NR Evaluate on Reset");
+        if (resets[frame] != 0) {
+          Check(native_runtime_resets.size() == 1 && native_runtime_resets.front() == 1,
+                "Render x2 forwards source Reset to the real NR Evaluate");
+          render_reset_output = sr_output;
+          render_report["reset_stand_in_differs_from_original"] = stand_in != original;
+        }
+        render_report["frames"].push_back(std::move(sample));
+      }
+    }
     constexpr uint32_t cache_cost_warmup_frames = 32;
     constexpr uint32_t cache_cost_sample_frames = 128;
     if (jitter_test) {
@@ -4558,7 +4655,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       jitter_report["sequence_host_sr_evaluates"] = 9;
       jitter_report["sequence_nr_evaluates"] = 0;
     }
-    if (sequence_test && !cache_cost) {
+    if (sequence_test && !cache_cost && !render_cache_test) {
       const auto history_look = addon::LookSettingsSnapshot(true);
       Check(addon::detail_stability.load() == 1u && history_look.stabilize == 0u
                 && !history_look.stabilize_detail && history_look.stabilize_alpha == 0.f,
@@ -8600,7 +8697,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     std::vector<uint8_t> output_bytes;
     ComPtr<ID3D12Resource> output_readback;
     bool keep_raw_output = false;
-    if (!cold_components && !pipeline_steps && !cache_two_tiers) {
+    if (!cold_components && !pipeline_steps && !cache_two_tiers && !render_cache_test) {
       const D3D12_RESOURCE_DESC final_output_desc = output->GetDesc();
       D3D12_PLACED_SUBRESOURCE_FOOTPRINT output_footprint{};
       UINT64 output_readback_size = 0;
@@ -8725,9 +8822,17 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       native_runtime_results.clear();
       native_motion_sr_calls = 0;
       if (!jitter_test) {
+        std::optional<d3d12_test::TextureTransfer> render_control_readback;
+        if (render_cache_test) {
+          // Match the measured Reset frame with the original Color bound to real SR.
+          parameters.Set(NVSDK_NGX_Parameter_Reset, 1);
+          render_control_readback.emplace(gpu.CreateTextureTransfer(output.Get()));
+          native_motion_sr_readback = &*render_control_readback;
+        }
         addon::ngx_slot_real[0].evaluate = reinterpret_cast<void*>(ObserveNativeHostEvaluate);
         const auto resumed = addon::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), owner, &parameters, nullptr);
         addon::ngx_slot_real[0].evaluate = nullptr;
+        native_motion_sr_readback = nullptr;
         gpu.Submit();
         if (diagnostic_probe || demand_prepare || selected_sequence) {
           resize_report["teardown_apis"]["disabled_host_result"] = static_cast<uint32_t>(resumed);
@@ -8736,6 +8841,20 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         }
         Check(NVSDK_NGX_SUCCEED(resumed) && native_motion_sr_calls == 1 && native_runtime_results.empty(),
               "real SR continues once with no NR Evaluate after the add-on is disabled");
+        if (render_control_readback) {
+          const auto completed = gpu.fence->GetCompletedValue();
+          const auto device_status = gpu.device->GetDeviceRemovedReason();
+          Check(completed >= gpu.serial && completed != UINT64_MAX && SUCCEEDED(device_status),
+                "Render x2 original-Color control completes on a healthy GPU");
+          const auto original_sr_output = gpu.ReadTexture(*render_control_readback);
+          const bool changed = original_sr_output != render_reset_output;
+          render_report["original_color_sr_control"] = {{"reset", 1}, {"sr_calls", native_motion_sr_calls},
+              {"sr_result", static_cast<uint32_t>(resumed)}, {"fence", gpu.serial}, {"completed_fence", completed},
+              {"device_status", device_status}, {"output_differs_from_render_reset", changed},
+              {"sr_output_crc32", renodx::utils::hash::ComputeCRC32(original_sr_output.data(), original_sr_output.size())}};
+          Check(render_report["reset_stand_in_differs_from_original"] == true && changed,
+                "real SR produces different Reset output with the edited stand-in than with the original Color");
+        }
       }
       addon::ngx_slot_real[0].release = reinterpret_cast<void*>(NVSDK_NGX_D3D12_ReleaseFeature);
       const auto released = addon::HookedReleaseFeatureSlot<0>(sr_handle);
@@ -8805,6 +8924,14 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
             + cache_cost_report.at("sequence_nr_evaluates").get<uint32_t>();
         cache_cost_report["status"] = "passed";
         save_cache_cost_report();
+      } else if (render_cache_test) {
+        render_report["status"] = "passed";
+        render_report["teardown"] = {{"sr_release", true}, {"sdk_shutdown", true}, {"identity_bridge_installed", false}};
+        std::ofstream file("nr-edit-reuse-render.json", std::ios::binary | std::ios::trunc);
+        file << render_report.dump(2) << '\n';
+        file.close();
+        Check(!file.fail(), "completed Render x2 evidence saved");
+        std::cout << "PASS Render x2 NATIVE_GPU+NATIVE_NGX: 5 SR frames, 3 NR refreshes, 2 reuses, 1 original-Color SR control\n";
       } else if (sequence_test) {
         history_report["teardown"] = {{"sr_continues_without_nr", true}, {"sr_release", true},
             {"sdk_shutdown", true}, {"identity_bridge_installed", false},

@@ -12,7 +12,7 @@ inline Json last_receipt;
 
 inline bool Allowed(std::string_view key) {
   constexpr std::string_view base[] = {
-      "NeuralUplift", "NRDisableRelease", "NRHookPoint", "NRPasses", "NRFollowInputRes", "NRResolutionScale",
+      "NeuralUplift", "NRDisableRelease", "NRHookPoint", "NRPasses", "NRFollowInputRes", "NRResolutionScale", "NREditReuse",
       "NRAdaptiveEnabled", "NRAdaptiveTargetFPS", "NRAdaptiveMinScale", "NRAdaptiveLevelCount", "NRAdaptiveLimitedResidency",
       "NRControlMaskEnabled",
       "NRControlMaskMode", "NRControlMaskBlendMode", "NRControlMaskRed", "NRControlMaskGreen",
@@ -41,12 +41,16 @@ inline Json Identity() {
           {"edit_reuse_adaptive_evidence", "requested_enabled_not_activation"}}}};
 }
 
-inline Json Snapshot() {
+inline Json ProcessIdentityState() {
   FILETIME created{}, exited{}, kernel{}, user{};
   const bool process_known = GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user) != FALSE;
-  Json state{{"pid", GetCurrentProcessId()},
-      {"process_created", process_known ? Json(std::to_string((uint64_t{created.dwHighDateTime} << 32) | created.dwLowDateTime)) : Json(nullptr)},
-      {"version", kAddonVersion}, {"available", false}, {"reason", "runtime_busy"}};
+  return {{"pid", GetCurrentProcessId()},
+      {"process_created", process_known ? Json(std::to_string((uint64_t{created.dwHighDateTime} << 32) | created.dwLowDateTime)) : Json(nullptr)}};
+}
+
+inline Json Snapshot() {
+  auto state = ProcessIdentityState();
+  state.update({{"version", kAddonVersion}, {"available", false}, {"reason", "runtime_busy"}});
   const auto roi = screenshot::GetInlineRestoreStatus();
   state["inline_restore_roi"] = {{"capture_id", roi.capture_id}, {"status", roi.status},
       {"reason", roi.reason}, {"serial", roi.serial}};
@@ -119,6 +123,15 @@ inline Json Snapshot() {
   }
   const auto output = output_framerate::Read(now);
   const auto fg_environment = ReadEditReuseFgEnvironmentLocked();
+  Json native_evaluate = nullptr;
+  if (edit_reuse_enabled.load() && edit_reuse_fg_experiment.load()) {
+    const auto observed = fg::native_options::frame_source::Snapshot().evaluations;
+    native_evaluate = {{"feature_order", {sl::kFeatureDLSS, sl::kFeatureDLSS_RR, sl::kFeatureDLSS_G, "other"}},
+        {"feature_calls", {observed.features[0].enters, observed.features[1].enters,
+            observed.features[2].enters, observed.features[3].enters}},
+        {"ngx_fg_calls", observed.ngx_fg_calls}, {"ngx_fg_under_dlssg", observed.ngx_fg_under_dlssg},
+        {"evidence", "cpu_calls_only"}};
+  }
   edit_fg_observation::Snapshot fg_observed;
   edit_fg_observation::CopySnapshot(&fg_observed);
   const auto resource_identity = [](const edit_fg_observation::ResourceIdentity& resource) {
@@ -401,6 +414,9 @@ inline Json Snapshot() {
           {"preparation_cpu_ms", adaptive.preparation_cpu_ms},
           {"preparation_vram_delta_bytes", adaptive.preparation_vram_delta_bytes},
           {"peak_process_vram_bytes", adaptive.peak_process_vram_bytes}}}});
+  if (!native_evaluate.is_null()) {
+    state["edit_reuse"]["native_evaluate"] = std::move(native_evaluate);
+  }
 #if defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
   const auto probe = fg_output_probe::CopySnapshot();
   const auto& native_probe = probe.native;
@@ -448,7 +464,7 @@ inline Json Snapshot() {
           {"source_generation", marker.binding.source_generation}, {"provider", marker.binding.provider},
           {"context", marker.binding.context}, {"environment_generation", marker.binding.environment_generation},
           {"roi_position", "source_width/4,source_height/3"}, {"roi_size", {128, 64}},
-          {"encoding", "linear_FP16_after_resolve_alpha_preserved"}}}};
+          {"encoding", "scRGB_FP16_or_PQ_RGB10A2_after_commit_alpha_preserved"}}}};
 #endif
   return state;
 }
@@ -465,6 +481,186 @@ inline Json Execute(const Json& request) {
   if (operation == request.end() || !operation->is_string()) {
     return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "invalid_operation"}};
   }
+  if (*operation == "native_ui_alpha_preflight") {
+    const auto action = request.find("action");
+    if (action == request.end() || !action->is_string()
+        || (*action != "arm" && *action != "status" && *action != "stop")) {
+      return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "invalid_action"}};
+    }
+    const bool nr_disabled = !enabled.load() && !shutting_down.load();
+    if (*action == "arm" && !nr_disabled) {
+      return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "requires_nr_disabled"}};
+    }
+    auto result = native_ui_alpha_observation::Control(action->get_ref<const std::string&>(), nr_disabled);
+    result["id"] = *id;
+    result["ok"] = true;
+    result["status"] = "observed";
+    result["state"] = ProcessIdentityState();
+    return result;
+  }
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+  const bool xefg_operation = *operation == "xefg_present_probe";
+  const auto xefg_snapshot = [&]() {
+    const auto observed = xefg_present_probe::CopySnapshot();
+    Json bindings = Json::array(), events = Json::array();
+    for (const auto& binding : observed.bindings) {
+      if (binding.init_serial == 0) continue;
+      Json queues = Json::array();
+      for (uint32_t index = 0; index < std::min<uint32_t>(binding.buffer_count, xefg_present_probe::kMaxBuffers); ++index) {
+        queues.push_back(binding.queues[index]);
+      }
+      const auto& tag = binding.tag_control;
+      const bool tag_generation = binding.live && binding.bound && !binding.resizing
+          && tag.context_generation == binding.context_generation && tag.buffer_generation == binding.buffer_generation;
+      bindings.push_back({{"init_serial", binding.init_serial}, {"slot", binding.key.slot}, {"module", binding.key.module},
+          {"handle", binding.key.handle}, {"factory", binding.key.factory}, {"hwnd", binding.key.window},
+          {"module_path", binding.key.module_path}, {"module_path_available", !binding.key.module_path.empty()},
+          {"width", binding.created.width}, {"height", binding.created.height}, {"format_dxgi", binding.created.format},
+          {"application_swapchain", binding.key.application_swapchain}, {"context", binding.context},
+          {"context_epoch", binding.context_epoch}, {"context_generation", binding.context_generation},
+          {"native_swapchain", binding.created.swapchain}, {"create_queue", binding.created.queue},
+          {"device", binding.created.device}, {"native_method_module", binding.created.method_module},
+          {"hooks_ready", binding.created.hooks_ready}, {"buffer_count", binding.buffer_count},
+          {"buffer_generation", binding.buffer_generation}, {"present_queues", std::move(queues)},
+          {"tag_control", {{"same_generation", tag_generation}, {"entered", tag.entered}, {"returned", tag.returned},
+              {"external_calls", tag.external_calls}, {"external_false_calls", tag.external_false_calls},
+              {"conflicts", tag.conflicts}, {"own_true_call", tag.own_true_call}, {"own_window_conflicts", tag.own_window_conflicts},
+              {"last_entry", tag.last_entry}, {"last_return", tag.last_return}, {"tag_in_flight", tag.in_flight},
+              {"value_available", tag_generation && tag.value_available},
+              {"observed_value", tag_generation && tag.value_available ? Json(tag.enabled) : Json(nullptr)},
+              {"own_on_window_valid", tag_generation && tag.value_available && tag.enabled && tag.in_flight == 0
+                  && tag.own_true_call != 0 && tag.own_window_conflicts == 0}}},
+          {"live", binding.live}, {"bound", binding.bound}, {"resizing", binding.resizing}, {"reason", binding.reason},
+          {"present_api_calls", binding.present_calls}, {"successful_present_api_calls", binding.successful_present_calls},
+          {"test_api_calls", binding.test_calls}, {"last_present_serial", binding.last_present_serial},
+          {"last_present_index", binding.last_present_index}, {"last_present_result", binding.last_present_result}});
+    }
+    constexpr std::array<const char*, 8> names{"init_begin", "init_return", "create_return", "present_before", "present_return",
+        "resize_before", "resize_return", "invalidated"};
+    const auto count = std::min<uint64_t>(observed.sequence, observed.events.size());
+    for (uint64_t sequence = observed.sequence - count + 1; sequence <= observed.sequence && count != 0; ++sequence) {
+      const auto& event = observed.events[(sequence - 1) % observed.events.size()];
+      events.push_back({{"kind", names[static_cast<size_t>(event.kind)]}, {"sequence", event.sequence},
+          {"init_serial", event.init_serial}, {"buffer_generation", event.buffer_generation}, {"present_serial", event.present_serial},
+          {"swapchain", event.swapchain}, {"queue", event.queue}, {"thread_id", event.thread_id}, {"method", event.method},
+          {"buffer_index", event.index}, {"flags", event.flags}, {"result", event.result}, {"reason", event.reason}});
+    }
+    const auto& pending = observed.pending;
+    const auto& debug = observed.debug_calls;
+    Json debug_calls = Json::array();
+    const auto debug_count = std::min<uint64_t>(debug.entered, debug.calls.size());
+    for (uint64_t call_id = debug.entered - debug_count + 1; call_id <= debug.entered && debug_count != 0; ++call_id) {
+      const auto& call = debug.calls[(call_id - 1) % debug.calls.size()];
+      debug_calls.push_back({{"call_id", call.call_id}, {"enter_sequence", call.enter_sequence},
+          {"return_sequence", call.return_sequence}, {"feature", call.feature}, {"value", call.value}, {"argument", call.argument},
+          {"own_job_id", call.own_job_id}, {"source", call.own_job_id != 0 ? "nexus_apply_tag" : "external"},
+          {"caller_address", call.caller_address}, {"caller_module", call.caller_module},
+          {"caller_path", call.caller_path}, {"caller_path_available", !call.caller_path.empty()},
+          {"native_present_serial", call.native_present_serial},
+          {"entered_ms", call.entered_ms}, {"returned_ms", call.returned_ms},
+          {"entered_thread", call.entered_thread}, {"returned_thread", call.returned_thread},
+          {"returned", call.returned}, {"result", call.result},
+          {"target", {{"slot", call.target.slot}, {"module", call.target.module}, {"handle", call.target.handle},
+              {"init_serial", call.target.init_serial}, {"context", call.target.context},
+              {"context_generation", call.target.context_generation}, {"buffer_generation", call.target.buffer_generation}}}});
+    }
+    const auto calibration = xefg_present_probe::CopyCalibration();
+    const auto control = xefg_present_probe::CopyControl();
+    constexpr std::array<const char*, 4> control_actions{"baseline", "arm", "poll", "stop"};
+    constexpr std::array<const char*, 8> control_phases{"idle", "queued", "waiting_lifecycle", "sdk_entered",
+        "returned", "cancelled", "expired", "rejected"};
+    const auto capture = screenshot::CopyXefgCaptureStatus();
+    return Json{{"enabled", true}, {"stopped", observed.stopped}, {"evidence", xefg_present_probe::kEvidence},
+            {"present_serial_kind", "api_call_not_physical_frame_or_source_id"},
+            {"gpu_copy_enabled", calibration.active}, {"sdk_debug_called", calibration.api_sequence != 0},
+            {"pending", {{"active", pending.active}, {"init_serial", pending.serial}, {"slot", pending.key.slot},
+                {"module", pending.key.module}, {"handle", pending.key.handle}, {"factory", pending.key.factory}, {"hwnd", pending.key.window},
+                {"owner_thread", pending.owner_thread}, {"candidates", pending.candidates}, {"creates_inflight", pending.creates_inflight},
+                {"ambiguous", pending.ambiguous}, {"factory_hooks_ready", pending.factory_hooks_ready}}},
+            {"rejected_creates", observed.rejected_creates}, {"stale_returns", observed.stale_returns}, {"overflow", observed.overflow},
+            {"event_capacity", observed.events.size()}, {"event_sequence", observed.sequence}, {"bindings", std::move(bindings)},
+            {"events", std::move(events)},
+            {"debug_calls", {{"scope", "observed_export_calls_not_getter_or_pixels"},
+                {"capacity", debug.calls.size()}, {"sequence", debug.sequence}, {"entered", debug.entered},
+                {"returned", debug.returned}, {"in_flight", debug.in_flight}, {"overwritten", debug.overwritten},
+                {"overwritten_unreturned", debug.overwritten_unreturned}, {"stale_returns", debug.stale_returns},
+                {"calls", std::move(debug_calls)}}},
+            {"control", {{"job_id", control.job_id}, {"request_id", control.request_id},
+                {"action", control_actions[static_cast<size_t>(control.action)]},
+                {"phase", control_phases[static_cast<size_t>(control.phase)]}, {"finished", control.finished},
+                {"accepted", control.accepted}, {"cancel_requested", control.cancel_requested},
+                {"sdk_entered", control.sdk_entered}, {"sdk_returned", control.sdk_returned},
+                {"api_result_available", control.api_result_available}, {"result", control.result},
+                {"queued_thread", control.queued_thread}, {"worker_thread", control.worker_thread},
+                {"lifecycle_thread", control.lifecycle_thread}, {"sdk_entered_thread", control.sdk_entered_thread},
+                {"sdk_returned_thread", control.sdk_returned_thread}, {"queued_ms", control.queued_ms},
+                {"waiting_ms", control.waiting_ms}, {"lifecycle_ms", control.lifecycle_ms},
+                {"sdk_entered_ms", control.sdk_entered_ms}, {"sdk_returned_ms", control.sdk_returned_ms},
+                {"finished_ms", control.finished_ms}, {"reason", control.reason},
+                {"target", {{"slot", control.target.slot}, {"module", control.target.module}, {"handle", control.target.handle},
+                    {"init_serial", control.target.init_serial}, {"context", control.target.context},
+                    {"context_generation", control.target.context_generation}, {"buffer_generation", control.target.buffer_generation}}}}},
+            {"calibration", {{"init_serial", calibration.target.init_serial}, {"baseline_known", calibration.baseline_known},
+                {"baseline_value", false}, {"previous_state", "Unknown"}, {"original_restore", "NotClaimed"},
+                {"baseline_result", calibration.baseline_result}, {"tag_result", calibration.tag_result},
+                {"restore_result", calibration.restore_result}, {"tag_enabled", calibration.tag_enabled},
+                {"active", calibration.active}, {"restore_pending", calibration.restore_pending}, {"cancelled", calibration.cancelled},
+                {"generation", calibration.generation}, {"api_sequence", calibration.api_sequence},
+                {"requested", calibration.requested}, {"attempted", calibration.attempted}, {"accepted", calibration.accepted},
+                {"submitted", calibration.submitted}, {"deadline_ms", calibration.deadline_ms},
+                {"reason", calibration.reason}, {"classification", "Unknown"}}},
+            {"capture", {{"capture_id", capture.capture_id}, {"status", capture.status}, {"reason", capture.reason},
+                {"recorded", capture.recorded}, {"written", capture.written}, {"blocked", capture.blocked},
+                {"last_serial", capture.last_serial}, {"drained", capture.drained}}}};
+  };
+  if (xefg_operation && request.value("action", Json(nullptr)) == "status") {
+    return {{"id", *id}, {"ok", true}, {"status", "observed"}, {"state", ProcessIdentityState()}, {"probe", xefg_snapshot()}};
+  }
+#endif
+  const bool marker_operation = *operation == "fg_output_marker";
+  const bool consumer_operation = *operation == "fg_consumer_capture";
+  const bool benchmark_operation = *operation == "sr_benchmark";
+  const bool compact_operation = marker_operation || consumer_operation || benchmark_operation
+#if defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+      || xefg_operation
+#endif
+      ;
+  const auto consumer_snapshot = []() {
+    const auto capture = screenshot::CopyFgConsumerStatus();
+    return Json{{"capture_id", capture.capture_id}, {"status", capture.status},
+        {"reason", capture.reason}, {"serial", capture.serial}};
+  };
+  const auto marker_snapshot = []() {
+    const auto& marker = fg_output_marker_window;
+    const auto now = SteadyNowNs();
+    return Json{{"request_generation", marker.request_generation}, {"enabled", marker.enabled},
+        {"bound", marker.bound}, {"stopped", marker.stopped}, {"reason", marker.reason},
+        {"expired", marker.enabled && (now < marker.armed_ns || now - marker.armed_ns >= marker.MAX_DURATION_NS)},
+        {"frame_limit", marker.MAX_FRAMES}, {"duration_ms", marker.MAX_DURATION_NS / 1'000'000},
+        {"recorded", marker.recorded}, {"refreshes", marker.refreshes}, {"reuses", marker.reuses},
+        {"first_sequence", marker.first_sequence}, {"last_sequence", marker.last_sequence},
+        {"source", marker.binding.source}, {"source_generation", marker.binding.source_generation},
+        {"provider", marker.binding.provider}, {"context", marker.binding.context},
+        {"environment_generation", marker.binding.environment_generation},
+        {"evidence", "marker_recording_not_GPU_completion_or_FG_pixels"}};
+  };
+  if (marker_operation && request.value("action", Json(nullptr)) == "status") {
+    RuntimeTryLock lock(runtime_mutex);
+    if (!lock.owns_lock()) {
+      return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "runtime_busy"},
+          {"state", ProcessIdentityState()}};
+    }
+    return {{"id", *id}, {"ok", true}, {"status", "observed"}, {"marker", marker_snapshot()},
+        {"state", ProcessIdentityState()}};
+  }
+  if (consumer_operation && request.value("action", Json(nullptr)) == "status") {
+    return {{"id", *id}, {"ok", true}, {"status", "observed"}, {"capture", consumer_snapshot()},
+        {"state", ProcessIdentityState()}};
+  }
+  if (benchmark_operation && request.value("action", Json(nullptr)) == "status") {
+    return {{"id", *id}, {"ok", true}, {"status", "observed"}, {"capture", control_mask_capture::benchmark::Status()},
+        {"state", ProcessIdentityState()}};
+  }
   if (*operation == "status") {
     auto state = Snapshot();
     return {{"id", *id}, {"ok", true}, {"status", "observed"}, {"state", state},
@@ -475,26 +671,43 @@ inline Json Execute(const Json& request) {
   if (*operation != "set" && *operation != "adaptive_feature_experiment"
       && *operation != "bridge_adaptive_experiment" && *operation != "edit_reuse_adaptive_experiment"
       && *operation != "edit_reuse_fg_experiment"
+      && *operation != "reset_nr"
+      && !compact_operation
       && *operation != "inline_restore_roi") {
     return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "invalid_operation"}};
   }
   if (last_request.is_object() && last_request["id"] == *id) {
     if (request == last_request) return last_receipt;
+    if (compact_operation) {
+      return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "request_id_reused"},
+          {"state", ProcessIdentityState()}};
+    }
     return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "request_id_reused"}};
   }
   Json response{{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "invalid_setting"},
       {"message", ""}, {"changes", Json::object()}};
+  if (*operation == "reset_nr") {
+    response["configuration_generation_before"] = configuration_generation.load();
+  }
   const auto finish = [&]() {
-    response["state"] = Snapshot();
-    if (response["state"].value("available", false)) {
-      // Status can contain both the current state and this cached receipt.
-      // Keep bounded events in the current status, rather than duplicating
-      // them into every mutation receipt under the same 64 KiB pipe limit.
-      auto& observed = response["state"]["edit_reuse"]["fg_observation"];
-      observed["events"] = Json::array();
-      observed["events_in_status_only"] = true;
+    if (*operation == "reset_nr") {
+      response["configuration_generation_after"] = configuration_generation.load();
     }
-    response["identity"] = response["state"].value("identity", Json(nullptr));
+    if (compact_operation) {
+      response["state"] = ProcessIdentityState();
+    } else {
+      response["state"] = Snapshot();
+      if (response["state"].value("available", false)) {
+        // Status can contain both the current state and this cached receipt.
+        // Keep bounded events in the current status, rather than duplicating
+        // them into every mutation receipt under the same 64 KiB pipe limit.
+        auto& observed = response["state"]["edit_reuse"]["fg_observation"];
+        observed["events"] = Json::array();
+        observed["events_in_status_only"] = true;
+        response["state"]["edit_reuse"].erase("native_evaluate");
+      }
+      response["identity"] = response["state"].value("identity", Json(nullptr));
+    }
     last_request = request;
     last_receipt = response;
     Log(reshade::log::level::info, NR_NEXUS_NAME " development control: id=" + id->get<std::string>()
@@ -504,6 +717,249 @@ inline Json Execute(const Json& request) {
   const bool configuration_busy = shutting_down.load() || slider_pending != nullptr || stage_edit::pending || resolution_edit::pending
       || stage_edit_request.setting != nullptr || !resolution_edit_request.empty() || profile_ui::Busy()
       || profile_ui::pending_action != profile_ui::Action::NONE || preset_ui::manager_geometry.was_open;
+  if (benchmark_operation) {
+    namespace benchmark = control_mask_capture::benchmark;
+    const auto action = request.value("action", Json(nullptr));
+    const auto environment = [] {
+      const auto xefg = fg::xefg::QueryEnabledContext();
+      int64_t xefg_last_proxy_present_ns = 0;
+      {
+        // ObserveXeFG runs at the real proxy Present return, even on a failed or OFF status.
+        std::shared_lock lock(output_framerate::internal::state.mutex);
+        xefg_last_proxy_present_ns = output_framerate::internal::state.xefg_ns;
+      }
+      return Json{{"sampled_ns", SteadyNowNs()}, {"native_fg_calls", benchmark::native_fg_calls.load()},
+          {"native_fg_successes", benchmark::native_fg_successes.load()},
+          {"native_fg_declaration", static_cast<uint32_t>(native_fg_declaration.load())},
+          {"native_fg_owns", native_fg_owns.load()}, {"xefg_enabled", fg::xefg::Enabled()},
+          {"xefg_owns", fg::xefg::OwnsStream()}, {"xefg_context", xefg.context_identity},
+          {"xefg_context_state", xefg.reason}, {"xefg_nr_submissions", fg::xefg::SubmittedFrames()},
+          {"xefg_last_proxy_present_ns", xefg_last_proxy_present_ns}};
+    };
+    const auto settings = [] {
+      auto captured = preset_ui::Capture(presets::Scope::FULL, Json::object()).settings;
+      captured["NeuralUplift"] = enabled.load();
+      captured["NREditReuse"] = edit_reuse_enabled.load();
+      return captured;
+    };
+    response["reason"] = "invalid_benchmark_request";
+    bool applied = false;
+    if (action == "arm") {
+      const auto frames = request.find("max_frames");
+      const auto seconds = request.find("seconds");
+      if (frames == request.end() || seconds == request.end() || !frames->is_number_unsigned()
+          || !seconds->is_number_unsigned() || *frames < 1 || *frames > 8192 || *seconds < 1 || *seconds > 180) return finish();
+      if (configuration_busy || !gpu_timers_enabled.load() || !queue_tracking_active.load()) {
+        response["reason"] = configuration_busy ? "configuration_busy" : "requires_gpu_timers_and_queue_tracking";
+        return finish();
+      }
+      applied = benchmark::Arm(frames->get<uint32_t>(), seconds->get<uint32_t>(), environment(), settings());
+    } else if (action == "mark") {
+      const auto label = request.find("label");
+      if (label == request.end() || !label->is_string()) return finish();
+      const auto& value = label->get_ref<const std::string&>();
+      if (value.empty() || value.size() > 32 || !std::all_of(value.begin(), value.end(), [](unsigned char c) {
+            return std::isalnum(c) || c == '-' || c == '_';
+          })) return finish();
+      applied = benchmark::Mark(value, environment(), settings());
+    } else if (action == "stop") {
+      applied = benchmark::Stop("requested_stop", environment());
+    } else {
+      return finish();
+    }
+    response.update({{"ok", applied}, {"status", applied ? "accepted" : "rejected"},
+        {"reason", applied ? "benchmark_request_accepted" : "benchmark_state_conflict"}, {"capture", benchmark::Status()}});
+    return finish();
+  }
+  if (*operation == "reset_nr") {
+    response["reason"] = "invalid_reset_request";
+    if (request.size() != 2) return finish();
+    if (configuration_busy) {
+      response["reason"] = "configuration_busy";
+      return finish();
+    }
+    DWORD foreground_process = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &foreground_process);
+    if (foreground_process != GetCurrentProcessId()) {
+      response["reason"] = "not_foreground";
+      return finish();
+    }
+    RecreateFeatures();
+    response.update({{"ok", true}, {"status", "accepted"}, {"reason", "nr_reset_requested"},
+        {"evidence", "reset_requested_not_model_or_gpu_completion"}});
+    return finish();
+  }
+#if defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+  if (xefg_operation) {
+    response["reason"] = "invalid_calibration_request";
+    const auto complete = [&]() {
+      response["probe"] = xefg_snapshot();
+      return finish();
+    };
+    const auto queue = [&](xefg_present_probe::ControlAction action, const xefg_present_probe::Target& target,
+                           bool tag_enabled = false, uint32_t samples = 0, uint32_t duration_ms = 0) {
+      const auto job_id = xefg_present_probe::QueueControl(id->get_ref<const std::string&>(), action, target,
+          tag_enabled, samples, duration_ms);
+      if (job_id == 0) {
+        response.update({{"ok", false}, {"status", "blocked"}, {"reason", "control_busy_or_stopped"}});
+        return false;
+      }
+      const bool scheduled = screenshot::ScheduleXefgControl();
+      const auto control = xefg_present_probe::CopyControl();
+      const bool entered = control.cancel_requested && control.sdk_entered && !control.finished;
+      response.update({{"ok", scheduled && !entered}, {"status", scheduled && !entered ? "queued" : "blocked"},
+          {"job_id", job_id}, {"reason", !scheduled ? "worker_unavailable" : entered ? "sdk_call_in_flight" : "control_job_queued"}});
+      return scheduled && !entered;
+    };
+    const auto action = request.value("action", Json(nullptr));
+    if (action == "poll" || action == "stop") {
+      const auto current = xefg_present_probe::CopyCalibration();
+      const auto control = xefg_present_probe::CopyControl();
+      const auto target = (xefg_present_probe::ControlBusy(control) ? control.target : current.target);
+      if (!request.contains("init_serial") || !request["init_serial"].is_number_unsigned()
+          || target.init_serial == 0 || request["init_serial"].get<uint64_t>() != target.init_serial) return complete();
+      if (action == "stop") {
+        screenshot::CancelXefgCapture("explicit_async_stop");
+      }
+      queue(action == "stop" ? xefg_present_probe::ControlAction::STOP : xefg_present_probe::ControlAction::POLL, target);
+      return complete();
+    }
+    if (action != "baseline" && action != "arm") return complete();
+    const auto object = request.find("target");
+    if (object == request.end() || !object->is_object()) return complete();
+    for (const char* key : {"slot", "module", "handle", "init_serial", "context", "context_generation", "buffer_generation"}) {
+      const auto value = object->find(key);
+      if (value == object->end() || !value->is_number_unsigned()) return complete();
+    }
+    if ((*object)["slot"] > 1) return complete();
+    const xefg_present_probe::Target target{.slot = (*object)["slot"].get<uint32_t>(),
+        .module = (*object)["module"].get<uintptr_t>(), .handle = (*object)["handle"].get<uintptr_t>(),
+        .init_serial = (*object)["init_serial"].get<uint64_t>(), .context = (*object)["context"].get<uintptr_t>(),
+        .context_generation = (*object)["context_generation"].get<uint64_t>(), .buffer_generation = (*object)["buffer_generation"].get<uint64_t>()};
+    if (xefg_present_probe::ControlBusy(xefg_present_probe::CopyControl())) {
+      response["reason"] = "control_busy";
+      return complete();
+    }
+    if (configuration_busy || enabled.load() || !disabled_resources_released.load() || !screenshot::CopyXefgCaptureStatus().drained) {
+      response["reason"] = "nr_off_and_idle_required";
+      return complete();
+    }
+    if (action == "baseline") {
+      queue(xefg_present_probe::ControlAction::BASELINE, target);
+      return complete();
+    }
+    if (!request.contains("tag_enabled") || !request["tag_enabled"].is_boolean()
+        || !request.contains("samples") || !request["samples"].is_number_unsigned()
+        || request["samples"] < 1 || request["samples"] > xefg_present_probe::kMaxSamplesPerWindow
+        || !request.contains("duration_ms") || !request["duration_ms"].is_number_unsigned()
+        || request["duration_ms"] < 100 || request["duration_ms"] > 3000
+        || !request.contains("output_directory") || !request["output_directory"].is_string()
+        || !request.contains("capture_id") || !request["capture_id"].is_string()) return complete();
+    std::array<screenshot::CaptureRect, 2> rois{};
+    size_t index = 0;
+    for (const char* name : {"nr_roi", "sdk_roi"}) {
+      const auto roi = request.find(name);
+      if (roi == request.end() || !roi->is_object()) return complete();
+      for (const char* key : {"x", "y", "width", "height"}) {
+        if (!roi->contains(key) || !(*roi)[key].is_number_unsigned() || (*roi)[key] > UINT32_MAX) return complete();
+      }
+      rois[index++] = {.x = (*roi)["x"].get<uint32_t>(), .y = (*roi)["y"].get<uint32_t>(),
+          .width = (*roi)["width"].get<uint32_t>(), .height = (*roi)["height"].get<uint32_t>()};
+    }
+    const auto& directory = request["output_directory"].get_ref<const std::string&>();
+    if (!screenshot::RequestXefgCapture(std::filesystem::path(std::u8string(directory.begin(), directory.end())),
+        request["capture_id"].get_ref<const std::string&>(), rois, present_generation)) return complete();
+    xefg_present_probe::ConfigureCapture({.prepare = screenshot::PrepareXefgPresent, .returned = screenshot::ReturnXefgPresent,
+        .install = +[](ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list) {
+          return InstallCommandListStateHooks(list) && InstallQueueCompletionHooks(queue) && queue_tracking_active.load();
+        }, .cancel = screenshot::CancelXefgCapture, .ready = screenshot::ReserveXefgRecording, .release = screenshot::ReleaseXefgRecording});
+    if (!queue(xefg_present_probe::ControlAction::ARM, target, request["tag_enabled"].get<bool>(),
+        request["samples"].get<uint32_t>(), request["duration_ms"].get<uint32_t>())) {
+      screenshot::CancelXefgCapture("control_queue_rejected");
+    }
+    return complete();
+  }
+#endif
+  if (consumer_operation) {
+    response["reason"] = "invalid_consumer_request";
+    const auto directory = request.find("output_directory");
+    const auto capture_id = request.find("capture_id");
+    const auto roi = request.find("roi");
+    if (request.value("action", Json(nullptr)) != "arm"
+        || directory == request.end() || !directory->is_string()
+        || capture_id == request.end() || !capture_id->is_string() || roi == request.end() || !roi->is_object()) return finish();
+    for (const char* key : {"x", "y", "width", "height"}) {
+      const auto value = roi->find(key);
+      if (value == roi->end() || !value->is_number_integer() || *value < 0 || *value > UINT32_MAX) return finish();
+    }
+    if (configuration_busy) {
+      response["reason"] = "configuration_busy";
+      return finish();
+    }
+    bool route_ready = false;
+    {
+      RuntimeTryLock lock(runtime_mutex);
+      if (!lock.owns_lock()) {
+        response["reason"] = "runtime_busy";
+      } else {
+        const auto environment = ReadEditReuseFgEnvironmentLocked();
+        route_ready = enabled.load() && hook_point.load() == kHookUpscaled
+            && environment.available && environment.provider == 1;
+        response["reason"] = "native_consumer_route_unavailable";
+      }
+    }
+    if (route_ready) {
+      try {
+        const auto& utf8_directory = directory->get_ref<const std::string&>();
+        std::string reason;
+        const bool armed = screenshot::RequestFgConsumerCapture(
+            std::filesystem::path(std::u8string(utf8_directory.begin(), utf8_directory.end())),
+            capture_id->get_ref<const std::string&>(),
+            {.x = (*roi)["x"].get<uint32_t>(), .y = (*roi)["y"].get<uint32_t>(),
+                .width = (*roi)["width"].get<uint32_t>(), .height = (*roi)["height"].get<uint32_t>()}, &reason);
+        response["ok"] = armed;
+        response["status"] = (armed ? "armed" : "rejected");
+        response["reason"] = reason;
+      } catch (...) {
+        response["reason"] = "invalid_consumer_request";
+      }
+    }
+    response["capture"] = consumer_snapshot();
+    return finish();
+  }
+  if (marker_operation) {
+    const auto action = request.find("action");
+    response["reason"] = "invalid_marker_action";
+    if (action == request.end() || !action->is_string() || (*action != "arm" && *action != "stop")) return finish();
+    {
+      RuntimeTryLock lock(runtime_mutex);
+      if (!lock.owns_lock()) {
+        response["reason"] = "runtime_busy";
+      } else {
+        if (*action == "stop") {
+          fg_output_marker_window.Stop("explicit_stop");
+          response.update({{"ok", true}, {"status", "stopped"}, {"reason", "marker_stopped"}});
+        } else if (configuration_busy) {
+          response["reason"] = "configuration_busy";
+        } else if (!enabled.load() || !edit_reuse_enabled.load()) {
+          response["reason"] = "nr_x2_not_running";
+        } else {
+          const auto environment = ReadEditReuseFgEnvironmentLocked();
+          const bool route = (environment.provider == 1 && hook_point.load() == kHookUpscaled
+                  && edit_reuse_fg_experiment.load())
+              || (environment.provider == 2 && hook_point.load() == kHookPresent);
+          if (!environment.available || !route) {
+            response["reason"] = "marker_route_unavailable";
+          } else {
+            fg_output_marker_window.Arm(SteadyNowNs());
+            response.update({{"ok", true}, {"status", "armed"}, {"reason", "marker_requested"}});
+          }
+        }
+        response["marker"] = marker_snapshot();
+      }
+    }
+    return finish();
+  }
   if (*operation == "inline_restore_roi") {
     response["reason"] = "invalid_output_directory";
     const auto directory = request.find("output_directory");
@@ -572,9 +1028,9 @@ inline Json Execute(const Json& request) {
           requested_flag->store(requested);
           if (fg_experiment && !unchanged) {
             edit_fg_observation::SetEnabled(requested);
-#if defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
-            fg_output_marker_window.SetEnabled(requested);
-#endif
+            if (!requested) {
+              fg_output_marker_window.Stop("fg_experiment_disabled");
+            }
           }
         } else {
           const auto requested = static_cast<AdaptiveFeatureMode>(value->get<uint32_t>());

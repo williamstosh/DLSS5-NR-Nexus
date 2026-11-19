@@ -295,7 +295,8 @@ NVSDK_NGX_Result NVSDK_CONV MotionEvaluateModel(ID3D12GraphicsCommandList* list,
   model_uploads.push_back(upload);
   return NVSDK_NGX_Result_Success;
 }
-void WaitForGpu(ID3D12Fence* fence, uint64_t value) {
+template <typename Fence>
+void WaitForGpu(Fence* fence, uint64_t value) {
   HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   Check(event != nullptr, "GPU event");
   const HRESULT hr = fence->SetEventOnCompletion(value, event);
@@ -376,6 +377,7 @@ int main(int argc, char** argv) {
     bool same_stage_resolution = false;
     bool render_stage_resolution = false;
     bool present_stage_resolution = false;
+    bool ordinary_watchdog = false;
     bool adaptive_case = false;
     bool adaptive_hardware = false;
     bool adaptive_native_ngx = false;
@@ -388,6 +390,8 @@ int main(int argc, char** argv) {
         dlaa_only = true;
       } else if (std::strcmp(argv[arg], "--sr") == 0) {
         sr_only = true;
+      } else if (std::strcmp(argv[arg], "--ordinary-watchdog") == 0) {
+        ordinary_watchdog = true;
       } else if (std::strcmp(argv[arg], "--adaptive") == 0) {
         Check(!adaptive_case, "one explicit Bridge Adaptive condition per process");
         adaptive_case = true;
@@ -422,8 +426,12 @@ int main(int argc, char** argv) {
 #if defined(NR_NEXUS_TEST_WARP_ONLY)
     Check(warp, "hardware adapter forbidden in WARP-only Bridge test build");
 #endif
-    const bool strict_debug = adaptive_case || (warp && sr_only);
+    const bool strict_debug = ordinary_watchdog || adaptive_case || (warp && sr_only);
     ComPtr<ID3D12Debug> adaptive_debug;
+    if (ordinary_watchdog) {
+      Check(!adaptive_case && !stage_resolution && !present_stage_resolution && !dlaa_only && !sr_only,
+          "ordinary Bridge watchdog runs without other stage variants");
+    }
     if (adaptive_case) {
       Check(warp != adaptive_hardware && !stage_resolution && !present_stage_resolution && !dlaa_only && !sr_only,
           "Bridge Adaptive explicitly selects WARP or hardware, without other stage variants or fallback");
@@ -475,9 +483,9 @@ int main(int argc, char** argv) {
       Check(SUCCEEDED(device.As(&adaptive_info11))
           && SUCCEEDED(native::bridge.device12->QueryInterface(IID_PPV_ARGS(&adaptive_info12))),
           "Bridge requires both real D3D11 and D3D12 InfoQueues");
-      std::cout << (adaptive_case ? "BRIDGE_ADAPTIVE" : "BRIDGE_SR")
+      std::cout << (ordinary_watchdog ? "BRIDGE_ORDINARY_WATCHDOG" : (adaptive_case ? "BRIDGE_ADAPTIVE" : "BRIDGE_SR"))
           << " debug11=1 debug12=1 info11=1 info12=1 adapter="
-          << (adaptive_hardware ? "NVIDIA_HARDWARE" : "SOFTWARE")
+          << (warp ? "SOFTWARE" : "HARDWARE")
           << " runtime=" << (adaptive_native_snippet ? "PRODUCTION_SNIPPET_INIT"
               : (adaptive_native_ngx ? "SDK_PREINITIALIZED_NGX" : "MOCK")) << '\n';
     }
@@ -595,6 +603,169 @@ int main(int argc, char** argv) {
       }
     }
     auto depth_direct = make_texture(width, height, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_SHADER_RESOURCE, depth_pixels.data(), width * 4);
+    struct StallRelease {
+      ID3D12Fence* gate;
+      ~StallRelease() {
+        if (gate != nullptr) {
+          gate->Signal(1);
+        }
+      }
+    };
+    if (ordinary_watchdog) {
+      native::d3d11_swapchain_seen.store(true);
+      native::dx11_route.store(native::kDx11RouteNative);
+      native::dedupe_mode.store(renodx::addons::dlss5::kDedupePerEvaluate);
+      native::hook_point.store(native::kHookUpscaled);
+      native::preset.store(1);
+      native::intensity.store(1.f);
+      native::nr_follow_input_res.store(false);
+      native::nr_resolution_scale.store(1.f);
+      native::nr_adaptive_enabled.store(false);
+      native::edit_reuse_enabled.store(false);
+      native::ngx_loader_staging.nr_ready = true;
+      native::ngx_loader_staging.core_ready = true;
+      native::PublishNgxLoaderSymbols();
+
+      params::OwnedParameters parameters;
+      parameters.Set(NVSDK_NGX_Parameter_Width, width);
+      parameters.Set(NVSDK_NGX_Parameter_Height, height);
+      parameters.Set(NVSDK_NGX_Parameter_OutWidth, adaptive_output_width);
+      parameters.Set(NVSDK_NGX_Parameter_OutHeight, adaptive_output_height);
+      parameters.Set(NVSDK_NGX_Parameter_Color, static_cast<ID3D11Resource*>(color.Get()));
+      parameters.Set(NVSDK_NGX_Parameter_Output, static_cast<ID3D11Resource*>(output.Get()));
+      parameters.Set(NVSDK_NGX_Parameter_Depth, static_cast<ID3D11Resource*>(depth_direct.Get()));
+      parameters.Set(NVSDK_NGX_Parameter_MotionVectors, static_cast<ID3D11Resource*>(rg16.Get()));
+      parameters.Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags,
+          int(NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes));
+      parameters.Set(NVSDK_NGX_Parameter_MV_Scale_X, 1.f);
+      parameters.Set(NVSDK_NGX_Parameter_MV_Scale_Y, 1.f);
+      const auto* handle = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xD511});
+      const params::ParameterView create_view(&parameters, nullptr);
+      native::RegisterCreatedFeatureLocked(handle, native::kFeatureDlss, &create_view);
+      const auto frame = [&] {
+        ++native::present_generation;
+        const auto result = native::Ngx11Evaluate(0, "ordinary Bridge watchdog", context.Get(), handle, &parameters, [&] {
+          context->UpdateSubresource(output.Get(), 0, nullptr, output_pixels.data(), adaptive_output_width * 8, 0);
+          return NVSDK_NGX_Result_Success;
+        });
+        Check(NVSDK_NGX_SUCCEED(result), "ordinary Bridge preserves MOCK SR success");
+      };
+
+      auto* const raw_context = native::bridge.context11;
+      const auto original = Read11(output.Get(), 8);
+      auto consumer = make_texture(adaptive_output_width, adaptive_output_height, DXGI_FORMAT_R16G16B16A16_FLOAT, 0, nullptr, 0);
+      ComPtr<ID3D11Device5> fence_device;
+      ComPtr<ID3D11Fence> consumer_tail;
+      Check(SUCCEEDED(device.As(&fence_device))
+                && SUCCEEDED(fence_device->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(&consumer_tail))),
+          "ordinary Bridge D3D11 consumer fence");
+
+      {
+        // The stalled twin still contains the SR snapshot. An early copy can be byte-identical.
+        using CopyRegion = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext4*, ID3D11Resource*, UINT, UINT, UINT,
+            UINT, ID3D11Resource*, UINT, const D3D11_BOX*);
+        static CopyRegion original_copy = nullptr;
+        static ID3D11DeviceContext4* observed_context = raw_context;
+        static ID3D11Resource* observed_output = output.Get();
+        static uint32_t output_copies = 0;
+        renodx::utils::vtable::Slot<CopyRegion> copy_slot{
+            .object = raw_context,
+            .index = 46,  // ID3D11DeviceContext4 inherits CopySubresourceRegion at this ABI slot.
+            .original = &original_copy,
+            .replacement = [](ID3D11DeviceContext4* observed, ID3D11Resource* dst, UINT dst_subresource, UINT x, UINT y,
+                               UINT z, ID3D11Resource* src, UINT src_subresource, const D3D11_BOX* box) {
+              original_copy(observed, dst, dst_subresource, x, y, z, src, src_subresource, box);
+              if (observed == observed_context && dst == observed_output) {
+                ++output_copies;
+              }
+            }};
+        renodx::utils::vtable::Install(&copy_slot);
+        struct RestoreCopySlot {
+          decltype(copy_slot)* slot;
+          ~RestoreCopySlot() { renodx::utils::vtable::Uninstall(slot); }
+        } restore_copy_slot{.slot = &copy_slot};
+
+        uint32_t warm_copies = 0;
+        uint64_t warm_waits = 0;
+        uint64_t warm_wait_ns = 0;
+        for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 2 && model_calls == 0; ++attempt) {
+          const auto copies_before = output_copies;
+          const auto waits_before = native::bridge_completion_waits;
+          const auto wait_ns_before = native::bridge_completion_wait_ns;
+          frame();
+          if (const auto submitted = native::bridge_submitted_value.load(); submitted != 0) {
+            WaitForGpu(native::bridge.fence_done12, submitted);
+          }
+          warm_copies = output_copies - copies_before;
+          warm_waits = native::bridge_completion_waits - waits_before;
+          warm_wait_ns = native::bridge_completion_wait_ns - wait_ns_before;
+        }
+        const auto warm_pixels = Read11(output.Get(), 8);
+        std::cout << "BRIDGE_ORDINARY_WATCHDOG warm_model_calls=" << model_calls << " warm_copies=" << warm_copies
+                  << " completion_waits=" << warm_waits << " completion_wait_ns=" << warm_wait_ns << '\n';
+        Check(model_calls == 1 && warm_copies == 1, "completed ordinary NR issues one observed game Output copy");
+        Check(std::memcmp(warm_pixels.data(), original.data(), 3 * sizeof(uint16_t)) != 0,
+            "completed ordinary NR changes game Output RGB");
+
+        const auto pending = native::bridge_submitted_value.load() + 1;
+        const auto calls_before = model_calls;
+        const auto copies_before = output_copies;
+        const auto timeouts_before = native::bridge_timeouts.load();
+        const auto wait_ns_before = native::bridge_completion_wait_ns;
+        ComPtr<ID3D12Fence> stalled;
+        Check(SUCCEEDED(native::bridge.device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&stalled))),
+            "ordinary Bridge stall gate");
+        Check(SUCCEEDED(native::bridge.queue->Wait(stalled.Get(), 1)), "stall ordinary Bridge private queue");
+        StallRelease stall_release{.gate = stalled.Get()};
+        frame();
+        Check(native::bridge_submitted_value.load() == pending && model_calls == calls_before + 1,
+            "stalled ordinary frame submits one real NR recording");
+        const auto watchdog_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (native::bridge.fence_out12->GetCompletedValue() < pending
+               && std::chrono::steady_clock::now() < watchdog_deadline) {
+          Sleep(10);
+        }
+        const auto input_value = native::bridge.fence_in12->GetCompletedValue();
+        const auto out_value = native::bridge.fence_out12->GetCompletedValue();
+        Check(input_value == pending && out_value == pending && native::bridge_timeouts.load() == timeouts_before + 1
+                  && native::bridge.fence_done12->GetCompletedValue() < pending,
+            "actual watchdog releases out after the D3D11 input while real D3D12 done is still pending");
+
+        raw_context->CopyResource(consumer.Get(), output.Get());
+        Check(SUCCEEDED(raw_context->Signal(consumer_tail.Get(), 1)), "signal after the real D3D11 consumer copy");
+        raw_context->Flush();
+        WaitForGpu(consumer_tail.Get(), 1);
+        const auto consumed_pixels = Read11(consumer.Get(), 8);
+        const auto done_before_release = native::bridge.fence_done12->GetCompletedValue();
+        Check(done_before_release < pending, "D3D11 game consumption finishes before the stalled NR GPU work");
+        const auto early_copies = output_copies - copies_before;
+        std::cout << "BRIDGE_ORDINARY_WATCHDOG input=" << input_value << " out=" << out_value
+                  << " done=" << done_before_release << " game_copy_backs=" << early_copies
+                  << " consumed_sr=" << (consumed_pixels == original)
+                  << " completion_wait_ns=" << native::bridge_completion_wait_ns - wait_ns_before << '\n';
+
+        Check(SUCCEEDED(stalled->Signal(1)), "release the ordinary Bridge test gate");
+        stall_release.gate = nullptr;
+        WaitForGpu(native::bridge.fence_done12, pending);
+        const auto after_done = Read11(output.Get(), 8);
+        Check(early_copies == 0, "ordinary Upscaled copied back to game Output before real D3D12 done");
+        Check(consumed_pixels == original, "stalled ordinary Bridge preserves the SR pixels seen by the game");
+        Check(after_done == original && output_copies == copies_before, "late NR completion leaves game Output intact");
+
+        frame();
+        Check(native::bridge_submitted_value.load() == pending + 1 && model_calls == calls_before + 2,
+            "first frame after real completion resumes NR");
+        WaitForGpu(native::bridge.fence_done12, pending + 1);
+        Check(model_observations.back().reset == 1, "first resumed NR frame resets history after the undelivered frame");
+        Check(Read11(output.Get(), 8) == warm_pixels && output_copies == copies_before + 1,
+            "first resumed frame writes the completed NR result to game Output exactly once");
+      }
+      native::ReleaseBridge();
+      check_debug_messages();
+      std::cout << "PASS ordinary Upscaled watchdog " << (warp ? "WARP" : "NATIVE_GPU")
+                << "+MOCK game consumption and first resumed NR result\n";
+      return 0;
+    }
     if (adaptive_case) {
       native::d3d11_swapchain_seen.store(true);
       native::dx11_route.store(native::kDx11RouteNative);
@@ -2145,7 +2316,7 @@ int main(int argc, char** argv) {
       ComPtr<ID3D12Fence> stalled;
       Check(SUCCEEDED(native::bridge.device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&stalled))), "stall gate");
       Check(SUCCEEDED(native::bridge.queue->Wait(stalled.Get(), 1)), "stall private queue");
-      std::jthread release_stall([stalled] { Sleep(1600); stalled->Signal(1); });
+      StallRelease stall_release{.gate = stalled.Get()};
       const auto signals_before_stall = native::bridge_signals.load();
       const auto timed_out = frame(false, false, false, false);
       const auto pending = native::bridge_submitted_value.load();
@@ -2161,13 +2332,90 @@ int main(int argc, char** argv) {
       Check(model_calls == blocked.calls_before && model_calls == blocked_single.calls_before
                 && native::bridge_signals.load() == signals_before_stall + 1,
           "unproven mixed delivery blocks twin writes across a switch to single stage");
-      native::RetireBridgeSetLocked(mixed_handle);
-      const auto retained = native::bridge_retired.size();
-      native::DrainBridgeRetired(native::bridge.fence_done12->GetCompletedValue());
-      Check(!native::bridge_retired.empty() && native::bridge_retired.size() <= retained,
-          "in-flight twins remain retired until actual done");
-      release_stall.join();
-      WaitForGpu(native::bridge.fence_done12, pending);
+      const auto finish_stall = [&] {
+        native::RetireBridgeSetLocked(mixed_handle);
+        const auto retained = native::bridge_retired.size();
+        native::DrainBridgeRetired(native::bridge.fence_done12->GetCompletedValue());
+        Check(!native::bridge_retired.empty() && native::bridge_retired.size() <= retained,
+            "in-flight twins remain retired until actual done");
+        Check(SUCCEEDED(stalled->Signal(1)), "release the stalled Bridge submission");
+        stall_release.gate = nullptr;
+        WaitForGpu(native::bridge.fence_done12, pending);
+      };
+      if (warp && sr_only) {
+        namespace submission = renodx::addons::dlss5::submission;
+        const auto& pending_slot = native::bridge.ring[pending % native::kBridgeRing];
+        auto* const pending_list = pending_slot.list;
+        auto* const pending_allocator = pending_slot.allocator;
+        auto* const bridge_device = native::bridge.device12;
+        Check(pending != 0 && pending_list != nullptr && pending_allocator != nullptr && pending_slot.value == pending
+                  && native::bridge.fence_out12->GetCompletedValue() >= pending
+                  && native::bridge.fence_done12->GetCompletedValue() < pending,
+            "WARP Bridge has a recorded submission stalled after the watchdog advanced out");
+        const auto recording = submission::ObserveRecording(pending_list);
+        Check(recording != nullptr && !recording->closed.load(), "the pending Bridge recording must be observed");
+        const auto recording_identity = submission::RecordingIdentity(pending_list);
+
+        // The Render twins return to COMMON. Keep them alive through the handoff
+        // even after this fixture retires their Bridge source set.
+        const auto& render_set = native::bridge_sets.at(mixed_handle)[1];
+        const ComPtr<ID3D12Resource> color12 = render_set.color12;
+        const ComPtr<ID3D12Resource> motion12 = render_set.motion12;
+        const ComPtr<ID3D12Resource> depth12 = render_set.depth12;
+        fg::FrameInput input{.queue = native::bridge.queue, .backbuffer = color12.Get(),
+            .depth = depth12.Get(), .motion = motion12.Get(),
+            .color_width = width, .color_height = height, .guide_width = width, .guide_height = height,
+            .context = 0xD11F, .epoch = 1, .application_frame = 1,
+            .color_space = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, .fg_enabled = true};
+        // Isolate the Bridge retirement from provider initialization by reusing
+        // the ready fixture model on the same WARP device as a private provider.
+        auto& symbols = native::ngx_loader_staging;
+        native::direct_api.private_instance = true;
+        symbols.native_api = native::direct_api;
+        symbols.native_ready = true;
+        native::PublishNgxLoaderSymbols();
+        const auto saved_hooks = native::hooks_enabled.exchange(true);
+        const auto saved_hook_point = native::hook_point.exchange(native::kHookPresent);
+        Check(native::fg_service::Requested(), "XeFG Service is selected for the Bridge handoff");
+        const auto calls_before_service = model_calls;
+        Check(native::fg_service::Service(input) == fg::Result::NOT_SERVED && model_calls == calls_before_service
+                  && !recording->closed.load() && pending_slot.value == pending && pending_slot.list == pending_list
+                  && submission::RecordingIdentity(pending_list) == recording_identity,
+            "Service refuses before GPU-only done and preserves the same Bridge slot and recording");
+
+        finish_stall();
+        Check(!recording->closed.load() && pending_slot.value == pending,
+            "GPU-only done leaves the old Bridge recording replayable until Reset");
+        auto result = fg::Result::NOT_SERVED;
+        uint64_t service_submitted = 0;
+        for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8 && result != fg::Result::SUBMITTED; ++attempt) {
+          ++input.application_frame;
+          result = native::fg_service::Service(input);
+          Check(recording->closed.load() && pending_slot.value == 0 && pending_slot.list == pending_list
+                    && pending_slot.allocator == pending_allocator && native::bridge.device12 == bridge_device,
+              "Service resets the completed recording and keeps the Bridge allocator, list and device");
+          Check(result != fg::Result::FAILED, "Service can record after Bridge retirement");
+          const auto& stream = native::fg_service::streams.at({false, input.context});
+          service_submitted = stream.submitted;
+          if (service_submitted != 0) {
+            WaitForGpu(stream.fence, service_submitted);
+          }
+        }
+        Check(result == fg::Result::SUBMITTED && service_submitted != 0 && model_calls > calls_before_service,
+            "Service submits real WARP work using the model substitute after Bridge retirement");
+        native::fg_service::Retire();
+        native::DrainRetiredResources(true);
+        native::DrainPresentRetired();
+        native::hooks_enabled.store(saved_hooks);
+        native::hook_point.store(saved_hook_point);
+        native::direct_api.private_instance = false;
+        symbols.native_api = {};
+        symbols.native_ready = false;
+        native::PublishNgxLoaderSymbols();
+        std::printf("PASS Bridge Service handoff WARP+MOCK watchdog out / GPU done / SUBMITTED with completed fence\n");
+      } else {
+        finish_stall();
+      }
       native::DrainBridgeRetired(pending);
       // Three watchdog trips intentionally make the production bridge lost for
       // the rest of this D3D11 session. The fixture starts a fresh bridge to

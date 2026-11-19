@@ -141,6 +141,7 @@ struct PassStats {
   uint32_t total_us = 0;
   bool look_measured = false;
   SampleState state = SampleState::NOT_EXECUTED;
+  bool edit_reused = false;
 };
 
 struct Segment {
@@ -149,6 +150,7 @@ struct Segment {
   uint64_t written = 0;  // bit per slot written (kSlotsPerEval == 64)
   bool recorded = false;
   bool bypass = false;  // zero-strength passthrough frame: no stats
+  bool group_edit_reused = false;
   bool measure = true;
   uint32_t pass_begin = 0;
   uint32_t pass_count = 0;
@@ -166,6 +168,9 @@ struct Segment {
   uint32_t color_role = 0;  // 0: ordinary chain, 1: FG backbuffer, 2: FG HUDLess.
   gpu_comparison::Sample comparison;
   uint64_t diagnostic_token = 0;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  uint64_t benchmark_token = 0;
+#endif
   adaptive_resolution::Frame adaptive;
   bool service_scope = false;
   ID3D12GraphicsCommandList* service_list = nullptr;  // Borrowed only while current.active.
@@ -187,6 +192,7 @@ struct Stats {
   uint32_t width = 0;
   uint32_t height = 0;
   bool valid = false;
+  bool group_edit_reused = false;
   std::array<PassStats, kTimerMaxPasses> passes{};
   SampleState state = SampleState::NOT_MEASURED;
   uint64_t sequence = 0;
@@ -221,6 +227,9 @@ inline uint64_t device_session = 0;
 // Optional experiment consumer; observes the original, unaveraged completion
 // result. A token belongs to the recording, never to the current configuration.
 inline void (*raw_observer)(const Stats&, uint64_t) = nullptr;
+#if defined(NR_NEXUS_DEV_CONTROL)
+inline void (*benchmark_observer)(const Stats&, uint64_t) = nullptr;
+#endif
 // Dedicated HUD history is dormant until the visible trend view requests it.
 // Producers and the UI drain hold runtime_mutex; only the enable flag crosses
 // callbacks without that lock. Overflow is reported as a history gap.
@@ -387,13 +396,20 @@ inline void Reject(const Segment& s, SampleState state) {
         .paired = s.adaptive.paired, .pair_first_frame = s.adaptive.pair_first_frame,
         .sampling_generation = s.adaptive.sampling_generation}, NowNs());
   }
-  if (s.measure && s.diagnostic_token != 0 && raw_observer != nullptr && state != SampleState::PENDING) {
+  if (s.measure && state != SampleState::PENDING && ((s.diagnostic_token != 0 && raw_observer != nullptr)
+#if defined(NR_NEXUS_DEV_CONTROL)
+      || (s.benchmark_token != 0 && benchmark_observer != nullptr)
+#endif
+      )) {
     Stats rejected{.width = s.width, .height = s.height, .passes = s.passes,
                    .state = state, .sequence = s.sequence, .measured_ns = NowNs(),
                    .identity = s.comparison.identity,
                    .recorded_ns = static_cast<int64_t>(s.comparison.recorded_ns)};
     std::memcpy(rejected.path, s.path, sizeof(rejected.path));
-    raw_observer(rejected, s.diagnostic_token);
+    if (s.diagnostic_token != 0 && raw_observer != nullptr) raw_observer(rejected, s.diagnostic_token);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (s.benchmark_token != 0 && benchmark_observer != nullptr) benchmark_observer(rejected, s.benchmark_token);
+#endif
   }
   if (!s.measure) {
     if (state != SampleState::PENDING) {
@@ -476,10 +492,12 @@ inline bool Publish(const Segment& s, bool log, const void* queue) {
     auto& layer = next.passes[pass];
     layer = s.passes[pass];
     if ((s.written >> PassEncodeStart(pass) & 1) == 0) continue;
+    const bool valid_evaluate = (layer.edit_reused
+        ? (s.written >> PassEvalStart(pass) & 1) == 0 && has_span(PassEncodeEnd(pass), PassEvalEnd(pass))
+        : has_span(PassEncodeEnd(pass), PassEvalStart(pass)) && has_span(PassEvalStart(pass), PassEvalEnd(pass)));
     if (layer.width == 0 || layer.height == 0
         || !has_span(PassEncodeStart(pass), PassEncodeEnd(pass))
-        || !has_span(PassEncodeEnd(pass), PassEvalStart(pass))
-        || !has_span(PassEvalStart(pass), PassEvalEnd(pass))
+        || !valid_evaluate
         || !has_span(PassEvalEnd(pass), PassResolveEnd(pass))
         || q[PassEncodeStart(pass)] < q[kSlotFrameStart]
         || q[PassResolveEnd(pass)] > q[kSlotCopyBackEnd]
@@ -490,7 +508,7 @@ inline bool Publish(const Segment& s, bool log, const void* queue) {
       return false;
     }
     layer.encode_us = delta_us(PassEncodeStart(pass), PassEncodeEnd(pass));
-    layer.eval_us = delta_us(PassEvalStart(pass), PassEvalEnd(pass));
+    layer.eval_us = (layer.edit_reused ? 0u : delta_us(PassEvalStart(pass), PassEvalEnd(pass)));
     layer.resolve_us = delta_us(PassEvalEnd(pass), PassResolveEnd(pass));
     layer.look_us = delta_us(PassEvalEnd(pass), PassLookEnd(pass));
     layer.look_measured = (s.written >> PassLookEnd(pass) & 1) != 0;
@@ -501,7 +519,7 @@ inline bool Publish(const Segment& s, bool log, const void* queue) {
     next.resolve_us += layer.resolve_us;
     next.look_us += layer.look_us;
   }
-  if (std::none_of(next.passes.begin(), next.passes.end(), [](const auto& pass) {
+  if (!s.group_edit_reused && std::none_of(next.passes.begin(), next.passes.end(), [](const auto& pass) {
         return pass.state == SampleState::VALID;
       })) {
     Reject(s, SampleState::NOT_EXECUTED);
@@ -517,6 +535,7 @@ inline bool Publish(const Segment& s, bool log, const void* queue) {
   next.height = s.height;
   std::memcpy(next.path, s.path, sizeof(next.path));
   next.valid = true;
+  next.group_edit_reused = s.group_edit_reused;
   next.state = SampleState::VALID;
   next.sequence = s.sequence;
   next.measured_ns = NowNs();
@@ -524,9 +543,9 @@ inline bool Publish(const Segment& s, bool log, const void* queue) {
   next.recorded_ns = static_cast<int64_t>(s.comparison.recorded_ns);
   next.queue = queue;
   next.samples = 1;
-  const bool complete = s.pass_count != 0 && s.pass_count <= kTimerMaxPasses
+  const bool complete = s.group_edit_reused || (s.pass_count != 0 && s.pass_count <= kTimerMaxPasses
       && std::all_of(next.passes.begin(), next.passes.begin() + std::min(s.pass_count, kTimerMaxPasses),
-          [](const auto& pass) { return pass.state == SampleState::VALID; });
+          [](const auto& pass) { return pass.state == SampleState::VALID; }));
   auto& completed = completed_stats[StageIndex(s.path)];
   if (complete && next.sequence > completed.sequence) {
     completed = next;
@@ -544,6 +563,9 @@ inline bool Publish(const Segment& s, bool log, const void* queue) {
   if (s.diagnostic_token != 0 && raw_observer != nullptr) {
     raw_observer(next, s.diagnostic_token);
   }
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (s.benchmark_token != 0 && benchmark_observer != nullptr) benchmark_observer(next, s.benchmark_token);
+#endif
   if (superseded) return false;
   QueueMonitorSample(next);
   if (s.comparison.sequence != 0 && ComparisonActive()) {
@@ -577,6 +599,7 @@ inline bool Publish(const Segment& s, bool log, const void* queue) {
   const auto& previous = window.samples[(window.next + kDisplaySamples - 1) % kDisplaySamples];
   bool same_contract = window.count != 0 && previous.queue == next.queue
       && previous.identity == next.identity
+      && previous.group_edit_reused == next.group_edit_reused
       && previous.width == next.width && previous.height == next.height
       && next.measured_ns - previous.measured_ns <= kSampleAgeNs;
   for (uint32_t pass = 0; pass < kTimerMaxPasses && same_contract; ++pass) {
@@ -735,6 +758,7 @@ inline bool Begin(
   s.base = internal::head * kSlotsPerEval;
   s.count = 0;
   s.bypass = false;
+  s.group_edit_reused = false;
   s.measure = measure;
   s.pass_begin = pass_begin;
   s.pass_count = pass_count;
@@ -753,6 +777,9 @@ inline bool Begin(
   s.passes = {};
   s.comparison = {};
   s.diagnostic_token = 0;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  s.benchmark_token = 0;
+#endif
   s.adaptive = {};
   s.service_scope = service_scope;
   s.service_list = (service_scope ? command_list : nullptr);
@@ -798,6 +825,23 @@ inline void Mark(ID3D12GraphicsCommandList* command_list, uint32_t slot) {
   }
   if (slot >= s.count) s.count = slot + 1;
   s.written |= uint64_t{1} << slot;
+}
+
+inline void MarkEditReuse(ID3D12GraphicsCommandList* command_list, uint32_t pass) {
+  if (!internal::current.active || pass >= kTimerMaxPasses) return;
+  // This boundary ends Apply/Snapshot and starts resolve. The full pass
+  // includes that GPU work; there is no NGX Evaluate interval to publish.
+  internal::segments[internal::current.idx].passes[pass].edit_reused = true;
+  Mark(command_list, PassEvalEnd(pass));
+}
+
+// The finished-color anchor bypasses every layer. Only the frame-level
+// timestamps apply to this recording.
+inline void MarkGroupEditReuse(ID3D12GraphicsCommandList* command_list) {
+  if (internal::current.active) {
+    internal::segments[internal::current.idx].group_edit_reused = true;
+    Mark(command_list, kSlotCommitEnd);
+  }
 }
 
 // Flags the current segment as a zero-strength passthrough frame: it resolves
@@ -942,16 +986,17 @@ inline void Poll(bool exact_proofs, bool log) {
             && (s.written & (uint64_t{1} << kSlotFrameStart)) != 0;
         for (uint32_t pass = 0; pass < std::min(s.pass_count, kTimerMaxPasses); ++pass) {
           const auto& layer = s.passes[pass];
+          const uint64_t eval_start = uint64_t{1} << PassEvalStart(pass);
           const uint64_t required = (uint64_t{1} << PassEncodeStart(pass))
-              | (uint64_t{1} << PassEncodeEnd(pass)) | (uint64_t{1} << PassEvalStart(pass))
+              | (uint64_t{1} << PassEncodeEnd(pass)) | (layer.edit_reused ? 0 : eval_start)
               | (uint64_t{1} << PassEvalEnd(pass)) | (uint64_t{1} << PassResolveEnd(pass));
           if (layer.id != s.pass_begin + pass || layer.width == 0 || layer.height == 0
-              || (s.written & required) != required) {
+              || (s.written & required) != required || (layer.edit_reused && (s.written & eval_start) != 0)) {
             complete = false;
           }
         }
-        if (complete) {
-          Stats next{.width = s.width, .height = s.height, .valid = true, .passes = s.passes,
+        if (complete || (s.group_edit_reused && (s.written & (uint64_t{1} << kSlotCopyBackEnd)) != 0)) {
+          Stats next{.width = s.width, .height = s.height, .valid = true, .group_edit_reused = s.group_edit_reused, .passes = s.passes,
                      .state = SampleState::VALID, .sequence = s.sequence, .measured_ns = NowNs(),
                      .identity = s.comparison.identity,
                      .recorded_ns = static_cast<int64_t>(s.comparison.recorded_ns)};

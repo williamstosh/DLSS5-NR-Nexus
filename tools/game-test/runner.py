@@ -571,9 +571,10 @@ class Session:
             if 'unexpected' in normalized_text and 'token_' in normalized_text:
                 self.event('script_compilation_error', ocr_text=text)
                 raise RuntimeError('script_compilation_error')
-            if ('读取游戏' in text and '退出游戏' in text
-                    and ('新游戏' in text or (script_startup and '游戏模组' in text
-                                             and ('更新亮点' in text or '制作人员' in text)))):
+            script_title = (script_startup and '游戏模组' in text
+                            and (('读取游戏' in text and ('更新亮点' in text or '制作人员' in text))
+                                 or ('设置游戏模组更新亮点制作人员退出游戏' in text)))
+            if '退出游戏' in text and (('读取游戏' in text and '新游戏' in text) or script_title):
                 self.ui_state = 'main_menu'
                 self.status['startup'] = ('ocr_title_confirmed_for_script_bridge' if script_startup
                                           else 'main_menu_confirmed')
@@ -1350,8 +1351,12 @@ def recover_owned(cfg, out, owned, *, capture_stopped=False):
 
 
 def summarize_motion(recording):
-    """Verify sampled JPEGs and their smaller playback before releasing source frames."""
+    """Verify sampled JPEGs and their playback before releasing source frames."""
     record = json.loads(recording.read_text(encoding='utf-8'))
+    preview_width = record.get('preview_width', 1280)
+    if type(preview_width) is not int or not 64 <= preview_width <= 1920:
+        raise ValueError('Motion preview_width must be an integer from 64 to 1920')
+    preview_height = round(preview_width * 720 / 1280)
     frames = record['frames']
     if record['status'] != 'complete' or len(frames) < 2:
         raise ValueError('Motion recording is incomplete; preserve source frames')
@@ -1376,7 +1381,7 @@ def summarize_motion(recording):
                 if image.size != (record['width'], record['height']) or image.mode != 'RGB':
                     raise ValueError(f'Motion source format mismatch: {index}')
                 sample = image.copy()
-                sample.thumbnail((1280, 720), Image.Resampling.LANCZOS)
+                sample.thumbnail((preview_width, preview_height), Image.Resampling.LANCZOS)
                 images.append(sample)
             sources.append(source)
         with preview.open('xb') as stream:
@@ -1394,7 +1399,7 @@ def summarize_motion(recording):
             source_recording=recording.name, source_sha256=sha(recording), source_hashes_verified=True,
             preview=preview.name, preview_sha256=sha(preview), frame_count=len(frames),
             duration_ms=durations, preview_size=list(images[0].size),
-            limitation='Reduced SDR sampling preview; original resolution and native game FPS are not preserved'))
+            limitation='SDR sampling preview; resolution may be reduced and native game FPS is not preserved'))
         return sources
     finally:
         for image in images:

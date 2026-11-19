@@ -124,6 +124,35 @@ const auto RunProfileRuntimeCases = [&](const std::filesystem::path& outputdir) 
     Check(profile::active == index, ("Requested populated Slot becomes active: " + profile::notice).c_str());
   };
 
+  {
+    namespace adapter = runtime::preset_ui;
+    namespace presets = renodx::addons::dlss5::presets;
+    const auto before = adapter::Capture(presets::Scope::FULL, Json::object());
+    runtime::kSetEditReuse.Commit(1.f);
+    const auto shared = adapter::Capture(presets::Scope::QUALITY, {{"name", "Synthetic x2 request"}});
+    presets::Document imported;
+    Check(presets::Parse(presets::Serialize(shared), &imported)
+              && imported.settings["NREditReuse"] == true,
+          "Quality capture and share-text round trip retain the x2 boolean request.");
+    runtime::kSetEditReuse.Commit(0.f);
+    Check(adapter::Apply(imported, false, true, &error) && runtime::edit_reuse_enabled.load(),
+          "Applying a shared quality preset restores its x2 request.");
+    Check(adapter::Undo(&error) && !runtime::edit_reuse_enabled.load(),
+          "Undo import restores the prior x2 request through the batch transaction.");
+    runtime::kSetEditReuse.Commit(1.f);
+    Check(adapter::Apply({.scope = presets::Scope::QUALITY, .settings = {{"NRIntensity", 0.75f}}}, false, false, &error)
+              && runtime::edit_reuse_enabled.load(),
+          "An older partial preset without x2 preserves the current request.");
+    const auto* rule = presets::FindRule("NREditReuse");
+    for (const Json invalid : {Json(0), Json(1), Json("true"), Json(nullptr)}) {
+      Check(rule != nullptr && !adapter::ValidateValue(*rule, invalid),
+            "The x2 preset field rejects non-boolean values.");
+    }
+    Check(adapter::DefaultsDocument(0).settings["NREditReuse"] == false,
+          "Quality page defaults restore the disabled x2 request.");
+    Check(adapter::Apply(before, true, false, &error), "Restore fixture after x2 preset checks.");
+  }
+
   // Exercise the registry adapters directly; no GPU execution is claimed here.
   {
     namespace adapter = runtime::preset_ui;
@@ -243,12 +272,26 @@ const auto RunProfileRuntimeCases = [&](const std::filesystem::path& outputdir) 
   }
   seed();
 
+  auto legacy_custom = profile::Snapshot();
+  legacy_custom.erase("NREditReuse");
+  profile::Assign(3, legacy_custom);
+  settle();
+  Check(!disk().slots[3].snapshot.contains("NREditReuse"),
+        "An older custom Slot can remain stored without an x2 field.");
+  commit(runtime::kSetEditReuse, 1.f);
+  select(3);
+  Check(runtime::edit_reuse_enabled.load(), "Selecting an older custom Slot preserves the missing x2 request.");
+  select(0);
+  Check(!runtime::edit_reuse_enabled.load(), "An unmodified official template uses the disabled x2 default.");
+  seed();
+
   for (int index = 0; index < 3; ++index) {
     select(index);
     commit(runtime::kSetIntensity, 0.25f + static_cast<float>(index) * 0.125f);
     commit(runtime::kSetPassStage[2], static_cast<float>(index + 1));
     commit(*runtime::preset_ui::FindSetting("NRPass4ResolutionMode"), static_cast<float>(index));
     commit(*runtime::preset_ui::FindSetting("NRPass4ResolutionScale"), 0.5f + static_cast<float>(index) * 0.125f);
+    commit(runtime::kSetEditReuse, index == 1 ? 1.f : 0.f);
     settle();
   }
   commit(runtime::kSetIntensity, 0.5625f);
@@ -266,13 +309,19 @@ const auto RunProfileRuntimeCases = [&](const std::filesystem::path& outputdir) 
     Check(profile::Snapshot()["NRPass4ResolutionMode"] == index
               && profile::Snapshot()["NRPass4ResolutionScale"] == 0.5f + static_cast<float>(index) * 0.125f,
           "Each official Slot preserves inactive pass resolution overrides.");
+    Check(profile::Snapshot()["NREditReuse"] == (index == 1),
+          "Official Slot switching restores the persisted x2 request for each Slot.");
   }
   commit(runtime::kSetStackPasses, 1.f);
   commit(runtime::kSetPassPreset[2], 2.f);
   commit(runtime::kSetPassStage[2], 3.f);
   commit(runtime::kSetPassIntensity[2], 0.375f);
+  commit(runtime::kSetEditReuse, 1.f);
   settle();
   const auto captured = profile::Snapshot();
+  Check(profile::active == 2 && captured["NREditReuse"] == true
+            && disk().slots[2].overrides.value("NREditReuse", false),
+        "Editing x2 before custom capture saves the active official Max override too.");
   Check(captured["NRPasses"] == 1 && captured["NRPass4Preset"] == 2 && captured["NRPass4Intensity"] == 0.375f
             && captured["NRPass4Stage"] == 3,
         "Snapshot retains settings for disabled Pass 4.");
@@ -298,6 +347,11 @@ const auto RunProfileRuntimeCases = [&](const std::filesystem::path& outputdir) 
     Check(profile::Snapshot()["NRPass4ResolutionMode"] == (index < 3 ? index : 2)
               && profile::Snapshot()["NRPass4ResolutionScale"] == (index < 3 ? 0.5f + static_cast<float>(index) * 0.125f : 0.75f),
           "All six Slots restore inactive pass resolution mode and scale.");
+    const bool expected_reuse = index != 0;
+    std::printf("x2 profile slot=%d current=%s expected=%s\n", index,
+                runtime::edit_reuse_enabled.load() ? "true" : "false", expected_reuse ? "true" : "false");
+    Check(profile::Snapshot()["NREditReuse"] == expected_reuse,
+          "All six Slots restore their saved official or captured custom x2 request.");
   }
   Check(disk().slots[5].snapshot["NRPass4Preset"] == 2, "Real worker persists disabled pass selection.");
 

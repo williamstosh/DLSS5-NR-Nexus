@@ -45,7 +45,8 @@ def budget(target):
 
 
 def prepare_target(source, destination, hold_seconds=600, exit_reserve_seconds=60,
-                   stage_timeout_seconds=60, startup_exit_seconds=None, development_control=False):
+                   stage_timeout_seconds=60, startup_exit_seconds=None, development_control=False,
+                   ui_validation=False):
     """Write a new local target copy; never modify the user's original target."""
     source = Path(source).resolve(strict=True)
     destination = Path(destination).resolve()
@@ -58,10 +59,11 @@ def prepare_target(source, destination, hold_seconds=600, exit_reserve_seconds=6
     options.update(hold_seconds=hold_seconds, exit_reserve_seconds=exit_reserve_seconds,
                    stage_timeout_seconds=stage_timeout_seconds, startup_exit_seconds=overhead)
     target.update(capture_hold_seconds=hold_seconds, run_timeout=hold_seconds + overhead, static_capture=options)
-    if type(development_control) is not bool:
-        raise ValueError('development_control must be Boolean')
-    if development_control:
-        target['static_capture']['dev_control'] = True
+    if type(development_control) is not bool or type(ui_validation) is not bool:
+        raise ValueError('development_control and ui_validation must be Boolean')
+    if development_control and ui_validation:
+        raise ValueError('UI validation cannot be combined with development_control')
+    options.update(dev_control=not ui_validation, ui_validation=ui_validation)
     budget(target)
     development_options(target)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -73,8 +75,14 @@ def prepare_target(source, destination, hold_seconds=600, exit_reserve_seconds=6
 def development_options(target):
     options = target.get('static_capture', {})
     enabled = options.get('dev_control', False)
-    if type(enabled) is not bool:
-        raise ValueError('static_capture.dev_control must be Boolean')
+    ui_validation = options.get('ui_validation', False)
+    if type(enabled) is not bool or type(ui_validation) is not bool:
+        raise ValueError('static_capture.dev_control and ui_validation must be Boolean')
+    if enabled and ui_validation:
+        raise ValueError('UI validation cannot be combined with dev_control')
+    if not enabled and not ui_validation:
+        raise ValueError('Manual functional operations require explicit static_capture.ui_validation=true; '
+                         'use dev_control=true for scripted configuration')
     stages = options.get('stages')
     if stages is not None:
         if not enabled or not isinstance(stages, list) or not 3 <= len(stages) <= 4:
@@ -263,6 +271,16 @@ def capture(run, entry_script=None):
             dump(run / 'static-events.json', events)
 
         client = development_client(window, record) if enabled else None
+        if client:
+            try:
+                observed = client.status(deadline=min(collection_deadline, time.monotonic() + 3))
+            except (OSError, TimeoutError) as error:
+                raise RuntimeError('Development control unavailable; static configuration not executed') from error
+            snapshot = observed.get('state', {})
+            if (observed.get('ok') is not True or observed.get('status') != 'observed'
+                    or snapshot.get('available') is False
+                    or type(snapshot.get('settings', {}).get('NeuralUplift')) is not bool):
+                raise RuntimeError('Development control unavailable; static configuration not executed')
 
         def begin_cleanup(reason, current):
             nonlocal state, cleanup, active
@@ -448,17 +466,20 @@ def main():
     parser.add_argument('--exit-reserve-seconds', type=int, default=60, help='Target preparation only')
     parser.add_argument('--stage-timeout-seconds', type=int, default=60, help='Target preparation only')
     parser.add_argument('--startup-exit-seconds', type=int, help='Target preparation only')
-    parser.add_argument('--development-control', action='store_true', help='Prepare an opt-in development-pipe target')
+    parser.add_argument('--development-control', action='store_true', help='Prepare a development-pipe target (default)')
+    parser.add_argument('--ui-validation', action='store_true', help='Prepare an explicit player UI validation target')
     args = parser.parse_args()
     if args.prepare_target:
         if args.run or not args.output_target:
             parser.error('--prepare-target requires --output-target and no run directory')
         target = prepare_target(args.prepare_target, args.output_target, args.hold_seconds,
-            args.exit_reserve_seconds, args.stage_timeout_seconds, args.startup_exit_seconds, args.development_control)
+            args.exit_reserve_seconds, args.stage_timeout_seconds, args.startup_exit_seconds, args.development_control,
+            args.ui_validation)
         print(json.dumps(budget(target)))
     elif args.run and not args.output_target:
         preparation_options = {'--hold-seconds', '--exit-reserve-seconds',
-                               '--stage-timeout-seconds', '--startup-exit-seconds', '--development-control'}
+                               '--stage-timeout-seconds', '--startup-exit-seconds', '--development-control',
+                               '--ui-validation'}
         if preparation_options.intersection(arg.split('=')[0] for arg in sys.argv[1:]):
             parser.error('Prepare the target copy first; capture uses only its recorded budgets')
         capture(args.run)

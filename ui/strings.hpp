@@ -165,6 +165,24 @@ inline constexpr const char* kFgFallbackShort = "Pre-FG fallback observed";
 inline constexpr const char* kFgUpscaledShort = "NR fallback to Upscaled";
 inline constexpr const char* kFgMixedShort = "Mixed Pre-FG and fallback";
 inline constexpr const char* kStackCost = "Additional passes increase NR GPU work.";
+inline constexpr const char* kEditReuse = "x2 edit reuse (experimental)";
+inline constexpr const char* kEditReuseTip =
+    "Refresh NR once per two base frames and reproject its edit onto the next frame to reduce GPU work. Upscaling still runs every frame; x2 is separate from the FG multiplier. Turn off if motion, lighting or frame pacing looks worse.";
+inline constexpr const char* kEditReuseCompatibility =
+    "D3D12 Render and Upscaled support x2 for one or more passes at the same hook point. "
+    "Present x2 uses one pass with a single XeFG backbuffer or verified scRGB Game frames.";
+inline constexpr const char* kEditReuseRequirements =
+    "Reuse needs compatible HDR color and matching depth, motion and jitter. "
+    "With temporal filtering, multi-pass x2 needs full resolution in every pass.";
+inline constexpr const char* kEditReuseFallback =
+    "Render, Upscaled and XeFG Present use per-frame NR if reuse is unavailable. Ordinary Present keeps the original frame without a verified same-frame source. Invalid reprojected pixels keep their current color.";
+inline constexpr const char* kEditReuseMonitorRequested = "x2 requested";
+inline constexpr const char* kEditReuseMonitorEffective = "Effective edit reuse";
+inline constexpr const char* kEditReuseMonitorActive = "x2 active";
+inline constexpr const char* kEditReuseMonitorPerFrame = "Per-frame NR";
+inline constexpr const char* kEditReuseMonitorOriginal = "Original frame";
+inline constexpr const char* kEditReuseMonitorWaiting = "Waiting for first valid frame";
+inline constexpr const char* kEditReuseMonitorHdr10SourceUnconfirmed = "The source of the current HDR10 frame is unconfirmed.";
 inline constexpr const char* kFgUnknownMultiplierTip = "FG activity and multiplier are separate observations. Native FG/XeFG can bypass Present cadence sampling; an unknown multiplier does not mean FG is off.";
 
 inline constexpr const char* kHookTips[] = {kHookRenderTip, kHookUpscaledTip, kHookPresentTip};

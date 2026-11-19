@@ -55,6 +55,8 @@ struct MonitorInputs {
   std::array<MonitorPass, 4> passes;
   unsigned pass_count = 0;
   std::string current_conclusion;
+  std::string edit_reuse_effective;
+  std::string edit_reuse_reason;
   std::string gpu_scope;
   std::string current_limit;
   // Same monotonic nanosecond clock as recent.last_sample_ns; zero means unknown.
@@ -440,6 +442,10 @@ inline MonitorActions DrawRuntimeMonitor(const MonitorInputs& inputs, MonitorSta
     const auto field = [](const char* label, const std::string& value) {
       ImGui::TextWrapped("%s: %s", Tr(label), value.empty() ? Tr("Pending confirmation") : value.c_str());
     };
+    if (!inputs.edit_reuse_effective.empty()) {
+      ImGui::TextWrapped("%s | %s", Tr(text::kEditReuseMonitorRequested), inputs.edit_reuse_effective.c_str());
+      if (!inputs.edit_reuse_reason.empty()) ImGui::TextWrapped("%s", inputs.edit_reuse_reason.c_str());
+    }
     if (!inline_mode) {
       ImGui::SeparatorText(Tr("Execution chain"));
       const unsigned count = (std::min)(inputs.pass_count, 4u);

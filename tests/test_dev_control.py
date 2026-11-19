@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import struct
 import subprocess
+import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -51,6 +53,43 @@ class ClientTests(unittest.TestCase):
         self.assertNotEqual(*[r['id'] for r in self.transport.requests])
         self.assertEqual(dev.NamedPipeTransport(42).path, r'\\.\pipe\nr-nexus-dev-42')
 
+    def test_compact_marker_replies_preserve_the_native_process_identity_contract(self):
+        for action, accepted, status in (('arm', True, 'armed'), ('stop', True, 'stopped'),
+                                         ('status', True, 'observed'), ('invalid', False, 'rejected')):
+            with self.subTest(action=action):
+                def compact(request):
+                    return dict(id=request['id'], ok=accepted, status=status,
+                                state=dict(pid=42, process_created='123'),
+                                marker=dict(recorded=0, frame_limit=128, duration_ms=3000))
+                client = self.client(compact)
+                deadline = time.monotonic() + 1
+                request = dict(id='marker-' + action, op='fg_output_marker', action=action)
+                actual = (client._request(request, deadline) if action == 'status'
+                          else client._mutation(request, deadline))
+                self.assertEqual(actual['state'], dict(pid=42, process_created='123'))
+                self.assertEqual(actual['ok'], accepted)
+                self.assertEqual(actual['status'], status)
+                self.assertEqual(self.transport.requests, [request])
+                self.assertEqual(self.transport.deadlines, [deadline])
+                self.assertNotIn('settings', actual['state'])
+
+    def test_compact_marker_replies_reject_missing_or_mismatched_identity(self):
+        identities = (None, {}, dict(pid=42), dict(pid=43, process_created='123'),
+                      dict(pid=42, process_created='wrong'), dict(pid=True, process_created='123'))
+        for accepted in (True, False):
+            for identity in identities:
+                with self.subTest(accepted=accepted, identity=identity):
+                    def compact(request):
+                        result = dict(id=request['id'], ok=accepted,
+                                      status='observed' if accepted else 'rejected', marker={})
+                        if identity is not None:
+                            result['state'] = identity
+                        return result
+                    client = self.client(compact)
+                    with self.assertRaisesRegex(dev.ProtocolError, 'process identity mismatch'):
+                        client._request(dict(id='marker-identity', op='fg_output_marker', action='status'),
+                                        time.monotonic() + 1)
+
     def test_confirmation_is_explicit_and_uses_exact_proposal_with_new_id(self):
         def proposal(request):
             result = response(request)
@@ -65,6 +104,44 @@ class ClientTests(unittest.TestCase):
         self.assertNotEqual(initial['id'], confirmed['id'])
         self.assertEqual(confirmed['confirm'], dict(identity=response(initial)['identity'], changes={'NRPasses': 2}))
         self.assertEqual(self.transport.deadlines[-2], self.transport.deadlines[-1])
+
+    def test_reset_nr_has_no_setting_or_confirmation_parameters(self):
+        client = self.client()
+        deadline = time.monotonic() + 1
+        actual = client.reset_nr(deadline=deadline)
+        self.assertEqual(self.transport.requests, [dict(id=actual['id'], op='reset_nr')])
+        self.assertEqual(self.transport.deadlines, [deadline])
+        for arguments in ({'key': 'NeuralUplift'}, {'value': True}, {'confirm': True}, {'mode': 1}):
+            with self.subTest(arguments=arguments), self.assertRaises(TypeError):
+                client.reset_nr(**arguments)
+        with self.assertRaises(TypeError):
+            client.reset_nr(True)
+        self.assertEqual(len(self.transport.requests), 1)
+
+    def test_lost_reset_receipt_only_queries_the_original_request(self):
+        for recover in (True, False):
+            with self.subTest(recover=recover):
+                original = {}
+                def action(request):
+                    if request['op'] == 'reset_nr':
+                        original.update(request)
+                        raise OSError('synthetic reset response disconnect')
+                    result = response(request)
+                    result['receipt'] = dict(response(original), status='accepted') if recover else None
+                    return result
+                client = self.client(action)
+                deadline = time.monotonic() + 1
+                if recover:
+                    actual = client.reset_nr(deadline=deadline)
+                    self.assertEqual(actual['id'], original['id'])
+                    self.assertEqual(actual['status'], 'accepted')
+                else:
+                    with self.assertRaises(dev.OutcomeUnknown) as error:
+                        client.reset_nr(deadline=deadline)
+                    self.assertEqual(error.exception.request_id, original['id'])
+                self.assertEqual(self.transport.requests, [original,
+                    dict(id=self.transport.requests[-1]['id'], op='status', query_id=original['id'])])
+                self.assertEqual(self.transport.deadlines, [deadline, deadline])
 
     def test_adaptive_feature_experiment_has_a_dedicated_integer_request_and_shared_deadline(self):
         client = self.client()
@@ -337,6 +414,78 @@ class ClientTests(unittest.TestCase):
         self.assertLessEqual(len(self.transport.requests), 4)
 
 
+class JournalCliTests(unittest.TestCase):
+    def test_reset_cli_uses_the_real_client_encoding_and_rejects_extra_parameters(self):
+        original_client = dev.Client
+        transport = Transport(lambda request: dict(response(request), status='accepted'))
+
+        def client(pid, created, **kwargs):
+            return original_client(pid, created, transport=transport, identity_probe=lambda _: '123', **kwargs)
+
+        base = ['dev_control.py', '--pid', '42', '--process-created', '123']
+        with mock.patch.object(sys, 'argv', base + ['reset-nr']), \
+                mock.patch.object(dev, 'Client', side_effect=client), mock.patch('builtins.print'):
+            self.assertEqual(dev.main(), 0)
+        self.assertEqual(transport.requests, [dict(id=transport.requests[0]['id'], op='reset_nr')])
+        transport.requests.clear()
+        for extra in (['NeuralUplift'], ['NeuralUplift', 'true'], [''], ['--confirm'],
+                      ['--query-id', 'original'], ['--tail-frames', '2']):
+            with self.subTest(extra=extra), mock.patch.object(sys, 'argv', base + ['reset-nr'] + extra), \
+                    mock.patch.object(dev, 'Client', side_effect=client), mock.patch.object(sys, 'stderr'), \
+                    self.assertRaises(SystemExit) as error:
+                dev.main()
+            self.assertEqual(error.exception.code, 2)
+        self.assertEqual(transport.requests, [])
+
+    def observe_timeout(self, action, clock=None):
+        original_client = dev.Client
+        transport = Transport(action)
+
+        def client(pid, created, **kwargs):
+            return original_client(pid, created, transport=transport,
+                                   identity_probe=lambda _: '123', **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'journal.jsonl'
+            argv = ['dev_control.py', '--pid', '42', '--process-created', '123',
+                    '--timeout', '.05', '--journal', str(path), 'status']
+            with mock.patch.object(sys, 'argv', argv), mock.patch.object(dev, 'Client', side_effect=client):
+                if clock is None:
+                    with self.assertRaises(TimeoutError):
+                        dev.main()
+                else:
+                    with mock.patch.object(dev.time, 'monotonic', side_effect=lambda: clock[0]), \
+                            mock.patch.object(dev.time, 'sleep', side_effect=lambda s: clock.__setitem__(0, clock[0] + s)):
+                        with self.assertRaises(TimeoutError):
+                            dev.main()
+            return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
+
+    def test_busy_receipts_survive_final_status_timeout(self):
+        def busy(request):
+            result = response(request)
+            result['state'].update(available=False, reason='runtime_busy')
+            return result
+
+        entries = self.observe_timeout(busy, [1.0])
+        receipts = [entry for entry in entries if entry['kind'] == 'dev_control_receipt']
+        self.assertGreater(len(receipts), 0)
+        self.assertTrue(all(entry['response']['state']['reason'] == 'runtime_busy' for entry in receipts))
+        self.assertEqual(entries[-1]['kind'], 'dev_control_error')
+        self.assertEqual(entries[-1]['error'], 'Development control deadline expired')
+        self.assertIn('status', entries[-1]['traceback'])
+        self.assertTrue(all(entry['time'].endswith('+00:00') for entry in entries))
+
+    def test_transport_timeout_is_distinct_from_received_busy_replies(self):
+        def stalled(_):
+            raise TimeoutError('Development pipe I/O deadline expired')
+
+        entries = self.observe_timeout(stalled)
+        self.assertEqual([entry['kind'] for entry in entries], ['dev_control_request', 'dev_control_error'])
+        self.assertEqual(entries[-1]['error'], 'Development pipe I/O deadline expired')
+        self.assertIn('exchange', entries[-1]['traceback'])
+        self.assertEqual(entries[-1]['pid'], 42)
+
+
 class FakeKernel:
     """Overlapped API mock with deliberately partial stream reads and writes."""
     def __init__(self, reply=b'{}', pending=False, server=42, read_pending=False):
@@ -399,6 +548,19 @@ class NativeTransportMockTests(unittest.TestCase):
         self.assertEqual(native.output, struct.pack('<I', 2) + b'{}')
         self.assertEqual(native.open_flags, 0x40000000)
         self.assertIn(7, native.closed)
+
+    def test_reset_nr_encodes_one_parameterless_native_mutation(self):
+        reply = dict(id='reset-wire', ok=True, status='accepted', reason='nr_reset_requested',
+                     evidence='reset_requested_not_model_or_gpu_completion',
+                     configuration_generation_before=7, configuration_generation_after=8,
+                     state=dict(pid=42, process_created='123'))
+        native = FakeKernel(json.dumps(reply).encode())
+        client = dev.Client(42, '123', identity_probe=lambda _: '123')
+        with mock.patch.object(dev, '_kernel', return_value=native), \
+                mock.patch.object(dev.uuid, 'uuid4', return_value='reset-wire'):
+            self.assertEqual(client.reset_nr(), reply)
+        payload = b'{"id":"reset-wire","op":"reset_nr"}'
+        self.assertEqual(native.output, struct.pack('<I', len(payload)) + payload)
 
     def test_read_size_cap_and_wrong_server_pid_are_rejected(self):
         native = FakeKernel()

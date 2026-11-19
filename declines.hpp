@@ -206,6 +206,7 @@ enum class NrDeclineReason : uint8_t {
   kStageResolutionBackend,
   kControlMaskSubmissionsUnproven,
   kControlMaskReuseNotReady,
+  kPresentBaseUnproven,
   kCount,
 };
 inline std::atomic_uint64_t nr_decline_counts[
@@ -283,6 +284,7 @@ inline const char* const kNrDeclineNames[
     "independent pass working resolution requires the DX11/DX12 path",
     "retained ControlMask work has an unknown submission proof",
     "ControlMask recording objects are not ready for reuse",
+    "ordinary Present x2 could not verify the backbuffer and guides as one base frame",
 };
 // Short tags for the periodic telemetry line (same order).
 inline const char* const kNrDeclineTags[
@@ -301,6 +303,7 @@ inline const char* const kNrDeclineTags[
     "screenshot_wait", "vk_owner_mismatch", "stage_plan", "stage_predecessor",
     "stage_resolution", "stage_resolution_backend",
     "control_mask_unproven", "control_mask_reuse_not_ready",
+    "present_base_unproven",
 };
 // A split chain still belongs to one source SR evaluate. Preserve per-group
 // observations separately and publish one terminal when its outer call ends.

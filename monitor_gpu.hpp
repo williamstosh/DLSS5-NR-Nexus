@@ -5,6 +5,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -12,6 +13,55 @@
 #include "stage_plan.hpp"
 
 namespace renodx::addons::dlss5 {
+
+enum class PresentEditReuseRejection : uint8_t { NONE, SOURCE_UNCONFIRMED, HDR10_SOURCE_UNCONFIRMED };
+
+inline std::atomic_uint64_t present_edit_reuse_monitor_revision{0};
+
+// Owned by the swapchain's PresentStream under runtime_mutex. An early
+// rejection has no source sequence, submission or completion to publish.
+struct PresentEditReuseMonitor {
+  const void* device = nullptr;
+  const void* backbuffer = nullptr;
+  uint64_t generation = 0;
+  uint64_t attempt = 0;
+  uint64_t configuration = 0;
+  uint64_t reset_epoch = 0;
+  int64_t rejected_ns = 0;
+  PresentEditReuseRejection reason = PresentEditReuseRejection::NONE;
+
+  void Reject(const void* device_identity, const void* backbuffer_identity,
+              uint64_t stream_generation, uint64_t present_attempt, PresentEditReuseRejection rejection,
+              int64_t now, uint64_t current_configuration, uint64_t current_reset_epoch) {
+    if (device_identity == nullptr || backbuffer_identity == nullptr || present_attempt == 0 || now <= 0
+        || rejection == PresentEditReuseRejection::NONE
+        || (generation == stream_generation && present_attempt <= attempt)) return;
+    const bool changed = device != device_identity || generation != stream_generation || reason != rejection
+        || configuration != current_configuration || reset_epoch != current_reset_epoch;
+    *this = {.device = device_identity, .backbuffer = backbuffer_identity, .generation = stream_generation,
+             .attempt = present_attempt, .configuration = current_configuration, .reset_epoch = current_reset_epoch,
+             .rejected_ns = now, .reason = rejection};
+    if (changed) {
+      present_edit_reuse_monitor_revision.fetch_add(1, std::memory_order_release);
+    }
+  }
+
+  void Deliver(uint64_t stream_generation, uint64_t present_attempt) {
+    if (rejected_ns == 0 || generation != stream_generation || present_attempt <= attempt) return;
+    attempt = present_attempt;
+    // The next refresh must not use x2 proof from before the rejection.
+    if (reason != PresentEditReuseRejection::NONE) {
+      reason = PresentEditReuseRejection::NONE;
+      present_edit_reuse_monitor_revision.fetch_add(1, std::memory_order_release);
+    }
+  }
+
+  void Reset(uint64_t stream_generation = 0) {
+    if (stream_generation == 0 && rejected_ns == 0) return;
+    *this = {};
+    present_edit_reuse_monitor_revision.fetch_add(1, std::memory_order_release);
+  }
+};
 
 struct MonitorGpuTotal {
   bool valid = false;

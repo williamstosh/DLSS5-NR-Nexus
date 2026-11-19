@@ -12,14 +12,14 @@ param(
     [string]$DetoursLibrary,
     [string]$PythonExecutable,
     [ValidateSet('Auto','Quick','Full','None')][string]$UiPreview = 'Auto',
-    [ValidateSet('inline-restore-roi','control-mask','control-mask-safety','control-mask-safety-hardware','control-mask-capture','control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','control-mask-native-ngx-fg','gpu-pass-diagnostics','native-required-menu','native-owner-idle','native-options-resume','native-options-delayed','native-guide-contract','present-guide-models','adaptive-fg-service','adaptive-inline','vulkan-recorded-use-contract','native-present-decision','trace-metadata','stage-chain','stage-resolution','stage-resolution-hardware','same-stage-resolution','same-stage-resolution-hardware','render-stage-resolution','render-stage-resolution-hardware','present-stage-resolution','present-stage-resolution-hardware','native-prefg-resolution','native-prefg-resolution-hardware','native-frame-identity','same-stage-model-pair','same-stage-mixed-pair','source-lifecycle','feature-switch','feature-switch-hardware','f5-mixed','present-chain','present-chain-hardware','present-chain-scrgb','present-chain-hdr10','native-full','native-full-hardware','nr-edit-reuse-contracts','nr-edit-reuse-xefg-contracts','nr-fg-output-marker')]
+    [ValidateSet('inline-restore-roi','control-mask','control-mask-safety','control-mask-safety-hardware','control-mask-capture','control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','control-mask-native-ngx-fg','gpu-pass-diagnostics','native-required-menu','native-owner-idle','native-options-resume','native-options-delayed','native-guide-contract','present-guide-models','adaptive-fg-service','adaptive-inline','vulkan-recorded-use-contract','native-present-decision','trace-metadata','stage-chain','stage-resolution','stage-resolution-hardware','same-stage-resolution','same-stage-resolution-hardware','render-stage-resolution','render-stage-resolution-hardware','present-stage-resolution','present-stage-resolution-hardware','native-prefg-resolution','native-prefg-resolution-hardware','native-frame-identity','same-stage-model-pair','same-stage-mixed-pair','source-lifecycle','feature-switch','feature-switch-hardware','f5-mixed','present-chain','present-chain-hardware','present-chain-scrgb','present-chain-hdr10','native-full','native-full-hardware','nr-edit-reuse-contracts','nr-edit-reuse-contracts-public','nr-edit-reuse-render-contracts','nr-edit-reuse-present-contracts','nr-edit-reuse-present-diagnostic','nr-edit-reuse-present-native','nr-edit-reuse-xefg-contracts','nr-edit-reuse-native-contracts','native-frame-source','nr-fg-output-marker','fg-consumer-capture','xefg-present-probe')]
     [string[]]$NativeCase = @(),
     [switch]$VulkanNativeNgx,
     [string]$NativeNgxProjectIdPath,
     [string]$NativeNgxSdkLibraryDirectory,
     [string]$NativeNgxRuntimePath = $(if ($env:NR_NEXUS_NGX_RUNTIME_DIR) { Join-Path $env:NR_NEXUS_NGX_RUNTIME_DIR 'nvngx_dlssnr.dll' }),
     [string]$NativeNgxSrRuntimePath,
-    [ValidateSet('dlaa','sr','stage-resolution','same-stage-resolution','render-stage-resolution','present-stage-resolution','adaptive','adaptive-hardware','adaptive-native-ngx','adaptive-native-snippet')][string[]]$BridgeCase = @(),
+    [ValidateSet('dlaa','sr','stage-resolution','same-stage-resolution','render-stage-resolution','present-stage-resolution','ordinary-watchdog','adaptive','adaptive-hardware','adaptive-native-ngx','adaptive-native-snippet')][string[]]$BridgeCase = @(),
     [switch]$BuildOnly,
     [ValidateSet('Standard','Full','Acceptance')][string]$RetentionMode = $(if ($env:NR_NEXUS_TEST_RETENTION) { $env:NR_NEXUS_TEST_RETENTION } else { 'Standard' }),
     [switch]$SoftwareOnly
@@ -63,7 +63,12 @@ if ($BuildOnly -and @($Suite | Where-Object { $_ -in @('config','constants','lif
     throw '-BuildOnly requires explicitly selecting native/policy/scope/fg-xefg/fg-native/bridge-motion suites.'
 }
 if ($NativeCase.Count -and $Suite -notcontains 'fg-native') { throw '-NativeCase requires -Suite fg-native (or all).' }
-if (@($NativeCase | Where-Object { $_ -in @('nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-jitter') }).Count -and -not $BuildOnly -and -not $PythonExecutable) {
+$renderEditCache = $env:NR_NEXUS_TEST_NR_CACHE_ROUTE -ceq 'render' -and $NativeCase -contains 'nr-edit-reuse-cache'
+$presentEditNative = $NativeCase -contains 'nr-edit-reuse-present-native'
+if ($presentEditNative -and $SoftwareOnly) { throw 'Native NGX Present x2 requires a hardware D3D12 device.' }
+if (@($NativeCase | Where-Object {
+            $_ -in @('nr-edit-reuse-history','nr-edit-reuse-jitter') -or ($_ -eq 'nr-edit-reuse-cache' -and -not $renderEditCache)
+        }).Count -and -not $BuildOnly -and -not $PythonExecutable) {
     throw 'NR edit experiments require -PythonExecutable with NumPy and Pillow for paired analysis before raw cleanup.'
 }
 if ($VulkanNativeNgx -and $Suite -notcontains 'vulkan-control-mask') { throw '-VulkanNativeNgx requires -Suite vulkan-control-mask (or all).' }
@@ -72,7 +77,10 @@ $bridgeNativeNgx = @($BridgeCase | Where-Object { $_ -in @('adaptive-native-ngx'
 if ($SoftwareOnly -and @($BridgeCase | Where-Object { $_ -in @('adaptive-hardware','adaptive-native-ngx','adaptive-native-snippet') }).Count) {
     throw 'Explicit Bridge hardware cases conflict with -SoftwareOnly; no hardware or WARP fallback is permitted.'
 }
-$usesNativeNgx = $bridgeNativeNgx -or $VulkanNativeNgx -or (@($NativeCase | Where-Object { $_ -in @('control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','control-mask-native-ngx-fg') }).Count -gt 0)
+$nativeNgxCases = @('control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb',
+    'control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','control-mask-native-ngx-fg',
+    'nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','nr-edit-reuse-present-native')
+$usesNativeNgx = $bridgeNativeNgx -or $VulkanNativeNgx -or (@($NativeCase | Where-Object { $_ -in $nativeNgxCases }).Count -gt 0)
 if (@($Suite | Where-Object { $_ -in @('fg-native','vulkan-control-mask','bridge-motion') }).Count -gt 0 -and ($usesNativeNgx -or $NativeNgxSdkLibraryDirectory)) {
     if (-not $NativeNgxSdkLibraryDirectory -or
         -not (Test-Path -LiteralPath (Join-Path $NativeNgxSdkLibraryDirectory 'nvsdk_ngx_s.lib') -PathType Leaf)) {
@@ -82,10 +90,10 @@ if (@($Suite | Where-Object { $_ -in @('fg-native','vulkan-control-mask','bridge
 }
 if ($usesNativeNgx) {
     if (-not $NativeNgxProjectIdPath -or -not (Test-Path -LiteralPath $NativeNgxProjectIdPath -PathType Leaf)) {
-        throw 'native NGX ControlMask cases require -NativeNgxProjectIdPath to an existing ProjectID file.'
+        throw 'Selected native NGX cases require -NativeNgxProjectIdPath to an existing ProjectID file.'
     }
     if (-not $NativeNgxRuntimePath -or -not (Test-Path -LiteralPath $NativeNgxRuntimePath -PathType Leaf)) {
-        throw 'native NGX ControlMask cases require -NativeNgxRuntimePath or NR_NEXUS_NGX_RUNTIME_DIR.'
+        throw 'Selected native NGX cases require -NativeNgxRuntimePath or NR_NEXUS_NGX_RUNTIME_DIR.'
     }
     $NativeNgxProjectIdPath = (Resolve-Path -LiteralPath $NativeNgxProjectIdPath).Path
     $NativeNgxRuntimePath = (Resolve-Path -LiteralPath $NativeNgxRuntimePath).Path
@@ -94,6 +102,12 @@ if ($usesNativeNgx) {
     }
     if ($bridgeNativeNgx -and (-not $NativeNgxSrRuntimePath -or -not (Test-Path -LiteralPath $NativeNgxSrRuntimePath -PathType Leaf))) {
         throw 'Bridge native NGX requires the existing SR Runtime via -NativeNgxSrRuntimePath.'
+    }
+    if ($renderEditCache -and (-not $NativeNgxSrRuntimePath -or -not (Test-Path -LiteralPath $NativeNgxSrRuntimePath -PathType Leaf))) {
+        throw 'Native NGX Render x2 requires the existing SR Runtime via -NativeNgxSrRuntimePath.'
+    }
+    if ($presentEditNative -and (-not $NativeNgxSrRuntimePath -or -not (Test-Path -LiteralPath $NativeNgxSrRuntimePath -PathType Leaf))) {
+        throw 'Native NGX Present x2 requires the existing SR Runtime via -NativeNgxSrRuntimePath.'
     }
 }
 if ($BridgeCase -and $Suite -notcontains 'bridge-motion') { throw '-BridgeCase requires -Suite bridge-motion (or all).' }
@@ -166,11 +180,14 @@ foreach ($item in $Suite) {
         $arguments += @('/bigobj','/Gy','/Gw','/DNDEBUG','/DRESHADE_ADDON=1',
             "/I$ShaderIncludeDirectory", "/I$HostRoot/external/DLSS/include",
             "/I$HostRoot/external/json/include", "/I$HostRoot/external/frozen/include", "/I$HostRoot/external/gtl/include")
-        if ($item -eq 'fg-native' -and ($NativeCase -contains 'inline-restore-roi' -or $NativeCase -contains 'nr-edit-reuse-contracts')) {
+        if ($item -eq 'fg-native' -and (@($NativeCase | Where-Object { $_ -in @('inline-restore-roi','nr-edit-reuse-contracts','nr-edit-reuse-native-contracts','native-frame-source') }).Count -gt 0)) {
             $arguments += '/DNR_NEXUS_DEV_CONTROL'
         }
-        if ($item -eq 'fg-native' -and $NativeCase -contains 'nr-fg-output-marker') {
-            $arguments += @('/DNR_NEXUS_DEV_CONTROL','/DNR_NEXUS_TEST_FG_OUTPUT_PROBE')
+        if ($item -eq 'fg-native' -and @($NativeCase | Where-Object { $_ -in @('nr-fg-output-marker','fg-consumer-capture','xefg-present-probe') }).Count -gt 0) {
+            $arguments += '/DNR_NEXUS_DEV_CONTROL'
+        }
+        if ($item -eq 'fg-native' -and $NativeCase -contains 'xefg-present-probe') {
+            $arguments += '/DNR_NEXUS_TEST_XEFG_PRESENT_PROBE'
         }
         if ($item -eq 'vulkan-control-mask') { $arguments += "/I$VulkanIncludeDirectory" }
         $link += @('user32.lib','gdi32.lib','ole32.lib','psapi.lib')
@@ -239,7 +256,7 @@ foreach ($item in $Suite) {
             }
         } elseif ($item -eq 'fg-native' -and $NativeCase.Count) {
             foreach ($case in $NativeCase) {
-                if ($case -in @('control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','control-mask-native-ngx-fg')) {
+                if ($case -in $nativeNgxCases) {
                     $runtimeLink = Join-Path $directory 'nvngx_dlssnr.dll'
                     $srRuntimeLink = if ($NativeNgxSrRuntimePath) { Join-Path $directory 'nvngx_dlss.dll' } else { $null }
                     if (Test-Path -LiteralPath $runtimeLink) { throw "Runtime link target already exists: $runtimeLink" }
@@ -268,7 +285,8 @@ foreach ($item in $Suite) {
                             }
                             & $PythonExecutable (Join-Path $PSScriptRoot 'offline/sr_jitter.py') --input $directory
                             if ($LASTEXITCODE -ne 0) { throw 'SR jitter calibration failed or is inconclusive; see sr-jitter-analysis.json.' }
-                        } elseif ($case -in @('nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost')) {
+                        } elseif ($case -in @('nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost') -and
+                                  -not ($renderEditCache -and $case -eq 'nr-edit-reuse-cache')) {
                             $cacheCostExperiment = $case -eq 'nr-edit-reuse-cost'
                             $cacheExperiment = $case -in @('nr-edit-reuse-cache','nr-edit-reuse-cost')
                             $conditionVariable = if ($cacheExperiment) { 'NR_NEXUS_TEST_NR_CACHE_CONDITION' } else { 'NR_NEXUS_TEST_NR_HISTORY_CONDITION' }
@@ -312,6 +330,21 @@ foreach ($item in $Suite) {
                         if (Test-Path -LiteralPath $runtimeLink) { Remove-Item -LiteralPath $runtimeLink -Force }
                         if ($srRuntimeLink -and (Test-Path -LiteralPath $srRuntimeLink)) { Remove-Item -LiteralPath $srRuntimeLink -Force }
                     }
+                } elseif ($case -eq 'fg-consumer-capture') {
+                    $consumerPassed = $false
+                    try {
+                        Invoke-TestProcess $exe $directory $case @("--$case") -DeferFailureCleanup
+                        $consumerPassed = $true
+                    } finally {
+                        $consumerRaw = Join-Path $directory 'fg-consumer-evidence'
+                        if (Test-Path -LiteralPath $consumerRaw) {
+                            @(Get-ChildItem -LiteralPath $consumerRaw -Filter '*.raw' -File | ForEach-Object {
+                                Register-TestDisposable -Directory $directory -Path $_.FullName -Kind 'fg-consumer-raw'
+                                @{path=[IO.Path]::GetRelativePath($directory, $_.FullName); bytes=$_.Length; sha256=(Get-FileHash -LiteralPath $_.FullName).Hash}
+                            }) | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $directory 'fg-consumer-raw-inputs.json') -Encoding utf8
+                        }
+                        if (-not $consumerPassed) { Complete-TestOutput $directory -Outcome Failed }
+                    }
                 } else {
                     Invoke-TestProcess $exe $directory $case @("--$case")
                 }
@@ -323,6 +356,11 @@ foreach ($item in $Suite) {
                 Invoke-TestProcess $exe $directory 'control-mask' @('--control-mask')
                 Invoke-TestProcess $exe $directory 'adaptive-fg-service' @('--adaptive-fg-service')
                 Invoke-TestProcess $exe $directory 'adaptive-inline' @('--adaptive-inline')
+                Invoke-TestProcess $exe $directory 'present-guide-models' @('--present-guide-models')
+            }
+            if ($item -eq 'vulkan-control-mask') {
+                Invoke-TestProcess $exe $directory 'evaluate-recovery' @('--evaluate-recovery')
+                Invoke-TestProcess $exe $directory 'evaluate-recovery-hdr' @('--evaluate-recovery-hdr')
             }
         }
         if ($item -eq 'vulkan-control-mask' -and $VulkanNativeNgx) {

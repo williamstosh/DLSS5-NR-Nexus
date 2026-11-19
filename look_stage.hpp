@@ -46,6 +46,10 @@ enum : uint32_t {
   kRootHistoryOut = 4,  // u9: root UAV
   kRootMotion = 5,      // t4: one motion-vector view
   kRootParameterCount = 6,
+  kRootAnchorDepth = kRootParameterCount,  // t5: source depth
+  kRootAnchor,                            // u11: raw anchor buffer
+  kRootAnchorConstants,                   // b1: guide raster and jitter
+  kRootAnchorParameterCount,
 };
 
 // The UAV table, relative to its base.
@@ -278,8 +282,9 @@ inline Constants MakeConstants(const Settings& s, const Frame& f) {
 inline HRESULT SerializeRootSignature(
     PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serialize,
     ID3DBlob** blob,
-    ID3DBlob** errors) {
-  D3D12_DESCRIPTOR_RANGE ranges[3]{};
+    ID3DBlob** errors,
+    bool capture_anchor = false) {
+  D3D12_DESCRIPTOR_RANGE ranges[4]{};
   ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
   ranges[0].NumDescriptors = 4;
   ranges[0].BaseShaderRegister = 0;
@@ -289,7 +294,7 @@ inline HRESULT SerializeRootSignature(
   ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
   ranges[2].NumDescriptors = 1;
   ranges[2].BaseShaderRegister = 4;
-  D3D12_ROOT_PARAMETER parameters[kRootParameterCount]{};
+  D3D12_ROOT_PARAMETER parameters[kRootAnchorParameterCount]{};
   parameters[kRootSrvSet].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
   parameters[kRootSrvSet].DescriptorTable.NumDescriptorRanges = 1;
   parameters[kRootSrvSet].DescriptorTable.pDescriptorRanges = &ranges[0];
@@ -306,8 +311,17 @@ inline HRESULT SerializeRootSignature(
   parameters[kRootMotion].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
   parameters[kRootMotion].DescriptorTable.NumDescriptorRanges = 1;
   parameters[kRootMotion].DescriptorTable.pDescriptorRanges = &ranges[2];
+  if (capture_anchor) {
+    ranges[3] = {.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV, .NumDescriptors = 1, .BaseShaderRegister = 5};
+    parameters[kRootAnchorDepth].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[kRootAnchorDepth].DescriptorTable = {1, &ranges[3]};
+    parameters[kRootAnchor].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    parameters[kRootAnchor].Descriptor.ShaderRegister = 11;
+    parameters[kRootAnchorConstants].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[kRootAnchorConstants].Constants = {1, 0, 4};
+  }
   D3D12_ROOT_SIGNATURE_DESC desc{};
-  desc.NumParameters = kRootParameterCount;
+  desc.NumParameters = (capture_anchor ? kRootAnchorParameterCount : kRootParameterCount);
   desc.pParameters = parameters;
   return serialize(&desc, D3D_ROOT_SIGNATURE_VERSION_1, blob, errors);
 }
@@ -318,6 +332,21 @@ struct Pipeline {
   ID3D12PipelineState* band = nullptr;
   ID3D12PipelineState* upsample = nullptr;
   ID3D12PipelineState* trace = nullptr;
+  ID3D12RootSignature* anchor_root_signature = nullptr;
+  ID3D12PipelineState* compose_anchor = nullptr;
+  bool compose_anchor_attempted = false;
+};
+
+struct AnchorCapture {
+  struct Constants {
+    uint32_t guide_size[2];
+    float guide_offset[2];
+  };
+  static_assert(sizeof(Constants) == 4 * sizeof(uint32_t));
+
+  D3D12_GPU_DESCRIPTOR_HANDLE depth{};
+  D3D12_GPU_VIRTUAL_ADDRESS anchor = 0;
+  Constants constants{};
 };
 
 // Everything one pass's look dispatches bind.  Every table and root
@@ -337,10 +366,11 @@ struct Bindings {
 inline void Bind(
     ID3D12GraphicsCommandList* list, const Pipeline& pipeline,
     ID3D12PipelineState* program, const Bindings& bindings,
-    D3D12_GPU_DESCRIPTOR_HANDLE srv_set, const Constants& constants) {
+    D3D12_GPU_DESCRIPTOR_HANDLE srv_set, const Constants& constants,
+    const AnchorCapture* capture = nullptr) {
   ID3D12DescriptorHeap* heaps[] = {bindings.heap};
   list->SetDescriptorHeaps(1, heaps);
-  list->SetComputeRootSignature(pipeline.root_signature);
+  list->SetComputeRootSignature(capture != nullptr ? pipeline.anchor_root_signature : pipeline.root_signature);
   list->SetPipelineState(program);
   list->SetComputeRootDescriptorTable(kRootSrvSet, srv_set);
   list->SetComputeRootDescriptorTable(kRootUavTable, bindings.uav_table);
@@ -349,6 +379,11 @@ inline void Bind(
   list->SetComputeRootUnorderedAccessView(kRootHistoryIn, bindings.history_in);
   list->SetComputeRootUnorderedAccessView(kRootHistoryOut, bindings.history_out);
   list->SetComputeRootDescriptorTable(kRootMotion, bindings.motion);
+  if (capture != nullptr) {
+    list->SetComputeRootDescriptorTable(kRootAnchorDepth, capture->depth);
+    list->SetComputeRootUnorderedAccessView(kRootAnchor, capture->anchor);
+    list->SetComputeRoot32BitConstants(kRootAnchorConstants, sizeof(capture->constants) / 4, &capture->constants, 0);
+  }
 }
 
 // Every look pass reads what the previous one wrote through UAVs only, so a
@@ -364,7 +399,7 @@ inline void UavBarrierAll(ID3D12GraphicsCommandList* list) {
 // N' in kUavOutput (UAV state; the caller transitions it for the resolve).
 inline void RecordCompose(
     ID3D12GraphicsCommandList* list, const Pipeline& pipeline,
-    const Bindings& bindings, Constants constants) {
+    const Bindings& bindings, Constants constants, const AnchorCapture* capture = nullptr) {
   if ((constants.flags & kFlagBands) != 0u) {
     Constants band = constants;
     band.size[0] = (constants.nr_size[0] + 1) / 2;
@@ -379,7 +414,8 @@ inline void RecordCompose(
   constants.mode = 0;
   constants.size[0] = constants.nr_size[0];
   constants.size[1] = constants.nr_size[1];
-  Bind(list, pipeline, pipeline.compose, bindings, bindings.codec_set, constants);
+  Bind(list, pipeline, capture != nullptr ? pipeline.compose_anchor : pipeline.compose,
+       bindings, bindings.codec_set, constants, capture);
   list->Dispatch((constants.size[0] + 15) / 16, (constants.size[1] + 15) / 16, 1);
   UavBarrierAll(list);
 }

@@ -4,12 +4,13 @@
  */
 #pragma once
 
-#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
+#if defined(NR_NEXUS_DEV_CONTROL)
 
 #include <d3d12sdklayers.h>
 #include <DirectXPackedVector.h>
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -20,7 +21,7 @@
 #include "d3d12_test_gpu.hpp"
 
 // Include beside nr_edit_reuse_gpu_cases.hpp in the existing native fixture.
-// This dedicated Run uses that fixture's Gpu/transfer/submission helpers only.
+// This Run uses that fixture's Gpu/transfer/submission helpers only.
 namespace nr_fg_output_marker_gpu_cases {
 namespace marker = renodx::addons::dlss5::fg_output_marker;
 namespace submission = renodx::addons::dlss5::submission;
@@ -117,6 +118,60 @@ inline int Run() {
         Check(submission::ResourceReleasable(object), "completed and retired marker recording releases GPU objects");
       }
     }
+    auto pq_target = texture(DXGI_FORMAT_R10G10B10A2_UNORM, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto pq_transfer = gpu.CreateTextureTransfer(pq_target.Get());
+    std::vector<uint32_t> pq_original(static_cast<size_t>(width) * height);
+    for (uint32_t pixel = 0; pixel < width * height; ++pixel) {
+      pq_original[pixel] = (pixel & 1023u) | (((pixel * 3u) & 1023u) << 10)
+          | (((pixel * 7u) & 1023u) << 20) | ((pixel & 3u) << 30);
+    }
+    gpu.Transition(pq_target.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    gpu.UploadTexture(pq_target.Get(), pq_transfer, reinterpret_cast<const uint8_t*>(pq_original.data()),
+        pq_original.size() * sizeof(uint32_t), width * 4);
+    gpu.Transition(pq_target.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    marker::State pq_state;
+    const auto pq_code = [](double nits) {
+      const auto powered = std::pow(nits / 10000., 2610. / 16384.);
+      const auto encoded = std::pow((3424. / 4096. + (2413. / 128.) * powered)
+              / (1. + (2392. / 128.) * powered), 2523. / 32.);
+      return static_cast<uint32_t>(std::lround(encoded * 1023.));
+    };
+    for (uint32_t phase = 0; phase < 2; ++phase) {
+      Check(marker::Record(gpu.device.Get(), gpu.list.Get(), &pq_state, pq_target.Get(), width, height, 2, phase != 0)
+              == marker::Result::RECORDED,
+          "record an explicitly PQ-encoded RGB10A2 marker phase");
+      Check(!submission::ResourceReleasable(&pq_state), "PQ marker owner remains tracked until its recording completes");
+      gpu.Transition(pq_target.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      gpu.RecordTextureReadback(pq_target.Get(), pq_transfer);
+      gpu.Transition(pq_target.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      gpu.Submit();
+      const auto bytes = gpu.ReadTexture(pq_transfer);
+      Check(bytes.size() == pq_original.size() * sizeof(uint32_t), "PQ readback retains the full packed target");
+      const std::array<uint8_t, 4> rows{0xB3, 0x4E, 0xD6, static_cast<uint8_t>(phase == 0 ? 0x99 : 0x59)};
+      for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+          const auto pixel = static_cast<size_t>(y) * width + x;
+          uint32_t actual = 0;
+          std::memcpy(&actual, bytes.data() + pixel * 4, 4);
+          const bool inside = x >= region.x && x < region.x + region.width
+              && y >= region.y && y < region.y + region.height;
+          if (!inside) {
+            Check(actual == pq_original[pixel], "PQ marker leaves every exterior packed RGBA word unchanged");
+            continue;
+          }
+          const auto column = (x - region.x) / 16;
+          const auto row = (y - region.y) / 16;
+          const bool high = ((rows[row] >> column) & 1u) != 0;
+          const auto code = pq_code(high ? 320. : 10.);
+          const auto expected = code | (code << 10) | (code << 20) | (pq_original[pixel] & 0xC0000000u);
+          Check(actual == expected, "PQ marker encodes neutral 320/10-nit cells while preserving every two-bit alpha value");
+        }
+      }
+      Check(submission::ResourceReleasable(&pq_state), "completed PQ recording releases its stable marker owner");
+      for (auto* object : pq_state.Objects()) {
+        Check(object != nullptr && submission::ResourceReleasable(object), "completed PQ recording releases every marker object");
+      }
+    }
     marker::State rejected;
     auto other_format = texture(DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     auto no_uav = texture(DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
@@ -128,7 +183,7 @@ inline int Run() {
         "marker rejects FP16 resources without UAV capability");
     Check(marker::Record(gpu.device.Get(), gpu.list.Get(), &rejected, target.Get(), width, height, 2, false)
             == marker::Result::NOT_SUPPORTED,
-        "marker rejects PQ instead of changing the encoding proxy");
+        "marker rejects the mismatched PQ/FP16 contract without changing the encoding proxy");
     Check(marker::Record(gpu.device.Get(), gpu.list.Get(), &rejected, target.Get(), width - 1, height, 1, false)
             == marker::Result::NOT_SUPPORTED && !rejected.attempted,
         "marker requires the complete target extent and rejects before creating GPU state");

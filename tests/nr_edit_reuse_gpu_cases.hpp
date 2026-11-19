@@ -12,6 +12,7 @@
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -38,6 +39,17 @@ NVSDK_NGX_Result NVSDK_CONV MirrorSr(ID3D12GraphicsCommandList* list, const NVSD
     const NVSDK_NGX_Parameter* parameters, PFN_NVSDK_NGX_ProgressCallback_C) {
   return native::HookedEvaluateFeatureSlot<0>(list, handle, parameters, nullptr);
 }
+
+#if defined(NR_NEXUS_DEV_CONTROL)
+inline int64_t benchmark_inner_return_ns = 0;
+
+NVSDK_NGX_Result NVSDK_CONV MirrorSrCpp(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle,
+    const NVSDK_NGX_Parameter* parameters, PFN_NVSDK_NGX_ProgressCallback callback) {
+  const auto result = native::HookedEvaluateFeatureSlot<1>(list, handle, parameters, callback);
+  benchmark_inner_return_ns = native::SteadyNowNs();
+  return result;
+}
+#endif
 
 NVSDK_NGX_Result NVSDK_CONV NeutralModel(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle,
     const NVSDK_NGX_Parameter* parameters, PFN_NVSDK_NGX_ProgressCallback callback) {
@@ -74,6 +86,13 @@ NVSDK_NGX_Result NVSDK_CONV ConstantModel(ID3D12GraphicsCommandList* list, const
       pixels.size() * sizeof(uint16_t), static_cast<UINT>(desc.Width) * 8);
   native::Transition(list, output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   return result;
+}
+
+template <uint32_t NeutralPreset>
+NVSDK_NGX_Result NVSDK_CONV OneEditedLayer(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle,
+    const NVSDK_NGX_Parameter* parameters, PFN_NVSDK_NGX_ProgressCallback callback) {
+  const auto evaluate = (stage_execution_cases::presets.at(handle) == NeutralPreset ? NeutralModel : ConstantModel);
+  return evaluate(list, handle, parameters, callback);
 }
 
 int Run() {
@@ -260,6 +279,60 @@ int Run() {
     Check(std::isfinite(composed_x) && std::fabs(composed_x - 80000.f) < .1f,
           "RG32 composed motion retains finite 80000 raw units for an in-bounds 0.8-pixel displacement");
     std::cout << "PASS edit reuse WARP shader: untouched refresh validity, full sentinel overwrite, known edit, scaled reprojection, edge/depth/color rejection, neutral exact RGBA\n";
+
+    // A fractional shift over texture detail can match the warped reference
+    // exactly while differing from every individual tap.
+    std::fill(depth_values.begin(), depth_values.end(), .5f);
+    for (size_t pixel = 0; pixel < motion_values.size() / 2; ++pixel) {
+      motion_values[pixel * 2] = -.25f;
+    }
+    for (uint32_t pixel = 0; pixel < width * height; ++pixel) {
+      const float source_luminance = (pixel % width % 2 == 0 ? .125f : .5f);
+      for (uint32_t channel = 0; channel < 3; ++channel) {
+        proxy_values[pixel * 4 + channel] = encode(source_luminance);
+        neural_values[pixel * 4 + channel] = encode(1.5f * source_luminance);
+      }
+    }
+    upload(depth.Get(), depth_values, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, guide_width * 4);
+    upload(proxy.Get(), proxy_values, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, width * 16);
+    upload(neural.Get(), neural_values, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, width * 16);
+    Check(reuse::Record(gpu.device.Get(), gpu.list.Get(), &state, inputs, reuse::Phase::CAPTURE),
+          "capture an edited texture before a half-pixel shift");
+    const float warped_reference = .3125f;
+    const float half_confidence_ratio = .5f * (std::exp2(-.125f) + std::exp2(-.375f));
+    const float lighter = warped_reference / half_confidence_ratio;
+    const float darker = warped_reference * half_confidence_ratio;
+    for (uint32_t pixel = 0; pixel < width * height; ++pixel) {
+      for (uint32_t channel = 0; channel < 3; ++channel) {
+        float current = warped_reference;
+        if (pixel == 4) current = .75f;
+        if (pixel == 5) current = lighter;
+        if (pixel == 6) current = darker;
+        if (pixel == 7 && channel == 0) current *= std::exp2(.38f);
+        proxy_values[pixel * 4 + channel] = encode(current);
+      }
+    }
+    depth_values[guide_width + 2] = .9f;
+    upload(depth.Get(), depth_values, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, guide_width * 4);
+    upload(proxy.Get(), proxy_values, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, width * 16);
+    upload(motion.Get(), motion_values, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, guide_width * 8);
+    planes = apply();
+    std::array<float, 4> shifted_edit{};
+    std::memcpy(shifted_edit.data(), planes.first.data() + 2 * 16, 16);
+    Check(std::fabs(shifted_edit[0] - encode(1.5f * warped_reference)) < 3e-5f
+              && shifted_edit[3] == .375f,
+          "the matching bilinear color of translated detail keeps its edit and current alpha");
+    for (const size_t rejected : {size_t{4}, size_t{7}, size_t{2 * width + 4}}) {
+      Check(std::memcmp(planes.second.data() + rejected * 16, original_values.data() + rejected * 4, 16) == 0,
+            "real color discontinuity and same-color depth reveal keep bit-exact original RGBA");
+    }
+    for (size_t pixel = 5; pixel <= 6; ++pixel) {
+      const float current = (pixel == 5 ? lighter : darker);
+      std::array<float, 4> attenuated{};
+      std::memcpy(attenuated.data(), planes.first.data() + pixel * 16, 16);
+      Check(std::fabs(attenuated[0] - encode(current * std::sqrt(1.5f))) < 3e-5f && attenuated[3] == .375f,
+            "small moving color changes ease the edit symmetrically and preserve current alpha");
+    }
 
     for (const bool low_grid : {false, true}) {
       constexpr uint32_t code_width = 1024, alpha_count = 4;
@@ -599,6 +672,9 @@ int Run() {
     native::intensity = 1.f;
     native::preset = 2;
     native::edit_reuse_enabled = true;
+#if defined(NR_NEXUS_DEV_CONTROL)
+    native::edit_reuse_fg_experiment = false;
+#endif
     native::direct_api.module = GetModuleHandleW(nullptr);
     native::direct_api.create = CreateModel;
     native::direct_api.evaluate = NeutralModel;
@@ -670,14 +746,83 @@ int Run() {
     };
     for (uint32_t prefix = 0; prefix < native::kContractDebounceFrames + 8; ++prefix) frame(1);
     Check(native::features.at(owner).slots[0].edit_reuse != nullptr, "production wrapper establishes an edit anchor");
+#if defined(NR_NEXUS_DEV_CONTROL)
+    {
+      namespace benchmark = addon::control_mask_capture::benchmark;
+      namespace timers = addon::gpu_timers;
+      funnel_accounting_tests::Restore restore;
+      restore.Atomic(&native::gpu_timers_enabled);
+      restore.Atomic(&native::control_mask_use_core_context);
+      restore.Value(&timers::benchmark_observer);
+      restore.Value(&native::ngx_slot_real[0]);
+      restore.Value(&native::ngx_slot_real[1]);
+      native::gpu_timers_enabled = true;
+      native::control_mask_use_core_context = false;
+      timers::benchmark_observer = benchmark::ObserveTiming;
+      native::ngx_slot_real[0].evaluate = reinterpret_cast<void*>(MirrorSrCpp);
+      native::ngx_slot_real[1].evaluate = reinterpret_cast<void*>(CopySr);
+      Check(benchmark::Arm(2, 30, nullptr, nullptr), "arm a two-source measurement for the duplicate C++ export path");
+      for (size_t index = 0; index < 2; ++index) {
+        parameters.Set(NVSDK_NGX_Parameter_Reset, index == 0 ? 1 : 0);
+        gpu.list->ClearState(nullptr);
+        const auto recording = addon::submission::RecordingIdentity(gpu.list.Get());
+        const auto calls_before = model_calls;
+        Check(NVSDK_NGX_SUCCEED(native::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), owner, &parameters, nullptr)),
+            "outer game SR returns success through the inner C++ export");
+        // The production queue hook owns the proof. The generic fixture
+        // submit would register a second receipt and prune before the timer.
+        Check(SUCCEEDED(gpu.list->Close()), "nested benchmark recording close");
+        ID3D12CommandList* lists[]{gpu.list.Get()};
+        gpu.queue->ExecuteCommandLists(1, lists);
+        gpu.submission_pending = true;
+        Check(SUCCEEDED(gpu.queue->Signal(gpu.fence.Get(), ++gpu.serial)), "nested benchmark completion signal");
+        HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        Check(event != nullptr, "nested benchmark completion event");
+        const auto armed = gpu.fence->SetEventOnCompletion(gpu.serial, event);
+        const auto wait = (SUCCEEDED(armed) ? WaitForSingleObject(event, 10000) : WAIT_FAILED);
+        CloseHandle(event);
+        Check(wait == WAIT_OBJECT_0, "bounded nested benchmark completion");
+        gpu.submission_pending = false;
+        Check(SUCCEEDED(gpu.allocator->Reset()) && SUCCEEDED(gpu.list->Reset(gpu.allocator.Get(), nullptr)),
+            "nested benchmark recording reset");
+        native::DrainRetiredResources(true);
+        timers::Poll(true, false);
+        gpu.uploads.clear();
+        gpu.retained_resources.clear();
+        std::shared_lock lock(benchmark::state.mutex);
+        Check(benchmark::state.rows.size() == index + 1 && benchmark::state.frame_count == index + 1,
+            "publish one row per successful outer SR call");
+        const auto& row = benchmark::state.rows[index];
+        const bool refresh = index == 0;
+        Check(row.wrapper_finalized && row.frame.sr_success_ns >= benchmark_inner_return_ns
+                  && row.frame.source_sequence == index + 1 && row.frame.passes_recorded == 1
+                  && row.frame.delivery == (refresh ? benchmark::Delivery::kRefresh : benchmark::Delivery::kReuse)
+                  && row.frame.passes[0].calls == (refresh ? 1u : 0u)
+                  && model_calls - calls_before == (refresh ? 1u : 0u),
+            "join the inner refresh/reuse to the authoritative outer source timestamp");
+        Check(row.frame.recording != nullptr && row.frame.recording->list == recording.first
+                  && row.frame.recording->generation == recording.second && row.timing.valid && row.timing.samples == 1
+                  && row.timing.recorded_ns < benchmark_inner_return_ns,
+            "the nested writeback's completed GPU timer uses the exact source recording");
+      }
+      Check(benchmark::Stop("fixture_complete", nullptr, true), "finish the duplicate C++ export measurement");
+      benchmark::Tick(timers::NowNs(), false);
+      benchmark::write_pending = false;
+      std::unique_lock lock(benchmark::state.mutex);
+      benchmark::state.rows.clear();
+      benchmark::state.sources.clear();
+      benchmark::state.status = "idle";
+    }
+#endif
     Check(frame(1) == 1, "Reset forces a real NR refresh");
     auto anchor_state = native::features.at(owner).slots[0].edit_reuse;
     const auto generation = anchor_state->anchor_generation;
     const auto wrapper_anchor = read_buffer(anchor_state->anchor.Get());
+    const auto anchor_reuses = anchor_state->reuse_count;
     const auto before_reuses = native::edit_reuse_reuses.load();
     Check(frame(0, true, true) == 0 && native::edit_reuse_reuses.load() == before_reuses + 1,
           "nested mirrored source reuses once with zero actual NR calls");
-    Check(anchor_state == native::features.at(owner).slots[0].edit_reuse && anchor_state->reuse_count == 1
+    Check(anchor_state == native::features.at(owner).slots[0].edit_reuse && anchor_state->reuse_count == anchor_reuses + 1
               && anchor_state->anchor_generation == generation && read_buffer(anchor_state->anchor.Get()) == wrapper_anchor,
           "one reuse retains the exact refresh anchor and generation");
     auto neutral_final = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -687,6 +832,248 @@ int Run() {
           "production neutral reuse returns exact current half-float source and alpha");
     Check(frame(0) == 1, "the second following base frame refreshes rather than reusing a second time");
     Check(frame(1) == 1 && frame(1) == 1, "successive explicit Reset frames both run NR");
+    const auto set_native_fg_mode = [](bool enabled) {
+      namespace options = addon::fg::native_options;
+      funnel_accounting_tests::Restore substitutions;
+      substitutions.Value(&options::internal::state.real);
+      substitutions.Atomic(&options::internal::options_changed);
+      substitutions.Atomic(&options::internal::present_observed);
+      substitutions.Atomic(&options::internal::stopped);
+      options::internal::state.real = +[](const sl::ViewportHandle&, const sl::DLSSGOptions&) {
+        return sl::Result::eOk;
+      };
+      options::internal::stopped = false;
+      options::Configure(native::OnNativeFgOptions);
+
+      // The SDK can call SetOptions while the SR wrapper holds this lock.
+      addon::RuntimeLock lock(native::runtime_mutex);
+      Check(!native::native_fg_owns.load(), "Upscaled Options contrast starts without a native owner");
+      const bool changed = native::native_fg_public_off.load() == enabled;
+      const auto generation = native::native_fg_options_generation.load();
+      sl::DLSSGOptions request;
+      request.mode = (enabled ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff);
+      request.numFramesToGenerate = 1;
+      Check(options::internal::HookedSetOptions(sl::ViewportHandle{0}, request) == sl::Result::eOk
+                && native::native_fg_public_off.load() == !enabled
+                && native::native_fg_declaration.load() == (enabled ? native::NativeFgDeclaration::kOn
+                                                                   : native::NativeFgDeclaration::kOff)
+                && native::native_fg_options_generation.load() == generation + changed
+                && !native::native_fg_owns.load(),
+            "successful SetOptions updates only the native declaration interval without acquiring ownership");
+    };
+    {
+      native::direct_api.evaluate = ConstantModel;
+      auto& feature = native::features.at(owner);
+      const auto source_generation = feature.source_generation;
+      const auto configuration = native::configuration_generation.load();
+      auto reset_epoch = native::history_reset_epoch.load();
+      const auto models = native::nr_features_created;
+      const auto worksets = native::worksets_created;
+      const auto model = feature.slots[0].handle;
+      const auto anchor = feature.slots[0].edit_reuse;
+      auto anchor_generation = anchor->anchor_generation;
+      const auto reuses = native::edit_reuse_reuses.load();
+      const auto fallbacks = native::edit_reuse_fallbacks.load();
+      std::vector<uint8_t> refresh_pixels, anchor_pixels;
+      using Declaration = native::NativeFgDeclaration;
+      const std::array declarations{Declaration::kOff, Declaration::kUnknown, Declaration::kUnknown,
+          Declaration::kOff, Declaration::kOff, Declaration::kOn, Declaration::kOn, Declaration::kOff, Declaration::kOff};
+      for (size_t index = 0; index < declarations.size(); ++index) {
+        const auto declaration = declarations[index];
+        if (index >= 4) {
+          // Start with a refreshed Off frame and exercise the callback on both frame phases.
+          set_native_fg_mode(declaration == Declaration::kOn);
+        } else {
+          // Unknown models the absence of a public Options declaration.
+          native::native_fg_public_off = declaration == Declaration::kOff;
+          native::native_fg_declaration = declaration;
+        }
+        const bool refresh = index % 2 == 0;
+        const auto reuse_count = anchor->reuse_count;
+        const auto calls = frame(index == 0 ? 1 : 0);
+        if (index == 0) {
+          reset_epoch = native::history_reset_epoch.load();
+        }
+        std::cout << "OBS fixed-size Upscaled frame=" << index + 1
+                  << " declaration=" << (declaration == Declaration::kOff ? "Off" : (declaration == Declaration::kOn ? "On" : "Unknown"))
+                  << " model_calls=" << calls << " expected=" << (refresh ? 1 : 0)
+                  << " reuses=" << native::edit_reuse_reuses.load() - reuses << '\n';
+        Check(calls == (refresh ? 1u : 0u), "owner-free declaration changes preserve single-Pass cadence");
+        Check(feature.source_generation == source_generation && native::configuration_generation.load() == configuration
+                  && native::history_reset_epoch.load() == reset_epoch && feature.slots[0].handle == model
+                  && feature.slots[0].edit_reuse == anchor && native::nr_features_created == models
+                  && native::worksets_created == worksets && native::edit_reuse_fallbacks.load() == fallbacks,
+              "declaration-only changes preserve the live source, model, workset and edit cache");
+        if (refresh) {
+          Check(model_resets.back() == (index == 0 ? 1 : 0), "declaration-only changes add no NR History Reset");
+          ++anchor_generation;
+          anchor_pixels = read_buffer(anchor->anchor.Get());
+        } else {
+          Check(anchor->reuse_count == reuse_count + 1 && read_buffer(anchor->anchor.Get()) == anchor_pixels,
+                "declaration changes preserve the exact nonzero refresh anchor on reuse");
+        }
+        Check(anchor->valid && anchor->anchor_generation == anchor_generation
+                  && native::edit_reuse_reuses.load() == reuses + (index + 1) / 2,
+              "only refresh advances the anchor generation and each adjacent frame reuses once");
+        auto final = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        submit_commands("single-Pass declaration contrast readback");
+        const auto pixels = final.Pixels();
+        if (refresh) {
+          refresh_pixels = pixels;
+        }
+        bool nonneutral = false;
+        for (size_t pixel = 0; pixel < source_values.size() / 4; ++pixel) {
+          for (size_t channel = 0; channel < 3; ++channel) {
+            uint16_t refreshed, actual;
+            std::memcpy(&refreshed, refresh_pixels.data() + (pixel * 4 + channel) * 2, 2);
+            std::memcpy(&actual, pixels.data() + (pixel * 4 + channel) * 2, 2);
+            Check(std::fabs(DirectX::PackedVector::XMConvertHalfToFloat(actual)
+                      - DirectX::PackedVector::XMConvertHalfToFloat(refreshed)) < .003f,
+                  "declaration contrast reads back the refreshed nonzero RGB edit");
+            nonneutral |= std::fabs(DirectX::PackedVector::XMConvertHalfToFloat(actual)
+                - DirectX::PackedVector::XMConvertHalfToFloat(source_values[pixel * 4 + channel])) > .05f;
+          }
+          Check(std::memcmp(pixels.data() + pixel * 8 + 6, source_values.data() + pixel * 4 + 3, 2) == 0,
+                "declaration contrast preserves original alpha exactly");
+        }
+        Check(nonneutral, "declaration contrast output contains a distinguishable nonzero edit");
+      }
+      native::native_fg_public_off = false;
+      native::native_fg_declaration = native::NativeFgDeclaration::kUnknown;
+      native::create_contracts.at(owner).source_type_confirmed = false;
+      const auto rejected_reuses = native::edit_reuse_reuses.load();
+      Check(frame(0) == 1 && native::edit_reuse_reuses.load() == rejected_reuses && feature.slots[0].edit_reuse == nullptr,
+            "Unknown FG cannot authorize an unconfirmed source");
+      native::create_contracts.at(owner).source_type_confirmed = true;
+      Check(frame(1) == 1, "the confirmed source recovers its own anchor under Unknown FG");
+      ++native::create_contracts.at(owner).source_generation;
+      Check(frame(0) == 1 && native::edit_reuse_reuses.load() == rejected_reuses && feature.slots[0].edit_reuse == nullptr,
+            "Unknown FG cannot authorize a mismatched source generation");
+      native::create_contracts.at(owner).source_generation = source_generation;
+      Check(frame(1) == 1, "matching source generation restores refresh under Unknown FG");
+      native::native_fg_owns = true;
+      frame(0);
+      Check(native::edit_reuse_reuses.load() == rejected_reuses && feature.slots[0].edit_reuse == nullptr,
+            "Unknown FG cannot cross actual native Present-service ownership");
+      native::native_fg_owns = false;
+      Check(frame(1) == 1, "Upscaled ownership recovers with a refresh under Unknown FG");
+      native::native_fg_declaration = native::NativeFgDeclaration::kOn;
+      Check(frame(0) == 0
+                && native::edit_reuse_reuses.load() == rejected_reuses + 1 && feature.slots[0].edit_reuse != nullptr,
+            "native On declaration alone preserves fixed Upscaled reuse alongside the direct SR writer");
+      native::native_fg_public_off = true;
+      native::native_fg_declaration = native::NativeFgDeclaration::kOff;
+      native::direct_api.evaluate = NeutralModel;
+      Check(frame(1) == 1, "restore the neutral model with an explicit source Reset after the declaration contrast");
+      std::cout << "PASS single-Pass Upscaled Off/Unknown/Off and owner-free SetOptions Off/On/Off:"
+                   " model_calls=1/0/1/0/1 per contrast, stable history, nonzero RGB, exact alpha; evidence=WARP+MOCK\n";
+    }
+    {
+      auto& feature = native::features.at(owner);
+      auto& slot = feature.slots[0];
+      const auto b_anchor = slot.edit_reuse;
+      const auto before_auto_reuses = native::edit_reuse_reuses.load();
+      native::preset = 0;
+      Check(frame(0) == 0 && slot.nr_preset == 2 && slot.edit_reuse == b_anchor
+                && native::edit_reuse_reuses.load() == before_auto_reuses + 1,
+            "a live B anchor also accepts Auto when its resolved request is B");
+
+      const auto saved_style = native::style.load();
+      const auto saved_skin = native::skin_structure_strength.load();
+      const auto saved_skin_independent = native::skin_independent.load();
+      const auto saved_runtime = native::direct_runtime_requirements;
+      native::direct_runtime_requirements.file_version = "310.8.0.0";
+      native::direct_runtime_requirements.dual_models = false;
+      native::preset = 1;
+      native::detail_stability = 0;
+      native::use_auto_mask = true;
+      native::control_mask_enabled = true;
+      native::style = 2;
+      native::skin_structure_strength = .8f;
+      native::skin_independent = true;
+      native::mixed_present_fg_seen = true;
+      native::configuration_generation.fetch_add(1);
+      native::direct_api.evaluate = ConstantModel;
+      const ID3D12Resource* model_motion = nullptr;
+      model_parameter_observer = [&](const NVSDK_NGX_Handle* model, const NVSDK_NGX_Parameter* block) {
+        Check(model == slot.handle && slot.nr_preset == 1 && native::GetInt(block, "DLSSNR.UseAutoMask") == 1
+                  && native::GetD3D12Resource(block, "DLSSNR.ControlMask") == nullptr
+                  && native::GetUInt(block, "DLSSNR.Style") == 2u
+                  && native::GetFloat(block, "DLSSNR.Intensity") == 1.f
+                  && native::GetFloat(block, "DLSSNR.SkinStructureStrength") == .8f,
+              "legacy A refresh sends the configured steering and AutoMask while the Region Mask request is declined");
+        model_motion = native::GetD3D12Resource(block, "DLSSNR.MVec");
+      };
+      Check(frame(1) == 0, "A keeps the existing feature maturation frame");
+      const auto stabilized = native::look_stability_passes.load();
+      Check(frame(1) == 1 && slot.model_reset && slot.look_history.valid && slot.look_history.whole_edit,
+            "Upscaled Auto runs whole-edit Look on the real A model refresh and honors Reset");
+      const auto restarts = native::look_history_restarts.load();
+      const auto motion_missing = native::look_motion_missing_passes.load();
+      const auto refresh_history = slot.look_history.written;
+      const auto before_a_reuses = native::edit_reuse_reuses.load();
+      const auto before_a_fallbacks = native::edit_reuse_fallbacks.load();
+      std::vector<uint16_t> moving(16 * 16 * 2, 0);
+      for (size_t pixel = 0; pixel < moving.size() / 2; ++pixel) {
+        moving[pixel * 2] = DirectX::PackedVector::XMConvertFloatToHalf(.5f);
+      }
+      std::vector<float> revealed(16 * 16, .5f);
+      revealed[0] = .9f;
+      upload(wrapper_motion.Get(), moving, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 4);
+      upload(wrapper_depth.Get(), revealed, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 4);
+      submit_commands("A with active Look motion and reveal upload");
+      Check(frame(0) == 0 && native::mixed_present_fg_seen.load() && native::edit_reuse_reuses.load() == before_a_reuses + 1
+                && native::edit_reuse_fallbacks.load() == before_a_fallbacks,
+            "legacy A reuses on fixed Upscaled despite a declined Region Mask request and an old FG observation");
+      Check(slot.look_history.valid && slot.look_history.written != refresh_history
+                && native::look_stability_passes.load() == stabilized + 2
+                && native::look_history_restarts.load() == restarts
+                && native::look_motion_missing_passes.load() == motion_missing,
+            "A reuse advances Look with motion and without replaying the previous model Reset");
+      auto reused_final = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      submit_commands("A with active Look output readback");
+      const auto pixels = reused_final.Pixels();
+      Check(std::memcmp(pixels.data(), source_values.data(), 4 * sizeof(uint16_t)) == 0,
+            "the depth reveal selects exact current original RGBA after Look on the x2 reuse frame");
+      constexpr size_t interior = (8 * 16 + 8) * 4;
+      uint16_t edited_red = 0;
+      std::memcpy(&edited_red, pixels.data() + interior * sizeof(uint16_t), sizeof(edited_red));
+      Check(std::abs(DirectX::PackedVector::XMConvertHalfToFloat(edited_red)
+                     - DirectX::PackedVector::XMConvertHalfToFloat(source_values[interior])) > .05f,
+            "a valid interior pixel retains a visible edit through the active Look path");
+      Check(frame(0) == 1 && model_resets.back() == 0 && native::look_stability_passes.load() == stabilized + 3
+                && native::look_history_restarts.load() == restarts,
+            "next A refresh keeps adjacent-motion Look history while the model advances across the reused frame");
+      Check(slot.edit_reuse != nullptr && model_motion == slot.edit_reuse->composed_motion.Get(),
+            "only the model consumes the combined two-frame motion on the next refresh");
+      bool look_used_adjacent_motion = false;
+      for (const auto& [key, resources] : native::worksets) {
+        if (key.handle != owner) continue;
+        for (const auto* motion : resources.motion_views) {
+          if (motion == nullptr) continue;
+          Check(motion == wrapper_motion.Get(), "Look binds only current source motion on each base frame");
+          look_used_adjacent_motion = true;
+        }
+      }
+      Check(look_used_adjacent_motion, "Look has a current source motion binding");
+      Check(frame(1) == 1 && model_resets.back() == 1 && native::look_history_restarts.load() == restarts + 1,
+            "a current source Reset restarts Look and forces a model refresh");
+
+      model_parameter_observer = {};
+      native::direct_api.evaluate = NeutralModel;
+      native::direct_runtime_requirements = saved_runtime;
+      native::preset = 2;
+      native::detail_stability = 1;
+      native::use_auto_mask = false;
+      native::control_mask_enabled = false;
+      native::style = saved_style;
+      native::skin_structure_strength = saved_skin;
+      native::skin_independent = saved_skin_independent;
+      native::mixed_present_fg_seen = false;
+      upload(wrapper_motion.Get(), std::vector<uint16_t>(16 * 16 * 2, 0), NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 4);
+      upload(wrapper_depth.Get(), std::vector<float>(16 * 16, .5f), NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 4);
+      submit_commands("restore neutral wrapper guides");
+    }
     native::intensity = .75f;
     native::configuration_generation.fetch_add(1);
     const auto before_settings_reuses = native::edit_reuse_reuses.load();
@@ -752,18 +1139,18 @@ int Run() {
       auto reservation = std::make_shared<addon::adaptive_resolution::Session>();
       native::adaptive_resident_session = reservation;
       native::nr_adaptive_enabled = true;
-      Check(frame(0) == 1 && native::edit_reuse_reuses.load() == reuses_before_adaptive
-                && native::edit_reuse_fallbacks.load() == fallbacks_before_adaptive + 1,
-            "requested adaptive On retains per-frame NR even when its current route cannot be admitted");
+      Check(frame(0) == 0 && native::edit_reuse_reuses.load() == reuses_before_adaptive + 1
+                && native::edit_reuse_fallbacks.load() == fallbacks_before_adaptive,
+            "an adaptive request blocked by another source preserves reuse on the actual fixed workset");
       const auto session = native::features.at(owner).adaptive_session;
       Check(session != nullptr && native::features.at(owner).adaptive_cache == nullptr
                 && session->status.reason == addon::adaptive_resolution::Reason::PREPARING
-                && native::features.at(owner).slots[0].edit_reuse == nullptr && old_anchor.expired(),
-            "unavailable adaptive admission retires the completed old anchor without treating the request as Off");
+                && native::features.at(owner).slots[0].edit_reuse == old_anchor.lock(),
+            "the dormant adaptive request retains its status and the current fixed anchor");
       reservation.reset();
       native::adaptive_resident_session.reset();
       Check(native::EnsureLookPipeline(gpu.device.Get()), "warm existing Look programs before admitted adaptive recording");
-      Check(frame(0) >= 1 && native::edit_reuse_reuses.load() == reuses_before_adaptive
+      Check(frame(0) >= 1 && native::edit_reuse_reuses.load() == reuses_before_adaptive + 1
                 && native::features.at(owner).adaptive_cache != nullptr
                 && native::features.at(owner).slots[0].edit_reuse == nullptr,
             "an admitted adaptive On frame evaluates the model without edit reuse");
@@ -777,10 +1164,71 @@ int Run() {
             "adaptive Off retains its Session, retires standby slots and refreshes a new edit anchor");
       const auto fresh_anchor = native::features.at(owner).slots[0].edit_reuse;
       const auto fresh_generation = fresh_anchor->anchor_generation;
-      Check(frame(0) == 0 && native::edit_reuse_reuses.load() == reuses_before_adaptive + 1
+      Check(frame(0) == 0 && native::edit_reuse_reuses.load() == reuses_before_adaptive + 2
                 && native::features.at(owner).slots[0].edit_reuse == fresh_anchor
                 && fresh_anchor->anchor_generation == fresh_generation,
             "the retained disabled Session permits one reuse with zero model calls and no recursive recapture");
+    }
+    {
+      auto& slot = native::features.at(owner).slots[0];
+      const auto saved_upsample = native::look_upsample.load();
+      const auto refresh_at_size = [&](uint32_t size) {
+        for (uint32_t attempt = 0; attempt < 4; ++attempt) {
+          if (frame(1) == 1 && slot.edit_reuse != nullptr && slot.edit_reuse->valid
+              && slot.edit_reuse->width == size && slot.edit_reuse->height == size) return;
+        }
+        Check(false, "fixed Upscaled refresh reaches the committed edit grid");
+      };
+      native::direct_api.evaluate = ConstantModel;
+      native::look_upsample = addon::look::kUpsampleClassic;
+      native::nr_resolution_scale = .75f;
+      ++native::nr_resolution_commit_epochs[0];
+      refresh_at_size(12);
+      const auto low_anchor = slot.edit_reuse;
+      const auto low_reuses = native::edit_reuse_reuses.load();
+      std::vector<float> revealed(16 * 16, .5f);
+      for (uint32_t y = 0; y < 16; ++y) {
+        for (uint32_t x = 12; x < 16; ++x) {
+          revealed[y * 16 + x] = .9f;
+        }
+      }
+      upload(wrapper_depth.Get(), revealed, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 4);
+      submit_commands("fixed low-grid reveal upload");
+      Check(frame(0) == 0 && slot.edit_reuse == low_anchor && native::edit_reuse_reuses.load() == low_reuses + 1,
+            "fixed Upscaled with Classic Resolve reuses on the committed 12-to-16 grid");
+      auto low_final = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      submit_commands("fixed low-grid output readback");
+      const auto pixels = low_final.Pixels();
+      for (uint32_t y = 0; y < 16; ++y) {
+        for (uint32_t x = 12; x < 16; ++x) {
+          const size_t pixel = (y * 16 + x) * 4;
+          Check(std::memcmp(pixels.data() + pixel * sizeof(uint16_t), source_values.data() + pixel,
+                            4 * sizeof(uint16_t)) == 0,
+                "fixed low-grid Resolve and original selection restore exact RGBA in the reveal strip");
+        }
+      }
+      constexpr size_t interior = (7 * 16 + 7) * 4;
+      uint16_t edited_red = 0;
+      std::memcpy(&edited_red, pixels.data() + interior * sizeof(uint16_t), sizeof(edited_red));
+      Check(std::abs(DirectX::PackedVector::XMConvertHalfToFloat(edited_red)
+                     - DirectX::PackedVector::XMConvertHalfToFloat(source_values[interior])) > .05f,
+            "fixed low-grid output preserves a visible edit in the valid interior");
+      native::look_upsample = addon::look::kUpsampleAuto;
+      Check(frame(0) == 1 && slot.edit_reuse == nullptr && native::edit_reuse_reuses.load() == low_reuses + 1,
+            "actual low-grid Look transport continues to evaluate every frame");
+      native::look_upsample = addon::look::kUpsampleClassic;
+      native::detail_stability = 0;
+      Check(frame(0) == 1 && slot.edit_reuse == nullptr && native::edit_reuse_reuses.load() == low_reuses + 1,
+            "actual low-grid temporal Look continues to evaluate every frame");
+
+      native::detail_stability = 1;
+      native::look_upsample = saved_upsample;
+      native::nr_resolution_scale = 1.f;
+      ++native::nr_resolution_commit_epochs[0];
+      native::direct_api.evaluate = NeutralModel;
+      upload(wrapper_depth.Get(), std::vector<float>(16 * 16, .5f), NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 4);
+      submit_commands("restore fixed wrapper depth");
+      refresh_at_size(16);
     }
     {
       Check(!native::edit_reuse_adaptive_experiment.load(), "two-tier edit reuse experiment defaults to disabled");
@@ -1000,15 +1448,15 @@ int Run() {
       checked_frame(0, 0);
       Check(native::nr_features_created == models && native::worksets_created == allocations,
             "upper/lower/upper reuse creates no additional model or adaptive workset");
+      native::native_fg_public_off = false;
+      native::native_fg_declaration = native::NativeFgDeclaration::kUnknown;
+      checked_frame(0, 1);
+      Check(feature.slots[0].edit_reuse == nullptr && !feature.adaptive_session->paired_sampling,
+            "Unknown without a public Off receipt never admits two-tier reuse");
 #if defined(NR_NEXUS_DEV_CONTROL)
       {
         namespace xefg = addon::fg::xefg;
         namespace xi = xefg::internal;
-        native::native_fg_public_off = false;
-        native::native_fg_declaration = native::NativeFgDeclaration::kUnknown;
-        checked_frame(0, 1);
-        Check(feature.slots[0].edit_reuse == nullptr && !feature.adaptive_session->paired_sampling,
-              "Unknown without a public Off receipt never admits two-tier reuse");
         // Only the receipt is MOCK here. Public Enable/link acceptance is
         // exercised by fg_xefg_tests; recording, shaders and retirement use WARP.
         const bool stopped = xi::stopped.exchange(false);
@@ -1061,10 +1509,10 @@ int Run() {
         xi::state.contexts.clear();
         xi::sdk_detours_enabled = sdk_enabled;
         xi::stopped = stopped;
-        native::native_fg_public_off = true;
-        native::native_fg_declaration = native::NativeFgDeclaration::kOff;
       }
 #endif
+      native::native_fg_public_off = true;
+      native::native_fg_declaration = native::NativeFgDeclaration::kOff;
       native::edit_reuse_adaptive_experiment = false;
       const auto reuses = native::edit_reuse_reuses.load();
       checked_frame(0, 1);
@@ -1144,26 +1592,124 @@ int Run() {
       Check(native_environment.available && native_environment.provider == 1
                 && native_environment.context == reinterpret_cast<uintptr_t>(fg_handle),
           "successful On declaration and a unique known FG handle expose environment metadata only");
-      Check(frame(1) == 1 && native::features.at(owner).slots[0].edit_reuse == nullptr,
-          "the default Off admission still declines x2 while the MOCK FG environment is On");
-      native::edit_reuse_fg_experiment = true;
-      const auto first_on_calls = frame(0);
-      const auto first_on_cache = native::features.at(owner).slots[0].edit_reuse;
-      std::cout << "OBS DEV On first anchor: model_calls=" << first_on_calls << " reset=" << model_resets.back()
-                << " cache=" << (first_on_cache != nullptr) << '\n';
-      Check(first_on_calls == 1 && first_on_cache != nullptr && first_on_cache->valid
-                && first_on_cache->contract[32] == 1
-                && first_on_cache->source_sequence == native::features.at(owner).sr_sequence,
-          "DEV On establishes a fresh fixed-size SR anchor while preserving already-continuous NR History");
-      const auto on_reuses = native::edit_reuse_reuses.load();
-      Check(frame(0) == 0 && native::edit_reuse_reuses.load() == on_reuses + 1,
-          "DEV On reuses exactly once despite ordinary observed FG input");
-      const auto on_final = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-      submit_commands("DEV On neutral output readback");
-      const auto on_bytes = on_final.Pixels();
-      Check(std::memcmp(on_bytes.data(), source_values.data(), on_bytes.size()) == 0,
-          "DEV On neutral edit preserves the current SR RGB and alpha exactly");
-      Check(frame(0) == 1, "DEV On refreshes on the next base frame after that reuse");
+      {
+        namespace cap = addon::control_mask_capture;
+        namespace timers = addon::gpu_timers;
+        Check(!cap::Enabled() && !cap::CapturePending() && !cap::WorkPending(), "inline WARP fixture owns the idle capture singleton");
+        struct RestoreInlineCapture {
+          decltype(cap::wake_worker) wake = cap::wake_worker;
+          decltype(timers::raw_observer) observer = timers::raw_observer;
+          bool profiling = native::gpu_timers_enabled.exchange(true);
+          int64_t stable = native::comparison_stable_after_ns[1];
+          ~RestoreInlineCapture() {
+            cap::Stop("fixture_complete", false);
+            {
+              std::unique_lock lock(cap::internal::state.mutex);
+              auto& state = cap::internal::state;
+              state.summary = {};
+              state.rows.clear();
+              state.armed = false;
+              state.marker_needed = false;
+              state.terminal_needed = false;
+            }
+            cap::internal::capture_pending = false;
+            cap::internal::work_pending = false;
+            cap::wake_worker = wake;
+            timers::raw_observer = observer;
+            native::gpu_timers_enabled = profiling;
+            native::comparison_stable_after_ns[1] = stable;
+          }
+        } restore_inline_capture;
+        timers::Poll(true, false);
+        cap::wake_worker = +[] { return true; };  // No export worker or filesystem in this recording fixture.
+        timers::raw_observer = cap::Observe;
+        native::comparison_stable_after_ns[1] = 0;
+        Check(cap::Configure(4, 30, 0, 4), "baseline and x2 share one finite existing capture request");
+        const auto timed_frame = [&](int reset) {
+          const auto sequence = timers::internal::next_sequence;
+          const auto calls = frame(reset, false);
+          const auto found = std::find_if(std::begin(timers::internal::segments), std::end(timers::internal::segments),
+              [&](const auto& segment) { return segment.recorded && segment.sequence == sequence + 1; });
+          Check(found != std::end(timers::internal::segments) && found->diagnostic_token != 0,
+              "a successful production source write reserves exactly one complete-chain timer context");
+          const auto timer_sequence = found->sequence;
+          Check(SUCCEEDED(gpu.list->Close()), "inline capture recording close");
+          ID3D12CommandList* lists[]{gpu.list.Get()};
+          gpu.queue->ExecuteCommandLists(1, lists);
+          gpu.submission_pending = true;
+          Check(SUCCEEDED(gpu.queue->Signal(gpu.fence.Get(), ++gpu.serial)), "inline capture real completion signal");
+          HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+          Check(event != nullptr, "inline capture completion event");
+          const auto armed = gpu.fence->SetEventOnCompletion(gpu.serial, event);
+          const auto wait = (SUCCEEDED(armed) ? WaitForSingleObject(event, 10000) : WAIT_FAILED);
+          CloseHandle(event);
+          Check(wait == WAIT_OBJECT_0 && SUCCEEDED(gpu.device->GetDeviceRemovedReason()), "inline capture bounded healthy WARP completion");
+          gpu.submission_pending = false;
+          Check(SUCCEEDED(gpu.allocator->Reset()) && SUCCEEDED(gpu.list->Reset(gpu.allocator.Get(), nullptr)),
+              "inline capture completed list reset");
+          native::DrainRetiredResources(true);
+          timers::Poll(true, false);
+          submission::PruneCompletedGenerations();
+          gpu.uploads.clear();
+          gpu.retained_resources.clear();
+          {
+            std::shared_lock lock(cap::internal::state.mutex);
+            const auto& rows = cap::internal::state.rows;
+            const auto sample = std::find_if(rows.begin(), rows.end(), [&](const auto& row) {
+              return row.timer_sequence == timer_sequence;
+            });
+            Check(sample != rows.end() && sample->state == cap::internal::RowState::VALID && sample->stats.valid
+                      && sample->stats.sequence == timer_sequence && sample->stats.samples == 1,
+                "the existing raw observer receives actual completed chain timestamps");
+          }
+          return calls;
+        };
+        native::edit_reuse_fg_experiment = true;
+        native::edit_reuse_enabled = false;
+        Check(timed_frame(1) == 1 && native::features.at(owner).slots[0].edit_reuse == nullptr,
+            "the baseline runs ordinary NR while the MOCK FG environment is On");
+        native::edit_reuse_enabled = true;
+        const auto first_on_calls = timed_frame(0);
+        const auto first_on_cache = native::features.at(owner).slots[0].edit_reuse;
+        std::cout << "OBS DEV On first anchor: model_calls=" << first_on_calls << " reset=" << model_resets.back()
+                  << " cache=" << (first_on_cache != nullptr) << '\n';
+        Check(first_on_calls == 1 && first_on_cache != nullptr && first_on_cache->valid
+                  && first_on_cache->contract[32] == 0 && first_on_cache->contract[33] == 0
+                  && first_on_cache->contract[34] == 0
+                  && first_on_cache->source_sequence == native::features.at(owner).sr_sequence,
+            "DEV On establishes a fresh fixed-size SR anchor while preserving already-continuous NR History");
+        const auto on_reuses = native::edit_reuse_reuses.load();
+        Check(timed_frame(0) == 0 && native::edit_reuse_reuses.load() == on_reuses + 1,
+            "DEV On reuses exactly once despite ordinary observed FG input");
+        const auto on_final = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        submit_commands("DEV On neutral output readback");
+        const auto on_bytes = on_final.Pixels();
+        Check(std::memcmp(on_bytes.data(), source_values.data(), on_bytes.size()) == 0,
+            "DEV On neutral edit preserves the current SR RGB and alpha exactly");
+        Check(timed_frame(0) == 1, "DEV On refreshes on the next base frame after that reuse");
+        const auto summary = cap::GetSummary();
+        Check(summary.inline_edit_reuse && !summary.xefg_service && summary.recorded == 4
+                  && summary.valid == 4 && summary.rejected == 0 && summary.dropped == 0,
+            "one baseline and refresh/reuse/refresh each publish one real completed inline sample");
+        std::shared_lock lock(cap::internal::state.mutex);
+        const auto& rows = cap::internal::state.rows;
+        Check(rows.size() == 4, "neither the NR branch nor a mirrored source creates an extra capture reservation");
+        for (size_t index = 0; index < rows.size(); ++index) {
+          const auto& context = rows[index].context;
+          const bool reused = index == 2;
+          Check(context.inline_edit_reuse && context.output_ready && context.source_handle == reinterpret_cast<uintptr_t>(owner)
+                    && context.source_generation_available && context.source_generation == native::features.at(owner).source_generation
+                    && context.source_sequence != 0 && context.model_evaluates == (reused ? 0u : 1u)
+                    && context.reuse == reused && context.refresh != reused
+                    && context.api_returned != reused && context.ngx_accepted != reused
+                    && (!reused || context.reset_reasons == 0),
+              "actual source identity, model calls, API returns and zero-reset reuse remain distinct");
+          if (index != 0) {
+            Check(context.source_sequence == rows[index - 1].context.source_sequence + 1,
+                "capture cadence follows true source frames across baseline and x2");
+          }
+        }
+      }
       {
         auto other_output = uav_texture(16, 16, DXGI_FORMAT_R16G16B16A16_FLOAT);
         gpu.Transition(other_output.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1205,27 +1751,145 @@ int Run() {
         Check(frame(1) == 1, "restore the neutral model with an explicit source Reset");
       }
 
-      native::RegisterCreatedFeatureLocked(second_fg, NVSDK_NGX_Feature_FrameGeneration, &parameters);
-      Check(!native::ReadEditReuseFgEnvironmentLocked().available && frame(0) == 1
-                && native::features.at(owner).slots[0].edit_reuse == nullptr,
-          "multiple native FG objects cannot lend one environment to an old edit anchor");
-      native::ForgetSourceHandleLocked(second_fg);
-      Check(frame(1) == 1 && frame(0) == 0, "a unique native environment restarts from a fresh anchor");
-      const auto before_recreate = native::ReadEditReuseFgEnvironmentLocked().generation;
-      native::RegisterCreatedFeatureLocked(fg_handle, NVSDK_NGX_Feature_FrameGeneration, &parameters);
-      const auto reuses_before_recreate = native::edit_reuse_reuses.load();
-      Check(native::ReadEditReuseFgEnvironmentLocked().generation != before_recreate
-                && frame(0) == 1 && model_resets.back() == 1
-                && native::edit_reuse_reuses.load() == reuses_before_recreate,
-          "recreating the same FG handle address changes environment generation and resets x2 history");
+      const auto check_output = [&](const std::vector<uint8_t>* reference = nullptr) {
+        auto capture = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        submit_commands("DEV stable-source edited output readback");
+        const auto pixels = capture.Pixels();
+        bool nonneutral = false;
+        for (size_t pixel = 0; pixel < source_values.size() / 4; ++pixel) {
+          for (size_t channel = 0; channel < 3; ++channel) {
+            uint16_t actual;
+            std::memcpy(&actual, pixels.data() + (pixel * 4 + channel) * 2, 2);
+            if (reference != nullptr) {
+              uint16_t expected;
+              std::memcpy(&expected, reference->data() + (pixel * 4 + channel) * 2, 2);
+              Check(std::fabs(DirectX::PackedVector::XMConvertHalfToFloat(actual)
+                        - DirectX::PackedVector::XMConvertHalfToFloat(expected)) < .003f,
+                  "DEV metadata changes preserve the actual refreshed RGB edit");
+            }
+            nonneutral |= std::fabs(DirectX::PackedVector::XMConvertHalfToFloat(actual)
+                - DirectX::PackedVector::XMConvertHalfToFloat(source_values[pixel * 4 + channel])) > .05f;
+          }
+          Check(std::memcmp(pixels.data() + pixel * 8 + 6, source_values.data() + pixel * 4 + 3, 2) == 0,
+              "DEV refresh and reuse preserve exact current source alpha");
+        }
+        Check(nonneutral, "the DEV stable-source witness contains a nonzero edit");
+        return pixels;
+      };
+      {
+        native::direct_api.evaluate = ConstantModel;
+        Check(frame(1) == 1, "establish a nonzero anchor before changing only diagnostic metadata");
+        auto& feature = native::features.at(owner);
+        const auto anchor = feature.slots[0].edit_reuse;
+        const auto model = feature.slots[0].handle;
+        const auto models = native::nr_features_created;
+        const auto allocations = native::worksets_created;
+        const auto source_generation = feature.source_generation;
+        const auto epoch = native::history_reset_epoch.load();
+        auto diagnostic_anchor_generation = anchor->anchor_generation;
+        auto anchor_pixels = read_buffer(anchor->anchor.Get());
+        const auto reference = check_output();
+        uint32_t expected_calls = 0;
+        const auto check_diagnostics = [&](const char* scenario, bool environment_available) {
+          const auto reuses = native::edit_reuse_reuses.load();
+          const auto calls = frame(0);
+          std::cout << "OBS DEV diagnostic-only " << scenario << ": model_calls=" << calls
+                    << " expected=" << expected_calls << '\n';
+          Check(calls == expected_calls && native::ReadEditReuseFgEnvironmentLocked().available == environment_available,
+              "diagnostic availability does not alter fixed-size SR refresh/reuse cadence");
+          Check(feature.slots[0].edit_reuse == anchor && anchor->valid && feature.slots[0].handle == model
+                    && native::nr_features_created == models && native::worksets_created == allocations
+                    && feature.source_generation == source_generation && native::history_reset_epoch.load() == epoch
+                    && anchor->contract[32] == 0 && anchor->contract[33] == 0 && anchor->contract[34] == 0,
+              "FG diagnostic identity never replaces the live NR source, model, workset or contract");
+          if (expected_calls == 0) {
+            Check(native::edit_reuse_reuses.load() == reuses + 1 && read_buffer(anchor->anchor.Get()) == anchor_pixels,
+                "diagnostic-only reuse leaves the exact nonzero refresh anchor unchanged");
+          } else {
+            Check(model_resets.back() == 0, "diagnostic-only refresh adds no NR Reset");
+            ++diagnostic_anchor_generation;
+            anchor_pixels = read_buffer(anchor->anchor.Get());
+          }
+          Check(anchor->anchor_generation == diagnostic_anchor_generation, "diagnostics never advance the anchor generation");
+          check_output(&reference);
+          expected_calls ^= 1u;
+        };
+        native::RegisterCreatedFeatureLocked(second_fg, NVSDK_NGX_Feature_FrameGeneration, &parameters);
+        check_diagnostics("multiple FG handles", false);
+        native::ForgetSourceHandleLocked(second_fg);
+        check_diagnostics("unique FG handle restored", true);
+        const auto before_recreate = native::ReadEditReuseFgEnvironmentLocked().generation;
+        native::RegisterCreatedFeatureLocked(fg_handle, NVSDK_NGX_Feature_FrameGeneration, &parameters);
+        Check(native::ReadEditReuseFgEnvironmentLocked().generation != before_recreate,
+            "recreated FG handle still invalidates diagnostic attribution");
+        check_diagnostics("FG handle recreated", true);
+        native::ForgetSourceHandleLocked(fg_handle);
+        check_diagnostics("FG handle unobserved", false);
+        native::RegisterCreatedFeatureLocked(fg_handle, NVSDK_NGX_Feature_FrameGeneration, &parameters);
+        check_diagnostics("FG handle observed again", true);
 
+        const bool saved_stopped = xi::stopped.exchange(false);
+        const bool saved_detours = xi::sdk_detours_enabled.exchange(true);
+        const bool saved_enabled = xi::owns_stream.load();
+        Check(xi::state.contexts.empty(), "isolated XeFG On metadata fixture");
+        const auto make_context = [&] {
+          auto context = std::make_shared<xi::Context>();
+          context->queue = gpu.queue;
+          context->device = gpu.device;
+          context->proxy_identity = 0xED190;
+          context->bridge_context_ready = context->bridge_proxy_ready = context->enabled = true;
+          context->fg_environment_generation = ++xi::state.fg_environment_generation;
+          return context;
+        };
+        auto context = make_context();
+        const auto sdk_handle = reinterpret_cast<void*>(uintptr_t{0xED191});
+        xi::state.contexts.emplace(sdk_handle, context);
+        xi::RefreshOwnership();
+        const auto xe_environment = native::ReadEditReuseFgEnvironmentLocked();
+        Check(xe_environment.available && xe_environment.provider == 2
+                  && native::native_fg_declaration.load() == native::NativeFgDeclaration::kOn
+                  && !xefg::OwnsStream() && !xefg::QueryBridgeOff({}).available,
+            "enabled XeFG changes diagnostic precedence without transferring SR resources or ownership");
+        check_diagnostics("XeFG metadata precedence", true);
+        const auto before_resize = native::ReadEditReuseFgEnvironmentLocked().generation;
+        {
+          std::unique_lock lock(xi::state.mutex);
+          xi::ReleaseFrames(context.get());
+        }
+        Check(native::ReadEditReuseFgEnvironmentLocked().generation != before_resize,
+            "XeFG metadata lifetime still changes its diagnostic generation");
+        check_diagnostics("XeFG diagnostic generation", true);
+        xi::state.contexts.emplace(reinterpret_cast<void*>(uintptr_t{0xED192}), make_context());
+        xi::RefreshOwnership();
+        check_diagnostics("multiple XeFG metadata contexts", false);
+        xi::state.contexts.erase(reinterpret_cast<void*>(uintptr_t{0xED192}));
+        check_diagnostics("unique XeFG metadata context restored", true);
+        const auto before_replace = native::ReadEditReuseFgEnvironmentLocked().generation;
+        context = make_context();
+        xi::state.contexts[sdk_handle] = context;
+        Check(native::ReadEditReuseFgEnvironmentLocked().generation != before_replace,
+            "replacement at the same SDK handle retains a distinct diagnostic identity");
+        check_diagnostics("XeFG metadata context replaced", true);
+        xi::state.contexts.clear();
+        xi::owns_stream = saved_enabled;
+        xi::sdk_detours_enabled = saved_detours;
+        xi::stopped = saved_stopped;
+        check_diagnostics("native metadata restored", true);
+        std::cout << "PASS DEV diagnostic-only changes: missing/ambiguous/recreated native and XeFG metadata,"
+                     " stable SR history, nonzero RGB, exact alpha, immutable reuse anchor and no model/workset recreation; evidence=WARP+MOCK\n";
+      }
+      native::direct_api.evaluate = NeutralModel;
+      Check(frame(1) == 1, "restore the neutral model before source and ownership rejection checks");
       native::RegisterCreatedFeatureLocked(second_source, native::kFeatureDlss, &parameters);
       native::create_contracts.at(second_source).source_device12_identity =
           native::create_contracts.at(owner).source_device12_identity;
-      Check(frame(0) == 1 && native::features.at(owner).slots[0].edit_reuse == nullptr,
-          "DEV On rejects two observed SR sources on the same native device");
+      const auto diagnostic_reuses = native::edit_reuse_reuses.load();
+      Check(frame(0) == 0 && native::edit_reuse_reuses.load() == diagnostic_reuses + 1
+                && native::features.at(owner).slots[0].edit_reuse->valid,
+            "a second registered source does not revoke confirmed direct write-back for this SR handle");
       native::ForgetSourceHandleLocked(second_source);
       Check(frame(1) == 1, "the remaining source establishes its own fresh anchor");
+
       native::create_contracts.at(owner).source_type_confirmed = false;
       Check(frame(0) == 1 && native::features.at(owner).slots[0].edit_reuse == nullptr,
           "environment On cannot authorize an unconfirmed SR source");
@@ -1238,79 +1902,109 @@ int Run() {
           "DEV On does not cross a native Present-service ownership boundary");
       native::native_fg_owns = false;
       Check(frame(1) == 1, "Upscaled ownership recovers with a refresh");
+
       const auto before_experiment_exit = native::features.at(owner).slots[0].edit_reuse;
       native::edit_reuse_fg_experiment = false;
-      Check(frame(0) == 1 && model_resets.back() == 1 && native::features.at(owner).slots[0].edit_reuse == nullptr,
-          "leaving the DEV On experiment retires its cache without changing the public FG declaration");
+      Check(frame(0) == 0 && native::features.at(owner).slots[0].edit_reuse == before_experiment_exit,
+          "disabling DEV FG observation preserves the ordinary Upscaled reuse and anchor");
       native::edit_reuse_fg_experiment = true;
-      Check(frame(0) == 1 && native::features.at(owner).slots[0].edit_reuse != before_experiment_exit
-                && native::features.at(owner).slots[0].edit_reuse->valid,
-          "re-entering DEV On refreshes a new anchor after the intervening normal NR frame");
+      Check(frame(0) == 1 && model_resets.back() == 0
+                && native::features.at(owner).slots[0].edit_reuse == before_experiment_exit
+                && before_experiment_exit->valid,
+          "re-enabling DEV FG observation retains the model history and refresh cadence");
       const auto reset_before_off = native::history_reset_epoch.load();
       native::OnNativeFgOptions(false);
-      Check(native::history_reset_epoch.load() == reset_before_off && frame(0) == 1 && model_resets.back() == 1
+      Check(native::history_reset_epoch.load() == reset_before_off && frame(0) == 0
                 && native::features.at(owner).slots[0].edit_reuse->contract[32] == 0,
-          "On-to-Off changes cache identity and resets even when Upscaled owns no FG service or global reset");
+          "On-to-Off without an owner retains the same fixed-size source history");
       native::OnNativeFgOptions(true);
       native::mixed_present_fg_seen = true;
-      Check(frame(1) == 1, "native On recovers its own anchor");
-
-      const bool saved_stopped = xi::stopped.exchange(false);
-      const bool saved_detours = xi::sdk_detours_enabled.exchange(true);
-      const bool saved_enabled = xi::owns_stream.load();
-      Check(xi::state.contexts.empty(), "isolated XeFG On metadata fixture");
-      const auto make_context = [&] {
-        auto context = std::make_shared<xi::Context>();
-        context->queue = gpu.queue;
-        context->device = gpu.device;
-        context->proxy_identity = 0xED190;
-        context->bridge_context_ready = context->bridge_proxy_ready = context->enabled = true;
-        context->fg_environment_generation = ++xi::state.fg_environment_generation;
-        return context;
-      };
-      auto context = make_context();
-      const auto sdk_handle = reinterpret_cast<void*>(uintptr_t{0xED191});
-      xi::state.contexts.emplace(sdk_handle, context);
-      xi::RefreshOwnership();
-      const auto xe_environment = native::ReadEditReuseFgEnvironmentLocked();
-      Check(xe_environment.available && xe_environment.provider == 2
-                && native::native_fg_declaration.load() == native::NativeFgDeclaration::kOn
-                && native::created_feature_ids.at(fg_handle) == NVSDK_NGX_Feature_FrameGeneration
-                && !xefg::OwnsStream() && !xefg::QueryBridgeOff({}).available,
-          "unique enabled XeFG takes environment precedence over OptiScaler-like DLSSG input without granting Off or ownership");
-      Check(frame(0) == 1 && model_resets.back() == 1
-                && native::features.at(owner).slots[0].edit_reuse->contract[32] == 2 && frame(0) == 0,
-          "switching native-input to XeFG environment refreshes, then reuses only its own anchor");
-      const auto before_resize = native::ReadEditReuseFgEnvironmentLocked().generation;
+      Check(frame(1) == 1, "native On retains its confirmed source");
       {
-        std::unique_lock lock(xi::state.mutex);
-        xi::ReleaseFrames(context.get());
+        namespace options = addon::fg::native_options;
+        funnel_accounting_tests::Restore substitutions;
+        substitutions.Value(&options::internal::state.real);
+        substitutions.Atomic(&options::internal::options_changed);
+        substitutions.Atomic(&options::internal::stopped);
+        options::internal::state.real = +[](const sl::ViewportHandle&, const sl::DLSSGOptions&) {
+          return sl::Result::eOk;
+        };
+        options::internal::stopped = false;
+        options::Configure(native::OnNativeFgOptions);
+        native::direct_api.evaluate = ConstantModel;
+        for (const bool hooked : {false, true}) {
+          native::OnNativeFgOptions(false);
+          Check(frame(1) == 1, "start an Options contrast from the same confirmed Off source");
+          auto& feature = native::features.at(owner);
+          const auto anchor = feature.slots[0].edit_reuse;
+          const auto contract = anchor->contract;
+          const auto model = feature.slots[0].handle;
+          const auto models = native::nr_features_created;
+          const auto allocations = native::worksets_created;
+          const auto epoch = native::history_reset_epoch.load();
+          auto options_anchor_generation = anchor->anchor_generation;
+          auto anchor_pixels = read_buffer(anchor->anchor.Get());
+          const auto reference = check_output();
+          const std::array modes{false, true, true, false, false};
+          for (size_t index = 1; index < modes.size(); ++index) {
+            const auto options_generation = native::native_fg_options_generation.load();
+            const auto diagnostic_generation = native::edit_reuse_native_fg_generation.load();
+            const auto changed_ns = native::native_fg_options_changed_ns.load();
+            {
+              // The production wrapper can hold this lock when the SDK calls SetOptions.
+              addon::RuntimeLock lock(native::runtime_mutex);
+              if (hooked) {
+                sl::DLSSGOptions request;
+                request.mode = (modes[index] ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff);
+                request.numFramesToGenerate = 1;
+                Check(options::internal::HookedSetOptions(sl::ViewportHandle{0}, request) == sl::Result::eOk,
+                    "real SetOptions wrapper forwards the MOCK SDK success to the production callback");
+              } else {
+                native::OnNativeFgOptions(modes[index]);
+              }
+            }
+            const auto calls = frame(0);
+            const uint32_t expected_calls = (index % 2 == 0 ? 1u : 0u);
+            std::cout << "OBS DEV Options " << (hooked ? "HookedSetOptions" : "OnNativeFgOptions")
+                      << " frame=" << index + 1 << " mode=" << (modes[index] ? "On" : "Off")
+                      << " model_calls=" << calls << " expected=" << expected_calls << '\n';
+            Check(calls == expected_calls, "actual owner-free Off/On/Off callbacks preserve cadence 1/0/1/0/1");
+            const uint64_t changes = (modes[index] != modes[index - 1] ? 1u : 0u);
+            Check(native::native_fg_options_generation.load() == options_generation + changes
+                      && native::edit_reuse_native_fg_generation.load() == diagnostic_generation + changes
+                      && (changes != 0 ? native::native_fg_options_changed_ns.load() >= changed_ns
+                                       : native::native_fg_options_changed_ns.load() == changed_ns)
+                      && native::native_fg_public_off.load() != modes[index]
+                      && native::native_fg_declaration.load() == (modes[index]
+                          ? native::NativeFgDeclaration::kOn : native::NativeFgDeclaration::kOff),
+                "actual callbacks retain declaration intervals and diagnostic generation, including duplicate requests");
+            Check(!native::native_fg_owns.load() && native::history_reset_epoch.load() == epoch
+                      && feature.slots[0].edit_reuse == anchor && anchor->valid && anchor->contract == contract
+                      && feature.slots[0].handle == model && native::nr_features_created == models
+                      && native::worksets_created == allocations,
+                "owner-free Options changes preserve the same NR contract, source, model and workset");
+            if (expected_calls == 0) {
+              Check(read_buffer(anchor->anchor.Get()) == anchor_pixels,
+                  "Options callback reuse preserves the nonzero refresh anchor exactly");
+            } else {
+              Check(model_resets.back() == 0, "owner-free Options refresh adds no model Reset");
+              ++options_anchor_generation;
+              anchor_pixels = read_buffer(anchor->anchor.Get());
+            }
+            Check(anchor->anchor_generation == options_anchor_generation, "Options callbacks never advance anchor generation");
+            check_output(&reference);
+          }
+          std::cout << "PASS DEV owner-free " << (hooked ? "HookedSetOptions" : "OnNativeFgOptions")
+                    << " Off/On/Off: model_calls=1/0/1/0/1, stable history, nonzero RGB, exact alpha; evidence=WARP+MOCK\n";
+        }
+        native::direct_api.evaluate = NeutralModel;
+        Check(frame(1) == 1, "restore the neutral model after actual Options callback contrasts");
       }
-      Check(native::ReadEditReuseFgEnvironmentLocked().generation != before_resize
-                && frame(0) == 1 && model_resets.back() == 1,
-          "XeFG frame-lifetime invalidation changes environment generation and forces a fresh x2 history");
-      xi::state.contexts.emplace(reinterpret_cast<void*>(uintptr_t{0xED192}), make_context());
-      xi::RefreshOwnership();
-      Check(!native::ReadEditReuseFgEnvironmentLocked().available && frame(0) == 1
-                && native::features.at(owner).slots[0].edit_reuse == nullptr,
-          "multiple XeFG contexts decline instead of borrowing the native input environment");
-      xi::state.contexts.erase(reinterpret_cast<void*>(uintptr_t{0xED192}));
-      Check(frame(1) == 1, "unique XeFG context restarts with a refresh");
-      const auto before_replace = native::ReadEditReuseFgEnvironmentLocked();
-      context = make_context();
-      xi::state.contexts[sdk_handle] = context;
-      Check(native::ReadEditReuseFgEnvironmentLocked().generation != before_replace.generation
-                && frame(0) == 1 && model_resets.back() == 1,
-          "replacement at the same opaque SDK handle cannot inherit the prior environment or anchor");
-      xi::state.contexts.clear();
-      xi::owns_stream = saved_enabled;
-      xi::sdk_detours_enabled = saved_detours;
-      xi::stopped = saved_stopped;
       native::edit_reuse_fg_experiment = false;
       native::OnNativeFgOptions(false);
       native::ForgetSourceHandleLocked(fg_handle);
       for (uint32_t prefix = 0; prefix < 4; ++prefix) frame(1);
-      std::cout << "PASS DEV On environment + WARP SR x2: unique source, native/XeFG metadata, precedence, ownership rejection, lifetime/switch Reset and exact neutral output; actual FG handoff=NotRun\n";
+      std::cout << "PASS DEV On + WARP SR x2: shared fixed-size eligibility, unique source, diagnostic-independent history, ownership rejection and exact output; actual FG handoff=NotRun\n";
     }
     native::ForgetSourceHandleLocked(owner);
     native::DrainRetiredResources(true);
@@ -1319,6 +2013,381 @@ int Run() {
                   [&](const auto& entry) { return entry.first.handle == owner; }),
         "the separate On source lifetime releases its rotating-output worksets through normal retirement");
 #endif
+    // Exercise two independent temporal Look passes through the same successful SR wrapper.
+    native::RegisterCreatedFeatureLocked(owner, native::kFeatureDlss, &parameters);
+    native::created_feature_ids[owner] = native::kFeatureDlss;
+    native::stack_passes = 2;
+    native::chained_temporal_history = true;
+    native::pass_stage[0] = 0;
+    native::preset = 1;
+    native::intensity = .5f;
+    native::pass_preset[0] = 2;
+    native::pass_follow[0] = false;
+    native::pass_intensity[0] = .75f;
+    native::pass_transfer_strength[0] = 1.f;
+    native::pass_color_strength[0] = 1.f;
+    native::pass_look_result[0].follow = false;
+    native::pass_look_result[0].mode = false;
+    native::pass_look_result[0].detail_stability = 0;
+    native::detail_stability = 0;
+    native::direct_api.create = stage_execution_cases::Create;
+    native::direct_api.evaluate = same_stage_resolution_cases::Evaluate;
+    auto& pair_calls = same_stage_resolution_cases::evaluations;
+    same_stage_resolution_cases::stamps = {0x3900, 0x3b00};
+    parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, 0.f);
+    parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, 0.f);
+
+    const auto pair_frame = [&](const char* label, int reset, uint64_t expected_calls) {
+      pair_calls.clear();
+      const auto calls = frame(reset);
+      const auto final = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      submit_commands("two-Pass Upscaled writeback readback");
+      std::cout << "OBS Upscaled multipass " << label << " calls=" << calls << " fence=" << gpu.serial << '\n';
+      Check(calls == expected_calls && pair_calls.size() == expected_calls, "Upscaled cadence applies to the complete group");
+      return final.Pixels();
+    };
+    bool pair_ready = false;
+    for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8; ++attempt) {
+      pair_calls.clear();
+      const auto calls = frame(1);
+      std::cout << "OBS Upscaled multipass warmup=" << attempt << " calls=" << calls << '\n';
+      if (calls == 2) {
+        pair_ready = true;
+        break;
+      }
+    }
+    Check(pair_ready, "Upscaled two-Pass group matures");
+    auto& pair_slots = native::features.at(owner).slots;
+    const auto pair_refresh = pair_frame("refresh", 1, 2);
+    const auto read_red = [](const std::vector<uint8_t>& bytes, size_t pixel) {
+      uint16_t red = 0;
+      std::memcpy(&red, bytes.data() + pixel * 8, sizeof(red));
+      return DirectX::PackedVector::XMConvertHalfToFloat(red);
+    };
+    constexpr size_t center = 8 * 16 + 8;
+    const auto first_layer_input = pair_calls[0].input.Pixels();
+    const auto second_layer_input = pair_calls[1].input.Pixels();
+    Check(std::abs(read_red(second_layer_input, center) - read_red(first_layer_input, center)) > .025f,
+          "Pass 2 Evaluate reads edited current-frame color from Pass 1");
+    std::array<uint32_t, 2> look_written{};
+    std::array<uint64_t, 2> anchor_generations{};
+    for (size_t pass = 0; pass < 2; ++pass) {
+      const auto& call = pair_calls[pass];
+      const auto& slot = pair_slots[pass];
+      std::cout << "OBS Upscaled multipass pass=" << pass + 1 << " model=" << call.preset
+                << " size=" << call.input.width << 'x' << call.input.height << " intensity=" << call.intensity
+                << " reset=" << call.reset << " look=" << slot.look_history.valid
+                << " anchor=" << (slot.edit_reuse != nullptr && slot.edit_reuse->valid) << '\n';
+      Check(call.handle == slot.handle && call.preset == pass + 1 && call.intensity == (pass == 0 ? .5f : .75f)
+                && call.input.width == 16 && call.input.height == 16 && call.reset == 1,
+            "Upscaled refresh sends each Pass's real model, working size, strength and Reset");
+      Check(slot.look_history.valid && slot.look_history.buffers[0] != nullptr && slot.edit_reuse != nullptr
+                && slot.edit_reuse->valid,
+            "each temporal layer owns a Look history and a pre-Look anchor");
+      look_written[pass] = slot.look_history.written;
+      anchor_generations[pass] = slot.edit_reuse->anchor_generation;
+    }
+    Check(pair_slots[0].look_history.buffers[0] != pair_slots[1].look_history.buffers[0]
+              && pair_slots[0].edit_reuse != pair_slots[1].edit_reuse,
+          "two temporal layers never share Look buffers or the edit anchor");
+    const auto look_restarts = native::look_history_restarts.load();
+    const auto group_reuses = native::edit_reuse_reuses.load();
+    auto current_source = source_values;
+    for (size_t channel = 0; channel < 3; ++channel) {
+      current_source[center * 4 + channel] = DirectX::PackedVector::XMConvertFloatToHalf(
+          DirectX::PackedVector::XMConvertHalfToFloat(current_source[center * 4 + channel]) * 1.04f);
+    }
+    current_source[center * 4 + 3] = 0x3a00;
+    std::vector<float> reveal(16 * 16, .5f);
+    reveal.front() = .9f;
+    upload(source.Get(), current_source, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 8);
+    upload(wrapper_depth.Get(), reveal, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 4);
+    const auto pair_reuse = pair_frame("reuse", 0, 0);
+    const float refresh_red = read_red(pair_refresh, center);
+    const float reuse_red = read_red(pair_reuse, center);
+    const float original_red = DirectX::PackedVector::XMConvertHalfToFloat(current_source[center * 4]);
+    Check(std::abs(reuse_red - original_red) > .05f && std::abs(reuse_red - refresh_red) > .003f,
+          "zero-model Look reuse writes a nonneutral edit of new RGB, distinct from the last output");
+    Check(std::memcmp(pair_reuse.data(), current_source.data(), 8) == 0,
+          "depth rejection in the group selects the current original RGBA");
+    for (size_t pixel = 0; pixel < current_source.size() / 4; ++pixel) {
+      Check(std::memcmp(pair_reuse.data() + pixel * 8 + 6, &current_source[pixel * 4 + 3], 2) == 0,
+            "Upscaled two-Pass reuse preserves the exact current alpha");
+    }
+    for (size_t pass = 0; pass < 2; ++pass) {
+      const auto& slot = pair_slots[pass];
+      Check(slot.look_history.valid && slot.look_history.written != look_written[pass] && slot.edit_reuse != nullptr
+                && slot.edit_reuse->anchor_generation == anchor_generations[pass],
+            "reuse advances each Look history without moving either model anchor");
+    }
+    Check(native::look_history_restarts.load() == look_restarts && native::edit_reuse_reuses.load() == group_reuses + 1,
+          "the whole group reuses once without consuming either model's old Reset");
+    const auto& pair_work = native::worksets.at(native::WorksetKey{owner, output.Get()});
+    const auto reused_layer_input = stage_execution_cases::Capture(gpu, pair_work.proxy, pair_work.proxy_state);
+    submit_commands("two-Pass Upscaled reused tail input readback");
+    const float reused_layer_red = read_red(reused_layer_input.Pixels(), center);
+    const float refreshed_layer_red = read_red(second_layer_input, center);
+    const float unedited_layer_red = read_red(first_layer_input, center);
+    std::cout << "OBS Upscaled multipass tail_proxy_R=" << refreshed_layer_red << '/' << reused_layer_red
+              << " original_proxy_R=" << unedited_layer_red << " final_R=" << refresh_red << '/' << reuse_red << '\n';
+    Check(std::abs(reused_layer_red - refreshed_layer_red) > .001f
+              && std::abs(reused_layer_red - refreshed_layer_red) < std::abs(reused_layer_red - unedited_layer_red),
+          "Pass 2 reuse encodes this frame's edited Pass 1 color and retains the upstream edit");
+
+    set_native_fg_mode(false);
+    pair_frame("refresh-after-reuse", 0, 2);
+    Check(pair_calls[0].reset == 0 && pair_calls[1].reset == 0
+              && pair_calls[0].motion != wrapper_motion.Get() && pair_calls[1].motion != wrapper_motion.Get(),
+          "both real models advance from their last refresh using composed motion");
+    {
+      const auto& feature = native::features.at(owner);
+      const auto source_generation = feature.source_generation;
+      const auto reset_epoch = native::history_reset_epoch.load();
+      const auto models = native::nr_features_created;
+      const auto worksets = native::worksets_created;
+      const native::WorksetKey workset_key{owner, output.Get()};
+      const auto* workset_proxy = native::worksets.at(workset_key).proxy;
+      const auto reuses_before_options = native::edit_reuse_reuses.load();
+      const auto fallbacks_before_options = native::edit_reuse_fallbacks.load();
+      const std::array model_handles{pair_slots[0].handle, pair_slots[1].handle};
+      const std::array anchors{pair_slots[0].edit_reuse, pair_slots[1].edit_reuse};
+      std::array generations{anchors[0]->anchor_generation, anchors[1]->anchor_generation};
+      std::array anchor_pixels{read_buffer(anchors[0]->anchor.Get()), read_buffer(anchors[1]->anchor.Get())};
+      const std::array modes{true, true, false, false};
+      for (size_t index = 0; index < modes.size(); ++index) {
+        set_native_fg_mode(modes[index]);
+        const bool refresh = (index % 2 != 0);
+        const auto pixels = pair_frame(modes[index] ? "options-on" : "options-off", 0, refresh ? 2u : 0u);
+        Check(feature.source_generation == source_generation && native::history_reset_epoch.load() == reset_epoch
+                  && native::nr_features_created == models && native::worksets_created == worksets
+                  && native::worksets.at(workset_key).proxy == workset_proxy
+                  && native::look_history_restarts.load() == look_restarts
+                  && native::edit_reuse_reuses.load() == reuses_before_options + (index + 2) / 2
+                  && native::edit_reuse_fallbacks.load() == fallbacks_before_options,
+              "owner-free Options preserve the two-Pass source, workset and history without fallback");
+        for (size_t pass = 0; pass < anchors.size(); ++pass) {
+          const auto& slot = pair_slots[pass];
+          const auto anchor_bytes = read_buffer(anchors[pass]->anchor.Get());
+          if (refresh) {
+            Check(pair_calls[pass].handle == model_handles[pass] && pair_calls[pass].reset == 0,
+                  "owner-free Options refresh the same two models without an Evaluate Reset");
+            ++generations[pass];
+            anchor_pixels[pass] = anchor_bytes;
+          } else {
+            Check(anchor_bytes == anchor_pixels[pass], "two-Pass reuse retains each refresh anchor byte-for-byte");
+          }
+          Check(slot.handle == model_handles[pass] && slot.edit_reuse == anchors[pass] && anchors[pass]->valid
+                    && anchors[pass]->anchor_generation == generations[pass],
+                "two-Pass Options preserve model and anchor identity with refresh-only generations");
+        }
+        Check(std::abs(read_red(pixels, center) - original_red) > .05f,
+              "two-Pass Options contrast writes a nonneutral edit to the current SR output");
+        for (size_t pixel = 0; pixel < current_source.size() / 4; ++pixel) {
+          Check(std::memcmp(pixels.data() + pixel * 8 + 6, &current_source[pixel * 4 + 3], 2) == 0,
+                "two-Pass Options contrast preserves exact current alpha");
+        }
+      }
+      std::cout << "PASS two-Pass Upscaled owner-free SetOptions Off/On/Off: model_calls=2/0/2/0/2,"
+                   " stable history, nonzero RGB, exact alpha; evidence=WARP+MOCK\n";
+    }
+    pair_slots[1].pending_reset = true;
+    pair_slots[1].pending_reset_reasons = native::kResetRecovery;
+    const auto restarts_before_tail_reset = native::look_history_restarts.load();
+    pair_frame("tail-reset", 0, 2);
+    Check(pair_calls[0].reset == 0 && pair_calls[1].reset == 1
+              && native::look_history_restarts.load() == restarts_before_tail_reset + 1,
+          "an invalid tail anchor refreshes the group and restarts only the tail's model and Look history");
+
+    // Both directions matter: the neutral layer can run before or after
+    // the only edit. Depth and color rejection still win at the final output.
+    bool neutral_compositions_match = true;
+    for (uint32_t neutral_model = 1; neutral_model <= 2; ++neutral_model) {
+      native::direct_api.evaluate = (neutral_model == 1 ? OneEditedLayer<1> : OneEditedLayer<2>);
+      const std::vector<float> stable_depth(16 * 16, .5f);
+      upload(source.Get(), source_values, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 8);
+      upload(wrapper_depth.Get(), stable_depth, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 4);
+      Check(frame(1) == 2, "one neutral layer still evaluates on a full group refresh");
+      const auto refreshed_color = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      submit_commands("one neutral layer refresh readback");
+
+      auto next_source = source_values;
+      constexpr size_t color_disocclusion = center + 3;
+      for (size_t channel = 0; channel < 3; ++channel) {
+        next_source[color_disocclusion * 4 + channel] = DirectX::PackedVector::XMConvertFloatToHalf(2.f);
+      }
+      for (size_t pixel = 0; pixel < next_source.size() / 4; ++pixel) {
+        next_source[pixel * 4 + 3] = 0x32f0;
+      }
+      upload(source.Get(), next_source, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 8);
+      upload(wrapper_depth.Get(), reveal, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 4);
+      Check(frame(0, false) == 0, "a neutral layer never forces Evaluate on an eligible group reuse");
+      const auto reused_color = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      submit_commands("one neutral layer reuse and writeback readback");
+      const auto pixels = reused_color.Pixels();
+      const float game_red = DirectX::PackedVector::XMConvertHalfToFloat(next_source[center * 4]);
+      const float edited_red = read_red(refreshed_color.Pixels(), center);
+      const float reused_red = read_red(pixels, center);
+      std::cout << "OBS Upscaled neutral model=" << neutral_model << " original/refresh/reuse R="
+                << game_red << '/' << edited_red << '/' << reused_red << " fence=" << gpu.serial << '\n';
+      Check(std::abs(edited_red - game_red) > .05f, "the nonneutral layer changes the full group refresh output");
+      neutral_compositions_match &= std::abs(reused_red - game_red) > .05f;
+      Check(std::memcmp(pixels.data(), next_source.data(), 8) == 0
+                && std::memcmp(pixels.data() + color_disocclusion * 8, &next_source[color_disocclusion * 4], 8) == 0,
+            "real depth and color rejection select exact current SR RGBA across the group");
+      for (size_t pixel = 0; pixel < next_source.size() / 4; ++pixel) {
+        Check(std::memcmp(pixels.data() + pixel * 8 + 6, &next_source[pixel * 4 + 3], 2) == 0,
+              "neutral composition preserves current alpha on every pixel");
+      }
+    }
+    Check(neutral_compositions_match, "a valid neutral edit in either layer preserves the other layer's edit");
+    native::direct_api.evaluate = same_stage_resolution_cases::Evaluate;
+    upload(source.Get(), current_source, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 8);
+    upload(wrapper_depth.Get(), reveal, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 4);
+
+    fail_call = model_calls + 2;
+    const auto tail_failure = pair_frame("second-model-failure", 1, 2);
+    fail_call = 0;
+    Check(std::memcmp(tail_failure.data(), current_source.data(), tail_failure.size()) == 0,
+          "a model failure after an edited first Pass leaves the entire current SR output byte-exact");
+    Check(std::ranges::none_of(std::span{pair_slots}.first(2), [](const auto& slot) {
+            return slot.edit_reuse != nullptr && slot.edit_reuse->valid;
+          }),
+          "neither temporal layer publishes a valid cache when the tail fails");
+    const auto reuses_after_failure = native::edit_reuse_reuses.load();
+    pair_calls.clear();
+    const auto retry_calls = frame(0);
+    std::cout << "OBS Upscaled multipass failure-retry calls=" << retry_calls << " fence=" << gpu.serial << '\n';
+    Check(native::edit_reuse_reuses.load() == reuses_after_failure,
+          "ordinary retry cannot reuse the first Pass's partially advanced anchor");
+    std::cout << "PASS two-Pass Upscaled x2 evidence=WARP+MOCK cadence=2/0/2, GPU tail input and writeback, "
+                 "independent Look/Reset and failed-tail original RGBA\n";
+
+    {
+      // Only the smaller workset has a temporal Look. Compare the x2 request
+      // with the same three frames through the ordinary per-frame chain.
+      struct SplitFrame {
+        std::vector<uint8_t> tail_input;
+        std::vector<uint8_t> final_output;
+      };
+      constexpr size_t tail_center = 6 * 12 + 6;
+      constexpr std::array<std::array<uint16_t, 2>, 3> split_stamps{{
+          {0x3900, 0x3b00}, {0x3a00, 0x3b00}, {0x3a00, 0x38c0}}};
+      std::array<SplitFrame, split_stamps.size()> reference;
+      native::look_upsample = addon::look::kUpsampleClassic;
+      native::detail_stability = 1;
+      native::pass_resolution_mode[0] = 2;
+      native::pass_resolution_scale[0] = .75f;
+      for (const bool x2 : {false, true}) {
+        native::ForgetSourceHandleLocked(owner);
+        native::DrainRetiredResources(true);
+        native::RegisterCreatedFeatureLocked(owner, native::kFeatureDlss, &parameters);
+        native::created_feature_ids[owner] = native::kFeatureDlss;
+        native::edit_reuse_enabled = x2;
+        same_stage_resolution_cases::stamps = split_stamps[0];
+        bool ready = false;
+        for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8; ++attempt) {
+          pair_calls.clear();
+          if (frame(1) == 2) {
+            ready = true;
+            break;
+          }
+        }
+        Check(ready, "split Upscaled pair matures");
+        const auto& work = native::worksets.at(native::WorksetKey{owner, output.Get()});
+        Check(work.resolution_tail != nullptr && work.proxy != work.resolution_tail->proxy
+                  && work.nr_output != work.resolution_tail->nr_output,
+              "independent Upscaled pair has distinct model resources");
+        const auto& slots = native::features.at(owner).slots;
+        const auto reuses = native::edit_reuse_reuses.load();
+        const auto refreshes = native::edit_reuse_refreshes.load();
+        uint32_t previous_history = slots[1].look_history.written;
+        for (size_t sample = 0; sample < split_stamps.size(); ++sample) {
+          same_stage_resolution_cases::stamps = split_stamps[sample];
+          pair_calls.clear();
+          const auto calls = frame(sample == 0 ? 1 : 0, false);
+          const auto output_snapshot = stage_execution_cases::Capture(
+              gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+          submit_commands("split Upscaled final writeback readback");
+          std::cout << "OBS Upscaled split x2=" << x2 << " frame=" << sample << " calls=" << calls
+                    << " fence=" << gpu.serial;
+          for (const auto& call : pair_calls) {
+            std::cout << " model=" << call.preset << ':' << call.input.width << 'x' << call.input.height
+                      << "->" << call.output.width << 'x' << call.output.height << " reset=" << call.reset;
+          }
+          std::cout << " reuse_delta=" << native::edit_reuse_reuses.load() - reuses << '\n';
+          Check(calls == 2 && pair_calls.size() == 2, "split temporal Upscaled evaluates both models every frame");
+          constexpr std::array<uint32_t, 2> sizes{16, 12};
+          for (size_t pass = 0; pass < sizes.size(); ++pass) {
+            const auto& call = pair_calls[pass];
+            Check(call.handle == slots[pass].handle && call.preset == pass + 1
+                      && call.input.width == sizes[pass] && call.input.height == sizes[pass]
+                      && call.output.width == sizes[pass] && call.output.height == sizes[pass],
+                  "split Upscaled Evaluate binds each model's actual input and output extent");
+          }
+          const auto& history = slots[1].look_history;
+          Check(slots[0].look_history.buffers[0] == nullptr && history.valid
+                    && history.width == 12 && history.height == 12 && history.written != previous_history,
+                "only the tail's 12x12 Look history advances");
+          previous_history = history.written;
+          auto tail_input = pair_calls[1].input.Pixels();
+          auto final_output = output_snapshot.Pixels();
+          std::cout << "OBS Upscaled split pixels tail_proxy_R=" << read_red(tail_input, tail_center)
+                    << " final_R=" << read_red(final_output, center) << " history="
+                    << history.width << 'x' << history.height << ':' << history.written << '\n';
+          Check(output_snapshot.width == 16 && output_snapshot.height == 16,
+                "split Upscaled writes the full-resolution SR output");
+          if (x2) {
+            Check(tail_input == reference[sample].tail_input && final_output == reference[sample].final_output,
+                  "split x2 fallback preserves the per-frame tail input and final RGBA byte-for-byte");
+          } else {
+            reference[sample] = {.tail_input = std::move(tail_input), .final_output = std::move(final_output)};
+          }
+        }
+        Check(native::edit_reuse_reuses.load() == reuses && native::edit_reuse_refreshes.load() == refreshes
+                  && slots[0].edit_reuse == nullptr && slots[1].edit_reuse == nullptr,
+              "split temporal Upscaled publishes neither a reuse nor a refresh anchor");
+      }
+      Check(std::abs(read_red(reference[1].tail_input, tail_center)
+                     - read_red(reference[0].tail_input, tail_center)) > .025f,
+            "changing only the first model changes the tail's actual input");
+      Check(reference[2].tail_input == reference[1].tail_input
+                && std::abs(read_red(reference[2].final_output, center)
+                            - read_red(reference[1].final_output, center)) > .025f,
+            "changing only the tail model changes the actual final writeback");
+      std::cout << "PASS Upscaled split temporal Look x2 fallback: 16x16/12x12 Evaluate every frame, "
+                   "tail input and final writeback match x1; evidence=WARP+MOCK\n";
+      // A spatial-only tail can use the terminal cache. Its own Look must
+      // invalidate that cache even when the parent has no Look surfaces.
+      auto& tail_look = native::pass_look_result[0];
+      tail_look.detail_stability = 1;
+      tail_look.mode = true;
+      tail_look.stabilize = 0;
+      tail_look.strength = .5f;
+      same_stage_resolution_cases::stamps = split_stamps[0];
+      const auto reuses = native::edit_reuse_reuses.load();
+      pair_frame("split spatial refresh", 1, 2);
+      pair_frame("split spatial stable reuse", 0, 0);
+      Check(native::edit_reuse_reuses.load() == reuses + 1,
+            "a stable spatial-only split group reuses the terminal edit");
+      const auto before_look_change = pair_frame("split spatial next refresh", 0, 2);
+      tail_look.strength = 1.5f;
+      pair_calls.clear();
+      const auto changed_calls = frame(0, false);
+      const auto changed_output = stage_execution_cases::Capture(
+          gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      submit_commands("split Upscaled spatial Look writeback readback");
+      const float before_red = read_red(before_look_change, center);
+      const float after_red = read_red(changed_output.Pixels(), center);
+      std::cout << "OBS Upscaled split spatial tail Look change calls=" << changed_calls
+                << " final_R=" << before_red << '/' << after_red << " fence=" << gpu.serial << '\n';
+      Check(changed_calls == 2 && pair_calls.size() == 2 && pair_calls[1].input.width == 12
+                && native::edit_reuse_reuses.load() == reuses + 1,
+            "changing only the split tail Look refreshes both models before reuse");
+      Check(std::abs(after_red - before_red) > .05f,
+            "the new spatial tail Look reaches the full-resolution SR output");
+      std::cout << "PASS Upscaled split spatial Look: stable terminal reuse and tail Look refresh; evidence=WARP+MOCK\n";
+    }
+
     native::ReleaseFeatureStates();
     native::RetireAllWorksets();
     native::FlushRetiredResources();

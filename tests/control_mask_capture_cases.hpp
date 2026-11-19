@@ -212,6 +212,71 @@ inline int Run() {
             && service_event["timing_us"]["staging"] == 20 && service_event["timing_us"]["writeback"] == 30,
         "completed reuse exports full Service cost without inventing an NR call or NGX acceptance");
 
+  auto inline_context = changed;
+  inline_context.inline_edit_reuse = true;
+  inline_context.source_generation_available = true;
+  inline_context.source_generation = 2;
+  inline_context.source_handle = 17;
+  inline_context.source_sequence = 100;
+  inline_context.output_ready = true;
+  inline_context.refresh = true;
+  inline_context.model_evaluates = 1;
+  inline_context.api_returned = true;
+  inline_context.ngx_accepted = true;
+  Check(cap::Configure(3, 1, 0), "inline comparison uses the existing bounded capture");
+  for (uint32_t frame = 0; frame < 3; ++frame) {
+    inline_context.source_sequence = 100 + frame;
+    inline_context.reuse = frame == 1;
+    inline_context.refresh = !inline_context.reuse;
+    inline_context.model_evaluates = (inline_context.reuse ? 0u : 1u);
+    inline_context.api_returned = inline_context.ngx_accepted = !inline_context.reuse;
+    const auto inline_token = cap::Reserve(inline_context, 200 + frame, frame);
+    Check(inline_token != 0 && cap::Reserve(changed, 300 + frame, frame) == 0,
+        "one capture cannot mix model-only rows into its inline source-chain scope");
+    cap::Observe(valid(200 + frame), inline_token);
+  }
+  expect_written();
+  const auto inline_output = read_json(terminal_for(cap::GetSummary().capture_id));
+  const auto& reused_row = inline_output["events"][1];
+  Check(inline_output["scope"] == "native_upscaled_inline_chain"
+            && inline_output["summary"]["actual_valid"] == 3
+            && inline_output["events"][0]["inline_chain"]["source_sequence"] == 100
+            && reused_row["inline_chain"]["source_sequence"] == 101
+            && inline_output["events"][2]["inline_chain"]["source_sequence"] == 102,
+        "refresh/reuse/refresh all export one completed source-chain row in order");
+  Check(reused_row["inline_chain"]["reuse"] && reused_row["inline_chain"]["model_evaluates"] == 0
+            && !reused_row["context"]["api_returned"].get<bool>()
+            && !reused_row["context"]["ngx_accepted"].get<bool>()
+            && reused_row["timing_us"]["total"] == 110
+            && reused_row["inline_chain"]["source_handle"] == 17
+            && reused_row["context"]["source_generation"] == 2
+            && inline_output["eval_scope"].get<std::string>().find("cache apply") != std::string::npos,
+        "a completed cache-only write keeps actual false model API fields and a nonempty full-chain time");
+
+  Check(cap::Configure(2, 1, 0), "inline invalid-result fixture configures");
+  inline_context.refresh = false;
+  inline_context.reuse = true;
+  inline_context.api_returned = inline_context.ngx_accepted = false;
+  inline_context.model_evaluates = 1;
+  auto inline_token = cap::Reserve(inline_context, 210, 0);
+  cap::Observe(valid(210), inline_token);
+  inline_context.model_evaluates = 0;
+  inline_token = cap::Reserve(inline_context, 211, 1);
+  auto inline_replayed = valid(211);
+  inline_replayed.state = timers::SampleState::REPLAYED;
+  cap::Observe(inline_replayed, inline_token);
+  inline_context.output_ready = false;
+  inline_token = cap::Reserve(inline_context, 212, 2);
+  cap::Observe(valid(212), inline_token);
+  Check(cap::GetSummary().valid == 0 && cap::GetSummary().rejected == 3,
+      "invented reuse calls, replayed GPU work and failed output cannot become completed inline samples");
+  inline_context.output_ready = true;
+  inline_context.stage = static_cast<uint32_t>(renodx::addons::dlss5::stage_plan::Stage::PRESENT);
+  Check(cap::Reserve(inline_context, 213, 3) == 0, "native inline scope does not accept a Present row");
+  inline_context.stage = static_cast<uint32_t>(renodx::addons::dlss5::stage_plan::Stage::UPSCALED);
+  cap::Stop("inline_negative_cases_complete");
+  expect_written();
+
   Check(cap::Configure(2, 1, 0), "capture can configure after successful export");
   auto token = cap::Reserve(changed, 10, 0);
   auto rejected = valid(10);

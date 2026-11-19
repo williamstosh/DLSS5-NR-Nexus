@@ -62,6 +62,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cctype>
 #include <array>
 #include <deque>
 #include <memory>
@@ -95,12 +96,18 @@
 #include "report_bundle.hpp"
 #include "version.h"
 #endif
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+#include "nr_xefg_present_probe.hpp"
+#endif
 
 namespace renodx::addons::dlss5::screenshot {
 
 enum class RequestKind : uint32_t { FINAL_PRESENTATION, PRE_FG_SERVICE
 #if defined(NR_NEXUS_DEV_CONTROL)
-                                   , INLINE_RESTORE_ROI
+                                   , INLINE_RESTORE_ROI, FG_CONSUMER_ROI
+#endif
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+                                   , XEFG_PRESENT_ROI
 #endif
 };
 
@@ -118,6 +125,52 @@ struct CaptureRect {
 };
 
 #if defined(NR_NEXUS_DEV_CONTROL)
+struct FgConsumerContext {
+  uintptr_t feature_handle = 0;
+  uintptr_t parameters_identity = 0;
+  uint32_t module_slot = 0;
+  uint32_t mfg_index = 0;
+  bool mfg_index_available = false;
+  // Screenshot retirement clock only; this is not an FG source frame token.
+  uint64_t present_generation = 0;
+  // Derived from the selected typed input at Begin, never supplied as proof by a caller.
+  uintptr_t input_resource_identity = 0;
+  DXGI_FORMAT input_format = DXGI_FORMAT_UNKNOWN;
+  uint32_t input_width = 0, input_height = 0;
+  CaptureRect roi;
+};
+
+struct FgConsumerStatus {
+  std::string capture_id;
+  const char* status = "idle";
+  std::string reason;
+  uint64_t serial = 0;
+};
+#if defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+struct XefgCaptureRequest {
+  std::filesystem::path directory;
+  std::string capture_id;
+  std::array<CaptureRect, 2> rois{};
+  uint64_t retirement_generation = 0;
+};
+struct XefgCaptureStatus {
+  std::string capture_id;
+  const char* status = "idle";
+  std::string reason;
+  uint32_t recorded = 0, written = 0, blocked = 0;
+  uint64_t last_serial = 0;
+  bool drained = true;
+};
+struct XefgPresentCapture {
+  XefgCaptureRequest request;
+  xefg_present_probe::CopyContext context;
+  std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 2> footprints{};
+  std::array<uint64_t, 2> bytes{};
+  bool api_returned = false;
+  HRESULT api_result = E_PENDING;
+};
+#endif
+
 struct InlineRestoreContext {
   bool d3d11_bridge = false, mixed = false, present = false;
   bool preparing = false, warmup = false, reset_sent = false;
@@ -383,6 +436,28 @@ struct InlineRestoreCapture : InlineRestoreFrame {
   std::vector<InlineRestoreFrame> frames;
 };
 
+struct FgConsumerCapture {
+  std::filesystem::path output_directory;
+  std::string capture_id;
+  uint64_t deadline_ms = 0;
+  FgConsumerContext context;
+  std::pair<uint64_t, uint64_t> recording;
+  std::shared_ptr<submission::RecordingStatus> recording_status;
+  uintptr_t backbuffer_identity = 0, hudless_identity = 0, output_identity = 0;
+  DXGI_FORMAT backbuffer_format = DXGI_FORMAT_UNKNOWN;
+  uint32_t backbuffer_width = 0, backbuffer_height = 0;
+  DXGI_FORMAT output_format = DXGI_FORMAT_UNKNOWN;
+  uint32_t output_width = 0, output_height = 0;
+  std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 2> output_footprints;
+  std::array<uint64_t, 2> output_plane_bytes{};
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT output_footprint{};
+  uint64_t output_bytes = 0;
+  bool input_hudless = false;
+  bool api_returned = false, api_succeeded = false;
+  uint32_t api_result = 0;
+  std::string reason;
+};
+
 inline std::span<const InlineRestoreFrame> InlineFrames(const InlineRestoreCapture& capture) {
   if (capture.tail_frame_count != 0) return capture.frames;
   return {&static_cast<const InlineRestoreFrame&>(capture), 1};
@@ -448,6 +523,11 @@ struct PendingCapture {
 #if defined(NR_NEXUS_DEV_CONTROL)
   std::optional<InlineRestoreCapture> inline_restore;
   std::optional<InlineRestoreFrame> bridge_model_stages;
+  std::optional<FgConsumerCapture> fg_consumer;
+#if defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+  std::optional<XefgPresentCapture> xefg_present;
+  std::shared_ptr<xefg_present_probe::CopyPacket> xefg_copy;
+#endif
 #endif
   uint64_t service_serial = 0;
   uint64_t restore_config_epoch = 0;
@@ -556,6 +636,13 @@ inline std::atomic_bool inline_restore_active = false;
 inline std::atomic_uint64_t inline_restore_request_id = 0;
 inline std::optional<InlineRestoreCapture> requested_inline_restore;
 inline InlineRestoreStatus inline_restore_status;
+inline std::optional<FgConsumerCapture> requested_fg_consumer;
+inline FgConsumerStatus fg_consumer_status;
+#if defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+inline std::optional<XefgCaptureRequest> xefg_request;
+inline XefgCaptureStatus xefg_status;
+inline bool xefg_recording_reserved = false, xefg_gate_owned = false;
+#endif
 #endif
 inline std::optional<HdrCapturePlan> configured_hdr_plan;
 inline std::deque<PendingCapture> hdr_in_flight;
@@ -615,6 +702,9 @@ inline void PublishFinished(FinishedCapture record) noexcept {
 // COM readback pointers, leaking every re-recorded plane (a 4K FP16 plane is
 // ~63 MiB; v6 audit issue 13).
 struct RetiredCaptureBuffers {
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+  std::shared_ptr<xefg_present_probe::CopyPacket> xefg_copy;
+#endif
   std::shared_ptr<CaptureReservation> reservation;
   std::shared_ptr<NativeReceiver> native_receiver;
   std::vector<ID3D12Resource*> temporary_resources;
@@ -636,6 +726,9 @@ struct RetiredCaptureBuffers {
     temporary_resources.clear();
     reservation.reset();
     native_receiver.reset();
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+    xefg_copy.reset();
+#endif
   }
 
   // Takes ownership of a cancelled PendingCapture's raw buffers for
@@ -645,6 +738,9 @@ struct RetiredCaptureBuffers {
   void Take(PendingCapture&& capture) {
     reservation = std::move(capture.reservation);
     native_receiver = std::move(capture.native_receiver);
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+    xefg_copy = std::move(capture.xefg_copy);
+#endif
     temporary_resources = std::move(capture.temporary_resources);
     stage_planes = capture.stage_planes;
     pre_nr_readback = capture.pre_nr_readback;
@@ -664,6 +760,9 @@ inline std::vector<RetiredCaptureBuffers> held_unexecuted;
 // still execute or replay (a PendingCapture or a RetiredCaptureBuffers).
 template <typename Buffers>
 inline bool ReadbacksReleasable(const Buffers& buffers) {
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+  if (buffers.xefg_copy && !buffers.xefg_copy->IsRetired()) return false;
+#endif
   if (buffers.native_receiver && buffers.native_receiver->context != nullptr && !buffers.native_receiver->completed.load()) return false;
   if (!submission::ResourceReleasable(buffers.pre_nr_readback)
       || !submission::ResourceReleasable(buffers.nr_output_readback)) {
@@ -686,6 +785,21 @@ inline std::optional<PendingCapture> job;
 inline std::deque<PendingCapture> hdr_jobs;
 inline std::atomic_uint32_t outstanding_jobs = 0;
 inline std::atomic_bool worker_started = false;
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+inline std::atomic_bool xefg_control_pending = false;
+// Caller holds state_mutex. A closed request releases only its own gate.
+inline bool XefgDrainedLocked() {
+  return !xefg_recording_reserved && !pending && hdr_in_flight.empty() && !worker_busy.load()
+      && outstanding_jobs.load() == 0 && retained_sets.load() == 0;
+}
+inline void ReleaseXefgGateIfDrained() {
+  std::scoped_lock lock(state_mutex);
+  if (xefg_gate_owned && !xefg_request && XefgDrainedLocked()) {
+    stage_busy.store(false);
+    xefg_gate_owned = false;
+  }
+}
+#endif
 inline std::atomic_bool sequence_manifest_dirty = false;
 inline std::atomic_bool sequence_manifest_busy = false;
 inline std::atomic_bool sequence_manifest_failed = false;
@@ -735,6 +849,9 @@ inline void ReleaseReadbacks(PendingCapture& capture) {
   capture.temporary_resources.clear();
   capture.reservation.reset();
   capture.native_receiver.reset();
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+  capture.xefg_copy.reset();
+#endif
 }
 
 // Shared readback-buffer allocator for the PNG pair and the float planes.
@@ -1177,6 +1294,45 @@ inline bool StageSubmissionCompleted(PendingCapture* capture) {
     }
     return !proof->empty() && GpuLeaseCompleted(*proof);
   };
+  if (capture->fg_consumer
+#if defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+      || capture->xefg_present
+#endif
+  ) {
+#if defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+    if (capture->xefg_present && (!capture->xefg_copy || !capture->xefg_copy->IsCompleted())) return false;
+#endif
+    bool completed = capture->service_sealed && capture->pre_recorded;
+    if (capture->pre_recorded) {
+      completed = observe(capture->pre_nr_readback, &capture->pre_submission_proof) && completed;
+      completed = completed && capture->pre_submission_proof.waits.size() == 1;
+    }
+    if (capture->ready) {
+      completed = observe(capture->nr_output_readback, &capture->post_submission_proof) && completed;
+      completed = completed && capture->post_submission_proof.waits.size() == 1;
+    }
+    if (capture->pre_submission_proof.waits.size() > 1 || capture->post_submission_proof.waits.size() > 1) {
+      if (capture->fg_consumer) capture->fg_consumer->reason = "fg_consumer_copy_recording_replayed";
+      capture->required_planes_complete = false;
+      capture->aborted = true;
+    }
+    for (const auto* proof : {&capture->pre_submission_proof, &capture->post_submission_proof}) {
+      for (const auto& [fence, value] : proof->waits) {
+        if (fence.fence == nullptr || fence->GetCompletedValue() == UINT64_MAX) {
+          completed = false;
+          if (capture->fg_consumer) capture->fg_consumer->reason = "fg_consumer_copy_device_removed";
+        } else if (fence->GetCompletedValue() < value) {
+          completed = false;
+        }
+      }
+    }
+    for (auto& plane : capture->planes) {
+      if (plane.recorded) {
+        completed = observe(plane.readback, &plane.submission_proof) && completed;
+      }
+    }
+    return completed;
+  }
   bool completed = capture->pre_recorded && capture->ready;
   if (capture->inline_restore) {
     const auto& roi = *capture->inline_restore;
@@ -2001,11 +2157,24 @@ inline void ProcessJob(std::optional<PendingCapture> work) noexcept {
 #if defined(NR_NEXUS_DEV_CONTROL)
     bool inline_roi;
     uint64_t serial;
+#if defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+    bool xefg;
+#endif
 #endif
     ~BusyReset() {
       if (hdr) outstanding_jobs.fetch_sub(1);
       worker_busy.store(outstanding_jobs.load() != 0, std::memory_order_release);
-      if (stage_planes) stage_busy.store(false, std::memory_order_release);
+      if (stage_planes) {
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+        if (xefg) {
+          ReleaseXefgGateIfDrained();
+        } else {
+          stage_busy.store(false, std::memory_order_release);
+        }
+#else
+        stage_busy.store(false, std::memory_order_release);
+#endif
+      }
 #if defined(NR_NEXUS_DEV_CONTROL)
       if (inline_roi) {
         std::scoped_lock state_lock(state_mutex);
@@ -2020,6 +2189,9 @@ inline void ProcessJob(std::optional<PendingCapture> work) noexcept {
   } busy_reset{.stage_planes = work->stage_planes, .hdr = work->hdr_plan.has_value()
 #if defined(NR_NEXUS_DEV_CONTROL)
               , .inline_roi = work->inline_restore.has_value(), .serial = work->serial
+#if defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+              , .xefg = work->xefg_present.has_value()
+#endif
 #endif
   };
   struct SequenceResult {
@@ -2248,6 +2420,248 @@ inline void ProcessJob(std::optional<PendingCapture> work) noexcept {
       record.meta = meta_path;
       record.outcome = (valid ? "written" : "incomplete");
       record.reason = (valid ? (tail ? "tail_stage_frames_written" : "four_raw_planes_written") : error);
+      PublishFinished(std::move(record));
+      ReleaseReadbacks(*work);
+      return;
+    }
+#if defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+    if (work->xefg_present) {
+      const auto& frame = *work->xefg_present;
+      const auto& context = frame.context;
+      const bool completed = work->completion_proven && !work->metadata_only && !work->aborted
+          && CaptureCompletionProven(*work) && StageSubmissionCompleted(&*work);
+      const bool current = xefg_present_probe::FrameCurrent(context);
+      std::array<std::vector<uint8_t>, 2> raw;
+      const std::array<const char*, 2> names{"nr_roi", "sdk_roi"};
+      const std::array<ID3D12Resource*, 2> readbacks{work->pre_nr_readback, work->nr_output_readback};
+      std::array<std::string, 2> errors;
+      for (size_t index = 0; index < raw.size(); ++index) {
+        const auto roi = frame.request.rois[index];
+        const auto row_bytes = size_t(roi.width) * DiagnosticPixelBytes(context.format);
+        if (!completed || !current) {
+          errors[index] = (!current ? "capture_generation_cancelled" : "gpu_unconfirmed");
+          continue;
+        }
+        void* mapped = nullptr;
+        if (readbacks[index] == nullptr || FAILED(readbacks[index]->Map(0, nullptr, &mapped))) {
+          errors[index] = "readback_map_failed";
+          continue;
+        }
+        if (mapped == nullptr || Unwritten(mapped, frame.bytes[index])) {
+          errors[index] = "unwritten_readback";
+        } else {
+          raw[index].resize(row_bytes * roi.height);
+          for (uint32_t row = 0; row < roi.height; ++row) {
+            std::memcpy(raw[index].data() + row * row_bytes,
+                static_cast<const uint8_t*>(mapped) + frame.footprints[index].Offset
+                    + uint64_t(row) * frame.footprints[index].Footprint.RowPitch, row_bytes);
+          }
+        }
+        readbacks[index]->Unmap(0, nullptr);
+      }
+      const bool valid = completed && current && frame.api_returned && SUCCEEDED(frame.api_result)
+          && work->service_sealed && errors[0].empty() && errors[1].empty();
+      const std::string stem = frame.request.capture_id + "_" + std::to_string(work->serial);
+      std::ostringstream meta;
+      meta << "capture_schema=xefg_native_present_roi_v1\ncapture_id=" << frame.request.capture_id
+           << "\ncapture_serial=" << work->serial << "\nwindow_generation=" << context.window_generation
+           << "\nslot=" << context.target.slot << "\nmodule=" << context.target.module << "\nhandle=" << context.target.handle
+           << "\ninit_serial=" << context.target.init_serial << "\ncontext=" << context.target.context
+           << "\ncontext_generation=" << context.target.context_generation << "\nbuffer_generation=" << context.target.buffer_generation
+           << "\nnative_present_serial=" << context.native_serial << "\nnative_swapchain=" << context.swapchain
+           << "\nqueue=" << context.queue << "\nbuffer=" << context.buffer << "\nbuffer_index=" << context.index
+           << "\nrecording_list=" << context.recording_list << "\nrecording_generation=" << context.recording_generation
+           << "\ncopy_fence=" << reinterpret_cast<uintptr_t>(work->xefg_copy->fence.Get())
+           << "\ncopy_fence_value=1\ncopy_signal_result=" << work->xefg_copy->signal_result
+           << "\nfull_width=" << context.width << "\nfull_height=" << context.height << "\nformat_dxgi=" << context.format
+           << "\ntag_enabled_request=" << context.tag_enabled << "\ntag_api_sequence=" << context.tag_api_sequence
+           << "\napi_returned=" << frame.api_returned << "\napi_result=" << frame.api_result
+           << "\ncopy_state_contract=PRESENT_COPY_SOURCE_PRESENT\ngpu_completed=" << completed << "\nraw_copy_valid=" << valid
+           << "\ncolor_conversion=none\nclassification=Unknown\nmarker_contribution=NotMeasured\nscanout=NotMeasured\n";
+      for (size_t index = 0; index < raw.size(); ++index) {
+        const auto roi = frame.request.rois[index];
+        uint64_t hash = 14695981039346656037ull;
+        for (const auto byte : raw[index]) {
+          hash = (hash ^ byte) * 1099511628211ull;
+        }
+        meta << names[index] << ".x=" << roi.x << '\n' << names[index] << ".y=" << roi.y
+             << '\n' << names[index] << ".width=" << roi.width << '\n' << names[index] << ".height=" << roi.height
+             << '\n' << names[index] << ".bytes=" << raw[index].size() << '\n' << names[index] << ".fnv1a64=" << hash
+             << '\n' << names[index] << ".error=" << errors[index] << '\n';
+      }
+      const auto redacted = report::RedactText(meta.str(), report::SystemRedaction());
+      if (redacted.empty()) {
+        throw std::runtime_error("XeFG present metadata redaction failed");
+      }
+      std::filesystem::create_directories(frame.request.directory);
+      struct Cleanup {
+        std::vector<std::filesystem::path> files;
+        bool committed = false;
+        ~Cleanup() {
+          if (committed) return;
+          std::error_code error;
+          for (const auto& file : files) {
+            std::filesystem::remove(file, error);
+          }
+        }
+      } cleanup;
+      for (size_t index = 0; index < raw.size(); ++index) {
+        if (raw[index].empty()) continue;
+        const auto path = frame.request.directory / (stem + "_" + names[index] + ".raw");
+        cleanup.files.push_back(path);
+        if (!WriteBytes(path, raw[index])) {
+          throw std::runtime_error("XeFG present raw write failed");
+        }
+      }
+      const auto path = frame.request.directory / (stem + ".meta.txt");
+      cleanup.files.push_back(path);
+      std::ofstream output(path, std::ios::binary | std::ios::trunc);
+      output << redacted;
+      output.close();
+      if (output.fail()) {
+        throw std::runtime_error("XeFG present metadata write failed");
+      }
+      cleanup.committed = true;
+      {
+        std::scoped_lock lock(state_mutex);
+        if (xefg_status.capture_id == frame.request.capture_id) {
+          xefg_status.written += valid;
+          xefg_status.blocked += !valid;
+          xefg_status.status = (valid ? "written" : "blocked");
+          xefg_status.reason = (valid ? "dual_roi_gpu_bytes_written_classification_unknown" : "present_copy_not_proven");
+        }
+      }
+      record.meta = path;
+      record.outcome = (valid ? "written" : "blocked");
+      record.reason = (valid ? "xefg_native_present_dual_roi_written" : "present_copy_not_proven");
+      PublishFinished(std::move(record));
+      ReleaseReadbacks(*work);
+      return;
+    }
+#endif
+    if (work->fg_consumer) {
+      const auto& frame = *work->fg_consumer;
+      const auto& context = frame.context;
+      const bool completed = work->completion_proven && !work->metadata_only
+          && CaptureCompletionProven(*work) && StageSubmissionCompleted(&*work);
+      std::array<std::vector<uint8_t>, 2> raw;
+      std::array<std::string, 2> errors;
+      const std::array<const char*, 2> names{"input", "output_interpolated"};
+      const std::array<ID3D12Resource*, 2> readbacks{work->pre_nr_readback, work->nr_output_readback};
+      const std::array<bool, 2> recorded{work->pre_recorded, work->ready};
+      const std::array<DXGI_FORMAT, 2> formats{work->format, frame.output_format};
+      const std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 2> footprints{work->footprint, frame.output_footprint};
+      const std::array<uint64_t, 2> plane_bytes{work->total_bytes, frame.output_bytes};
+      for (size_t index = 0; index < raw.size(); ++index) {
+        if (!completed) {
+          errors[index] = "gpu_unconfirmed";
+        } else if (!recorded[index] || readbacks[index] == nullptr) {
+          errors[index] = "copy_not_recorded";
+        } else {
+          const size_t row_bytes = static_cast<size_t>(work->width) * DiagnosticPixelBytes(formats[index]);
+          raw[index].resize(row_bytes * work->height);
+          void* mapped = nullptr;
+          if (FAILED(readbacks[index]->Map(0, nullptr, &mapped))) {
+            raw[index].clear();
+            errors[index] = "readback_map_failed";
+          } else {
+            const bool unwritten = mapped == nullptr || Unwritten(mapped, plane_bytes[index]);
+            if (!unwritten) {
+              for (uint32_t row = 0; row < work->height; ++row) {
+                std::memcpy(raw[index].data() + row * row_bytes,
+                    static_cast<const uint8_t*>(mapped) + footprints[index].Offset + uint64_t(row) * footprints[index].Footprint.RowPitch,
+                    row_bytes);
+              }
+            }
+            readbacks[index]->Unmap(0, nullptr);
+            if (unwritten) {
+              raw[index].clear();
+              errors[index] = "unwritten_readback";
+            }
+          }
+        }
+      }
+      const bool valid = frame.api_returned && frame.api_succeeded && work->service_sealed
+          && !work->aborted && errors[0].empty() && errors[1].empty();
+      const std::string stem = frame.capture_id + "_" + std::to_string(work->serial);
+      std::ostringstream meta;
+      meta << "capture_schema=fg_consumer_roi_v1\ncapture_id=" << frame.capture_id
+           << "\ncapture_serial=" << work->serial << "\nfeature_handle=" << context.feature_handle
+           << "\nparameters_identity=" << context.parameters_identity << "\nmodule_slot=" << context.module_slot
+           << "\nmfg_index_available=" << context.mfg_index_available << "\nmfg_index=" << context.mfg_index
+           << "\nsource_frame_token_available=0\nlifecycle_present_generation=" << context.present_generation
+           << "\ncompletion_lifecycle_generation=" << work->completion_generation
+           << "\nrecording_list=" << frame.recording.first << "\nrecording_generation=" << frame.recording.second
+           << "\nrecording_submitted=" << (frame.recording_status && frame.recording_status->submitted.load())
+           << "\nrecording_retired=" << (frame.recording_status && frame.recording_status->closed.load())
+           << "\nbackbuffer_resource=" << frame.backbuffer_identity << "\nhudless_resource=" << frame.hudless_identity
+           << "\nbackbuffer_format_dxgi=" << frame.backbuffer_format
+           << "\nbackbuffer_width=" << frame.backbuffer_width << "\nbackbuffer_height=" << frame.backbuffer_height
+           << "\ninput_role=" << (frame.input_hudless ? "HUDLess" : "Backbuffer")
+           << "\ninput_resource=" << context.input_resource_identity << "\noutput_interpolated_resource=" << frame.output_identity
+           << "\noutput_interpolated_format_dxgi=" << frame.output_format
+           << "\noutput_interpolated_width=" << frame.output_width << "\noutput_interpolated_height=" << frame.output_height
+           << "\ninput_format_dxgi=" << context.input_format << "\nfull_width=" << context.input_width
+           << "\nfull_height=" << context.input_height << "\nroi_x=" << context.roi.x << "\nroi_y=" << context.roi.y
+           << "\nroi_width=" << context.roi.width << "\nroi_height=" << context.roi.height
+           << "\ninput_state_contract=NON_PIXEL_SHADER_RESOURCE\noutput_state_contract=UNORDERED_ACCESS"
+           << "\napi_returned=" << frame.api_returned << "\napi_result=" << frame.api_result
+           << "\napi_succeeded=" << frame.api_succeeded << "\nrecorded_copies_gpu_completed=" << completed
+           << "\nsingle_submission_receipts_verified="
+           << (work->pre_submission_proof.waits.size() == 1 && work->post_submission_proof.waits.size() == 1)
+           << "\nraw_input_output_copy_valid=" << valid
+           << "\ninterpolation_validity_flag_verified=0\npresentation_verified=0\ncolor_conversion=none\nreason=" << frame.reason << '\n';
+      const std::array<const GpuLease*, 2> proofs{&work->pre_submission_proof, &work->post_submission_proof};
+      for (size_t index = 0; index < raw.size(); ++index) {
+        uint64_t hash = 14695981039346656037ull;
+        for (uint8_t byte : raw[index]) {
+          hash = (hash ^ byte) * 1099511628211ull;
+        }
+        meta << names[index] << ".file=" << (raw[index].empty() ? "" : stem + "_" + names[index] + ".raw")
+             << '\n' << names[index] << ".bytes=" << raw[index].size()
+             << '\n' << names[index] << ".fnv1a64=" << hash
+             << '\n' << names[index] << ".error=" << errors[index]
+             << '\n' << names[index] << ".fence_count=" << proofs[index]->waits.size() << '\n';
+        for (size_t fence_index = 0; fence_index < proofs[index]->waits.size(); ++fence_index) {
+          const auto& [fence, value] = proofs[index]->waits[fence_index];
+          meta << names[index] << ".fence." << fence_index << ".identity=" << reinterpret_cast<uintptr_t>(fence.fence)
+               << '\n' << names[index] << ".fence." << fence_index << ".value=" << value << '\n';
+        }
+      }
+      const auto redacted = report::RedactText(meta.str(), report::SystemRedaction());
+      if (redacted.empty()) throw std::runtime_error("FG consumer metadata redaction failed");
+      std::filesystem::create_directories(frame.output_directory);
+      struct ExportCleanup {
+        std::vector<std::filesystem::path> files;
+        bool committed = false;
+        ~ExportCleanup() {
+          if (committed) return;
+          std::error_code error;
+          for (const auto& file : files) {
+            std::filesystem::remove(file, error);
+          }
+        }
+      } cleanup;
+      for (size_t index = 0; index < raw.size(); ++index) {
+        if (raw[index].empty()) continue;
+        const auto path = frame.output_directory / (stem + "_" + names[index] + ".raw");
+        cleanup.files.push_back(path);
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        output.write(reinterpret_cast<const char*>(raw[index].data()), raw[index].size());
+        output.close();
+        if (output.fail()) throw std::runtime_error("FG consumer raw write failed");
+      }
+      const auto meta_path = frame.output_directory / (stem + ".meta.txt");
+      cleanup.files.push_back(meta_path);
+      std::ofstream output(meta_path, std::ios::binary | std::ios::trunc);
+      output << redacted;
+      output.close();
+      if (output.fail()) throw std::runtime_error("FG consumer metadata write failed");
+      cleanup.committed = true;
+      record.meta = meta_path;
+      record.outcome = (valid ? "written" : "blocked");
+      record.reason = (valid ? "actual_consumer_input_and_OutputInterpolated_roi_written"
+                             : (frame.reason.empty() ? "consumer_copy_not_proven" : frame.reason));
       PublishFinished(std::move(record));
       ReleaseReadbacks(*work);
       return;
@@ -2693,13 +3107,17 @@ inline void ProcessJob(std::optional<PendingCapture> work) noexcept {
   } catch (const std::exception& ex) {
     record.outcome = "exception";
 #if defined(NR_NEXUS_DEV_CONTROL)
-    if (work->inline_restore) record.reason = ex.what();
+    if (work->inline_restore || work->fg_consumer) {
+      record.reason = ex.what();
+    }
 #endif
     SafeLog(reshade::log::level::error, std::string("NR screenshot exception: ") + ex.what());
   } catch (...) {
     record.outcome = "exception";
 #if defined(NR_NEXUS_DEV_CONTROL)
-    if (work->inline_restore) record.reason = "unknown_export_exception";
+    if (work->inline_restore || work->fg_consumer) {
+      record.reason = "unknown_export_exception";
+    }
 #endif
     SafeLog(reshade::log::level::error, "NR screenshot unknown exception");
   }
@@ -2720,15 +3138,54 @@ inline void WorkerLoop() noexcept {
       &pinned_module);
   for (;;) {
     std::optional<PendingCapture> work;
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+    bool xefg_control = false;
+#endif
     {
       std::unique_lock lock(job_mutex);
       job_signal.wait(lock, [] {
         return shutdown_requested.load(std::memory_order_acquire) || job.has_value() || !hdr_jobs.empty()
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+               || xefg_control_pending.load()
+#endif
                || sequence_manifest_dirty.load() || control_mask_capture::WorkPending();
       });
-      if (job) { work = std::move(*job); job.reset(); }
-      else if (!hdr_jobs.empty()) { work = std::move(hdr_jobs.front()); hdr_jobs.pop_front(); }
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+      xefg_control = xefg_control_pending.exchange(false);
+      if (!xefg_control) {
+#endif
+        if (job) {
+          work = std::move(*job);
+          job.reset();
+        } else if (!hdr_jobs.empty()) {
+          work = std::move(hdr_jobs.front());
+          hdr_jobs.pop_front();
+        }
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+      }
+#endif
     }
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+    if (xefg_control) {
+      // This worker owns a module reference. No render/runtime, job, screenshot,
+      // or probe ledger lock crosses the SDK job callback.
+      const auto finish_capture = +[] {
+        if (!xefg_present_probe::CopyCalibration().active) {
+          {
+            std::scoped_lock lock(state_mutex);
+            xefg_request.reset();
+          }
+          ReleaseXefgGateIfDrained();
+        }
+      };
+      if (shutdown_requested.load(std::memory_order_acquire)) {
+        xefg_present_probe::RejectControlStart("worker_shutdown");
+        finish_capture();
+      } else {
+        xefg_present_probe::RunControlJob(finish_capture);
+      }
+    }
+#endif
     if (shutdown_requested.load(std::memory_order_acquire)) {
       control_mask_capture::Stop("shutdown", /*notify_worker=*/false);
     }
@@ -2779,6 +3236,17 @@ inline void WorkerLoop() noexcept {
   }
 }
 
+inline bool EnsureWorkerStarted() noexcept {
+  if (worker_started.exchange(true, std::memory_order_acq_rel)) return true;
+  try {
+    std::thread(WorkerLoop).detach();
+    return true;
+  } catch (...) {
+    worker_started.store(false, std::memory_order_release);
+    return false;
+  }
+}
+
 // Hands a settled capture to the worker. Called on the present thread with no
 // other lock held; must not throw.
 inline void HandoffToWorker(std::optional<PendingCapture> work) noexcept {
@@ -2802,14 +3270,7 @@ inline void HandoffToWorker(std::optional<PendingCapture> work) noexcept {
     }
     if (!work->hdr_plan) job = std::move(work);
   }
-  if (!worker_started.exchange(true, std::memory_order_acq_rel)) {
-    bool created = false;
-    try {
-      std::thread(WorkerLoop).detach();
-      created = true;
-    } catch (...) {
-    }
-    if (!created) {
+  if (!EnsureWorkerStarted()) {
       // No worker available: degrade to synchronous completion rather than
       // leaving the feature wedged. One present-thread stall, never a crash.
       worker_started.store(false, std::memory_order_release);
@@ -2846,7 +3307,6 @@ inline void HandoffToWorker(std::optional<PendingCapture> work) noexcept {
         ProcessJob(std::move(fallback));
       }
       return;
-    }
   }
   job_signal.notify_one();
 }
@@ -3188,6 +3648,14 @@ inline void PreserveStageSubmissionProofs() {
 
 inline void Disarm() {
   std::scoped_lock lock(internal::state_mutex);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (internal::requested_fg_consumer) {
+    internal::requested_fg_consumer.reset();
+    internal::configured_hdr_plan.reset();
+    internal::fg_consumer_status.status = "cancelled";
+    internal::fg_consumer_status.reason = "request_disarmed";
+  }
+#endif
   if (internal::requested_kind.load() == RequestKind::PRE_FG_SERVICE) internal::configured_hdr_plan.reset();
   internal::capture_requested.store(false, std::memory_order_release);
   if (!internal::pending.has_value()) internal::stage_busy.store(false, std::memory_order_release);
@@ -3265,6 +3733,18 @@ inline bool RequestPreFgService(const HdrCapturePlan& plan) {
 // substitute a pre-tonemap NGX texture and call it a displayed NR off/on pair.
 inline void FailRequest(const char* outcome, const char* explanation) {
   std::scoped_lock lock(internal::state_mutex);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (internal::requested_kind.load() == RequestKind::FG_CONSUMER_ROI) {
+    internal::requested_fg_consumer.reset();
+    internal::configured_hdr_plan.reset();
+    internal::fg_consumer_status.status = outcome;
+    internal::fg_consumer_status.reason = explanation;
+    if (internal::pending && internal::pending->fg_consumer) {
+      internal::pending->service_sealed = true;
+      internal::pending->fg_consumer->reason = explanation;
+    }
+  }
+#endif
   if (internal::requested_kind.load() == RequestKind::PRE_FG_SERVICE) internal::configured_hdr_plan.reset();
   if (!internal::capture_requested.exchange(false, std::memory_order_acq_rel) && !internal::pending) return;
   if (internal::pending.has_value()) {
@@ -3357,7 +3837,11 @@ inline bool PrepareCapture(
     uint8_t hdr_mode,
     uint64_t generation,
     float linear_unit_nits = 80.f,
-    bool model_diagnostic = false) {
+    bool model_diagnostic = false
+#if defined(NR_NEXUS_DEV_CONTROL)
+    , uint64_t fg_consumer_request = 0
+#endif
+) {
   if (device == nullptr || source == nullptr || width == 0 || height == 0)
     return false;
   const D3D12_RESOURCE_DESC source_desc = source->GetDesc();
@@ -3381,8 +3865,18 @@ inline bool PrepareCapture(
 
   std::scoped_lock lock(internal::state_mutex);
   const bool prefg = internal::requested_kind.load() == RequestKind::PRE_FG_SERVICE;
-  const auto hdr_plan = ((hdr_mode != 0 || prefg) ? internal::configured_hdr_plan : std::nullopt);
+  const bool fg_consumer =
+#if defined(NR_NEXUS_DEV_CONTROL)
+      internal::requested_kind.load() == RequestKind::FG_CONSUMER_ROI;
+#else
+      false;
+#endif
+  const auto hdr_plan = ((hdr_mode != 0 || prefg || fg_consumer) ? internal::configured_hdr_plan : std::nullopt);
   if (prefg && (internal::pending || !internal::capture_requested.load() || !hdr_plan)) return false;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (fg_consumer && (fg_consumer_request == 0 || fg_consumer_request != internal::request_id.load()
+      || internal::pending || !internal::capture_requested.load() || !hdr_plan)) return false;
+#endif
   const bool capture_stages = stage_planes_enabled.load(std::memory_order_relaxed) || hdr_plan.has_value();
   if (hdr_plan) {
     const auto roi = hdr_plan->roi;
@@ -3414,6 +3908,17 @@ inline bool PrepareCapture(
     device->GetCopyableFootprints(&roi_desc, 0, 1, 0, &footprint, &rows, nullptr, &total_bytes);
     crop_x = roi.x; crop_y = roi.y; width = roi.width; height = roi.height;
   }
+  uint64_t post_readback_bytes = total_bytes;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (fg_consumer) {
+    auto maximum_output = source_desc;
+    maximum_output.Width = width;
+    maximum_output.Height = height;
+    maximum_output.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    device->GetCopyableFootprints(&maximum_output, 0, 1, 0, nullptr, nullptr, nullptr, &post_readback_bytes);
+    post_readback_bytes = std::max(post_readback_bytes, total_bytes);
+  }
+#endif
   if (capture_stages) {
     std::scoped_lock job_lock(internal::job_mutex);
     if (internal::pending.has_value() || (!hdr_plan && (internal::job.has_value()
@@ -3441,8 +3946,11 @@ inline bool PrepareCapture(
     // their growth transients; fixed slack covers profiles, streams and metadata.
     capture.cpu_export_bytes = static_cast<uint64_t>(width) * height * 128 + 262144 + capture.cpu_row_bytes;
     const auto allocation_bytes = internal::ReadbackAllocationBytes(device, total_bytes);
+    const auto post_allocation_bytes = (post_readback_bytes == total_bytes
+        ? allocation_bytes : internal::ReadbackAllocationBytes(device, post_readback_bytes));
     if (allocation_bytes > internal::MAX_STAGE_READBACK_BYTES / 2
-        || !capture.reservation->Reserve(allocation_bytes * 2)) {
+        || post_allocation_bytes > internal::MAX_STAGE_READBACK_BYTES / 2
+        || !capture.reservation->Reserve(allocation_bytes + post_allocation_bytes)) {
       internal::SafeLog(reshade::log::level::warning, "HDR capture refused: aggregate_readback_budget_exceeded");
       return false;
     }
@@ -3452,7 +3960,7 @@ inline bool PrepareCapture(
     }
   }
   capture.stage_planes = capture_stages;
-  capture.allocated_bytes = total_bytes * 2;
+  capture.allocated_bytes = total_bytes + post_readback_bytes;
   capture.model_diagnostic = model_diagnostic;
   capture.width = width;
   capture.height = height;
@@ -3471,8 +3979,8 @@ inline bool PrepareCapture(
   capture.serial = internal::capture_serial.fetch_add(1) + 1;
   capture.creation_generation = generation;
 
-  if (!internal::MakeReadbackBuffer(device, total_bytes, &capture.pre_nr_readback, !capture.stage_planes)
-      || !internal::MakeReadbackBuffer(device, total_bytes, &capture.nr_output_readback, !capture.stage_planes)) {
+  if (!internal::MakeReadbackBuffer(device, total_bytes, &capture.pre_nr_readback, !capture.stage_planes || fg_consumer)
+      || !internal::MakeReadbackBuffer(device, post_readback_bytes, &capture.nr_output_readback, !capture.stage_planes || fg_consumer)) {
     internal::ReleaseReadbacks(capture);
     return false;
   }
@@ -3503,7 +4011,13 @@ inline bool PrepareCapture(
     internal::QueueSequenceManifest();
   }
   internal::pending = std::move(capture);
-  if (prefg) internal::configured_hdr_plan.reset();
+  if (prefg || fg_consumer) internal::configured_hdr_plan.reset();
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (fg_consumer) {
+    internal::requested_fg_consumer.reset();
+    internal::capture_requested.store(false, std::memory_order_release);
+  }
+#endif
   if (capture_stages) internal::stage_busy.store(true, std::memory_order_release);
   internal::has_pending.store(true, std::memory_order_release);
   return true;
@@ -3518,6 +4032,12 @@ inline void RecordPreCopy(
   std::scoped_lock lock(internal::state_mutex);
   if (!internal::pending.has_value()) return;
   if (internal::pending->stage_planes && internal::pending->pre_recorded) return;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (internal::pending->fg_consumer
+      && (internal::pending->model_recording_list != command_list || internal::pending->service_sealed
+          || internal::pending->fg_consumer->recording != submission::RecordingIdentity(command_list)
+          || internal::pending->fg_consumer->context.input_resource_identity != reinterpret_cast<uintptr_t>(pre_nr_source))) return;
+#endif
   D3D12_TEXTURE_COPY_LOCATION dst{};
   dst.pResource = internal::pending->pre_nr_readback;
   dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
@@ -3543,6 +4063,9 @@ inline void RecordPostCopy(
   std::scoped_lock lock(internal::state_mutex);
   if (!internal::pending.has_value()) return;
   if (internal::pending->stage_planes && internal::pending->ready) return;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (internal::pending->fg_consumer) return;
+#endif
   D3D12_TEXTURE_COPY_LOCATION dst{};
   dst.pResource = internal::pending->nr_output_readback;
   dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
@@ -4362,12 +4885,453 @@ inline void EndPreFgCapture(ID3D12GraphicsCommandList* list, ID3D12Resource* bac
   }
 }
 
+#if defined(NR_NEXUS_DEV_CONTROL)
+inline bool WantsFgConsumerCapture() {
+  return IsArmed() && internal::requested_kind.load() == RequestKind::FG_CONSUMER_ROI;
+}
+
+inline FgConsumerStatus CopyFgConsumerStatus() {
+  std::scoped_lock lock(internal::state_mutex);
+  auto result = internal::fg_consumer_status;
+  std::scoped_lock finished_lock(internal::finished_mutex);
+  if (result.serial != 0 && internal::finished.serial == result.serial) {
+    result.status = internal::finished.outcome;
+    result.reason = internal::finished.reason;
+  }
+  return result;
+}
+
+inline bool RequestFgConsumerCapture(const std::filesystem::path& directory, const std::string& capture_id,
+                                    CaptureRect roi, std::string* reason = nullptr) {
+  const auto reject = [&](const char* text) {
+    if (reason != nullptr) {
+      *reason = text;
+    }
+    return false;
+  };
+  if (!directory.is_absolute() || capture_id.empty() || capture_id.size() > 80
+      || !std::all_of(capture_id.begin(), capture_id.end(), [](unsigned char c) {
+           return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
+         }) || roi.width == 0 || roi.height == 0 || roi.width > 256 || roi.height > 192
+      || roi.x > UINT32_MAX - roi.width || roi.y > UINT32_MAX - roi.height) return reject("invalid_consumer_roi_request");
+  std::scoped_lock lock(internal::state_mutex);
+  if (internal::capture_requested.load() || internal::pending || internal::stage_busy.load()
+      || internal::inline_restore_active.load() || internal::worker_busy.load() || internal::sequence.active
+      || !internal::hdr_in_flight.empty() || internal::aggregate_bytes.load() != 0
+      || internal::outstanding_jobs.load() != 0 || internal::retained_sets.load() != 0
+      || internal::sequence_manifest_dirty.load() || internal::sequence_manifest_busy.load()
+      || internal::sequence_manifest_failed.load()) return reject("capture_busy");
+  {
+    std::scoped_lock job_lock(internal::job_mutex);
+    if (internal::job) return reject("capture_busy");
+  }
+  internal::requested_fg_consumer = internal::FgConsumerCapture{
+      .output_directory = directory, .capture_id = capture_id, .deadline_ms = GetTickCount64() + 30'000,
+      .context = {.roi = roi}};
+  internal::fg_consumer_status = {.capture_id = capture_id, .status = "armed", .reason = "waiting_for_actual_fg_consumer"};
+  internal::configured_hdr_plan = HdrCapturePlan{.roi = roi};
+  internal::requested_kind.store(RequestKind::FG_CONSUMER_ROI);
+  internal::request_id.fetch_add(1);
+  internal::presents_while_armed.store(0);
+  internal::stage_busy.store(true);
+  internal::capture_requested.store(true, std::memory_order_release);
+  if (reason != nullptr) {
+    *reason = "capture_armed";
+  }
+  return true;
+}
+
+// Only the actual NGX FG wrapper calls this, with its typed Backbuffer/HUDLess
+// inputs already in the SDK's NON_PIXEL_SHADER_RESOURCE consumption state.
+inline uint64_t BeginFgConsumerCapture(ID3D12Device* device, ID3D12GraphicsCommandList* list,
+                                      ID3D12Resource* backbuffer, ID3D12Resource* hudless,
+                                      const FgConsumerContext& context) {
+  if (!WantsFgConsumerCapture()) return 0;
+  internal::FgConsumerCapture frame;
+  uint64_t consumer_request = 0;
+  {
+    std::scoped_lock lock(internal::state_mutex);
+    if (!internal::requested_fg_consumer || internal::pending) return 0;
+    frame = *internal::requested_fg_consumer;
+    consumer_request = internal::request_id.load();
+  }
+  const auto blocked = [consumer_request](const char* reason) {
+    std::scoped_lock lock(internal::state_mutex);
+    if (internal::request_id.load() != consumer_request || internal::pending || !internal::requested_fg_consumer) return uint64_t{0};
+    internal::requested_fg_consumer.reset();
+    internal::configured_hdr_plan.reset();
+    internal::capture_requested.store(false, std::memory_order_release);
+    internal::stage_busy.store(false);
+    internal::fg_consumer_status.status = "blocked";
+    internal::fg_consumer_status.reason = reason;
+    return uint64_t{0};
+  };
+  ID3D12Resource* input = (hudless != nullptr ? hudless : backbuffer);
+  if (GetTickCount64() >= frame.deadline_ms) return blocked("fg_consumer_request_expired");
+  if (device == nullptr || list == nullptr || input == nullptr || context.feature_handle == 0
+      || context.parameters_identity == 0) return blocked("fg_consumer_typed_input_or_identity_missing");
+  const auto desc = input->GetDesc();
+  const auto roi = frame.context.roi;
+  if ((desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT && desc.Format != DXGI_FORMAT_R10G10B10A2_UNORM)
+      || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1
+      || desc.SampleDesc.Count != 1 || desc.MipLevels != 1 || desc.Width > UINT32_MAX
+      || roi.x >= desc.Width || roi.y >= desc.Height
+      || roi.width > desc.Width - roi.x || roi.height > desc.Height - roi.y) return blocked("fg_consumer_input_format_or_roi_unsupported");
+  frame.recording = submission::RecordingIdentity(list);
+  frame.recording_status = submission::ObserveRecording(list);
+  if (frame.recording.first == 0 || (frame.recording.first >> 63) != 0 || !frame.recording_status
+      || frame.recording_status->closed.load()) return blocked("fg_consumer_recording_identity_unavailable");
+  frame.context = context;
+  frame.context.input_resource_identity = reinterpret_cast<uintptr_t>(input);
+  frame.context.input_format = desc.Format;
+  frame.context.input_width = static_cast<uint32_t>(desc.Width);
+  frame.context.input_height = desc.Height;
+  frame.context.roi = roi;
+  frame.backbuffer_identity = reinterpret_cast<uintptr_t>(backbuffer);
+  frame.hudless_identity = reinterpret_cast<uintptr_t>(hudless);
+  frame.input_hudless = hudless != nullptr;
+  if (backbuffer != nullptr) {
+    const auto backbuffer_desc = backbuffer->GetDesc();
+    frame.backbuffer_format = backbuffer_desc.Format;
+    frame.backbuffer_width = static_cast<uint32_t>(backbuffer_desc.Width);
+    frame.backbuffer_height = backbuffer_desc.Height;
+  }
+  for (size_t index = 0; index < frame.output_footprints.size(); ++index) {
+    auto output_desc = desc;
+    output_desc.Width = roi.width;
+    output_desc.Height = roi.height;
+    output_desc.Format = (index == 0 ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R10G10B10A2_UNORM);
+    device->GetCopyableFootprints(&output_desc, 0, 1, 0, &frame.output_footprints[index], nullptr, nullptr,
+        &frame.output_plane_bytes[index]);
+  }
+  if (!PrepareCapture(device, input, roi.x, roi.y, roi.width, roi.height, desc.Format,
+          desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM ? 2u : 1u, context.present_generation, 80.f, true, consumer_request)) {
+    return blocked("fg_consumer_readback_allocation_or_request_rejected");
+  }
+  uint64_t serial = 0;
+  {
+    std::scoped_lock lock(internal::state_mutex);
+    if (internal::request_id.load() != consumer_request) return 0;
+    if (!internal::pending || internal::pending->request_kind != RequestKind::FG_CONSUMER_ROI) {
+      internal::fg_consumer_status.status = "blocked";
+      internal::fg_consumer_status.reason = "fg_consumer_retired_before_input_copy";
+      return 0;
+    }
+    auto& capture = *internal::pending;
+    serial = capture.serial;
+    capture.fg_consumer = std::move(frame);
+    capture.model_recording_list = list;
+    internal::requested_fg_consumer.reset();
+    internal::capture_requested.store(false, std::memory_order_release);
+    internal::fg_consumer_status.status = "recording";
+    internal::fg_consumer_status.reason = "actual_fg_input_copy";
+    internal::fg_consumer_status.serial = serial;
+    if (capture.aborted) {
+      capture.service_sealed = true;
+      capture.fg_consumer->reason = "capture_aborted_before_input_copy";
+      internal::fg_consumer_status.status = "blocked";
+      internal::fg_consumer_status.reason = capture.fg_consumer->reason;
+      return 0;
+    }
+  }
+  D3D12_RESOURCE_BARRIER barrier{.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+      .Transition = {.pResource = input, .Subresource = 0,
+          .StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, .StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE}};
+  list->ResourceBarrier(1, &barrier);
+  RecordPreCopy(list, input);
+  std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+  list->ResourceBarrier(1, &barrier);
+  return serial;
+}
+
+// OutputInterpolated is the official typed texture, in the SDK's UAV state.
+// A successful API return alone does not establish generated-frame validity.
+inline bool EndFgConsumerCapture(uint64_t serial, ID3D12GraphicsCommandList* list,
+                                ID3D12Resource* output_interpolated, uint32_t api_result, bool api_succeeded) {
+  if (serial == 0) return false;
+  ID3D12Resource* readback = nullptr;
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+  CaptureRect roi;
+  {
+    std::scoped_lock lock(internal::state_mutex);
+    if (!internal::pending || !internal::pending->fg_consumer || internal::pending->serial != serial
+        || internal::pending->service_sealed) return false;
+    auto& capture = *internal::pending;
+    auto& frame = *capture.fg_consumer;
+    roi = frame.context.roi;
+    frame.api_returned = true;
+    frame.api_result = api_result;
+    frame.api_succeeded = api_succeeded;
+    frame.output_identity = reinterpret_cast<uintptr_t>(output_interpolated);
+    if (list == nullptr || capture.model_recording_list != list || submission::RecordingIdentity(list) != frame.recording) {
+      frame.reason = "fg_consumer_recording_changed";
+    } else if (!api_succeeded) {
+      frame.reason = "fg_consumer_api_failed";
+    } else if (output_interpolated == nullptr) {
+      frame.reason = "fg_consumer_OutputInterpolated_absent";
+    } else {
+      const auto desc = output_interpolated->GetDesc();
+      frame.output_format = desc.Format;
+      frame.output_width = static_cast<uint32_t>(desc.Width);
+      frame.output_height = desc.Height;
+      if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1
+          || desc.DepthOrArraySize != 1 || desc.MipLevels != 1
+          || (desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT && desc.Format != DXGI_FORMAT_R10G10B10A2_UNORM)
+          || roi.x >= desc.Width || roi.y >= desc.Height
+          || roi.width > desc.Width - roi.x || roi.height > desc.Height - roi.y) {
+        frame.reason = "fg_consumer_output_format_or_dimensions_unsupported";
+      } else if (frame.backbuffer_identity != 0 && (desc.Format != frame.backbuffer_format
+          || desc.Width != frame.backbuffer_width || desc.Height != frame.backbuffer_height)) {
+        frame.reason = "fg_consumer_output_Backbuffer_contract_mismatch";
+      } else {
+        const size_t index = (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 0 : 1);
+        frame.output_footprint = frame.output_footprints[index];
+        frame.output_bytes = frame.output_plane_bytes[index];
+        if (frame.output_bytes == 0 || frame.output_bytes > capture.nr_output_readback->GetDesc().Width) {
+          frame.reason = "fg_consumer_output_readback_capacity_rejected";
+        }
+      }
+    }
+    if (!frame.reason.empty()) {
+      capture.aborted = true;
+      capture.required_planes_complete = false;
+      capture.service_sealed = true;
+      internal::fg_consumer_status.status = "blocked";
+      internal::fg_consumer_status.reason = frame.reason;
+      return false;
+    }
+    readback = capture.nr_output_readback;
+    footprint = frame.output_footprint;
+  }
+  D3D12_RESOURCE_BARRIER barrier{.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+      .Transition = {.pResource = output_interpolated, .Subresource = 0,
+          .StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS, .StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE}};
+  list->ResourceBarrier(1, &barrier);
+  const D3D12_TEXTURE_COPY_LOCATION destination{.pResource = readback,
+      .Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, .PlacedFootprint = footprint};
+  const D3D12_TEXTURE_COPY_LOCATION source{.pResource = output_interpolated,
+      .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = 0};
+  const auto width = footprint.Footprint.Width;
+  const auto height = footprint.Footprint.Height;
+  const D3D12_BOX box{roi.x, roi.y, 0, roi.x + width, roi.y + height, 1};
+  list->CopyTextureRegion(&destination, 0, 0, 0, &source, &box);
+  submission::TrackUse(list, readback);
+  std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+  list->ResourceBarrier(1, &barrier);
+  std::scoped_lock lock(internal::state_mutex);
+  if (!internal::pending || internal::pending->serial != serial || !internal::pending->fg_consumer) return false;
+  internal::pending->ready = true;
+  internal::pending->service_sealed = true;
+  internal::fg_consumer_status.status = "waiting_gpu";
+  internal::fg_consumer_status.reason = "exact_recording_completion_pending";
+  return internal::pending->ready;
+}
+#endif
+
 // A helper's presentation window is not the evaluated game image. Copy
 // only addon-owned model buffers, whose states and equal extents are known;
 // the game's pre-SR Color is merely shader-readable, with no copy-state
 // proof. Both PNGs are explicitly sRGB previews, not calibrated HDR or the
 // game's final NR-off/on result. Call after the full chain succeeds, while
 // the last evaluated pass's proxy/output still exist unmodified.
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+inline bool ScheduleXefgControl() {
+  if (xefg_present_probe::CopyControl().phase != xefg_present_probe::ControlPhase::QUEUED) return true;
+  {
+    std::scoped_lock lock(internal::job_mutex);
+    internal::xefg_control_pending.store(true);
+  }
+  if (internal::shutdown_requested.load(std::memory_order_acquire) || !internal::EnsureWorkerStarted()) {
+    internal::xefg_control_pending.store(false);
+    xefg_present_probe::RejectControlStart();
+    {
+      std::scoped_lock lock(internal::state_mutex);
+      internal::xefg_request.reset();
+    }
+    internal::ReleaseXefgGateIfDrained();
+    return false;
+  }
+  internal::job_signal.notify_one();
+  return true;
+}
+inline bool ValidateXefgRois(const std::array<CaptureRect, 2>& rois) {
+  for (const auto roi : rois) {
+    if (roi.width == 0 || roi.height == 0 || roi.width > 256 || roi.height > 192
+        || roi.x > UINT32_MAX - roi.width || roi.y > UINT32_MAX - roi.height) return false;
+  }
+  const auto first = rois[0], second = rois[1];
+  return first.width == 128 && first.height == 64 && (first.x + first.width <= second.x || second.x + second.width <= first.x
+      || first.y + first.height <= second.y || second.y + second.height <= first.y);
+}
+inline XefgCaptureStatus CopyXefgCaptureStatus() {
+  std::scoped_lock lock(internal::state_mutex);
+  auto result = internal::xefg_status;
+  result.drained = internal::XefgDrainedLocked();
+  std::scoped_lock finished_lock(internal::finished_mutex);
+  if (result.last_serial != 0 && internal::finished.serial == result.last_serial) {
+    result.status = internal::finished.outcome;
+    result.reason = internal::finished.reason;
+  }
+  return result;
+}
+inline bool ReserveXefgRecording() {
+  std::scoped_lock lock(internal::state_mutex);
+  if (!internal::xefg_request || internal::xefg_recording_reserved || internal::pending
+      || HdrCaptureSlotsFull(internal::hdr_live_sets.load())) return false;
+  internal::xefg_recording_reserved = true;
+  return true;
+}
+inline void ReleaseXefgRecording() {
+  std::scoped_lock lock(internal::state_mutex);
+  internal::xefg_recording_reserved = false;
+}
+inline void CloseXefgRequest() {
+  {
+    std::scoped_lock lock(internal::state_mutex);
+    internal::xefg_request.reset();
+  }
+  internal::ReleaseXefgGateIfDrained();
+}
+inline bool RequestXefgCapture(const std::filesystem::path& directory, const std::string& capture_id,
+                               const std::array<CaptureRect, 2>& rois, uint64_t retirement_generation = 0) {
+  if (!directory.is_absolute() || capture_id.empty() || capture_id.size() > 80 || !ValidateXefgRois(rois)
+      || !std::all_of(capture_id.begin(), capture_id.end(), [](unsigned char c) {
+           return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
+         })) return false;
+  std::scoped_lock lock(internal::state_mutex);
+  if (internal::capture_requested.load() || internal::pending || internal::stage_busy.load()
+      || internal::worker_busy.load() || !internal::hdr_in_flight.empty() || internal::sequence.active
+      || internal::outstanding_jobs.load() != 0 || internal::retained_sets.load() != 0) return false;
+  internal::xefg_request = XefgCaptureRequest{.directory = directory, .capture_id = capture_id,
+      .rois = rois, .retirement_generation = retirement_generation};
+  internal::xefg_status = {.capture_id = capture_id, .status = "armed", .reason = "waiting_for_native_present"};
+  internal::xefg_gate_owned = true;
+  internal::stage_busy.store(true);
+  return true;
+}
+inline void CancelXefgCapture(const char* reason) {
+  std::scoped_lock lock(internal::state_mutex);
+  internal::xefg_request.reset();
+  internal::xefg_status.status = "stopped";
+  internal::xefg_status.reason = reason;
+  if (internal::pending && internal::pending->xefg_present) {
+    internal::pending->aborted = true;
+    internal::pending->service_sealed = true;
+  }
+  for (auto& frame : internal::hdr_in_flight) {
+    if (frame.xefg_present) {
+      frame.aborted = true;
+    }
+  }
+  if (internal::xefg_gate_owned && internal::XefgDrainedLocked()) {
+    internal::stage_busy.store(false);
+    internal::xefg_gate_owned = false;
+  }
+}
+inline uint64_t PrepareXefgPresent(const xefg_present_probe::CopyContext& context,
+                                  const std::shared_ptr<xefg_present_probe::CopyPacket>& packet, ID3D12Resource* buffer) {
+  XefgCaptureRequest request;
+  {
+    std::scoped_lock lock(internal::state_mutex);
+    if (!internal::xefg_request || internal::pending || HdrCaptureSlotsFull(internal::hdr_live_sets.load())) return 0;
+    request = *internal::xefg_request;
+  }
+  const auto desc = buffer->GetDesc();
+  if (!xefg_present_probe::FrameCurrent(context) || context.buffer != reinterpret_cast<uintptr_t>(buffer)
+      || context.queue != reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(packet->owner->queue.Get()))
+      || context.width != desc.Width || context.height != desc.Height || context.format != desc.Format
+      || (desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT && desc.Format != DXGI_FORMAT_R10G10B10A2_UNORM)
+      || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 || desc.MipLevels != 1
+      || desc.SampleDesc.Count != 1 || desc.Width > UINT32_MAX || !ValidateXefgRois(request.rois)
+      || request.rois[0].x != desc.Width / 4 || request.rois[0].y != desc.Height / 3) return 0;
+  for (const auto roi : request.rois) {
+    if (roi.x >= desc.Width || roi.y >= desc.Height || roi.width > desc.Width - roi.x || roi.height > desc.Height - roi.y) return 0;
+  }
+  internal::PendingCapture capture;
+  capture.request_kind = RequestKind::XEFG_PRESENT_ROI;
+  capture.xefg_copy = packet;
+  capture.xefg_present = XefgPresentCapture{.request = request, .context = context};
+  capture.hdr_plan = HdrCapturePlan{.roi = request.rois[0]};
+  capture.stage_planes = true;
+  capture.model_diagnostic = true;
+  capture.model_recording_list = packet->list.Get();
+  capture.full_width = context.width;
+  capture.full_height = context.height;
+  capture.format = context.format;
+  capture.serial = internal::capture_serial.fetch_add(1) + 1;
+  // The existing application-present clock is only a retirement clock.
+  capture.creation_generation = request.retirement_generation;
+  capture.reservation = std::make_shared<internal::CaptureReservation>();
+  capture.reservation->holds_hdr_slot = true;
+  internal::hdr_live_sets.fetch_add(1);
+  struct ReleaseUnclaimed {
+    internal::PendingCapture* capture;
+    ID3D12GraphicsCommandList* list;
+    bool moved = false;
+    ~ReleaseUnclaimed() {
+      if (moved) return;
+      submission::OnCommandListReset(list);
+      internal::ReleaseReadbacks(*capture);
+    }
+  } release{&capture, packet->list.Get()};
+  auto& frame = *capture.xefg_present;
+  const std::array<ID3D12Resource**, 2> destinations{&capture.pre_nr_readback, &capture.nr_output_readback};
+  for (size_t index = 0; index < destinations.size(); ++index) {
+    auto roi_desc = desc;
+    roi_desc.Width = request.rois[index].width;
+    roi_desc.Height = request.rois[index].height;
+    packet->owner->device->GetCopyableFootprints(&roi_desc, 0, 1, 0, &frame.footprints[index], nullptr, nullptr, &frame.bytes[index]);
+    if (frame.bytes[index] == 0 || !capture.reservation->Reserve(internal::ReadbackAllocationBytes(packet->owner->device.Get(), frame.bytes[index]))
+        || !capture.reservation->ReserveCpu(frame.bytes[index])
+        || !internal::MakeReadbackBuffer(packet->owner->device.Get(), frame.bytes[index], destinations[index])) return 0;
+    capture.allocated_bytes += frame.bytes[index];
+  }
+  D3D12_RESOURCE_BARRIER barrier{.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+      .Transition = {.pResource = buffer, .Subresource = 0, .StateBefore = D3D12_RESOURCE_STATE_PRESENT,
+          .StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE}};
+  packet->list->ResourceBarrier(1, &barrier);
+  for (size_t index = 0; index < destinations.size(); ++index) {
+    const auto roi = request.rois[index];
+    const D3D12_TEXTURE_COPY_LOCATION destination{.pResource = *destinations[index],
+        .Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, .PlacedFootprint = frame.footprints[index]};
+    const D3D12_TEXTURE_COPY_LOCATION source{.pResource = buffer, .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    const D3D12_BOX box{roi.x, roi.y, 0, roi.x + roi.width, roi.y + roi.height, 1};
+    packet->list->CopyTextureRegion(&destination, 0, 0, 0, &source, &box);
+    submission::TrackUse(packet->list.Get(), destination.pResource);
+  }
+  std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+  packet->list->ResourceBarrier(1, &barrier);
+  capture.pre_recorded = capture.ready = true;
+  const auto serial = capture.serial;
+  {
+    std::scoped_lock lock(internal::state_mutex);
+    if (!internal::xefg_request || internal::pending || internal::xefg_request->capture_id != request.capture_id) return 0;
+    internal::pending = std::move(capture);
+    internal::has_pending.store(true);
+    ++internal::xefg_status.recorded;
+    internal::xefg_status.last_serial = serial;
+    internal::xefg_status.status = "waiting_api_and_gpu";
+  }
+  release.moved = true;
+  return serial;
+}
+inline void ReturnXefgPresent(uint64_t serial, HRESULT result) {
+  std::scoped_lock lock(internal::state_mutex);
+  const auto finish = [&](internal::PendingCapture* capture) {
+    if (capture->serial != serial || !capture->xefg_present) return;
+    capture->xefg_present->api_returned = true;
+    capture->xefg_present->api_result = result;
+    capture->service_sealed = true;
+  };
+  if (internal::pending) {
+    finish(&*internal::pending);
+  }
+  for (auto& frame : internal::hdr_in_flight) {
+    finish(&frame);
+  }
+}
+#endif
+
 inline void CaptureModelPair(
     ID3D12Device* device, ID3D12GraphicsCommandList* command_list,
     ID3D12Resource* proxy, D3D12_RESOURCE_STATES proxy_state,
@@ -4524,6 +5488,17 @@ inline void AbortPending() {
   CancelHdrSequence();
   std::scoped_lock lock(internal::state_mutex);
 #if defined(NR_NEXUS_DEV_CONTROL)
+  if (internal::requested_fg_consumer) {
+    internal::requested_fg_consumer.reset();
+    internal::configured_hdr_plan.reset();
+    internal::fg_consumer_status.status = "cancelled";
+    internal::fg_consumer_status.reason = "capture_aborted_before_claim";
+    internal::stage_busy.store(false);
+  }
+  if (internal::pending && internal::pending->fg_consumer) {
+    internal::pending->service_sealed = true;
+    internal::pending->fg_consumer->reason = "capture_aborted";
+  }
   if (internal::requested_inline_restore) {
     internal::requested_inline_restore.reset();
     internal::inline_restore_status.status = "failed";
@@ -4541,9 +5516,17 @@ inline void AbortPending() {
 // Fast path when idle is a few atomic loads. Settled captures are moved to the
 // worker; all heavy work happens off this thread.
 inline void OnPresent(uint64_t generation, bool exact_proofs) noexcept {
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+  struct XefgGateCleanup {
+    ~XefgGateCleanup() { internal::ReleaseXefgGateIfDrained(); }
+  } xefg_gate_cleanup;
+#endif
   // Never acquire the game's immediate-context lock under state_mutex:
   // bridge recording takes those locks in the opposite order.
   std::vector<std::shared_ptr<internal::NativeReceiver>> native_polls;
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+  std::vector<std::shared_ptr<xefg_present_probe::CopyPacket>> xefg_polls;
+#endif
   {
     std::scoped_lock lock(internal::state_mutex);
 #if defined(NR_NEXUS_DEV_CONTROL)
@@ -4562,15 +5545,36 @@ inline void OnPresent(uint64_t generation, bool exact_proofs) noexcept {
     for (const auto& retained : internal::retired_buffers) {
       if (retained.native_receiver) native_polls.push_back(retained.native_receiver);
     }
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+    if (internal::pending && internal::pending->xefg_copy) xefg_polls.push_back(internal::pending->xefg_copy);
+    for (const auto& capture : internal::hdr_in_flight) {
+      if (capture.xefg_copy) xefg_polls.push_back(capture.xefg_copy);
+    }
+    for (const auto& retained : internal::retired_buffers) {
+      if (retained.xefg_copy) xefg_polls.push_back(retained.xefg_copy);
+    }
+#endif
   }
   for (const auto& receiver : native_polls) receiver->Poll();
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+  for (const auto& packet : xefg_polls) packet->Poll();
+#endif
   std::deque<internal::PendingCapture> hdr_ready;
   bool hdr_owned = false;
   {
     std::scoped_lock lock(internal::state_mutex);
     hdr_owned = internal::sequence.active || !internal::hdr_in_flight.empty()
                 || (internal::pending && internal::pending->hdr_plan);
+    bool consumer_call_open = false;
+#if defined(NR_NEXUS_DEV_CONTROL)
+    consumer_call_open = internal::pending && internal::pending->request_kind == RequestKind::FG_CONSUMER_ROI
+        && !internal::pending->service_sealed;
+#if defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+    consumer_call_open = consumer_call_open || (internal::pending && internal::pending->xefg_present && !internal::pending->service_sealed);
+#endif
+#endif
     if (internal::pending && internal::pending->hdr_plan && generation > internal::pending->creation_generation
+        && (!consumer_call_open || generation >= internal::pending->creation_generation + internal::kExactSettlePresents)
         && (internal::pending->request_kind != RequestKind::PRE_FG_SERVICE || internal::pending->ready
             || internal::pending->aborted
             || generation >= internal::pending->creation_generation + internal::kExactSettlePresents)) {
@@ -4593,7 +5597,13 @@ inline void OnPresent(uint64_t generation, bool exact_proofs) noexcept {
       const bool submitted = internal::StageSubmissionCompleted(&*it);
       const bool releasable = internal::ReadbacksReleasable(*it);
       const bool timeout = generation >= it->lease_generation + internal::kExactSettlePresents;
-      const bool service_closed = it->request_kind != RequestKind::PRE_FG_SERVICE || it->service_sealed;
+      bool service_closed = it->request_kind != RequestKind::PRE_FG_SERVICE || it->service_sealed;
+#if defined(NR_NEXUS_DEV_CONTROL)
+      service_closed = service_closed && (it->request_kind != RequestKind::FG_CONSUMER_ROI || it->service_sealed);
+#if defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
+      service_closed = service_closed && (!it->xefg_present || it->service_sealed);
+#endif
+#endif
       if (it->exact && submitted && releasable && service_closed) {
         it->completion_proven = true; it->completion_generation = generation;
         hdr_ready.push_back(std::move(*it));
@@ -4631,7 +5641,14 @@ inline void OnPresent(uint64_t generation, bool exact_proofs) noexcept {
     if (internal::presents_while_armed.fetch_add(1, std::memory_order_relaxed) + 1
         > internal::kArmTimeoutPresents) {
       internal::presents_while_armed.store(0, std::memory_order_relaxed);
-      FailRequest("no_nr_frame", "no eligible capture frame arrived within 600 presents");
+#if defined(NR_NEXUS_DEV_CONTROL)
+      if (internal::requested_kind.load() == RequestKind::FG_CONSUMER_ROI) {
+        FailRequest("blocked", "no actual FG consumer arrived within 600 presents");
+      } else
+#endif
+      {
+        FailRequest("no_nr_frame", "no eligible capture frame arrived within 600 presents");
+      }
     }
   } else {
     internal::presents_while_armed.store(0, std::memory_order_relaxed);

@@ -544,6 +544,23 @@ class HdrTargetTests(unittest.TestCase):
 
 
 class CaptureTests(unittest.TestCase):
+    def setUp(self):
+        self.client = mock.Mock()
+        self.nr_enabled = False
+
+        def status(**kwargs):
+            return dict(ok=True, status='observed', state=dict(settings=dict(NeuralUplift=self.nr_enabled)))
+
+        def set_value(key, value, **kwargs):
+            self.nr_enabled = value
+            return dict(status(), status='applied')
+
+        self.client.status.side_effect = status
+        self.client.set.side_effect = set_value
+        patcher = mock.patch.object(fg_acceptance, 'development_client', return_value=self.client)
+        self.development_client = patcher.start()
+        self.addCleanup(patcher.stop)
+
     def write_capture_ready(self, run):
         window = dict(hwnd=456, pid=123, created=1, path='game.exe', title='The Witcher 3')
         (run / 'capture-ready.json').write_text(json.dumps(dict(
@@ -647,11 +664,70 @@ class CaptureTests(unittest.TestCase):
                     mock.patch.object(fg_acceptance.time, 'sleep'):
                 with self.assertRaisesRegex(RuntimeError, 'menu capture failed'):
                     fg_acceptance.capture(run, check_addon_menu=True)
-            self.assertEqual([call.args[1] for call in key.call_args_list], ['F6', 'F6', 'D', 'HOME', 'HOME'])
+            self.assertEqual([call.args[1] for call in key.call_args_list], ['D', 'HOME', 'HOME'])
             self.assertFalse((run / 'capture-complete.json').exists())
             failure = json.loads((run / 'capture-failed.json').read_text())
             self.assertFalse(failure['no_game_input_sent'])
             self.assertTrue(failure['game_input_may_have_been_sent'])
+
+    def test_comparison_sets_explicit_states_with_receipt_and_readback_without_f6(self):
+        with tempfile.TemporaryDirectory(dir=fg_acceptance.ROOT / 'tmp') as directory:
+            run = Path(directory)
+            window = self.write_capture_ready(run)
+            with mock.patch.object(fg_acceptance.desktop, 'modules', return_value=[]), \
+                    mock.patch.object(fg_acceptance.desktop, 'same_process', return_value=True), \
+                    mock.patch.object(fg_acceptance.desktop.u, 'GetForegroundWindow', return_value=456), \
+                    mock.patch.object(fg_acceptance.desktop, 'capture') as capture, \
+                    mock.patch.object(fg_acceptance.desktop, 'key') as key, \
+                    mock.patch.object(fg_acceptance.time, 'sleep'):
+                fg_acceptance.capture(run)
+            self.assertEqual([call.args for call in self.client.set.call_args_list],
+                             [('NeuralUplift', True), ('NeuralUplift', False), ('NeuralUplift', True)])
+            self.assertEqual(self.client.status.call_count, 4)
+            self.assertTrue(all('deadline' in call.kwargs for call in self.client.set.call_args_list))
+            self.assertEqual(self.development_client.call_args.args[0], window)
+            self.assertEqual([call.args[1] for call in key.call_args_list], ['D'])
+            self.assertEqual(capture.call_count, 4)
+            events = json.loads((run / 'nr-toggle-captures.json').read_text())
+            assignments = [e for e in events if e['action'] == 'dev_control_set']
+            self.assertEqual([e['intended_state'] for e in assignments], [True, False, True])
+            self.assertTrue(all(e['response']['ok'] and e['readback']['ok'] for e in assignments))
+            self.assertTrue((run / 'capture-complete.json').exists())
+
+    def test_unavailable_or_unconfirmed_dev_control_never_falls_back_or_completes(self):
+        observed = dict(ok=True, status='observed', state=dict(settings=dict(NeuralUplift=False)))
+        cases = ('missing_pipe', 'unavailable', 'rejected', 'confirmation_required',
+                 'receipt_mismatch', 'readback_mismatch')
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory(dir=fg_acceptance.ROOT / 'tmp') as directory:
+                run = Path(directory)
+                self.write_capture_ready(run)
+                self.client.reset_mock()
+                self.client.status.side_effect = lambda **kwargs: observed
+                if case == 'missing_pipe':
+                    self.client.status.side_effect = TimeoutError('development pipe missing')
+                elif case == 'unavailable':
+                    self.client.status.side_effect = lambda **kwargs: dict(ok=False, status='unsupported', state={})
+                self.client.set.side_effect = lambda *args, **kwargs: dict(
+                    ok=case not in ('rejected', 'confirmation_required'),
+                    status=case if case in ('rejected', 'confirmation_required') else 'applied',
+                    state=dict(settings=dict(NeuralUplift=case != 'receipt_mismatch')))
+                with mock.patch.object(fg_acceptance.desktop, 'modules', return_value=[]), \
+                        mock.patch.object(fg_acceptance.desktop, 'same_process', return_value=True), \
+                        mock.patch.object(fg_acceptance.desktop.u, 'GetForegroundWindow', return_value=456), \
+                        mock.patch.object(fg_acceptance.desktop, 'capture') as capture, \
+                        mock.patch.object(fg_acceptance.desktop, 'key') as key, \
+                        mock.patch.object(fg_acceptance.time, 'sleep') as sleep:
+                    with self.assertRaisesRegex(RuntimeError, 'Development'):
+                        fg_acceptance.capture(run)
+                capture.assert_not_called()
+                key.assert_not_called()
+                sleep.assert_not_called()
+                if case in ('missing_pipe', 'unavailable'):
+                    self.client.set.assert_not_called()
+                self.assertFalse((run / 'capture-complete.json').exists())
+                failure = json.loads((run / 'capture-failed.json').read_text())
+                self.assertTrue(failure['no_game_input_sent'])
 
     def test_nr_off_control_never_toggles_nr_or_moves_camera(self):
         with tempfile.TemporaryDirectory(dir=fg_acceptance.ROOT / 'tmp') as directory:
@@ -667,6 +743,7 @@ class CaptureTests(unittest.TestCase):
                 fg_acceptance.capture(run, nr_off_control=True)
             key.assert_not_called()
             capture.assert_called_once()
+            self.development_client.assert_not_called()
             activate.assert_not_called()
             self.assertEqual(capture.call_args.kwargs, {'activate': False})
             events = json.loads((run / 'nr-toggle-captures.json').read_text())

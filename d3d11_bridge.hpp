@@ -29,9 +29,9 @@
 //      that ProcessInline recorded - the SAME after-upscale pipeline D3D12
 //      games get, reading the game's NGX block through bridge::ParameterView,
 //      which answers the resource keys with the D3D12 twins;
-//   5. the queue signals the return fence; the D3D11 context waits on it on
-//      the GPU and copies the twin back over the
-//      game's Output.
+//   5. the queue signals the shared, GPU-only completion fence. With
+//      completion proved, the D3D11 context orders its copy-back through
+//      that fence.
 //
 // Before upscaling (NRPreUpscale=1) the same handshake runs BEFORE real():
 // the game's Color is copied into a twin instead of its Output, the list is
@@ -66,12 +66,9 @@
 //   - a ring of kBridgeRing allocator/list pairs, reused only once the
 //     private done fence proves the GPU finished with them (else
 //     bridge_busy - the frame keeps the game's image, nothing waits);
-//   - a watchdog thread: a D3D12 submission that has not completed
-//     kBridgeWatchdogNs after its input fence arrived has its return fence
-//     CPU-signalled, so the game's D3D11 GPU never waits on a hung D3D12
-//     queue for longer than that (2000 ms was the plan's first value and
-//     equals the default TdrDelay; BridgeWatchdogMain says why the clock
-//     starts at the input fence);
+//   - after kBridgeWatchdogNs of D3D12-side time, the watchdog advances
+//     its rescue fence and wakes ordinary delivery to keep the original
+//     image. Only the GPU advances completion;
 //   - lock order: the game device's critical section before runtime_mutex
 //     (BridgeDeviceLock);
 //   - teardown drains the queue before NR state is released and releases the
@@ -174,15 +171,14 @@ struct Bridge {
   ID3D12Device* device12 = nullptr;
   ID3D12CommandQueue* queue = nullptr;
   BridgeSlot ring[kBridgeRing];
-  // in: D3D11 -> D3D12 (the twins hold this frame's inputs); out: D3D12 ->
-  // D3D11 (the output twin holds NR's result); done: private, the proof the
-  // D3D12 work itself finished - `out` can be CPU-signalled by the
-  // watchdog, `done` never is, so ring reuse and retirement key on it.
+  // `in` orders the D3D11 inputs. `done` orders D3D11 consumption, reuse
+  // and retirement. Only the D3D12 queue signals `done`. `out` is the CPU
+  // rescue fence and never orders access to the twins.
   ID3D12Fence* fence_in12 = nullptr;
   ID3D12Fence* fence_out12 = nullptr;
   ID3D12Fence* fence_done12 = nullptr;
   ID3D11Fence* fence_in11 = nullptr;
-  ID3D11Fence* fence_out11 = nullptr;
+  ID3D11Fence* fence_done11 = nullptr;
   ID3D11ComputeShader* depth_cs = nullptr;
   ID3D11ComputeShader* motion_cs = nullptr;
   HANDLE completion_event = nullptr;
@@ -230,8 +226,8 @@ inline std::atomic_uint64_t bridge_waits{0};
 inline std::atomic_uint64_t bridge_submits{0};
 inline std::atomic_uint64_t bridge_waits11{0};
 inline std::atomic_uint64_t bridge_skew{0};
-// Mixed-stage delivery requires real completion; a watchdog rescue of `out`
-// alone must never expose an unfinished Color to the game's SR.
+// CPU waits for delivery when GPU completion has not already been proved,
+// or when the strict stage contract requires its bounded completion wait.
 inline uint64_t bridge_completion_waits = 0;
 inline uint64_t bridge_completion_wait_ns = 0;
 inline uint64_t bridge_completion_failures = 0;
@@ -246,8 +242,8 @@ struct BridgeCpuTiming {
   uint64_t return_ns = 0;
 };
 inline std::array<BridgeCpuTiming, 2> bridge_cpu_timing;
-// A mixed transaction that withheld the D3D11 return Wait must finish before
-// any later input copy can overwrite its twins, even after a mode switch.
+// A submission that withheld the D3D11 return Wait must finish before any
+// later input copy can overwrite its twins, even after a mode switch.
 inline uint64_t bridge_pending_delivery_value = 0;
 
 // Two independently resident sets per source DLSS feature (Upscaled, Render),
@@ -900,9 +896,10 @@ struct BridgeWatchdogParams {
   ID3D12Fence* done = nullptr;
   ID3D12Fence* out = nullptr;
   HMODULE module = nullptr;
+  HANDLE completion_event = nullptr;
 };
 
-// The watchdog holds its own references to the fences and to this module,
+// The watchdog holds its own references to the fences, event and module,
 // so neither a teardown that gives up waiting for it nor an add-on unload can
 // pull anything out from under it; it leaves through FreeLibraryAndExitThread.
 //
@@ -950,11 +947,12 @@ inline DWORD WINAPI BridgeWatchdogMain(void* raw) {
       continue;
     }
     if (now_ns - timed_since_ns <= kBridgeWatchdogNs) continue;
-    // Releases every D3D11 wait up to `submitted`.  The D3D12 work itself is
-    // left to finish, or the device to be removed - `done` tells which.
+    // Wake delivery up to `submitted`. The D3D12 work itself is left to
+    // finish, or the device to be removed. `done` tells which.
     bridge_tripped.store(true, std::memory_order_release);
     bridge_timeouts.fetch_add(1, std::memory_order_release);
     params->out->Signal(submitted);
+    SetEvent(params->completion_event);
     // trip_ns[trips % kBridgeMaxTimeouts] is now the oldest of the last
     // kBridgeMaxTimeouts trips.
     trip_ns[trips++ % kBridgeMaxTimeouts] = now_ns;
@@ -966,6 +964,7 @@ inline DWORD WINAPI BridgeWatchdogMain(void* raw) {
   params->in->Release();
   params->done->Release();
   params->out->Release();
+  CloseHandle(params->completion_event);
   const HMODULE module = params->module;
   delete params;
   FreeLibraryAndExitThread(module, 0);
@@ -1045,7 +1044,7 @@ inline void ReleaseBridgeObjects() {
   }
   ReleaseCom(bridge.queue);
   ReleaseCom(bridge.fence_in11);
-  ReleaseCom(bridge.fence_out11);
+  ReleaseCom(bridge.fence_done11);
   ReleaseCom(bridge.fence_in12);
   ReleaseCom(bridge.fence_out12);
   ReleaseCom(bridge.fence_done12);
@@ -1164,7 +1163,7 @@ inline NrDeclineReason EnsureBridgeUp(ID3D11DeviceContext* context) {
     // The pair crosses the APIs: created on D3D12, opened on D3D11.
     for (auto [fence12, fence11] :
          {std::pair{&bridge.fence_in12, &bridge.fence_in11},
-          std::pair{&bridge.fence_out12, &bridge.fence_out11}}) {
+          std::pair{&bridge.fence_done12, &bridge.fence_done11}}) {
       if (FAILED(hr = bridge.device12->CreateFence(
                      0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(fence12)))) {
         return "CreateFence (shared)";
@@ -1179,7 +1178,7 @@ inline NrDeclineReason EnsureBridgeUp(ID3D11DeviceContext* context) {
       if (FAILED(hr)) return "ID3D11Device5::OpenSharedFence";
     }
     if (FAILED(hr = bridge.device12->CreateFence(
-                   0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&bridge.fence_done12)))) {
+                   0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&bridge.fence_out12)))) {
       return "CreateFence";
     }
     bridge.completion_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -1188,7 +1187,7 @@ inline NrDeclineReason EnsureBridgeUp(ID3D11DeviceContext* context) {
       return "CreateEventW (bridge completion)";
     }
     auto* params = new (std::nothrow) BridgeWatchdogParams{
-        bridge.fence_in12, bridge.fence_done12, bridge.fence_out12, nullptr};
+        .in = bridge.fence_in12, .done = bridge.fence_done12, .out = bridge.fence_out12};
     if (params == nullptr
         || GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                               reinterpret_cast<LPCWSTR>(&BridgeWatchdogMain),
@@ -1196,6 +1195,13 @@ inline NrDeclineReason EnsureBridgeUp(ID3D11DeviceContext* context) {
                == FALSE) {
       delete params;
       return "GetModuleHandleExW (watchdog)";
+    }
+    if (!DuplicateHandle(GetCurrentProcess(), bridge.completion_event, GetCurrentProcess(),
+                         &params->completion_event, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+      hr = HRESULT_FROM_WIN32(GetLastError());
+      FreeLibrary(params->module);
+      delete params;
+      return "DuplicateHandle (watchdog completion event)";
     }
     params->in->AddRef();
     params->done->AddRef();
@@ -1207,6 +1213,7 @@ inline NrDeclineReason EnsureBridgeUp(ID3D11DeviceContext* context) {
       params->in->Release();
       params->done->Release();
       params->out->Release();
+      CloseHandle(params->completion_event);
       FreeLibrary(params->module);
       delete params;
       return "CreateThread (watchdog)";
@@ -1289,6 +1296,28 @@ inline NrDeclineReason EnsureBridgeUp(ID3D11DeviceContext* context) {
                  : std::string(nr_before_upscale.load() ? "before" : "after")
                        + " the game's own DLSS upscale (NRHookPoint)"));
   return kBridgeReady;
+}
+
+// The caller holds the Bridge device section, NGX turn and runtime_mutex.
+// The watchdog can advance out before the GPU is done with these allocators.
+inline bool RetireBridgeRecordings() {
+  if (!bridge_device_live.load(std::memory_order_acquire)) return true;
+  if (std::ranges::none_of(bridge.ring, [](const BridgeSlot& slot) { return slot.value != 0; })) return true;
+  if (bridge_state.load(std::memory_order_acquire) != BridgeState::kUp || bridge.fence_done12 == nullptr) return false;
+
+  const uint64_t done = bridge.fence_done12->GetCompletedValue();
+  if (done == UINT64_MAX || done < bridge_submitted_value.load(std::memory_order_acquire)) return false;
+  for (BridgeSlot& slot : bridge.ring) {
+    if (slot.value == 0) continue;
+    if (slot.allocator == nullptr || slot.list == nullptr
+        || FAILED(slot.allocator->Reset()) || FAILED(slot.list->Reset(slot.allocator, nullptr))) {
+      return false;
+    }
+    submission::OnCommandListReset(slot.list);
+    if (FAILED(slot.list->Close())) return false;
+    slot.value = 0;
+  }
+  return true;
 }
 
 // Shutdown, before NR state is released: every submission must be off the
@@ -1406,6 +1435,7 @@ inline bool RunBridge(ID3D11DeviceContext* context,
   bool issued = false;
   bool independent_present_pair = false;
   bool adaptive_bridge = false;
+  bool ordinary_delivery_failed = false;
   NrRecording bridge_recording;
 #if defined(NR_NEXUS_DEV_CONTROL)
   uint64_t inline_restore_submission = 0;
@@ -1553,7 +1583,7 @@ inline bool RunBridge(ID3D11DeviceContext* context,
     }
     if (done < bridge_pending_delivery_value) {
       decline(NrDeclineReason::kBridgeTimeout,
-              "the previous mixed-stage delivery is still on the GPU; its twins cannot be reused");
+              "the previous undelivered Bridge submission is still on the GPU; its twins cannot be reused");
       return;
     }
     bridge_pending_delivery_value = 0;
@@ -1595,6 +1625,11 @@ inline bool RunBridge(ID3D11DeviceContext* context,
       return;
     }
     strict_delivery |= adaptive_bridge;
+    if (!strict_delivery && !pre && present == nullptr) {
+      // Let the original SR run while the CPU records NR. The input fence
+      // below still orders the shared copies after SR on this context.
+      bridge.context11->Flush();
+    }
     if (FAILED(slot.allocator->Reset())
         || FAILED(slot.list->Reset(slot.allocator, nullptr))) {
       bridge_skew.fetch_add(1, std::memory_order_relaxed);
@@ -1809,8 +1844,7 @@ inline bool RunBridge(ID3D11DeviceContext* context,
 #endif
       issued = true;
       bridge_submits.fetch_add(1, std::memory_order_relaxed);
-      submitted = SUCCEEDED(bridge.queue->Signal(bridge.fence_out12, value))
-                  && SUCCEEDED(bridge.queue->Signal(bridge.fence_done12, value));
+      submitted = SUCCEEDED(bridge.queue->Signal(bridge.fence_done12, value));
     }
 #if defined(NR_NEXUS_DEV_CONTROL)
     if (bridge_recording.inline_restore_serial != 0) {
@@ -1821,7 +1855,7 @@ inline bool RunBridge(ID3D11DeviceContext* context,
     slot.value = value;
     set->last_value = value;
     bridge_submitted_value.store(value, std::memory_order_release);
-    if (strict_delivery) bridge_pending_delivery_value = value;
+    bridge_pending_delivery_value = value;
     if (measure_cpu) {
       cpu.submit_ns += SteadyNowNs() - cpu_start;
     }
@@ -1835,37 +1869,57 @@ inline bool RunBridge(ID3D11DeviceContext* context,
       if (plan.mixed) decline(NrDeclineReason::kBridgeLost, "the D3D12 stage submission failed");
       return;
     }
-    if (strict_delivery) {
-      // `out` is also a watchdog escape hatch. Only the private GPU-only
-      // done fence proves the texture can be consumed. Inputs were flushed
-      // before this wait, so completion needs no further D3D11 submission.
+    // The D3D11 context cannot cancel a queued copy or SR read when the
+    // watchdog signals `out`. Keep delivery on the CPU side until `done`.
+    uint64_t completed_value = bridge.fence_done12->GetCompletedValue();
+    DWORD wait_result = WAIT_OBJECT_0;
+    if (strict_delivery || completed_value < value) {
+      // The event wakes on completion or rescue. Strict delivery retains
+      // its existing done deadline. The inputs are already flushed.
       const int64_t wait_start = SteadyNowNs();
       ++bridge_completion_waits;
       ResetEvent(bridge.completion_event);
-      const HRESULT event_result = bridge.fence_done12->SetEventOnCompletion(value, bridge.completion_event);
-      const DWORD wait_result = (SUCCEEDED(event_result)
-          ? WaitForSingleObject(bridge.completion_event, 1000) : WAIT_FAILED);
+      wait_result = WAIT_FAILED;
+      if (SUCCEEDED(bridge.fence_done12->SetEventOnCompletion(value, bridge.completion_event))) {
+        wait_result = WAIT_OBJECT_0;
+        const uint64_t deadline = GetTickCount64() + 1000;
+        // Recheck the value after every wake, including a late notification
+        // for a preceding request that used this event.
+        while (bridge.fence_done12->GetCompletedValue() < value
+               && (strict_delivery || bridge_timeouts.load(std::memory_order_acquire) == timeouts_before)) {
+          const uint64_t now = GetTickCount64();
+          if (now >= deadline) {
+            wait_result = WAIT_TIMEOUT;
+            break;
+          }
+          wait_result = WaitForSingleObject(bridge.completion_event, static_cast<DWORD>(deadline - now));
+          if (wait_result != WAIT_OBJECT_0) break;
+        }
+      }
       const int64_t waited_ns = SteadyNowNs() - wait_start;
       bridge_completion_wait_ns += waited_ns;
       if (measure_cpu) {
         cpu.completion_ns += waited_ns;
       }
-      const uint64_t completed_value = bridge.fence_done12->GetCompletedValue();
+      completed_value = bridge.fence_done12->GetCompletedValue();
+    }
+    if (completed_value == UINT64_MAX || completed_value < value || wait_result != WAIT_OBJECT_0
+        || bridge_timeouts.load(std::memory_order_acquire) != timeouts_before) {
+      ++bridge_completion_failures;
+      ordinary_delivery_failed = !strict_delivery;
       if (completed_value == UINT64_MAX) {
-        ++bridge_completion_failures;
         MarkBridgeLost("the private device was removed during stage delivery");
-        decline(NrDeclineReason::kBridgeLost, "device removed before stage delivery");
-        return;
-      }
-      if (completed_value < value || wait_result != WAIT_OBJECT_0
-          || bridge_timeouts.load(std::memory_order_acquire) != timeouts_before) {
-        ++bridge_completion_failures;
-        decline(SUCCEEDED(event_result) && wait_result != WAIT_FAILED
-                    ? NrDeclineReason::kBridgeTimeout : NrDeclineReason::kBridgeDown,
+        if (strict_delivery) {
+          decline(NrDeclineReason::kBridgeLost, "device removed before stage delivery");
+        }
+      } else if (strict_delivery) {
+        decline(wait_result != WAIT_FAILED ? NrDeclineReason::kBridgeTimeout : NrDeclineReason::kBridgeDown,
                 "the stage has no timely GPU completion proof; no result was handed to D3D11");
-        return;
       }
-      bridge_pending_delivery_value = 0;
+      return;
+    }
+    bridge_pending_delivery_value = 0;
+    if (strict_delivery) {
       if (adaptive_bridge) {
         // Close the recording lifetime only by actually discarding this owned
         // list after GPU-only done, including preparation-only recordings.
@@ -1900,7 +1954,7 @@ inline bool RunBridge(ID3D11DeviceContext* context,
     if (measure_cpu) {
       cpu_start = SteadyNowNs();
     }
-    if (FAILED(ctx->Wait(bridge.fence_out11, value))) {
+    if (FAILED(ctx->Wait(bridge.fence_done11, value))) {
       bridge_skew.fetch_add(1, std::memory_order_relaxed);
       if (plan.mixed) decline(NrDeclineReason::kBridgeDown, "the D3D11 return fence wait failed");
       return;
@@ -1928,7 +1982,7 @@ inline bool RunBridge(ID3D11DeviceContext* context,
           && bridge_recording.model_reset_mask == 0,
       inline_restore_submission, inline_restore_submitted, delivered);
 #endif
-  if ((independent_present_pair || adaptive_bridge || (!pre && present == nullptr)) && !delivered) {
+  if (!delivered && (ordinary_delivery_failed || independent_present_pair || adaptive_bridge || (!pre && present == nullptr))) {
     const BridgeDeviceLock device_lock(context);
     RuntimeLock lock(runtime_mutex);
     if (auto state = features.find(handle); state != features.end()) {

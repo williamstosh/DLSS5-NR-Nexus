@@ -16,6 +16,11 @@ void RunRuntimeMonitorCases(const Check& check) {
   const auto original_display = io.DisplaySize;
   for (int language = 0; language < ui::kLanguageCount; ++language) {
     ui::SelectLanguage(language);
+    if (language != 0) {
+      check(std::strcmp(ui::Tr(ui::text::kEditReuseMonitorHdr10SourceUnconfirmed),
+                        ui::text::kEditReuseMonitorHdr10SourceUnconfirmed) != 0,
+            "the HDR10 Present rejection has a translation in each supported language");
+    }
     for (auto stage : {renodx::addons::dlss5::stage_plan::Stage::RENDER,
                        renodx::addons::dlss5::stage_plan::Stage::UPSCALED,
                        renodx::addons::dlss5::stage_plan::Stage::PRESENT}) {
@@ -257,6 +262,29 @@ void RunRuntimeMonitorCases(const Check& check) {
   check(window->Active && state.geometry.position.x == saved.position.x
         && state.geometry.size.x == saved.size.x, "reopen remembers geometry");
   check(output.find("0.5 s ago") != std::string::npos, "recent evidence displays monotonic sample age");
+  inputs.edit_reuse_effective = ui::Tr(ui::text::kEditReuseMonitorOriginal);
+  inputs.edit_reuse_reason = ui::Tr(ui::text::kEditReuseMonitorHdr10SourceUnconfirmed);
+  draw();
+  check(output.find(ui::Tr(ui::text::kEditReuseMonitorRequested)) != std::string::npos
+            && output.find(inputs.edit_reuse_effective) != std::string::npos
+            && output.find(inputs.edit_reuse_reason) != std::string::npos
+            && output.find(ui::Tr(ui::text::kEditReuseMonitorActive)) == std::string::npos
+            && output.find("NR GPU") != std::string::npos,
+        "the monitor displays the x2 request, original frame and HDR10 reason alongside its existing metrics");
+  const auto card = inputs.card;
+  inputs.card.id = ui::CardId::kStreamlineSetting;
+  inputs.card.title = "NR needs the Streamline setting";
+  inputs.current_conclusion.clear();
+  inputs.current_conclusion.swap(inputs.edit_reuse_reason);
+  draw();
+  check(output.find(ui::Tr(ui::text::kEditReuseMonitorHdr10SourceUnconfirmed)) != std::string::npos
+            && output.find(ui::Tr(ui::text::kEditReuseMonitorOriginal)) != std::string::npos
+            && output.find(ui::Tr(inputs.card.title)) == std::string::npos,
+        "a confirmed HDR10 rejection can headline the original-frame status instead of a generic setup hint");
+  inputs.card = card;
+  inputs.current_conclusion = "Confirmed source frames";
+  inputs.edit_reuse_effective.clear();
+  inputs.edit_reuse_reason.clear();
   inputs.now_ns = 4'000'000'000LL;
   inputs.passes[0].gpu_state = ui::MonitorGpuState::STALE;
   inputs.passes[1].gpu_state = ui::MonitorGpuState::UNAVAILABLE;

@@ -8,6 +8,7 @@
 #include <d3d12.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstdint>
@@ -27,6 +28,13 @@ enum class Phase : uint32_t {
   SNAPSHOT_MOTION = 3,
   SELECT_ORIGINAL = 4,
   PREPARE = 5,
+  APPLY_AND_SNAPSHOT_MOTION = 6,
+};
+
+enum class ColorDomain : uint32_t {
+  MODEL_PROXY = 0,
+  LINEAR_TERMINAL = 1,
+  LAYER_PROXY = 2,
 };
 
 struct Inputs {
@@ -46,18 +54,29 @@ struct Inputs {
   float raster_offset_y = 0.f;
   float previous_motion_offset_x = 0.f;
   float previous_motion_offset_y = 0.f;
+  // Pre-SR color shares the guides' jittered raster. In that case the
+  // anchor lookup also needs the displacement between the two color grids.
+  bool color_uses_guide_raster = false;
+  float anchor_raster_delta_x = 0.f;
+  float anchor_raster_delta_y = 0.f;
   ID3D12Resource* proxy = nullptr;
   ID3D12Resource* neural = nullptr;
   ID3D12Resource* motion = nullptr;
   ID3D12Resource* depth = nullptr;
   ID3D12Resource* original = nullptr;
+  // An ordinary Present backbuffer is borrowed for ordered work on its
+  // presentation queue. ResizeBuffers requires all addon COM refs released.
+  uint64_t borrowed_original_epoch = 0;
   ID3D12Resource* decoded = nullptr;
   DXGI_FORMAT depth_view_format = DXGI_FORMAT_R32_FLOAT;
+  ColorDomain color_domain = ColorDomain::MODEL_PROXY;
 };
 
 struct Binding {
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;
   std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 6> resources;
+  ID3D12Resource* borrowed_original = nullptr;  // Identity only.
+  uint64_t borrowed_original_epoch = 0;
 };
 
 // One immutable geometry and one x2 anchor per source Feature/Stage. The
@@ -71,6 +90,7 @@ struct State {
   Microsoft::WRL::ComPtr<ID3D12Resource> composed_motion;
   std::vector<Binding> bindings;
   std::array<uint64_t, 40> contract{};
+  std::vector<uint32_t> group_effects;
   uint32_t width = 0;
   uint32_t height = 0;
   uint32_t output_width = 0;
@@ -83,6 +103,8 @@ struct State {
   uint64_t allocated_bytes = 0;
   float motion_offset_x = 0.f;
   float motion_offset_y = 0.f;
+  float anchor_raster_offset_x = 0.f;
+  float anchor_raster_offset_y = 0.f;
   bool valid = false;
   bool reused = false;
 };
@@ -117,7 +139,7 @@ inline bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list,
       parameters[3 + buffer].Descriptor.ShaderRegister = 1 + buffer;
     }
     parameters[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    parameters[6].Constants = {0, 0, 16};
+    parameters[6].Constants = {0, 0, 17};
     const D3D12_ROOT_SIGNATURE_DESC desc{.NumParameters = 7, .pParameters = parameters};
     Microsoft::WRL::ComPtr<ID3DBlob> serialized, errors;
     if (FAILED(renodx::utils::directx::pD3D12SerializeRootSignature(
@@ -167,11 +189,16 @@ inline bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list,
       || state->motion_width != inputs.motion_width || state->motion_height != inputs.motion_height) return false;
   const std::array<ID3D12Resource*, 6> resources{
       inputs.proxy, inputs.neural, inputs.motion, inputs.depth, inputs.original, inputs.decoded};
+  constexpr size_t kOriginal = 4;
+  const bool borrow_original = inputs.borrowed_original_epoch != 0;
   for (const auto* resource : resources) if (resource == nullptr) return false;
   Binding* binding = nullptr;
   for (auto& entry : state->bindings) {
-    bool same = true;
-    for (size_t index = 0; index < resources.size(); ++index) same &= entry.resources[index].Get() == resources[index];
+    bool same = entry.borrowed_original_epoch == inputs.borrowed_original_epoch;
+    for (size_t index = 0; index < resources.size(); ++index) {
+      const auto* previous = (borrow_original && index == kOriginal ? entry.borrowed_original : entry.resources[index].Get());
+      same &= previous == resources[index];
+    }
     if (same) {
       binding = &entry;
       break;
@@ -195,7 +222,11 @@ inline bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list,
           .NumDescriptors = 5 * 7, .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
       if (FAILED(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&binding->heap)))) return false;
     }
-    for (size_t index = 0; index < resources.size(); ++index) binding->resources[index] = resources[index];
+    binding->borrowed_original = (borrow_original ? inputs.original : nullptr);
+    binding->borrowed_original_epoch = inputs.borrowed_original_epoch;
+    for (size_t index = 0; index < resources.size(); ++index) {
+      binding->resources[index] = (borrow_original && index == kOriginal ? nullptr : resources[index]);
+    }
     auto cpu = binding->heap->GetCPUDescriptorHandleForHeapStart();
     // t0 proxy, t1 neural, t2 motion, t3 depth, t4 original.
     constexpr std::array<uint32_t, 5> active_srvs{
@@ -240,26 +271,32 @@ inline bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list,
   list->SetComputeRootSignature(state->root.Get());
   list->SetPipelineState(state->pipeline.Get());
   auto gpu = binding->heap->GetGPUDescriptorHandleForHeapStart();
-  gpu.ptr += static_cast<UINT64>(phase) * 7ull * stride;
+  const bool apply_and_snapshot = phase == Phase::APPLY_AND_SNAPSHOT_MOTION;
+  const auto dispatch_phase = apply_and_snapshot ? Phase::APPLY : phase;
+  gpu.ptr += static_cast<UINT64>(dispatch_phase) * 7ull * stride;
   list->SetComputeRootDescriptorTable(0, gpu);
   list->SetComputeRootDescriptorTable(1, {gpu.ptr + 5ull * stride});
   list->SetComputeRootDescriptorTable(2, {gpu.ptr + 6ull * stride});
   list->SetComputeRootUnorderedAccessView(3, state->anchor->GetGPUVirtualAddress());
   list->SetComputeRootUnorderedAccessView(4, state->previous_motion->GetGPUVirtualAddress());
   list->SetComputeRootUnorderedAccessView(5, state->validity->GetGPUVirtualAddress());
-  const std::array<uint32_t, 16> constants{inputs.width, inputs.height, inputs.motion_width, inputs.motion_height,
+  const std::array<uint32_t, 17> constants{inputs.width, inputs.height, inputs.motion_width, inputs.motion_height,
       std::bit_cast<uint32_t>(inputs.motion_scale_x), std::bit_cast<uint32_t>(inputs.motion_scale_y),
-      static_cast<uint32_t>(phase), 0,
+      static_cast<uint32_t>(phase), inputs.color_uses_guide_raster ? 1u : 0u,
       std::bit_cast<uint32_t>(inputs.raster_offset_x), std::bit_cast<uint32_t>(inputs.raster_offset_y),
       std::bit_cast<uint32_t>(inputs.previous_motion_offset_x), std::bit_cast<uint32_t>(inputs.previous_motion_offset_y),
-      output_width, output_height, 0, 0};
-  list->SetComputeRoot32BitConstants(6, 16, constants.data(), 0);
+      output_width, output_height,
+      std::bit_cast<uint32_t>(inputs.anchor_raster_delta_x), std::bit_cast<uint32_t>(inputs.anchor_raster_delta_y),
+      static_cast<uint32_t>(inputs.color_domain)};
+  list->SetComputeRoot32BitConstants(6, static_cast<UINT>(constants.size()), constants.data(), 0);
   const bool motion_phase = phase == Phase::MOTION || phase == Phase::SNAPSHOT_MOTION;
-  const uint32_t dispatch_width = (motion_phase ? inputs.motion_width
-      : (phase == Phase::SELECT_ORIGINAL ? output_width : inputs.width));
-  const uint32_t dispatch_height = (motion_phase ? inputs.motion_height
-      : (phase == Phase::SELECT_ORIGINAL ? output_height : inputs.height));
-  list->Dispatch((dispatch_width + 7) / 8, (dispatch_height + 7) / 8, 1);
+  const uint32_t dispatch_width = motion_phase ? inputs.motion_width
+      : (phase == Phase::SELECT_ORIGINAL ? output_width : inputs.width);
+  const uint32_t dispatch_height = motion_phase ? inputs.motion_height
+      : (phase == Phase::SELECT_ORIGINAL ? output_height : inputs.height);
+  const uint32_t covered_width = apply_and_snapshot ? std::max(dispatch_width, inputs.motion_width) : dispatch_width;
+  const uint32_t covered_height = apply_and_snapshot ? std::max(dispatch_height, inputs.motion_height) : dispatch_height;
+  list->Dispatch((covered_width + 7) / 8, (covered_height + 7) / 8, 1);
   list->ResourceBarrier(1, &barrier);
   return true;
 }

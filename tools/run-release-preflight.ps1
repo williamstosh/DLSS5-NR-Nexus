@@ -33,7 +33,7 @@ $checks = [Collections.Generic.List[object]]::new()
 $nativeCases = @('stage-chain','stage-resolution','same-stage-resolution','render-stage-resolution',
     'present-stage-resolution','native-prefg-resolution','source-lifecycle','feature-switch',
     'native-required-menu','native-owner-idle','native-options-resume','native-options-delayed',
-    'native-guide-contract','present-guide-models','native-present-decision','present-chain',
+    'native-guide-contract','native-present-decision','present-chain',
     'nr-edit-reuse-contracts','nr-edit-reuse-xefg-contracts')
 $bridgeCases = @('stage-resolution','same-stage-resolution','render-stage-resolution','present-stage-resolution')
 $summary = [ordered]@{
@@ -66,7 +66,7 @@ try {
         $fgDirectory = Join-Path $all 'fg-native'
         if ($RefreshFg) {
             $fgRoot = Join-Path $OutputDirectory 'refreshed-fg'
-            # No NativeCase: preserve all five default groups before additions.
+            # No NativeCase: preserve the default groups before additions.
             & (Join-Path $PSScriptRoot 'run-tests.ps1') -Suite fg-native -SoftwareOnly -UiPreview None -OutputDirectory $fgRoot
             $fgDirectory = Join-Path $fgRoot 'fg-native'
         }
@@ -135,7 +135,7 @@ try {
         $vulkan = $checks | Where-Object name -EQ 'all/vulkan-control-mask'
         $vulkan.status = 'NotRun'
         $vulkan['reason'] = 'Build passed; execution requires native Vulkan GPU/loader.'
-        foreach ($case in @('test','f5-mixed','control-mask','adaptive-fg-service','adaptive-inline')) {
+        foreach ($case in @('test','f5-mixed','control-mask','adaptive-fg-service','adaptive-inline','present-guide-models')) {
             if (-not (Test-Path (Join-Path $fgDirectory "$case.stdout.log"))) { throw "Default FG group is missing: $case" }
         }
         $defaultLog = Get-Content (Join-Path $fgDirectory 'test.stdout.log') -Raw

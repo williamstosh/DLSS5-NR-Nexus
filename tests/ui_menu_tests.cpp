@@ -117,6 +117,15 @@ inline void ObservedTextWrapped(const char* fmt, ...) {
 }
 }  // namespace ImGui
 namespace native_window_fixture {
+#if defined(NR_NEXUS_DEV_CONTROL)
+inline DWORD foreground_process = GetCurrentProcessId();
+inline DWORD WINAPI WindowThreadProcessId(HWND, LPDWORD process) {
+  if (process != nullptr) {
+    *process = foreground_process;
+  }
+  return GetCurrentThreadId();
+}
+#endif
 inline BOOL WINAPI Show(HWND window, int command) {
   return ShowWindow(window, GetDlgItem(window, 1001) != nullptr ? SW_HIDE : command);
 }
@@ -137,9 +146,13 @@ inline BOOL WINAPI Foreground(HWND window) {
 #define SetClipboardData clipboard_fixture::Set
 #define ShowWindow native_window_fixture::Show
 #define SetForegroundWindow native_window_fixture::Foreground
+#if defined(NR_NEXUS_DEV_CONTROL)
+#define GetWindowThreadProcessId native_window_fixture::WindowThreadProcessId
+#endif
 #undef IMGUI_VERSION_NUM
 #include "ui/runtime_monitor.hpp"
 #include "dlssnr.hpp"
+#undef GetWindowThreadProcessId
 #undef ShowWindow
 #undef SetForegroundWindow
 #undef OpenClipboard
@@ -381,6 +394,13 @@ int main() {
     load_theme_case("", ui::ThemeId::CYBER_NEON);
     load_theme_case("[OTHER]\nValue=1\n", ui::ThemeId::CYBER_NEON);
     const std::string section = std::string("[") + runtime::kConfigSection + "]\n";
+    load_theme_case((section + "UiTheme=cyber_neon\nNREditReuse=1\n").c_str(), ui::ThemeId::CYBER_NEON);
+    check(runtime::edit_reuse_enabled.load(), "explicit x2 edit reuse survives production INI loading");
+    load_theme_case((section + "UiTheme=cyber_neon\nNREditReuse=0\n").c_str(), ui::ThemeId::CYBER_NEON);
+    check(!runtime::edit_reuse_enabled.load(), "explicit x2 Off survives production INI loading");
+    runtime::edit_reuse_enabled = true;
+    load_theme_case((section + "UiTheme=cyber_neon\n").c_str(), ui::ThemeId::CYBER_NEON);
+    check(!runtime::edit_reuse_enabled.load(), "an older INI without x2 starts with reuse disabled");
     const auto load_monitor_session = [&](const std::string& values) {
       runtime::monitor_visibility_initialized = false;
       load_theme_case((section + "UiTheme=cyber_neon\n" + values).c_str(), ui::ThemeId::CYBER_NEON);

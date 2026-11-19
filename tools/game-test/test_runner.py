@@ -131,6 +131,69 @@ class DumpTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), self.before)
 
 
+class MotionPreviewTests(unittest.TestCase):
+    def setUp(self):
+        (runner.ROOT / 'tmp').mkdir(exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=runner.ROOT / 'tmp')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def motion_recording(self, name, size=(1920, 1080), **fields):
+        out = self.root / name
+        runner.output_lifecycle.initialize(out)
+        motion = out / 'motion-off'
+        (motion / 'frames').mkdir(parents=True)
+        frames = []
+        for index, color in enumerate(('red', 'green', 'blue')):
+            path = motion / f'frames/{index:04}.jpg'
+            with Image.new('RGB', size, color) as image:
+                image.save(path)
+            frames.append(dict(index=index, file=f'frames/{index:04}.jpg',
+                sha256=runner.sha(path), bytes=path.stat().st_size,
+                capture_begin_ns=index * 200000000))
+        recording = motion / 'recording.json'
+        runner.dump(recording, dict(status='complete', width=size[0], height=size[1],
+                                    frames=frames, **fields))
+        return out, recording, frames
+
+    def test_motion_preview_default_and_recording_width_preserve_aspect_and_cleanup(self):
+        for width, size, expected in ((None, (1920, 1080), (1280, 720)),
+                                      (1920, (1920, 1080), (1920, 1080)),
+                                      (None, (1080, 1920), (405, 720))):
+            with self.subTest(width=width, size=size), mock.patch.dict(runner.output_lifecycle.os.environ, {
+                    'NR_NEXUS_TEST_BUDGET_BYTES': '0', 'NR_NEXUS_TEST_KEEP_RAW': '0'}):
+                fields = {} if width is None else dict(preview_width=width)
+                out, recording, frames = self.motion_recording(f'{width}-{size[0]}', size, **fields)
+                runner.finish_artifacts(out, dict(result='passed'), False)
+                summary = json.loads((recording.parent / 'preview-summary.json').read_text())
+                self.assertEqual(summary['source_sha256'], runner.sha(recording))
+                self.assertTrue(summary['source_hashes_verified'])
+                self.assertEqual(summary['preview_size'], list(expected))
+                self.assertEqual(summary['frame_count'], len(frames))
+                self.assertEqual(summary['duration_ms'], [200, 200, 200])
+                with Image.open(recording.parent / 'preview.webp') as image:
+                    self.assertEqual(image.size, expected)
+                    self.assertEqual(image.n_frames, len(frames))
+                    for index in range(len(frames)):
+                        image.seek(index)
+                        image.load()
+                        self.assertEqual(image.info['duration'], 200)
+                for index, frame in enumerate(frames):
+                    self.assertEqual((recording.parent / frame['file']).exists(), index != 1)
+
+    def test_motion_preview_rejects_invalid_recording_width_and_preserves_sources(self):
+        for index, width in enumerate((None, True, 1280.0, '1920', 63, 1921)):
+            with self.subTest(width=width):
+                _, recording, frames = self.motion_recording(str(index), preview_width=width)
+                with self.assertRaisesRegex(ValueError, 'preview_width.*integer.*64.*1920'):
+                    runner.summarize_motion(recording)
+                self.assertFalse((recording.parent / 'preview.webp').exists())
+                for frame in frames:
+                    source = recording.parent / frame['file']
+                    self.assertEqual(source.stat().st_size, frame['bytes'])
+                    self.assertEqual(runner.sha(source), frame['sha256'])
+
+
 class ExitTests(unittest.TestCase):
     def setUp(self):
         (runner.ROOT / 'tmp').mkdir(exist_ok=True)
@@ -1150,7 +1213,8 @@ class ScriptBackendTests(unittest.TestCase):
     def test_script_backend_ocr_is_limited_to_intro_and_title_before_bridge(self):
         for title in ('读取游戏 新游戏 退出游戏',
                       '读 取 游 戏 退 出 游 戏 游 戏 模 组 更 新 亮 点',
-                      '读取游戏 设置 游戏模组 制作人员 退出游戏'):
+                      '读取游戏 设置 游戏模组 制作人员 退出游戏',
+                      '重制版v5，01C NR GPU不可用 设置 游戏模组 更新亮点 制作人员 退 出 游 戏 CD PROJEKT RED'):
             with self.subTest(title=title), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 session = runner.Session(dict(executable=str(root / 'game.exe'), logs=[],
@@ -1181,6 +1245,8 @@ class ScriptBackendTests(unittest.TestCase):
                 ('script', ' '.join(runner.PAUSE_MENU)),
                 ('script', '读取游戏 游戏模组 退出游戏'),
                 ('script', '读取游戏 更新亮点 制作人员 退出游戏'),
+                ('script', '设置 游戏模组 制作人员 退出游戏'),
+                ('desktop', '设置 游戏模组 更新亮点 制作人员 退出游戏'),
                 ('desktop', '读取游戏 游戏模组 更新亮点 退出游戏'),
                 ('desktop', '读取游戏 游戏模组 制作人员 退出游戏')):
             with self.subTest(backend=backend, text=text), tempfile.TemporaryDirectory() as directory:

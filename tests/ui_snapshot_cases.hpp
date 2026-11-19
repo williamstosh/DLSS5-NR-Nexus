@@ -35,6 +35,10 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
   if (!docs_only) {
     scenarios.push_back({.id = "adaptive-resolution", .action = "adaptive-resolution", .language = 1});
     scenarios.push_back({.id = "adaptive-resolution-zh", .action = "adaptive-resolution", .language = 14});
+    for (int language : {1, 14}) {
+      scenarios.push_back({.id = (language == 1 ? "edit-reuse-enabled-en" : "edit-reuse-enabled-zh"),
+                           .action = "edit-reuse-enabled", .language = language, .width = 450.f, .passes = 1});
+    }
     for (float width : {450.f, 600.f}) {
       scenarios.push_back({.id = "r7-quality-" + std::to_string(static_cast<int>(width)) + "-common",
                            .action = "r7-common", .width = width});
@@ -353,6 +357,7 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
     if (std::find(registry["expected"].begin(), registry["expected"].end(), scenario.id)
         == registry["expected"].end()) continue;
     const bool round_seven = scenario.action.starts_with("r7-");
+    const bool edit_reuse_snapshot = scenario.action == "edit-reuse-enabled";
     const bool saved_adaptive_enabled = runtime::nr_adaptive_enabled.load();
     const float saved_adaptive_target = runtime::nr_adaptive_target_fps.load();
     const float saved_adaptive_minimum = runtime::nr_adaptive_min_scale.load();
@@ -363,7 +368,7 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
     const float saved_motion_start = runtime::control_mask_motion_start.load();
     const float saved_motion_end = runtime::control_mask_motion_end.load();
     std::vector<std::pair<const runtime::Setting*, float>> round_seven_restore;
-    if (round_seven) {
+    if (round_seven || edit_reuse_snapshot) {
       for (const runtime::SettingGroup group : {runtime::SettingGroup(runtime::kCoreSettings),
                runtime::SettingGroup(runtime::kStrengthSettings),
                runtime::SettingGroup(runtime::kLookSettings), runtime::SettingGroup(runtime::kLookResultSettings),
@@ -540,6 +545,18 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
       runtime::nr_adaptive_selected_levels = 6;
       runtime::nr_adaptive_limited_residency = false;
     }
+    if (edit_reuse_snapshot) {
+      runtime::hook_point = runtime::kHookUpscaled;
+      runtime::stack_passes = 1;
+      runtime::preset = 2;
+      runtime::nr_follow_input_res = false;
+      runtime::nr_resolution_scale = 1.f;
+      runtime::look_mode = false;
+      runtime::detail_stability = 1;
+      runtime::control_mask_enabled = false;
+      runtime::nr_adaptive_enabled = false;
+      runtime::edit_reuse_enabled = false;
+    }
     const bool render_stage_resolution = scenario.action == "render-stage-resolution";
     const bool present_stage_resolution = scenario.action == "present-stage-resolution";
     const bool same_stage_resolution = scenario.action == "same-stage-resolution"
@@ -715,7 +732,7 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
     for (auto& scope : ui::fold_scopes) scope = {};
     settle();
     drain_workers();
-    if (scenario.action != "doc-default" && scenario.action != "r7-common" && !synthetic_window) {
+    if (scenario.action != "doc-default" && scenario.action != "r7-common" && !edit_reuse_snapshot && !synthetic_window) {
       // The manager inherits the page's fold scope; keep its custom tools folded until explicitly clicked.
       click(find(collapsed ? "collapse_all" : "expand_all"));
     }
@@ -723,7 +740,7 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
     const bool long_page = scenario.action == "expanded" || scenario.action == "collapsed"
         || scenario.action == "pass-independent" || scenario.action == "pass-first" || scenario.action == "doc-default"
         || cross_stage || scenario.action == "gpu-pass-diagnostics" || scenario.action == "gpu-comparison"
-        || round_seven || scenario.action == "adaptive-resolution"
+        || round_seven || edit_reuse_snapshot || scenario.action == "adaptive-resolution"
         || (scenario.action.starts_with("r2-") && scenario.action != "r2-reset-confirm");
     if (scenario.action == "cross-stage-resolution" || same_stage_resolution) {
       check(items.contains(find("##pass_resolution_scale").id), "independent pass resolution slider is drawn");
@@ -750,6 +767,25 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
       check(runtime::nr_adaptive_limited_residency.load() && runtime::nr_adaptive_selected_levels.load() == 6
                 && runtime::nr_adaptive_target_fps.load() == 120.f,
             "the real preparation-mode choice preserves the six logical levels and target in both snapshot languages");
+    }
+    ImGuiID edit_reuse_toggle_id = 0;
+    if (edit_reuse_snapshot) {
+      ImGuiWindow* quality_window = nullptr;
+      for (auto* window : ImGui::GetCurrentContext()->Windows) {
+        if (window->Active && std::strstr(window->Name, "/##nr_settings_") != nullptr
+            && std::strstr(window->Name, "/gpu_comparison_") == nullptr) {
+          quality_window = window;
+        }
+      }
+      check(quality_window != nullptr, "x2 snapshot requires the production settings child");
+      const auto scope = ImHashStr("NREditReuse", 0, ImHashStr("##quality_columns", 0, quality_window->ID));
+      edit_reuse_toggle_id = ImHashStr("##value", 0, scope);
+      check(items.contains(edit_reuse_toggle_id), "snapshot requires the production x2 request switch");
+      auto expected = profile::Snapshot();
+      expected["NREditReuse"] = true;
+      click(items.at(edit_reuse_toggle_id));
+      check(runtime::edit_reuse_enabled.load() && profile::Snapshot() == expected,
+            "the real x2 snapshot switch changes only its requested setting");
     }
     ImGuiWindow* settings = nullptr;
     if (long_page) {
@@ -781,14 +817,14 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
         // This technical disclosure intentionally does not follow parameter folds.
         if (item.label == "##Recorded working sizes") continue;
         ++fold_count;
-        if (scenario.action != "doc-default" && scenario.action != "r7-common") {
+        if (scenario.action != "doc-default" && scenario.action != "r7-common" && !edit_reuse_snapshot) {
           check(((item.status & ImGuiItemStatusFlags_Opened) != 0) == !collapsed,
                 "snapshot tree/header disagrees with real expand/collapse command");
         }
       }
       const int scope = scenario.page * 8 + (scenario.page == 0 ? static_cast<int>(runtime::hook_point.load())
                                            : scenario.page == 1 ? runtime::ui_selected_pass : 0);
-      if (scenario.action != "doc-default" && scenario.action != "r7-common") {
+      if (scenario.action != "doc-default" && scenario.action != "r7-common" && !edit_reuse_snapshot) {
         check(ui::fold_scopes[scope].target == !collapsed, "snapshot fold scope target mismatch");
       }
       std::printf("snapshot %s height=%.0f fold_nodes=%u\n", scenario.id.c_str(), panel_height, fold_count);
@@ -804,6 +840,9 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
       check(scroller, "fixed viewport must expose the production vertical scroller");
     }
     std::string interaction = (scenario.action == "doc-default" ? "production default folds" : "real expand_all/collapse_all button");
+    if (edit_reuse_snapshot) {
+      interaction = "real x2 request switch; no NR or FG execution";
+    }
     if (resolution_confirmation) {
       const auto unchanged = profile::Snapshot();
       const auto epoch = runtime::profile_commit_epoch.load();
@@ -1406,6 +1445,18 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
     }
     capture(scenario.id.c_str(), diagnostic, false);
     Json regions = Json::object();
+    if (edit_reuse_snapshot) {
+      check(items.contains(edit_reuse_toggle_id), "x2 capture retains its production switch");
+      ImRect bounds = items.at(edit_reuse_toggle_id).rect;
+      for (const char* key : {ui::text::kEditReuseCompatibility, ui::text::kEditReuseRequirements, ui::text::kEditReuseFallback}) {
+        const auto text = std::ranges::find_if(rendered_text, [&](const auto& entry) { return entry.text == ui::Tr(key); });
+        check(text != rendered_text.end(), "x2 capture includes every compatibility and fallback paragraph");
+        bounds.Add(text->rect);
+      }
+      check(bounds.Min.y >= 0.f && bounds.Max.y <= panel_height, "x2 explanation is inside the settled capture");
+      regions["edit_reuse"] = {(std::max)(0.f, bounds.Min.x - 4.f), bounds.Min.y - 4.f,
+          (std::min)(panel_width, bounds.Max.x + 4.f), bounds.Max.y + 4.f};
+    }
     if (scenario.action == "gpu-pass-diagnostics") {
       ImRect metrics(ImVec2(panel_width, panel_height), ImVec2(0.f, 0.f));
       bool inside = false;

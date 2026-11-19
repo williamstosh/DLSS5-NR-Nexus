@@ -20,15 +20,20 @@ cbuffer ReuseConstants : register(b0) {
   uint2 MotionSize;
   float2 MotionScale;
   uint Phase;
-  uint Padding;
+  uint ColorUsesGuideRaster;
   float2 RasterOffset;
   float2 PreviousMotionOffset;
   uint2 OutputSize;
-  uint2 OutputPadding;
+  float2 AnchorRasterDelta;
+  uint ColorDomain;
 };
 
+// Matches edit_reuse::ColorDomain.
+static const uint kLinearTerminal = 1u;
+static const uint kLayerProxy = 2u;
 static const float kEditFloor = 1.0 / 1024.0;
-static const float kReferenceLimit = 0.125;  // stops, max per channel
+static const float kReferenceFullConfidence = exp2(-0.125);  // max channel difference, in stops
+static const float kReferenceZeroConfidence = exp2(-0.375);
 
 [numthreads(8, 8, 1)]
 void main(uint3 dispatch_id : SV_DispatchThreadID) {
@@ -81,22 +86,34 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     if (!valid) Target[pixel] = Original.Load(int3(pixel, 0));
     return;
   }
+  // APPLY reads current Motion. It does not consume PreviousMotion until the next frame.
+  if (Phase == 6u && all(pixel < MotionSize)) {
+    const uint address = (pixel.y * MotionSize.x + pixel.x) * 8u;
+    PreviousMotion.Store2(address, asuint(Motion.Load(int3(pixel, 0)) * MotionScale));
+  }
   if (any(pixel >= Size)) return;
   const uint index = pixel.y * Size.x + pixel.x;
-  const float2 guide_position = (float2(pixel) + 0.5) * float2(MotionSize) / float2(Size) + RasterOffset;
+  const float2 guide_offset = (ColorUsesGuideRaster != 0u ? 0.0 : RasterOffset);
+  const float2 guide_position = (float2(pixel) + 0.5) * float2(MotionSize) / float2(Size) + guide_offset;
   const bool guide_valid = all(guide_position >= 0.0) && all(guide_position < float2(MotionSize));
   const uint2 guide = uint2(clamp(floor(guide_position), 0.0, float2(MotionSize - 1u)));
   const float depth = Depth.Load(int3(guide, 0));
   const float4 encoded = Proxy.Load(int3(pixel, 0));
-  const float3 reference = SrgbDecode(encoded.rgb);
+  const bool linear_color = ColorDomain == kLinearTerminal;
+  const float3 reference = (linear_color ? encoded.rgb : SrgbDecode(encoded.rgb));
   if (Phase == 0u) {
-    const float3 neural = SrgbDecode(Neural.Load(int3(pixel, 0)).rgb);
-    const float3 edit = log2(max(neural, kEditFloor)) - log2(max(reference, kEditFloor));
-    Anchor.Store4(index * 32u, asuint(float4(edit, guide_valid ? 1.0 : 0.0)));
+    const float3 result = Neural.Load(int3(pixel, 0)).rgb;
+    const float3 neural = (linear_color ? result : SrgbDecode(result));
+    const float3 log_reference = log2(max(reference, kEditFloor));
+    const float3 edit = log2(max(neural, kEditFloor)) - log_reference;
+    const uint3 reference_exponent = asuint(reference) & 0x7f800000u;
+    const bool valid = guide_valid && all(reference_exponent != 0x7f800000u)
+        && (!linear_color || (all(reference >= kEditFloor) && all(isfinite(neural)) && all(neural >= 0.0)));
+    Anchor.Store4(index * 32u, asuint(float4(edit, valid ? 1.0 : 0.0)));
     Anchor.Store4(index * 32u + 16u, asuint(float4(reference, depth)));
     return;
   }
-  const float2 d = Motion.Load(int3(guide, 0)) * MotionScale * float2(Size) / float2(MotionSize);
+  const float2 d = (Motion.Load(int3(guide, 0)) * MotionScale + AnchorRasterDelta) * float2(Size) / float2(MotionSize);
   const float2 previous = float2(pixel) + d;
   bool valid = guide_valid && all(isfinite(previous)) && all(previous >= 0.0) && all(previous <= float2(Size - 1u))
       && isfinite(depth) && all(isfinite(reference)) && all(reference >= kEditFloor);
@@ -107,22 +124,36 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     const uint2 taps[4] = {lo, uint2(hi.x, lo.y), uint2(lo.x, hi.y), hi};
     const float2 f = frac(previous);
     const float weights[4] = {(1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y};
+    float3 warped_reference = 0.0;
     for (uint tap = 0u; tap < 4u; ++tap) {
       if (weights[tap] <= 0.0) continue;
       const uint address = (taps[tap].y * Size.x + taps[tap].x) * 32u;
       const float4 cached_edit = asfloat(Anchor.Load4(address));
       const float4 cached = asfloat(Anchor.Load4(address + 16u));
-      const float3 change = abs(log2(max(reference, kEditFloor)) - log2(max(cached.rgb, kEditFloor)));
       valid = valid && cached_edit.a > 0.5 && all(isfinite(cached)) && all(isfinite(cached_edit))
-          && abs(depth - cached.a) <= 0.01 + 0.02 * abs(depth)
-          && all(change <= kReferenceLimit);
+          && abs(depth - cached.a) <= 0.01 + 0.02 * abs(depth);
       edit += weights[tap] * cached_edit.rgb;
+      warped_reference += weights[tap] * cached.rgb;
     }
+    // Match the same bilinear footprint used for the edit. Testing each tap
+    // against the current pixel rejects correctly warped high-contrast detail.
+    const float3 comparison = max(warped_reference, kEditFloor);
+    const float3 match = min(reference, comparison) / max(reference, comparison);
+    const float weakest_channel = min(match.r, min(match.g, match.b));
+    // A small color mismatch should fade the edit instead of punching a
+    // hole. Large changes still select the exact current color below.
+    const float confidence = smoothstep(kReferenceZeroConfidence, kReferenceFullConfidence, weakest_channel);
+    valid = valid && confidence > 0.0;
+    edit *= confidence;
   }
-  // A neutral edit selects the untouched source at the final boundary rather
-  // than relying on a codec round trip to reproduce half-float source bits.
-  valid = valid && any(abs(edit) > 1e-6);
-  const float3 neural = valid ? SrgbEncode(reference * exp2(edit)) : encoded.rgb;
+  // A neutral layer passes its current proxy through exactly. Only a failed
+  // reprojection may discard the other layers' valid edits at final resolve.
+  // Single and final-color anchors retain exact original selection for zero edits.
+  const bool has_edit = any(abs(edit) > 1e-6);
+  const float3 applied = reference * exp2(edit);
+  valid = valid && (has_edit || ColorDomain == kLayerProxy)
+      && (!linear_color || (all(isfinite(applied)) && all(applied <= 65504.0)));
+  const float3 neural = (valid && has_edit ? (linear_color ? applied : SrgbEncode(applied)) : encoded.rgb);
   Target[pixel] = float4(neural, encoded.a);
   Validity.Store(index * 4u, valid ? 1u : 0u);
 }
