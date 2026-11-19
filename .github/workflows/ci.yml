@@ -37,3 +37,20 @@ jobs:
     uses: ./.github/workflows/build-windows.yml
     with:
       run_core: true
+  required:
+    name: CI required
+    needs: [evidence, windows]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require successful core or exact-tree evidence
+        shell: pwsh
+        env:
+          CI_EVIDENCE_RESULT: ${{ needs.evidence.result }}
+          CI_RUN_CORE: ${{ needs.evidence.outputs.run_core }}
+          CI_WINDOWS_RESULT: ${{ needs.windows.result }}
+        run: ./tools/ci-evidence.ps1 -Mode Gate

@@ -51,6 +51,30 @@ function Assert-Rejected([string]$Name, [hashtable]$Arguments, [string]$Pattern)
     }
     throw "Evidence accepted incorrectly: $Name"
 }
+
+function Assert-GateCase {
+    param(
+        [string]$Name,
+        [string]$RefName = '42/merge',
+        [string]$EventName = 'pull_request',
+        [string]$EvidenceResult = 'success',
+        [string]$RunCore = 'true',
+        [string]$WindowsResult = 'success',
+        [string]$Rejection
+    )
+
+    try {
+        Assert-CiGate -RefName $RefName -EventName $EventName -EvidenceResult $EvidenceResult `
+            -RunCore $RunCore -WindowsResult $WindowsResult
+    } catch {
+        if (-not $Rejection -or $_.Exception.Message -notlike "$Rejection*") { throw }
+        $checks.Add("gate: $Name")
+        return
+    }
+    if ($Rejection) { throw "Gate accepted incorrectly: $Name" }
+    $checks.Add("gate: $Name")
+}
+
 $outcome = 'Failed'
 try {
     $first = New-FixtureRun
@@ -100,6 +124,29 @@ try {
     Assert-Accepted 'current pending main run excluded' @{Runs=@($oldRerun,$other);Jobs=@{[long]2=(New-FixtureJob $other)};CurrentRunId=1} 2
     Assert-Rejected 'API failure does not pass' @{Runs=@($first);Jobs=@{[long]1=$job};ApiError=$true} 'Synthetic API failure'
     Assert-Rejected 'bounded incomplete history does not pass' @{Runs=@($first);Jobs=@{[long]1=$job};Overflow=$true} 'bounded evidence search'
+
+    $mainReuse = @{RefName='main';EventName='push';RunCore='false';WindowsResult='skipped'}
+    $manualReuse = @{RefName='main';EventName='workflow_dispatch';RunCore='false';WindowsResult='skipped'}
+    Assert-GateCase 'PR ran independent core'
+    Assert-GateCase 'main fallback ran independent core' -RefName main -EventName push
+    Assert-GateCase 'dev ran independent core' -RefName dev -EventName push
+    Assert-GateCase 'main push reused exact-tree evidence' @mainReuse
+    Assert-GateCase 'main dispatch reused exact-tree evidence' @manualReuse
+    Assert-GateCase 'PR cannot reuse even with main ref' -RefName main -RunCore false -WindowsResult skipped -Rejection 'Invalid core'
+    Assert-GateCase 'dev cannot reuse' -RefName dev -EventName push -RunCore false -WindowsResult skipped -Rejection 'Invalid core'
+    foreach ($state in @('failure','cancelled','skipped','')) {
+        Assert-GateCase "main reuse with evidence result '$state'" @mainReuse -EvidenceResult $state -Rejection 'Expected successful evidence'
+        Assert-GateCase "PR with Windows result '$state'" -WindowsResult $state -Rejection 'Invalid core'
+    }
+    foreach ($state in @('failure','cancelled','success')) {
+        Assert-GateCase "main reuse with Windows result '$state'" -RefName main -EventName push -RunCore false `
+            -WindowsResult $state -Rejection 'Invalid core'
+    }
+    foreach ($decision in @('false','unknown','')) {
+        Assert-GateCase "PR with run_core '$decision' despite green Windows" -RunCore $decision -Rejection 'Invalid core'
+    }
+    Assert-GateCase 'main with missing reuse output' -RefName main -EventName push -RunCore '' `
+        -WindowsResult skipped -Rejection 'Invalid core'
     $outcome='Passed'
 } finally {
     @{status=$outcome;checks=@($checks)} | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'result.json') -Encoding utf8

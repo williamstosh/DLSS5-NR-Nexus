@@ -1,5 +1,28 @@
 [CmdletBinding()]
-param([ValidateSet('Branch','Release')][string]$Mode = 'Branch')
+param([ValidateSet('Branch','Release','Gate')][string]$Mode = 'Branch')
+
+function Test-CiMainReuseEvent([string]$RefName, [string]$EventName) {
+    return ($RefName -ceq 'main' -and $EventName -cin @('push','workflow_dispatch'))
+}
+
+function Assert-CiGate {
+    param(
+        [string]$RefName,
+        [string]$EventName,
+        [string]$EvidenceResult,
+        [string]$RunCore,
+        [string]$WindowsResult
+    )
+
+    if ($EvidenceResult -cne 'success') {
+        throw "Expected successful evidence job; got '$EvidenceResult'."
+    }
+    if ($RunCore -ceq 'true' -and $WindowsResult -ceq 'success') { return }
+    if ($RunCore -ceq 'false' -and $WindowsResult -ceq 'skipped' -and
+        (Test-CiMainReuseEvent $RefName $EventName)) { return }
+
+    throw "Invalid core result for $EventName on ${RefName}: run_core='$RunCore', windows='$WindowsResult'."
+}
 
 function Get-CiCoreEvidence {
     param(
@@ -69,13 +92,19 @@ function Get-CiCoreEvidence {
 if ($MyInvocation.InvocationName -eq '.') { return }
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+if ($Mode -eq 'Gate') {
+    Assert-CiGate -RefName $env:GITHUB_REF_NAME -EventName $env:GITHUB_EVENT_NAME `
+        -EvidenceResult $env:CI_EVIDENCE_RESULT -RunCore $env:CI_RUN_CORE -WindowsResult $env:CI_WINDOWS_RESULT
+    Write-Host 'CI required passed.'
+    return
+}
 $repo = Split-Path $PSScriptRoot -Parent
 $tree = (& git --no-optional-locks -C $repo rev-parse 'HEAD^{tree}').Trim()
 if ($LASTEXITCODE -ne 0) { throw 'Cannot identify the current source tree.' }
 $runCore = $true
 $evidence = $null
 $reason = 'This branch/event requires independent core regression.'
-if ($Mode -eq 'Release' -or ($env:GITHUB_REF_NAME -ceq 'main' -and $env:GITHUB_EVENT_NAME -cin @('push','workflow_dispatch'))) {
+if ($Mode -eq 'Release' -or (Test-CiMainReuseEvent $env:GITHUB_REF_NAME $env:GITHUB_EVENT_NAME)) {
     try {
         if ($env:GITHUB_REPOSITORY -cnotmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' -or -not $env:GH_TOKEN) {
             throw 'GitHub repository and read token are required for evidence lookup.'
