@@ -31,6 +31,12 @@ enum class Phase : uint32_t {
   APPLY_AND_SNAPSHOT_MOTION = 6,
 };
 
+enum class ColorDomain : uint32_t {
+  MODEL_PROXY = 0,
+  LINEAR_TERMINAL = 1,
+  LAYER_PROXY = 2,
+};
+
 struct Inputs {
   // Proxy/neural/anchor/Validity working extent.
   uint32_t width = 0;
@@ -63,6 +69,7 @@ struct Inputs {
   uint64_t borrowed_original_epoch = 0;
   ID3D12Resource* decoded = nullptr;
   DXGI_FORMAT depth_view_format = DXGI_FORMAT_R32_FLOAT;
+  ColorDomain color_domain = ColorDomain::MODEL_PROXY;
 };
 
 struct Binding {
@@ -83,6 +90,7 @@ struct State {
   Microsoft::WRL::ComPtr<ID3D12Resource> composed_motion;
   std::vector<Binding> bindings;
   std::array<uint64_t, 40> contract{};
+  std::vector<uint32_t> group_effects;
   uint32_t width = 0;
   uint32_t height = 0;
   uint32_t output_width = 0;
@@ -131,7 +139,7 @@ inline bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list,
       parameters[3 + buffer].Descriptor.ShaderRegister = 1 + buffer;
     }
     parameters[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    parameters[6].Constants = {0, 0, 16};
+    parameters[6].Constants = {0, 0, 17};
     const D3D12_ROOT_SIGNATURE_DESC desc{.NumParameters = 7, .pParameters = parameters};
     Microsoft::WRL::ComPtr<ID3DBlob> serialized, errors;
     if (FAILED(renodx::utils::directx::pD3D12SerializeRootSignature(
@@ -272,14 +280,15 @@ inline bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list,
   list->SetComputeRootUnorderedAccessView(3, state->anchor->GetGPUVirtualAddress());
   list->SetComputeRootUnorderedAccessView(4, state->previous_motion->GetGPUVirtualAddress());
   list->SetComputeRootUnorderedAccessView(5, state->validity->GetGPUVirtualAddress());
-  const std::array<uint32_t, 16> constants{inputs.width, inputs.height, inputs.motion_width, inputs.motion_height,
+  const std::array<uint32_t, 17> constants{inputs.width, inputs.height, inputs.motion_width, inputs.motion_height,
       std::bit_cast<uint32_t>(inputs.motion_scale_x), std::bit_cast<uint32_t>(inputs.motion_scale_y),
       static_cast<uint32_t>(phase), inputs.color_uses_guide_raster ? 1u : 0u,
       std::bit_cast<uint32_t>(inputs.raster_offset_x), std::bit_cast<uint32_t>(inputs.raster_offset_y),
       std::bit_cast<uint32_t>(inputs.previous_motion_offset_x), std::bit_cast<uint32_t>(inputs.previous_motion_offset_y),
       output_width, output_height,
-      std::bit_cast<uint32_t>(inputs.anchor_raster_delta_x), std::bit_cast<uint32_t>(inputs.anchor_raster_delta_y)};
-  list->SetComputeRoot32BitConstants(6, 16, constants.data(), 0);
+      std::bit_cast<uint32_t>(inputs.anchor_raster_delta_x), std::bit_cast<uint32_t>(inputs.anchor_raster_delta_y),
+      static_cast<uint32_t>(inputs.color_domain)};
+  list->SetComputeRoot32BitConstants(6, static_cast<UINT>(constants.size()), constants.data(), 0);
   const bool motion_phase = phase == Phase::MOTION || phase == Phase::SNAPSHOT_MOTION;
   const uint32_t dispatch_width = motion_phase ? inputs.motion_width
       : (phase == Phase::SELECT_ORIGINAL ? output_width : inputs.width);

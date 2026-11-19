@@ -42,6 +42,7 @@
 #include <new>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -13545,8 +13546,8 @@ inline bool EditReuseInputsEligible(
     const stage_plan::Plan& plan, const stage_plan::Group& group, const FeatureState& current,
     const D3D12_RESOURCE_DESC& color_desc, const D3D12_RESOURCE_DESC& motion_desc,
     const D3D12_RESOURCE_DESC& depth_desc, uint8_t hdr_mode, bool allow_hdr10,
-    uint32_t model_request) {
-  return !plan.mixed && group.begin == 0 && group.count == 1
+    uint32_t model_request, bool same_stage_stack = false) {
+  return !plan.mixed && group.begin == 0 && (group.count == 1 || same_stage_stack)
       && !D3D11OnlySession() && !direct_api.borrowed_core_context
       && (model_request == 1u || model_request == 2u)
       && ((hdr_mode == 1 && color_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) || allow_hdr10)
@@ -13594,6 +13595,20 @@ inline void RetireEditReuse(NrFeatureSlot* slot, uint64_t sequence) {
   retired_nr_features.push_back(RetiredNrFeature{
       .generation = present_generation, .tracker_proof = true, .edit_reuse = std::move(slot->edit_reuse)});
   nr_retirement_pending.store(true, std::memory_order_relaxed);
+}
+
+inline void RetireStackEditReuse(NrFeatureSlot* slots, uint64_t sequence) {
+  // When the group's final color owned the only anchor, every model skipped
+  // the same frame even though only the first slot has a cache to retire.
+  const bool skipped = slots[0].edit_reuse != nullptr && slots[0].edit_reuse->reused;
+  for (uint32_t pass = 0; pass < kMaxNrPasses; ++pass) {
+    if (skipped && slots[pass].handle != nullptr) {
+      slots[pass].pending_reset = true;
+      slots[pass].pending_reset_reasons |= kResetRecovery;
+      slots[pass].look_history.valid = false;
+    }
+    RetireEditReuse(&slots[pass], sequence);
+  }
 }
 
 inline std::array<uint64_t, 40> PrepareEditReuseHistory(
@@ -13647,11 +13662,12 @@ struct EditReuseRecording {
   bool composed_motion = false;
 };
 
-inline EditReuseRecording RecordEditReuseBeforeEvaluate(
+inline EditReuseRecording PrepareEditReuseRecording(
     ID3D12Device* device, ID3D12GraphicsCommandList* list, NrFeatureSlot* slot,
     const FinalResources& res, const EvaluationContract& frame, ID3D12Resource* original,
     DXGI_FORMAT depth_format, uint32_t work_width, uint32_t work_height, uint64_t sequence,
-    const std::array<uint64_t, 40>& contract, bool color_uses_guide_raster, uint64_t borrowed_original_epoch = 0) {
+    const std::array<uint64_t, 40>& contract, bool color_uses_guide_raster, uint64_t borrowed_original_epoch = 0,
+    edit_reuse::ColorDomain color_domain = edit_reuse::ColorDomain::MODEL_PROXY) {
   auto& cache = slot->edit_reuse;
   if (cache == nullptr) {
     cache = std::make_shared<edit_reuse::State>();
@@ -13659,6 +13675,7 @@ inline EditReuseRecording RecordEditReuseBeforeEvaluate(
   }
   // Guides live on the jittered render grid. For Upscaled the guide lookup
   // adds jitter. For Render the lookup is direct and the anchor grid shifts.
+  const bool terminal_color = color_domain == edit_reuse::ColorDomain::LINEAR_TERMINAL;
   EditReuseRecording recorded{.inputs = {
       .width = work_width, .height = work_height, .output_width = frame.output_width,
       .output_height = frame.output_height, .motion_width = frame.motion_width, .motion_height = frame.motion_height,
@@ -13668,28 +13685,36 @@ inline EditReuseRecording RecordEditReuseBeforeEvaluate(
       .color_uses_guide_raster = color_uses_guide_raster,
       .anchor_raster_delta_x = (color_uses_guide_raster ? cache->anchor_raster_offset_x - frame.jitter_x : 0.f),
       .anchor_raster_delta_y = (color_uses_guide_raster ? cache->anchor_raster_offset_y - frame.jitter_y : 0.f),
-      .proxy = res.proxy, .neural = res.nr_output, .motion = frame.motion, .depth = frame.depth,
+      .proxy = (terminal_color ? original : res.proxy), .neural = (terminal_color ? res.decoded : res.nr_output),
+      .motion = frame.motion, .depth = frame.depth,
       .original = original, .borrowed_original_epoch = borrowed_original_epoch, .decoded = res.decoded,
-      .depth_view_format = ControlMaskDepthViewFormat(depth_format)}};
+      .depth_view_format = ControlMaskDepthViewFormat(depth_format), .color_domain = color_domain}};
   if (!edit_reuse::Record(device, list, cache.get(), recorded.inputs, edit_reuse::Phase::PREPARE)) {
     ++edit_reuse_fallbacks;
     RetireEditReuse(slot, sequence);
     return {};
   }
   recorded.cache = cache.get();
-  if (!cache->valid) return recorded;
-  if (!cache->reused) {
-    recorded.reused = edit_reuse::Record(device, list, recorded.cache, recorded.inputs,
-                                        edit_reuse::Phase::APPLY_AND_SNAPSHOT_MOTION);
-    if (recorded.reused) {
+  return recorded;
+}
+
+inline void RecordEditReuseWork(
+    ID3D12Device* device, ID3D12GraphicsCommandList* list, NrFeatureSlot* slot,
+    EditReuseRecording* recorded, uint64_t sequence, bool allow_reuse, bool allow_motion, bool snapshot_motion = true) {
+  auto* cache = recorded->cache;
+  if (cache == nullptr || !cache->valid) return;
+  if (allow_reuse && !cache->reused) {
+    recorded->reused = edit_reuse::Record(device, list, cache, recorded->inputs,
+        snapshot_motion ? edit_reuse::Phase::APPLY_AND_SNAPSHOT_MOTION : edit_reuse::Phase::APPLY);
+    if (recorded->reused) {
       cache->reused = true;
       cache->source_sequence = sequence;
-      cache->motion_offset_x = frame.jitter_x;
-      cache->motion_offset_y = frame.jitter_y;
+      cache->motion_offset_x = recorded->inputs.raster_offset_x;
+      cache->motion_offset_y = recorded->inputs.raster_offset_y;
     }
-  } else {
-    recorded.composed_motion = edit_reuse::Record(device, list, recorded.cache, recorded.inputs, edit_reuse::Phase::MOTION);
-    if (recorded.composed_motion) {
+  } else if (allow_motion && cache->reused) {
+    recorded->composed_motion = edit_reuse::Record(device, list, cache, recorded->inputs, edit_reuse::Phase::MOTION);
+    if (recorded->composed_motion) {
       Transition(list, cache->composed_motion.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     } else {
@@ -13699,6 +13724,16 @@ inline EditReuseRecording RecordEditReuseBeforeEvaluate(
       ++edit_reuse_fallbacks;
     }
   }
+}
+
+inline EditReuseRecording RecordEditReuseBeforeEvaluate(
+    ID3D12Device* device, ID3D12GraphicsCommandList* list, NrFeatureSlot* slot,
+    const FinalResources& res, const EvaluationContract& frame, ID3D12Resource* original,
+    DXGI_FORMAT depth_format, uint32_t work_width, uint32_t work_height, uint64_t sequence,
+    const std::array<uint64_t, 40>& contract, bool color_uses_guide_raster, uint64_t borrowed_original_epoch = 0) {
+  auto recorded = PrepareEditReuseRecording(device, list, slot, res, frame, original,
+      depth_format, work_width, work_height, sequence, contract, color_uses_guide_raster, borrowed_original_epoch);
+  RecordEditReuseWork(device, list, slot, &recorded, sequence, true, true);
   return recorded;
 }
 
@@ -13716,6 +13751,175 @@ inline void CaptureEditReuse(
     ++cache->anchor_generation;
   } else {
     ++edit_reuse_fallbacks;
+  }
+}
+
+struct EditReuseGroup {
+  std::array<EditReuseRecording, kMaxNrPasses> layers;
+  uint32_t anchors = 0;
+  bool terminal = false;
+  bool reuse = false;
+  bool valid = false;
+};
+
+inline EditReuseGroup PrepareEditReuseGroup(
+    ID3D12Device* device, ID3D12GraphicsCommandList* list, FeatureState* feature,
+    const FinalResources& res, const FinalResources* second_workset,
+    const EvaluationContract& frame, const LookChain& look_chain, ID3D12Resource* original, DXGI_FORMAT depth_format,
+    uint32_t passes, uint64_t sequence, uint64_t reset_epoch, uint32_t encoding, bool guide_raster, bool layer_history) {
+  EditReuseGroup group;
+  const bool skipped = feature->slots[0].edit_reuse != nullptr && feature->slots[0].edit_reuse->reused;
+  const auto slots = std::span{feature->slots, passes};
+  if (std::ranges::any_of(slots, [](const auto& slot) { return slot.handle == nullptr; })) {
+    RetireStackEditReuse(feature->slots, sequence);
+    return group;
+  }
+  group.terminal = !layer_history;
+  group.anchors = (group.terminal ? 1u : passes);
+  const auto workset_for_pass = [&](uint32_t pass) -> const FinalResources& {
+    return (pass == 1 && second_workset != nullptr ? *second_workset : res);
+  };
+  // Each layer's grid and live Look affect the next layer and the terminal edit.
+  constexpr size_t look_words = sizeof(look::Constants) / sizeof(uint32_t);
+  constexpr size_t blend_words = 2;
+  constexpr size_t grid_words = 2;
+  constexpr size_t layer_words = blend_words + grid_words + look_words;
+  std::array<uint32_t, layer_words * kMaxNrPasses> effects{};
+  for (uint32_t pass = 0; pass < passes; ++pass) {
+    const auto& pass_res = workset_for_pass(pass);
+    auto inputs = std::span{effects}.subspan(pass * layer_words, layer_words);
+    inputs[0] = std::bit_cast<uint32_t>(PassTransferStrength(pass));
+    inputs[1] = std::bit_cast<uint32_t>(PassColorStrength(pass));
+    inputs[2] = pass_res.input_width;
+    inputs[3] = pass_res.input_height;
+    const uint32_t live_look = look_chain.wanted & pass_res.look_surfaces;
+    const bool transport = (live_look & kLookSurfaceTransport) != 0;
+    if ((live_look & kLookSurfaceOutput) == 0 || !look::Dispatched(look_chain.settings[pass], transport)) continue;
+    const auto constants = look::MakeConstants(look_chain.settings[pass], {.nr_width = pass_res.input_width,
+        .nr_height = pass_res.input_height, .full_width = pass_res.width, .full_height = pass_res.height,
+        .reference_linear = pass_res.hdr_mode != 0, .transport = transport});
+    std::ranges::copy(std::bit_cast<std::array<uint32_t, look_words>>(constants),
+                      inputs.begin() + blend_words + grid_words);
+  }
+  const auto* first_cache = feature->slots[0].edit_reuse.get();
+  const bool effects_changed = first_cache == nullptr || !std::ranges::equal(first_cache->group_effects, effects);
+  if (effects_changed && first_cache != nullptr && first_cache->group_effects.size() == effects.size()) {
+    bool upstream_changed = false;
+    for (uint32_t pass = 0; pass < passes; ++pass) {
+      const auto old_inputs = std::span{first_cache->group_effects}.subspan(pass * layer_words, layer_words);
+      const auto new_inputs = std::span{effects}.subspan(pass * layer_words, layer_words);
+      const bool grid_or_look_changed = !std::ranges::equal(old_inputs.subspan(blend_words), new_inputs.subspan(blend_words));
+      if (upstream_changed || grid_or_look_changed) {
+        slots[pass].look_history.valid = false;
+      }
+      upstream_changed |= grid_or_look_changed
+          || !std::ranges::equal(old_inputs.first(blend_words), new_inputs.first(blend_words));
+    }
+  }
+  // Reset/configuration epochs are shared by the stage. The route key also
+  // distinguishes a final-color anchor from a model-proxy anchor.
+  const std::array<uint64_t, 3> route{guide_raster ? kHookRender : kHookUpscaled,
+      (uint64_t{passes} << 1u) | uint64_t{group.terminal}, static_cast<uint64_t>(frame.feed)};
+  if (group.terminal) {
+    for (uint32_t pass = 1; pass < passes; ++pass) {
+      RetireEditReuse(&feature->slots[pass], sequence);
+    }
+  }
+  group.valid = true;
+  group.reuse = !effects_changed;
+  for (uint32_t pass = 0; pass < group.anchors; ++pass) {
+    auto& slot = feature->slots[pass];
+    const auto& pass_res = workset_for_pass(pass);
+    const uint32_t anchor_width = (group.terminal ? frame.output_width : pass_res.input_width);
+    const uint32_t anchor_height = (group.terminal ? frame.output_height : pass_res.input_height);
+    const auto contract = PrepareEditReuseHistory(&slot, frame, pass_res, feature->source_generation, sequence, reset_epoch,
+        anchor_width, anchor_height, original->GetDesc().Format, encoding, route, true, slot.nr_preset);
+    auto& layer = group.layers[pass];
+    layer = PrepareEditReuseRecording(device, list, &slot, pass_res, frame, original, depth_format,
+        anchor_width, anchor_height, sequence, contract, guide_raster, 0,
+        group.terminal ? edit_reuse::ColorDomain::LINEAR_TERMINAL : edit_reuse::ColorDomain::LAYER_PROXY);
+    group.valid &= layer.cache != nullptr;
+    group.reuse &= layer.cache != nullptr && layer.cache->valid && !layer.cache->reused;
+  }
+  if (group.valid) {
+    if (effects_changed) {
+      auto& snapshot = group.layers[0].cache->group_effects;
+      snapshot.assign(effects.begin(), effects.end());
+    }
+  }
+  bool compose = group.valid && skipped;
+  for (uint32_t pass = 0; pass < group.anchors; ++pass) {
+    const auto* cache = group.layers[pass].cache;
+    compose &= cache != nullptr && cache->valid && cache->reused;
+  }
+  const bool pending_reset = std::ranges::any_of(slots, [reset_epoch](const auto& slot) {
+    return slot.pending_reset || slot.acknowledged_reset_epoch != reset_epoch;
+  });
+  group.reuse &= !pending_reset && frame.frame_reset == 0;
+  if (!group.valid) {
+    RetireStackEditReuse(feature->slots, sequence);
+  }
+  if (skipped && (!compose || pending_reset || frame.frame_reset != 0)) {
+    for (auto& slot : slots) {
+      slot.pending_reset = true;
+      slot.pending_reset_reasons |= kResetRecovery;
+    }
+  }
+  if (compose && !pending_reset && frame.frame_reset == 0) {
+    // All layers consume the same current and skipped guide frames. One
+    // composed motion image remains read-only until the last model returns.
+    auto& first = group.layers[0];
+    RecordEditReuseWork(device, list, &feature->slots[0], &first, sequence, false, true);
+    if (!first.composed_motion) {
+      for (auto& slot : slots) {
+        slot.pending_reset = true;
+        slot.pending_reset_reasons |= kResetRecovery;
+      }
+    }
+  }
+  return group;
+}
+
+inline void EndEditReuseGroupMotion(ID3D12GraphicsCommandList* list, EditReuseGroup* group) {
+  auto& first = group->layers[0];
+  if (!first.composed_motion) return;
+  Transition(list, first.cache->composed_motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  first.composed_motion = false;
+}
+
+inline void RecordTerminalEditReuse(ID3D12Device* device, ID3D12GraphicsCommandList* list,
+                                    NrFeatureSlot* first_slot, EditReuseGroup* group, FinalResources* res,
+                                    D3D12_RESOURCE_STATES original_state, uint64_t sequence, bool capture) {
+  auto& edit = group->layers[0];
+  const auto output_state = (capture ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                   : D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  Transition(list, edit.inputs.original, original_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, 0u);
+  Transition(list, res->decoded, *res->DecodedState(), output_state);
+  *res->DecodedState() = output_state;
+  if (capture) {
+    CaptureEditReuse(device, list, edit, sequence);
+  } else {
+    RecordEditReuseWork(device, list, first_slot, &edit, sequence, true, false);
+  }
+  Transition(list, edit.inputs.original, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, original_state, 0u);
+  Transition(list, res->decoded, output_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  *res->DecodedState() = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+}
+
+inline void FinishEditReuseGroup(EditReuseGroup* group, NrFeatureSlot* slots, uint32_t passes,
+                                 bool delivered, bool reuse_failed) {
+  if (delivered || !group->valid) return;
+  for (uint32_t pass = 0; pass < group->anchors; ++pass) {
+    group->layers[pass].cache->valid = false;
+    group->layers[pass].cache->reused = false;
+  }
+  if (reuse_failed) {
+    for (uint32_t pass = 0; pass < passes; ++pass) {
+      slots[pass].pending_reset = true;
+      slots[pass].pending_reset_reasons |= kResetRecovery;
+      slots[pass].look_history.valid = false;
+    }
   }
 }
 
@@ -14263,7 +14467,7 @@ inline bool RecordInline(
 #if defined(NR_NEXUS_DEV_CONTROL)
   EditReuseFgEnvironment edit_fg_environment;
   bool edit_reuse_dev_inline_route = false;
-  if (edit_reuse_fixed_inline_route && edit_reuse_fg_experiment.load()
+  if (edit_reuse_fixed_inline_route && requested_stack == 1 && edit_reuse_fg_experiment.load()
       && (native_fg_declaration.load() == NativeFgDeclaration::kOn || fg::xefg::Enabled())) {
     // The experiment still requires a unique source for consumer attribution.
     const auto& created = create_contracts.at(handle);
@@ -14311,12 +14515,14 @@ inline bool RecordInline(
       && present->units.encoding == codec::Encoding::Pq && present->units.absolute
       && present->units.unit_nits == 10000.f && present->units.bt2020 && present->hdr_encoding == 4u;
   const uint32_t edit_reuse_model_request = nr_model::ResolvePreset(preset.load(), 0, direct_runtime_requirements.dual_models);
+  const bool same_stage_stack = requested_stack > 1 && edit_reuse_fixed_inline_route && !plan.mixed
+      && group.begin == 0 && group.count == requested_stack;
   const bool edit_reuse_contract_eligible = edit_reuse_requested
       && (edit_reuse_fixed_inline_route || edit_reuse_adaptive_inline_route || edit_reuse_prefg_route || edit_reuse_present_route)
       && !control_mask_eligible
       && output_rect.x == 0 && output_rect.y == 0 && width == output_desc.Width && height == output_desc.Height
       && EditReuseInputsEligible(plan, group, current, output_desc, motion_desc, depth_desc,
-                                 hdr_mode, edit_reuse_hdr10, edit_reuse_model_request);
+                                 hdr_mode, edit_reuse_hdr10, edit_reuse_model_request, same_stage_stack);
   std::optional<std::array<look::Settings, kMaxNrPasses>> fixed_edit_look;
   if (edit_reuse_contract_eligible && edit_reuse_fixed_inline_route
       && (nr_input_width != width || nr_input_height != height
@@ -14331,7 +14537,7 @@ inline bool RecordInline(
   const auto& edit_tiers = feature.adaptive_cache;
   // Establish the same ordered-history provenance while both tiers prepare.
   // Otherwise the first x2 frame must discard their unguarded ready objects.
-  const bool edit_reuse_adaptive_contract = edit_reuse_contract_eligible
+  const bool edit_reuse_adaptive_contract = edit_reuse_contract_eligible && requested_stack == 1
       && edit_reuse_adaptive_experiment.load(std::memory_order_relaxed)
       // The existing private low tier has its own resolve and history contract.
       && !look_mode.load() && detail_stability.load() == 1u && !nr_follow_input_res.load() && edit_reuse_model_request == 2u
@@ -14385,7 +14591,7 @@ inline bool RecordInline(
   if (edit_reuse_requested && !edit_reuse_route_eligible) ++edit_reuse_fallbacks;
   if (!edit_reuse_route_eligible) {
     if (edit_monitor.device != nullptr || monitor_present_delivery) {
-      if (plan.mixed || group.begin != 0 || group.count != 1) edit_monitor.reason = EditReuseBlock::PASSES;
+      if (plan.mixed || group.begin != 0 || (group.count != 1 && !same_stage_stack)) edit_monitor.reason = EditReuseBlock::PASSES;
       else if (control_mask_eligible) edit_monitor.reason = EditReuseBlock::MASK;
       else if (!edit_reuse_fixed_workset) edit_monitor.reason = EditReuseBlock::ADAPTIVE;
       else if (!edit_reuse_fixed_inline_route && !edit_reuse_present_route && !edit_reuse_xefg_route) {
@@ -14394,7 +14600,11 @@ inline bool RecordInline(
       else if (!edit_reuse_contract_eligible) edit_monitor.reason = EditReuseBlock::INPUTS;
       else edit_monitor.reason = EditReuseBlock::GEOMETRY;
     }
-    RetireEditReuse(&feature.slots[0], edit_reuse_sequence);
+    if (requested_stack > 1) {
+      RetireStackEditReuse(feature.slots, edit_reuse_sequence);
+    } else {
+      RetireEditReuse(&feature.slots[0], edit_reuse_sequence);
+    }
   }
   const uint32_t history_slot = (feature.adaptive_cache != nullptr
       ? static_cast<uint32_t>(feature.adaptive_cache->active) : 0u);
@@ -14469,9 +14679,12 @@ inline bool RecordInline(
         ++existing;
         RetireWorkset(key);
       }
-      ReleaseNrSlot(feature, 0, true);
-      feature.slots[0].pending_reset = true;
-      feature.slots[0].pending_reset_reasons |= kResetRecovery;
+      const uint32_t ordered_slots = (same_stage_stack ? requested_stack : 1u);
+      for (uint32_t pass = 0; pass < ordered_slots; ++pass) {
+        ReleaseNrSlot(feature, pass, true);
+        feature.slots[pass].pending_reset = true;
+        feature.slots[pass].pending_reset_reasons |= kResetRecovery;
+      }
       feature.control_mask_recording.reset();
       feature.control_mask_stream.reset();
     }
@@ -14521,7 +14734,11 @@ inline bool RecordInline(
     edit_reuse_route_eligible = false;
     edit_monitor.reason = EditReuseBlock::GEOMETRY;
     ++edit_reuse_fallbacks;
-    RetireEditReuse(&feature.slots[0], edit_reuse_sequence);
+    if (same_stage_stack) {
+      RetireStackEditReuse(feature.slots, edit_reuse_sequence);
+    } else {
+      RetireEditReuse(&feature.slots[0], edit_reuse_sequence);
+    }
   }
   std::array<uint32_t, kMaxNrPasses> pass_widths{}, pass_heights{};
   bool second_dims_committed = false;
@@ -15259,7 +15476,30 @@ inline bool RecordInline(
   const uint64_t chain_reset_epoch =
       history_reset_epoch.load(std::memory_order_relaxed);
   std::array<uint64_t, 40> edit_contract{};
-  if (edit_reuse_route_eligible) {
+  EditReuseGroup edit_group;
+  if (edit_reuse_route_eligible && same_stage_stack) {
+    bool layer_history = false;
+    bool full_working_grid = true;
+    bool active_layers = true;
+    for (uint32_t pass = 0; pass < requested_stack; ++pass) {
+      const auto& pass_res = (pass == 1 && second_workset != nullptr ? *second_workset : res);
+      layer_history |= (pass_look_wanted[pass] & pass_res.look_surfaces & kLookSurfaceOutput) != 0
+          && look_chain.settings[pass].stabilize != 0;
+      full_working_grid &= pass_res.input_width == pass_res.width && pass_res.input_height == pass_res.height;
+      active_layers &= PassTransferStrength(pass) > 0.f || PassColorStrength(pass) > 0.f;
+    }
+    // Temporal anchors bind the shared model surfaces and use the full-grid
+    // validity footprint. A smaller layer keeps its ordinary Evaluate and Look.
+    if (v6_encoding == 1u && active_layers && (!layer_history || full_working_grid)) {
+      edit_group = PrepareEditReuseGroup(device, command_list, &feature, res, second_workset, frame, look_chain, output,
+          depth_desc.Format, requested_stack, edit_reuse_sequence, chain_reset_epoch, v6_encoding, false, layer_history);
+    } else {
+      RetireStackEditReuse(feature.slots, edit_reuse_sequence);
+      edit_reuse_route_eligible = false;
+      edit_monitor.reason = (active_layers ? EditReuseBlock::GEOMETRY : EditReuseBlock::PASSES);
+      ++edit_reuse_fallbacks;
+    }
+  } else if (edit_reuse_route_eligible) {
     std::array<uint64_t, 3> route_contract{};
     if (present != nullptr) {
       route_contract = {present->restore_config_epoch, std::bit_cast<uint32_t>(frame_divisor), frame.ui_correction};
@@ -15296,7 +15536,36 @@ inline bool RecordInline(
 #if defined(NR_NEXUS_DEV_CONTROL)
   uint64_t inline_restore_serial = 0;
 #endif
-  for (uint32_t pass = 0; pass < requested_stack; ++pass) {
+  const bool terminal_reuse = edit_group.terminal && edit_group.reuse;
+  if (terminal_reuse) {
+    RecordTerminalEditReuse(device, command_list, &feature.slots[0], &edit_group, &res,
+                            output_rest, edit_reuse_sequence, false);
+    edit_reused = edit_group.layers[0].reused;
+    edit_reuse_delivery_failed = !edit_reused;
+    if (edit_reuse_delivery_failed) {
+      ++edit_reuse_fallbacks;
+    }
+    if (edit_reused) {
+      edit = edit_group.layers[0];
+      executed = static_cast<int32_t>(requested_stack) - 1;
+      if (timers_active) {
+        gpu_timers::MarkGroupEditReuse(command_list);
+      }
+#if defined(NR_NEXUS_DEV_CONTROL)
+      if (benchmark_frame != nullptr) {
+        for (uint32_t pass = 0; pass < requested_stack; ++pass) {
+          const auto& slot = feature.slots[pass];
+          benchmark_frame->passes[pass] = {.model = slot.nr_preset, .width = pass_widths[pass],
+              .height = pass_heights[pass], .auto_mask = slot.model_sent[4] != 0.f, .intensity = slot.model_intensity_sent,
+              .color_strength = PassColorStrength(pass), .transfer_strength = PassTransferStrength(pass)};
+        }
+        benchmark_frame->passes_recorded = requested_stack;
+      }
+#endif
+    }
+  }
+  for (uint32_t pass = 0; !terminal_reuse && pass < requested_stack; ++pass) {
+    edit = {};
     // Encode source and decode reference for this pass: the copied DLSS
     // output for the first pass, the previous pass's decoded result after.
     // Each pass re-normalizes the running image into the proxy, so the model
@@ -15477,6 +15746,8 @@ inline bool RecordInline(
       sample.model = feature.slots[pass].nr_preset;
       sample.width = nr_input_width;
       sample.height = nr_input_height;
+      sample.color_strength = pass_color;
+      sample.transfer_strength = pass_transfer;
       sample.detail_stability = (global_pass != 0 && !pass_look_result[global_pass - 1].follow.load())
           ? pass_look_result[global_pass - 1].detail_stability.load() : detail_stability.load();
       benchmark_frame->passes_recorded = pass + 1;
@@ -15520,13 +15791,27 @@ inline bool RecordInline(
         res.nr_output_state,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     res.nr_output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    if (timers_active && !edit_reuse_route_eligible) {
+    const bool layer_edit_reuse = edit_group.valid && !edit_group.terminal;
+    const bool single_edit_reuse = edit_reuse_route_eligible && !same_stage_stack;
+    if (timers_active && !single_edit_reuse && !layer_edit_reuse) {
       // Preserve the per-frame evaluation span, including ControlMask work.
       gpu_timers::Mark(command_list, gpu_timers::PassEvalStart(pass));
     }
     NVSDK_NGX_Result nr_result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
     bool nr_returned = false;
-    if (edit_reuse_route_eligible) {
+    if (layer_edit_reuse) {
+      auto& layer = edit_group.layers[pass];
+      if (edit_group.reuse) {
+        RecordEditReuseWork(device, command_list, &feature.slots[pass], &layer, edit_reuse_sequence, true, false, pass == 0);
+        if (!layer.reused) {
+          edit_reuse_delivery_failed = true;
+          ++edit_reuse_fallbacks;
+          break;
+        }
+      }
+      edit = layer;
+      edit.composed_motion = false;
+    } else if (single_edit_reuse) {
 #if defined(NR_NEXUS_DEV_CONTROL)
       const auto* benchmark_anchor = benchmark_frame == nullptr ? nullptr : feature.slots[0].edit_reuse.get();
       const bool benchmark_expected_reuse = benchmark_anchor != nullptr && benchmark_anchor->valid && !benchmark_anchor->reused;
@@ -15558,7 +15843,7 @@ inline bool RecordInline(
         gpu_timers::MarkEditReuse(command_list, pass);
       }
     } else {
-      if (timers_active && edit_reuse_route_eligible) {
+      if (timers_active && (single_edit_reuse || layer_edit_reuse)) {
         gpu_timers::Mark(command_list, gpu_timers::PassEvalStart(pass));
       }
       const ControlMaskParameters mask_parameters =
@@ -15604,6 +15889,8 @@ inline bool RecordInline(
       EvaluationContract model_frame = frame;
       if (edit.composed_motion) {
         model_frame.motion = edit.cache->composed_motion.Get();
+      } else if (edit_group.layers[0].composed_motion) {
+        model_frame.motion = edit_group.layers[0].cache->composed_motion.Get();
       }
       SetEvaluationParameters(
           feature,
@@ -15774,7 +16061,7 @@ inline bool RecordInline(
       if (edit.cache != nullptr && !capture_edit_in_look) {
         capture_edit(false);
       }
-      if (edit_reuse_route_eligible) {
+      if (single_edit_reuse) {
         if (edit_reuse_present_route && recording != nullptr) {
           recording->edit_refreshed = true;
         } else {
@@ -15981,6 +16268,7 @@ inline bool RecordInline(
     final_pass_color = pass_color;
     final_pass_shaped = route.shaped;
   }
+  EndEditReuseGroupMotion(command_list, &edit_group);
 
   // Write back the LAST EXECUTED pass's result: the full stack on a normal
   // frame, or the already-matured partial stack when the loop above broke on
@@ -15989,7 +16277,7 @@ inline bool RecordInline(
   // the game output still holds the game's own DLSS result, which is the
   // correct flicker-free behavior for this frame.  A failed pass also keeps
   // the write-back off - the failure path below retains the game output.
-  if (executed >= 0 && !NVSDK_NGX_FAILED(stack_failure) && !adaptive.preparing) {
+  if (executed >= 0 && !NVSDK_NGX_FAILED(stack_failure) && !adaptive.preparing && !edit_reuse_delivery_failed) {
     if (executed + 1 == static_cast<int32_t>(requested_stack) && last_model_pass >= 0) {
       const auto& model_resources = (last_model_pass == 1 && second_workset != nullptr ? *second_workset : res);
       const uint64_t previous_capture_serial = (last_model_used_control_mask
@@ -16030,7 +16318,17 @@ inline bool RecordInline(
         }
       }
     }
-    if (res.hdr_mode != 0) {
+    if (terminal_reuse) {
+      Transition(command_list, res.decoded, *res.DecodedState(), D3D12_RESOURCE_STATE_COPY_SOURCE);
+      Transition(command_list, output, output_rest, D3D12_RESOURCE_STATE_COPY_DEST, 0u);
+      CopyMip0(command_list, output, res.decoded);
+      Transition(command_list, output, D3D12_RESOURCE_STATE_COPY_DEST, output_rest, 0u);
+      Transition(command_list, res.decoded, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      *res.DecodedState() = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      if (timers_active) {
+        gpu_timers::Mark(command_list, gpu_timers::kSlotCopyBackEnd);
+      }
+    } else if (res.hdr_mode != 0) {
       // v6 single encode-back: estimate the model's dark pedestal per block
       // against the untouched work0, then commit - bounded, dark-gated
       // pedestal removal and the one transfer into the destination encoding
@@ -16289,10 +16587,22 @@ inline bool RecordInline(
           0.f, present, hdr_capture.get());
       command_list->Dispatch((width + 15) / 16, (height + 15) / 16, 1);
       UavBarrier(command_list, res.decoded);
+      if (edit_group.valid && edit_group.terminal && executed + 1 == static_cast<int32_t>(requested_stack)) {
+        RecordTerminalEditReuse(device, command_list, &feature.slots[0], &edit_group, &res,
+                                output_rest, edit_reuse_sequence, true);
+      }
       if (edit_reused) {
         Transition(command_list, output, output_rest, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, 0u);
-        auto& slot = feature.slots[0];
-        if (!edit_reuse::Record(device, command_list, slot.edit_reuse.get(), edit.inputs, edit_reuse::Phase::SELECT_ORIGINAL)) {
+        bool selected = true;
+        if (edit_group.valid) {
+          for (uint32_t pass = 0; pass < edit_group.anchors; ++pass) {
+            const auto& layer = edit_group.layers[pass];
+            selected &= edit_reuse::Record(device, command_list, layer.cache, layer.inputs, edit_reuse::Phase::SELECT_ORIGINAL);
+          }
+        } else {
+          selected = edit_reuse::Record(device, command_list, edit.cache, edit.inputs, edit_reuse::Phase::SELECT_ORIGINAL);
+        }
+        if (!selected) {
           // No model was invoked on this frame. Keep its original output and
           // restart NR history on the next actual refresh.
 #if defined(NR_NEXUS_DEV_CONTROL)
@@ -16304,6 +16614,7 @@ inline bool RecordInline(
           CopyMip0(command_list, res.decoded, output);
           Transition(command_list, res.decoded, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
           Transition(command_list, output, D3D12_RESOURCE_STATE_COPY_SOURCE, output_rest, 0u);
+          auto& slot = feature.slots[0];
           slot.edit_reuse->valid = false;
           slot.pending_reset = true;
           slot.pending_reset_reasons |= kResetRecovery;
@@ -16462,6 +16773,20 @@ inline bool RecordInline(
     }
   }
 
+  const bool group_anchor_ready = edit_group.valid && !edit_reuse_delivery_failed
+      && !NVSDK_NGX_FAILED(stack_failure) && executed + 1 == static_cast<int32_t>(requested_stack)
+      && std::ranges::all_of(std::span{edit_group.layers}.first(edit_group.anchors),
+          [edit_reuse_sequence](const auto& layer) {
+            return layer.cache->valid && layer.cache->source_sequence == edit_reuse_sequence;
+          });
+  FinishEditReuseGroup(&edit_group, feature.slots, requested_stack, group_anchor_ready, edit_reuse_delivery_failed);
+  if (same_stage_stack && group_anchor_ready && !edit_reused) {
+    ++edit_reuse_refreshes;
+  }
+  if (edit_reuse_delivery_failed && timers_active) {
+    gpu_timers::MarkBypassed();
+  }
+
   if (capture_service_role) {
     screenshot::RecordPreFgRole(present->service_serial, present->restore_config_epoch,
         present->domain == present_restore_scope::Domain::PRE_FG_HUDLESS, res.hdr_mode,
@@ -16475,8 +16800,10 @@ inline bool RecordInline(
 #if defined(NR_NEXUS_DEV_CONTROL)
   if (benchmark_frame != nullptr) {
     using sr_benchmark::Delivery;
-    if (benchmark_frame->original_selection_failed) {
-      benchmark_frame->fallback_reason = "select_original_failed";
+    benchmark_frame->nr_writeback_recorded = executed >= 0 && !NVSDK_NGX_FAILED(stack_failure)
+        && !adaptive.preparing && !edit_reuse_delivery_failed;
+    if (edit_reuse_delivery_failed || benchmark_frame->original_selection_failed) {
+      benchmark_frame->fallback_reason = (benchmark_frame->original_selection_failed ? "select_original_failed" : "reuse_apply_failed");
     } else if (NVSDK_NGX_FAILED(stack_failure)) {
       benchmark_frame->fallback_reason = "nr_evaluate_failed";
     } else if (executed < 0 || adaptive.preparing) {
@@ -16491,7 +16818,8 @@ inline bool RecordInline(
       benchmark_frame->delivery = Delivery::kPerFrame;
       benchmark_frame->fallback_reason = nullptr;
     } else if (!edit_reuse_route_eligible || benchmark_frame->expected_reuse_failed
-               || edit_reuse_fallbacks.load() != benchmark_fallbacks_before || edit.cache == nullptr) {
+               || edit_reuse_fallbacks.load() != benchmark_fallbacks_before
+               || (same_stage_stack ? !group_anchor_ready : edit.cache == nullptr)) {
       benchmark_frame->delivery = Delivery::kFallbackRefresh;
       benchmark_frame->fallback_reason = (!edit_reuse_route_eligible ? "edit_reuse_ineligible"
           : benchmark_frame->expected_reuse_failed ? "reuse_apply_failed" : "edit_reuse_recording_failed");
@@ -16616,7 +16944,8 @@ inline bool RecordInline(
       recording->reused_edit = edit.cache;
       recording->edit_reuse_encoding = v6_encoding;
     } else {
-      ObserveEditReuse(edit.cache, output_desc.Format, hdr_mode, v6_encoding);
+      auto* const anchor = (same_stage_stack ? edit_group.layers[0].cache : edit.cache);
+      ObserveEditReuse(anchor, output_desc.Format, hdr_mode, v6_encoding);
     }
     if (recording != nullptr) {
       recording->edit_reused = true;
@@ -16631,7 +16960,8 @@ inline bool RecordInline(
     return true;
   }
   if ((edit_monitor.device != nullptr || monitor_present_delivery) && stage_scope.complete) {
-    const bool refresh = edit_reuse_route_eligible && !edit_monitor_expected_reuse && edit.cache != nullptr && edit.cache->valid;
+    const bool refresh = edit_reuse_route_eligible && !edit_monitor_expected_reuse
+        && (same_stage_stack ? group_anchor_ready : edit.cache != nullptr && edit.cache->valid);
     const auto reason = (refresh ? EditReuseBlock::NONE
         : (edit_monitor.reason != EditReuseBlock::NONE ? edit_monitor.reason : EditReuseBlock::HISTORY));
     publish_edit_monitor((refresh ? EditReuseDelivery::REFRESH : EditReuseDelivery::PER_FRAME), reason);
@@ -16769,6 +17099,7 @@ struct PreSrSwap {
   const NVSDK_NGX_Handle* edit_source = nullptr;
   uint64_t edit_source_generation = 0;
   uint64_t edit_sequence = 0;
+  uint32_t edit_pass_count = 0;
   const NVSDK_NGX_Handle* monitor_source = nullptr;
   ID3D12GraphicsCommandList* monitor_list = nullptr;
   EditReuseMonitorFrame monitor_frame;
@@ -16802,8 +17133,8 @@ inline void RestorePreSrColor(
     swap.color = nullptr;
   }
   if (swap.monitor_source == nullptr && (sr_succeeded || swap.edit_source == nullptr)) return;
-  // A rejected SR frame has no usable handoff. Only invalidate the cache
-  // that produced this Color, since another source may be recording now.
+  // A rejected SR frame has no usable handoff. Its anchor may represent
+  // several models, and another source or sequence may be recording now.
   RuntimeLock lock(runtime_mutex);
   if (swap.monitor_source != nullptr) {
     if (const auto source = features.find(swap.monitor_source); source != features.end()) {
@@ -16819,11 +17150,19 @@ inline void RestorePreSrColor(
   const auto source = features.find(swap.edit_source);
   if (source == features.end() || source->second.source_generation != swap.edit_source_generation
       || source->second.sr_sequence != swap.edit_sequence) return;
-  auto& slot = source->second.slots[0];
-  if (slot.edit_reuse != nullptr && slot.edit_reuse->source_sequence == swap.edit_sequence) {
-    slot.edit_reuse->valid = false;
-    slot.pending_reset = true;
-    slot.pending_reset_reasons |= kResetRecovery;
+  bool rejected_anchor = false;
+  for (auto& slot : source->second.slots) {
+    if (slot.edit_reuse != nullptr && slot.edit_reuse->source_sequence == swap.edit_sequence) {
+      slot.edit_reuse->valid = false;
+      rejected_anchor = true;
+    }
+  }
+  if (rejected_anchor) {
+    for (auto& slot : std::span{source->second.slots, swap.edit_pass_count}) {
+      slot.pending_reset = true;
+      slot.pending_reset_reasons |= kResetRecovery;
+      slot.look_history.valid = false;
+    }
   }
 }
 
@@ -17161,21 +17500,24 @@ inline bool RecordInlinePreSR(
     }
   }
   const uint32_t edit_model_request = nr_model::ResolvePreset(preset.load(), 0, direct_runtime_requirements.dual_models);
+  const bool same_stage_stack = !plan.mixed && requested_stack > 1;
   bool edit_reuse_eligible = edit_reuse_requested && edit_sequence != 0
       && feature.source_feature == kFeatureDlss && EditReuseSourceConfirmed(handle, feature)
       && queue_tracking_active.load(std::memory_order_relaxed)
       && !control_mask_eligible && UsesFixedEditReuseWorkset(feature, adaptive)
-      && CanCommitFullSizeEditReuse(feature, width, height, nr_input_width, nr_input_height)
+      && (same_stage_stack || CanCommitFullSizeEditReuse(feature, width, height, nr_input_width, nr_input_height))
       && width == color_w && height == color_h && current.input_width == width && current.input_height == height
       && GetUInt(game_parameters, NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_X) == 0
       && GetUInt(game_parameters, NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_Y) == 0
       && !motion_window.contradicted && motion_window.width == width && motion_window.height == height
       && valid_edit_motion_scale
       && EditReuseInputsEligible(plan, group, current, color_desc, motion_desc, depth_desc,
-                                 hdr_mode, false, edit_model_request);
+                                 hdr_mode, false, edit_model_request, same_stage_stack);
   if (!edit_reuse_eligible) {
     if (swap.monitor_source != nullptr) {
-      if (group.begin != 0 || group.count != 1) swap.monitor_frame.reason = EditReuseBlock::PASSES;
+      if (group.begin != 0 || (group.count != 1 && !same_stage_stack)) {
+        swap.monitor_frame.reason = EditReuseBlock::PASSES;
+      }
       else if (control_mask_eligible) swap.monitor_frame.reason = EditReuseBlock::MASK;
       else if (!UsesFixedEditReuseWorkset(feature, adaptive)) swap.monitor_frame.reason = EditReuseBlock::ADAPTIVE;
       else if (!queue_tracking_active.load(std::memory_order_relaxed)) swap.monitor_frame.reason = EditReuseBlock::ORDER;
@@ -17185,7 +17527,11 @@ inline bool RecordInlinePreSR(
         swap.monitor_frame.reason = EditReuseBlock::INPUTS;
       }
     }
-    RetireEditReuse(&feature.slots[0], edit_sequence);
+    if (same_stage_stack) {
+      RetireStackEditReuse(feature.slots, edit_sequence);
+    } else {
+      RetireEditReuse(&feature.slots[0], edit_sequence);
+    }
   }
   const uint32_t history_slot = (feature.adaptive_cache != nullptr
       ? static_cast<uint32_t>(feature.adaptive_cache->active) : 0u);
@@ -17328,7 +17674,7 @@ inline bool RecordInlinePreSR(
   }
   const bool dims_committed =
       CommitNrResolution(feature, nr_input_width, nr_input_height, group.begin);
-  if (edit_reuse_eligible && (nr_input_width != width || nr_input_height != height)) {
+  if (edit_reuse_eligible && !same_stage_stack && (nr_input_width != width || nr_input_height != height)) {
     edit_reuse_eligible = false;
     swap.monitor_frame.reason = EditReuseBlock::GEOMETRY;
     RetireEditReuse(&feature.slots[0], edit_sequence);
@@ -17762,22 +18108,56 @@ inline bool RecordInlinePreSR(
   // `executed` via copies only and must not count as a successful NR frame.
   bool model_evaluated = false;
   std::array<uint64_t, 40> edit_contract{};
-  if (edit_reuse_eligible) {
+  EditReuseGroup edit_group;
+  if (edit_reuse_eligible && same_stage_stack) {
+    bool layer_history = false;
+    bool full_working_grid = true;
+    bool active_layers = true;
+    for (uint32_t pass = 0; pass < requested_stack; ++pass) {
+      const auto& pass_res = (pass == 1 && second_workset != nullptr ? *second_workset : res);
+      layer_history |= (pass_look_wanted[pass] & pass_res.look_surfaces & kLookSurfaceOutput) != 0
+          && look_chain.settings[pass].stabilize != 0;
+      full_working_grid &= pass_widths[pass] == width && pass_heights[pass] == height;
+      active_layers &= PassTransferStrength(pass) > 0.f || PassColorStrength(pass) > 0.f;
+    }
+    if (v6_encoding == 1u && active_layers && (!layer_history || full_working_grid)) {
+      edit_group = PrepareEditReuseGroup(device, command_list, &feature, res, second_workset, frame, look_chain, color,
+          depth_desc.Format, requested_stack, edit_sequence, chain_reset_epoch, v6_encoding, true, layer_history);
+    } else {
+      RetireStackEditReuse(feature.slots, edit_sequence);
+      edit_reuse_eligible = false;
+      swap.monitor_frame.reason = (active_layers ? EditReuseBlock::GEOMETRY : EditReuseBlock::PASSES);
+      ++edit_reuse_fallbacks;
+    }
+  } else if (edit_reuse_eligible) {
     edit_contract = PrepareEditReuseHistory(&feature.slots[0], frame, res, feature.source_generation,
         edit_sequence, chain_reset_epoch, nr_input_width, nr_input_height, color_desc.Format, v6_encoding,
         {kHookRender, static_cast<uint32_t>(frame.feed), source_primaries.load()}, true, edit_model_request);
   }
   const auto* previous_edit = feature.slots[0].edit_reuse.get();
-  const bool edit_monitor_expected_reuse = swap.monitor_source != nullptr && edit_reuse_eligible
+  const bool edit_monitor_expected_reuse = swap.monitor_source != nullptr && edit_reuse_eligible && !same_stage_stack
       && previous_edit != nullptr && previous_edit->valid && !previous_edit->reused;
-  EditReuseRecording edit;
+  EditReuseRecording single_edit;
   int32_t last_model_pass = -1;
   // Strengths of the last EXECUTED pass, consumed by the v6 pedestal and
   // commit dispatches after the loop.
   float final_pass_transfer = 0.f;
   float final_pass_color = 0.f;
   bool final_pass_shaped = false;
-  for (uint32_t pass = 0; pass < requested_stack; ++pass) {
+  bool group_reuse_failed = false;
+  const bool terminal_reuse = edit_group.terminal && edit_group.reuse;
+  if (terminal_reuse) {
+    // The game's Color is already shader-readable at the NR entry.
+    RecordTerminalEditReuse(device, command_list, &feature.slots[0], &edit_group, &res,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, edit_sequence, false);
+    group_reuse_failed = !edit_group.layers[0].reused;
+    if (!group_reuse_failed) {
+      executed = static_cast<int32_t>(requested_stack) - 1;
+    }
+  }
+  for (uint32_t pass = 0; !terminal_reuse && pass < requested_stack; ++pass) {
+    // The terminal anchor reads packed Color after the complete stack.
+    auto& edit = (edit_group.valid && !edit_group.terminal ? edit_group.layers[pass] : single_edit);
     // v6 HDR swaps the linear work surfaces in (work0 for pass 0, the
     // previous pass's work output after - the fixed set fill's parity);
     // SDR keeps the game color / decoded ping-pong arrangement.
@@ -18003,7 +18383,15 @@ inline bool RecordInlinePreSR(
         res.nr_output_state,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     res.nr_output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    if (edit_reuse_eligible) {
+    if (same_stage_stack) {
+      if (edit_group.reuse) {
+        RecordEditReuseWork(device, command_list, &feature.slots[pass], &edit, edit_sequence, true, false, pass == 0);
+        if (!edit.reused) {
+          group_reuse_failed = true;
+          break;
+        }
+      }
+    } else if (edit_reuse_eligible) {
 #if defined(NR_NEXUS_DEV_CONTROL)
       const bool expected_reuse = benchmark_frame != nullptr && previous_edit != nullptr
           && previous_edit->valid && !previous_edit->reused;
@@ -18029,8 +18417,9 @@ inline bool RecordInlinePreSR(
             adaptive.enabled ? adaptive.upper[group.begin + pass].height : 0u);
       }
       EvaluationContract model_frame = frame;
-      if (edit.composed_motion) {
-        model_frame.motion = edit.cache->composed_motion.Get();
+      const auto& model_edit = (same_stage_stack ? edit_group.layers[0] : edit);
+      if (model_edit.composed_motion) {
+        model_frame.motion = model_edit.cache->composed_motion.Get();
       }
       SetEvaluationParameters(
           feature,
@@ -18080,7 +18469,7 @@ inline bool RecordInlinePreSR(
           nr_result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
         }
       }
-      if (edit.composed_motion) {
+      if (!same_stage_stack && edit.composed_motion) {
         Transition(command_list, edit.cache->composed_motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
       }
@@ -18123,10 +18512,10 @@ inline bool RecordInlinePreSR(
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     res.nr_output_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    if (edit_reuse_eligible && !edit.reused) {
-      if (edit.cache != nullptr) {
-        CaptureEditReuse(device, command_list, edit, edit_sequence);
-      }
+    if (edit.cache != nullptr && !edit.reused) {
+      CaptureEditReuse(device, command_list, edit, edit_sequence);
+    }
+    if (edit_reuse_eligible && !same_stage_stack && !edit.reused) {
       ++edit_reuse_refreshes;
     }
 #if defined(NR_NEXUS_DEV_CONTROL)
@@ -18228,7 +18617,9 @@ inline bool RecordInlinePreSR(
     final_pass_shaped = route.shaped;
   }
 
+  EndEditReuseGroupMotion(command_list, &edit_group);
   if (NVSDK_NGX_FAILED(stack_failure)) {
+    FinishEditReuseGroup(&edit_group, feature.slots, requested_stack, false, false);
     // Leave the game its own color rather than feeding it a broken image.
     // The proxy is post-encode and returns to its UAV resting state via a
     // tracked transition; nr_output can break here from a slot-create
@@ -18266,7 +18657,8 @@ inline bool RecordInlinePreSR(
     return false;
   }
 
-  if (executed < 0) {
+  if (executed < 0 && !group_reuse_failed) {
+    FinishEditReuseGroup(&edit_group, feature.slots, requested_stack, false, false);
     // Frame-ahead maturation frame: pass 0 itself was just created and
     // NR did not run.  Park the codec surfaces and decline - the
     // game's evaluate runs on its own color, and the stand-in
@@ -18311,7 +18703,10 @@ inline bool RecordInlinePreSR(
   D3D12_RESOURCE_STATES* final_state = nullptr;
   ID3D12Resource* work_final = nullptr;
   D3D12_RESOURCE_STATES* work_final_state = nullptr;
-  if (res.hdr_mode != 0) {
+  if (terminal_reuse || group_reuse_failed) {
+    final_surface = res.decoded;
+    final_state = res.DecodedState();
+  } else if (res.hdr_mode != 0) {
     // v6 single encode-back (see ProcessInline): pedestal estimate against
     // the untouched work0, then the one bounded, dark-gated removal and
     // transfer into the destination encoding, landing in `decoded` - the
@@ -18414,19 +18809,43 @@ inline bool RecordInlinePreSR(
     final_surface = stack_surfaces[executed & 1];
     final_state = stack_states[executed & 1];
   }
-  if (edit.reused && !edit_reuse::Record(
-          device, command_list, edit.cache, edit.inputs, edit_reuse::Phase::SELECT_ORIGINAL)) {
+  const bool complete_stack = executed + 1 == static_cast<int32_t>(requested_stack);
+  if (edit_group.valid && !edit_group.reuse && complete_stack && model_evaluated) {
+    if (edit_group.terminal) {
+      RecordTerminalEditReuse(device, command_list, &feature.slots[0], &edit_group, &res,
+          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, edit_sequence, true);
+    }
+    ++edit_reuse_refreshes;
+  }
+  const auto group_anchors = std::span{edit_group.layers}.first(edit_group.valid ? edit_group.anchors : 0u);
+  const auto anchors = (same_stage_stack ? group_anchors : std::span{&single_edit, 1u});
+  const bool edit_reused = (same_stage_stack ? edit_group.reuse && !group_reuse_failed : single_edit.reused);
+  bool selected_original = true;
+  if (edit_reused) {
+    for (const auto& anchor : anchors) {
+      if (!edit_reuse::Record(device, command_list, anchor.cache, anchor.inputs, edit_reuse::Phase::SELECT_ORIGINAL)) {
+        selected_original = false;
+        break;
+      }
+    }
+  }
+  if (group_reuse_failed || !selected_original) {
     // Reuse recorded no NR Evaluate. Leave Color with SR and reset the
     // skipped history on its next real refresh.
     ++edit_reuse_fallbacks;
     swap.monitor_frame.delivery = EditReuseDelivery::ORIGINAL;
-    swap.monitor_frame.reason = EditReuseBlock::SELECT_ORIGINAL;
+    swap.monitor_frame.reason = (group_reuse_failed ? EditReuseBlock::HISTORY : EditReuseBlock::SELECT_ORIGINAL);
 #if defined(NR_NEXUS_DEV_CONTROL)
     if (benchmark_frame != nullptr) {
-      benchmark_frame->fallback_reason = "select_original_failed";
+      benchmark_frame->expected_reuse_failed = group_reuse_failed;
+      benchmark_frame->fallback_reason = (group_reuse_failed ? "reuse_apply_failed" : "select_original_failed");
     }
 #endif
-    RetireEditReuse(&feature.slots[0], edit_sequence);
+    if (edit_group.valid) {
+      FinishEditReuseGroup(&edit_group, feature.slots, requested_stack, false, true);
+    } else {
+      RetireEditReuse(&feature.slots[0], edit_sequence);
+    }
     if (timers_active) {
       gpu_timers::MarkBypassed();
       gpu_timers::End(command_list);
@@ -18436,9 +18855,12 @@ inline bool RecordInlinePreSR(
   }
 #if defined(NR_NEXUS_DEV_CONTROL)
   if (benchmark_frame != nullptr) {
-    benchmark_frame->original_selection_recorded = edit.reused;
+    benchmark_frame->original_selection_recorded = edit_reused;
   }
 #endif
+  if (terminal_reuse && timers_active) {
+    gpu_timers::MarkGroupEditReuse(command_list);
+  }
   Transition(
       command_list,
       final_surface,
@@ -18461,6 +18883,9 @@ inline bool RecordInlinePreSR(
       D3D12_RESOURCE_STATE_COPY_DEST,
       kPreSrReadable);
   res.pre_sr_color_state = kPreSrReadable;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (benchmark_frame != nullptr) benchmark_frame->nr_writeback_recorded = true;
+#endif
   if (timers_active) {
     gpu_timers::Mark(command_list, gpu_timers::kSlotCopyBackEnd);
   }
@@ -18493,26 +18918,31 @@ inline bool RecordInlinePreSR(
       D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   res.nr_output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 
+  const bool valid_anchor = !anchors.empty() && std::ranges::all_of(anchors, [](const auto& anchor) {
+    return anchor.cache != nullptr && anchor.cache->valid;
+  });
+  FinishEditReuseGroup(&edit_group, feature.slots, requested_stack, complete_stack && valid_anchor, false);
   // Point the game's NGX Color at the NR stand-in for the duration of
   // the real evaluate below; RestorePreSrColor puts the game's pointer back.
   swap.color = color;
   swap.result = res.pre_sr_color;
-  if (edit.cache != nullptr) {
+  if (edit_group.valid || single_edit.cache != nullptr) {
     swap.edit_source = handle;
     swap.edit_source_generation = feature.source_generation;
     swap.edit_sequence = edit_sequence;
+    swap.edit_pass_count = (edit_group.valid ? requested_stack : 1u);
   }
   NVSDK_NGX_Parameter_SetVoidPointer(
       const_cast<NVSDK_NGX_Parameter*>(game_parameters),
       NVSDK_NGX_Parameter_Color,
       res.pre_sr_color);
-  evaluate_chain.render_complete = executed + 1 == static_cast<int32_t>(requested_stack);
+  evaluate_chain.render_complete = complete_stack;
   stage_scope.complete = evaluate_chain.render_complete;
   if (swap.monitor_source != nullptr && stage_scope.complete) {
-    if (edit.reused) {
+    if (edit_reused) {
       swap.monitor_frame.delivery = EditReuseDelivery::REUSED;
     } else if (model_evaluated) {
-      if (edit_reuse_eligible && !edit_monitor_expected_reuse && edit.cache != nullptr && edit.cache->valid) {
+      if (edit_reuse_eligible && !edit_monitor_expected_reuse && valid_anchor) {
         swap.monitor_frame.delivery = EditReuseDelivery::REFRESH;
       } else {
         swap.monitor_frame.delivery = EditReuseDelivery::PER_FRAME;
@@ -18521,10 +18951,10 @@ inline bool RecordInlinePreSR(
     }
   }
   if (!adaptive.preparing) RecordOutputPass(color, handle, admission_stage);
-  if (edit.reused) {
-    ObserveEditReuse(edit.cache, color_desc.Format, hdr_mode, v6_encoding);
+  if (edit_reused) {
+    ObserveEditReuse(anchors.front().cache, color_desc.Format, hdr_mode, v6_encoding);
   }
-  if (!model_evaluated && !edit.reused) {
+  if (!model_evaluated && !edit_reused) {
     ++bypassed_evaluations;
     CountNrDecline(NrDeclineReason::kSlotWarmupMaturation);
     if (timers_active) {
@@ -18541,11 +18971,11 @@ inline bool RecordInlinePreSR(
     if (!stage_scope.complete) {
       benchmark_frame->delivery = Delivery::kPartial;
       benchmark_frame->fallback_reason = "partial_pass_stack";
-    } else if (edit.reused) {
+    } else if (edit_reused) {
       benchmark_frame->delivery = Delivery::kReuse;
     } else if (!edit_reuse_requested) {
       benchmark_frame->delivery = Delivery::kPerFrame;
-    } else if (!edit_reuse_eligible || benchmark_frame->expected_reuse_failed || edit.cache == nullptr || !edit.cache->valid) {
+    } else if (!edit_reuse_eligible || benchmark_frame->expected_reuse_failed || !valid_anchor) {
       benchmark_frame->delivery = Delivery::kFallbackRefresh;
       benchmark_frame->fallback_reason = (!edit_reuse_eligible ? "edit_reuse_ineligible"
           : benchmark_frame->expected_reuse_failed ? "reuse_apply_failed" : "edit_reuse_recording_failed");

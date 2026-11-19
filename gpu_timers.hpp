@@ -150,6 +150,7 @@ struct Segment {
   uint64_t written = 0;  // bit per slot written (kSlotsPerEval == 64)
   bool recorded = false;
   bool bypass = false;  // zero-strength passthrough frame: no stats
+  bool group_edit_reused = false;
   bool measure = true;
   uint32_t pass_begin = 0;
   uint32_t pass_count = 0;
@@ -191,6 +192,7 @@ struct Stats {
   uint32_t width = 0;
   uint32_t height = 0;
   bool valid = false;
+  bool group_edit_reused = false;
   std::array<PassStats, kTimerMaxPasses> passes{};
   SampleState state = SampleState::NOT_MEASURED;
   uint64_t sequence = 0;
@@ -517,7 +519,7 @@ inline bool Publish(const Segment& s, bool log, const void* queue) {
     next.resolve_us += layer.resolve_us;
     next.look_us += layer.look_us;
   }
-  if (std::none_of(next.passes.begin(), next.passes.end(), [](const auto& pass) {
+  if (!s.group_edit_reused && std::none_of(next.passes.begin(), next.passes.end(), [](const auto& pass) {
         return pass.state == SampleState::VALID;
       })) {
     Reject(s, SampleState::NOT_EXECUTED);
@@ -533,6 +535,7 @@ inline bool Publish(const Segment& s, bool log, const void* queue) {
   next.height = s.height;
   std::memcpy(next.path, s.path, sizeof(next.path));
   next.valid = true;
+  next.group_edit_reused = s.group_edit_reused;
   next.state = SampleState::VALID;
   next.sequence = s.sequence;
   next.measured_ns = NowNs();
@@ -540,9 +543,9 @@ inline bool Publish(const Segment& s, bool log, const void* queue) {
   next.recorded_ns = static_cast<int64_t>(s.comparison.recorded_ns);
   next.queue = queue;
   next.samples = 1;
-  const bool complete = s.pass_count != 0 && s.pass_count <= kTimerMaxPasses
+  const bool complete = s.group_edit_reused || (s.pass_count != 0 && s.pass_count <= kTimerMaxPasses
       && std::all_of(next.passes.begin(), next.passes.begin() + std::min(s.pass_count, kTimerMaxPasses),
-          [](const auto& pass) { return pass.state == SampleState::VALID; });
+          [](const auto& pass) { return pass.state == SampleState::VALID; }));
   auto& completed = completed_stats[StageIndex(s.path)];
   if (complete && next.sequence > completed.sequence) {
     completed = next;
@@ -596,6 +599,7 @@ inline bool Publish(const Segment& s, bool log, const void* queue) {
   const auto& previous = window.samples[(window.next + kDisplaySamples - 1) % kDisplaySamples];
   bool same_contract = window.count != 0 && previous.queue == next.queue
       && previous.identity == next.identity
+      && previous.group_edit_reused == next.group_edit_reused
       && previous.width == next.width && previous.height == next.height
       && next.measured_ns - previous.measured_ns <= kSampleAgeNs;
   for (uint32_t pass = 0; pass < kTimerMaxPasses && same_contract; ++pass) {
@@ -754,6 +758,7 @@ inline bool Begin(
   s.base = internal::head * kSlotsPerEval;
   s.count = 0;
   s.bypass = false;
+  s.group_edit_reused = false;
   s.measure = measure;
   s.pass_begin = pass_begin;
   s.pass_count = pass_count;
@@ -828,6 +833,15 @@ inline void MarkEditReuse(ID3D12GraphicsCommandList* command_list, uint32_t pass
   // includes that GPU work; there is no NGX Evaluate interval to publish.
   internal::segments[internal::current.idx].passes[pass].edit_reused = true;
   Mark(command_list, PassEvalEnd(pass));
+}
+
+// The finished-color anchor bypasses every layer. Only the frame-level
+// timestamps apply to this recording.
+inline void MarkGroupEditReuse(ID3D12GraphicsCommandList* command_list) {
+  if (internal::current.active) {
+    internal::segments[internal::current.idx].group_edit_reused = true;
+    Mark(command_list, kSlotCommitEnd);
+  }
 }
 
 // Flags the current segment as a zero-strength passthrough frame: it resolves
@@ -981,8 +995,8 @@ inline void Poll(bool exact_proofs, bool log) {
             complete = false;
           }
         }
-        if (complete) {
-          Stats next{.width = s.width, .height = s.height, .valid = true, .passes = s.passes,
+        if (complete || (s.group_edit_reused && (s.written & (uint64_t{1} << kSlotCopyBackEnd)) != 0)) {
+          Stats next{.width = s.width, .height = s.height, .valid = true, .group_edit_reused = s.group_edit_reused, .passes = s.passes,
                      .state = SampleState::VALID, .sequence = s.sequence, .measured_ns = NowNs(),
                      .identity = s.comparison.identity,
                      .recorded_ns = static_cast<int64_t>(s.comparison.recorded_ns)};

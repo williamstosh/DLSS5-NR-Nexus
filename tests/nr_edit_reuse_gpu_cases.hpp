@@ -12,6 +12,7 @@
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -85,6 +86,13 @@ NVSDK_NGX_Result NVSDK_CONV ConstantModel(ID3D12GraphicsCommandList* list, const
       pixels.size() * sizeof(uint16_t), static_cast<UINT>(desc.Width) * 8);
   native::Transition(list, output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   return result;
+}
+
+template <uint32_t NeutralPreset>
+NVSDK_NGX_Result NVSDK_CONV OneEditedLayer(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle,
+    const NVSDK_NGX_Parameter* parameters, PFN_NVSDK_NGX_ProgressCallback callback) {
+  const auto evaluate = (stage_execution_cases::presets.at(handle) == NeutralPreset ? NeutralModel : ConstantModel);
+  return evaluate(list, handle, parameters, callback);
 }
 
 int Run() {
@@ -1969,6 +1977,329 @@ int Run() {
                   [&](const auto& entry) { return entry.first.handle == owner; }),
         "the separate On source lifetime releases its rotating-output worksets through normal retirement");
 #endif
+    // Exercise two independent temporal Look passes through the same successful SR wrapper.
+    native::RegisterCreatedFeatureLocked(owner, native::kFeatureDlss, &parameters);
+    native::created_feature_ids[owner] = native::kFeatureDlss;
+    native::stack_passes = 2;
+    native::chained_temporal_history = true;
+    native::pass_stage[0] = 0;
+    native::preset = 1;
+    native::intensity = .5f;
+    native::pass_preset[0] = 2;
+    native::pass_follow[0] = false;
+    native::pass_intensity[0] = .75f;
+    native::pass_transfer_strength[0] = 1.f;
+    native::pass_color_strength[0] = 1.f;
+    native::pass_look_result[0].follow = false;
+    native::pass_look_result[0].mode = false;
+    native::pass_look_result[0].detail_stability = 0;
+    native::detail_stability = 0;
+    native::direct_api.create = stage_execution_cases::Create;
+    native::direct_api.evaluate = same_stage_resolution_cases::Evaluate;
+    auto& pair_calls = same_stage_resolution_cases::evaluations;
+    same_stage_resolution_cases::stamps = {0x3900, 0x3b00};
+    parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, 0.f);
+    parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, 0.f);
+
+    const auto pair_frame = [&](const char* label, int reset, uint64_t expected_calls) {
+      pair_calls.clear();
+      const auto calls = frame(reset);
+      const auto final = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      submit_commands("two-Pass Upscaled writeback readback");
+      std::cout << "OBS Upscaled multipass " << label << " calls=" << calls << " fence=" << gpu.serial << '\n';
+      Check(calls == expected_calls && pair_calls.size() == expected_calls, "Upscaled cadence applies to the complete group");
+      return final.Pixels();
+    };
+    bool pair_ready = false;
+    for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8; ++attempt) {
+      pair_calls.clear();
+      const auto calls = frame(1);
+      std::cout << "OBS Upscaled multipass warmup=" << attempt << " calls=" << calls << '\n';
+      if (calls == 2) {
+        pair_ready = true;
+        break;
+      }
+    }
+    Check(pair_ready, "Upscaled two-Pass group matures");
+    auto& pair_slots = native::features.at(owner).slots;
+    const auto pair_refresh = pair_frame("refresh", 1, 2);
+    const auto read_red = [](const std::vector<uint8_t>& bytes, size_t pixel) {
+      uint16_t red = 0;
+      std::memcpy(&red, bytes.data() + pixel * 8, sizeof(red));
+      return DirectX::PackedVector::XMConvertHalfToFloat(red);
+    };
+    constexpr size_t center = 8 * 16 + 8;
+    const auto first_layer_input = pair_calls[0].input.Pixels();
+    const auto second_layer_input = pair_calls[1].input.Pixels();
+    Check(std::abs(read_red(second_layer_input, center) - read_red(first_layer_input, center)) > .025f,
+          "Pass 2 Evaluate reads edited current-frame color from Pass 1");
+    std::array<uint32_t, 2> look_written{};
+    std::array<uint64_t, 2> anchor_generations{};
+    for (size_t pass = 0; pass < 2; ++pass) {
+      const auto& call = pair_calls[pass];
+      const auto& slot = pair_slots[pass];
+      std::cout << "OBS Upscaled multipass pass=" << pass + 1 << " model=" << call.preset
+                << " size=" << call.input.width << 'x' << call.input.height << " intensity=" << call.intensity
+                << " reset=" << call.reset << " look=" << slot.look_history.valid
+                << " anchor=" << (slot.edit_reuse != nullptr && slot.edit_reuse->valid) << '\n';
+      Check(call.handle == slot.handle && call.preset == pass + 1 && call.intensity == (pass == 0 ? .5f : .75f)
+                && call.input.width == 16 && call.input.height == 16 && call.reset == 1,
+            "Upscaled refresh sends each Pass's real model, working size, strength and Reset");
+      Check(slot.look_history.valid && slot.look_history.buffers[0] != nullptr && slot.edit_reuse != nullptr
+                && slot.edit_reuse->valid,
+            "each temporal layer owns a Look history and a pre-Look anchor");
+      look_written[pass] = slot.look_history.written;
+      anchor_generations[pass] = slot.edit_reuse->anchor_generation;
+    }
+    Check(pair_slots[0].look_history.buffers[0] != pair_slots[1].look_history.buffers[0]
+              && pair_slots[0].edit_reuse != pair_slots[1].edit_reuse,
+          "two temporal layers never share Look buffers or the edit anchor");
+    const auto look_restarts = native::look_history_restarts.load();
+    const auto group_reuses = native::edit_reuse_reuses.load();
+    auto current_source = source_values;
+    for (size_t channel = 0; channel < 3; ++channel) {
+      current_source[center * 4 + channel] = DirectX::PackedVector::XMConvertFloatToHalf(
+          DirectX::PackedVector::XMConvertHalfToFloat(current_source[center * 4 + channel]) * 1.04f);
+    }
+    current_source[center * 4 + 3] = 0x3a00;
+    std::vector<float> reveal(16 * 16, .5f);
+    reveal.front() = .9f;
+    upload(source.Get(), current_source, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 8);
+    upload(wrapper_depth.Get(), reveal, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 4);
+    const auto pair_reuse = pair_frame("reuse", 0, 0);
+    const float refresh_red = read_red(pair_refresh, center);
+    const float reuse_red = read_red(pair_reuse, center);
+    const float original_red = DirectX::PackedVector::XMConvertHalfToFloat(current_source[center * 4]);
+    Check(std::abs(reuse_red - original_red) > .05f && std::abs(reuse_red - refresh_red) > .003f,
+          "zero-model Look reuse writes a nonneutral edit of new RGB, distinct from the last output");
+    Check(std::memcmp(pair_reuse.data(), current_source.data(), 8) == 0,
+          "depth rejection in the group selects the current original RGBA");
+    for (size_t pixel = 0; pixel < current_source.size() / 4; ++pixel) {
+      Check(std::memcmp(pair_reuse.data() + pixel * 8 + 6, &current_source[pixel * 4 + 3], 2) == 0,
+            "Upscaled two-Pass reuse preserves the exact current alpha");
+    }
+    for (size_t pass = 0; pass < 2; ++pass) {
+      const auto& slot = pair_slots[pass];
+      Check(slot.look_history.valid && slot.look_history.written != look_written[pass] && slot.edit_reuse != nullptr
+                && slot.edit_reuse->anchor_generation == anchor_generations[pass],
+            "reuse advances each Look history without moving either model anchor");
+    }
+    Check(native::look_history_restarts.load() == look_restarts && native::edit_reuse_reuses.load() == group_reuses + 1,
+          "the whole group reuses once without consuming either model's old Reset");
+    const auto& pair_work = native::worksets.at(native::WorksetKey{owner, output.Get()});
+    const auto reused_layer_input = stage_execution_cases::Capture(gpu, pair_work.proxy, pair_work.proxy_state);
+    submit_commands("two-Pass Upscaled reused tail input readback");
+    const float reused_layer_red = read_red(reused_layer_input.Pixels(), center);
+    const float refreshed_layer_red = read_red(second_layer_input, center);
+    const float unedited_layer_red = read_red(first_layer_input, center);
+    std::cout << "OBS Upscaled multipass tail_proxy_R=" << refreshed_layer_red << '/' << reused_layer_red
+              << " original_proxy_R=" << unedited_layer_red << " final_R=" << refresh_red << '/' << reuse_red << '\n';
+    Check(std::abs(reused_layer_red - refreshed_layer_red) > .001f
+              && std::abs(reused_layer_red - refreshed_layer_red) < std::abs(reused_layer_red - unedited_layer_red),
+          "Pass 2 reuse encodes this frame's edited Pass 1 color and retains the upstream edit");
+
+    pair_frame("refresh-after-reuse", 0, 2);
+    Check(pair_calls[0].reset == 0 && pair_calls[1].reset == 0
+              && pair_calls[0].motion != wrapper_motion.Get() && pair_calls[1].motion != wrapper_motion.Get(),
+          "both real models advance from their last refresh using composed motion");
+    pair_slots[1].pending_reset = true;
+    pair_slots[1].pending_reset_reasons = native::kResetRecovery;
+    const auto restarts_before_tail_reset = native::look_history_restarts.load();
+    pair_frame("tail-reset", 0, 2);
+    Check(pair_calls[0].reset == 0 && pair_calls[1].reset == 1
+              && native::look_history_restarts.load() == restarts_before_tail_reset + 1,
+          "an invalid tail anchor refreshes the group and restarts only the tail's model and Look history");
+
+    // Both directions matter: the neutral layer can run before or after
+    // the only edit. Depth and color rejection still win at the final output.
+    bool neutral_compositions_match = true;
+    for (uint32_t neutral_model = 1; neutral_model <= 2; ++neutral_model) {
+      native::direct_api.evaluate = (neutral_model == 1 ? OneEditedLayer<1> : OneEditedLayer<2>);
+      const std::vector<float> stable_depth(16 * 16, .5f);
+      upload(source.Get(), source_values, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 8);
+      upload(wrapper_depth.Get(), stable_depth, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 4);
+      Check(frame(1) == 2, "one neutral layer still evaluates on a full group refresh");
+      const auto refreshed_color = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      submit_commands("one neutral layer refresh readback");
+
+      auto next_source = source_values;
+      constexpr size_t color_disocclusion = center + 3;
+      for (size_t channel = 0; channel < 3; ++channel) {
+        next_source[color_disocclusion * 4 + channel] = DirectX::PackedVector::XMConvertFloatToHalf(2.f);
+      }
+      for (size_t pixel = 0; pixel < next_source.size() / 4; ++pixel) {
+        next_source[pixel * 4 + 3] = 0x32f0;
+      }
+      upload(source.Get(), next_source, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 8);
+      upload(wrapper_depth.Get(), reveal, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 4);
+      Check(frame(0, false) == 0, "a neutral layer never forces Evaluate on an eligible group reuse");
+      const auto reused_color = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      submit_commands("one neutral layer reuse and writeback readback");
+      const auto pixels = reused_color.Pixels();
+      const float game_red = DirectX::PackedVector::XMConvertHalfToFloat(next_source[center * 4]);
+      const float edited_red = read_red(refreshed_color.Pixels(), center);
+      const float reused_red = read_red(pixels, center);
+      std::cout << "OBS Upscaled neutral model=" << neutral_model << " original/refresh/reuse R="
+                << game_red << '/' << edited_red << '/' << reused_red << " fence=" << gpu.serial << '\n';
+      Check(std::abs(edited_red - game_red) > .05f, "the nonneutral layer changes the full group refresh output");
+      neutral_compositions_match &= std::abs(reused_red - game_red) > .05f;
+      Check(std::memcmp(pixels.data(), next_source.data(), 8) == 0
+                && std::memcmp(pixels.data() + color_disocclusion * 8, &next_source[color_disocclusion * 4], 8) == 0,
+            "real depth and color rejection select exact current SR RGBA across the group");
+      for (size_t pixel = 0; pixel < next_source.size() / 4; ++pixel) {
+        Check(std::memcmp(pixels.data() + pixel * 8 + 6, &next_source[pixel * 4 + 3], 2) == 0,
+              "neutral composition preserves current alpha on every pixel");
+      }
+    }
+    Check(neutral_compositions_match, "a valid neutral edit in either layer preserves the other layer's edit");
+    native::direct_api.evaluate = same_stage_resolution_cases::Evaluate;
+    upload(source.Get(), current_source, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 8);
+    upload(wrapper_depth.Get(), reveal, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 4);
+
+    fail_call = model_calls + 2;
+    const auto tail_failure = pair_frame("second-model-failure", 1, 2);
+    fail_call = 0;
+    Check(std::memcmp(tail_failure.data(), current_source.data(), tail_failure.size()) == 0,
+          "a model failure after an edited first Pass leaves the entire current SR output byte-exact");
+    Check(std::ranges::none_of(std::span{pair_slots}.first(2), [](const auto& slot) {
+            return slot.edit_reuse != nullptr && slot.edit_reuse->valid;
+          }),
+          "neither temporal layer publishes a valid cache when the tail fails");
+    const auto reuses_after_failure = native::edit_reuse_reuses.load();
+    pair_calls.clear();
+    const auto retry_calls = frame(0);
+    std::cout << "OBS Upscaled multipass failure-retry calls=" << retry_calls << " fence=" << gpu.serial << '\n';
+    Check(native::edit_reuse_reuses.load() == reuses_after_failure,
+          "ordinary retry cannot reuse the first Pass's partially advanced anchor");
+    std::cout << "PASS two-Pass Upscaled x2 evidence=WARP+MOCK cadence=2/0/2, GPU tail input and writeback, "
+                 "independent Look/Reset and failed-tail original RGBA\n";
+
+    {
+      // Only the smaller workset has a temporal Look. Compare the x2 request
+      // with the same three frames through the ordinary per-frame chain.
+      struct SplitFrame {
+        std::vector<uint8_t> tail_input;
+        std::vector<uint8_t> final_output;
+      };
+      constexpr size_t tail_center = 6 * 12 + 6;
+      constexpr std::array<std::array<uint16_t, 2>, 3> split_stamps{{
+          {0x3900, 0x3b00}, {0x3a00, 0x3b00}, {0x3a00, 0x38c0}}};
+      std::array<SplitFrame, split_stamps.size()> reference;
+      native::look_upsample = addon::look::kUpsampleClassic;
+      native::detail_stability = 1;
+      native::pass_resolution_mode[0] = 2;
+      native::pass_resolution_scale[0] = .75f;
+      for (const bool x2 : {false, true}) {
+        native::ForgetSourceHandleLocked(owner);
+        native::DrainRetiredResources(true);
+        native::RegisterCreatedFeatureLocked(owner, native::kFeatureDlss, &parameters);
+        native::created_feature_ids[owner] = native::kFeatureDlss;
+        native::edit_reuse_enabled = x2;
+        same_stage_resolution_cases::stamps = split_stamps[0];
+        bool ready = false;
+        for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8; ++attempt) {
+          pair_calls.clear();
+          if (frame(1) == 2) {
+            ready = true;
+            break;
+          }
+        }
+        Check(ready, "split Upscaled pair matures");
+        const auto& work = native::worksets.at(native::WorksetKey{owner, output.Get()});
+        Check(work.resolution_tail != nullptr && work.proxy != work.resolution_tail->proxy
+                  && work.nr_output != work.resolution_tail->nr_output,
+              "independent Upscaled pair has distinct model resources");
+        const auto& slots = native::features.at(owner).slots;
+        const auto reuses = native::edit_reuse_reuses.load();
+        const auto refreshes = native::edit_reuse_refreshes.load();
+        uint32_t previous_history = slots[1].look_history.written;
+        for (size_t sample = 0; sample < split_stamps.size(); ++sample) {
+          same_stage_resolution_cases::stamps = split_stamps[sample];
+          pair_calls.clear();
+          const auto calls = frame(sample == 0 ? 1 : 0, false);
+          const auto output_snapshot = stage_execution_cases::Capture(
+              gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+          submit_commands("split Upscaled final writeback readback");
+          std::cout << "OBS Upscaled split x2=" << x2 << " frame=" << sample << " calls=" << calls
+                    << " fence=" << gpu.serial;
+          for (const auto& call : pair_calls) {
+            std::cout << " model=" << call.preset << ':' << call.input.width << 'x' << call.input.height
+                      << "->" << call.output.width << 'x' << call.output.height << " reset=" << call.reset;
+          }
+          std::cout << " reuse_delta=" << native::edit_reuse_reuses.load() - reuses << '\n';
+          Check(calls == 2 && pair_calls.size() == 2, "split temporal Upscaled evaluates both models every frame");
+          constexpr std::array<uint32_t, 2> sizes{16, 12};
+          for (size_t pass = 0; pass < sizes.size(); ++pass) {
+            const auto& call = pair_calls[pass];
+            Check(call.handle == slots[pass].handle && call.preset == pass + 1
+                      && call.input.width == sizes[pass] && call.input.height == sizes[pass]
+                      && call.output.width == sizes[pass] && call.output.height == sizes[pass],
+                  "split Upscaled Evaluate binds each model's actual input and output extent");
+          }
+          const auto& history = slots[1].look_history;
+          Check(slots[0].look_history.buffers[0] == nullptr && history.valid
+                    && history.width == 12 && history.height == 12 && history.written != previous_history,
+                "only the tail's 12x12 Look history advances");
+          previous_history = history.written;
+          auto tail_input = pair_calls[1].input.Pixels();
+          auto final_output = output_snapshot.Pixels();
+          std::cout << "OBS Upscaled split pixels tail_proxy_R=" << read_red(tail_input, tail_center)
+                    << " final_R=" << read_red(final_output, center) << " history="
+                    << history.width << 'x' << history.height << ':' << history.written << '\n';
+          Check(output_snapshot.width == 16 && output_snapshot.height == 16,
+                "split Upscaled writes the full-resolution SR output");
+          if (x2) {
+            Check(tail_input == reference[sample].tail_input && final_output == reference[sample].final_output,
+                  "split x2 fallback preserves the per-frame tail input and final RGBA byte-for-byte");
+          } else {
+            reference[sample] = {.tail_input = std::move(tail_input), .final_output = std::move(final_output)};
+          }
+        }
+        Check(native::edit_reuse_reuses.load() == reuses && native::edit_reuse_refreshes.load() == refreshes
+                  && slots[0].edit_reuse == nullptr && slots[1].edit_reuse == nullptr,
+              "split temporal Upscaled publishes neither a reuse nor a refresh anchor");
+      }
+      Check(std::abs(read_red(reference[1].tail_input, tail_center)
+                     - read_red(reference[0].tail_input, tail_center)) > .025f,
+            "changing only the first model changes the tail's actual input");
+      Check(reference[2].tail_input == reference[1].tail_input
+                && std::abs(read_red(reference[2].final_output, center)
+                            - read_red(reference[1].final_output, center)) > .025f,
+            "changing only the tail model changes the actual final writeback");
+      std::cout << "PASS Upscaled split temporal Look x2 fallback: 16x16/12x12 Evaluate every frame, "
+                   "tail input and final writeback match x1; evidence=WARP+MOCK\n";
+      // A spatial-only tail can use the terminal cache. Its own Look must
+      // invalidate that cache even when the parent has no Look surfaces.
+      auto& tail_look = native::pass_look_result[0];
+      tail_look.detail_stability = 1;
+      tail_look.mode = true;
+      tail_look.stabilize = 0;
+      tail_look.strength = .5f;
+      same_stage_resolution_cases::stamps = split_stamps[0];
+      const auto reuses = native::edit_reuse_reuses.load();
+      pair_frame("split spatial refresh", 1, 2);
+      pair_frame("split spatial stable reuse", 0, 0);
+      Check(native::edit_reuse_reuses.load() == reuses + 1,
+            "a stable spatial-only split group reuses the terminal edit");
+      const auto before_look_change = pair_frame("split spatial next refresh", 0, 2);
+      tail_look.strength = 1.5f;
+      pair_calls.clear();
+      const auto changed_calls = frame(0, false);
+      const auto changed_output = stage_execution_cases::Capture(
+          gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      submit_commands("split Upscaled spatial Look writeback readback");
+      const float before_red = read_red(before_look_change, center);
+      const float after_red = read_red(changed_output.Pixels(), center);
+      std::cout << "OBS Upscaled split spatial tail Look change calls=" << changed_calls
+                << " final_R=" << before_red << '/' << after_red << " fence=" << gpu.serial << '\n';
+      Check(changed_calls == 2 && pair_calls.size() == 2 && pair_calls[1].input.width == 12
+                && native::edit_reuse_reuses.load() == reuses + 1,
+            "changing only the split tail Look refreshes both models before reuse");
+      Check(std::abs(after_red - before_red) > .05f,
+            "the new spatial tail Look reaches the full-resolution SR output");
+      std::cout << "PASS Upscaled split spatial Look: stable terminal reuse and tail Look refresh; evidence=WARP+MOCK\n";
+    }
+
     native::ReleaseFeatureStates();
     native::RetireAllWorksets();
     native::FlushRetiredResources();

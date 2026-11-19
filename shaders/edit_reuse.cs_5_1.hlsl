@@ -25,8 +25,12 @@ cbuffer ReuseConstants : register(b0) {
   float2 PreviousMotionOffset;
   uint2 OutputSize;
   float2 AnchorRasterDelta;
+  uint ColorDomain;
 };
 
+// Matches edit_reuse::ColorDomain.
+static const uint kLinearTerminal = 1u;
+static const uint kLayerProxy = 2u;
 static const float kEditFloor = 1.0 / 1024.0;
 static const float kReferenceFullConfidence = exp2(-0.125);  // max channel difference, in stops
 static const float kReferenceZeroConfidence = exp2(-0.375);
@@ -95,13 +99,16 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   const uint2 guide = uint2(clamp(floor(guide_position), 0.0, float2(MotionSize - 1u)));
   const float depth = Depth.Load(int3(guide, 0));
   const float4 encoded = Proxy.Load(int3(pixel, 0));
-  const float3 reference = SrgbDecode(encoded.rgb);
+  const bool linear_color = ColorDomain == kLinearTerminal;
+  const float3 reference = (linear_color ? encoded.rgb : SrgbDecode(encoded.rgb));
   if (Phase == 0u) {
-    const float3 neural = SrgbDecode(Neural.Load(int3(pixel, 0)).rgb);
+    const float3 result = Neural.Load(int3(pixel, 0)).rgb;
+    const float3 neural = (linear_color ? result : SrgbDecode(result));
     const float3 log_reference = log2(max(reference, kEditFloor));
     const float3 edit = log2(max(neural, kEditFloor)) - log_reference;
     const uint3 reference_exponent = asuint(reference) & 0x7f800000u;
-    const bool valid = guide_valid && all(reference_exponent != 0x7f800000u);
+    const bool valid = guide_valid && all(reference_exponent != 0x7f800000u)
+        && (!linear_color || (all(reference >= kEditFloor) && all(isfinite(neural)) && all(neural >= 0.0)));
     Anchor.Store4(index * 32u, asuint(float4(edit, valid ? 1.0 : 0.0)));
     Anchor.Store4(index * 32u + 16u, asuint(float4(reference, depth)));
     return;
@@ -135,12 +142,18 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     const float weakest_channel = min(match.r, min(match.g, match.b));
     // A small color mismatch should fade the edit instead of punching a
     // hole. Large changes still select the exact current color below.
-    edit *= smoothstep(kReferenceZeroConfidence, kReferenceFullConfidence, weakest_channel);
+    const float confidence = smoothstep(kReferenceZeroConfidence, kReferenceFullConfidence, weakest_channel);
+    valid = valid && confidence > 0.0;
+    edit *= confidence;
   }
-  // A neutral edit selects the untouched source at the final boundary rather
-  // than relying on a codec round trip to reproduce half-float source bits.
-  valid = valid && any(abs(edit) > 1e-6);
-  const float3 neural = valid ? SrgbEncode(reference * exp2(edit)) : encoded.rgb;
+  // A neutral layer passes its current proxy through exactly. Only a failed
+  // reprojection may discard the other layers' valid edits at final resolve.
+  // Single and final-color anchors retain exact original selection for zero edits.
+  const bool has_edit = any(abs(edit) > 1e-6);
+  const float3 applied = reference * exp2(edit);
+  valid = valid && (has_edit || ColorDomain == kLayerProxy)
+      && (!linear_color || (all(isfinite(applied)) && all(applied <= 65504.0)));
+  const float3 neural = (valid && has_edit ? (linear_color ? applied : SrgbEncode(applied)) : encoded.rgb);
   Target[pixel] = float4(neural, encoded.a);
   Validity.Store(index * 4u, valid ? 1u : 0u);
 }

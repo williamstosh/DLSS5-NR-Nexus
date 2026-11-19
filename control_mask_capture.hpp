@@ -218,6 +218,8 @@ struct Pass {
   bool auto_mask = false;
   bool external_mask = false;
   float intensity = 0;
+  float color_strength = 0;
+  float transfer_strength = 0;
 };
 
 struct Frame {
@@ -246,6 +248,7 @@ struct Frame {
   bool pre_sr_color_bound = false;
   bool original_color_restored = false;
   bool original_selection_recorded = false;
+  bool nr_writeback_recorded = false;
   const char* fallback_reason = nullptr;  // Static diagnostic text.
   std::array<Pass, gpu_timers::kTimerMaxPasses> passes{};
   std::shared_ptr<submission::RecordingStatus> recording;
@@ -552,7 +555,8 @@ inline void Export(const std::filesystem::path& directory, const report::Redacti
       Json timing = {{"state", gpu_timers::StateText(t.state)}, {"sequence", t.sequence}, {"valid", t.valid},
           {"path", t.path[0] == '\0' ? Json(nullptr) : Json(t.path)}, {"recorded_ns", t.recorded_ns},
           {"samples", t.samples}, {"observed_ns", t.measured_ns}, {"total_us", t.valid ? Json(t.total_us) : Json(nullptr)},
-          {"commit_us", t.valid ? Json(t.commit_us) : Json(nullptr)}, {"copies_us", t.valid ? Json(t.copies_us) : Json(nullptr)}};
+          {"commit_us", t.valid ? Json(t.commit_us) : Json(nullptr)}, {"copies_us", t.valid ? Json(t.copies_us) : Json(nullptr)},
+          {"group_edit_reused", t.group_edit_reused}};
       Json passes = Json::array();
       for (uint32_t i = 0; i < f.passes_recorded; ++i) {
         const auto& p = f.passes[i];
@@ -563,6 +567,7 @@ inline void Export(const std::filesystem::path& directory, const report::Redacti
             {"look", p.look}, {"detail_stability", p.detail_stability}, {"detail_temporal", p.detail_temporal},
             {"refresh_capture_fused", p.refresh_capture_fused},
             {"auto_mask", p.auto_mask}, {"external_mask", p.external_mask}, {"intensity", p.intensity},
+            {"color_strength", p.color_strength}, {"transfer_strength", p.transfer_strength},
             {"model_values_source", p.calls != 0 ? "current_call" : (f.delivery == Delivery::kReuse ? "reuse_anchor" : "none")},
             {"gpu", timed ? Json{{"encode_us", g.encode_us}, {"eval_us", g.eval_us}, {"resolve_us", g.resolve_us},
                                  {"look_us", g.look_us}, {"total_us", g.total_us}} : Json(nullptr)}});
@@ -574,6 +579,7 @@ inline void Export(const std::filesystem::path& directory, const report::Redacti
           {"sr_input_size", {f.input_width, f.input_height}}, {"sr_output_size", {f.output_width, f.output_height}},
           {"sr_output_format", f.output_format}, {"motion_size", {f.motion_width, f.motion_height}},
           {"nr_enabled", f.nr_enabled}, {"reuse_requested", f.reuse_requested},
+          {"nr_writeback_recorded", f.nr_writeback_recorded},
           {"nr_stage", f.stage == Stage::kUnobserved ? Json(nullptr) : Json(stages[static_cast<size_t>(f.stage)])},
           {"pre_sr", f.stage == Stage::kRender ? Json{{"color_bound", f.pre_sr_color_bound},
               {"original_color_restored", f.original_color_restored},

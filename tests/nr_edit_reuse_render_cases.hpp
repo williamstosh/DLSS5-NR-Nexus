@@ -47,6 +47,7 @@ struct SrConsumer {
   ID3D12Resource* game_motion = nullptr;
   FrameInput input;
   uint32_t calls = 0;
+  uint64_t model_calls_at_entry = 0;
   bool swapped_color = false;
   Snapshot motion;
 };
@@ -65,6 +66,7 @@ NVSDK_NGX_Result NVSDK_CONV EvaluateSr(ID3D12GraphicsCommandList* list, const NV
                                      const NVSDK_NGX_Parameter* parameters, PFN_NVSDK_NGX_ProgressCallback) {
   auto& consumer = *sr_consumer;
   ++consumer.calls;
+  consumer.model_calls_at_entry = model_calls;
   Check(handle == consumer.handle && list == model_gpu->list.Get(), "SR receives the original handle and list");
   auto* color = native::GetD3D12Resource(parameters, NVSDK_NGX_Parameter_Color);
   auto* output = native::GetD3D12Resource(parameters, NVSDK_NGX_Parameter_Output);
@@ -85,12 +87,22 @@ NVSDK_NGX_Result NVSDK_CONV EvaluateSr(ID3D12GraphicsCommandList* list, const NV
   consumer.motion = Capture(*model_gpu, motion, NATIVE_INPUT_STATE);
   consumer.swapped_color = color != consumer.game_color;
   const auto color_state = (consumer.swapped_color ? native::kPreSrReadable : NATIVE_INPUT_STATE);
+  ComPtr<ID3D12DebugCommandList> debug_list;
+  if (SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&debug_list)))) {
+    Check(debug_list->AssertResourceState(consumer.game_color, 0, NATIVE_INPUT_STATE)
+              && debug_list->AssertResourceState(color, 0, color_state),
+          "original SR sees shader-readable game Color and replacement Color");
+  }
   model_gpu->Transition(color, color_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
   model_gpu->Transition(output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
   const D3D12_TEXTURE_COPY_LOCATION from{.pResource = color, .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
   const D3D12_TEXTURE_COPY_LOCATION to{.pResource = output, .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-  // Use the actual Color binding to fill one Render-sized tile of the SR output.
-  list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+  // Tile the actual Color so the cross-stage case has a fully defined SR output.
+  for (uint32_t y = 0; y < SR_SIZE; y += RENDER_SIZE) {
+    for (uint32_t x = 0; x < SR_SIZE; x += RENDER_SIZE) {
+      list->CopyTextureRegion(&to, x, y, 0, &from, nullptr);
+    }
+  }
   model_gpu->Transition(output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   model_gpu->Transition(color, D3D12_RESOURCE_STATE_COPY_SOURCE, color_state);
 #if defined(NR_NEXUS_DEV_CONTROL)
@@ -141,12 +153,18 @@ int Run() {
     reshade::internal::get_reshade_module_handle(GetModuleHandleW(nullptr));
     Check(renodx::utils::directx::Initialize(), "initialize DirectX entry points");
     ComPtr<ID3D12Debug> debug;
+    ComPtr<ID3D12Debug1> gpu_validation;
     if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
       debug->EnableDebugLayer();
+      if (SUCCEEDED(debug.As(&gpu_validation))) {
+        gpu_validation->SetEnableGPUBasedValidation(TRUE);
+      }
     }
     Gpu gpu;
     model_gpu = &gpu;
     gpu.device.As(&info);
+    std::cout << "OBS Render D3D12 debug=" << (info != nullptr)
+              << " gpu_validation=" << (gpu_validation != nullptr) << '\n';
     native::enabled = true;
     native::hooks_enabled = true;
     native::d3d12_device_seen = true;
@@ -250,9 +268,11 @@ int Run() {
 
     struct FrameResult {
       uint64_t model_calls = 0;
+      uint64_t model_calls_before_sr = 0;
       bool swapped_color = false;
       std::vector<ColorPixel> sr_tile;
       uint64_t timer_sequence = 0;
+      uint64_t timer_written = 0;
       bool timer_published = false;
       timers::Stats completed_timer;
     };
@@ -300,15 +320,21 @@ int Run() {
       Check(consumer.calls == 1 && status == input.sr_result, "wrapper calls game SR once and propagates its return");
       Check(native::GetD3D12Resource(&parameters, NVSDK_NGX_Parameter_Color) == color.Get(),
             "wrapper restores the original Color binding on return from SR");
-      FrameResult result{.model_calls = model_calls - before, .swapped_color = consumer.swapped_color};
+      FrameResult result{.model_calls = model_calls - before,
+          .model_calls_before_sr = consumer.model_calls_at_entry - before, .swapped_color = consumer.swapped_color};
       const timers::Segment* timer = nullptr;
-      if (timers::internal::next_sequence != timer_sequence_before) {
-        timer = &timers::internal::segments[timers::internal::current.idx];
-        Check(timer->recorded && timer->measure && std::strcmp(timer->path, "preSR") == 0
-                  && timer->sequence == timer_sequence_before + 1 && timers::internal::mapped != nullptr
+      // A mixed frame can also record an Upscaled segment after original SR.
+      const auto render_segment = std::ranges::find_if(timers::internal::segments, [timer_sequence_before](const auto& segment) {
+        return segment.sequence > timer_sequence_before && segment.recorded && segment.measure
+            && std::strcmp(segment.path, "preSR") == 0;
+      });
+      if (render_segment != std::ranges::end(timers::internal::segments)) {
+        timer = &*render_segment;
+        Check(timers::internal::mapped != nullptr
                   && timers::internal::mapped[timer->base + timers::kSlotFrameStart] == timers::kUnwritten,
-              "PreSR wrapper recorded one unresolved production timestamp segment");
+              "PreSR wrapper recorded an unresolved production timestamp segment");
         result.timer_sequence = timer->sequence;
+        result.timer_written = timer->written;
       }
       if (!submit) {
         gpu.Retain(consumer.motion.readback.Get());
@@ -570,6 +596,221 @@ int Run() {
     std::cout << "PASS Render sr_benchmark_v1 source, timing, Color and crossover evidence\n";
 #endif
 
+    // Keep the real SR consumer and Color restoration checks for the two-Pass chain.
+    model_parameter_observer = {};
+    native::RecreateFeatures();
+    native::edit_reuse_enabled = true;
+    native::stack_passes = 2;
+    native::chained_temporal_history = true;
+    native::pass_stage[0] = 0;
+    native::preset = 1;
+    native::intensity = .5f;
+    native::pass_preset[0] = 2;
+    native::pass_follow[0] = false;
+    native::pass_intensity[0] = .75f;
+    native::pass_transfer_strength[0] = 1.f;
+    native::pass_color_strength[0] = 1.f;
+    native::pass_resolution_mode[0] = 2;
+    native::pass_resolution_scale[0] = .75f;
+    native::detail_stability = 1;
+    native::direct_api.evaluate = same_stage_resolution_cases::Evaluate;
+    auto& render_calls = same_stage_resolution_cases::evaluations;
+    same_stage_resolution_cases::stamps = {0x3900, 0x3b00};
+    const auto render_frame = [&](const char* label, int source_reset, uint64_t expected_calls, bool delivered,
+                                  NVSDK_NGX_Result sr_result = NVSDK_NGX_Result_Success) {
+      render_calls.clear();
+      const auto result = frame({.reset = source_reset, .sr_result = sr_result});
+      std::cout << "OBS Render multipass " << label << " calls=" << result.model_calls
+                << " sr_consumed_edit=" << result.swapped_color << " fence=" << gpu.serial << '\n';
+      Check(result.model_calls == expected_calls && render_calls.size() == expected_calls
+                && result.swapped_color == delivered,
+            "Render records all models or no models and delivers only the complete group to SR");
+      return result;
+    };
+    const auto warm_pair = [&] {
+      for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8; ++attempt) {
+        render_calls.clear();
+        const auto result = frame({.reset = 1});
+        if (result.swapped_color && result.model_calls == 2) return;
+      }
+      Check(false, "Render two-Pass chain matures");
+    };
+    warm_pair();
+    const auto& render_slots = native::features.at(handle).slots;
+    const auto group_anchor = render_slots[0].edit_reuse;
+    Check(group_anchor != nullptr && group_anchor->valid, "Render warm-up establishes a terminal anchor");
+    const auto generation_before_refresh = group_anchor->anchor_generation;
+    std::vector<uint64_t> generation_at_evaluate;
+    ComPtr<ID3D12DebugCommandList> debug_list;
+    gpu.list.As(&debug_list);
+    model_parameter_observer = [&](const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter* parameters) {
+      generation_at_evaluate.push_back(group_anchor->anchor_generation);
+      if (debug_list != nullptr) {
+        auto* proxy = native::GetD3D12Resource(parameters, "DLSSNR.Color");
+        auto* output = native::GetD3D12Resource(parameters, "DLSSNR.Output");
+        Check(debug_list->AssertResourceState(proxy, 0, NATIVE_INPUT_STATE)
+                  && debug_list->AssertResourceState(output, 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+              "each Render model evaluates with SRV proxy and UAV output");
+      }
+    };
+    const auto group_refresh = render_frame("refresh", 1, 2, true);
+    model_parameter_observer = {};
+    Check(group_refresh.model_calls_before_sr == 2 && generation_at_evaluate.size() == 2,
+          "both Render models execute in order before original SR");
+    constexpr std::array<uint32_t, 2> pass_sizes{RENDER_SIZE, 12};
+    for (size_t pass = 0; pass < 2; ++pass) {
+      const auto& call = render_calls[pass];
+      Check(call.handle == render_slots[pass].handle && call.preset == pass + 1
+                && call.input.width == pass_sizes[pass] && call.input.height == pass_sizes[pass]
+                && call.intensity == (pass == 0 ? .5f : .75f) && call.reset == 1,
+            "Render refresh uses each logical Pass's Feature, model request, size, strength and Reset");
+    }
+    Check(render_slots[0].edit_reuse == group_anchor && group_anchor->valid && group_anchor->width == RENDER_SIZE
+              && render_slots[1].edit_reuse == nullptr && !render_slots[0].look_history.valid
+              && !render_slots[1].look_history.valid,
+          "a spatial Render group has one terminal-color anchor at the full stage size");
+    const auto group_generation = group_anchor->anchor_generation;
+    std::cout << "OBS Render terminal generations before=" << generation_before_refresh
+              << " at_models=" << generation_at_evaluate[0] << '/' << generation_at_evaluate[1]
+              << " after=" << group_generation << '\n';
+    Check(generation_at_evaluate == std::vector<uint64_t>(2, generation_before_refresh)
+              && group_generation == generation_before_refresh + 1,
+          "Render records exactly one terminal capture after both model evaluations");
+    constexpr size_t center = 8 * RENDER_SIZE + 8;
+    const auto check_terminal_pixel = [&](const ColorPixel& sr_pixel) {
+      // Layout: log2 RGB edit and validity, followed by linear reference RGB and depth.
+      std::array<float, 8> pixel{};
+      auto* anchor = group_anchor->anchor.Get();
+      const size_t offset = center * sizeof(pixel);
+      auto readback = gpu.Buffer(sizeof(pixel), D3D12_HEAP_TYPE_READBACK);
+      gpu.Transition(anchor, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      gpu.list->CopyBufferRegion(readback.Get(), 0, anchor, offset, sizeof(pixel));
+      gpu.Transition(anchor, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      gpu.Submit();
+      const D3D12_RANGE range{0, sizeof(pixel)};
+      void* mapped = nullptr;
+      Check(SUCCEEDED(readback->Map(0, &range, &mapped)), "map terminal edit readback after the WARP fence");
+      std::memcpy(pixel.data(), mapped, sizeof(pixel));
+      const D3D12_RANGE no_writes{0, 0};
+      readback->Unmap(0, &no_writes);
+      Check(pixel[3] == 1.f && pixel[4] == .25f && pixel[5] == .375f && pixel[6] == .5f,
+            "terminal edit references original linear Color");
+      for (size_t channel = 0; channel < 3; ++channel) {
+        const auto packed = DirectX::PackedVector::XMConvertHalfToFloat(sr_pixel[channel]);
+        Check(std::abs(pixel[4 + channel] * std::exp2(pixel[channel]) - packed) < .0005f,
+              "terminal edit reconstructs packed Color actually consumed by SR");
+      }
+      std::cout << "OBS Render terminal sentinel_R=" << pixel[4] * std::exp2(pixel[0])
+                << " packed_SR_R=" << red(sr_pixel) << '\n';
+    };
+    check_terminal_pixel(group_refresh.sr_tile[center]);
+    const auto total_reuses = native::edit_reuse_reuses.load();
+    const auto group_reuse = render_frame("reuse", 0, 0, true);
+    std::cout << "OBS Render multipass output_R=" << red(group_refresh.sr_tile[center]) << '/'
+              << red(group_reuse.sr_tile[center]) << " anchor_generation=" << group_generation << '\n';
+    Check(std::abs(red(group_refresh.sr_tile[center]) - .25f) > .05f
+              && std::abs(red(group_reuse.sr_tile[center]) - red(group_refresh.sr_tile[center])) < .005f
+              && group_anchor->anchor_generation == group_generation && native::edit_reuse_reuses.load() == total_reuses + 1,
+          "zero-model Render reuse gives SR a nonneutral edit, with this frame's exact alpha");
+    const auto settled = render_frame("refresh-after-reuse", 0, 2, true);
+    Check(render_calls[0].reset == 0 && render_calls[1].reset == 0
+              && render_calls[0].motion != motion.Get() && render_calls[1].motion != motion.Get(),
+          "each Render Feature composes motion since its own actual Evaluate without an extra Reset");
+    // The terminal anchor includes Transfer. Its live setting has no global Reset effect.
+    native::kSetPassTransfer[0].Store(.625f);
+    native::ApplySettingEffect(native::kSetPassTransfer[0].effect);
+    const auto new_transfer = render_frame("tail-transfer-change", 0, 2, true);
+    Check(std::abs(red(new_transfer.sr_tile[center]) - red(settled.sr_tile[center])) > .01f,
+          "changing only Pass 2's transfer refreshes the terminal anchor with a visible GPU change");
+    check_terminal_pixel(new_transfer.sr_tile[center]);
+    const auto new_reuse = render_frame("reuse-after-transfer-change", 0, 0, true);
+    Check(std::abs(red(new_reuse.sr_tile[center]) - red(new_transfer.sr_tile[center])) < .005f,
+          "Render reuse delivers the new group edit after a transfer change");
+
+    const auto generation_before_rejection = group_anchor->anchor_generation;
+    const auto reuses_before_rejection = native::edit_reuse_reuses.load();
+    render_frame("original-sr-failure", 1, 2, true, NVSDK_NGX_Result_FAIL_InvalidParameter);
+    const auto& rejected_delivery = native::features.at(handle).edit_reuse_monitor[0];
+    Check(group_anchor->anchor_generation == generation_before_rejection + 1 && !group_anchor->valid
+              && rejected_delivery.delivery == native::EditReuseDelivery::NONE
+              && rejected_delivery.reason == native::EditReuseBlock::SR_FAILED,
+          "failed original SR invalidates the provisional terminal capture before publishing delivery");
+    render_frame("refresh-after-sr-failure", 0, 2, true);
+    Check(render_calls[0].reset == 1 && render_calls[1].reset == 1
+              && native::edit_reuse_reuses.load() == reuses_before_rejection,
+          "the next Render frame refreshes both models with recovery Reset after SR rejects the anchor");
+
+    const auto generation_before_failure = group_anchor->anchor_generation;
+    fail_call = model_calls + 2;
+    const auto failed_tail = render_frame("second-model-failure", 1, 2, false);
+    fail_call = 0;
+    const auto& failed_render_delivery = native::features.at(handle).edit_reuse_monitor[0];
+    const auto commit_slots = (uint64_t{1} << timers::kSlotCommitEnd) | (uint64_t{1} << timers::kSlotCopyBackEnd);
+    Check(failed_tail.timer_sequence != 0 && (failed_tail.timer_written & commit_slots) == 0
+              && group_anchor->anchor_generation == generation_before_failure
+              && failed_render_delivery.delivery == native::EditReuseDelivery::ORIGINAL
+              && failed_render_delivery.reason == native::EditReuseBlock::NR_FAILED
+              && (render_slots[0].edit_reuse == nullptr || !render_slots[0].edit_reuse->valid),
+          "a failed Render tail records no terminal capture, packed commit or stand-in copy");
+    const auto reuses_after_failure = native::edit_reuse_reuses.load();
+    render_calls.clear();
+    const auto retry = frame({});
+    std::cout << "OBS Render multipass failure-retry calls=" << retry.model_calls
+              << " sr_consumed_edit=" << retry.swapped_color << " fence=" << gpu.serial << '\n';
+    Check(native::edit_reuse_reuses.load() == reuses_after_failure,
+          "ordinary Render retry cannot reuse the failed group anchor");
+
+    native::RecreateFeatures();
+    native::pass_resolution_mode[0] = 0;
+    native::detail_stability = 2;
+    warm_pair();
+    render_frame("temporal-refresh", 1, 2, true);
+    std::array<uint64_t, 2> layer_generations{};
+    std::array<uint32_t, 2> look_written{};
+    for (size_t pass = 0; pass < 2; ++pass) {
+      const auto& slot = render_slots[pass];
+      Check(render_calls[pass].handle == slot.handle && slot.edit_reuse != nullptr
+                && slot.edit_reuse->valid && slot.look_history.valid,
+            "each temporal Render layer owns its edit anchor and Look history");
+      layer_generations[pass] = slot.edit_reuse->anchor_generation;
+      look_written[pass] = slot.look_history.written;
+    }
+    render_frame("temporal-reuse", 0, 0, true);
+    for (size_t pass = 0; pass < 2; ++pass) {
+      const auto& slot = render_slots[pass];
+      Check(slot.edit_reuse->anchor_generation == layer_generations[pass] && slot.edit_reuse->reused
+                && slot.look_history.valid && slot.look_history.written != look_written[pass],
+            "temporal Render reuse advances each Look history with its own retained edit anchor");
+    }
+
+    native::RecreateFeatures();
+    native::pass_stage[0] = 2;
+    native::detail_stability = 1;
+    native::gpu_timers_enabled = false;
+    native::edit_reuse_enabled = false;
+    warm_pair();
+    const auto mixed_per_frame = render_frame("mixed-per-frame", 1, 2, true);
+    const auto mixed_render_grid = render_calls[0].input;
+    const auto mixed_upscaled_grid = render_calls[1].input;
+    native::edit_reuse_enabled = true;
+    const auto mixed_reuses = native::edit_reuse_reuses.load();
+    const auto mixed_first = render_frame("mixed-refresh", 1, 2, true);
+    const auto mixed_next = render_frame("mixed-next", 0, 2, true);
+    std::cout << "OBS mixed cross-stage models before SR with x2 off/on=" << mixed_per_frame.model_calls_before_sr
+              << '/' << mixed_first.model_calls_before_sr << '/' << mixed_next.model_calls_before_sr
+              << " grids=" << render_calls[0].input.width << 'x' << render_calls[0].input.height << '/'
+              << render_calls[1].input.width << 'x' << render_calls[1].input.height << '\n';
+    Check(mixed_per_frame.model_calls_before_sr == 1 && mixed_first.model_calls_before_sr == 1
+              && mixed_next.model_calls_before_sr == 1,
+          "each mixed frame Evaluate sequence places one model on each side of original SR");
+    Check(render_calls[0].input.width == mixed_render_grid.width && render_calls[0].input.height == mixed_render_grid.height
+              && render_calls[1].input.width == mixed_upscaled_grid.width
+              && render_calls[1].input.height == mixed_upscaled_grid.height,
+          "x2 leaves the original mixed-stage working grids in effect");
+    Check(native::edit_reuse_reuses.load() == mixed_reuses, "mixed-stage frames keep their per-frame cadence");
+    std::cout << "PASS two-Pass Render x2 evidence=WARP+MOCK cadence=2/0/2/0, working grids=16x16/12x12, "
+                 "terminal GPU pixels, temporal layer history, tail and original SR failure recovery\n";
+
     model_parameter_observer = {};
     native::ngx_slot_real[0].evaluate = nullptr;
     native::ForgetSourceHandleLocked(handle);
@@ -578,7 +819,8 @@ int Run() {
     native::direct_device = nullptr;
     model_gpu = nullptr;
     if (info != nullptr) {
-      for (UINT64 index = 0; index < info->GetNumStoredMessages(); ++index) {
+      const auto messages = info->GetNumStoredMessages();
+      for (UINT64 index = 0; index < messages; ++index) {
         SIZE_T bytes = 0;
         info->GetMessage(index, nullptr, &bytes);
         std::vector<uint8_t> storage(bytes);
@@ -586,6 +828,7 @@ int Run() {
         Check(SUCCEEDED(info->GetMessage(index, message, &bytes)), "Render reuse debug message");
         Check(message->Severity > D3D12_MESSAGE_SEVERITY_ERROR, message->pDescription);
       }
+      std::cout << "OBS Render D3D12 messages=" << messages << " errors=0\n";
     }
     std::cout << "OBS Render reuse: frames=" << application_frames << " edit_edge_R=" << left << '/' << right
               << " NR_MV=" << composed[0] << '/' << composed[1] << " SR_MV=0.5/-0.25\n";
