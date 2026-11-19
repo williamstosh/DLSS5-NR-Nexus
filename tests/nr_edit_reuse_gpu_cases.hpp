@@ -832,6 +832,35 @@ int Run() {
           "production neutral reuse returns exact current half-float source and alpha");
     Check(frame(0) == 1, "the second following base frame refreshes rather than reusing a second time");
     Check(frame(1) == 1 && frame(1) == 1, "successive explicit Reset frames both run NR");
+    const auto set_native_fg_mode = [](bool enabled) {
+      namespace options = addon::fg::native_options;
+      funnel_accounting_tests::Restore substitutions;
+      substitutions.Value(&options::internal::state.real);
+      substitutions.Atomic(&options::internal::options_changed);
+      substitutions.Atomic(&options::internal::present_observed);
+      substitutions.Atomic(&options::internal::stopped);
+      options::internal::state.real = +[](const sl::ViewportHandle&, const sl::DLSSGOptions&) {
+        return sl::Result::eOk;
+      };
+      options::internal::stopped = false;
+      options::Configure(native::OnNativeFgOptions);
+
+      // The SDK can call SetOptions while the SR wrapper holds this lock.
+      addon::RuntimeLock lock(native::runtime_mutex);
+      Check(!native::native_fg_owns.load(), "Upscaled Options contrast starts without a native owner");
+      const bool changed = native::native_fg_public_off.load() == enabled;
+      const auto generation = native::native_fg_options_generation.load();
+      sl::DLSSGOptions request;
+      request.mode = (enabled ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff);
+      request.numFramesToGenerate = 1;
+      Check(options::internal::HookedSetOptions(sl::ViewportHandle{0}, request) == sl::Result::eOk
+                && native::native_fg_public_off.load() == !enabled
+                && native::native_fg_declaration.load() == (enabled ? native::NativeFgDeclaration::kOn
+                                                                   : native::NativeFgDeclaration::kOff)
+                && native::native_fg_options_generation.load() == generation + changed
+                && !native::native_fg_owns.load(),
+            "successful SetOptions updates only the native declaration interval without acquiring ownership");
+    };
     {
       native::direct_api.evaluate = ConstantModel;
       auto& feature = native::features.at(owner);
@@ -846,23 +875,30 @@ int Run() {
       const auto reuses = native::edit_reuse_reuses.load();
       const auto fallbacks = native::edit_reuse_fallbacks.load();
       std::vector<uint8_t> refresh_pixels, anchor_pixels;
-      const std::array declarations{native::NativeFgDeclaration::kOff, native::NativeFgDeclaration::kUnknown,
-          native::NativeFgDeclaration::kUnknown, native::NativeFgDeclaration::kOff, native::NativeFgDeclaration::kOff};
+      using Declaration = native::NativeFgDeclaration;
+      const std::array declarations{Declaration::kOff, Declaration::kUnknown, Declaration::kUnknown,
+          Declaration::kOff, Declaration::kOff, Declaration::kOn, Declaration::kOn, Declaration::kOff, Declaration::kOff};
       for (size_t index = 0; index < declarations.size(); ++index) {
-        // Change only the declaration pair; no Options callback, owner handoff or source recreation.
-        native::native_fg_public_off = declarations[index] == native::NativeFgDeclaration::kOff;
-        native::native_fg_declaration = declarations[index];
+        const auto declaration = declarations[index];
+        if (index >= 4) {
+          // Start with a refreshed Off frame and exercise the callback on both frame phases.
+          set_native_fg_mode(declaration == Declaration::kOn);
+        } else {
+          // Unknown models the absence of a public Options declaration.
+          native::native_fg_public_off = declaration == Declaration::kOff;
+          native::native_fg_declaration = declaration;
+        }
         const bool refresh = index % 2 == 0;
         const auto reuse_count = anchor->reuse_count;
         const auto calls = frame(index == 0 ? 1 : 0);
         if (index == 0) {
           reset_epoch = native::history_reset_epoch.load();
         }
-        std::cout << "OBS fixed-size Off/Unknown frame=" << index + 1
-                  << " declaration=" << (native::native_fg_public_off.load() ? "Off" : "Unknown")
+        std::cout << "OBS fixed-size Upscaled frame=" << index + 1
+                  << " declaration=" << (declaration == Declaration::kOff ? "Off" : (declaration == Declaration::kOn ? "On" : "Unknown"))
                   << " model_calls=" << calls << " expected=" << (refresh ? 1 : 0)
                   << " reuses=" << native::edit_reuse_reuses.load() - reuses << '\n';
-        Check(calls == (refresh ? 1u : 0u), "Off/Unknown/Off preserves actual model cadence 1/0/1/0/1");
+        Check(calls == (refresh ? 1u : 0u), "owner-free declaration changes preserve single-Pass cadence");
         Check(feature.source_generation == source_generation && native::configuration_generation.load() == configuration
                   && native::history_reset_epoch.load() == reset_epoch && feature.slots[0].handle == model
                   && feature.slots[0].edit_reuse == anchor && native::nr_features_created == models
@@ -874,13 +910,13 @@ int Run() {
           anchor_pixels = read_buffer(anchor->anchor.Get());
         } else {
           Check(anchor->reuse_count == reuse_count + 1 && read_buffer(anchor->anchor.Get()) == anchor_pixels,
-                "Off/Unknown reuse preserves the exact nonzero refresh anchor");
+                "declaration changes preserve the exact nonzero refresh anchor on reuse");
         }
         Check(anchor->valid && anchor->anchor_generation == anchor_generation
                   && native::edit_reuse_reuses.load() == reuses + (index + 1) / 2,
               "only refresh advances the anchor generation and each adjacent frame reuses once");
         auto final = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        submit_commands("Off/Unknown nonzero output readback");
+        submit_commands("single-Pass declaration contrast readback");
         const auto pixels = final.Pixels();
         if (refresh) {
           refresh_pixels = pixels;
@@ -893,14 +929,14 @@ int Run() {
             std::memcpy(&actual, pixels.data() + (pixel * 4 + channel) * 2, 2);
             Check(std::fabs(DirectX::PackedVector::XMConvertHalfToFloat(actual)
                       - DirectX::PackedVector::XMConvertHalfToFloat(refreshed)) < .003f,
-                  "Off/Unknown reuse reads back the refreshed nonzero RGB edit");
+                  "declaration contrast reads back the refreshed nonzero RGB edit");
             nonneutral |= std::fabs(DirectX::PackedVector::XMConvertHalfToFloat(actual)
                 - DirectX::PackedVector::XMConvertHalfToFloat(source_values[pixel * 4 + channel])) > .05f;
           }
           Check(std::memcmp(pixels.data() + pixel * 8 + 6, source_values.data() + pixel * 4 + 3, 2) == 0,
-                "Off/Unknown refresh and reuse preserve original alpha exactly");
+                "declaration contrast preserves original alpha exactly");
         }
-        Check(nonneutral, "Off/Unknown output contains a distinguishable nonzero edit");
+        Check(nonneutral, "declaration contrast output contains a distinguishable nonzero edit");
       }
       native::native_fg_public_off = false;
       native::native_fg_declaration = native::NativeFgDeclaration::kUnknown;
@@ -929,8 +965,8 @@ int Run() {
       native::native_fg_declaration = native::NativeFgDeclaration::kOff;
       native::direct_api.evaluate = NeutralModel;
       Check(frame(1) == 1, "restore the neutral model with an explicit source Reset after the declaration contrast");
-      std::cout << "PASS fixed-size Off/Unknown/Off: model_calls=1/0/1/0/1, nonzero RGB, exact alpha,"
-                   " stable source/model/workset, unchanged reuse anchor and no declaration Reset; evidence=WARP+MOCK\n";
+      std::cout << "PASS single-Pass Upscaled Off/Unknown/Off and owner-free SetOptions Off/On/Off:"
+                   " model_calls=1/0/1/0/1 per contrast, stable history, nonzero RGB, exact alpha; evidence=WARP+MOCK\n";
     }
     {
       auto& feature = native::features.at(owner);
@@ -2098,10 +2134,62 @@ int Run() {
               && std::abs(reused_layer_red - refreshed_layer_red) < std::abs(reused_layer_red - unedited_layer_red),
           "Pass 2 reuse encodes this frame's edited Pass 1 color and retains the upstream edit");
 
+    set_native_fg_mode(false);
     pair_frame("refresh-after-reuse", 0, 2);
     Check(pair_calls[0].reset == 0 && pair_calls[1].reset == 0
               && pair_calls[0].motion != wrapper_motion.Get() && pair_calls[1].motion != wrapper_motion.Get(),
           "both real models advance from their last refresh using composed motion");
+    {
+      const auto& feature = native::features.at(owner);
+      const auto source_generation = feature.source_generation;
+      const auto reset_epoch = native::history_reset_epoch.load();
+      const auto models = native::nr_features_created;
+      const auto worksets = native::worksets_created;
+      const native::WorksetKey workset_key{owner, output.Get()};
+      const auto* workset_proxy = native::worksets.at(workset_key).proxy;
+      const auto reuses_before_options = native::edit_reuse_reuses.load();
+      const auto fallbacks_before_options = native::edit_reuse_fallbacks.load();
+      const std::array model_handles{pair_slots[0].handle, pair_slots[1].handle};
+      const std::array anchors{pair_slots[0].edit_reuse, pair_slots[1].edit_reuse};
+      std::array generations{anchors[0]->anchor_generation, anchors[1]->anchor_generation};
+      std::array anchor_pixels{read_buffer(anchors[0]->anchor.Get()), read_buffer(anchors[1]->anchor.Get())};
+      const std::array modes{true, true, false, false};
+      for (size_t index = 0; index < modes.size(); ++index) {
+        set_native_fg_mode(modes[index]);
+        const bool refresh = (index % 2 != 0);
+        const auto pixels = pair_frame(modes[index] ? "options-on" : "options-off", 0, refresh ? 2u : 0u);
+        Check(feature.source_generation == source_generation && native::history_reset_epoch.load() == reset_epoch
+                  && native::nr_features_created == models && native::worksets_created == worksets
+                  && native::worksets.at(workset_key).proxy == workset_proxy
+                  && native::look_history_restarts.load() == look_restarts
+                  && native::edit_reuse_reuses.load() == reuses_before_options + (index + 2) / 2
+                  && native::edit_reuse_fallbacks.load() == fallbacks_before_options,
+              "owner-free Options preserve the two-Pass source, workset and history without fallback");
+        for (size_t pass = 0; pass < anchors.size(); ++pass) {
+          const auto& slot = pair_slots[pass];
+          const auto anchor_bytes = read_buffer(anchors[pass]->anchor.Get());
+          if (refresh) {
+            Check(pair_calls[pass].handle == model_handles[pass] && pair_calls[pass].reset == 0,
+                  "owner-free Options refresh the same two models without an Evaluate Reset");
+            ++generations[pass];
+            anchor_pixels[pass] = anchor_bytes;
+          } else {
+            Check(anchor_bytes == anchor_pixels[pass], "two-Pass reuse retains each refresh anchor byte-for-byte");
+          }
+          Check(slot.handle == model_handles[pass] && slot.edit_reuse == anchors[pass] && anchors[pass]->valid
+                    && anchors[pass]->anchor_generation == generations[pass],
+                "two-Pass Options preserve model and anchor identity with refresh-only generations");
+        }
+        Check(std::abs(read_red(pixels, center) - original_red) > .05f,
+              "two-Pass Options contrast writes a nonneutral edit to the current SR output");
+        for (size_t pixel = 0; pixel < current_source.size() / 4; ++pixel) {
+          Check(std::memcmp(pixels.data() + pixel * 8 + 6, &current_source[pixel * 4 + 3], 2) == 0,
+                "two-Pass Options contrast preserves exact current alpha");
+        }
+      }
+      std::cout << "PASS two-Pass Upscaled owner-free SetOptions Off/On/Off: model_calls=2/0/2/0/2,"
+                   " stable history, nonzero RGB, exact alpha; evidence=WARP+MOCK\n";
+    }
     pair_slots[1].pending_reset = true;
     pair_slots[1].pending_reset_reasons = native::kResetRecovery;
     const auto restarts_before_tail_reset = native::look_history_restarts.load();
