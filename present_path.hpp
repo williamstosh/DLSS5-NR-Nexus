@@ -1238,9 +1238,7 @@ inline void CapturePresentGuides(
         && (output_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0
         && !contract.output_subrects_enabled && contract.output_x == 0 && contract.output_y == 0
         && contract.declared_output_width == output_desc.Width && contract.declared_output_height == output_desc.Height
-        && output != motion && output != depth && contract.has_jitter
-        && std::isfinite(contract.jitter_x) && std::isfinite(contract.jitter_y)
-        && std::abs(contract.jitter_x) <= 0.5f && std::abs(contract.jitter_y) <= 0.5f
+        && output != motion && output != depth
         && std::isfinite(contract.motion_scale_x) && std::isfinite(contract.motion_scale_y)
         && contract.motion_scale_x != 0.f && contract.motion_scale_y != 0.f
         && ((contract.create_flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) != 0
@@ -3756,11 +3754,15 @@ inline ClaimedPresentFrame IdentifyPresentBaseFrame(ID3D12CommandQueue* native_q
       || source == features.end() || source->second.source_generation != frame.source_generation
       || source->second.sr_sequence != frame.sequence
       || stream->mixed_queue != renodx::utils::directx::NativeIdentity(native_queue)) return {};
+  const auto& contract = guides->contract;
   const present_frame_policy::Frame current{
       .source = reinterpret_cast<uintptr_t>(guides->source_handle), .generation = frame.source_generation,
       .sequence = frame.sequence, .output_epoch = frame.swapchain_epoch,
       .pass_count = RequestedStagePlan().At(stage_plan::Stage::PRESENT).count,
-      .reuse_edits = WantsPresentBaseFrames()};
+      // Missing temporal inputs do not erase the proven SR-to-BB identity.
+      .reuse_edits = WantsPresentBaseFrames() && contract.has_jitter
+          && std::isfinite(contract.jitter_x) && std::isfinite(contract.jitter_y)
+          && std::abs(contract.jitter_x) <= 0.5f && std::abs(contract.jitter_y) <= 0.5f};
   if (repeated) {
     if (order->entered.load() == frame.queue_entry
         && present_frame_policy::Classify(stream->base_frame_clock, current) == present_frame_policy::Claim::REPEATED) {
@@ -3796,7 +3798,8 @@ inline bool RunPresentBaseFrame(ID3D12CommandQueue* native_queue, reshade::api::
                                 PresentSlot* slot, PresentStream& stream, ID3D12Resource* back,
                                 PresentTarget target) {
   const auto identified = IdentifyPresentBaseFrame(native_queue, &stream, back, target);
-  if (identified.guides == nullptr) {
+  auto* guides = identified.guides;
+  if (guides == nullptr || !identified.frame.reuse_edits) {
     ResetPresentStreamHistory(&stream);
     stream.base_frame_clock.complete = false;
     ++edit_reuse_fallbacks;
@@ -3804,7 +3807,6 @@ inline bool RunPresentBaseFrame(ID3D12CommandQueue* native_queue, reshade::api::
     PublishPresentBaseRejection(&stream, renodx::utils::directx::NativeIdentity(back), target.hdr_color_space);
     return false;
   }
-  auto* guides = identified.guides;
   if (identified.claim == present_frame_policy::Claim::REPEATED) {
     CountNrDecline(NrDeclineReason::kPresentRepeat);
     return stream.base_frame_clock.complete && guides->serial == stream.consumed_serial;

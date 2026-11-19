@@ -509,14 +509,16 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
       }
       Check(NVSDK_NGX_SUCCEED(result) && sr_handle != nullptr, "Present x2 wrapped game SR Create");
     };
-    const auto evaluate_sr = [&](bool reset, bool jitter) {
+    const auto evaluate_sr = [&](bool reset, bool jitter, bool jitter_x_present = true) {
       if (!native_ngx) {
         upload(color.Get(), game_pixel, NATIVE_INPUT_STATE);
       }
       auto parameters = base;
       auto* evaluate_parameters = (native_ngx ? source_parameters : &parameters);
       evaluate_parameters->Set(NVSDK_NGX_Parameter_Reset, static_cast<int>(reset));
-      evaluate_parameters->Set(NVSDK_NGX_Parameter_Jitter_Offset_X, jitter_x);
+      if (jitter_x_present) {
+        evaluate_parameters->Set(NVSDK_NGX_Parameter_Jitter_Offset_X, jitter_x);
+      }
       if (jitter) {
         evaluate_parameters->Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, jitter_y);
       }
@@ -532,8 +534,8 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
       Check(NVSDK_NGX_SUCCEED(result), "Present x2 wrapped game SR Evaluate succeeds");
     };
     const auto record = [&](bool reset = false, bool jitter = true, bool overwrite = false,
-                            ID3D12Resource* destination = nullptr) {
-      evaluate_sr(reset, jitter);
+                            ID3D12Resource* destination = nullptr, bool jitter_x_present = true) {
+      evaluate_sr(reset, jitter, jitter_x_present);
       auto* target = (destination != nullptr ? destination : back());
       // The game list supplies the native transitions and the complete
       // delivery. Its one Execute is the only submission before the callback.
@@ -838,13 +840,37 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     reopen();
     swap();
 
-    before = stats();
-    record(false, false);
-    submit();
-    event();
-    no_output(before, stats(), "an incomplete jitter pair cannot borrow Present x2 history");
-    unchanged_pixels(read_back(), GAME_PIXEL);
+    for (const bool jitter_x_present : {true, false}) {
+      before = stats();
+      record(false, !jitter_x_present, false, nullptr, jitter_x_present);
+      submit();
+      event();
+      const auto after = stats();
+      no_output(before, after, "an incomplete jitter pair cannot borrow Present x2 history");
+      const auto captured = std::ranges::find_if(native::present_guide_sets, [&](const auto& set) {
+        return set.source_handle == sr_handle && set.base_frame.sequence == native::features.at(sr_handle).sr_sequence;
+      });
+      Check(captured != std::end(native::present_guide_sets) && captured->base_frame.sealed
+                && captured->base_frame.backbuffer == renodx::utils::directx::NativeIdentity(back())
+                && !captured->contract.has_jitter && after.base_claims == before.base_claims,
+            "strict x2 preserves the proven source but cannot claim it with an incomplete jitter pair");
+      unchanged_pixels(read_back(), GAME_PIXEL);
+      swap();
+      std::cout << "PRESENT_SOURCE_JITTER strict=1 jitter_x=" << jitter_x_present
+                << " jitter_y=" << !jitter_x_present << " source_retained=1 claims=0 calls=0 outputs=0\n";
+    }
+    const auto before_jitter_recovery = stats();
+    present_frame();
+    const auto jitter_recovery = stats();
+    Check(jitter_recovery.calls == before_jitter_recovery.calls + 1 && model_resets.back() == 1
+              && jitter_recovery.base_claims == before_jitter_recovery.base_claims + 1
+              && jitter_recovery.base_outputs == before_jitter_recovery.base_outputs + 1 && jitter_recovery.base_complete
+              && jitter_recovery.refreshes == before_jitter_recovery.refreshes + 1
+              && jitter_recovery.reuses == before_jitter_recovery.reuses,
+          "the next complete jitter pair refreshes the same source with Reset after strict rejection");
+    alpha_preserved(read_back());
     swap();
+    std::cout << "PRESENT_SOURCE_JITTER recovery=1 calls=1 reset=1 outputs=1\n";
 
     before = stats();
     record(false, true, true);
@@ -1301,11 +1327,21 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
 
       const auto& stream = native::present_streams.at(&output);
       const auto& clock = stream.base_frame_clock;
-      for (const bool proven : {true, false, true}) {
+      struct SourceCase {
+        bool proven = true;
+        bool jitter_x = true;
+        bool jitter_y = true;
+        const char* present_frames = "0";
+      };
+      for (const auto& scenario : std::array{SourceCase{}, SourceCase{.jitter_y = false}, SourceCase{},
+               SourceCase{.jitter_x = false, .present_frames = nullptr}, SourceCase{},
+               SourceCase{.proven = false}, SourceCase{}}) {
+        load_present_mode(scenario.present_frames);
+        const bool proven = scenario.proven;
         const auto before = stats();
         const auto previous = clock.frame;
         if (proven) {
-          record();
+          record(false, scenario.jitter_y, false, nullptr, scenario.jitter_x);
         } else {
           evaluate_sr(false, true);
           upload(back(), OVERWRITE_PIXEL, PRESENT);
@@ -1328,8 +1364,8 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
         Check(capture_a != nullptr && capture_b != nullptr && capture_a->serial > 0 && capture_b->serial > capture_a->serial
                   && capture_a->device_identity == capture_b->device_identity
                   && capture_a->output_width == capture_b->output_width && capture_a->output_height == capture_b->output_height
-                  && capture_b->base_frame.backbuffer == nullptr && capture_a->base_frame.sealed == proven,
-              "newer compatible view B has no SR-to-BB copy and only the ordered A capture can prove this BB");
+                  && capture_b->base_frame.backbuffer == nullptr,
+              "newer compatible view B has no SR-to-BB copy and cannot identify the current A picture");
 
         stages::Snapshot model_motion, model_depth;
         const auto* expected = (proven ? capture_a : capture_b);
@@ -1358,17 +1394,22 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
         const bool depth_matches = all_pixels(model_depth, proven ? depth_a : depth_b);
         std::cout << "PRESENT_SOURCE_VIEWS proven=" << proven << " serial_a=" << capture_a->serial
                   << " serial_b=" << capture_b->serial << " consumed=" << after.consumed_serial
+                  << " jitter_x=" << scenario.jitter_x << " jitter_y=" << scenario.jitter_y
+                  << " ini_missing=" << (scenario.present_frames == nullptr)
                   << " motion_match=" << motion_matches << " depth_match=" << depth_matches
                   << " claims=" << after.base_claims - before.base_claims
                   << " base_outputs=" << after.base_outputs - before.base_outputs << std::endl;
         Check(after.calls == before.calls + 1 && after.outputs == before.outputs + 1
-                  && after.ring_submissions == before.ring_submissions + 1 && native::PresentRingComplete(),
+                  && after.ring_submissions == before.ring_submissions + 1 && native::PresentRingComplete()
+                  && after.refreshes == before.refreshes && after.reuses == before.reuses
+                  && native::present_frames.load() == 0 && native::edit_reuse_enabled.load(),
               "two-view Every present records one model call and completes one real GPU submission");
         Check(expected_inputs && motion_matches && depth_matches && after.consumed_serial == expected->serial,
               "two-view Every present model must read MV and depth from the SR view that supplies its proven BB");
         if (proven) {
           const auto& source = native::features.at(sr_handle);
           Check(after.base_claims == before.base_claims + 1 && after.base_outputs == before.base_outputs + 1
+                    && capture_a->base_frame.sealed
                     && after.base_complete && !stream.base_history_unbound && !clock.frame.reuse_edits
                     && clock.frame.source == reinterpret_cast<uintptr_t>(sr_handle)
                     && clock.frame.generation == source.source_generation && clock.frame.sequence == source.sr_sequence,
@@ -1378,7 +1419,8 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
           }
         } else {
           Check(after.base_claims == before.base_claims && after.base_outputs == before.base_outputs
-                    && !after.base_complete && stream.base_history_unbound && clock.frame.sequence == previous.sequence,
+                    && !capture_a->base_frame.sealed && !after.base_complete
+                    && stream.base_history_unbound && clock.frame.sequence == previous.sequence,
                 "legacy Every present can use B guides without claiming the unproven BB as a base frame");
         }
         reopen();
