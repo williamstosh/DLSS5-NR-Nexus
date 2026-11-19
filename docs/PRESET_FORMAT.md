@@ -162,7 +162,7 @@ manifest 严格包含 `format="nr-nexus-profiles"`、`schema_version=1`、无符
 
 所有配置对象均须通过 runtime 的 Slot 管理白名单（`QUALITY`／`MULTIPASS`，以及 `COMPATIBILITY` 中的 `NRPresentGuides`）及类型／范围验证，包含未启用层的保存值。`NRPresentGuides` 随方案保存 Present 的深度／运动策略；旧自定义快照缺少该键时保留当前值。未知字段不静默删除：非法文件拒读／拒写，非法解析结果拒绝应用并保留原文件。这里比共享预设中可保留的未知 `settings` 更严格。沿用 256 KiB、深度 8、每个配置对象最多 512 项、严格 UTF-8、重复键及字符串限制；未知 manifest／Slot 键、未来 schema 拒绝，未来 `template_version` 拒绝应用。
 
-官方值从实际注册的 Setting fallback 构建模板，再合并本 Slot 显式 overrides；自定义直接使用 snapshot。当前官方模板版本为 3：Lite 为 Render／B／75%，Balanced 为 Present／B／67%，Max 为 Present A／B 两层／100%，第 1 层使用电影感，第 2 层使用默认风格，两层角色遮罩及角色／皮肤 0.80／0.50。官方模板升级只刷新官方 Slot 的派生快照并保留显式 overrides；三个自定义 Slot 不参与迁移。所有组合均为开发候选，未完成实机画质／性能验证。
+官方值从实际注册的 Setting fallback 构建模板，再合并本 Slot 显式 overrides；自定义直接使用 snapshot。当前官方模板版本为 3：Lite 为 Render／B／75%，Balanced 为 Present／B／67%，Max 为 Present A／B 两层／100%，第 1 层使用电影感，第 2 层使用默认风格，两层角色遮罩及角色／皮肤 0.80／0.50。官方模板升级只刷新官方 Slot 的派生快照并保留显式 overrides；三个自定义 Slot 不参与迁移。这些初始配方已随安装包提供，画质和性能仍需按具体游戏与设置比较。
 
 INI 的 `ProfileGameId` 是随机 128 位身份，以 32 位十六进制定位目录；runtime 的 `owner` 为小写 EXE 路径 UTF-16 字节的 SHA-256 摘要（64 位十六进制），不是原始路径，也不是可分享预设字段。迁移安装位置或复制 INI 后若 owner 不符，会创建新 ID、复制 Slot 数据并保留当前游戏配置，不自动应用；不承诺自动合并不同商店／安装版本。首次升级不自动套用官方模板；重启仅在运行配置与 `last_applied` 匹配时恢复选中关联，外部重载导致配置变化时解除关联而不捕获为 override。
 
