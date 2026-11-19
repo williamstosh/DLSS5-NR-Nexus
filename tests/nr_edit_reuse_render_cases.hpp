@@ -839,6 +839,41 @@ int Run() {
     std::cout << "PASS Render A-to-B full-grid head Look: model_calls=2/0/2/0, "
                  "per-layer anchors, exact dormant Pass 3 RGBA and original SR recovery; evidence=WARP+MOCK\n";
 
+    {
+      native::RecreateFeatures();
+      tail_look.detail_stability = 2;
+      warm_pair(&full_sizes);
+      render_frame("both-temporal-refresh", {.reset = 1}, 2, true);
+      const std::array anchors{render_slots[0].edit_reuse, render_slots[1].edit_reuse};
+      std::array<uint64_t, 2> generations{};
+      std::array<uint32_t, 2> look_written{};
+      for (size_t pass = 0; pass < anchors.size(); ++pass) {
+        const auto& slot = render_slots[pass];
+        Check(render_calls[pass].handle == slot.handle && anchors[pass] != nullptr
+                  && anchors[pass]->valid && slot.look_history.valid,
+              "each temporal Render layer owns its edit anchor and Look history");
+        generations[pass] = anchors[pass]->anchor_generation;
+        look_written[pass] = slot.look_history.written;
+      }
+      const auto stabilized = native::look_stability_passes.load();
+      render_frame("both-temporal-reuse", {}, 0, true);
+      for (size_t pass = 0; pass < anchors.size(); ++pass) {
+        const auto& slot = render_slots[pass];
+        Check(slot.edit_reuse == anchors[pass] && anchors[pass]->anchor_generation == generations[pass]
+                  && anchors[pass]->valid && anchors[pass]->reused
+                  && slot.look_history.valid && slot.look_history.written != look_written[pass],
+              "temporal Render reuse advances each Look history with its own retained edit anchor");
+        std::cout << "OBS Render both-temporal pass=" << pass + 1 << " anchor_generation="
+                  << generations[pass] << '/' << anchors[pass]->anchor_generation
+                  << " history_written=" << look_written[pass] << '/' << slot.look_history.written << '\n';
+      }
+      Check(native::look_stability_passes.load() == stabilized + 2,
+            "zero-model Render reuse executes both enabled temporal Look histories");
+      std::cout << "PASS Render both-temporal Look reuse: model_calls=2/0, "
+                   "both anchor generations unchanged, both Look histories advanced; evidence=WARP+MOCK\n";
+      tail_look.detail_stability = 1;
+    }
+
     native::look_upsample = addon::look::kUpsampleClassic;
     native::pass_resolution_mode[0] = 2;
     const std::array split_sizes{pass_sizes, std::array<uint32_t, 2>{12, RENDER_SIZE}};
