@@ -762,6 +762,18 @@ int RunNativeRequiredMenuTest() {
 #endif
 
 int main(int argc, char** argv) {
+  const auto run_edit_reuse_case = [argv](auto run) {
+    const int result = run();
+    if (result == 0) {
+      std::cout << "PASS case=" << (argv[1] + 2) << " evidence=WARP+MOCK dev="
+#if defined(NR_NEXUS_DEV_CONTROL)
+                << "1\n";
+#else
+                << "0\n";
+#endif
+    }
+    return result;
+  };
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
   if (argc == 2 && std::strcmp(argv[1], "--xefg-present-probe") == 0) return nr_xefg_present_probe_cases::Run();
 #endif
@@ -775,7 +787,9 @@ int main(int argc, char** argv) {
   if (argc == 2 && std::strcmp(argv[1], "--inline-restore-roi") == 0) return inline_restore_roi_cases::Run();
 #endif
   if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-xefg-contracts") == 0) return nr_edit_reuse_xefg_cases::Run();
-  if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-render-contracts") == 0) return nr_edit_reuse_render_cases::Run();
+  if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-render-contracts") == 0) {
+    return run_edit_reuse_case(nr_edit_reuse_render_cases::Run);
+  }
   if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-present-contracts") == 0) {
     return RunNrEditReusePresentContracts(nullptr);
   }
@@ -784,7 +798,7 @@ int main(int argc, char** argv) {
   }
   if (argc == 2 && (std::strcmp(argv[1], "--nr-edit-reuse-contracts") == 0
                    || std::strcmp(argv[1], "--nr-edit-reuse-contracts-public") == 0)) {
-    return nr_edit_reuse_gpu_cases::Run();
+    return run_edit_reuse_case(nr_edit_reuse_gpu_cases::Run);
   }
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-inline") == 0) return adaptive_inline_cases::Run();
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-fg-service") == 0) return adaptive_fg_service_cases::Run();

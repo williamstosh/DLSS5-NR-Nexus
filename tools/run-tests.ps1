@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('all','report','branding','ui','dev-control','presets','unicode-input','native','lastgasp','sdr-policy','hdr-policy','scope','config','constants','control-mask','control-mask-execution','vulkan-control-mask','fg-xefg','fg-native','lifecycle','bridge-motion','stage-plan','adaptive-resolution','copy-slots')]
+    [ValidateSet('all','report','branding','ui','dev-control','presets','unicode-input','native','lastgasp','sdr-policy','hdr-policy','scope','config','constants','control-mask','control-mask-execution','vulkan-control-mask','fg-xefg','fg-native','lifecycle','bridge-motion','stage-plan','edit-reuse-policy','adaptive-resolution','copy-slots')]
     [string[]]$Suite = @('all'),
     [string]$SourceRoot = (Split-Path $PSScriptRoot -Parent),
     [string]$HostRoot = (Join-Path (Split-Path $PSScriptRoot -Parent) '.local/renodx'),
@@ -55,6 +55,7 @@ $sources = [ordered]@{
     'fg-xefg'='fg_xefg_tests'; 'fg-native'='fg_native_tests'
     lifecycle='fg_lifecycle_tests'; 'bridge-motion'='d3d11_bridge_motion_tests'
     'stage-plan'='stage_plan_tests'
+    'edit-reuse-policy'='edit_reuse_policy_tests'
     'adaptive-resolution'='adaptive_resolution_tests'
     'copy-slots'='copy_slots_tests'
 }
@@ -170,11 +171,16 @@ foreach ($item in $Suite) {
     $name = $sources[$item]
     $exe = Join-Path $directory "$name.exe"
     $arguments = $common + @($includes | ForEach-Object { "/I$_" })
+    if ($item -eq 'edit-reuse-policy') {
+        $msvcInclude = Join-Path $env:VCToolsInstallDir 'include'
+        $ucrtInclude = Join-Path $env:WindowsSdkDir "Include/$($env:WindowsSDKVersion.TrimEnd('\'))/ucrt"
+        $arguments = $common + @('/X', '/Y-', "/I$SourceRoot", "/I$msvcInclude", "/I$ucrtInclude")
+    }
     if ($item -in @('control-mask-execution','vulkan-control-mask')) {
         $arguments += "/I$HostRoot/external/reshade/include"
     }
     $link = $libraries
-    if ($item -in @('branding','sdr-policy','hdr-policy','scope','stage-plan','adaptive-resolution','control-mask')) { $link = @() }
+    if ($item -in @('branding','sdr-policy','hdr-policy','scope','stage-plan','edit-reuse-policy','adaptive-resolution','control-mask')) { $link = @() }
     if ($item -in @('fg-native','bridge-motion','vulkan-control-mask')) {
         if (-not (Test-Path -LiteralPath "$ShaderIncludeDirectory/embed/shaders.h")) { throw 'Build new shaders first.' }
         $arguments += @('/bigobj','/Gy','/Gw','/DNDEBUG','/DRESHADE_ADDON=1',
@@ -204,8 +210,15 @@ foreach ($item in $Suite) {
     Register-TestCompilerOutput $directory -ObjectPath @(Join-Path $directory "$name.obj") -ExecutablePath $exe
     & cl.exe @arguments *> "$directory/compile.log"
     if ($LASTEXITCODE -ne 0) { throw "Compile/link failed: $item; see $directory/compile.log" }
-    $dependencies = (Get-Content -LiteralPath "$directory/dependencies.json" -Raw | ConvertFrom-Json).Data.Includes
-    $hashes = @(@((Join-Path $testRoot "$name.cpp"), $PSCommandPath) + $dependencies | Sort-Object -Unique | ForEach-Object {
+    $dependencyFile = Join-Path $directory 'dependencies.json'
+    $inputPaths = @((Join-Path $testRoot "$name.cpp"), $PSCommandPath)
+    if ($item -eq 'edit-reuse-policy') {
+        $policyChecker = Join-Path $PSScriptRoot 'check-execution-policy-dependencies.ps1'
+        $inputPaths += $policyChecker
+        & $policyChecker -DependencyFile $dependencyFile -SourceRoot $SourceRoot
+    }
+    $dependencies = (Get-Content -LiteralPath $dependencyFile -Raw | ConvertFrom-Json).Data.Includes
+    $hashes = @($inputPaths + $dependencies | Sort-Object -Unique | ForEach-Object {
         @{path=$_; sha256=(Get-FileHash -LiteralPath $_).Hash}
     })
     $hashes | ConvertTo-Json | Set-Content -LiteralPath "$directory/inputs.json" -Encoding utf8
@@ -351,6 +364,11 @@ foreach ($item in $Suite) {
             }
         } else {
             Invoke-TestProcess $exe $directory 'test'
+            if ($item -eq 'edit-reuse-policy') {
+                $receipts = @(Get-Content -LiteralPath (Join-Path $directory 'test.stdout.log') |
+                    Where-Object { $_ -cmatch '^PASS edit reuse policy evidence=CPU cases=[1-9][0-9]*$' })
+                if ($receipts.Count -ne 1) { throw "Missing or ambiguous CPU receipt: $directory/test.stdout.log" }
+            }
             if ($item -eq 'fg-native') {
                 Invoke-TestProcess $exe $directory 'f5-mixed' @('--f5-mixed')
                 Invoke-TestProcess $exe $directory 'control-mask' @('--control-mask')
@@ -378,6 +396,7 @@ foreach ($item in $Suite) {
         }
     }
     $result = @{suite=$item; build='passed'; run=$(if ($BuildOnly -or $skipVulkanRun) { 'not_run' } else { 'passed' })}
+    if ($item -eq 'edit-reuse-policy') { $result.dependency_policy = 'passed' }
     if ($skipVulkanRun) { $result.skip_reason = 'software_only_native_gpu_required' }
     $result | ConvertTo-Json | Set-Content -LiteralPath "$directory/result.json" -Encoding utf8
     if (-not $BuildOnly) { Complete-TestOutput $directory }
@@ -410,6 +429,7 @@ if ($Suite -contains 'ui' -and -not $BuildOnly -and $UiPreview -ne 'None') {
 
 } catch {
     if ($OutputDirectory -and (Test-Path -LiteralPath (Join-Path $OutputDirectory 'artifact-lifecycle.json'))) {
+        if ($testWorkspaceStarted) { Complete-TestOutput (Join-Path $OutputDirectory 'edit-reuse-policy') -Outcome Failed }
         Complete-TestOutput $OutputDirectory -Outcome Failed
     }
     throw

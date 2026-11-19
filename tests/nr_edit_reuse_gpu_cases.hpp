@@ -2263,102 +2263,161 @@ int Run() {
                  "independent Look/Reset and failed-tail original RGBA\n";
 
     {
-      // Only the smaller workset has a temporal Look. Compare the x2 request
-      // with the same three frames through the ordinary per-frame chain.
-      struct SplitFrame {
-        std::vector<uint8_t> tail_input;
-        std::vector<uint8_t> final_output;
-      };
-      constexpr size_t tail_center = 6 * 12 + 6;
-      constexpr std::array<std::array<uint16_t, 2>, 3> split_stamps{{
-          {0x3900, 0x3b00}, {0x3a00, 0x3b00}, {0x3a00, 0x38c0}}};
-      std::array<SplitFrame, split_stamps.size()> reference;
-      native::look_upsample = addon::look::kUpsampleClassic;
-      native::detail_stability = 1;
-      native::pass_resolution_mode[0] = 2;
-      native::pass_resolution_scale[0] = .75f;
-      for (const bool x2 : {false, true}) {
+      auto& tail_look = native::pass_look_result[0];
+      const auto warm_group = [&](bool x2) {
         native::ForgetSourceHandleLocked(owner);
         native::DrainRetiredResources(true);
         native::RegisterCreatedFeatureLocked(owner, native::kFeatureDlss, &parameters);
         native::created_feature_ids[owner] = native::kFeatureDlss;
         native::edit_reuse_enabled = x2;
-        same_stage_resolution_cases::stamps = split_stamps[0];
-        bool ready = false;
         for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8; ++attempt) {
           pair_calls.clear();
-          if (frame(1) == 2) {
-            ready = true;
-            break;
-          }
+          if (frame(1) == 2) return;
         }
-        Check(ready, "split Upscaled pair matures");
-        const auto& work = native::worksets.at(native::WorksetKey{owner, output.Get()});
-        Check(work.resolution_tail != nullptr && work.proxy != work.resolution_tail->proxy
-                  && work.nr_output != work.resolution_tail->nr_output,
-              "independent Upscaled pair has distinct model resources");
-        const auto& slots = native::features.at(owner).slots;
-        const auto reuses = native::edit_reuse_reuses.load();
-        const auto refreshes = native::edit_reuse_refreshes.load();
-        uint32_t previous_history = slots[1].look_history.written;
-        for (size_t sample = 0; sample < split_stamps.size(); ++sample) {
-          same_stage_resolution_cases::stamps = split_stamps[sample];
-          pair_calls.clear();
-          const auto calls = frame(sample == 0 ? 1 : 0, false);
-          const auto output_snapshot = stage_execution_cases::Capture(
-              gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-          submit_commands("split Upscaled final writeback readback");
-          std::cout << "OBS Upscaled split x2=" << x2 << " frame=" << sample << " calls=" << calls
-                    << " fence=" << gpu.serial;
-          for (const auto& call : pair_calls) {
-            std::cout << " model=" << call.preset << ':' << call.input.width << 'x' << call.input.height
-                      << "->" << call.output.width << 'x' << call.output.height << " reset=" << call.reset;
+        Check(false, "Upscaled A-to-B group matures");
+      };
+
+      native::detail_stability = 2;
+      tail_look.detail_stability = 1;
+      constexpr std::array<uint64_t, 4> cadence{2, 0, 2, 0};
+      std::array<std::vector<uint8_t>, cadence.size()> full_reference;
+      for (const bool change_dormant_pass : {false, true}) {
+        warm_group(true);
+        const auto& feature = native::features.at(owner);
+        const auto& slots = feature.slots;
+        std::array<std::shared_ptr<reuse::State>, 2> anchors;
+        std::array<uint64_t, 2> generations{};
+        uint32_t previous_history = slots[0].look_history.written;
+        for (size_t sample = 0; sample < cadence.size(); ++sample) {
+          if (change_dormant_pass && sample == 1) {
+            native::pass_transfer_strength[1] = 0.f;
+            native::pass_color_strength[1] = 0.f;
+            native::pass_resolution_mode[1] = 2;
+            native::pass_resolution_scale[1] = .75f;
+            native::pass_look_result[1].follow = false;
+            native::pass_look_result[1].detail_stability = 2;
           }
-          std::cout << " reuse_delta=" << native::edit_reuse_reuses.load() - reuses << '\n';
-          Check(calls == 2 && pair_calls.size() == 2, "split temporal Upscaled evaluates both models every frame");
-          constexpr std::array<uint32_t, 2> sizes{16, 12};
-          for (size_t pass = 0; pass < sizes.size(); ++pass) {
-            const auto& call = pair_calls[pass];
-            Check(call.handle == slots[pass].handle && call.preset == pass + 1
-                      && call.input.width == sizes[pass] && call.input.height == sizes[pass]
-                      && call.output.width == sizes[pass] && call.output.height == sizes[pass],
-                  "split Upscaled Evaluate binds each model's actual input and output extent");
+          const auto stabilized = native::look_stability_passes.load();
+          auto pixels = pair_frame("full-grid head Look", sample == 0 ? 1 : 0, cadence[sample]);
+          const bool refreshed = cadence[sample] == 2;
+          for (size_t pass = 0; pass < anchors.size(); ++pass) {
+            const auto& cache = slots[pass].edit_reuse;
+            Check(cache != nullptr && cache->valid && cache->reused == !refreshed
+                      && cache->width == 16 && cache->height == 16 && cache->source_sequence == feature.sr_sequence,
+                  "full-grid Upscaled gives each layer an anchor for the current base frame");
+            if (refreshed) {
+              Check(pair_calls[pass].handle == slots[pass].handle && pair_calls[pass].preset == pass + 1
+                        && pair_calls[pass].input.width == 16 && pair_calls[pass].input.height == 16
+                        && pair_calls[pass].reset == (sample == 0 ? 1 : 0),
+                    "full-grid Upscaled refresh evaluates A then B at the original size and Reset");
+            }
+            if (sample == 0) {
+              anchors[pass] = cache;
+              generations[pass] = cache->anchor_generation;
+            } else {
+              generations[pass] += (refreshed ? 1u : 0u);
+              Check(cache == anchors[pass] && cache->anchor_generation == generations[pass],
+                    "only a model refresh advances each Upscaled layer's anchor generation");
+            }
           }
-          const auto& history = slots[1].look_history;
-          Check(slots[0].look_history.buffers[0] == nullptr && history.valid
-                    && history.width == 12 && history.height == 12 && history.written != previous_history,
-                "only the tail's 12x12 Look history advances");
+          const auto& history = slots[0].look_history;
+          Check(anchors[0] != anchors[1] && history.valid && history.written != previous_history
+                    && !slots[1].look_history.valid && slots[1].look_history.buffers[0] == nullptr
+                    && native::look_stability_passes.load() == stabilized + 1 && slots[2].handle == nullptr,
+                "only the enabled head Look advances, including on a zero-model frame");
           previous_history = history.written;
-          auto tail_input = pair_calls[1].input.Pixels();
-          auto final_output = output_snapshot.Pixels();
-          std::cout << "OBS Upscaled split pixels tail_proxy_R=" << read_red(tail_input, tail_center)
-                    << " final_R=" << read_red(final_output, center) << " history="
-                    << history.width << 'x' << history.height << ':' << history.written << '\n';
-          Check(output_snapshot.width == 16 && output_snapshot.height == 16,
-                "split Upscaled writes the full-resolution SR output");
-          if (x2) {
-            Check(tail_input == reference[sample].tail_input && final_output == reference[sample].final_output,
-                  "split x2 fallback preserves the per-frame tail input and final RGBA byte-for-byte");
+          if (change_dormant_pass) {
+            Check(pixels == full_reference[sample], "dormant Pass 3 settings preserve every Upscaled output byte");
           } else {
-            reference[sample] = {.tail_input = std::move(tail_input), .final_output = std::move(final_output)};
+            full_reference[sample] = std::move(pixels);
           }
         }
-        Check(native::edit_reuse_reuses.load() == reuses && native::edit_reuse_refreshes.load() == refreshes
-                  && slots[0].edit_reuse == nullptr && slots[1].edit_reuse == nullptr,
-              "split temporal Upscaled publishes neither a reuse nor a refresh anchor");
       }
-      Check(std::abs(read_red(reference[1].tail_input, tail_center)
-                     - read_red(reference[0].tail_input, tail_center)) > .025f,
-            "changing only the first model changes the tail's actual input");
-      Check(reference[2].tail_input == reference[1].tail_input
-                && std::abs(read_red(reference[2].final_output, center)
-                            - read_red(reference[1].final_output, center)) > .025f,
-            "changing only the tail model changes the actual final writeback");
-      std::cout << "PASS Upscaled split temporal Look x2 fallback: 16x16/12x12 Evaluate every frame, "
-                   "tail input and final writeback match x1; evidence=WARP+MOCK\n";
+      std::cout << "PASS Upscaled A-to-B full-grid head Look: model_calls=2/0/2/0, "
+                   "per-layer anchors and dormant Pass 3 RGBA equality; evidence=WARP+MOCK\n";
+
+      // Keep the same-tail control and put Look and the low grid on separate layers in both orders.
+      struct SplitFrame {
+        std::array<std::vector<uint8_t>, 2> inputs;
+        std::vector<uint8_t> final_output;
+      };
+      struct SplitCase {
+        std::array<uint32_t, 2> sizes;
+        uint32_t temporal_pass;
+      };
+      constexpr std::array split_cases{
+          SplitCase{.sizes = {12, 16}, .temporal_pass = 1},
+          SplitCase{.sizes = {16, 12}, .temporal_pass = 0},
+          SplitCase{.sizes = {16, 12}, .temporal_pass = 1},
+      };
+      constexpr size_t tail_center = 6 * 12 + 6;
+      constexpr std::array<std::array<uint16_t, 2>, 3> split_stamps{{
+          {0x3900, 0x3b00}, {0x3a00, 0x3b00}, {0x3a00, 0x38c0}}};
+      native::look_upsample = addon::look::kUpsampleClassic;
+      native::pass_resolution_mode[0] = 2;
+      for (const auto& [sizes, temporal_pass] : split_cases) {
+        native::nr_resolution_scale = static_cast<float>(sizes[0]) / 16.f;
+        native::pass_resolution_scale[0] = static_cast<float>(sizes[1]) / 16.f;
+        std::cout << "OBS Upscaled split grids=" << sizes[0] << '/' << sizes[1]
+                  << " temporal_pass=" << temporal_pass + 1 << '\n';
+        native::detail_stability = (temporal_pass == 0 ? 2u : 1u);
+        tail_look.detail_stability = (temporal_pass == 1 ? 2u : 1u);
+        std::array<SplitFrame, split_stamps.size()> reference;
+        for (const bool x2 : {false, true}) {
+          same_stage_resolution_cases::stamps = split_stamps[0];
+          warm_group(x2);
+          const auto& work = native::worksets.at(native::WorksetKey{owner, output.Get()});
+          Check(work.resolution_tail != nullptr && work.proxy != work.resolution_tail->proxy
+                    && work.nr_output != work.resolution_tail->nr_output,
+                "independent Upscaled pair has distinct model resources");
+          const auto& slots = native::features.at(owner).slots;
+          const auto reuses = native::edit_reuse_reuses.load();
+          const auto refreshes = native::edit_reuse_refreshes.load();
+          uint32_t previous_history = slots[temporal_pass].look_history.written;
+          for (size_t sample = 0; sample < split_stamps.size(); ++sample) {
+            same_stage_resolution_cases::stamps = split_stamps[sample];
+            auto final_output = pair_frame("split temporal", sample == 0 ? 1 : 0, 2);
+            for (size_t pass = 0; pass < sizes.size(); ++pass) {
+              const auto& call = pair_calls[pass];
+              Check(call.handle == slots[pass].handle && call.preset == pass + 1
+                        && call.input.width == sizes[pass] && call.input.height == sizes[pass]
+                        && call.output.width == sizes[pass] && call.output.height == sizes[pass],
+                    "split Upscaled Evaluate binds each model's actual input and output extent");
+            }
+            const auto& history = slots[temporal_pass].look_history;
+            Check(slots[1 - temporal_pass].look_history.buffers[0] == nullptr && history.valid
+                      && history.width == sizes[temporal_pass] && history.height == sizes[temporal_pass]
+                      && history.written != previous_history,
+                  "split Upscaled advances the selected Look history on its working grid");
+            previous_history = history.written;
+            std::array inputs{pair_calls[0].input.Pixels(), pair_calls[1].input.Pixels()};
+            Check(final_output.size() == 16 * 16 * 8, "split Upscaled writes the full-resolution SR output");
+            if (x2) {
+              Check(inputs == reference[sample].inputs && final_output == reference[sample].final_output,
+                    "split Upscaled x2 fallback matches both model inputs and final RGBA with x2 off");
+            } else {
+              reference[sample] = {.inputs = std::move(inputs), .final_output = std::move(final_output)};
+            }
+            Check(native::edit_reuse_reuses.load() == reuses && native::edit_reuse_refreshes.load() == refreshes
+                      && slots[0].edit_reuse == nullptr && slots[1].edit_reuse == nullptr,
+                  "split temporal Upscaled publishes neither reuse nor a refresh anchor");
+          }
+        }
+        if (sizes[0] == 16 && temporal_pass == 1) {
+          Check(std::abs(read_red(reference[1].inputs[1], tail_center)
+                         - read_red(reference[0].inputs[1], tail_center)) > .025f,
+                "changing only the first model changes the tail's actual input");
+          Check(reference[2].inputs[1] == reference[1].inputs[1]
+                    && std::abs(read_red(reference[2].final_output, center)
+                                - read_red(reference[1].final_output, center)) > .025f,
+                "changing only the tail model changes the actual final writeback");
+        }
+        std::cout << "PASS Upscaled split temporal Look x2 fallback: grids=" << sizes[0] << '/' << sizes[1]
+                  << " temporal_pass=" << temporal_pass + 1
+                  << ", both model inputs and final RGBA match x2 off; evidence=WARP+MOCK\n";
+      }
       // A spatial-only tail can use the terminal cache. Its own Look must
       // invalidate that cache even when the parent has no Look surfaces.
-      auto& tail_look = native::pass_look_result[0];
       tail_look.detail_stability = 1;
       tail_look.mode = true;
       tail_look.stabilize = 0;
@@ -2366,10 +2425,20 @@ int Run() {
       same_stage_resolution_cases::stamps = split_stamps[0];
       const auto reuses = native::edit_reuse_reuses.load();
       pair_frame("split spatial refresh", 1, 2);
+      const auto& slots = native::features.at(owner).slots;
+      const auto terminal_anchor = slots[0].edit_reuse;
+      Check(terminal_anchor != nullptr && terminal_anchor->valid && terminal_anchor->width == 16
+                && terminal_anchor->height == 16 && slots[1].edit_reuse == nullptr
+                && pair_calls[0].input.width == 16 && pair_calls[1].input.width == 12,
+            "spatial Upscaled uses one full-stage terminal anchor with distinct model grids");
+      const auto terminal_generation = terminal_anchor->anchor_generation;
       pair_frame("split spatial stable reuse", 0, 0);
-      Check(native::edit_reuse_reuses.load() == reuses + 1,
-            "a stable spatial-only split group reuses the terminal edit");
+      Check(native::edit_reuse_reuses.load() == reuses + 1 && slots[0].edit_reuse == terminal_anchor
+                && terminal_anchor->reused && terminal_anchor->anchor_generation == terminal_generation,
+            "a stable spatial-only split group reuses the same terminal edit generation");
       const auto before_look_change = pair_frame("split spatial next refresh", 0, 2);
+      Check(slots[0].edit_reuse == terminal_anchor && terminal_anchor->anchor_generation == terminal_generation + 1,
+            "the next full refresh advances the Upscaled terminal anchor once");
       tail_look.strength = 1.5f;
       pair_calls.clear();
       const auto changed_calls = frame(0, false);

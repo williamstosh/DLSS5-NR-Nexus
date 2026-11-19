@@ -121,6 +121,7 @@
 #include "ui/text_input.hpp"
 #include "submission_tracker.hpp"
 #include "edit_reuse.hpp"
+#include "edit_reuse_policy.hpp"
 #if defined(NR_NEXUS_DEV_CONTROL)
 #include "nr_fg_output_marker.hpp"
 #endif
@@ -462,10 +463,6 @@ struct NrPassResolutionContract {
 };
 
 enum class EditReuseDelivery : uint8_t { NONE, REFRESH, REUSED, PER_FRAME, ORIGINAL };
-enum class EditReuseBlock : uint8_t {
-  NONE, PASSES, MASK, ADAPTIVE, ROUTE, INPUTS, GEOMETRY, ORDER, HISTORY, NR_FAILED, SELECT_ORIGINAL, SR_FAILED,
-};
-
 struct EditReuseMonitorFrame {
   EditReuseDelivery delivery = EditReuseDelivery::NONE;
   EditReuseBlock reason = EditReuseBlock::NONE;
@@ -15478,25 +15475,24 @@ inline bool RecordInline(
   std::array<uint64_t, 40> edit_contract{};
   EditReuseGroup edit_group;
   if (edit_reuse_route_eligible && same_stage_stack) {
-    bool layer_history = false;
-    bool full_working_grid = true;
-    bool active_layers = true;
+    std::array<edit_reuse_policy::Layer, kMaxNrPasses> layers{};
     for (uint32_t pass = 0; pass < requested_stack; ++pass) {
       const auto& pass_res = (pass == 1 && second_workset != nullptr ? *second_workset : res);
-      layer_history |= (pass_look_wanted[pass] & pass_res.look_surfaces & kLookSurfaceOutput) != 0
-          && look_chain.settings[pass].stabilize != 0;
-      full_working_grid &= pass_res.input_width == pass_res.width && pass_res.input_height == pass_res.height;
-      active_layers &= PassTransferStrength(pass) > 0.f || PassColorStrength(pass) > 0.f;
+      layers[pass] = {.transfer_strength = PassTransferStrength(pass), .color_strength = PassColorStrength(pass),
+          .temporal_look = (pass_look_wanted[pass] & pass_res.look_surfaces & kLookSurfaceOutput) != 0
+              && look_chain.settings[pass].stabilize != 0,
+          .working_width = pass_res.input_width, .working_height = pass_res.input_height,
+          .full_width = pass_res.width, .full_height = pass_res.height};
     }
-    // Temporal anchors bind the shared model surfaces and use the full-grid
-    // validity footprint. A smaller layer keeps its ordinary Evaluate and Look.
-    if (v6_encoding == 1u && active_layers && (!layer_history || full_working_grid)) {
+    const auto decision = edit_reuse_policy::DecideGroup(std::span{layers}.first(requested_stack), v6_encoding);
+    if (decision.anchors != edit_reuse_policy::Anchors::NONE) {
       edit_group = PrepareEditReuseGroup(device, command_list, &feature, res, second_workset, frame, look_chain, output,
-          depth_desc.Format, requested_stack, edit_reuse_sequence, chain_reset_epoch, v6_encoding, false, layer_history);
+          depth_desc.Format, requested_stack, edit_reuse_sequence, chain_reset_epoch, v6_encoding, false,
+          decision.anchors == edit_reuse_policy::Anchors::PER_LAYER);
     } else {
       RetireStackEditReuse(feature.slots, edit_reuse_sequence);
       edit_reuse_route_eligible = false;
-      edit_monitor.reason = (active_layers ? EditReuseBlock::GEOMETRY : EditReuseBlock::PASSES);
+      edit_monitor.reason = decision.reason;
       ++edit_reuse_fallbacks;
     }
   } else if (edit_reuse_route_eligible) {
@@ -18110,23 +18106,24 @@ inline bool RecordInlinePreSR(
   std::array<uint64_t, 40> edit_contract{};
   EditReuseGroup edit_group;
   if (edit_reuse_eligible && same_stage_stack) {
-    bool layer_history = false;
-    bool full_working_grid = true;
-    bool active_layers = true;
+    std::array<edit_reuse_policy::Layer, kMaxNrPasses> layers{};
     for (uint32_t pass = 0; pass < requested_stack; ++pass) {
       const auto& pass_res = (pass == 1 && second_workset != nullptr ? *second_workset : res);
-      layer_history |= (pass_look_wanted[pass] & pass_res.look_surfaces & kLookSurfaceOutput) != 0
-          && look_chain.settings[pass].stabilize != 0;
-      full_working_grid &= pass_widths[pass] == width && pass_heights[pass] == height;
-      active_layers &= PassTransferStrength(pass) > 0.f || PassColorStrength(pass) > 0.f;
+      layers[pass] = {.transfer_strength = PassTransferStrength(pass), .color_strength = PassColorStrength(pass),
+          .temporal_look = (pass_look_wanted[pass] & pass_res.look_surfaces & kLookSurfaceOutput) != 0
+              && look_chain.settings[pass].stabilize != 0,
+          .working_width = pass_widths[pass], .working_height = pass_heights[pass],
+          .full_width = width, .full_height = height};
     }
-    if (v6_encoding == 1u && active_layers && (!layer_history || full_working_grid)) {
+    const auto decision = edit_reuse_policy::DecideGroup(std::span{layers}.first(requested_stack), v6_encoding);
+    if (decision.anchors != edit_reuse_policy::Anchors::NONE) {
       edit_group = PrepareEditReuseGroup(device, command_list, &feature, res, second_workset, frame, look_chain, color,
-          depth_desc.Format, requested_stack, edit_sequence, chain_reset_epoch, v6_encoding, true, layer_history);
+          depth_desc.Format, requested_stack, edit_sequence, chain_reset_epoch, v6_encoding, true,
+          decision.anchors == edit_reuse_policy::Anchors::PER_LAYER);
     } else {
       RetireStackEditReuse(feature.slots, edit_sequence);
       edit_reuse_eligible = false;
-      swap.monitor_frame.reason = (active_layers ? EditReuseBlock::GEOMETRY : EditReuseBlock::PASSES);
+      swap.monitor_frame.reason = decision.reason;
       ++edit_reuse_fallbacks;
     }
   } else if (edit_reuse_eligible) {
