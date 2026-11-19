@@ -443,25 +443,21 @@ F6 立即提示开关操作，随后状态更新为正在检查、正常运行�
 <a id="zh-edit-reuse"></a>
 #### 隔帧编辑复用 x2（实验）
 
-每两个基础帧重新生成一次 NR 编辑，中间帧将编辑跟随运动应用到当前画面，用于试验降低 NR 开销；遮挡、颜色变化或越界区域保留当前原色。**x2 是 NR 编辑的刷新间隔，与 FG 的输出倍率分别设置。** 此功能默认关闭。
+符合复用条件时，NR 每两个基础帧重新生成一次编辑，中间帧把编辑随运动应用到当前画面，以降低 GPU 开销。遮挡、颜色变化或越界导致重投影失效时，对应像素保留当前原色。**x2 是 NR 编辑的刷新间隔，与 FG 的输出倍率分别设置。** 此功能默认关闭。
 
 在**画质 → 核心画质**的工作分辨率设置下方，打开**隔帧编辑复用 x2（实验）**，无需重启。关闭后恢复常规 NR，Present 按所选帧处理策略运行。开关随画质方案和共享预设保存。已有 `[RenoDX.DLSS5]` 配置键 `NREditReuse` 继续有效。
 
-普通安装包支持原生 DX12 的两条限定路径：关闭 FG 的 Upscaled，以及 XeFG 的 Present 单 Backbuffer（不含 HUDless/UI 合成）。均要求模型 B、1 层、固定100% HDR 输出，并关闭调整 NR 的外观、细节稳定、区域遮罩和自适应分辨率。游戏须提供匹配的深度和运动数据，以及完整的 jitter 采样偏移（支持非零值，每轴不超过半个渲染像素）；运动数据须不含 jitter。Upscaled 使用 FP16 scRGB；XeFG 单 Backbuffer 另支持10位 HDR10/PQ。不满足条件时继续逐帧 NR，打开开关不会自动改变其他设置。
+**已发布的 v0.5.1 安装包**支持原生 DX12 的 Upscaled（FG 关闭）和 XeFG 单 Backbuffer 的 Present（无 HUDLess/UI 合成）。这两条路径要求 NR Runtime 310.9.16.0、显式模型 B、单层、固定 100% HDR 工作尺寸，并关闭调整 NR 的外观、细节稳定、区域遮罩和自适应分辨率。Upscaled 使用 FP16 scRGB。XeFG 单 Backbuffer 也支持 10 位 HDR10/PQ。不满足条件时仍逐帧运行 NR。
 
-《巫师3》HDR10/PQ＋XeFG 的静态场景已确认隔帧调用；动态画质与帧节奏仍待实际场景验收。光照突然变化时可能短暂回到原色，NR 色调变化也可能延后一帧。出现拖影、明暗跳变或微卡顿时关闭此项。日志中的 `NR edit reuse` 表示实际发生复用。
+**开发候选（尚未发布）**沿用同一个开关。在**处理与兼容性 → 介入点**选择**超分后（Upscaled）**或**渲染（Render）**，可对符合条件的单层及同介入点多层组合启用 x2。模型按实际请求判断，可用 A、B 或解析为受支持模型的 Auto。Render 仍在每个基础帧运行原有 SR，Ray Reconstruction 走兼容的 Upscaled 路径。
 
-**开发版 Render** 沿用同一个 x2 开关，并在**处理与兼容性 → 介入点**选择**渲染（Render）**。在已确认的 D3D12 DLSS 超分辨率（SR）路径上，NR 在 SR 前处理画面，SR 仍在每个基础帧运行。当前路径使用 FP16 HDR 和单层 NR，实际工作格点须覆盖原渲染尺寸。游戏须提供匹配的全幅颜色、深度和有效运动矢量，并显式提供两轴 jitter 偏移。运动矢量须排除 jitter。细节稳定的 Auto 按 Render 的实际效果处理。启用 Ray Reconstruction 时，兼容回退仍走 Upscaled 路径。Render x2 的游戏内动态画质仍待验收。
+两种版本都要求可写的当帧 HDR 颜色和匹配的深度、运动矢量及两轴 jitter 偏移。每轴偏移最大半个渲染像素，运动矢量须排除 jitter。开发候选中，多层使用时域滤波时，各层须使用当前介入点的完整分辨率。任一层使用更小的工作尺寸时，整组按原设置逐帧处理。仅空间 Look 的异尺寸组可在满足复用条件时使用 x2。单层 Upscaled 在较低工作尺寸且只需普通双线性缩放时也可复用，需要低格 Look 传输时则逐帧处理。跨介入点或实际绑定区域遮罩时继续逐帧处理，自适应分辨率准备与切档沿用原处理流程。
 
-普通原生 **D3D12 Present x2** 是尚未发布的开发功能。打开同一个 x2 开关，在**处理与兼容性 → 介入点**选择 **Present**，再在 **FG 高级设置 → FG 帧处理策略**（Generated frames／Present Frames）选择**游戏帧**（Game frames only，`NRPresentFrames=1`）。NR 使用当前 FP16 scRGB Backbuffer 的颜色。复用要求实际使用模型 A 或 B、单层及覆盖完整画面的固定工作尺寸。即使请求了自适应分辨率，仍使用固定工作尺寸的帧也可复用。实际切档和绑定区域遮罩的帧沿用各自的处理方式。
+**开发候选的普通 D3D12 Present x2**使用单层和固定全幅工作尺寸。FG 关闭时，在**处理与兼容性 → 介入点**选**呈现（Present）**，再在 **FG 高级设置 → FG 帧处理策略**选**游戏帧**（Game frames，`NRPresentFrames=1`）。游戏须把已确认的同帧 SR 图像整幅复制到当前 FP16 scRGB Backbuffer。无法确认同帧来源时保留原画，普通 HDR10/PQ 也保留原画。选择**每帧**（`NRPresentFrames=0`）可恢复按呈现帧处理。
 
-插件须确认该帧的 DLSS 超分辨率（SR）已成功运行，取得同一帧的两轴 jitter 偏移及匹配的深度和运动矢量，并验证 SR 输出在呈现队列最后一次游戏提交的同一命令列表中整幅复制到当前 Backbuffer。证据不足时保留本帧游戏原画。要恢复默认的逐呈现帧 NR，可改回**每帧**（Every present，`NRPresentFrames=0`）。也可关闭 x2，按当前帧处理策略运行常规 NR。普通 Present x2 已用真实 NVIDIA Runtime 和 GPU 离线验证，游戏内表现仍待验收。
+XeFG 的 Present x2 仍使用单层和单 Backbuffer。原生 DLSS FG 的 Upscaled 开发实验默认关闭。原生 DLSS FG 的 Present 仍缺同帧来源和交接验证。开发候选可用默认快捷键 **F11** 打开监视器，查看 x2 请求、生效状态，以及逐帧处理或保留原画的原因。
 
-**开发版 Upscaled** 按实际创建的单层模型和工作尺寸判断 x2。受支持的 Runtime 可使用模型 A、B 或解析到同一模型的 Auto。生效的外观和细节稳定可随刷新和复用一起执行。在工作格点小于输出且只需普通双线性恢复时，可沿用 x2。当前颜色须来自已确认的成功 SR，并仍可在该次调用中写回。实际绑定的区域遮罩、低格外观传输和需要逐帧采样的模式继续逐帧运行。
-
-开发版的玩家监视器会显示 x2 请求与实际交付。等待、逐帧 NR 或保留原画时会显示已知原因。普通 Present 无法确认当前 HDR10 成图来源时，会保留原画并显示「当前 HDR10 成图来源未确认」。
-
-开发版还包含默认关闭的 FG On 组合实验，覆盖真实 SR 后的 Upscaled，以及原生 DLSS FG 消费前的 Present。Upscaled 实验在 SR 来源、工作尺寸和输出归属相同的情况下，可以跨 FG 状态变化保留隔帧历史。原生 Pre-FG Present 的 HDR10/PQ 去 HUD 编辑和透明度合成已有开发接线，游戏里的同帧输入与消费顺序仍待验证。两条实验路径目前仅用于开发验证。生成帧画面、动态画质与微卡顿仍待验收。
+《巫师 3》关闭 FG 的 4K 双层 Upscaled 已实机验证。异尺寸组合的结论来自离线测试，多层 Render 和开启 FG 的多层实机仍待测。普通 scRGB Present 已用真实 GPU 和 NVIDIA Runtime 离线验证，游戏内表现仍待验收。XeFG 单 Backbuffer 的 HDR10/PQ 已在《巫师 3》静态场景确认隔帧调用。若在自己的场景看到拖影、明暗跳变或感到卡顿，可关闭 x2 比较逐帧效果。
 
 <a id="zh-paths"></a>
 #### 可用组合
@@ -1015,25 +1011,21 @@ Use this for specific issues. Record old values and compare one change at a time
 <a id="en-edit-reuse"></a>
 #### x2 edit reuse (experimental)
 
-NR generates a new edit every two base frames and applies its motion-reprojected edit to the current image between refreshes, aiming to lower NR cost. Rejected occlusion, color-change and boundary pixels retain their current color. **x2 is the NR edit refresh interval, separate from the FG output multiplier.** This feature is off by default.
+When reuse is available, NR generates a new edit every two base frames and reprojects it onto the current image between refreshes to reduce GPU work. Pixels keep their current color where occlusion, color changes or image boundaries invalidate reprojection. **x2 is the NR edit refresh interval, separate from the FG output multiplier.** This feature is off by default.
 
 Under the working-resolution controls in **Quality → Core quality**, enable **x2 edit reuse (experimental)** without restarting. Turn it off to restore regular NR. Present follows the selected frame policy. The toggle is saved with quality profiles and shared presets. The existing `NREditReuse` key under `[RenoDX.DLSS5]` remains supported.
 
-The ordinary package supports two restricted native DX12 paths: Upscaled with FG off, and XeFG Present with a single Backbuffer and no HUDless/UI composition. Both require model B, one pass and fixed 100% HDR output, with Adjust NR's look, Detail stability, Region mask and Adaptive resolution off. The game must provide matching depth and motion plus both jitter sampling offsets; nonzero values up to half a render pixel per axis are supported, with jitter excluded from motion. Upscaled uses FP16 scRGB; XeFG single Backbuffer also supports 10-bit HDR10/PQ. When requirements are unmet, NR continues every frame. Enabling the toggle leaves other settings unchanged.
+**The released v0.5.1 package** supports native DX12 Upscaled with FG off and XeFG Present with a single backbuffer and no HUDLess/UI composition. Both paths require NR Runtime 310.9.16.0, explicit model B, one pass and a fixed 100% HDR working resolution, with Adjust NR's look, Detail stability, Region mask and Adaptive resolution off. Upscaled uses FP16 scRGB. XeFG with a single backbuffer also supports 10-bit HDR10/PQ. When requirements are unmet, NR runs every frame.
 
-HDR10/PQ x2 reuse has been confirmed in a static The Witcher 3 XeFG scene; dynamic image quality and frame pacing still need acceptance in the intended scene. Sudden lighting changes may briefly restore the original color, and changes in NR's tone may lag by one frame. Disable this option if you see ghosting, brightness shifts or microstutter. An `NR edit reuse` log entry confirms actual reuse.
+**Unreleased development candidates** use the same switch. Under **Processing & compatibility → Hook point**, choose Upscaled (after SR) or Render (before SR) for eligible single-pass and same-hook multi-pass D3D12 configurations. Reuse follows the actual model request, which may be A, B or Auto resolving to a supported model. With Render, the game's SR still runs on every base frame. Ray Reconstruction uses the compatible Upscaled path.
 
-**Render in development builds** uses the same x2 toggle. Choose **Render** under **Processing & compatibility → Hook point**. On a confirmed D3D12 DLSS Super Resolution (SR) path, NR processes the image before SR, which still runs on every base frame. This path uses FP16 HDR and one NR pass whose working grid matches the render size. The game must supply matching full-frame colour, depth and valid motion vectors, plus both jitter offsets. Motion vectors must exclude jitter. Detail Stability Auto follows its effective Render setting. With Ray Reconstruction, NR still uses the compatible Upscaled path. Dynamic image quality for Render x2 still needs in-game validation.
+Both versions require writable HDR color for the current frame, matching depth and motion vectors, and both jitter offsets. Each offset may be up to half a render pixel. Motion vectors must exclude jitter. In development candidates, multi-pass x2 with temporal filtering requires every pass to run at the hook point's full resolution. If any pass uses a smaller working resolution, the group runs every frame with its original settings. Eligible groups with mixed working resolutions and spatial-only Look can still reuse. Single-pass Upscaled can also reuse at a lower resolution with standard bilinear upsampling. It runs every frame when it needs lower-resolution Look transport. Mixed hook points and bound Region masks also run every frame. Adaptive resolution keeps its usual preparation and tier changes.
 
-Ordinary native **D3D12 Present x2** is an unreleased development feature. Enable the same x2 toggle, choose **Present** under **Processing & compatibility → Hook point**, then select **Game frames** (Game frames only, `NRPresentFrames=1`) under **FG advanced settings → FG frame processing policy** (Generated frames / Present Frames). NR uses the colour in the current FP16 scRGB backbuffer. Reuse requires one pass using model A or B at the fixed full-frame working size. A frame can reuse edits while Adaptive resolution is requested if it still uses that fixed size. Frames that switch adaptive tiers or bind a Region Mask follow their usual processing paths.
+**Ordinary D3D12 Present x2 in development candidates** uses one NR pass at a fixed full-frame working resolution. With FG off, choose **Present** under **Processing & compatibility → Hook point** and **Game frames** (`NRPresentFrames=1`) under **FG advanced settings → FG frame processing policy**. The game must copy the complete SR image from the verified source for that frame to the current FP16 scRGB backbuffer. If the source cannot be verified, the game image is kept. Ordinary HDR10/PQ also keeps the game image. Select **Every frame** (`NRPresentFrames=0`) to restore processing on each present.
 
-The add-on requires a successful DLSS Super Resolution (SR) evaluation, both jitter offsets, and matching depth and motion vectors from that frame. It verifies that the presentation queue's latest game submission used the same command list to copy the complete SR output to the current backbuffer. Without that evidence, it keeps the game's original image. Select **Every frame** (Every present, `NRPresentFrames=0`) to restore the default NR processing on each present, or turn off x2 to use regular NR with the current frame policy. Ordinary Present x2 has been verified offline with the NVIDIA runtime on real hardware. In-game performance and image quality still need validation.
+XeFG Present x2 still uses one pass and a single backbuffer. The native DLSS FG Upscaled experiment is off by default. Native DLSS FG Present still needs verification of frame identity and handoff. In development candidates, open the monitor with the default shortcut **F11** to see the x2 request, its effective state, and why NR is running every frame or keeping the original image.
 
-**Upscaled in development builds** evaluates x2 using the actual model request and NR work size for one pass. The supported runtime can use model A, model B or Auto resolving to the same model. Active Look and Detail Stability can run on both refresh and reuse frames. A smaller grid can use x2 when the output only needs the standard bilinear resolve. The current colour must come from a confirmed successful SR call and still be writable in that call. A bound Region Mask, Look transport from a smaller grid, and modes that require per-frame samples continue to run every frame.
-
-The monitor in development builds shows the x2 request and actual delivery. It gives the known reason when waiting, running NR every frame, or keeping the original image. If ordinary Present cannot verify the source of the current HDR10 frame, it keeps the original image and shows that reason.
-
-The development branch also includes disabled-by-default FG On experiments for Upscaled after actual SR and Present before native DLSS FG consumes the frame. The Upscaled experiment can preserve edit history across FG status changes when the SR source, working size and output ownership are the same. Native Pre-FG Present has experimental support for editing HDR10/PQ HUD-less colour and recombining it with alpha. Same-frame inputs and consumption order still need in-game verification. Both paths are for development testing. Generated-frame appearance, dynamic image quality and microstutter still await acceptance.
+Two 4K Upscaled passes with FG off have been verified in The Witcher 3. Results for different working resolutions came from offline tests. Multi-pass Render and multi-pass with FG on still need in-game testing. Ordinary scRGB Present has been tested offline on real hardware with the NVIDIA Runtime and still needs in-game validation. HDR10/PQ with a single XeFG backbuffer has been confirmed to reuse edits in a static Witcher 3 scene. If you notice ghosting, brightness jumps or stutter, turn off x2 to compare per-frame NR.
 
 <a id="en-paths"></a>
 #### Compatible combinations

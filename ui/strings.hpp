@@ -169,9 +169,11 @@ inline constexpr const char* kEditReuse = "x2 edit reuse (experimental)";
 inline constexpr const char* kEditReuseTip =
     "Refresh NR once per two base frames and reproject its edit onto the next frame to reduce GPU work. Upscaling still runs every frame; x2 is separate from the FG multiplier. Turn off if motion, lighting or frame pacing looks worse.";
 inline constexpr const char* kEditReuseCompatibility =
-    "D3D12 x2 supports confirmed Render and Upscaled sources and XeFG Present with one Backbuffer. Ordinary Present needs Game frames and a verified same-frame source.";
+    "D3D12 Render and Upscaled support x2 for one or more passes at the same hook point. "
+    "Present x2 uses one pass with a single XeFG backbuffer or verified scRGB Game frames.";
 inline constexpr const char* kEditReuseRequirements =
-    "Requires NR 310.9.16.0, one active Pass, compatible HDR color, and matching depth, motion and jitter. The available Look, mask and resolution combinations depend on the hook point.";
+    "Reuse needs compatible HDR color and matching depth, motion and jitter. "
+    "With temporal filtering, multi-pass x2 needs full resolution in every pass.";
 inline constexpr const char* kEditReuseFallback =
     "Render, Upscaled and XeFG Present use per-frame NR if reuse is unavailable. Ordinary Present keeps the original frame without a verified same-frame source. Invalid reprojected pixels keep their current color.";
 inline constexpr const char* kEditReuseMonitorRequested = "x2 requested";

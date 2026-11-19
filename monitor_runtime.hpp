@@ -667,7 +667,7 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
         }
       }
       switch (observed.reason) {
-        case EditReuseBlock::PASSES: monitor.edit_reuse_reason = ui::Tr("The current chain has multiple passes."); break;
+        case EditReuseBlock::PASSES: monitor.edit_reuse_reason = ui::Tr("x2 is unavailable for this pass configuration."); break;
         case EditReuseBlock::MASK: monitor.edit_reuse_reason = ui::Tr("An external region mask is active."); break;
         case EditReuseBlock::ADAPTIVE: monitor.edit_reuse_reason = ui::Tr("Adaptive resolution owns the current frame."); break;
         case EditReuseBlock::ROUTE: monitor.edit_reuse_reason = ui::Tr("The current delivery path does not support x2."); break;
