@@ -57,6 +57,10 @@ JSON 与插件内部文本使用 UTF-8，Windows 文件操作使用宽路径；�
 
 `NREditReuse` 是全局画质选项，保存实验性 x2 编辑复用请求，默认关闭；不按层重复。旧共享预设缺少该键时保留当前值，实际运行仍须满足[隔帧条件](USER_GUIDE.md#zh-edit-reuse)。
 
+`NRPresentFrames` 属于 `COMPATIBILITY`，仅 Full 导出携带：`0` 为每次呈现处理，`1` 为游戏帧策略，执行条件见[Present 指南](USER_GUIDE.md#zh-present)。旧 INI 缺键沿用默认 `0`；导入预设缺键保留当前值，Full 的显式 `0` 必须按值应用，不能当作缺键。Schema v1、键名和 `0/1` 值义保持，退回支持此键的旧版仍可读取同一 INI／Full 预设。
+
+`NRPresentFrames` is a `COMPATIBILITY` field included by Full exports: `0` processes every present and `1` selects the game-frame policy under the [Present conditions](USER_GUIDE.md#en-present). Old INIs without the key retain default `0`. A missing preset field keeps the current value; an explicit Full-preset `0` must be applied rather than treated as absent. Schema v1, the key and the meanings of `0/1` are unchanged, so older versions supporting this field can read the same INI/Full preset on rollback.
+
 `NRPasses` 是整数 `1..4`。每个 `NRPass{2,3,4}` 均展开同一组字段：
 
 | 后缀 | loader 数值范围／类型 |

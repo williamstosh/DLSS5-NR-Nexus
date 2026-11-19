@@ -1167,6 +1167,12 @@ int main(int argc, char** argv) {
       }
       runtime::LoadConfiguration();
       const auto persisted = capture();
+      constexpr const char* PRESENT_FRAMES_KEY = "NRPresentFrames";
+      const auto captured_present_frames = persisted.settings.find(PRESENT_FRAMES_KEY);
+      Check(Read(PRESENT_FRAMES_KEY) == "<absent>" && runtime::present_frames.load() == 0u
+                && captured_present_frames != persisted.settings.end()
+                && captured_present_frames->is_number_integer() && *captured_present_frames == 0u,
+            "The legacy INI key stays absent and Full capture exports the Every present default as integer zero.");
       const auto saved_local_size = GetEnvironmentVariableW(L"LOCALAPPDATA", nullptr, 0);
       std::wstring saved_local(saved_local_size, L'\0');
       if (saved_local_size != 0) {
@@ -1188,14 +1194,28 @@ int main(int argc, char** argv) {
         std::ofstream fixture(ini_path, std::ios::binary);
         fixture << "[GENERAL]\r\nPresetPath=game-two.ini\r\n[OTHER.ADDON]\r\nPersistent=29\r\n"
                    "[RenoDX.DLSS5]\r\n" << current_global << policy_keys
-                << "NRPresentRestoreScope=1\r\nNRPresentRestoreScopeConfigVersion=1\r\nNRIntensity=0.1\r\n";
+                << "NRPresentRestoreScope=1\r\nNRPresentRestoreScopeConfigVersion=1\r\n"
+                   "NRIntensity=0.1\r\nNRPresentFrames=1\r\n";
       }
       runtime::LoadConfiguration();
+      Check(runtime::present_frames.load() == 1u, "The legacy INI loads explicit one as Game frames.");
+      Check(apply({{"NRIntensity", 0.25f}}) && runtime::intensity.load() == 0.25f
+                && runtime::present_frames.load() == 1u && Read(PRESENT_FRAMES_KEY) == "1",
+            "A partial preset applies its change and preserves the omitted Game frames setting in memory and on disk.");
       std::filesystem::path library_two;
       Check(presets::LibraryPath(&library_two, &error) && library_two == library_one, "Separate game INIs share one preset library.");
       Check(presets::ReadFile(library_two / L"shared.nrnexus.json", &decoded, &error)
                 && adapter::Apply(decoded, true, true, &error), "Game two reads and applies game one's preset.");
+      const auto decoded_present_frames = decoded.settings.find(PRESENT_FRAMES_KEY);
+      Check(decoded.scope == presets::Scope::FULL && decoded_present_frames != decoded.settings.end()
+                && decoded_present_frames->is_number_integer() && *decoded_present_frames == 0u,
+            "Full preset file round trip preserves explicit NRPresentFrames integer zero.");
       Check(runtime::intensity.load() == 0.95f && Read("NRIntensity") != "0.1", "Game two writes only its selected INI.");
+      Check(runtime::present_frames.load() == 0u && Read(PRESENT_FRAMES_KEY) == "0",
+            "Applying the Full preset restores Every present from Game frames and writes the legacy INI value zero.");
+      runtime::LoadConfiguration();
+      Check(runtime::present_frames.load() == 0u && Read(PRESENT_FRAMES_KEY) == "0",
+            "Reloading the restored INI keeps explicit zero as Every present.");
       const auto game_two_bytes = Bytes();
       Check(game_two_bytes.find("Persistent=29") != std::string::npos && game_two_bytes.find("PresetPath=game-two.ini") != std::string::npos,
             "Game two unrelated sections remain intact.");

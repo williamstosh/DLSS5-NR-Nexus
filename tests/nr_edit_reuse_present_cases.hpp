@@ -1188,10 +1188,10 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     const std::unique_ptr<const std::filesystem::path, decltype(clean_config)> config_cleanup(&config_file, clean_config);
     CloseHandle(created);
     present_fixture_ini = config_file;
-    const auto load_present_mode = [&](const char* present_frames) {
+    const auto load_present_mode = [&](const char* present_frames, bool reuse_requested = true) {
       std::ofstream ini(present_fixture_ini, std::ios::trunc);
       ini << '[' << native::kConfigSection << "]\nConfigVersion=" << native::kConfigVersion
-          << "\nNeuralUplift=1\nEnableHooks=2\nNREditReuse=1\nNRHookPoint=" << native::kHookPresent
+          << "\nNeuralUplift=1\nEnableHooks=2\nNREditReuse=" << reuse_requested << "\nNRHookPoint=" << native::kHookPresent
           << "\nNRPasses=1\nNRPreset=2\nNRPresentPreFg=0\nNRPresentGuides=" << native::kPresentGuidesRequired
           << "\nNRPresentBlockHudlessConfigVersion=1\nNRPresentBlockHudless=1\nNRPresentUICorrection=0"
              "\nNRCodecMode=0\nNRFeedMode=1\nNRNormGovernor=0\nNRLookMode=0\nNRFollowInputRes=0"
@@ -1208,7 +1208,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
             "file-backed ReShade config distinguishes missing and explicit NRPresentFrames");
       native::LoadConfiguration();
       const uint32_t expected = (present_frames != nullptr && present_frames[0] == '1' ? 1u : 0u);
-      Check(native::enabled && native::edit_reuse_enabled && native::hook_point == native::kHookPresent
+      Check(native::enabled && native::edit_reuse_enabled == reuse_requested && native::hook_point == native::kHookPresent
                 && native::stack_passes == 1 && native::present_frames == expected,
             "production INI loader keeps NR/x2 requested and resolves the selected legacy Present mode");
     };
@@ -1239,6 +1239,44 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
             "Every present repeats legacy execution without counting a new base or running old x2");
       reopen();
       swap();
+    }
+
+    {
+      load_present_mode("1", false);
+      const auto before = stats();
+      present_frame();
+      const auto first = stats();
+      const auto& clock = native::present_streams.at(&output).base_frame_clock;
+      Check(native::present_frames == 1 && !native::edit_reuse_enabled && !native::WantsPresentBaseFrames()
+                && first.calls == before.calls + 1 && first.outputs == before.outputs + 1
+                && first.base_claims == before.base_claims + 1 && first.base_complete && !clock.frame.reuse_edits
+                && first.refreshes == before.refreshes && first.reuses == before.reuses,
+            "explicit Game frames processes an ordered source once without implicitly enabling x2");
+      event();
+      const auto duplicate = stats();
+      Check(duplicate.calls == first.calls && duplicate.outputs == first.outputs
+                && duplicate.base_claims == first.base_claims && duplicate.base_outputs == first.base_outputs,
+            "Game frames retains its completed output on a duplicate without another NR or base-history claim");
+      reopen();
+      swap();
+      present_frame();
+      const auto next = stats();
+      Check(next.calls == first.calls + 1 && next.outputs == first.outputs + 1
+                && next.base_claims == first.base_claims + 1 && next.base_complete,
+            "the next real ordered source still receives ordinary NR in Game frames mode");
+      load_present_mode("0", false);
+      event();
+      const auto compatible = stats();
+      Check(native::present_frames == 0 && !native::edit_reuse_enabled
+                && compatible.calls == next.calls + 1 && compatible.outputs == next.outputs + 1
+                && compatible.base_claims == next.base_claims && compatible.base_outputs == next.base_outputs
+                && compatible.refreshes == before.refreshes && compatible.reuses == before.reuses,
+            "explicit zero restores every-present compatibility without pretending a repeat is a new base frame");
+      std::cout << "PRESENT_POLICY_COMPAT game_frames_calls=1/0/1 every_present_repeat_calls=1"
+                   " new_base_claim_on_repeat=0 x2=0 evidence=WARP+MOCK\n";
+      reopen();
+      swap();
+      load_present_mode("0");
     }
 
     {

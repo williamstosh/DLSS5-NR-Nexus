@@ -270,6 +270,7 @@ F6 立即提示开关操作，随后状态更新为正在检查、正常运行�
 | 独立皮肤（Independent skin） | **开**，全链共用 | 配合人物遮罩，将 stock 皮肤传为 1、实际结构封顶 1。关闭时 stock 皮肤跟随结构；即使开启，结构低于 1 仍可能通过模型本身影响脸部。 |
 | UI 修正（UI correction） | **关** | 运行时模型 UI 修正；HUD 被影响时可比较。与 Present 默认开启的“保留 HUD”分开。 |
 
+<a id="zh-present"></a>
 #### 处理位置与 Present
 
 | 选项 | 输入与适用性 |
@@ -286,8 +287,10 @@ F6 立即提示开关操作，随后状态更新为正在检查、正常运行�
 | 保留 HUD | **开** | 请求模型修正已经包含 HUD 的呈现帧，HUD 仍有变化时可改用 Upscaled。 |
 | 帧编码 | **Auto**／SDR／HDR10／scRGB | Auto 根据交换链色彩空间证据判断，只有错误声明时才覆盖。 |
 | HDR 纸白 | **0**，**0–1000 nits** | 0 跟随已加载且进行色调映射的 RenoDX HDR Mod 的游戏亮度，否则用 Windows SDR 内容亮度；正数覆盖。 |
-| FG 帧处理策略（Generated frames／Present Frames） | **每帧（Every present，`NRPresentFrames=0`）**／游戏帧（Game frames only，`NRPresentFrames=1`） | 普通 Present 默认对每次呈现运行 NR，包括生成帧，开销较高。仅处理已识别的游戏帧可减少开销，生成帧观感可能不同。FG 开关在游戏或 FG 工具中设置。 |
+| FG 帧处理策略（Generated frames／Present Frames） | **每帧（Every present，`NRPresentFrames=0`）**／游戏帧（Game frames only，`NRPresentFrames=1`） | 每帧保留逐呈现兼容，增强入口实际收到的每次输出。游戏帧在捕获输入未更新时跳过重复处理；缺少识别线索且允许中性深度／运动时，仍可能逐呈现。FG 开关在游戏或 FG 工具中设置。 |
 | 帧生成检测 | **Auto**；Stable timing／稳定时序；Legacy timing／旧版时序 | Auto 优先读取声明倍率，缺失则稳定时序估计；稳定时序忽略声明；旧版时序用于兼容。 |
+
+每帧仍是默认值。已有可用的 Render／Upscaled 或 Pre-FG 入口时，可先增强游戏帧，再由原有后续流程交付；只有最终呈现可用的场景继续保留每帧兼容。游戏帧选项与 x2 分别设置，不会自动开启隔帧复用。旧 INI 缺少 `NRPresentFrames` 时仍取 `0`，显式 `0/1` 按原义读取。部分共享预设不含此键时保留当前选择，Full 预设中的显式 `0` 可恢复每帧；退回旧版也沿用相同键和值。
 
 #### 基础分辨率与上采样
 
@@ -840,6 +843,7 @@ New defaults initialize missing values and migrate the exact old `0.7 / 0.9` def
 | Independent skin | **On**, global | With Character mask, sends stock skin as 1 and caps sent structure at 1 in all passes. With it off, stock skin follows Structure. Even with it on, reducing Structure can still affect faces through the model itself. |
 | UI correction | **Off** | Runtime model UI correction. Try it when HUD elements are affected. Present's Keep the HUD is a separate, default-on setting. |
 
+<a id="en-present"></a>
 #### Location and Present
 
 | Choice | Input / applicability |
@@ -856,8 +860,10 @@ Compatible Pre-FG enhances game frames before FG. When it succeeds, it takes pre
 | Keep the HUD | **On** | Uses model UI correction for the presented frame. If HUD elements still change, compare Upscaled instead. |
 | Frame encoding | **Auto** / SDR / HDR10 / scRGB | Auto uses swapchain colour-space evidence. Override only for incorrect declarations. |
 | HDR paper white | **0**, **0–1000 nits** | Zero follows a loaded, tone-mapping RenoDX HDR mod's game brightness, otherwise Windows SDR content brightness. A positive value overrides it. |
-| FG frame processing policy (Generated frames / Present Frames) | **Every frame (Every present, `NRPresentFrames=0`)** / Game frames (Game frames only, `NRPresentFrames=1`) | Ordinary Present defaults to running NR on every presented frame, including generated frames, at a higher cost. Processing only identified game frames reduces that cost, and generated frames may look different. Enable or disable FG in the game or FG tool. |
+| FG frame processing policy (Generated frames / Present Frames) | **Every frame (Every present, `NRPresentFrames=0`)** / Game frames (Game frames only, `NRPresentFrames=1`) | Every frame retains compatibility by enhancing each output that reaches ordinary Present. Game frames skips repeats when the captured input has not changed. Without identification evidence, permitted neutral depth/motion can still lead to per-present processing. Enable or disable FG in the game or FG tool. |
 | Frame generation detection | **Auto** / Stable timing / Legacy timing | Auto uses the declared multiplier when available, otherwise stable cadence. Stable timing ignores declarations. Legacy timing is a compatibility fallback. |
+
+Every frame remains the default. When a usable Render/Upscaled or Pre-FG entry exists, NR can enhance the game frame before the normal downstream handoff. Scenes served only at final presentation retain every-present compatibility. Game frames and x2 are separate choices; selecting Game frames does not enable edit reuse. Old INIs without `NRPresentFrames` still load `0`, and explicit `0/1` keep their meanings. Partial shared presets without this key keep the current choice; an explicit `0` in a Full preset restores Every frame. Older versions use the same key and values on rollback.
 
 #### Base resolution and upsampling
 
