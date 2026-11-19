@@ -472,6 +472,8 @@ struct PresentRing {
 // Streamline path keys its synthetic streams the same way; never
 // dereferenced).
 struct PresentStream {
+  present_frame_policy::Clock base_frame_clock;
+  bool base_history_unbound = false;
   PresentEditReuseMonitor edit_reuse_monitor;
   uint64_t base_frame_attempt = 0;
   // Only this swapchain's current, submitted, final full-surface copy can
@@ -585,6 +587,11 @@ inline bool WantsPresentBaseFrames() {
       && edit_reuse_enabled.load(std::memory_order_relaxed)
       && present_frames.load(std::memory_order_relaxed) == 1
       && stack_passes.load(std::memory_order_relaxed) == 1;
+}
+
+inline bool ObservesPresentBaseFrames() {
+  return enabled.load(std::memory_order_relaxed)
+      && hook_point.load(std::memory_order_relaxed) == kHookPresent;
 }
 // One observed FG-only stream. Interleaved identities restart admission;
 // equal-size views remain ambiguous until exactly one swapchain matches.
@@ -754,6 +761,9 @@ inline void PublishPresentBaseRejection(PresentStream* stream, const void* backb
 
 inline void InvalidatePresentBaseFrames(PresentStream* stream) {
   stream->edit_reuse_monitor.Reset(stream->base_frame_epoch);
+  stream->base_frame_clock.frame = {};
+  stream->base_frame_clock.complete = false;
+  stream->base_history_unbound = false;
   if (stream->base_frame_epoch == 0) return;
   for (auto& set : present_guide_sets) {
     if (set.base_frame.swapchain_epoch == stream->base_frame_epoch) {
@@ -1035,7 +1045,7 @@ inline PresentGuideSet* NextPresentCaptureSet() {
   PresentGuideSet* target = nullptr;
   for (PresentGuideSet& set : present_guide_sets) {
     if (&set == last_read || (done != UINT64_MAX && set.read_value > done)
-        || (WantsPresentBaseFrames() && !set.d3d11 && !submission::ResourceReleasable(set.marker))) continue;
+        || (ObservesPresentBaseFrames() && !set.d3d11 && !submission::ResourceReleasable(set.marker))) continue;
     if (target == nullptr || set.serial < target->serial) target = &set;
   }
   if (target == nullptr) present_capture_busy.fetch_add(1, std::memory_order_relaxed);
@@ -1176,7 +1186,7 @@ inline void CapturePresentGuides(
   if (output != nullptr && !mixed_predecessor) {
     if (!AdmitOutputPass(output, handle)) return;
     RecordOutputPass(output, handle);
-    if (successful_dlss_sr && WantsPresentBaseFrames() && present_base_capture_active.load(std::memory_order_relaxed)) {
+    if (successful_dlss_sr && ObservesPresentBaseFrames() && present_base_capture_active.load(std::memory_order_relaxed)) {
       const auto identity = renodx::utils::directx::NativeIdentity(output);
       for (auto& set : present_guide_sets) {
         if (set.base_frame.source == identity || set.base_frame.backbuffer == identity) {
@@ -1216,7 +1226,7 @@ inline void CapturePresentGuides(
     return;
   }
   PresentBaseFrame base_frame;
-  if (successful_dlss_sr && !mixed_predecessor && WantsPresentBaseFrames()
+  if (successful_dlss_sr && !mixed_predecessor && ObservesPresentBaseFrames()
       && std::ranges::any_of(present_streams, [](const auto& entry) { return entry.second.base_frame_epoch != 0; })
       && submission::list_identity_fallbacks.load(std::memory_order_relaxed) == 0) {
     const auto source = features.find(handle);
@@ -2863,7 +2873,8 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
   auto* motion = GetD3D12Resource(&block, NVSDK_NGX_Parameter_MotionVectors);
   auto* depth = GetD3D12Resource(&block, NVSDK_NGX_Parameter_Depth);
   const bool mixed = target.stage_execution_plan != nullptr;
-  const bool base_frame = target.base_frame_sequence != 0;
+  const bool base_frame = target.base_frame_epoch != 0;
+  const bool identified_frame = present_frame_policy::Known(target.base_frame);
   target.independent_resolution_pair = target.independent_resolution_pair
       && stream.fg_multiplier == 1 && present_fg_multiplier.load(std::memory_order_relaxed) == 1
       && !present_prefg_active.load(std::memory_order_relaxed)
@@ -2874,13 +2885,13 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
   bool submitted = false;
   NrRecording recording;
   const auto cancel = [&](int*) {
-    if ((!mixed && !independent_pair && !base_frame) || !recording_started || submitted) return;
+    if ((!mixed && !independent_pair && !base_frame && !identified_frame) || !recording_started || submitted) return;
     // CPU-side NGX/state ledgers may have advanced even if Close failed.
     // Discard the recording and retire its private state before another try.
     submission::OnCommandListReset(slot->list);
     if (auto feature = features.find(handle); feature != features.end()) {
       ReleaseAllNrSlots(feature->second, true);
-      if (base_frame) {
+      if (base_frame || identified_frame) {
         ReleaseCom(feature->second.norm.commit);
         feature->second.norm = {};
       }
@@ -2907,7 +2918,7 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     const auto previous_capture_serial = screenshot::PendingModelCaptureSerial(slot->list);
     // From here ProcessInline names the terminal.
     const bool accepted = ProcessInline(slot->list, handle, &block, &touched, &target,
-        (mixed || base_frame) ? &recording : nullptr);
+        (mixed || base_frame || identified_frame) ? &recording : nullptr);
     if (base_frame && !accepted) {
       slot->list->Close();
       return false;
@@ -2949,13 +2960,25 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
   }
   if (base_frame && recording.model_invoked && !recording.output_ready) return false;
   std::unique_lock<std::shared_mutex> present_order;
-  if (base_frame) {
-    present_order = std::unique_lock(base_order->submit_mutex, std::try_to_lock);
-    if (!present_order || base_order->entered.load() != guides->base_frame.queue_entry) {
-      ++edit_reuse_fallbacks;
-      CountNrDecline(NrDeclineReason::kPresentBaseUnproven);
-      PublishPresentBaseRejection(&stream, guides->base_frame.backbuffer, target.hdr_color_space);
-      return false;
+  bool frame_ordered = false;
+  if (base_frame || identified_frame) {
+    if (base_order != nullptr && guides != nullptr) {
+      present_order = std::unique_lock(base_order->submit_mutex, std::try_to_lock);
+      frame_ordered = present_order && base_order->entered.load() == guides->base_frame.queue_entry;
+    }
+    if (!frame_ordered) {
+      stream.base_frame_clock.complete = false;
+      stream.base_history_unbound = true;
+      if (!base_frame) {
+        // Preserve Every present execution, but do not attribute a later BB
+        // write to the SR whose producer receipt was inspected earlier.
+        target.base_frame = {};
+      } else {
+        ++edit_reuse_fallbacks;
+        CountNrDecline(NrDeclineReason::kPresentBaseUnproven);
+        PublishPresentBaseRejection(&stream, guides->base_frame.backbuffer, target.hdr_color_space);
+        return false;
+      }
     }
   }
   // After the capture's copies: only this queue's own tokens are left here,
@@ -2966,7 +2989,7 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
   }
   // Add-on work recorded earlier through ReShade's immediate list keeps its
   // place ahead of NR.
-  if (queue != nullptr && !base_frame) queue->flush_immediate_command_list();
+  if (queue != nullptr && !base_frame && !identified_frame) queue->flush_immediate_command_list();
   ID3D12CommandList* list = slot->list;
   renodx::utils::directx::NativeFromReShadeProxy(&list);
   {
@@ -2983,6 +3006,10 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
   submitted = true;
   slot->value = ++present_ring.submitted;
   const bool signaled = SUCCEEDED(native_queue->Signal(present_ring.fence, slot->value));
+  if (identified_frame && !signaled) {
+    stream.base_frame_clock.complete = false;
+    stream.base_history_unbound = true;
+  }
   if (mixed) {
     mixed_present_last_fence = FenceRef(present_ring.fence);
     mixed_present_last_value = slot->value;
@@ -2991,8 +3018,8 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     guides->read_value = slot->value;
   }
   if (base_frame) {
-    const bool delivered = signaled && recording.output_ready && recording.group_complete
-        && (recording.model_recorded || recording.edit_reused);
+    const bool delivered = signaled && PresentGroupResult(std::span{&recording, 1}, 1, target.base_frame.reuse_edits).complete;
+    present_frame_policy::Publish(&stream.base_frame_clock, target.base_frame, signaled && frame_ordered, delivered);
     if ((delivered || (signaled && recording.edit_monitor_delivery == EditReuseDelivery::ORIGINAL))
         && recording.edit_monitor_delivery != EditReuseDelivery::NONE && guides != nullptr) {
       const auto source = features.find(guides->source_handle);
@@ -3023,6 +3050,13 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     }
   }
   ++stream.nr_presents;
+  if (!identified_frame && present_frame_policy::Known(stream.base_frame_clock.frame)) {
+    stream.base_history_unbound = true;
+  }
+  if (identified_frame && !base_frame) {
+    const auto group_result = PresentGroupResult(std::span{&recording, 1}, 1, false);
+    present_frame_policy::Publish(&stream.base_frame_clock, target.base_frame, signaled && frame_ordered, group_result.complete);
+  }
   if (guides != nullptr) {
     stream.consumed_serial = guides->serial;
     present_guides_real.fetch_add(1, std::memory_order_relaxed);
@@ -3064,7 +3098,7 @@ struct PresentCommandScope {
 
 inline void ObservePresentSourceBarriers(ID3D12GraphicsCommandList* list, UINT count,
                                          const D3D12_RESOURCE_BARRIER* barriers) {
-  if (barriers == nullptr || !IsPresentSourceList(list) || !WantsPresentBaseFrames()) return;
+  if (barriers == nullptr || !IsPresentSourceList(list) || !ObservesPresentBaseFrames()) return;
   RuntimeLock lock(runtime_mutex);
   const auto recording = submission::RecordingIdentity(list);
   for (UINT i = 0; i < count; ++i) {
@@ -3111,7 +3145,7 @@ inline void ObservePresentSourceBarriers(ID3D12GraphicsCommandList* list, UINT c
 }
 
 inline void ObservePresentSourceWork(ID3D12GraphicsCommandList* list, bool unknown_layout) {
-  if (!IsPresentSourceList(list) || !WantsPresentBaseFrames()) return;
+  if (!IsPresentSourceList(list) || !ObservesPresentBaseFrames()) return;
   RuntimeLock lock(runtime_mutex);
   const auto recording = submission::RecordingIdentity(list);
   for (auto& set : present_guide_sets) {
@@ -3129,7 +3163,7 @@ inline void ObservePresentSourceWork(ID3D12GraphicsCommandList* list, bool unkno
 
 inline void ObservePresentSourceCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* source,
                                      ID3D12Resource* destination, bool full) {
-  if (source == nullptr || destination == nullptr || !IsPresentSourceList(list) || !WantsPresentBaseFrames()) return;
+  if (source == nullptr || destination == nullptr || !IsPresentSourceList(list) || !ObservesPresentBaseFrames()) return;
   RuntimeLock lock(runtime_mutex);
   const auto input = renodx::utils::directx::NativeIdentity(source);
   const auto output = renodx::utils::directx::NativeIdentity(destination);
@@ -3683,32 +3717,31 @@ inline bool RunMixedPresent(ID3D12CommandQueue* queue, reshade::api::command_que
   return SubmitPresentGroup(queue, api_queue, slot, stream, block, guides, target, false, {});
 }
 
-inline bool RunPresentBaseFrame(ID3D12CommandQueue* native_queue, reshade::api::command_queue* queue,
-                                PresentSlot* slot, PresentStream& stream, ID3D12Resource* back,
-                                PresentTarget target) {
+struct ClaimedPresentFrame {
+  PresentGuideSet* guides = nullptr;
+  std::shared_ptr<PresentQueueOrder> order;
+  present_frame_policy::Frame frame;
+  present_frame_policy::Claim claim = present_frame_policy::Claim::UNPROVEN;
+};
+
+inline ClaimedPresentFrame IdentifyPresentBaseFrame(ID3D12CommandQueue* native_queue,
+    PresentStream* stream, ID3D12Resource* back, const PresentTarget& target) {
   const auto backbuffer = renodx::utils::directx::NativeIdentity(back);
   const auto order = present_queue_order.load(std::memory_order_acquire);
-  ++stream.base_frame_attempt;
-  const auto reject = [&] {
-    ResetPresentStreamHistory(&stream);
-    ++edit_reuse_fallbacks;
-    CountNrDecline(NrDeclineReason::kPresentBaseUnproven);
-    PublishPresentBaseRejection(&stream, backbuffer, target.hdr_color_space);
-    return false;
-  };
+  ++stream->base_frame_attempt;
   if (target.hdr_mode != 1 || target.hdr_color_space != reshade::api::color_space::scrgb
       || diagnostics::GuideMode(target.diagnostic.guides, present_guides.load()) == kPresentGuidesNever
       || backbuffer == nullptr || order == nullptr || order->queue != native_queue
-      || stream.base_frame_epoch == 0) return reject();
+      || stream->base_frame_epoch == 0) return {};
 
   PresentGuideSet* guides = nullptr;
   for (auto& set : present_guide_sets) {
-    if (set.serial == 0 || set.base_frame.swapchain_epoch != stream.base_frame_epoch
+    if (set.serial == 0 || set.base_frame.swapchain_epoch != stream->base_frame_epoch
         || set.base_frame.backbuffer != backbuffer) continue;
-    if (guides != nullptr) return reject();
+    if (guides != nullptr) return {};
     guides = &set;
   }
-  if (guides == nullptr) return reject();
+  if (guides == nullptr) return {};
   auto& frame = guides->base_frame;
   // A late producer cannot reopen a frame that this Present already declined.
   const bool repeated = std::exchange(frame.attempted, true);
@@ -3718,34 +3751,66 @@ inline bool RunPresentBaseFrame(ID3D12CommandQueue* native_queue, reshade::api::
       || frame.configuration != configuration_generation.load(std::memory_order_relaxed)
       || source == features.end() || source->second.source_generation != frame.source_generation
       || source->second.sr_sequence != frame.sequence
-      || stream.mixed_queue != renodx::utils::directx::NativeIdentity(native_queue)) return reject();
+      || stream->mixed_queue != renodx::utils::directx::NativeIdentity(native_queue)) return {};
+  const present_frame_policy::Frame current{
+      .source = reinterpret_cast<uintptr_t>(guides->source_handle), .generation = frame.source_generation,
+      .sequence = frame.sequence, .output_epoch = frame.swapchain_epoch,
+      .pass_count = RequestedStagePlan().At(stage_plan::Stage::PRESENT).count,
+      .reuse_edits = WantsPresentBaseFrames()};
   if (repeated) {
-    CountNrDecline(NrDeclineReason::kPresentRepeat);
-    if (guides->serial == stream.consumed_serial && order->entered.load() == frame.queue_entry) return true;
-    PublishPresentBaseRejection(&stream, backbuffer, target.hdr_color_space);
-    return false;
+    if (order->entered.load() == frame.queue_entry
+        && present_frame_policy::Classify(stream->base_frame_clock, current) == present_frame_policy::Claim::REPEATED) {
+      return {.guides = guides, .order = order, .frame = current, .claim = present_frame_policy::Claim::REPEATED};
+    }
+    return {};
   }
   // DXGI permits writes to this backbuffer only on its associated queue.
   // Require the exact producer to be that queue's isolated one-list tail.
   std::unique_lock gate(order->submit_mutex, std::try_to_lock);
-  if (!gate || order->producer_entry == 0 || order->producer_entry != order->entered.load()) return reject();
+  if (!gate || order->producer_entry == 0 || order->producer_entry != order->entered.load()) return {};
   std::vector<std::pair<FenceRef, uint64_t>> receipts;
-  if (submission::UseSubmissionTokens(guides->marker, &receipts) == submission::UseSubmission::kUnsubmitted) return reject();
+  if (submission::UseSubmissionTokens(guides->marker, &receipts) == submission::UseSubmission::kUnsubmitted) return {};
   if (!guides->completed_fence.empty()) receipts.emplace_back(guides->completed_fence, guides->completed_value);
   if (receipts.size() != 1 || receipts.front().second != order->producer_value
-      || !submission::OnlyRecordingUses(guides->marker, frame.recording)) return reject();
+      || !submission::OnlyRecordingUses(guides->marker, frame.recording)) return {};
   {
     std::shared_lock lock(queue_completion_mutex);
     const auto own = queue_completions.find(native_queue);
     if (own == queue_completions.end() || own->second.fence != receipts.front().first.fence
         || receipts.front().first->GetCompletedValue() == UINT64_MAX) {
       lock.unlock();
-      return reject();
+      return {};
     }
   }
   frame.queue_entry = order->producer_entry;
   gate.unlock();
+  const auto previous = stream->base_frame_clock.frame;
+  const auto claim = present_frame_policy::Observe(&stream->base_frame_clock, current);
+  if (claim != present_frame_policy::Claim::NEW_FRAME) return {};
+  if (present_frame_policy::NeedsReset(previous, current, previous.sequence, false, stream->base_history_unbound)) {
+    ResetPresentStreamHistory(stream);
+  }
+  stream->base_history_unbound = false;
+  return {.guides = guides, .order = order, .frame = current, .claim = claim};
+}
 
+inline bool RunPresentBaseFrame(ID3D12CommandQueue* native_queue, reshade::api::command_queue* queue,
+                                PresentSlot* slot, PresentStream& stream, ID3D12Resource* back,
+                                PresentTarget target) {
+  const auto identified = IdentifyPresentBaseFrame(native_queue, &stream, back, target);
+  if (identified.guides == nullptr) {
+    ResetPresentStreamHistory(&stream);
+    stream.base_frame_clock.complete = false;
+    ++edit_reuse_fallbacks;
+    CountNrDecline(NrDeclineReason::kPresentBaseUnproven);
+    PublishPresentBaseRejection(&stream, renodx::utils::directx::NativeIdentity(back), target.hdr_color_space);
+    return false;
+  }
+  auto* guides = identified.guides;
+  if (identified.claim == present_frame_policy::Claim::REPEATED) {
+    CountNrDecline(NrDeclineReason::kPresentRepeat);
+    return stream.base_frame_clock.complete && guides->serial == stream.consumed_serial;
+  }
   const auto& contract = guides->contract;
   auto& block = FillPresentBlock(&stream, back, guides->motion, guides->depth, contract,
       guides->output_width, guides->output_height, 1.f, contract.frame_reset, false, guides->source_handle);
@@ -3753,12 +3818,12 @@ inline bool RunPresentBaseFrame(ID3D12CommandQueue* native_queue, reshade::api::
   block.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, contract.jitter_y);
   target.workset_key = reinterpret_cast<const ID3D12Resource*>(&stream);
   target.guide_serial = guides->serial;
-  target.base_frame_sequence = frame.sequence;
-  target.base_frame_epoch = frame.swapchain_epoch;
-  target.diagnostic_source_generation = frame.source_generation;
+  target.base_frame = identified.frame;
+  target.base_frame_epoch = identified.frame.output_epoch;
+  target.diagnostic_source_generation = identified.frame.generation;
   target.diagnostic_source_feature = kFeatureDlss;
   target.guide_mode = kPresentGuidesRequired;
-  return SubmitPresentGroup(native_queue, queue, slot, stream, block, guides, target, false, {}, order.get());
+  return SubmitPresentGroup(native_queue, queue, slot, stream, block, guides, target, false, {}, identified.order.get());
 }
 
 inline void RunPresentPath(
@@ -3772,7 +3837,7 @@ inline void RunPresentPath(
       && stack_passes.load() == 2 && pass_stage[0].load() == 3
       && swapchain != nullptr && swapchain->get_device() != nullptr
       && swapchain->get_device()->get_api() == reshade::api::device_api::d3d12;
-  const bool ordinary_base_frames = !auto_fallback && WantsPresentBaseFrames()
+  const bool ordinary_base_frames = !auto_fallback && ObservesPresentBaseFrames()
       && !screenshot::WantsFinalPresent() && !fg::xefg::OwnsStream();
   // Resolve unsupported requests before the route's early return: Vulkan
   // and the D3D11 foreign/off routes never satisfy PresentHookServes().
@@ -3894,7 +3959,7 @@ inline void RunPresentPath(
   }
   if (!ordinary_base_frames && observed_present_queue.load(std::memory_order_acquire) != nullptr) {
     RuntimeLock lock(runtime_mutex);
-    if (!WantsPresentBaseFrames()) {
+    if (!ObservesPresentBaseFrames()) {
       for (auto& [_, stream] : present_streams) InvalidatePresentBaseFrames(&stream);
       ReleasePresentQueueOrder();
       present_base_capture_active.store(false, std::memory_order_relaxed);
@@ -4544,7 +4609,17 @@ inline void RunPresentPath(
     gap.ran = RunPresentBaseFrame(native_queue, queue, slot, stream, back, target);
     return;
   }
-  InvalidatePresentBaseFrames(&stream);
+  ClaimedPresentFrame identified;
+  if (!d3d11 && ordinary_base_frames && !native_passthrough && !deferred) {
+    renodx::utils::directx::NativeFromReShadeProxy(&native_queue);
+    queue->flush_immediate_command_list();
+    identified = IdentifyPresentBaseFrame(native_queue, &stream, back, target);
+    if (identified.guides == nullptr) {
+      stream.base_frame_clock.complete = false;
+    }
+  } else {
+    InvalidatePresentBaseFrames(&stream);
+  }
   const bool comparing_clean_frame = screenshot::WantsFinalPresent()
       && screenshot::internal::requires_passthrough_frame.load(std::memory_order_acquire);
   const uint32_t guides_mode = diagnostics::GuideMode(
@@ -4644,6 +4719,9 @@ inline void RunPresentPath(
     // Only the accepted request-stamped, presentation-ordered passthrough
     // frame retires the uncertainty from an earlier inline fallback.
     present_inline_fallback_pending = false;
+  }
+  if (guides != nullptr && guides == identified.guides) {
+    target.base_frame = identified.frame;
   }
   const bool new_frame = guides != nullptr && guides->serial != stream.consumed_serial;
   if (present_frames.load() == 1 && guides != nullptr && !new_frame) {
@@ -4796,7 +4874,8 @@ inline void RunPresentPath(
   }
 
   gap.ran = SubmitPresentGroup(native_queue, queue, slot, stream, block,
-      guides, target, neutral_model, waits);
+                               guides, target, neutral_model, waits,
+                               identified.guides == guides ? identified.order.get() : nullptr);
 }
 
 inline void OnNativePresentObserved(IDXGISwapChain* swapchain, UINT flags,

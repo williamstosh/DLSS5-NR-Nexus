@@ -10,19 +10,65 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #include <utils/hash.hpp>
+#include <unicode_input.hpp>
+
+static std::filesystem::path present_fixture_ini;
+
+extern "C" __declspec(dllexport) bool ReShadeGetConfigValue(
+    void*, reshade::api::effect_runtime*, const char* section, const char* key, char* value, size_t* size) {
+  if (present_fixture_ini.empty()) return false;
+  std::wstring wide_section, wide_key;
+  namespace unicode = renodx::addons::dlss5::unicode_input::internal;
+  if (!unicode::Utf8ToWide(section, &wide_section) || !unicode::Utf8ToWide(key, &wide_key)) return false;
+  wchar_t buffer[4096];
+  const auto count = GetPrivateProfileStringW(wide_section.c_str(), wide_key.c_str(), L"", buffer,
+                                               static_cast<DWORD>(std::size(buffer)), present_fixture_ini.c_str());
+  std::string result;
+  if (count == 0 || !unicode::WideToUtf8({buffer, count}, &result)) {
+    *size = 0;
+    return false;
+  }
+  if (value == nullptr) {
+    *size = result.size() + 2;
+    return true;
+  }
+  if (*size == 0) return false;
+  const size_t copied = (std::min)(*size - 1, result.size());
+  std::memcpy(value, result.data(), copied);
+  value[copied] = '\0';
+  *size = copied;
+  return true;
+}
+
+extern "C" __declspec(dllexport) void ReShadeSetConfigValue(
+    void*, reshade::api::effect_runtime*, const char* section, const char* key, const char* value) {
+  if (present_fixture_ini.empty()) return;
+  std::wstring wide_section, wide_key, wide_value;
+  namespace unicode = renodx::addons::dlss5::unicode_input::internal;
+  Check(unicode::Utf8ToWide(section, &wide_section) && unicode::Utf8ToWide(key, &wide_key)
+            && (value == nullptr || unicode::Utf8ToWide(value, &wide_value))
+            && WritePrivateProfileStringW(wide_section.c_str(), wide_key.c_str(),
+                                          value == nullptr ? nullptr : wide_value.c_str(), present_fixture_ini.c_str()),
+        "write a setting only into the isolated Present fixture INI");
+}
 
 // Included after the native WARP/model and ReShade device/queue fixtures.
 namespace nr_edit_reuse_present_cases {
 namespace addon = renodx::addons::dlss5;
 namespace stages = stage_execution_cases;
 namespace reuse = nr_edit_reuse_gpu_cases;
+namespace trace = nr_edit_reuse_xefg_cases;
 constexpr auto FORMAT = DXGI_FORMAT_R16G16B16A16_FLOAT;
 constexpr auto PRESENT = D3D12_RESOURCE_STATE_PRESENT;
 using Pixel = std::array<uint16_t, 4>;
@@ -82,19 +128,10 @@ struct Swapchain final : reshade::api::swapchain {
 NVSDK_NGX_Result NVSDK_CONV CreateSr(ID3D12GraphicsCommandList*, NVSDK_NGX_Feature feature,
                                    NVSDK_NGX_Parameter*, NVSDK_NGX_Handle** handle) {
   Check(feature == native::kFeatureDlss, "Present x2 registers a game SR feature");
-  static uint32_t sr_handle = 1;
-  *handle = reinterpret_cast<NVSDK_NGX_Handle*>(&sr_handle);
+  static uint32_t sr_handles[2] = {1, 2};
+  static size_t next_source = 0;
+  *handle = reinterpret_cast<NVSDK_NGX_Handle*>(&sr_handles[next_source++ % 2]);
   return NVSDK_NGX_Result_Success;
-}
-
-NVSDK_NGX_Result NVSDK_CONV Evaluate(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle,
-                                    const NVSDK_NGX_Parameter* parameters, PFN_NVSDK_NGX_ProgressCallback callback) {
-  const auto game_list = model_gpu->list;
-  model_gpu->list = list;
-  const auto restore = [&](int*) { model_gpu->list = game_list; };
-  int key = 0;
-  const std::unique_ptr<int, decltype(restore)> restore_list(&key, restore);
-  return reuse::ConstantModel(list, handle, parameters, callback);
 }
 
 struct Observed {
@@ -106,8 +143,15 @@ struct Observed {
   uint64_t anchor_generation = 0;
   uint64_t reuse_count = 0;
   uint64_t ring_submissions = 0;
+  uint64_t game_observations = 0;
+  uint64_t reset_epoch = 0;
+  uint64_t base_claims = 0;
+  uint64_t base_outputs = 0;
+  bool base_complete = false;
   uint32_t calls = 0;
   uint32_t creates = 0;
+
+  bool operator==(const Observed&) const = default;
 };
 
 struct ParkedExecute {
@@ -161,6 +205,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
   using namespace nr_edit_reuse_present_cases;
   ComPtr<ID3D12InfoQueue> info;
   try {
+    const bool config_fixture = project_id_path == nullptr && !diagnostic_only;
     const auto module = GetModuleHandleW(nullptr);
     reshade::internal::get_reshade_module_handle(module);
     Check(renodx::utils::directx::Initialize(), "Present x2 initializes DirectX");
@@ -184,6 +229,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
       }, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &message_cookie)), "Present x2 observes D3D12 validation");
     }
     native::enabled = true;
+    native::monitor_requested = true;
     native::hooks_enabled = true;
     native::d3d12_device_seen = true;
     native::shutdown_quiesce_enabled = false;
@@ -204,11 +250,18 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     native::control_mask_enabled = false;
     native::use_auto_mask = false;
     native::cost_meter_enabled = false;
+    native::telemetry_seconds = 0;
     native::transfer_strength = 1.f;
     native::color_strength = 1.f;
     native::intensity = 1.f;
     native::preset = 2;
     native::edit_reuse_enabled = true;
+    if (config_fixture) {
+      native::present_ui_correction = false;
+      native::chroma_clamp_stops = 2.f;
+      native::diffuse_white_nits = 200.f;
+      native::present_white_nits = 200.f;
+    }
 #if defined(NR_NEXUS_TEST_NATIVE_NGX)
     using nr_edit_reuse_present_native_cases::Runtime;
     std::unique_ptr<Runtime> runtime;
@@ -221,7 +274,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     if (!native_ngx) {
       native::direct_api.module = module;
       native::direct_api.create = stages::Create;
-      native::direct_api.evaluate = Evaluate;
+      native::direct_api.evaluate = trace::EvaluatePresentEdit;
       native::direct_api.release = ReleaseModel;
       native::direct_load_state = native::DirectLoadState::Ready;
       native::direct_device = gpu.device.Get();
@@ -286,7 +339,10 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
       const auto& stream = native::present_streams.at(&output);
       Observed observed{.outputs = stream.nr_presents, .consumed_serial = stream.consumed_serial,
           .refreshes = native::edit_reuse_refreshes.load(), .reuses = native::edit_reuse_reuses.load(),
-          .ring_submissions = native::present_ring.submitted, .calls = model_calls, .creates = next_handle};
+          .ring_submissions = native::present_ring.submitted, .game_observations = native::game_window.frames,
+          .reset_epoch = native::history_reset_epoch.load(), .base_claims = stream.base_frame_clock.claims,
+          .base_outputs = stream.base_frame_clock.outputs, .base_complete = stream.base_frame_clock.complete,
+          .calls = model_calls, .creates = next_handle};
       if (auto found = native::features.find(stream.Handle()); found != native::features.end()) {
         if (const auto& state = found->second.slots[0].edit_reuse) {
           observed.history_sequence = state->source_sequence;
@@ -299,6 +355,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     const auto no_output = [](const Observed& before, const Observed& after, const char* message) {
       Check(after.outputs == before.outputs && after.consumed_serial == before.consumed_serial
                 && after.calls == before.calls && after.refreshes == before.refreshes && after.reuses == before.reuses
+                && after.base_outputs == before.base_outputs && (after.base_claims == before.base_claims || !after.base_complete)
                 && after.history_sequence <= before.history_sequence
                 && after.anchor_generation <= before.anchor_generation && after.reuse_count <= before.reuse_count,
             message);
@@ -552,46 +609,134 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
       native::UnhookMixedPresentCopyHooks();
       return 0;
     }
-    std::vector<Pixel> refreshed;
-    for (uint32_t index = 0; index < 4; ++index) {
-      const bool refresh = (index % 2 == 0);
-      game_pixel[3] = (refresh ? GAME_PIXEL[3] : OVERWRITE_PIXEL[3]);
-      const auto before = stats();
-      present_frame(index == 0, index == 2);
-      const auto after = stats();
-      std::cout << "PRESENT_X2 frame=" << index << " model_calls=" << after.calls - before.calls
-                << " refreshes=" << after.refreshes - before.refreshes
-                << " reuses=" << after.reuses - before.reuses << " outputs=" << after.outputs - before.outputs
-                << " consumed=" << after.consumed_serial << " sequence=" << after.history_sequence << '\n';
-      Check(after.outputs == before.outputs + 1 && after.consumed_serial > before.consumed_serial
-                && after.calls == before.calls + refresh && after.refreshes == before.refreshes + refresh
-                && after.reuses == before.reuses + !refresh && after.history_sequence > before.history_sequence,
-            "Present x2 delivers four consecutive real bases in model cadence 1/0/1/0");
-      if (!refresh) {
-        event();
-        const auto repeat = stats();
-        no_output(after, repeat, "same base cannot count as another actual output");
-        Check(repeat.history_sequence == after.history_sequence && repeat.anchor_generation == after.anchor_generation
-                  && repeat.reuse_count == after.reuse_count && repeat.ring_submissions == after.ring_submissions,
-              "same base leaves history and Present ring unchanged");
-      }
-      auto pixels = read_back();
-      alpha_preserved(pixels);
-      const size_t center = size * (size / 2) + size / 2;
-      const auto half = DirectX::PackedVector::XMConvertHalfToFloat;
-      Check(std::abs(half(pixels[center][0]) - half(GAME_PIXEL[0])) > .05f, "actual backbuffer has a nonzero edit");
-      if (refresh) {
-        refreshed = std::move(pixels);
-      } else {
-        for (size_t pixel = 0; pixel < pixels.size(); ++pixel) {
-          for (size_t channel = 0; channel < 3; ++channel) {
-            Check(std::abs(half(pixels[pixel][channel]) - half(refreshed[pixel][channel])) < .003f,
-                  "reused edit reaches the actual backbuffer with the refresh RGB");
+    std::array<trace::PresentTraceFrame, 4> baseline;
+    for (const auto variant : {trace::PresentTrace::BASELINE, trace::PresentTrace::GENERATED_OUTPUT,
+                               trace::PresentTrace::REPEATED_CONSUMPTION}) {
+      const auto& source = native::features.at(sr_handle);
+      const auto sequence_prefix = source.sr_sequence;
+      const auto source_generation = source.source_generation;
+      const auto& stream = native::present_streams.at(&output);
+      const auto& clock = stream.base_frame_clock;
+      const auto claims_prefix = clock.claims;
+      const auto outputs_prefix = clock.outputs;
+      const auto attempts_prefix = stream.base_frame_attempt;
+      const auto prefix = stats();
+      uint64_t first_anchor_generation = 0;
+      uint64_t anchor_sequence = 0;
+      uint32_t downstream_outputs = 0;
+      uint32_t repeated_callbacks = 0;
+      std::vector<Pixel> refreshed;
+      for (uint32_t index = 0; index < baseline.size(); ++index) {
+        const bool refresh = index % 2 == 0;
+        game_pixel = trace::PRESENT_SOURCE_PIXELS[index];
+        const auto before = stats();
+        present_frame(index == 0, index == 2);
+        const auto after = stats();
+        const auto calls = after.calls - before.calls;
+        const auto& delivery = source.edit_reuse_monitor[0];
+        const auto& slot = native::features.at(stream.Handle()).slots[0];
+        Check(source.source_generation == source_generation && delivery.source_generation == source_generation
+                  && delivery.stage == addon::stage_plan::Stage::PRESENT && delivery.sequence == source.sr_sequence
+                  && delivery.surface == renodx::utils::directx::NativeIdentity(back()) && slot.nr_preset == 2
+                  && !slot.look_history.valid && slot.edit_reuse != nullptr && slot.edit_reuse->valid,
+              "ordinary Present uses the same actual SR source, stage, model and current Backbuffer for the group");
+        Check(clock.claims == claims_prefix + index + 1 && clock.outputs == outputs_prefix + index + 1
+                  && clock.frame.source == reinterpret_cast<uintptr_t>(sr_handle)
+                  && clock.frame.generation == source_generation && clock.frame.sequence == source.sr_sequence
+                  && clock.frame.output_epoch == stream.base_frame_epoch && clock.frame.pass_begin == 0
+                  && clock.frame.pass_count == 1 && clock.frame.roles == 1 && clock.frame.reuse_edits,
+              "ordinary Present recognizes one actual successful SR output and commits one BB product per base frame");
+        Check(after.outputs == before.outputs + 1 && after.consumed_serial > before.consumed_serial
+                  && after.refreshes == before.refreshes + refresh && after.reuses == before.reuses + !refresh
+                  && after.game_observations == prefix.game_observations + index + 1,
+              "ordinary Present submits one output and observes one game frame per real base");
+        if (index == 0) first_anchor_generation = after.anchor_generation;
+        if (after.anchor_generation != before.anchor_generation) anchor_sequence = after.history_sequence;
+        Check(after.anchor_generation != 0 && anchor_sequence != 0, "ordinary Present has a recorded anchor source");
+        trace::PresentTraceFrame observed{.evaluates = calls, .reset = (calls != 0 ? model_resets.back() : -1),
+            .sequence = clock.frame.sequence - sequence_prefix, .history_sequence = after.history_sequence - sequence_prefix,
+            .anchor_sequence = anchor_sequence - sequence_prefix,
+            .anchor_generation = after.anchor_generation - first_anchor_generation + 1,
+            .anchor_age = after.history_sequence - anchor_sequence, .reuses = after.reuses - before.reuses,
+            .complete = clock.complete && delivery.handed_off
+                && delivery.delivery == (refresh ? native::EditReuseDelivery::REFRESH : native::EditReuseDelivery::REUSED)};
+        if (variant == trace::PresentTrace::REPEATED_CONSUMPTION && index == 1) {
+          const auto callback = stream.base_frame_attempt;
+          const auto frame_clock = trace::PresentClockState(clock);
+          event();
+          ++repeated_callbacks;
+          Check(stream.base_frame_attempt == callback + 1 && stats() == after && trace::PresentClockState(clock) == frame_clock,
+                "duplicate OnPresent arrived on the unchanged ordered BB and changed neither history nor submission");
+        }
+        auto pixels = read_back();
+        observed.rgba.resize(pixels.size() * sizeof(Pixel));
+        std::memcpy(observed.rgba.data(), pixels.data(), observed.rgba.size());
+        const auto half = DirectX::PackedVector::XMConvertHalfToFloat;
+        const size_t center = size * (size / 2) + size / 2;
+        Check(std::abs(half(pixels[center][0]) - half(GAME_PIXEL[0])) > .05f, "actual backbuffer has a nonzero edit");
+        if (refresh) {
+          refreshed = std::move(pixels);
+        } else {
+          for (size_t pixel = 0; pixel < pixels.size(); ++pixel) {
+            for (size_t channel = 0; channel < 3; ++channel) {
+              Check(std::abs(half(pixels[pixel][channel]) - half(refreshed[pixel][channel])) < .003f,
+                    "reused edit reaches the actual backbuffer with the refresh RGB");
+            }
           }
         }
+        if (variant == trace::PresentTrace::GENERATED_OUTPUT && index == 0) {
+          const auto frame_clock = trace::PresentClockState(clock);
+          Check(trace::ConsumeGeneratedOutput(&gpu, back()) == observed.rgba,
+                "downstream stand-in consumes the separate generated surface in queue order");
+          ++downstream_outputs;
+          Check(stats() == after && trace::PresentClockState(clock) == frame_clock,
+                "extra downstream consumption cannot advance ordinary Present history");
+        }
+        swap();
+        ++downstream_outputs;
+        if (variant == trace::PresentTrace::BASELINE) {
+          trace::CheckPresentTraceFrame(observed, index, "ordinary");
+          baseline[index] = std::move(observed);
+        } else {
+          Check(observed == baseline[index], "ordinary G/R base trace must equal A including complete ordered RGBA");
+        }
       }
-      swap();
+      const bool generated = variant == trace::PresentTrace::GENERATED_OUTPUT;
+      const bool repeated = variant == trace::PresentTrace::REPEATED_CONSUMPTION;
+      Check(downstream_outputs == 4 + generated && repeated_callbacks == static_cast<uint32_t>(repeated)
+                && stream.base_frame_attempt == attempts_prefix + 4 + repeated
+                && native::features.at(sr_handle).sr_sequence == sequence_prefix + 4,
+            "ordinary G adds one downstream output and R one OnPresent on the same four actual SR calls");
+      std::cout << "PRESENT_POLICY_CONSUMERS route=ordinary generated=" << generated << " repeated=" << repeated
+                << " application_callbacks=" << stream.base_frame_attempt - attempts_prefix
+                << " downstream_outputs=" << downstream_outputs << '\n';
     }
+    game_pixel = GAME_PIXEL;
+
+    present_frame(true);
+    const auto original_source = native::present_streams.at(&output).base_frame_clock.frame;
+    const auto original_handle = sr_handle;
+    auto original_sr_output = sr_output;
+    const auto original_pixels = read_back();
+    swap();
+    Check(native::HookedReleaseFeatureSlot<0>(sr_handle) == NVSDK_NGX_Result_Success,
+          "release the old SR source before a genuine replacement Create");
+    create_source();
+    const auto replacement_prefix = stats();
+    game_pixel = OVERWRITE_PIXEL;
+    present_frame();
+    const auto& replacement = native::present_streams.at(&output).base_frame_clock;
+    Check(sr_handle != original_handle && replacement.frame.source == reinterpret_cast<uintptr_t>(sr_handle)
+              && replacement.frame.source != original_source.source && sr_output.Get() != original_sr_output.Get()
+              && replacement.frame.generation != original_source.generation && replacement.frame.sequence == 1
+              && replacement.complete && replacement.outputs == replacement_prefix.base_outputs + 1
+              && model_calls == replacement_prefix.calls + 1 && model_resets.back() == 1,
+          "real replacement SR source starts at its own first frame with independent model history and Reset");
+    const auto replacement_pixels = read_back();
+    alpha_preserved(replacement_pixels);
+    Check(replacement_pixels != original_pixels, "replacement source delivers its own current RGBA");
+    original_sr_output.Reset();
+    swap();
     game_pixel = GAME_PIXEL;
 
     {
@@ -622,6 +767,13 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     Check(SUCCEEDED(gpu.list->Close()), "close the empty list before discarded-frame readback");
     unchanged_pixels(read_back(), GAME_PIXEL);
     swap();
+    const auto before_discard_recovery = stats();
+    present_frame();
+    Check(stats().base_outputs == before_discard_recovery.base_outputs + 1 && model_calls == before_discard_recovery.calls + 1
+              && model_resets.back() == 1,
+          "the next ordered SR producer recovers from discarded base delivery with Reset");
+    reopen();
+    swap();
 
     before = stats();
     record();
@@ -632,6 +784,13 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     event();
     no_output(before, stats(), "submitting a declined producer cannot reopen the same base frame");
     unchanged_pixels(read_back(), GAME_PIXEL);
+    swap();
+    const auto before_order_recovery = stats();
+    present_frame();
+    Check(stats().base_outputs == before_order_recovery.base_outputs + 1 && model_calls == before_order_recovery.calls + 1
+              && model_resets.back() == 1,
+          "the next ordered SR producer recovers from an unsubmitted base with Reset");
+    reopen();
     swap();
 
     before = stats();
@@ -977,6 +1136,322 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
               && every_repeat.outputs == every_first.outputs + 1 && every_repeat.reuses == before.reuses,
           "Every Present still runs per present without x2 provenance or a fresh guide serial");
 
+    const auto config_file = native::ReShadeBaseDirectory() / L"ReShade.ini";
+    const HANDLE created = CreateFileW(config_file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    Check(created != INVALID_HANDLE_VALUE, "create the fixture INI in the runner output without replacing an existing file");
+    const auto clean_config = [](const std::filesystem::path* file) {
+      present_fixture_ini.clear();
+      std::error_code ignored;
+      std::filesystem::remove(*file, ignored);
+    };
+    const std::unique_ptr<const std::filesystem::path, decltype(clean_config)> config_cleanup(&config_file, clean_config);
+    CloseHandle(created);
+    present_fixture_ini = config_file;
+    const auto load_present_mode = [&](const char* present_frames) {
+      std::ofstream ini(present_fixture_ini, std::ios::trunc);
+      ini << '[' << native::kConfigSection << "]\nConfigVersion=" << native::kConfigVersion
+          << "\nNeuralUplift=1\nEnableHooks=2\nNREditReuse=1\nNRHookPoint=" << native::kHookPresent
+          << "\nNRPasses=1\nNRPreset=2\nNRPresentPreFg=0\nNRPresentGuides=" << native::kPresentGuidesRequired
+          << "\nNRPresentBlockHudlessConfigVersion=1\nNRPresentBlockHudless=1\nNRPresentUICorrection=0"
+             "\nNRCodecMode=0\nNRFeedMode=1\nNRNormGovernor=0\nNRLookMode=0\nNRFollowInputRes=0"
+             "\nNRAdaptiveEnabled=0\nNRResolutionScale=1\nNRDetailStability=1\nNRControlMaskEnabled=0"
+             "\nNRAutoMask=0\nNRCostMeter=0\nNRGpuTimers=0\nNRTransferStrength=1\nNRColorStrength=1\nNRIntensity=1"
+             "\nNRChromaClamp=2\nNRDiffuseWhiteNits=200\nNRPresentWhiteNits=200\n";
+      if (present_frames != nullptr) {
+        ini << "NRPresentFrames=" << present_frames << '\n';
+      }
+      ini.close();
+      Check(ini.good(), "write the old INI before loading production settings");
+      const auto saved = native::ReadPresentRestoreRaw("NRPresentFrames");
+      Check(present_frames == nullptr ? !saved.has_value() : saved == present_frames,
+            "file-backed ReShade config distinguishes missing and explicit NRPresentFrames");
+      native::LoadConfiguration();
+      const uint32_t expected = (present_frames != nullptr && present_frames[0] == '1' ? 1u : 0u);
+      Check(native::enabled && native::edit_reuse_enabled && native::hook_point == native::kHookPresent
+                && native::stack_passes == 1 && native::present_frames == expected,
+            "production INI loader keeps NR/x2 requested and resolves the selected legacy Present mode");
+    };
+    reopen();
+    for (const char* value : {static_cast<const char*>(nullptr), "0"}) {
+      load_present_mode(value);
+      const auto& stream = native::present_streams.at(&output);
+      const auto& clock = stream.base_frame_clock;
+      const auto& source = native::features.at(sr_handle);
+      const auto source_sequence = source.sr_sequence;
+      const auto claims = clock.claims;
+      const auto before_proven = stats();
+      present_frame();
+      const auto proven = stats();
+      Check(clock.claims == claims + 1 && clock.frame.sequence == source_sequence + 1
+                && clock.frame.generation == source.source_generation
+                && clock.frame.source == reinterpret_cast<uintptr_t>(sr_handle)
+                && !clock.frame.reuse_edits && native::present_frames == 0 && !native::WantsPresentBaseFrames()
+                && clock.complete && proven.base_outputs == before_proven.base_outputs + 1
+                && proven.calls == before_proven.calls + 1 && proven.outputs == before_proven.outputs + 1
+                && proven.refreshes == before_proven.refreshes && proven.reuses == before_proven.reuses,
+            "missing and explicit zero INIs recognize a proven source while retaining Every present and disabling old x2");
+      event();
+      const auto repeated = stats();
+      Check(clock.claims == claims + 1 && repeated.calls == proven.calls + 1 && repeated.outputs == proven.outputs + 1
+                && repeated.base_outputs == proven.base_outputs
+                && repeated.refreshes == proven.refreshes && repeated.reuses == proven.reuses,
+            "Every present repeats legacy execution without counting a new base or running old x2");
+      reopen();
+      swap();
+    }
+
+    {
+      ComPtr<ID3D12CommandAllocator> writer_allocator;
+      ComPtr<ID3D12GraphicsCommandList> writer;
+      Check(SUCCEEDED(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&writer_allocator)))
+                && SUCCEEDED(gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, writer_allocator.Get(),
+                                                           nullptr, IID_PPV_ARGS(&writer))),
+            "Every present race records a second game thread's Backbuffer writer in advance");
+      auto* const current_buffer = back();
+      const auto game_list = gpu.list;
+      gpu.list = writer;
+      const auto produced = stages::Capture(gpu, current_buffer, PRESENT);
+      upload(current_buffer, OVERWRITE_PIXEL, PRESENT);
+      const auto written = stages::Capture(gpu, current_buffer, PRESENT);
+      const auto writer_uploads = std::exchange(gpu.retained_resources, {});
+      gpu.list = game_list;
+      Check(SUCCEEDED(writer->Close()), "Every present race closes its independent BB writer before the SR producer");
+
+      record();
+      submit();
+      const auto before_race = stats();
+      const auto& stream = native::present_streams.at(&output);
+      const auto& clock = stream.base_frame_clock;
+      const auto source_sequence = native::features.at(sr_handle).sr_sequence;
+      const auto order = native::present_queue_order.load();
+      Check(order != nullptr && order->queue == gpu.queue.Get() && native::present_frames == 0,
+            "Every present race uses the actual SR producer's associated presentation queue");
+      const auto producer_entry = order->entered.load();
+      const auto submit_entries = native::queue_submit_entries.load();
+      uint32_t observed_gates = 0;
+      {
+        ParkedExecute gate(gpu.queue.Get(), writer.Get());
+        const auto clear_observer = [](int*) { model_parameter_observer = {}; };
+        int observer_key = 0;
+        const std::unique_ptr<int, decltype(clear_observer)> observer_cleanup(&observer_key, clear_observer);
+        model_parameter_observer = [&](const NVSDK_NGX_Handle* model, const NVSDK_NGX_Parameter*) {
+          Check(observed_gates++ == 0 && model == native::features.at(stream.Handle()).slots[0].handle
+                    && clock.claims == before_race.base_claims + 1 && clock.outputs == before_race.base_outputs
+                    && !clock.complete && clock.frame.source == reinterpret_cast<uintptr_t>(sr_handle)
+                    && clock.frame.generation == native::features.at(sr_handle).source_generation
+                    && clock.frame.sequence == source_sequence && clock.frame.output_epoch == stream.base_frame_epoch
+                    && !clock.frame.reuse_edits && stream.nr_presents == before_race.outputs
+                    && native::present_ring.submitted == before_race.ring_submissions,
+                "Every present has identified the real SR frame before its model call and private submission");
+          const auto guides = std::ranges::find_if(native::present_guide_sets, [&](const auto& candidate) {
+            return candidate.source_handle == sr_handle && candidate.base_frame.sequence == source_sequence
+                && candidate.base_frame.backbuffer == renodx::utils::directx::NativeIdentity(current_buffer);
+          });
+          Check(guides != std::end(native::present_guide_sets) && guides->base_frame.sealed && guides->base_frame.attempted
+                    && guides->base_frame.queue_entry == producer_entry && order->entered.load() == producer_entry,
+                "Every present race starts after successful SR-to-current-BB identification with an exact queue receipt");
+          std::jthread concurrent_writer([&] {
+            ID3D12CommandList* lists[]{writer.Get()};
+            native::HookedQueueExecuteCommandLists(gpu.queue.Get(), 1, lists);
+          });
+          const auto parked = WaitForSingleObject(gate.entered.get(), ParkedExecute::TIMEOUT_MS);
+          const auto entered = order->entered.load();
+          const bool still_parked = !gate.forwarded.load();
+          const bool released = SetEvent(gate.release.get()) != FALSE;
+          concurrent_writer.join();
+          Check(parked == WAIT_OBJECT_0 && entered == producer_entry + 1 && still_parked
+                    && released && gate.release_wait == WAIT_OBJECT_0 && gate.forwarded.load(),
+                "another real game thread enters the same queue after Identify and forwards the pre-recorded BB writer");
+          const std::unique_lock verify(order->submit_mutex, std::try_to_lock);
+          Check(verify.owns_lock() && order->entered.load() == producer_entry + 1
+                    && guides->base_frame.queue_entry == producer_entry && clock.outputs == before_race.base_outputs,
+                "writer has returned before Present submission so the held-lock queue-entry comparison must reject old provenance");
+        };
+        event();
+        Check(observed_gates == 1, "Every present race reaches the real model parameter observation exactly once");
+      }
+
+      const auto raced = stats();
+      const auto raced_reset = model_resets.back();
+      Check(raced.base_claims == before_race.base_claims + 1 && raced.base_outputs == before_race.base_outputs
+                && !raced.base_complete && clock.frame.sequence == source_sequence
+                && raced.calls == before_race.calls + 1 && raced_reset == 0 && raced.outputs == before_race.outputs + 1
+                && raced.ring_submissions == before_race.ring_submissions + 1
+                && raced.refreshes == before_race.refreshes && raced.reuses == before_race.reuses
+                && native::queue_submit_entries.load() == submit_entries + 2 && native::present_frames == 0,
+            "late BB writer prevents complete/base-output publication while Every present still evaluates and submits once");
+      const auto all_pixels = [&](const stages::Snapshot& snapshot, Pixel expected) {
+        const auto bytes = snapshot.Pixels();
+        const std::vector pixels(size * size, expected);
+        return bytes.size() == pixels.size() * sizeof(Pixel)
+            && std::memcmp(bytes.data(), pixels.data(), bytes.size()) == 0;
+      };
+      Check(all_pixels(produced, GAME_PIXEL) && all_pixels(written, OVERWRITE_PIXEL),
+            "racing game list reads the successful SR image then writes every expected FP16 Backbuffer pixel on the GPU");
+      const auto raced_pixels = read_back();
+      Check(raced_pixels != std::vector(size * size, OVERWRITE_PIXEL)
+                && std::ranges::all_of(raced_pixels, [](const Pixel& pixel) { return pixel[3] == OVERWRITE_PIXEL[3]; }),
+            "Every present delivers its actual edited color with the racing writer's current alpha");
+      const auto raced_frame = clock.frame;
+      swap();
+      const auto before_recovery = stats();
+      present_frame();
+      const auto recovered = stats();
+      Check(recovered.base_claims == before_recovery.base_claims + 1
+                && recovered.base_outputs == before_recovery.base_outputs + 1 && recovered.base_complete
+                && clock.frame.source == raced_frame.source && clock.frame.generation == raced_frame.generation
+                && clock.frame.output_epoch == raced_frame.output_epoch && clock.frame.sequence == source_sequence + 1
+                && !clock.frame.reuse_edits && recovered.calls == before_recovery.calls + 1 && model_resets.back() == 1
+                && recovered.outputs == before_recovery.outputs + 1
+                && recovered.ring_submissions == before_recovery.ring_submissions + 1
+                && recovered.refreshes == before_recovery.refreshes && recovered.reuses == before_recovery.reuses,
+            "the next actual ordered SR copy recovers a complete Every present base product and sends model Reset");
+      alpha_preserved(read_back());
+      swap();
+      std::cout << "PRESENT_EVERY_ORDER_RACE producer_entry=" << producer_entry
+                << " writer_entry=" << producer_entry + 1 << " claimed_sequence=" << source_sequence
+                << " calls=" << raced.calls - before_race.calls << " reset=" << raced_reset
+                << " outputs=" << raced.base_outputs - before_race.base_outputs
+                << " complete=" << raced.base_complete << " recovery_outputs=" << recovered.base_outputs - raced.base_outputs
+                << " recovery_reset=" << model_resets.back() << '\n';
+    }
+
+    {
+      namespace signal_fault = present_stage_resolution_cases;
+      ComPtr<ID3D12QueryHeap> execution_query;
+      const D3D12_QUERY_HEAP_DESC query_desc{.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP, .Count = 1};
+      Check(SUCCEEDED(gpu.device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&execution_query))),
+            "Every present Signal failure observes actual model GPU execution");
+      const auto execution_readback = gpu.Buffer(sizeof(uint64_t), D3D12_HEAP_TYPE_READBACK);
+      const auto execution_stamp = [&] {
+        uint64_t* mapped = nullptr;
+        Check(SUCCEEDED(execution_readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped))),
+              "Every present Signal failure reads the completed GPU timestamp");
+        const auto stamp = *mapped;
+        execution_readback->Unmap(0, nullptr);
+        return stamp;
+      };
+      funnel_accounting_tests::Restore substitutions;
+      substitutions.Value(&model_execution_query);
+      substitutions.Value(&model_execution_readback);
+      substitutions.Value(&model_parameter_observer);
+      substitutions.Value(&signal_fault::real_signal);
+      substitutions.Value(&signal_fault::fail_signal);
+      model_execution_query = execution_query.Get();
+      model_execution_readback = execution_readback.Get();
+      signal_fault::fail_signal = false;
+      signal_fault::real_signal = reinterpret_cast<signal_fault::SignalFn>((*reinterpret_cast<void***>(gpu.queue.Get()))[14]);
+      Check(DetourTransactionBegin() == NO_ERROR && DetourUpdateThread(GetCurrentThread()) == NO_ERROR
+                && DetourAttach(reinterpret_cast<PVOID*>(&signal_fault::real_signal),
+                                reinterpret_cast<PVOID>(signal_fault::Signal)) == NO_ERROR
+                && DetourTransactionCommit() == NO_ERROR,
+            "Every present reuses the scoped Present ring Signal fault detour");
+      const auto unhook_signal = [](int*) {
+        signal_fault::fail_signal = false;
+        DetourTransactionBegin();
+        DetourUpdateThread(GetCurrentThread());
+        DetourDetach(reinterpret_cast<PVOID*>(&signal_fault::real_signal), reinterpret_cast<PVOID>(signal_fault::Signal));
+        DetourTransactionCommit();
+      };
+      int hook_key = 0;
+      const std::unique_ptr<int, decltype(unhook_signal)> signal_hook(&hook_key, unhook_signal);
+
+      const auto before_first = stats();
+      present_frame();
+      const auto first = stats();
+      const auto& stream = native::present_streams.at(&output);
+      const auto& clock = stream.base_frame_clock;
+      const auto first_frame = clock.frame;
+      const auto first_execution = execution_stamp();
+      Check(first.base_complete && !stream.base_history_unbound && !clock.frame.reuse_edits
+                && first.base_claims == before_first.base_claims + 1 && first.base_outputs == before_first.base_outputs + 1
+                && first.calls == before_first.calls + 1 && first.ring_submissions == before_first.ring_submissions + 1
+                && native::present_frames == 0 && first_execution != 0,
+            "F1 first completes an identified Every present output with actual GPU execution");
+      bool repeated_complete_seen = false;
+      model_parameter_observer = [&](const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter*) {
+        Check(clock.complete && !stream.base_history_unbound && clock.claims == first.base_claims
+                  && clock.outputs == first.base_outputs && clock.frame.sequence == first_frame.sequence,
+              "same-F1 Every present Evaluate begins with the old completed product still published");
+        repeated_complete_seen = true;
+      };
+      ComPtr<ID3D12Fence> execution_gate;
+      Check(SUCCEEDED(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&execution_gate)))
+                && SUCCEEDED(gpu.queue->Wait(execution_gate.Get(), 1)),
+            "hold the real repeated-F1 GPU submission while checking Signal failure retention");
+      Observed failed;
+      try {
+        signal_fault::fail_signal = true;
+        native::OnPresent(&output.queue, &output, nullptr, nullptr, 0, nullptr);
+        model_parameter_observer = {};
+        failed = stats();
+        Check(repeated_complete_seen && !signal_fault::fail_signal
+                  && failed.base_claims == first.base_claims && failed.base_outputs == first.base_outputs
+                  && !failed.base_complete && stream.base_history_unbound
+                  && clock.frame.sequence == first_frame.sequence
+                  && failed.calls == first.calls + 1 && model_resets.back() == 0
+                  && failed.outputs == first.outputs + 1 && failed.ring_submissions == first.ring_submissions + 1,
+              "same-F1 Execute followed by failed Signal withdraws old completion without publishing another base output");
+        const addon::RuntimeLock lock(native::runtime_mutex);
+        const auto& pending = native::present_ring.slots[failed.ring_submissions % native::kPresentRing];
+        Check(pending.list != nullptr && pending.allocator != nullptr && pending.value == failed.ring_submissions
+                  && !native::PresentRingComplete() && !native::ReleasePresentRing(),
+              "failed Signal retains the genuinely in-flight Present list, allocator and owned work until completion");
+      } catch (...) {
+        model_parameter_observer = {};
+        execution_gate->Signal(1);
+        finish();
+        throw;
+      }
+      Check(SUCCEEDED(execution_gate->Signal(1)), "release the actual repeated-F1 GPU submission");
+      finish();
+      const auto repeated_execution = execution_stamp();
+      Check(repeated_execution > first_execution && !native::PresentRingComplete(),
+            "an independent real Fence proves repeated-F1 GPU execution while its failed ring Signal remains unproven");
+      const auto pixels = read_back();
+      alpha_preserved(pixels);
+      Check(pixels != std::vector(size * size, GAME_PIXEL), "the failed-Signal submission actually writes edited BB pixels");
+      swap();
+
+      present_frame();
+      const auto recovered = stats();
+      Check(recovered.base_claims == failed.base_claims + 1 && recovered.base_outputs == failed.base_outputs + 1
+                && recovered.base_complete && !stream.base_history_unbound
+                && native::present_frame_policy::SameSource(first_frame, clock.frame)
+                && clock.frame.sequence == first_frame.sequence + 1 && !clock.frame.reuse_edits
+                && recovered.calls == failed.calls + 1 && model_resets.back() == 1
+                && recovered.outputs == failed.outputs + 1 && recovered.ring_submissions == failed.ring_submissions + 1
+                && recovered.refreshes == first.refreshes && recovered.reuses == first.reuses
+                && native::PresentRingComplete()
+                && native::present_ring.fence->GetCompletedValue() >= failed.ring_submissions,
+            "next actual F2 resets model history and its successful same-queue Signal proves both submissions complete");
+      alpha_preserved(read_back());
+      swap();
+      std::cout << "PRESENT_EVERY_SIGNAL_FAILURE sequence=" << first_frame.sequence
+                << " gpu_execution=" << first_execution << ',' << repeated_execution
+                << " complete=" << failed.base_complete << " base_outputs=" << failed.base_outputs - first.base_outputs
+                << " recovery_outputs=" << recovered.base_outputs - failed.base_outputs
+                << " recovery_reset=" << model_resets.back() << '\n';
+    }
+    load_present_mode("1");
+    const auto before_unproven = stats();
+    evaluate_sr(false, true);
+    upload(back(), OVERWRITE_PIXEL, PRESENT);
+    submit();
+    event();
+    const auto unproven = stats();
+    no_output(before_unproven, unproven, "explicit one cannot obtain a base product without the actual SR-to-current-BB copy");
+    Check(unproven.base_claims == before_unproven.base_claims
+              && unproven.game_observations == before_unproven.game_observations,
+          "successful game SR and valid guides alone cannot advance claimed ordinary Present history");
+    unchanged_pixels(read_back(), OVERWRITE_PIXEL);
+    swap();
+    const auto before_ini_recovery = stats();
+    present_frame();
+    Check(stats().base_outputs == before_ini_recovery.base_outputs + 1 && model_calls == before_ini_recovery.calls + 1
+              && model_resets.back() == 1,
+          "explicit one recovers when the next producer copies its successful SR output to the current BB");
+
     Check(native::HookedReleaseFeatureSlot<0>(sr_handle) == NVSDK_NGX_Result_Success, "release resized game SR");
     native::RetirePresentStream(&output);
     Check(native::ReleasePresentPath(), "Present x2 releases completed private recordings");
@@ -1003,9 +1478,9 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
       std::cerr << "FAIL Present x2 recycled recording must bypass the Draw/Dispatch source observer runtime lock\n";
     }
     if (!preserves_cross_epoch_writer || !reset_observer_bypassed) return 1;
-    std::cout << "PASS ordinary D3D12 Present x2 WARP+MOCK: prepared/output, 1/0/1/0 pixels, duplicate, "
+    std::cout << "PASS ordinary D3D12 Present x2 WARP+MOCK: A/G/R 1/0/1/0 ordered RGBA, source replacement, prepared/output, "
                  "wrong buffer, discarded producer, missing jitter, late writes, failed model, "
-                 "XeFG ownership, DXGI resize, cross-epoch writer, recycled list and legacy Every Present\n";
+                 "XeFG ownership, DXGI resize, cross-epoch writer, recycled list and legacy INI source/strategy\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "FAIL ordinary Present x2: " << error.what() << '\n';

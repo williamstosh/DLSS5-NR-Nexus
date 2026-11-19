@@ -8,28 +8,42 @@ $repo = Split-Path $PSScriptRoot -Parent
 $OutputDirectory = Initialize-TestOutput $OutputDirectory
 $previousCl = $env:CL
 $outcome = 'Failed'
-$suites = @('native','sdr-policy','hdr-policy','scope','config','constants','stage-plan','edit-reuse-policy',
-    'adaptive-resolution','copy-slots','lifecycle','fg-native')
+$policySuites = @('edit-reuse-policy','present-frame-policy')
+$suites = @('native','sdr-policy','hdr-policy','scope','config','constants','stage-plan') +
+    $policySuites + @('adaptive-resolution','copy-slots','lifecycle','fg-native')
 $independentCases = [ordered]@{
     'native-prefg-resolution'='^PASS native-prefg-resolution hardware=0 steady_pairs_observed='
     'present-chain'='^PASS B1 WARP format=DXGI_FORMAT_R8G8B8A8_UNORM source_input='
     'nr-edit-reuse-contracts-public'='^PASS case=nr-edit-reuse-contracts-public evidence=WARP\+MOCK dev=0$'
     'nr-edit-reuse-render-contracts'='^PASS case=nr-edit-reuse-render-contracts evidence=WARP\+MOCK dev=0$'
+    'nr-edit-reuse-present-contracts'='^PASS case=nr-edit-reuse-present-contracts evidence=WARP\+MOCK dev=0$'
+    'nr-edit-reuse-xefg-contracts'='^PASS case=nr-edit-reuse-xefg-contracts evidence=WARP\+MOCK dev=0$'
 }
+$devCases = @('nr-edit-reuse-native-contracts','native-present-decision')
 $summary = [ordered]@{ schema='nr-nexus-ci-core/1'; status='Running'
     sourceCommit=(& git --no-optional-locks -C $repo rev-parse HEAD)
     sourceTree=(& git --no-optional-locks -C $repo rev-parse 'HEAD^{tree}')
     evidence='STATIC / CPU / WARP+MOCK'; suites=$suites; independent=@() }
+
+function Get-CoreCaseReceipt([string]$Case, [string]$Stdout, [string]$Pattern) {
+    # A mistyped flag can return zero after running the default FG group.
+    $receipts = @(Get-Content -LiteralPath $Stdout | Where-Object { $_ -cmatch $Pattern })
+    if ($receipts.Count -ne 1) { throw "Missing or ambiguous receipt for $Case`: $Stdout" }
+    return $receipts[0]
+}
+
 try {
     # -SoftwareOnly controls runner selection; the compile guard also rejects
     # any accidental native adapter path inside the existing FG fixtures.
     $env:CL = ($previousCl + ' /DNR_NEXUS_TEST_WARP_ONLY').Trim()
     $suiteOutput = Join-Path $OutputDirectory 'suites'
     & (Join-Path $PSScriptRoot 'run-tests.ps1') -Suite $suites -SoftwareOnly -UiPreview None -OutputDirectory $suiteOutput -RetentionMode Standard
-    $policy = Get-Content -LiteralPath (Join-Path $suiteOutput 'edit-reuse-policy/result.json') -Raw | ConvertFrom-Json
-    if ($policy.suite -cne 'edit-reuse-policy' -or $policy.build -cne 'passed' -or $policy.run -cne 'passed' -or
-        $policy.dependency_policy -cne 'passed') {
-        throw 'Edit reuse policy requires a passing CPU run and STATIC dependency check.'
+    foreach ($policySuite in $policySuites) {
+        $policy = Get-Content -LiteralPath (Join-Path $suiteOutput "$policySuite/result.json") -Raw | ConvertFrom-Json
+        if ($policy.suite -cne $policySuite -or $policy.build -cne 'passed' -or $policy.run -cne 'passed' -or
+            $policy.dependency_policy -cne 'passed') {
+            throw "$policySuite requires a passing CPU run and STATIC dependency check."
+        }
     }
     $fg = Join-Path $suiteOutput 'fg-native'
     $executable = Join-Path $fg 'fg_native_tests.exe'
@@ -40,16 +54,28 @@ try {
         }
         $directory = Initialize-TestOutput (Join-Path $OutputDirectory $case)
         Invoke-TestProcess $executable $directory 'test' @("--$case") -TimeoutMilliseconds 180000
-        # A mistyped flag can return zero after running the default FG group.
-        $stdout = Join-Path $directory 'test.stdout.log'
-        $receipts = @(Get-Content -LiteralPath $stdout | Where-Object { $_ -cmatch $independentCases[$case] })
-        if ($receipts.Count -ne 1) { throw "Missing or ambiguous receipt for $case`: $stdout" }
+        $receipt = Get-CoreCaseReceipt $case (Join-Path $directory 'test.stdout.log') $independentCases[$case]
         Complete-TestOutput $directory
-        $summary.independent += @{name=$case;status='Passed';evidence='WARP+MOCK';receipt=$receipts[0]
+        $summary.independent += @{name=$case;status='Passed';evidence='WARP+MOCK';receipt=$receipt
             executableSha256=(Get-FileHash -LiteralPath $executable).Hash}
     }
     foreach ($input in $inputs) {
         if ((Get-FileHash -LiteralPath $input.path).Hash -cne $input.sha256) { throw "Core input changed: $($input.path)" }
+    }
+
+    # The Native x2 contract selects the DEV macro for this separate FG binary.
+    $devOutput = Join-Path $OutputDirectory 'dev-suites'
+    & (Join-Path $PSScriptRoot 'run-tests.ps1') -Suite fg-native -NativeCase $devCases -SoftwareOnly -UiPreview None -OutputDirectory $devOutput -RetentionMode Standard
+    $devFg = Join-Path $devOutput 'fg-native'
+    $devResult = Get-Content -LiteralPath (Join-Path $devFg 'result.json') -Raw | ConvertFrom-Json
+    if ($devResult.suite -cne 'fg-native' -or $devResult.build -cne 'passed' -or $devResult.run -cne 'passed') {
+        throw 'Native DEV contracts require a passing FG build and run.'
+    }
+    $devExecutableHash = (Get-FileHash -LiteralPath (Join-Path $devFg 'fg_native_tests.exe')).Hash
+    foreach ($case in $devCases) {
+        $receipt = Get-CoreCaseReceipt $case (Join-Path $devFg "$case.stdout.log") "^PASS case=$case evidence=WARP\+MOCK dev=1$"
+        $summary.independent += @{name=$case;status='Passed';evidence='WARP+MOCK';receipt=$receipt
+            executableSha256=$devExecutableHash}
     }
     $outcome = 'Passed'
 } finally {

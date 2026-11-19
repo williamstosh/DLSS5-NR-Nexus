@@ -10,14 +10,104 @@
 #include <cstdint>
 #include <cstring>
 #include <DirectXPackedVector.h>
+#include <functional>
 #include <iostream>
 #include <memory>
+#include <tuple>
 #include <utility>
 #include <vector>
+
+#include <present_frame_policy.hpp>
+#include <utils/hash.hpp>
 
 // Included after the shared XeFG adapter host and the NR model substitutes.
 namespace nr_edit_reuse_xefg_cases {
 namespace addon = renodx::addons::dlss5;
+namespace policy = native::present_frame_policy;
+
+using PresentPixel = std::array<uint16_t, 4>;
+constexpr std::array<PresentPixel, 4> PRESENT_SOURCE_PIXELS{{
+    {0x3400, 0x3600, 0x3800, 0x3900}, {0x3400, 0x3600, 0x3800, 0x3800},
+    {0x3400, 0x3600, 0x3800, 0x3a00}, {0x3400, 0x3600, 0x3800, 0x3b00}}};
+
+enum class PresentTrace { BASELINE, GENERATED_OUTPUT, REPEATED_CONSUMPTION };
+
+struct PresentTraceFrame {
+  uint32_t evaluates = 0;
+  int reset = -1;
+  uint64_t sequence = 0;
+  uint64_t history_sequence = 0;
+  uint64_t anchor_sequence = 0;
+  uint64_t anchor_generation = 0;
+  uint64_t anchor_age = 0;
+  uint64_t reuses = 0;
+  bool complete = false;
+  std::vector<uint8_t> rgba;
+
+  bool operator==(const PresentTraceFrame&) const = default;
+};
+
+inline auto PresentClockState(const policy::Clock& clock) {
+  const auto& frame = clock.frame;
+  return std::tuple{clock.claims, clock.outputs, clock.complete, frame.source, frame.generation, frame.sequence,
+                    frame.output_epoch, frame.pass_begin, frame.pass_count, frame.roles, frame.reuse_edits};
+}
+
+inline void CheckPresentTraceFrame(const PresentTraceFrame& frame, uint32_t index, const char* route) {
+  constexpr uint32_t WIDTH = 16;
+  const bool refresh = index % 2 == 0;
+  Check(frame.complete && frame.evaluates == (refresh ? 1u : 0u)
+            && frame.reset == (refresh ? (index == 0 ? 1 : 0) : -1)
+            && frame.sequence == index + 1 && frame.history_sequence == index + 1
+            && frame.anchor_sequence == (index / 2) * 2 + 1 && frame.anchor_generation == index / 2 + 1
+            && frame.anchor_age == index % 2 && frame.reuses == (refresh ? 0u : 1u),
+        "Present baseline delivers one complete BB per real base with exact model, Reset and history cadence");
+  Check(frame.rgba.size() == WIDTH * WIDTH * sizeof(PresentPixel), "Present reads back the entire scRGB output");
+  const auto& original = PRESENT_SOURCE_PIXELS[index];
+  for (size_t offset = 0; offset < frame.rgba.size(); offset += sizeof(original)) {
+    PresentPixel pixel;
+    std::memcpy(pixel.data(), frame.rgba.data() + offset, sizeof(pixel));
+    Check(pixel[3] == original[3], "Present output preserves every pixel's current alpha");
+  }
+  std::cout << "PRESENT_POLICY_BASE route=" << route << " base=" << index + 1 << " calls=" << frame.evaluates
+            << " reset=" << frame.reset << " history=" << frame.history_sequence
+            << " anchor_base=" << frame.anchor_sequence << " anchor_generation=" << frame.anchor_generation
+            << " anchor_age=" << frame.anchor_age << " complete=" << frame.complete
+            << " rgba_crc32=" << renodx::utils::hash::ComputeCRC32(frame.rgba.data(), frame.rgba.size()) << '\n';
+}
+
+inline std::vector<uint8_t> ConsumeGeneratedOutput(Gpu* gpu, ID3D12Resource* delivered) {
+  // The downstream stand-in emits a separate surface from the first delivery.
+  // Reading it on the presentation queue proves an extra GPU consumption.
+  const auto desc = delivered->GetDesc();
+  auto generated = gpu->Texture(static_cast<uint32_t>(desc.Width), desc.Height, desc.Format);
+  auto readback = gpu->CreateTextureTransfer(generated.Get());
+  gpu->Transition(delivered, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  gpu->Transition(generated.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+  gpu->list->CopyResource(generated.Get(), delivered);
+  gpu->Transition(generated.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  gpu->RecordTextureReadback(generated.Get(), readback);
+  gpu->Transition(delivered, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+  gpu->Submit();
+  return gpu->ReadTexture(readback);
+}
+
+static std::function<void(IDXGISwapChain*)> consume_sdk_present;
+
+HRESULT STDMETHODCALLTYPE ConsumeSdkPresent(IDXGISwapChain* swapchain, UINT interval, UINT flags) {
+  if (consume_sdk_present) consume_sdk_present(swapchain);
+  return FakePresent(swapchain, interval, flags);
+}
+
+NVSDK_NGX_Result NVSDK_CONV EvaluatePresentEdit(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle,
+    const NVSDK_NGX_Parameter* parameters, PFN_NVSDK_NGX_ProgressCallback callback) {
+  const auto game_list = model_gpu->list;
+  model_gpu->list = list;
+  const auto restore = [&](int*) { model_gpu->list = game_list; };
+  int key = 0;
+  const std::unique_ptr<int, decltype(restore)> restore_list(&key, restore);
+  return nr_edit_reuse_gpu_cases::ConstantModel(list, handle, parameters, callback);
+}
 
 static std::vector<uint16_t> model_pixels;
 
@@ -69,6 +159,7 @@ int Run() {
     model_released_handles.clear();
     fail_call = 0;
     native::enabled = true;
+    native::monitor_requested = true;
     native::hooks_enabled = true;
     native::shutdown_quiesce_enabled = false;
     native::hook_point = native::kHookPresent;
@@ -89,6 +180,7 @@ int Run() {
     native::control_mask_enabled = false;
     native::use_auto_mask = false;
     native::cost_meter_enabled = false;
+    native::telemetry_seconds = 0;
     native::gpu_timers_enabled = false;
     native::transfer_strength = 1.f;
     native::color_strength = 1.f;
@@ -140,13 +232,15 @@ int Run() {
     adapter::modules[0].real[3] = reinterpret_cast<void*>(&FakeResource);
     adapter::modules[0].real[4] = reinterpret_cast<void*>(&FakeConstants);
     adapter::modules[0].real[5] = reinterpret_cast<void*>(&FakeId);
-    adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakePresent);
+    adapter::modules[0].real[7] = reinterpret_cast<void*>(+[](void*, int32_t) { return sdk_status; });
+    adapter::proxies[0].real[0] = reinterpret_cast<void*>(&ConsumeSdkPresent);
     adapter::proxies[0].real[1] = reinterpret_cast<void*>(&FakePresent1);
     xefg::Configure(&native::fg_service::Service, &native::fg_service::PrepareCapture,
                     &native::fg_service::Retire, &native::fg_service::Requested);
     for (const bool pq : {false, true}) {
       native::direct_api.evaluate = (pq ? EditedModel : nr_edit_reuse_gpu_cases::NeutralModel);
       native::codec_mode = (pq ? 3u : 0u);
+      native::present_white_nits = (pq ? 0.f : 200.f);
       native::transfer_mode = 0;
       native::style_highlight_guard = 0.f;
       native::chroma_clamp_stops = 2.f;
@@ -161,8 +255,8 @@ int Run() {
       upload(motion.Get(), std::vector<uint16_t>(guide_width * guide_height * 2, 0), D3D12_RESOURCE_STATE_COMMON,
              NATIVE_INPUT_STATE, guide_width * 4);
       gpu.Submit();
-      Session session(&gpu, 1, 0, pq ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT);
-      session.context->ui_composition = false;
+      Session session(&gpu, pq ? 1 : 0, 0, pq ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT);
+      Check(Hooks::UiState(session.handle, 0) == 0, "start XeFG without a required HUDLess role");
       session.context->color_space = (pq ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 : DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
       session.extent_left = session.extent_top = 0;
       session.extent_width = width;
@@ -237,6 +331,7 @@ int Run() {
       };
       uint32_t source_frame = 0;
       uint32_t present_id = 0;
+      const PresentPixel* trace_color = nullptr;
       struct Observation {
         fg::Result result = fg::Result::NOT_SERVED;
         uint32_t evaluates = 0;
@@ -245,7 +340,8 @@ int Run() {
         std::vector<uint8_t> pixels;
       };
       enum class Change { NONE, MOTION, DEPTH, COLOR };
-      const auto frame = [&](bool reset, bool guides = true, Change change = Change::NONE) {
+      const auto frame = [&](bool reset, bool guides = true, Change change = Change::NONE,
+                             ID3D12Resource* hudless = nullptr, bool unsubmitted_guides = false) {
         ++source_frame;
         ++present_id;
         ComPtr<ID3D12Resource> backbuffer;
@@ -256,6 +352,7 @@ int Run() {
           source[pixel * 4 + 1] = DirectX::PackedVector::XMConvertFloatToHalf(.375f + (pixel % width) / 4096.f);
           source[pixel * 4 + 2] = DirectX::PackedVector::XMConvertFloatToHalf(.5f);
           source[pixel * 4 + 3] = DirectX::PackedVector::XMConvertFloatToHalf(.25f + .125f * ((pixel + source_frame) % 4));
+          if (trace_color != nullptr) std::ranges::copy(*trace_color, source.begin() + pixel * 4);
           const uint32_t rgb = (pixel % width < 2 ? (1u << 10) | (2u << 20)
               : (change == Change::COLOR ? 610u | (650u << 10) | (680u << 20) : 460u | (500u << 10) | (530u << 20)));
           source_pq[pixel] = rgb | (((pixel + source_frame) % 4) << 30);
@@ -292,17 +389,32 @@ int Run() {
         gpu.Submit();
         if (guides) {
           for (auto [type, resource] : {std::pair{DEPTH, depth.Get()}, std::pair{MOTION, motion.Get()}}) {
-            const xefg::abi::Resource tag{.type = type, .validity = UNTIL_NEXT_PRESENT,
+            const xefg::abi::Resource tag{.type = type, .validity = (unsubmitted_guides ? ONLY_NOW : UNTIL_NEXT_PRESENT),
                 .base = {0, 0}, .size = {guide_width, guide_height}, .resource = resource, .state = NATIVE_INPUT_STATE};
             Check(Hooks::Resource(session.handle, gpu.list.Get(), present_id, &tag) == 0, "current XeFG guide tag");
+            if (unsubmitted_guides) {
+              const auto& copy = session.context->frames.at(present_id)->resources[type].copy;
+              std::vector<std::pair<addon::FenceRef, uint64_t>> receipts;
+              Check(copy != nullptr && addon::submission::UseSubmissionTokens(copy->texture.Get(), &receipts)
+                        == addon::submission::UseSubmission::kUnsubmitted,
+                    "ONLY_NOW guide has an actual copy on the still-unsubmitted producer list");
+            }
           }
         }
-        const xefg::abi::Constants constants{.motion_scale_x = 1.f, .motion_scale_y = 1.f,
+        if (hudless != nullptr) session.Tag(present_id, HUDLESS, hudless);
+        const xefg::abi::Constants constants{.jitter_x = (trace_color != nullptr ? .25f : 0.f),
+            .jitter_y = (trace_color != nullptr ? -.25f : 0.f), .motion_scale_x = 1.f, .motion_scale_y = 1.f,
             .reset = (reset ? 1u : 0u), .frame_time_ms = 1000.f / 60.f};
         Check(Hooks::Constants(session.handle, present_id, &constants) == 0, "current XeFG frame constants");
         const auto before_calls = model_calls;
         const auto before_reuses = native::edit_reuse_reuses.load();
         session.Present(present_id);
+        if (unsubmitted_guides) {
+          // Discard the unordered guide copy before the readback submits this list.
+          Check(SUCCEEDED(gpu.list->Close()) && SUCCEEDED(gpu.allocator->Reset())
+                    && SUCCEEDED(gpu.list->Reset(gpu.allocator.Get(), nullptr)),
+                "discard the unsubmitted XeFG guide capture without executing it");
+        }
         wait_service();
         Observation observed{.result = xefg::CurrentResult(), .evaluates = model_calls - before_calls,
             .reuses = native::edit_reuse_reuses.load() - before_reuses,
@@ -344,10 +456,122 @@ int Run() {
       for (uint32_t prefix = 0; prefix < native::kContractDebounceFrames + 12 && !mature; ++prefix) {
         const auto observed = frame(true);
         mature = observed.result == fg::Result::SUBMITTED && observed.evaluates == 1;
+        if (!pq && observed.result == fg::Result::PREPARED) {
+          const auto& clock = native::fg_service::streams.at({false, context}).base_frame_clock;
+          Check(clock.outputs == 0 && !clock.complete && source_matches(observed.pixels),
+                "prepared-only XeFG work cannot publish a complete BB group or alter the source image");
+        }
       }
       Check(mature, "single Backbuffer XeFG cache submits a mock-model refresh");
       auto& stream = native::fg_service::streams.at({false, context});
       const auto owner = stream.roles[0].Handle();
+      if (!pq) {
+        native::direct_api.evaluate = EvaluatePresentEdit;
+        std::array<PresentTraceFrame, 4> baseline;
+        for (const auto variant : {PresentTrace::BASELINE, PresentTrace::GENERATED_OUTPUT,
+                                   PresentTrace::REPEATED_CONSUMPTION}) {
+          const uint64_t sequence_prefix = session.context->application_frame;
+          const uint64_t claims_prefix = stream.base_frame_clock.claims;
+          const uint64_t outputs_prefix = stream.base_frame_clock.outputs;
+          const uint64_t presents_prefix = fake_present_calls;
+          const uint64_t history_prefix = native::game_window.frames;
+          uint64_t first_anchor_generation = 0;
+          uint32_t downstream_outputs = 0;
+          for (uint32_t index = 0; index < baseline.size(); ++index) {
+            const bool refresh = index % 2 == 0;
+            const auto submitted_before = stream.submitted;
+            const bool generated = variant == PresentTrace::GENERATED_OUTPUT && index == 0;
+            std::vector<uint8_t> sdk_rgba;
+            consume_sdk_present = [&](IDXGISwapChain* swapchain) {
+              const auto& clock = stream.base_frame_clock;
+              Check(stream.submitted == submitted_before + 1 && clock.outputs == outputs_prefix + index + 1
+                        && clock.complete,
+                    "XeFG publishes an ordered whole group and submits its private list before the original SDK Present");
+              ComPtr<IDXGISwapChain3> sdk_swapchain;
+              ComPtr<ID3D12Resource> input;
+              Check(SUCCEEDED(swapchain->QueryInterface(IID_PPV_ARGS(&sdk_swapchain)))
+                        && SUCCEEDED(sdk_swapchain->GetBuffer(sdk_swapchain->GetCurrentBackBufferIndex(),
+                                                              IID_PPV_ARGS(&input))),
+                    "original XeFG SDK Present receives the current proxy Backbuffer");
+              sdk_rgba = read_output(input.Get());
+              ++downstream_outputs;
+              if (generated) {
+                const auto sdk_base = PresentClockState(clock);
+                const auto model_count = model_calls;
+                const auto game_frames = native::game_window.frames;
+                Check(ConsumeGeneratedOutput(&gpu, input.Get()) == sdk_rgba,
+                      "XeFG downstream consumes one additional generated stand-in surface in GPU order");
+                ++downstream_outputs;
+                Check(PresentClockState(clock) == sdk_base && model_calls == model_count
+                          && native::game_window.frames == game_frames,
+                      "extra SDK output leaves XeFG claims, products, evaluations and game history unchanged");
+              }
+            };
+            trace_color = &PRESENT_SOURCE_PIXELS[index];
+            const auto observed = frame(index == 0);
+            const auto& clock = stream.base_frame_clock;
+            const auto& slot = native::features.at(owner).slots[0];
+            const auto& anchor = slot.edit_reuse;
+            const auto& delivered = stream.edit_reuse_monitor[0];
+            Check(sdk_rgba == observed.pixels && observed.result == fg::Result::SUBMITTED && anchor != nullptr
+                      && anchor->valid && slot.nr_preset == 2 && !slot.look_history.valid
+                      && !native::features.contains(stream.roles[1].Handle()),
+                  "XeFG SDK sees the actual single edited BB on the PRESENT stage with Look disabled");
+            Check(clock.claims == claims_prefix + index + 1 && clock.outputs == outputs_prefix + index + 1
+                      && clock.frame.source == context && clock.frame.generation == session.context->epoch
+                      && clock.frame.pass_begin == 0 && clock.frame.pass_count == 1 && clock.frame.roles == 1
+                      && clock.frame.reuse_edits && stream.last_output_frame[0] == clock.frame.sequence
+                      && native::game_window.frames == history_prefix + index + 1,
+                  "XeFG recognizes one real application input and commits one complete BB product each frame");
+            if (index == 0) first_anchor_generation = anchor->anchor_generation;
+            PresentTraceFrame product{.evaluates = observed.evaluates, .reset = observed.reset,
+                .sequence = clock.frame.sequence - sequence_prefix,
+                .history_sequence = anchor->source_sequence - sequence_prefix,
+                .anchor_sequence = stream.last_model_frame[0] - sequence_prefix,
+                .anchor_generation = anchor->anchor_generation - first_anchor_generation + 1,
+                .anchor_age = anchor->source_sequence - stream.last_model_frame[0], .reuses = observed.reuses,
+                .complete = clock.complete && delivered.handed_off && delivered.sequence == clock.frame.sequence
+                    && delivered.stage == addon::stage_plan::Stage::PRESENT
+                    && delivered.delivery == (refresh ? native::EditReuseDelivery::REFRESH : native::EditReuseDelivery::REUSED),
+                .rgba = observed.pixels};
+            if (variant == PresentTrace::REPEATED_CONSUMPTION && index == 1) {
+              const auto before = PresentClockState(clock);
+              const auto model_frame = stream.last_model_frame[0];
+              const auto output_frame = stream.last_output_frame[0];
+              const auto anchor_state = std::tuple{anchor->source_sequence, anchor->anchor_generation, anchor->reuse_count};
+              const auto calls = model_calls;
+              const auto history = native::game_window.frames;
+              const auto presents = fake_present_calls;
+              const auto submits = stream.submitted;
+              session.Present(present_id);
+              Check(fake_present_calls == presents + 1 && sdk_rgba == product.rgba && PresentClockState(clock) == before
+                        && session.context->application_frame == clock.frame.sequence && stream.submitted == submits
+                        && model_calls == calls && native::game_window.frames == history
+                        && stream.last_model_frame[0] == model_frame && stream.last_output_frame[0] == output_frame
+                        && std::tuple{anchor->source_sequence, anchor->anchor_generation, anchor->reuse_count} == anchor_state,
+                    "XeFG repeats the same Present ID at the SDK and delivers the same BB without changing NR history");
+            }
+            consume_sdk_present = {};
+            if (variant == PresentTrace::BASELINE) {
+              CheckPresentTraceFrame(product, index, "xefg");
+              Check(!source_matches(product.rgba), "the ordered XeFG output contains a nonzero scRGB edit");
+              baseline[index] = std::move(product);
+            } else {
+              Check(product == baseline[index], "XeFG G/R base trace must equal A including complete ordered RGBA");
+            }
+          }
+          const bool generated = variant == PresentTrace::GENERATED_OUTPUT;
+          const bool repeated = variant == PresentTrace::REPEATED_CONSUMPTION;
+          Check(downstream_outputs == 4 + generated + repeated && fake_present_calls == presents_prefix + 4 + repeated
+                    && session.context->application_frame == sequence_prefix + 4,
+                "XeFG G adds a downstream output without another outer application Present and R reaches the SDK once more");
+          std::cout << "PRESENT_POLICY_CONSUMERS route=xefg generated=" << generated << " repeated=" << repeated
+                    << " application_callbacks=" << fake_present_calls - presents_prefix
+                    << " downstream_outputs=" << downstream_outputs << '\n';
+        }
+        trace_color = nullptr;
+        native::direct_api.evaluate = nr_edit_reuse_gpu_cases::NeutralModel;
+      }
       const auto reference_source_frame = source_frame;
       std::array<Observation, 5> reference;
       for (uint32_t index = 0; index < reference.size(); ++index) {
@@ -513,12 +737,18 @@ int Run() {
         }
         Check(restored, "PQ color contract recovers after a bounded model refresh");
       }
-      const auto recover = [&] {
-        for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 12; ++attempt) {
+      const auto recover = [&](bool next_base = false) {
+        const auto limit = (next_base ? 1u : native::kContractDebounceFrames + 12);
+        for (uint32_t attempt = 0; attempt < limit; ++attempt) {
+          const auto before_products = stream.base_frame_clock.outputs;
+          const auto before_epoch = stream.epoch;
           const auto observed = frame(false);
           Check(observed.reuses == 0, "interrupted XeFG source cannot reuse before a fresh model output");
           if (observed.result == fg::Result::SUBMITTED && observed.evaluates == 1) {
-            Check(observed.reset == 1, "XeFG recovery sends Reset on its first actual model refresh");
+            const auto expected_outputs = (stream.epoch == before_epoch ? before_products + 1 : 1);
+            Check(observed.reset == 1
+                      && (pq || (stream.base_frame_clock.complete && stream.base_frame_clock.outputs == expected_outputs)),
+                  "XeFG recovery sends Reset on its first actual model refresh and publishes a complete product");
             return;
           }
         }
@@ -549,6 +779,56 @@ int Run() {
                 && source_matches(failed.pixels),
             "actual mock-model failure restores current XeFG source instead of cached output");
       recover();
+      if (!pq) {
+        const auto before_unordered = stream.base_frame_clock.outputs;
+        const auto unordered = frame(false, true, Change::NONE, nullptr, true);
+        Check(unordered.result != fg::Result::SUBMITTED && unordered.evaluates == 0 && unordered.reuses == 0
+                  && stream.base_frame_clock.outputs == before_unordered && source_matches(unordered.pixels),
+              "unordered XeFG capture does not publish a group and leaves the current source untouched");
+        recover(true);
+
+        const auto single_role = stream.base_frame_clock.frame;
+        const auto before_missing_role = stream.base_frame_clock.outputs;
+        Check(Hooks::UiState(session.handle, 1) == 0 && session.context->epoch != single_role.generation,
+              "real XeFG UI composition state changes the required color-role contract and its source epoch");
+        const auto missing_role = frame(false);
+        Check(missing_role.result != fg::Result::SUBMITTED && missing_role.evaluates == 0 && missing_role.reuses == 0
+                  && stream.base_frame_clock.outputs == before_missing_role && source_matches(missing_role.pixels),
+              "a submitted BB from the previous single-color contract cannot serve the missing required HUDLess role");
+
+        auto hudless = gpu.Texture(width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+        upload(hudless.Get(), source, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON, width * 8);
+        gpu.Submit();
+        bool dual_ready = false;
+        for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 12; ++attempt) {
+          const auto dual = frame(false, true, Change::NONE, hudless.Get());
+          if (dual.result == fg::Result::SUBMITTED) {
+            const auto& clock = stream.base_frame_clock;
+            Check(dual.evaluates == 2 && model_resets[model_resets.size() - 2] == 1 && dual.reset == 1
+                      && dual.reuses == 0 && clock.complete && clock.frame.roles == 3
+                      && clock.frame.generation == session.context->epoch && clock.frame.generation != single_role.generation
+                      && stream.last_output_frame[0] == clock.frame.sequence && stream.last_output_frame[1] == clock.frame.sequence,
+                  "supplying the required HUDLess causes real execution and complete ordered delivery of both roles");
+            dual_ready = true;
+            break;
+          }
+          Check(!stream.base_frame_clock.complete && source_matches(dual.pixels),
+                "preparing the new color plan cannot publish a partial group or change the original BB");
+        }
+        Check(dual_ready, "dual-role XeFG finishes preparing its real model slots");
+        const auto dual_products = stream.base_frame_clock.outputs;
+        const auto dual_gap = frame(false);
+        Check(dual_gap.result != fg::Result::SUBMITTED && dual_gap.evaluates == 0
+                  && stream.base_frame_clock.outputs == dual_products && source_matches(dual_gap.pixels),
+              "missing a required role on an already mature dual-color chain cannot produce a partial group");
+        const auto repaired = frame(false, true, Change::NONE, hudless.Get());
+        Check(repaired.result == fg::Result::SUBMITTED && repaired.evaluates == 2 && repaired.reset == 1
+                  && stream.base_frame_clock.complete && stream.base_frame_clock.outputs == dual_products + 1,
+              "restoring the required HUDLess on the next legal frame refreshes and submits both roles");
+
+        Check(Hooks::UiState(session.handle, 0) == 0, "return to the original XeFG single BB role");
+        recover();
+      }
       auto final_anchor = native::features.at(owner).slots[0].edit_reuse;
       Check(final_anchor != nullptr, "recovered XeFG source owns a new edit cache");
       std::weak_ptr<addon::edit_reuse::State> retired_anchor = final_anchor;
@@ -578,9 +858,11 @@ int Run() {
                  " depth=scRGB:R32_FLOAT/PQ:R32G8X24_TYPELESS_plane0"
                  " source_updates=per_base_frame native_declarations=Off/On/Off cadence=1/0/1/0/1"
                  " duplicate_present_id=stable_RGBA/anchor/model/reuse/submission anchor_bytes=immutable_on_reuse"
+                 " scRGB_A/G/R=ordered_RGBA missing_HUDLess/unknown_order/recovery=checked"
                  " reset/guides/gap/failure/retirement=checked interpolation=not_executed\n";
     return 0;
   } catch (const std::exception& error) {
+    consume_sdk_present = {};
     fail_call = 0;
     std::cerr << "nr-edit-reuse-xefg-contracts: " << error.what() << '\n';
     return 1;

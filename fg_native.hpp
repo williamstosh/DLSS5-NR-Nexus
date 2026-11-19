@@ -8,6 +8,7 @@
 namespace fg_service {
 
 struct Slot {
+  present_frame_policy::Frame base_frame;
   ID3D12CommandAllocator* allocator = nullptr;
   ID3D12GraphicsCommandList* list = nullptr;
   ID3D12Resource* color[2] = {};
@@ -26,6 +27,7 @@ struct Slot {
 };
 
 struct Stream {
+  present_frame_policy::Clock base_frame_clock;
   std::shared_ptr<adaptive_resolution::Session> adaptive_session;
   adaptive_resolution::Frame adaptive_frame;
   uint32_t adaptive_model_roles = 0;
@@ -88,6 +90,7 @@ static std::map<std::pair<bool, uintptr_t>, Stream> streams;
 static std::map<const NVSDK_NGX_Handle*, uintptr_t> native_bindings;
 
 inline void ResetNativeFrame(Stream* stream) {
+  stream->base_frame_clock.complete = false;
   stream->cached = nullptr;
   stream->native_pair_producer_marker = nullptr;
   stream->native_pair_completion = {};
@@ -136,6 +139,7 @@ inline bool PrepareCapture(ID3D12GraphicsCommandList* list) noexcept {
 // An unsubmitted recording can have created handles and advanced NGX CPU
 // history. Rebuild the feature and workset, including their GPU state ledger.
 inline void Invalidate(Stream* stream) {
+  stream->base_frame_clock.complete = false;
   stream->adaptive_role_unavailable = false;
 #if defined(NR_NEXUS_DEV_CONTROL)
   stream->native_edit_history = false;
@@ -424,6 +428,19 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
   const bool real_guides = input.depth != nullptr && input.motion != nullptr
       && input.guide_width != 0 && input.guide_height != 0 && guide_mode != kPresentGuidesNever;
   if (!real_guides && guide_mode == kPresentGuidesRequired) return fg::Result::NOT_SERVED;
+  auto base_frame = base.base_frame;
+  if (!stream->native && input.has_present_id && input.has_constants && input.application_frame != 0) {
+    base_frame = {.kind = present_frame_policy::SourceKind::APPLICATION,
+        .source = input.context, .generation = input.epoch, .sequence = input.application_frame,
+        .pass_count = EvaluationStagePlan(stream->roles[0].Handle(), false).pass_count,
+        .roles = (has_hudless && !coupled_ui ? 3u : 1u)};
+  }
+  const auto previous_base = stream->base_frame_clock.frame;
+  const auto base_claim = present_frame_policy::Observe(&stream->base_frame_clock, base_frame);
+  if (base_claim == present_frame_policy::Claim::REPEATED || base_claim == present_frame_policy::Claim::STALE) {
+    return fg::Result::NOT_SERVED;
+  }
+  const uint64_t base_sequence = (present_frame_policy::Known(base_frame) ? base_frame.sequence : input.application_frame);
   FeatureState contract;
   contract.input_width = (real_guides ? input.guide_width : input.color_width);
   contract.input_height = (real_guides ? input.guide_height : input.color_height);
@@ -695,12 +712,14 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
   const bool xefg_edit_reuse_frame = edit_reuse_enabled.load(std::memory_order_relaxed)
       && !stream->native && native_parameters == nullptr && !has_hudless && !input.ui_composition
       && input.fg_enabled && input.has_present_id && input.has_constants && input.application_frame != 0
+      && present_frame_policy::Known(base_frame)
       && real_guides && input.color_x == 0 && input.color_y == 0
       && backbuffer_desc.Width == input.color_width && backbuffer_desc.Height == input.color_height;
   bool native_edit_reuse_frame = false;
 #if defined(NR_NEXUS_DEV_CONTROL)
   auto fixed_workset = stream->adaptive_frame;
-  if (stream->native && native_parameters != nullptr && base.native_edit_reuse_frame != 0
+  if (stream->native && native_parameters != nullptr && base.base_frame.reuse_edits
+      && present_frame_policy::Known(base.base_frame)
       && real_guides && !coupled_ui) {
     if (const auto resident = adaptive_resident_session.lock();
         fixed_workset.enabled && resident != nullptr && resident != fixed_workset.session) {
@@ -719,6 +738,10 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
   stream->native_edit_history = native_edit_reuse_frame;
 #endif
   const bool edit_reuse_frame = xefg_edit_reuse_frame || native_edit_reuse_frame;
+  base_frame.reuse_edits = edit_reuse_frame;
+  if (base_claim == present_frame_policy::Claim::NEW_FRAME) {
+    stream->base_frame_clock.frame.reuse_edits = edit_reuse_frame;
+  }
   // Cache descriptors retain their sources. Stage the current original in
   // the existing private slot instead of retaining a DXGI backbuffer across ResizeBuffers.
   const bool borrow_color_inputs = native_parameters == nullptr
@@ -739,6 +762,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
   }
   gate_ever_opened.store(true, std::memory_order_relaxed);
   bool prepared = false;
+  uint32_t composed_roles = 0;
   const uint32_t diagnostic_interval = telemetry_seconds.load(std::memory_order_relaxed);
   const int64_t diagnostic_now = (gpu_timers_enabled.load(std::memory_order_relaxed)
       && diagnostic_interval != 0 ? SteadyNowNs() : 0);
@@ -759,8 +783,10 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     // for which a busy service could obtain a recording slot or NGX turn.
     // A cache output is a completed base frame without a new model call.
     const uint64_t previous_frame = (edit_reuse_frame ? stream->last_output_frame[i] : stream->last_model_frame[i]);
-    if (input.reset || role.real_guides != real_guides || stream->epoch != input.epoch
-        || (input.application_frame != 0 && previous_frame != 0 && input.application_frame != previous_frame + 1)) {
+    if (present_frame_policy::NeedsReset(previous_base, base_frame, previous_frame,
+            input.reset || stream->epoch != input.epoch, role.real_guides != real_guides)
+        || (!present_frame_policy::Known(base_frame) && input.application_frame != 0
+            && previous_frame != 0 && input.application_frame != previous_frame + 1)) {
       ResetPresentStreamHistory(&role);
     }
     role.real_guides = real_guides;
@@ -769,6 +795,8 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     role.parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, input.jitter_x);
     role.parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, input.jitter_y);
     PresentTarget target = base;
+    target.base_frame = base_frame;
+    target.native_fg_inputs = native_parameters != nullptr;
     auto adaptive_role = stream->adaptive_frame;
     adaptive_role.role = (i == 0 ? 1u : 2u);
     target.adaptive_frame = &adaptive_role;
@@ -780,10 +808,6 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     target.capture_display = false;
     target.ui_correction = i == 0 && base.ui_correction;
     target.guide_serial = (real_guides ? input.application_frame + 1 : 0u);
-    target.xefg_edit_reuse_frame = (xefg_edit_reuse_frame ? input.application_frame : 0u);
-#if defined(NR_NEXUS_DEV_CONTROL)
-    if (!native_edit_reuse_frame) target.native_edit_reuse_frame = 0;
-#endif
     target.domain = (i == 0 ? present_restore_scope::Domain::PRE_FG_BACKBUFFER
                             : present_restore_scope::Domain::PRE_FG_HUDLESS);
     target.original_identity = reinterpret_cast<uintptr_t>(i == 0 ? input.backbuffer : input.hudless);
@@ -814,9 +838,9 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
            << " depth_size=" << depth->GetDesc().Width << 'x' << depth->GetDesc().Height
            << " depth_flags=" << depth->GetDesc().Flags
            << " edit_requested=" << edit_reuse_enabled.load(std::memory_order_relaxed)
-           << " edit_frame=" << target.xefg_edit_reuse_frame
+           << " edit_frame=" << (xefg_edit_reuse_frame ? base_sequence : 0u)
 #if defined(NR_NEXUS_DEV_CONTROL)
-           << " native_edit_frame=" << target.native_edit_reuse_frame
+           << " native_edit_frame=" << (native_edit_reuse_frame ? base_sequence : 0u)
 #endif
            << " edit_refresh=" << edit_reuse_refreshes.load(std::memory_order_relaxed)
            << " edit_reuse=" << edit_reuse_reuses.load(std::memory_order_relaxed)
@@ -921,7 +945,10 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
           screenshot::internal::pending->required_planes_complete = capture_was_complete && recorded_planes == 5;
         }
       }
-      if (composed == 0) break;
+      if (composed == 0) {
+        composed_roles |= 1u;
+        break;
+      }
       if (native_edit_reuse_frame) {
         // The active edit history belongs to HUDLess. Do not publish it next
         // to an independently refreshed BB when this frame's composition fails.
@@ -979,9 +1006,12 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     }
   }
   restore_guides();
-  if (native_edit_reuse_frame && (*recordings)[0].output_ready && (*recordings)[1].output_ready
-      && (*recordings)[0].edit_reused != (*recordings)[1].edit_reused) {
-    // Both consumed roles must represent the same refresh/reuse phase.
+  const uint32_t output_roles = (has_hudless && !coupled_ui ? 3u : 1u);
+  const auto group_result = PresentGroupResult(*recordings, output_roles, edit_reuse_frame, composed_roles);
+  const bool recorded_edit = std::ranges::any_of(*recordings, [](const auto& recording) {
+    return recording.edit_refreshed || recording.edit_reused;
+  });
+  if (present_frame_policy::Known(base_frame) && !group_result.complete && (native_edit_reuse_frame || recorded_edit)) {
     return fg::Result::FAILED;
   }
 #if defined(NR_NEXUS_DEV_CONTROL)
@@ -1019,10 +1049,10 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
   if (input.application_frame != 0) {
     for (uint32_t i = 0; i < recordings->size(); ++i) {
       if ((*recordings)[i].model_recorded) {
-        stream->last_model_frame[i] = input.application_frame;
+        stream->last_model_frame[i] = base_sequence;
       }
       if ((*recordings)[i].output_ready) {
-        stream->last_output_frame[i] = input.application_frame;
+        stream->last_output_frame[i] = base_sequence;
       }
     }
   }
@@ -1033,6 +1063,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     PublishAdaptiveStatus(stream->adaptive_session->status);
   }
   *output_ready = true;
+  slot->base_frame = base_frame;
   return fg::Result::PREPARED;
 }
 
@@ -1080,7 +1111,16 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
         return fg::Result::FAILED;
       }
     }
-    if (stream.has_frame && stream.application_frame == input.application_frame) return stream.result;
+    const present_frame_policy::Frame application_base{
+        .kind = present_frame_policy::SourceKind::APPLICATION,
+        .source = input.context, .generation = input.epoch, .sequence = input.application_frame,
+        .pass_count = EvaluationStagePlan(stream.roles[0].Handle(), false).pass_count,
+        .roles = (input.hudless != nullptr && input.hudless != input.backbuffer ? 3u : 1u)};
+    const auto application_claim = present_frame_policy::Classify(stream.base_frame_clock, application_base);
+    if (application_claim == present_frame_policy::Claim::STALE) return fg::Result::NOT_SERVED;
+    if (application_claim == present_frame_policy::Claim::REPEATED
+        || (!present_frame_policy::Known(application_base) && stream.has_frame
+            && stream.application_frame == input.application_frame)) return stream.result;
     const bool service_interval_available = service_entry_ns > stream.gpu_capture_entry_ns
         && stream.gpu_capture_entry_ns != 0 && stream.has_frame
         && input.application_frame == stream.application_frame + 1;
@@ -1353,6 +1393,8 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
       return stream.result;
     }
     stream.result = fg::Result::SUBMITTED;
+    const auto group_result = PresentGroupResult(recordings, slot->base_frame.roles, slot->base_frame.reuse_edits);
+    present_frame_policy::Publish(&stream.base_frame_clock, slot->base_frame, true, group_result.complete);
     if (recordings[0].edit_monitor_delivery != EditReuseDelivery::NONE && nr_input.hudless == nullptr) {
       const auto surface = renodx::utils::directx::NativeIdentity(input.backbuffer);
       StoreEditReuseMonitorFrame(&stream.edit_reuse_monitor, {
@@ -1658,10 +1700,10 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
   // The overlay reads atomics without runtime_mutex. Publish a declined
   // recording on exit, not a transient outage before the model is called.
   struct DisplayRecording {
-    bool prepared = false;
+    bool preserve_current = false;
     fg::Result result = fg::Result::NOT_SERVED;
     ~DisplayRecording() {
-      if (!prepared) {
+      if (!preserve_current) {
         native_fg_continuing_submission.store(false, std::memory_order_release);
         native_fg_result.store(result, std::memory_order_release);
       }
@@ -1789,6 +1831,13 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
   // Preserve the producer's uint32 identity including frame zero. Wrap is a
   // discontinuity to the cache, rather than an invented application clock.
   const uint64_t native_edit_sequence = (native_edit_source ? static_cast<uint64_t>(native_frame.frame) + 1 : 0);
+  const present_frame_policy::Frame native_base_frame{
+      .kind = (native_tag_frame ? present_frame_policy::SourceKind::TAGGED_RESOURCE : present_frame_policy::SourceKind::SDK_SCOPE),
+      .source = (native_edit_source ? reinterpret_cast<uintptr_t>(owner->native_output_identity) : 0),
+      .generation = native_frame.generation, .sequence = native_edit_sequence,
+      .sequence_period = uint64_t{1} << 32,
+      .pass_count = pair_plan.pass_count, .roles = (hudless != nullptr && hudless != backbuffer ? 3u : 1u),
+      .reuse_edits = true};
   if (native_edit_requested) {
     static int64_t last_observation_ns = 0;
     static uint32_t observations = 0;
@@ -1941,6 +1990,14 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
   const auto context = (handle != nullptr ? reinterpret_cast<uintptr_t>(owner) : reinterpret_cast<uintptr_t>(parameters));
   auto& stream = fg_service::streams[{true, context}];
   diagnostic.stream = &stream;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (native_edit_source && present_frame_policy::Classify(stream.base_frame_clock, native_base_frame)
+          == present_frame_policy::Claim::STALE) {
+    diagnostic.reason = "base_frame_stale";
+    display_recording.preserve_current = true;
+    return nullptr;
+  }
+#endif
   if (stream.result == fg::Result::FAILED) {
     fg_service::Invalidate(&stream);
     stream.result = fg::Result::FAILED;
@@ -2062,7 +2119,8 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
       && stream.source_backbuffer == backbuffer && stream.source_hudless == hudless && stream.source_ui == ui;
 #if defined(NR_NEXUS_DEV_CONTROL)
   if (native_edit_source) {
-    const bool same_native_frame = native_edit_sequence == stream.native_edit_frame
+    const bool same_native_frame = present_frame_policy::Classify(stream.base_frame_clock, native_base_frame)
+            == present_frame_policy::Claim::REPEATED
         && (!native_tag_frame || native_frame.epoch == stream.native_edit_source_epoch) && stream.cached != nullptr
         && stream.result == fg::Result::PREPARED && stream.source_backbuffer == backbuffer
         && stream.source_hudless == hudless && stream.source_ui == ui && stream.native_edit_ui_alpha == ui_alpha;
@@ -2094,7 +2152,7 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
       // a reuse frame also has no newly recorded model to count as its role.
       cached_real_guides = false;
       for (const uint32_t role : {0u, 1u}) {
-        if (stream.last_output_frame[role] != stream.application_frame) continue;
+        if (stream.last_output_frame[role] != stream.base_frame_clock.frame.sequence) continue;
         cached_real_guides = stream.roles[role].real_guides;
         if (!cached_real_guides) break;
       }
@@ -2242,7 +2300,7 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     // Coupled opaque-UI inputs retain their current per-frame service. This
     // first native route preserves exact-alpha composition or independent roles.
     if (native_edit_source && !fg_service::NeedsNativeColorCoupling(input, parameters, ui_recomposition)) {
-      target.native_edit_reuse_frame = native_edit_sequence;
+      target.base_frame = native_base_frame;
     }
 #endif
     const auto result = fg_service::Record(&stream, slot, list, input, target,
@@ -2336,7 +2394,7 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     NVSDK_NGX_Parameter_SetVoidPointer(const_cast<NVSDK_NGX_Parameter*>(parameters),
                                       NVSDK_NGX_DLSSG_Parameter_UI, stream.cached->coupled_ui);
   }
-  display_recording.prepared = true;
+  display_recording.preserve_current = true;
   diagnostic.reason = (repeated_frame || index > 1 ? "mfg_cached_output_recorded" : "group_output_recorded");
   return (hudless != backbuffer ? hudless : nullptr);
 }
@@ -2355,6 +2413,9 @@ inline void RestoreNativePreFg(ID3D12GraphicsCommandList* list,
   const auto it = fg_service::streams.find({true, context});
   if (it == fg_service::streams.end()) return;
   auto& stream = it->second;
+  if (succeeded && backbuffer_replaced && stream.cached != nullptr) {
+    present_frame_policy::Publish(&stream.base_frame_clock, stream.cached->base_frame, true, true);
+  }
   // Evaluate returning does not end the SDK's real-frame consumption of B.
   // Keep successful NR pixels; rollback only this invocation's failed work.
   if (!succeeded && backbuffer_replaced && list != nullptr && stream.cached != nullptr
@@ -2382,7 +2443,9 @@ inline void RestoreNativePreFg(ID3D12GraphicsCommandList* list,
                                         NVSDK_NGX_DLSSG_Parameter_UI, stream.source_ui);
     }
   }
-  if (!succeeded) {
+  // Older internal consumers return the borrowed HUDLess without the BB flag.
+  // A declined invocation owns neither binding and cannot retract another base.
+  if (!succeeded && (backbuffer_replaced || hudless != nullptr)) {
     if (native_sdk_present_input.owner == reinterpret_cast<const PresentStream*>(context)) {
       const auto input = native_sdk_present_input;
       native_sdk_present_input = {.identity = input.identity, .decision_id = input.decision_id,

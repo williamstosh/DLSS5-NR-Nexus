@@ -1,14 +1,16 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$DependencyFile,
-    [string]$SourceRoot = (Split-Path $PSScriptRoot -Parent)
+    [string]$SourceRoot = (Split-Path $PSScriptRoot -Parent),
+    [ValidateSet('edit-reuse-policy','present-frame-policy')][string]$Suite = 'edit-reuse-policy'
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $repo = Split-Path $PSScriptRoot -Parent
-$testSource = [IO.Path]::GetFullPath((Join-Path $repo 'tests/edit_reuse_policy_tests.cpp'))
-$policyHeader = [IO.Path]::GetFullPath((Join-Path $SourceRoot 'edit_reuse_policy.hpp'))
+$policyName = $Suite.ToLowerInvariant().Replace('-', '_')
+$testSource = [IO.Path]::GetFullPath((Join-Path $repo "tests/${policyName}_tests.cpp"))
+$policyHeader = [IO.Path]::GetFullPath((Join-Path $SourceRoot "$policyName.hpp"))
 $record = Get-Content -LiteralPath $DependencyFile -Raw | ConvertFrom-Json -AsHashtable
 if ($record -isnot [Collections.IDictionary] -or $record['Data'] -isnot [Collections.IDictionary]) {
     throw "Missing MSVC dependency data: $DependencyFile"
@@ -51,4 +53,4 @@ foreach ($include in $includes) {
     }
 }
 if (-not $sawPolicyHeader) { throw "Missing production policy header in dependency record: $policyHeader" }
-Write-Host 'PASS edit reuse policy dependencies evidence=STATIC'
+Write-Host "PASS $($policyName.Replace('_', ' ')) dependencies evidence=STATIC"

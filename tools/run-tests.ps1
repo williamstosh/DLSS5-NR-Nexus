@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('all','report','branding','ui','dev-control','presets','unicode-input','native','lastgasp','sdr-policy','hdr-policy','scope','config','constants','control-mask','control-mask-execution','vulkan-control-mask','fg-xefg','fg-native','lifecycle','bridge-motion','stage-plan','edit-reuse-policy','adaptive-resolution','copy-slots')]
+    [ValidateSet('all','report','branding','ui','dev-control','presets','unicode-input','native','lastgasp','sdr-policy','hdr-policy','scope','config','constants','control-mask','control-mask-execution','vulkan-control-mask','fg-xefg','fg-native','lifecycle','bridge-motion','stage-plan','edit-reuse-policy','present-frame-policy','adaptive-resolution','copy-slots')]
     [string[]]$Suite = @('all'),
     [string]$SourceRoot = (Split-Path $PSScriptRoot -Parent),
     [string]$HostRoot = (Join-Path (Split-Path $PSScriptRoot -Parent) '.local/renodx'),
@@ -56,9 +56,11 @@ $sources = [ordered]@{
     lifecycle='fg_lifecycle_tests'; 'bridge-motion'='d3d11_bridge_motion_tests'
     'stage-plan'='stage_plan_tests'
     'edit-reuse-policy'='edit_reuse_policy_tests'
+    'present-frame-policy'='present_frame_policy_tests'
     'adaptive-resolution'='adaptive_resolution_tests'
     'copy-slots'='copy_slots_tests'
 }
+$executionPolicySuites = @('edit-reuse-policy','present-frame-policy')
 if ($Suite -contains 'all') { $Suite = @($sources.Keys) }
 if ($BuildOnly -and @($Suite | Where-Object { $_ -in @('config','constants','lifecycle','ui') }).Count) {
     throw '-BuildOnly requires explicitly selecting native/policy/scope/fg-xefg/fg-native/bridge-motion suites.'
@@ -171,16 +173,16 @@ foreach ($item in $Suite) {
     $name = $sources[$item]
     $exe = Join-Path $directory "$name.exe"
     $arguments = $common + @($includes | ForEach-Object { "/I$_" })
-    if ($item -eq 'edit-reuse-policy') {
+    if ($item -in $executionPolicySuites) {
         $msvcInclude = Join-Path $env:VCToolsInstallDir 'include'
         $ucrtInclude = Join-Path $env:WindowsSdkDir "Include/$($env:WindowsSDKVersion.TrimEnd('\'))/ucrt"
-        $arguments = $common + @('/X', '/Y-', "/I$SourceRoot", "/I$msvcInclude", "/I$ucrtInclude")
+        $arguments = $common + @('/X', '/Y-', '/UNR_NEXUS_DEV_CONTROL', "/I$SourceRoot", "/I$msvcInclude", "/I$ucrtInclude")
     }
     if ($item -in @('control-mask-execution','vulkan-control-mask')) {
         $arguments += "/I$HostRoot/external/reshade/include"
     }
     $link = $libraries
-    if ($item -in @('branding','sdr-policy','hdr-policy','scope','stage-plan','edit-reuse-policy','adaptive-resolution','control-mask')) { $link = @() }
+    if ($item -in $executionPolicySuites -or $item -in @('branding','sdr-policy','hdr-policy','scope','stage-plan','adaptive-resolution','control-mask')) { $link = @() }
     if ($item -in @('fg-native','bridge-motion','vulkan-control-mask')) {
         if (-not (Test-Path -LiteralPath "$ShaderIncludeDirectory/embed/shaders.h")) { throw 'Build new shaders first.' }
         $arguments += @('/bigobj','/Gy','/Gw','/DNDEBUG','/DRESHADE_ADDON=1',
@@ -212,10 +214,10 @@ foreach ($item in $Suite) {
     if ($LASTEXITCODE -ne 0) { throw "Compile/link failed: $item; see $directory/compile.log" }
     $dependencyFile = Join-Path $directory 'dependencies.json'
     $inputPaths = @((Join-Path $testRoot "$name.cpp"), $PSCommandPath)
-    if ($item -eq 'edit-reuse-policy') {
+    if ($item -in $executionPolicySuites) {
         $policyChecker = Join-Path $PSScriptRoot 'check-execution-policy-dependencies.ps1'
         $inputPaths += $policyChecker
-        & $policyChecker -DependencyFile $dependencyFile -SourceRoot $SourceRoot
+        & $policyChecker -DependencyFile $dependencyFile -SourceRoot $SourceRoot -Suite $item
     }
     $dependencies = (Get-Content -LiteralPath $dependencyFile -Raw | ConvertFrom-Json).Data.Includes
     $hashes = @($inputPaths + $dependencies | Sort-Object -Unique | ForEach-Object {
@@ -364,9 +366,10 @@ foreach ($item in $Suite) {
             }
         } else {
             Invoke-TestProcess $exe $directory 'test'
-            if ($item -eq 'edit-reuse-policy') {
+            if ($item -in $executionPolicySuites) {
+                $policyName = $item.ToLowerInvariant().Replace('-', ' ')
                 $receipts = @(Get-Content -LiteralPath (Join-Path $directory 'test.stdout.log') |
-                    Where-Object { $_ -cmatch '^PASS edit reuse policy evidence=CPU cases=[1-9][0-9]*$' })
+                    Where-Object { $_ -cmatch ('^PASS ' + $policyName + ' evidence=CPU cases=[1-9][0-9]*$') })
                 if ($receipts.Count -ne 1) { throw "Missing or ambiguous CPU receipt: $directory/test.stdout.log" }
             }
             if ($item -eq 'fg-native') {
@@ -396,7 +399,7 @@ foreach ($item in $Suite) {
         }
     }
     $result = @{suite=$item; build='passed'; run=$(if ($BuildOnly -or $skipVulkanRun) { 'not_run' } else { 'passed' })}
-    if ($item -eq 'edit-reuse-policy') { $result.dependency_policy = 'passed' }
+    if ($item -in $executionPolicySuites) { $result.dependency_policy = 'passed' }
     if ($skipVulkanRun) { $result.skip_reason = 'software_only_native_gpu_required' }
     $result | ConvertTo-Json | Set-Content -LiteralPath "$directory/result.json" -Encoding utf8
     if (-not $BuildOnly) { Complete-TestOutput $directory }
@@ -429,7 +432,11 @@ if ($Suite -contains 'ui' -and -not $BuildOnly -and $UiPreview -ne 'None') {
 
 } catch {
     if ($OutputDirectory -and (Test-Path -LiteralPath (Join-Path $OutputDirectory 'artifact-lifecycle.json'))) {
-        if ($testWorkspaceStarted) { Complete-TestOutput (Join-Path $OutputDirectory 'edit-reuse-policy') -Outcome Failed }
+        if ($testWorkspaceStarted) {
+            foreach ($policySuite in $executionPolicySuites) {
+                Complete-TestOutput (Join-Path $OutputDirectory $policySuite) -Outcome Failed
+            }
+        }
         Complete-TestOutput $OutputDirectory -Outcome Failed
     }
     throw

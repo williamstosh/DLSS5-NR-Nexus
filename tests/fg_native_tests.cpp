@@ -783,15 +783,19 @@ int main(int argc, char** argv) {
 #endif
 #if defined(NR_NEXUS_DEV_CONTROL)
   if (argc == 2 && std::strcmp(argv[1], "--native-frame-source") == 0) return native_fg_frame_cases::Run();
-  if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-native-contracts") == 0) return nr_edit_reuse_native_cases::Run();
+  if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-native-contracts") == 0) {
+    return run_edit_reuse_case(nr_edit_reuse_native_cases::Run);
+  }
   if (argc == 2 && std::strcmp(argv[1], "--inline-restore-roi") == 0) return inline_restore_roi_cases::Run();
 #endif
-  if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-xefg-contracts") == 0) return nr_edit_reuse_xefg_cases::Run();
+  if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-xefg-contracts") == 0) {
+    return run_edit_reuse_case(nr_edit_reuse_xefg_cases::Run);
+  }
   if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-render-contracts") == 0) {
     return run_edit_reuse_case(nr_edit_reuse_render_cases::Run);
   }
   if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-present-contracts") == 0) {
-    return RunNrEditReusePresentContracts(nullptr);
+    return run_edit_reuse_case([] { return RunNrEditReusePresentContracts(nullptr); });
   }
   if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-present-diagnostic") == 0) {
     return RunNrEditReusePresentContracts(nullptr, true);
@@ -1067,7 +1071,9 @@ int main(int argc, char** argv) {
   if (argc == 2 && std::strcmp(argv[1], "--native-options-delayed") == 0) return RunNativeOptionsResumeTest(true);
   if (argc == 2 && std::strcmp(argv[1], "--native-guide-contract") == 0) return RunNativeGuideContractTest();
   if (argc == 2 && std::strcmp(argv[1], "--present-guide-models") == 0) return RunPresentGuideModelsTest();
-  if (argc == 2 && std::strcmp(argv[1], "--native-present-decision") == 0) return RunNativePresentDecisionTest();
+  if (argc == 2 && std::strcmp(argv[1], "--native-present-decision") == 0) {
+    return run_edit_reuse_case(RunNativePresentDecisionTest);
+  }
   const bool trace_metadata_only = argc == 2 && std::strcmp(argv[1], "--trace-metadata") == 0;
   const bool hardware = argc == 2 && std::strcmp(argv[1], "--native-full-hardware") == 0;
   try {

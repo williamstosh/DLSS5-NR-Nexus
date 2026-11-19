@@ -10,19 +10,24 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <DirectXPackedVector.h>
 
 #include <edit_reuse.hpp>
 #include <native_fg_frame.hpp>
+#include <present_frame_policy.hpp>
 
 // Included after the native host, shared readbacks and edit-model substitutes.
 namespace nr_edit_reuse_native_cases {
 namespace addon = renodx::addons::dlss5;
+namespace frame_policy = native::present_frame_policy;
 namespace frame_source = addon::fg::native_options::frame_source;
 namespace tag_source = native::native_tag_source;
 using stage_execution_cases::Capture;
@@ -123,10 +128,9 @@ int Run() {
     Check(native::InstallQueueCompletionHooks(gpu.queue.Get()), "native edit production Execute hook");
     Check(native::InstallCommandListStateHooks(gpu.list.Get()), "native edit production command-list hooks");
     Check(native::InstallMixedPresentCopyHooks(gpu.list.Get()), "native tag-copy production CopyResource observer");
-    const auto submit = [&] {
+    const auto execute_recording = [&] {
       // Let production Execute hooks attach the proof; Gpu::Submit also
       // reserves a synthetic host proof and is deliberately not used here.
-      Check(SUCCEEDED(gpu.list->Close()), "native edit Close");
       ID3D12CommandList* lists[]{gpu.list.Get()};
       gpu.submission_pending = true;
       gpu.queue->ExecuteCommandLists(1, lists);
@@ -140,6 +144,8 @@ int Run() {
           "native edit real bounded Fence completion");
       gpu.submission_pending = false;
       check_debug();
+    };
+    const auto retire_recording = [&] {
       Check(SUCCEEDED(gpu.allocator->Reset()), "native edit allocator Reset");
       Check(SUCCEEDED(gpu.list->Reset(gpu.allocator.Get(), nullptr)), "native edit list Reset");
       // Keep the production callback that saves the exact completed native
@@ -153,6 +159,13 @@ int Run() {
       {
         const addon::RuntimeLock lock(native::runtime_mutex);
         native::DrainRetiredResources(true);
+      }
+    };
+    const auto submit = [&](bool retain_recording = false) {
+      Check(SUCCEEDED(gpu.list->Close()), "native edit Close");
+      execute_recording();
+      if (!retain_recording) {
+        retire_recording();
       }
     };
     submit();
@@ -241,15 +254,83 @@ int Run() {
       bool reject_motion = false;
       TagCopy tag_copy = TagCopy::NONE;
       bool owner_ready = true;
+      bool with_ui_alpha = true;
+      bool retain_recording = false;
     };
     struct Observation {
       bool replaced = false;
       uint32_t evaluates = 0;
       uint64_t reuses = 0;
+      uint64_t source_generation = 0;
       int reset = -1;
       std::vector<uint8_t> consumed_back;
       std::vector<uint8_t> consumed_hudless;
       std::vector<uint8_t> restored_back;
+    };
+    struct FrameProgress {
+      uint64_t base_frame;
+      uint64_t source_frame;
+      uint64_t sequence_period;
+      frame_policy::SourceKind kind;
+      uintptr_t source;
+      uint64_t source_generation;
+      uint64_t output_epoch;
+      uint32_t pass_begin;
+      uint32_t pass_count;
+      uint32_t roles;
+      bool reuse_edits;
+      bool complete;
+      uint64_t claims;
+      uint64_t outputs;
+      uint64_t native_frame;
+      uint64_t native_source_epoch;
+      uint64_t observed_frames;
+      uint64_t reset_epoch;
+      uint64_t delivery_serial;
+      std::array<uint64_t, 2> model_frames;
+      std::array<uint64_t, 2> output_frames;
+      const native::fg_service::Slot* cached;
+      const addon::edit_reuse::State* anchor;
+      uint64_t anchor_generation;
+      uint64_t anchor_sequence;
+      uint64_t reuse_count;
+      bool reused;
+      bool operator==(const FrameProgress&) const = default;
+    };
+    const auto read_progress = [&] {
+      const addon::RuntimeLock lock(native::runtime_mutex);
+      const auto& stream = native::fg_service::streams.at({true, context});
+      const auto& clock = stream.base_frame_clock;
+      const auto role = native::features.find(stream.roles[1].Handle());
+      const auto* anchor = (role != native::features.end() ? role->second.slots[0].edit_reuse.get() : nullptr);
+      return FrameProgress{
+          .base_frame = stream.application_frame,
+          .source_frame = clock.frame.sequence,
+          .sequence_period = clock.frame.sequence_period,
+          .kind = clock.frame.kind,
+          .source = clock.frame.source,
+          .source_generation = clock.frame.generation,
+          .output_epoch = clock.frame.output_epoch,
+          .pass_begin = clock.frame.pass_begin,
+          .pass_count = clock.frame.pass_count,
+          .roles = clock.frame.roles,
+          .reuse_edits = clock.frame.reuse_edits,
+          .complete = clock.complete,
+          .claims = clock.claims,
+          .outputs = clock.outputs,
+          .native_frame = stream.native_edit_frame,
+          .native_source_epoch = stream.native_edit_source_epoch,
+          .observed_frames = native::game_window.frames,
+          .reset_epoch = native::history_reset_epoch.load(),
+          .delivery_serial = stream.native_serial,
+          .model_frames = {stream.last_model_frame[0], stream.last_model_frame[1]},
+          .output_frames = {stream.last_output_frame[0], stream.last_output_frame[1]},
+          .cached = stream.cached,
+          .anchor = anchor,
+          .anchor_generation = (anchor != nullptr ? anchor->anchor_generation : 0),
+          .anchor_sequence = (anchor != nullptr ? anchor->source_sequence : 0),
+          .reuse_count = (anchor != nullptr ? anchor->reuse_count : 0),
+          .reused = anchor != nullptr && anchor->reused};
     };
     const auto record = [&](const Request& request) {
       if (request.update_source) {
@@ -285,7 +366,9 @@ int Run() {
       }
       const bool direct_tag = request.tag_copy == TagCopy::DIRECT || request.tag_copy == TagCopy::DIRECT_AMBIGUOUS;
       auto* input_hudless = (request.tag_copy != TagCopy::NONE && !direct_tag ? hudless_clone.Get() : hudless.Get());
+      auto* input_alpha = (request.with_ui_alpha ? ui.Get() : nullptr);
       parameters.Set(NVSDK_NGX_DLSSG_Parameter_HUDLess, input_hudless);
+      parameters.Set(NVSDK_NGX_DLSSG_Parameter_UIAlpha, input_alpha);
       parameters.Set(NVSDK_NGX_DLSSG_Parameter_Reset, request.reset ? 1u : 0u);
       parameters.Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, request.index);
       Observation observed;
@@ -308,6 +391,8 @@ int Run() {
             auto* cached_before = existing.cached;
             const auto serial_before = existing.native_serial;
             const auto frame_before = existing.application_frame;
+            const auto common_claims_before = existing.base_frame_clock.claims;
+            const auto common_outputs_before = existing.base_frame_clock.outputs;
             const bool owner_valid = owner.prefg_target_valid;
             owner.prefg_target_valid = false;
             try {
@@ -324,7 +409,9 @@ int Run() {
                 "owner-unavailable direct consumption creates neither NR work nor a native service stream");
             const auto& unchanged = native::fg_service::streams.at({true, context});
             Check(unchanged.cached == cached_before && unchanged.native_serial == serial_before
-                    && unchanged.application_frame == frame_before,
+                    && unchanged.application_frame == frame_before
+                    && unchanged.base_frame_clock.claims == common_claims_before
+                    && unchanged.base_frame_clock.outputs == common_outputs_before,
                 "owner-unavailable consumption cannot create or advance the previous output cache");
             const auto claimed = tag_source::Snapshot();
             const auto exact = tag_source::CurrentFrame(input_hudless, gpu.list.Get(), claimed.claim_epoch);
@@ -340,24 +427,77 @@ int Run() {
         }
         auto* bound_hudless = native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_HUDLess);
         if (observed.replaced) {
-          Check(original == input_hudless && bound_hudless != input_hudless && bound_hudless != backbuffer.Get(),
-              "native FG consumes a private HUDLess result and returns the borrowed original binding");
+          const auto& stream = native::fg_service::streams.at({true, context});
+          const auto* cached = stream.cached;
+          Check(cached != nullptr && cached->color[0] != nullptr && stream.source_backbuffer == backbuffer.Get()
+                  && stream.source_hudless == input_hudless,
+              "native FG publishes both output colors for the actual borrowed input pair");
+          auto* delivered_hudless = (cached->color_inputs_prepared ? cached->coupled_hudless : cached->color[1]);
+          Check(original == input_hudless && bound_hudless == delivered_hudless
+                  && bound_hudless != input_hudless && bound_hudless != backbuffer.Get(),
+              "native FG consumes the group's private HUDLess result and returns the borrowed original binding");
         } else {
           Check(original == nullptr && bound_hudless == input_hudless,
               "unprepared native input keeps its original HUDLess binding");
         }
-        Check(native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_UIAlpha) == ui.Get(),
-            "native exact alpha stays bound at FG consumption");
+        Check(native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_Backbuffer) == backbuffer.Get()
+                && native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_UI) == nullptr
+                && native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_UIAlpha) == input_alpha,
+            "native FG keeps the BB, UI and alpha parameter bindings at consumption");
         consumed_back = Capture(gpu, backbuffer.Get(), NATIVE_INPUT_STATE);
         consumed_hudless = Capture(gpu, bound_hudless, NATIVE_INPUT_STATE);
         native::RestoreNativePreFg(gpu.list.Get(), &parameters, original, request.fg_success, handle, observed.replaced);
-        Check(native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_HUDLess) == input_hudless
+        Check(native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_Backbuffer) == backbuffer.Get()
+                && native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_HUDLess) == input_hudless
                 && native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_UI) == nullptr
-                && native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_UIAlpha) == ui.Get(),
-            "native FG success/failure restores original HUDLess/UI/alpha bindings");
+                && native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_UIAlpha) == input_alpha
+                && native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_Depth) == depth.Get()
+                && native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_MVecs) == motion.Get()
+                && native::GetUInt(&parameters, NVSDK_NGX_DLSSG_Parameter_Reset) == (request.reset ? 1u : 0u)
+                && native::GetUInt(&parameters, NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex) == request.index,
+            "native FG restores original typed color, guide and scalar parameters after consumption");
         restored_back = Capture(gpu, backbuffer.Get(), NATIVE_INPUT_STATE);
         original_hudless = Capture(gpu, input_hudless, NATIVE_INPUT_STATE);
         unchanged_ui = Capture(gpu, ui.Get(), NATIVE_INPUT_STATE);
+        if (request.retain_recording) {
+          for (const auto* snapshot : {&consumed_back, &consumed_hudless, &restored_back, &original_hudless, &unchanged_ui}) {
+            gpu.retained_resources.emplace_back(snapshot->readback.Get());
+          }
+          const auto produced = read_progress();
+          const auto& stream = native::fg_service::streams.at({true, context});
+          std::vector<std::pair<addon::FenceRef, uint64_t>> receipts;
+          Check(observed.replaced && produced.cached != nullptr
+                  && stream.native_pair_recording == submission::RecordingIdentity(gpu.list.Get())
+                  && submission::UseSubmissionTokens(stream.native_pair_producer_marker, &receipts)
+                      == submission::UseSubmission::kUnsubmitted,
+              "complete Native color recording has no cross-list order before Execute");
+          const auto check_mfg = [&](ID3D12GraphicsCommandList* consumer, ID3D12Resource* consumer_hudless,
+                                     bool deliver) {
+            auto duplicate = parameters;
+            duplicate.Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, 2u);
+            duplicate.Set(NVSDK_NGX_DLSSG_Parameter_HUDLess, consumer_hudless);
+            const auto before = model_calls;
+            const auto reuses = native::edit_reuse_reuses.load();
+            bool replaced = false;
+            ID3D12Resource* original = nullptr;
+            {
+              const addon::RuntimeLock lock(native::runtime_mutex);
+              original = native::RunNativePreFg(consumer, &duplicate, handle, &replaced);
+            }
+            auto* expected = (deliver ? bound_hudless : consumer_hudless);
+            Check(replaced == deliver && original == (deliver ? consumer_hudless : nullptr)
+                    && native::PreFgResource(&duplicate, NVSDK_NGX_DLSSG_Parameter_HUDLess) == expected,
+                "same-token consumption requires every cached color role and proven producer order");
+            native::RestoreNativePreFg(consumer, &duplicate, original, true, handle, replaced);
+            Check(native::PreFgResource(&duplicate, NVSDK_NGX_DLSSG_Parameter_HUDLess) == consumer_hudless
+                    && model_calls == before && native::edit_reuse_reuses.load() == reuses
+                    && read_progress() == produced,
+                "Native MFG restores its binding and neither denial nor ordered re-delivery advances history");
+          };
+          check_mfg(proof_list.Get(), input_hudless, false);
+          check_mfg(gpu.list.Get(), nullptr, false);
+          check_mfg(gpu.list.Get(), input_hudless, true);
+        }
       };
       if (request.tag_copy != TagCopy::NONE) {
         const auto producer_thread = GetCurrentThreadId();
@@ -459,6 +599,7 @@ int Run() {
                 Check(claimed_epoch != 0, "repeated MFG queries the production pair's claimed source epoch");
               }
               const auto tagged = tag_source::CurrentFrame(input_hudless, gpu.list.Get(), claimed_epoch);
+              observed.source_generation = tagged.generation;
               const bool expected = request.tag_copy == TagCopy::SUCCESS || request.tag_copy == TagCopy::DIRECT;
               Check(tagged.available == expected && (!expected || tagged.frame == request.token),
                   "only a successful unique direct tag or unchanged completed clone retains its actual FrameToken");
@@ -483,16 +624,58 @@ int Run() {
         const frame_source::SdkScope scope(output_identity);
         const auto ticket = addon::fg::native_options::CurrentFrame(output_identity);
         Check(ticket.available && ticket.frame == request.token, "SDK scope exposes this producer token");
+        observed.source_generation = ticket.generation;
         consume();
       } else {
         Check(!addon::fg::native_options::CurrentFrame(output_identity).available,
             "missing SDK source scope cannot expose an old token");
         consume();
       }
+      if (request.retain_recording) {
+        // The current SDK scope must end before the old token acquires its own scope.
+        const auto prepared = read_progress();
+        const auto marker = native::native_fg_marker.load();
+        const auto serial = native::native_fg_recording_serial.load();
+        const auto submitted = native::native_fg_submitted_frames.load();
+        const auto calls = model_calls;
+        const auto reuses = native::edit_reuse_reuses.load();
+        std::vector<std::pair<addon::FenceRef, uint64_t>> receipts;
+        Check(request.fg_success && prepared.complete && prepared.cached != nullptr
+                && native::native_fg_result.load() == addon::fg::Result::PREPARED
+                && marker == prepared.cached->color[0] && serial == prepared.delivery_serial
+                && submission::UseSubmissionTokens(marker, &receipts) == submission::UseSubmission::kUnsubmitted,
+            "SDK-accepted F2 remains PREPARED on the actual unsubmitted host recording");
+        FakeFrameToken late_token;
+        late_token.frame = request.token - 1;
+        Check(frame_source::ObserveMarker(+[](sl::PCLMarker, const sl::FrameToken&) { return sl::Result::eOk; },
+                  sl::PCLMarker::ePresentStart, late_token) == sl::Result::eOk,
+            "late F1 reaches the real Reflex observer before the F2 host list is submitted");
+        {
+          const frame_source::SdkScope scope(output_identity);
+          const auto ticket = addon::fg::native_options::CurrentFrame(output_identity);
+          Check(ticket.available && ticket.frame == late_token.frame && ticket.generation == prepared.source_generation,
+              "the late F1 consumer acquires its own trusted SDK scope in F2's source generation");
+          auto late_parameters = parameters;
+          late_parameters.Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, 1u);
+          bool replaced = false;
+          ID3D12Resource* original = nullptr;
+          {
+            const addon::RuntimeLock lock(native::runtime_mutex);
+            original = native::RunNativePreFg(gpu.list.Get(), &late_parameters, handle, &replaced);
+          }
+          Check(original == nullptr && !replaced, "unsubmitted F2 declines late F1 without another NR output replacement");
+          native::RestoreNativePreFg(gpu.list.Get(), &late_parameters, original, false, handle, replaced);
+        }
+        Check(native::native_fg_result.load() == addon::fg::Result::PREPARED
+                && native::native_fg_marker.load() == marker && native::native_fg_recording_serial.load() == serial
+                && native::native_fg_submitted_frames.load() == submitted
+                && model_calls == calls && native::edit_reuse_reuses.load() == reuses && read_progress() == prepared,
+            "late F1 SDK failure preserves F2's PREPARED submission marker, serial, cache and history before Execute");
+      }
       observed.evaluates = model_calls - before_calls;
       observed.reuses = native::edit_reuse_reuses.load() - before_reuses;
       observed.reset = (observed.evaluates != 0 ? model_resets.back() : -1);
-      submit();
+      submit(request.retain_recording);
       observed.consumed_back = consumed_back.Pixels();
       observed.consumed_hudless = consumed_hudless.Pixels();
       observed.restored_back = restored_back.Pixels();
@@ -508,11 +691,11 @@ int Run() {
       return pixels.size() == source.size() * sizeof(uint32_t)
           && std::memcmp(pixels.data(), source.data(), pixels.size()) == 0;
     };
-    uint32_t token = 100;
+    uint32_t token = std::numeric_limits<uint32_t>::max() - (native::kContractDebounceFrames + 16);
     bool direct_warmup_mfg_checked = false;
-    const auto recover = [&](TagCopy tag_copy = TagCopy::NONE) {
+    const auto recover = [&](TagCopy tag_copy = TagCopy::NONE, bool reset = true) {
       for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 12; ++attempt) {
-        const auto observed = record({.token = ++token, .reset = true, .tag_copy = tag_copy});
+        auto observed = record({.token = ++token, .reset = reset, .tag_copy = tag_copy});
         Check(observed.reuses == 0, "native recovery cannot reuse an invalidated edit anchor");
         if (tag_copy == TagCopy::DIRECT && !direct_warmup_mfg_checked && !observed.replaced) {
           uint64_t claimed_epoch = 0, native_frame = 0;
@@ -539,46 +722,199 @@ int Run() {
           }
           direct_warmup_mfg_checked = true;
         }
-        if (observed.replaced && observed.evaluates == 1) return;
+        if (observed.replaced && observed.evaluates == 1) return observed;
       }
-      Check(false, "bounded native warmup reaches a one-model exact-alpha refresh");
+      throw std::runtime_error("bounded native warmup failed to reach a one-model exact-alpha refresh");
     };
     recover();
-    const auto refreshed = record({.token = ++token, .reset = true});
-    Check(refreshed.replaced && refreshed.evaluates == 1 && refreshed.reuses == 0 && refreshed.reset == 1,
-        "native refresh uses exactly one HUDLess model and current exact-alpha composition");
     auto& stream = native::fg_service::streams.at({true, context});
     const auto* role_handle = stream.roles[1].Handle();
-    auto anchor = native::features.at(role_handle).slots[0].edit_reuse;
-    Check(stream.native_edit_source && stream.native_edit_frame == static_cast<uint64_t>(token) + 1
-            && anchor != nullptr && anchor->valid && target.xefg_edit_reuse_frame == 0,
-        "native service derives a private edit anchor from the observed token without a XeFG marker");
-    for (const auto& binding : anchor->bindings) {
-      for (const auto& resource : binding.resources) {
-        Check(resource.Get() != backbuffer.Get() && resource.Get() != hudless.Get(),
-            "native edit descriptors retain private staged originals rather than game color inputs");
+    {
+      constexpr uint32_t last_token = std::numeric_limits<uint32_t>::max();
+      constexpr uint64_t token_period = static_cast<uint64_t>(last_token) + 1;
+      const auto before = read_progress();
+      const auto last = record({.token = last_token, .reset = true});
+      const auto at_limit = read_progress();
+      Check(last.replaced && last.evaluates == 1 && last.reuses == 0 && last.reset == 1
+              && at_limit.kind == frame_policy::SourceKind::SDK_SCOPE && at_limit.source == output_identity
+              && at_limit.source_generation == before.source_generation
+              && last.source_generation == at_limit.source_generation
+              && at_limit.sequence_period == token_period && at_limit.source_frame == token_period
+              && at_limit.claims == before.claims + 1 && at_limit.outputs == before.outputs + 1,
+          "a real SDK token reaches UINT32_MAX with its unchanged source generation and finite counter period");
+      const auto wrapped = record({.token = 0});
+      const auto at_zero = read_progress();
+      Check(wrapped.replaced && wrapped.evaluates == 1 && wrapped.reuses == 0 && wrapped.reset == 1
+              && at_zero.kind == at_limit.kind && at_zero.source == at_limit.source
+              && at_zero.source_generation == at_limit.source_generation
+              && wrapped.source_generation == at_limit.source_generation && at_zero.sequence_period == token_period
+              && at_zero.source_frame == 1 && at_zero.native_frame == 1
+              && at_zero.claims == at_limit.claims + 1 && at_zero.outputs == at_limit.outputs + 1
+              && at_zero.base_frame == at_limit.base_frame + 1 && at_zero.observed_frames == at_limit.observed_frames + 1
+              && at_zero.complete && at_zero.anchor != nullptr && at_zero.anchor->valid
+              && !at_zero.reused && at_zero.anchor_sequence == 1
+              && at_zero.model_frames[1] == 1 && at_zero.output_frames[1] == 1,
+          "the actual SDK counter wrap claims raw token zero as sequence one and refreshes with a model Reset");
+      const auto after_wrap = record({.token = 1});
+      const auto at_one = read_progress();
+      Check(after_wrap.replaced && after_wrap.evaluates == 0 && after_wrap.reuses == 1
+              && at_one.kind == at_zero.kind && at_one.source == at_zero.source
+              && at_one.source_generation == at_zero.source_generation && after_wrap.source_generation == at_zero.source_generation
+              && at_one.sequence_period == token_period && at_one.source_frame == 2 && at_one.native_frame == 2
+              && at_one.claims == at_zero.claims + 1 && at_one.outputs == at_zero.outputs + 1
+              && at_one.base_frame == at_zero.base_frame + 1 && at_one.observed_frames == at_zero.observed_frames + 1
+              && at_one.complete && at_one.anchor == at_zero.anchor && at_one.anchor_generation == at_zero.anchor_generation
+              && at_one.anchor_sequence == 2 && at_one.reused && at_one.reuse_count == at_zero.reuse_count + 1
+              && at_one.model_frames[1] == 1 && at_one.output_frames[1] == 2
+              && matches(after_wrap.consumed_back, source_back) && matches(after_wrap.consumed_hudless, source_hudless),
+          "the adjacent real SDK token one reuses the post-wrap anchor and delivers its current colors");
+      const auto submissions = native::native_fg_submitted_frames.load();
+      const auto late_limit = record({.token = last_token, .update_source = false});
+      Check(!late_limit.replaced && late_limit.evaluates == 0 && late_limit.reuses == 0
+              && late_limit.source_generation == at_one.source_generation && read_progress() == at_one
+              && native::native_fg_submitted_frames.load() == submissions
+              && late_limit.consumed_back == after_wrap.consumed_back
+              && late_limit.consumed_hudless == after_wrap.consumed_hudless,
+          "late UINT32_MAX after the wrap preserves the current cache, model, anchor, game history, clock and pixels");
+      const auto following = record({.token = 2});
+      Check(following.replaced && following.evaluates == 1 && following.reuses == 0 && following.reset == 0,
+          "real token two retains the post-wrap refresh cadence after the old maximum token is refused");
+      token = 2;
+    }
+    std::array<Observation, 4> baseline;
+    enum class ExtraConsumption { NONE, REPEATED, LATE, LATE_SDK_FAILURE };
+    for (const auto extra : {ExtraConsumption::NONE, ExtraConsumption::REPEATED, ExtraConsumption::LATE, ExtraConsumption::LATE_SDK_FAILURE}) {
+      // The fixture pixels repeat every 12 tokens so the reset arms have
+      // identical real-frame RGBA before inserting extra consumption.
+      if (extra != ExtraConsumption::NONE) token += 8;
+      for (size_t frame = 0; frame < baseline.size(); ++frame) {
+        const bool refresh = frame % 2 == 0;
+        const auto before = read_progress();
+        const auto submissions_before = native::native_fg_submitted_frames.load();
+        auto observed = record({.token = ++token, .reset = frame == 0});
+        const auto after = read_progress();
+        Check(observed.replaced && observed.evaluates == (refresh ? 1u : 0u)
+                && observed.reuses == (refresh ? 0u : 1u)
+                && observed.reset == (refresh ? (frame == 0 ? 1 : 0) : -1),
+            "native real-frame model calls follow refresh/reuse/refresh/reuse with only the initial Reset");
+        const auto& base = stream.base_frame_clock.frame;
+        Check(stream.native_edit_source && after.source == output_identity && after.source_generation != 0
+                && after.source_generation == observed.source_generation
+                && after.source_frame == static_cast<uint64_t>(token) + 1
+                && base.kind == frame_policy::SourceKind::SDK_SCOPE
+                && base.pass_begin == 0 && base.pass_count == 1 && base.roles == 3 && base.reuse_edits
+                && after.claims == before.claims + 1
+                && after.base_frame == before.base_frame + 1 && after.observed_frames == before.observed_frames + 1
+                && (frame == 0 || after.reset_epoch == before.reset_epoch),
+            "each Native SDK token claims its actual source, Present pass and two delivered color roles once");
+        const auto& model = native::features.at(role_handle).slots[0];
+        Check(after.anchor == model.edit_reuse.get() && after.anchor != nullptr && after.anchor->valid
+                && after.anchor_sequence == after.source_frame && after.reused == !refresh,
+            "native edit history follows the observed token and records the current x2 age");
+        if (frame != 0) {
+          Check(after.anchor == before.anchor && after.anchor_generation == before.anchor_generation + (refresh ? 1 : 0)
+                  && after.reuse_count == before.reuse_count + (refresh ? 0 : 1),
+              "native refresh changes the anchor generation and reuse only consumes the existing anchor");
+        }
+        if (refresh) {
+          Check(model_evaluated_handles.back() == model.handle,
+              "exact-alpha native refresh evaluates the HUDLess model");
+        } else {
+          Check(matches(observed.consumed_back, source_back) && matches(observed.consumed_hudless, source_hudless),
+              "native reuse delivers the current PQ colors and both packed alpha planes exactly");
+        }
+        Check(after.model_frames[0] == 0
+                && after.model_frames[1] == (refresh ? after.source_frame : before.model_frames[1])
+                && after.output_frames[1] == after.source_frame,
+            "exact-alpha composition delivers both colors with only the current HUDLess model output");
+        Check(after.cached != nullptr && stream.result == addon::fg::Result::PREPARED
+                && stream.base_frame_clock.complete && after.outputs == before.outputs + 1
+                && stream.native_pair_producer_marker == after.cached->original_backbuffer
+                && !stream.native_pair_completion.empty()
+                && stream.native_pair_completion.fence->GetCompletedValue() >= stream.native_pair_completion_value
+                && native::native_fg_submitted_frames.load() == submissions_before + 1,
+            "a new complete native color pair has a real ordered producer submission");
+        for (const auto& binding : after.anchor->bindings) {
+          for (const auto& resource : binding.resources) {
+            Check(resource.Get() != backbuffer.Get() && resource.Get() != hudless.Get(),
+                "native edit descriptors retain private staged originals rather than game color inputs");
+          }
+        }
+        if (extra == ExtraConsumption::NONE) {
+          baseline[frame] = std::move(observed);
+          continue;
+        }
+        Check(observed.consumed_back == baseline[frame].consumed_back
+                && observed.consumed_hudless == baseline[frame].consumed_hudless,
+            "extra Native consumption preserves each real frame's baseline delivered RGBA");
+        if (extra == ExtraConsumption::REPEATED && frame == 1) {
+          const auto duplicated = record({.token = token, .index = 2, .update_source = false});
+          Check(duplicated.replaced && duplicated.evaluates == 0 && duplicated.reuses == 0
+                  && duplicated.consumed_back == observed.consumed_back
+                  && duplicated.consumed_hudless == observed.consumed_hudless,
+              "repeated MFG consumes the exact previously delivered Native color pair");
+          Check(read_progress() == after && native::native_fg_submitted_frames.load() == submissions_before + 1,
+              "repeated MFG advances neither model/anchor/history nor the application submission count");
+        }
+        if ((extra == ExtraConsumption::LATE || extra == ExtraConsumption::LATE_SDK_FAILURE) && frame == 1) {
+          const bool sdk_succeeded = extra == ExtraConsumption::LATE;
+          const auto marker = native::native_fg_marker.load();
+          const auto serial = native::native_fg_recording_serial.load();
+          const auto calls = model_calls;
+          const auto reuses = native::edit_reuse_reuses.load();
+          for (const bool keep_hudless : {true, false}) {
+            auto late_parameters = parameters;
+            auto* late_hudless = (keep_hudless ? hudless.Get() : nullptr);
+            auto* late_alpha = (keep_hudless ? ui.Get() : nullptr);
+            late_parameters.Set(NVSDK_NGX_DLSSG_Parameter_HUDLess, late_hudless);
+            late_parameters.Set(NVSDK_NGX_DLSSG_Parameter_UIAlpha, late_alpha);
+            late_parameters.Set(NVSDK_NGX_DLSSG_Parameter_Reset, 1u);
+            late_parameters.Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, 1u);
+            FakeFrameToken late_token;
+            late_token.frame = token - 1;
+            Check(frame_source::ObserveMarker(+[](sl::PCLMarker, const sl::FrameToken&) { return sl::Result::eOk; },
+                      sl::PCLMarker::ePresentStart, late_token) == sl::Result::eOk,
+                "the real Reflex observer accepts the delayed F1 PresentStart after F2");
+            {
+              const frame_source::SdkScope scope(output_identity);
+              const auto ticket = addon::fg::native_options::CurrentFrame(output_identity);
+              Check(ticket.available && ticket.frame == late_token.frame && ticket.generation == after.source_generation,
+                  "the late Native wrapper receives a trusted older token in F2's actual source generation");
+              bool replaced = false;
+              ID3D12Resource* original = nullptr;
+              {
+                const addon::RuntimeLock lock(native::runtime_mutex);
+                original = native::RunNativePreFg(gpu.list.Get(), &late_parameters, handle, &replaced);
+              }
+              Check(original == nullptr && !replaced, "late F1 is declined for both its original and changed color-role group");
+              native::RestoreNativePreFg(gpu.list.Get(), &late_parameters, original, sdk_succeeded, handle, replaced);
+              Check(native::PreFgResource(&late_parameters, NVSDK_NGX_DLSSG_Parameter_Backbuffer) == backbuffer.Get()
+                      && native::PreFgResource(&late_parameters, NVSDK_NGX_DLSSG_Parameter_HUDLess) == late_hudless
+                      && native::PreFgResource(&late_parameters, NVSDK_NGX_DLSSG_Parameter_UIAlpha) == late_alpha
+                      && native::GetUInt(&late_parameters, NVSDK_NGX_DLSSG_Parameter_Reset) == 1u,
+                  "declining late F1 preserves its borrowed SDK parameters");
+            }
+            const auto late_back = Capture(gpu, backbuffer.Get(), NATIVE_INPUT_STATE);
+            const auto late_original_hudless = Capture(gpu, hudless.Get(), NATIVE_INPUT_STATE);
+            submit();
+            Check(read_progress() == after && model_calls == calls && native::edit_reuse_reuses.load() == reuses
+                    && stream.result == addon::fg::Result::PREPARED
+                    && native::native_fg_marker.load() == marker && native::native_fg_recording_serial.load() == serial
+                    && native::native_fg_submitted_frames.load() == submissions_before + 1,
+                sdk_succeeded
+                    ? "late F1 SDK success preserves F2's cache, producer, model, anchor, game history and complete common clock"
+                    : "late F1 SDK failure preserves F2's cache, producer, model, anchor, game history and complete common clock");
+            Check(late_back.Pixels() == observed.consumed_back && matches(late_original_hudless.Pixels(), source_hudless),
+                "late F1 leaves F2's delivered BB and the original HUDLess pixels intact");
+          }
+          const auto repeated_f2 = record({.token = token, .index = 2, .update_source = false});
+          Check(repeated_f2.replaced && repeated_f2.evaluates == 0 && repeated_f2.reuses == 0
+                  && read_progress() == after && repeated_f2.consumed_back == observed.consumed_back
+                  && repeated_f2.consumed_hudless == observed.consumed_hudless,
+              "F2 remains re-deliverable after late F1 and the next real frames retain the baseline cadence");
+        }
       }
     }
-    const auto anchor_generation = anchor->anchor_generation;
-    const auto model_frame = stream.last_model_frame[1];
-    const auto reused = record({.token = ++token});
-    Check(reused.replaced && reused.evaluates == 0 && reused.reuses == 1
-            && matches(reused.consumed_back, source_back) && matches(reused.consumed_hudless, source_hudless),
-        "native reuse delivers this frame's changed PQ colors and both current packed alpha planes exactly");
-    Check(native::features.at(role_handle).slots[0].edit_reuse == anchor
-            && anchor->anchor_generation == anchor_generation && stream.last_model_frame[1] == model_frame
-            && stream.last_output_frame[1] == stream.application_frame,
-        "native reuse advances delivered output without advancing the model or edit anchor");
-    const auto application_frame = stream.application_frame;
-    const auto native_frame = stream.native_edit_frame;
-    const auto duplicated = record({.token = token, .index = 2, .update_source = false});
-    Check(duplicated.replaced && duplicated.evaluates == 0 && duplicated.reuses == 0
-            && stream.application_frame == application_frame && stream.native_edit_frame == native_frame
-            && anchor->anchor_generation == anchor_generation,
-        "repeated MFG consumption of one real token advances neither NR, reuse, source cadence nor cache");
-    const auto next = record({.token = ++token});
-    Check(next.replaced && next.evaluates == 1 && next.reuses == 0 && next.reset == 0,
-        "next real native token refreshes after reuse without a false history Reset");
     token += 2;
     const auto gap = record({.token = token});
     Check(gap.replaced && gap.evaluates == 1 && gap.reuses == 0 && gap.reset == 1,
@@ -586,7 +922,74 @@ int Run() {
     const auto reset = record({.token = ++token, .reset = true});
     Check(reset.replaced && reset.evaluates == 1 && reset.reuses == 0 && reset.reset == 1,
         "explicit native Reset interrupts the x2 reuse phase");
-    anchor.reset();
+
+    {
+      Check(SUCCEEDED(proof_list->Close()) && SUCCEEDED(proof_list->Reset(proof_allocator.Get(), nullptr)),
+          "seed the foreign consumer recording's restorable command state");
+      ComPtr<ID3D12QueryHeap> query;
+      const D3D12_QUERY_HEAP_DESC query_desc{.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP, .Count = 1};
+      Check(SUCCEEDED(gpu.device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&query))), "native edit replay query");
+      const auto readback = gpu.Buffer(sizeof(uint64_t), D3D12_HEAP_TYPE_READBACK);
+      const auto timestamp = [&] {
+        uint64_t* mapped = nullptr;
+        Check(SUCCEEDED(readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped))), "native edit replay timestamp");
+        const auto value = *mapped;
+        readback->Unmap(0, nullptr);
+        return value;
+      };
+      funnel_accounting_tests::Restore substitutions;
+      substitutions.Value(&model_execution_query);
+      substitutions.Value(&model_execution_readback);
+      model_execution_query = query.Get();
+      model_execution_readback = readback.Get();
+      const auto submissions_before = native::native_fg_submitted_frames.load();
+      const auto retained = record({.token = ++token, .reset = true, .retain_recording = true});
+      model_execution_query = nullptr;
+      model_execution_readback = nullptr;
+      const auto original_execution = timestamp();
+      const auto recorded = read_progress();
+      const auto calls = model_calls;
+      const auto recording = submission::RecordingIdentity(gpu.list.Get());
+      Check(retained.replaced && retained.evaluates == 1 && retained.reset == 1 && recorded.cached != nullptr
+              && native::native_fg_result.load() == addon::fg::Result::SUBMITTED
+              && native::native_fg_marker.load() == recorded.cached->color[0]
+              && native::native_fg_recording_serial.load() == recorded.delivery_serial
+              && native::native_fg_counted_serial.load() == recorded.delivery_serial
+              && native::native_fg_submitted_frames.load() == submissions_before + 1,
+          "the original host list reaches SUBMITTED and counts F2 exactly once after declining late F1 SDK failure");
+      const auto* producer = recorded.cached->original_backbuffer;
+      execute_recording();
+      Check(original_execution != 0 && timestamp() > original_execution,
+          "replaying the closed host list executes the GPU model stand-in again");
+      Check(submission::RecordingIdentity(gpu.list.Get()) == recording && model_calls == calls
+              && read_progress() == recorded && native::native_fg_submitted_frames.load() == submissions_before + 1,
+          "host replay preserves the CPU model, frame, edit history and delivery claim");
+      std::vector<std::pair<addon::FenceRef, uint64_t>> receipts;
+      Check(submission::UseSubmissionTokens(producer, &receipts) == submission::UseSubmission::kTokens
+              && receipts.size() == 2 && receipts[0].second < receipts[1].second
+              && !submission::ResourceReleasable(producer),
+          "two real submissions retain the original producer while its host list remains replayable");
+      for (const auto& [fence, value] : receipts) {
+        const auto completed = fence->GetCompletedValue();
+        Check(completed != UINT64_MAX && completed >= value, "each host replay receipt has real GPU completion");
+      }
+      retire_recording();
+      Check(stream.native_pair_replayed && submission::ResourceReleasable(producer),
+          "after list Reset the producer retires and the stream preserves its replay ambiguity");
+      const auto denied = record({.token = token, .index = 2, .update_source = false});
+      Check(!denied.replaced && denied.evaluates == 0 && denied.reuses == 0 && read_progress() == recorded
+              && denied.consumed_back == retained.consumed_back
+              && native::native_fg_submitted_frames.load() == submissions_before + 1,
+          "Native refuses the same-frame replayed cache without rewriting the borrowed BB or advancing history");
+      const auto recovered = recover(TagCopy::NONE, false);
+      Check(recovered.reset == 1 && !stream.native_pair_replayed,
+          "a new properly ordered Native source frame rebuilds model history after replay without a caller Reset");
+      const auto reuse_after_replay = record({.token = ++token});
+      Check(reuse_after_replay.replaced && reuse_after_replay.evaluates == 0 && reuse_after_replay.reuses == 1,
+          "the frame following replay recovery reuses the new anchor");
+      // Leave a fresh anchor for the existing Adaptive residency regression.
+      Check(record({.token = ++token}).evaluates == 1, "refresh the fixed anchor before Adaptive changes");
+    }
 
     {
       Check(native::EnsureLookPipeline(gpu.device.Get()), "warm Look pipelines before Adaptive admission");
@@ -706,12 +1109,57 @@ int Run() {
             && !matches(failed.consumed_back, source_back) && matches(failed.restored_back, source_back)
             && native::fg_service::streams.at({true, context}).cached == nullptr,
         "FG failure rolls back the edited BB and invalidates the cache after restoring HUDLess/UI bindings");
+    {
+      // Removing exact UI alpha gives the existing Native contract two
+      // independent model roles. Fail only the BB after HUDLess records.
+      bool dual_ready = false;
+      for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 12; ++attempt) {
+        const auto outputs = stream.base_frame_clock.outputs;
+        const auto warmup = record({.token = ++token, .reset = true, .with_ui_alpha = false});
+        if (warmup.replaced) {
+          Check(warmup.evaluates == 2 && warmup.reuses == 0 && stream.base_frame_clock.complete
+                  && stream.base_frame_clock.frame.roles == 3 && stream.base_frame_clock.outputs == outputs + 1
+                  && stream.last_output_frame[0] == stream.base_frame_clock.frame.sequence
+                  && stream.last_output_frame[1] == stream.base_frame_clock.frame.sequence,
+              "the distinct Native BB and HUDLess model roles publish only as a complete group");
+          dual_ready = true;
+          break;
+        }
+        Check(stream.cached == nullptr && stream.base_frame_clock.outputs == outputs
+                && matches(warmup.consumed_back, source_back) && matches(warmup.consumed_hudless, source_hudless),
+            "private preparation of either Native role leaves original inputs and publishes no group");
+      }
+      Check(dual_ready, "both independent Native color roles finish bounded warmup");
+      const auto* hudless_model = native::features.at(role_handle).slots[0].handle;
+      const auto* backbuffer_model = native::features.at(stream.roles[0].Handle()).slots[0].handle;
+      const auto before_failure = read_progress();
+      const auto submissions = native::native_fg_submitted_frames.load();
+      const auto evaluations = model_evaluated_handles.size();
+      fail_call = model_calls + 2;
+      const auto partial = record({.token = ++token, .reset = true, .with_ui_alpha = false});
+      fail_call = 0;
+      const auto after_failure = read_progress();
+      Check(!partial.replaced && partial.evaluates == 2 && partial.reuses == 0
+              && model_evaluated_handles[evaluations] == hudless_model
+              && model_evaluated_handles[evaluations + 1] == backbuffer_model,
+          "actual BB Evaluate failure occurs after HUDLess has recorded on the borrowed list");
+      Check(after_failure.cached == nullptr && stream.result == addon::fg::Result::FAILED
+              && !stream.base_frame_clock.complete && after_failure.outputs == before_failure.outputs
+              && native::native_fg_submitted_frames.load() == submissions
+              && matches(partial.consumed_back, source_back) && matches(partial.consumed_hudless, source_hudless),
+          "a failed necessary role leaves both original SDK inputs and publishes no partial output or submission");
+    }
     native::direct_api.evaluate = nr_edit_reuse_gpu_cases::NeutralModel;
-    recover();
+    Check(recover(TagCopy::NONE, false).reset == 1,
+        "a complete Native group recovers with a model Reset after the previous second-role failure");
+    const auto before_scope_loss = read_progress();
     const auto no_scope = record({.token = ++token, .source_scope = false});
-    Check(no_scope.reuses == 0 && !native::fg_service::streams.at({true, context}).native_edit_source,
-        "missing native SDK scope returns to the existing full-rate path and cannot consume a previous edit anchor");
-    recover();
+    const auto after_scope_loss = read_progress();
+    Check(no_scope.reuses == 0 && !stream.native_edit_source && after_scope_loss.anchor == nullptr
+            && after_scope_loss.claims == before_scope_loss.claims && after_scope_loss.outputs == before_scope_loss.outputs,
+        "missing native SDK scope preserves full-rate fallback without reusing an anchor or claiming a common frame");
+    Check(recover(TagCopy::NONE, false).reset == 1,
+        "restored SDK source starts Native model history without a caller Reset");
     native::OnNativeFgOptions(false);
     const auto off = record({.token = ++token});
     Check(!off.replaced && off.evaluates == 0 && off.reuses == 0
@@ -736,20 +1184,30 @@ int Run() {
             && matches(tagged_reuse.consumed_back, source_back)
             && matches(tagged_reuse.consumed_hudless, source_hudless),
         "a subsequent completed tag-copy reuses edits on another thread with current PQ colors and alpha");
+    const auto tagged_progress = read_progress();
+    Check(tagged_progress.kind == frame_policy::SourceKind::TAGGED_RESOURCE
+            && tagged_progress.source == output_identity && tagged_progress.source_generation == tagged_reuse.source_generation
+            && tagged_progress.source_frame == static_cast<uint64_t>(token) + 1 && stream.base_frame_clock.complete,
+        "the production tag-copy observation supplies the common Native frame identity for the complete output");
     const auto tagged_application_frame = stream.application_frame;
     const auto tagged_native_frame = stream.native_edit_frame;
     const auto tagged_mfg = record({.token = token, .index = 2, .update_source = false, .tag_copy = TagCopy::SUCCESS});
     Check(tagged_mfg.replaced && tagged_mfg.evaluates == 0 && tagged_mfg.reuses == 0
             && stream.application_frame == tagged_application_frame && stream.native_edit_frame == tagged_native_frame
-            && tagged_anchor->anchor_generation == tagged_anchor_generation,
+            && tagged_anchor->anchor_generation == tagged_anchor_generation && read_progress() == tagged_progress
+            && tagged_mfg.consumed_back == tagged_reuse.consumed_back
+            && tagged_mfg.consumed_hudless == tagged_reuse.consumed_hudless,
         "deferred MFG reconsumes the same tagged clone without advancing NR or cache cadence");
     const auto tagged_next = record({.token = ++token, .tag_copy = TagCopy::SUCCESS});
     Check(tagged_next.replaced && tagged_next.evaluates == 1 && tagged_next.reuses == 0 && tagged_next.reset == 0,
         "next real tagged token refreshes after deferred reuse without a false history Reset");
     tagged_anchor.reset();
     for (const auto denied : {TagCopy::FAILED, TagCopy::OVERWRITTEN}) {
+      const auto before_denial = read_progress();
       const auto fallback = record({.token = ++token, .tag_copy = denied});
+      const auto after_denial = read_progress();
       Check(!fallback.replaced && fallback.evaluates == 0 && fallback.reuses == 0
+              && after_denial.claims == before_denial.claims && after_denial.outputs == before_denial.outputs
               && matches(fallback.restored_back, source_back),
           "failed or overwritten tag-copy rejects the old edit cache and preserves the current original BB");
       recover(TagCopy::SUCCESS);
@@ -780,17 +1238,66 @@ int Run() {
     const auto direct_application_frame = stream.application_frame;
     const auto direct_native_frame = stream.native_edit_frame;
     const auto direct_epoch = stream.native_edit_source_epoch;
+    const auto direct_progress = read_progress();
+    Check(direct_progress.kind == frame_policy::SourceKind::TAGGED_RESOURCE
+            && direct_progress.source == output_identity && direct_progress.source_generation == direct_reuse.source_generation
+            && direct_progress.source_frame == static_cast<uint64_t>(token) + 1 && stream.base_frame_clock.complete,
+        "the uniquely claimed direct tag supplies the common Native frame identity for the complete output");
     const auto direct_mfg = record({.token = token, .index = 2, .update_source = false, .tag_copy = TagCopy::DIRECT});
     Check(direct_mfg.replaced && direct_mfg.evaluates == 0 && direct_mfg.reuses == 0
             && stream.application_frame == direct_application_frame && stream.native_edit_frame == direct_native_frame
-            && stream.native_edit_source_epoch == direct_epoch && direct_anchor->anchor_generation == direct_anchor_generation,
+            && stream.native_edit_source_epoch == direct_epoch && direct_anchor->anchor_generation == direct_anchor_generation
+            && read_progress() == direct_progress && direct_mfg.consumed_back == direct_reuse.consumed_back
+            && direct_mfg.consumed_hudless == direct_reuse.consumed_hudless,
         "direct-tag MFG keeps its claimed epoch without advancing NR, source cadence or cache");
     const auto direct_next = record({.token = ++token, .tag_copy = TagCopy::DIRECT});
     Check(direct_next.replaced && direct_next.evaluates == 1 && direct_next.reuses == 0 && direct_next.reset == 0,
         "the next real direct FrameToken refreshes after reuse without a false history Reset");
     direct_anchor.reset();
+    {
+      const auto tagged = read_progress();
+      // SDK activation and the existing viewport lifetimes reach equal
+      // generation values independently; only the production APIs advance them.
+      Check(tagged.kind == frame_policy::SourceKind::TAGGED_RESOURCE
+              && tagged.source_generation == frame_source::Snapshot().generation,
+          "the direct-tag and SDK producers naturally have the same numeric generation");
+      const auto sdk_first = record({.token = token, .update_source = false});
+      const auto sdk_claim = read_progress();
+      Check(sdk_first.source_generation == tagged.source_generation && sdk_claim.kind == frame_policy::SourceKind::SDK_SCOPE
+              && sdk_claim.source == tagged.source && sdk_claim.source_generation == tagged.source_generation
+              && sdk_claim.source_frame == tagged.source_frame && sdk_claim.claims == tagged.claims + 1
+              && sdk_claim.observed_frames == tagged.observed_frames + 1,
+          "an actual SDK scope claims a new source domain despite the direct tag's equal generation and token");
+      Check(!sdk_first.replaced && sdk_first.evaluates == 0 && sdk_first.reuses == 0
+              && sdk_claim.cached == nullptr && !sdk_claim.complete && sdk_claim.outputs == tagged.outputs,
+          "switching to an equal-number SDK frame retires the tagged result and prepares its own model");
+      const auto sdk_refresh = recover(TagCopy::NONE, false);
+      const auto sdk_reuse = record({.token = ++token});
+      Check(sdk_refresh.reset == 1 && sdk_reuse.replaced && sdk_reuse.evaluates == 0 && sdk_reuse.reuses == 1,
+          "the SDK producer recovers with Reset and reuses only its own new edit anchor");
+      const auto sdk = read_progress();
+      const auto tagged_first = record({.token = --token, .tag_copy = TagCopy::DIRECT});
+      const auto tagged_claim = read_progress();
+      Check(tagged_first.source_generation == sdk.source_generation
+              && tagged_claim.kind == frame_policy::SourceKind::TAGGED_RESOURCE
+              && tagged_claim.source == sdk.source && tagged_claim.source_generation == sdk.source_generation
+              && tagged_claim.source_frame + 1 == sdk.source_frame && tagged_claim.claims == sdk.claims + 1
+              && tagged_claim.observed_frames == sdk.observed_frames + 1,
+          "a real unique direct tag claims its distinct domain even with a smaller token in the same numeric generation");
+      Check(!tagged_first.replaced && tagged_first.evaluates == 0 && tagged_first.reuses == 0
+              && tagged_claim.cached == nullptr && !tagged_claim.complete && tagged_claim.outputs == sdk.outputs,
+          "switching back to the smaller tagged token prepares fresh history without returning the SDK cache");
+      const auto tagged_recovered = recover(TagCopy::DIRECT, false);
+      const auto tagged_recovered_reuse = record({.token = ++token, .tag_copy = TagCopy::DIRECT});
+      Check(tagged_recovered.reset == 1 && tagged_recovered_reuse.replaced
+              && tagged_recovered_reuse.evaluates == 0 && tagged_recovered_reuse.reuses == 1,
+          "the direct producer resumes refresh/reuse using its own restored source identity");
+    }
+    const auto before_ambiguity = read_progress();
     const auto ambiguous_direct = record({.token = ++token, .tag_copy = TagCopy::DIRECT_AMBIGUOUS});
+    const auto after_ambiguity = read_progress();
     Check(!ambiguous_direct.replaced && ambiguous_direct.evaluates == 0 && ambiguous_direct.reuses == 0
+            && after_ambiguity.claims == before_ambiguity.claims && after_ambiguity.outputs == before_ambiguity.outputs
             && matches(ambiguous_direct.restored_back, source_back),
         "a recorded overwrite cannot make a later direct token unique; ambiguity preserves the current BB");
     ++token;
@@ -1011,11 +1518,17 @@ int Run() {
                  " direct_warmup_MFG_claim=stable"
                  " direct_unclaimed_recorded_overwrite=invalidated_and_retained"
                  " direct_owner_unavailable=claimed_and_tracked_without_NR"
-                 " refresh_reuse_refresh=1/0/1 repeated_MFG=stable current_color_alpha=checked"
+                 " baseline_repeat_and_late=1/0/1/0 common_frame_and_output=checked repeated_MFG=stable current_color_alpha=checked"
+                 " late_F1_same_and_changed_roles=F2_preserved provider_same_generation_equal_and_lower_tokens=distinct"
+                 " late_F1_SDK_failure=F2_preserved SDK_scope_wrap=max/zero/one late_max_after_wrap=denied"
+                 " unsubmitted_F2_late_F1_failure=PREPARED_to_SUBMITTED_once"
+                 " partial_BB_failure=no_output missing_role_and_foreign_unsubmitted=denied"
+                 " host_replay=two_GPU_executions_one_CPU_claim replayed_cache=denied recovery=checked"
                  " adaptive_unacquired=0_evaluate/1_reuse adaptive_preparation_and_switch=no_x2"
                  " adaptive_tokenless_after_prune=two_delivered fixed_recovery=refresh/reuse/MFG"
                  " motion_rejection/reset/gap/off/missing_scope/FG_failure/retirement=checked"
-                 " production_Execute_and_Fence=real NR=MOCK FG_consumer=readback no_game_or_visual_acceptance\n";
+                 " production_Execute_and_Fence=real NR=MOCK FG_consumer=readback"
+                 " per_output_identity=Unknown no_game_or_visual_acceptance\n";
     return 0;
   } catch (const std::exception& error) {
     fail_call = 0;

@@ -122,6 +122,7 @@
 #include "submission_tracker.hpp"
 #include "edit_reuse.hpp"
 #include "edit_reuse_policy.hpp"
+#include "present_frame_policy.hpp"
 #if defined(NR_NEXUS_DEV_CONTROL)
 #include "nr_fg_output_marker.hpp"
 #endif
@@ -1154,17 +1155,10 @@ struct PresentTarget {
   uint32_t sdr_restore_effective_mode = 0;
   std::array<float, kMaxNrPasses> pass_color_strength{};
   uint64_t guide_serial = 0;
-  // Ordinary Present supplies this only after matching the copied SR output,
-  // its guides and the actual backbuffer to one ordered submission.
-  uint64_t base_frame_sequence = 0;
+  // Each adapter proves the current producer and color ownership before
+  // supplying a frame. The ordinary route also carries its borrowed BB epoch.
+  present_frame_policy::Frame base_frame;
   uint64_t base_frame_epoch = 0;
-  // Granted only by XeFG's tagged, single-backbuffer service. Its private
-  // Output contains this base frame's original color before NR runs.
-  uint64_t xefg_edit_reuse_frame = 0;
-#if defined(NR_NEXUS_DEV_CONTROL)
-  // Native Pre-FG uses the observed producer FrameToken, never the XeFG clock.
-  uint64_t native_edit_reuse_frame = 0;
-#endif
   uint64_t diagnostic_source_generation = 0;
   NVSDK_NGX_Feature diagnostic_source_feature = NVSDK_NGX_Feature_Reserved_Unknown;
   uint32_t guide_mode = 0;
@@ -1176,6 +1170,7 @@ struct PresentTarget {
   // The native pre-FG service owns its command list and must not borrow the
   // game's Core context, which may have been initialized through a proxy.
   bool private_signed_runtime = false;
+  bool native_fg_inputs = false;
   // Granted only to the validated native single-plane FG transaction.
   bool native_prefg_resolution_pair = false;
   present_hdr_pedestal::Snapshot hdr_pedestal;
@@ -3679,6 +3674,7 @@ inline void NgxLifecycleTick();
 // evaluate hooks under runtime_mutex after the game's real evaluate.
 inline bool PresentTakesEvaluate();
 inline bool WantsPresentBaseFrames();
+inline bool ObservesPresentBaseFrames();
 // The wrapper must invalidate a still-writable source before calling NGX,
 // whose command traffic is hidden from the regular observation hooks.
 inline void ObservePresentSourceWork(ID3D12GraphicsCommandList* list, bool unknown_layout);
@@ -13469,6 +13465,18 @@ struct NrRecording {
 #endif
 };
 
+inline present_frame_policy::GroupResult PresentGroupResult(
+    std::span<const NrRecording> recordings, uint32_t required_roles, bool same_phase, uint32_t composed_roles = 0) {
+  std::array<present_frame_policy::Product, 2> products{};
+  for (size_t role = 0; role < recordings.size(); ++role) {
+    const auto& recording = recordings[role];
+    products[role] = {.prepared = recording.prepared, .model_invoked = recording.model_invoked,
+        .model_recorded = recording.model_recorded, .edit_reused = recording.edit_reused,
+        .output_ready = recording.output_ready, .group_complete = recording.group_complete};
+  }
+  return present_frame_policy::Resolve(std::span{products}.first(recordings.size()), required_roles, same_phase, composed_roles);
+}
+
 struct AdaptiveRecording {
   FeatureState* feature = nullptr;
   adaptive_resolution::Frame frame;
@@ -13700,7 +13708,8 @@ inline void RecordEditReuseWork(
     EditReuseRecording* recorded, uint64_t sequence, bool allow_reuse, bool allow_motion, bool snapshot_motion = true) {
   auto* cache = recorded->cache;
   if (cache == nullptr || !cache->valid) return;
-  if (allow_reuse && !cache->reused) {
+  if (present_frame_policy::Schedule(sequence, cache->source_sequence, cache->valid, cache->reused, allow_reuse)
+      == present_frame_policy::Execution::REUSE) {
     recorded->reused = edit_reuse::Record(device, list, cache, recorded->inputs,
         snapshot_motion ? edit_reuse::Phase::APPLY_AND_SNAPSHOT_MOTION : edit_reuse::Phase::APPLY);
     if (recorded->reused) {
@@ -14427,7 +14436,7 @@ inline bool RecordInline(
   const bool edit_reuse_requested = edit_reuse_enabled.load(std::memory_order_relaxed);
   const bool monitor_edit_requested = edit_reuse_requested && monitor_requested.load(std::memory_order_relaxed);
   const bool monitor_present_delivery = monitor_edit_requested && recording != nullptr && present != nullptr
-      && (present->base_frame_epoch != 0 || present->xefg_edit_reuse_frame != 0);
+      && present_frame_policy::Known(present->base_frame);
   EditReuseMonitorFrame edit_monitor;
   if (monitor_edit_requested
       && present == nullptr && bridge_source == nullptr && successful_sr_device == device
@@ -14488,23 +14497,15 @@ inline bool RecordInline(
       && !native_fg_owns.load() && !fg::xefg::OwnsStream() && !auto_fg_fallback_active.load()
       && (edit_reuse_current_native_off
           || (edit_off.available && native_fg_declaration.load() != NativeFgDeclaration::kOn));
-  const bool edit_reuse_xefg_route = present != nullptr && present->xefg_edit_reuse_frame != 0
-      && hook_point.load() == kHookPresent && !present->d3d11_bridge
-      && present->domain == present_restore_scope::Domain::PRE_FG_BACKBUFFER
-      && present->stage_execution_plan == nullptr && !present->native_prefg_resolution_pair
-      && present->source_color == nullptr;
-  bool edit_reuse_native_route = false;
-#if defined(NR_NEXUS_DEV_CONTROL)
-  edit_reuse_native_route = edit_reuse_fg_experiment.load() && present != nullptr
-      && present->native_edit_reuse_frame != 0 && present->xefg_edit_reuse_frame == 0
+  const bool edit_reuse_prefg_route = present != nullptr && present_frame_policy::Known(present->base_frame)
+      && present->base_frame.reuse_edits
       && hook_point.load() == kHookPresent && !present->d3d11_bridge
       && (present->domain == present_restore_scope::Domain::PRE_FG_BACKBUFFER
           || present->domain == present_restore_scope::Domain::PRE_FG_HUDLESS)
       && present->stage_execution_plan == nullptr && !present->native_prefg_resolution_pair
       && present->source_color == nullptr;
-#endif
-  const bool edit_reuse_prefg_route = edit_reuse_xefg_route || edit_reuse_native_route;
-  const bool edit_reuse_present_route = present != nullptr && present->base_frame_epoch != 0;
+  const bool edit_reuse_present_route = present != nullptr && present->base_frame_epoch != 0
+      && present_frame_policy::Known(present->base_frame) && present->base_frame.reuse_edits;
   // PQ stays in the existing Present codec: decode and convert to BT.709
   // before the sRGB model proxy, then commit back to HDR10 after reuse.
   const bool edit_reuse_hdr10 = edit_reuse_prefg_route && hdr_mode == 2
@@ -14553,13 +14554,7 @@ inline bool RecordInline(
   const bool edit_reuse_adaptive_route = edit_reuse_adaptive_contract && adaptive.session->prepared
       && edit_tiers->tiers[0].ready && edit_tiers->tiers[1].ready
       && AdaptiveTierUsable(*edit_tiers, *adaptive.session, 0) && AdaptiveTierUsable(*edit_tiers, *adaptive.session, 1);
-  uint64_t edit_reuse_sequence = (present != nullptr ? present->xefg_edit_reuse_frame : feature.sr_sequence);
-  if (edit_reuse_present_route) {
-    edit_reuse_sequence = present->base_frame_sequence;
-  }
-#if defined(NR_NEXUS_DEV_CONTROL)
-  if (edit_reuse_native_route) edit_reuse_sequence = present->native_edit_reuse_frame;
-#endif
+  const uint64_t edit_reuse_sequence = (present != nullptr ? present->base_frame.sequence : feature.sr_sequence);
   bool edit_reuse_route_eligible = edit_reuse_contract_eligible && !adaptive.preparing && !prepare_models_only
       && ((edit_reuse_fixed_workset
            && (edit_reuse_fixed_bilinear || CanCommitFullSizeEditReuse(feature, width, height, nr_input_width, nr_input_height)))
@@ -14591,7 +14586,7 @@ inline bool RecordInline(
       if (plan.mixed || group.begin != 0 || (group.count != 1 && !same_stage_stack)) edit_monitor.reason = EditReuseBlock::PASSES;
       else if (control_mask_eligible) edit_monitor.reason = EditReuseBlock::MASK;
       else if (!edit_reuse_fixed_workset) edit_monitor.reason = EditReuseBlock::ADAPTIVE;
-      else if (!edit_reuse_fixed_inline_route && !edit_reuse_present_route && !edit_reuse_xefg_route) {
+      else if (!edit_reuse_fixed_inline_route && !edit_reuse_present_route && !edit_reuse_prefg_route) {
         edit_monitor.reason = EditReuseBlock::ROUTE;
       }
       else if (!edit_reuse_contract_eligible) edit_monitor.reason = EditReuseBlock::INPUTS;
@@ -15503,7 +15498,8 @@ inline bool RecordInline(
       route_contract = {edit_off.context_identity, edit_off.epoch, edit_off.source_link_generation};
     }
     edit_contract = PrepareEditReuseHistory(&feature.slots[0], frame, res,
-        (edit_reuse_present_route ? present->diagnostic_source_generation : feature.source_generation),
+        (present != nullptr && present_frame_policy::Known(present->base_frame)
+            ? present->base_frame.generation : feature.source_generation),
         edit_reuse_sequence, chain_reset_epoch, nr_input_width, nr_input_height, output_desc.Format, v6_encoding,
         route_contract, present == nullptr, edit_reuse_model_request);
   }
@@ -16628,6 +16624,7 @@ inline bool RecordInline(
         }
       }
 #if defined(NR_NEXUS_DEV_CONTROL)
+      const bool edit_reuse_xefg_route = edit_reuse_prefg_route && !present->native_fg_inputs;
       if (fg_output_marker_window.enabled && !fg_output_marker_window.stopped
           && (edit_reuse_dev_inline_route || edit_reuse_xefg_route) && edit_reuse_route_eligible && !adaptive.preparing
           && executed + 1 == static_cast<int32_t>(requested_stack) && !NVSDK_NGX_FAILED(stack_failure)
@@ -22617,7 +22614,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
   // at the present (present_path.hpp).  When the present path cannot serve
   // (starved presents, an unusable swapchain) the after path below runs.
   if (fg::xefg::OwnsStream() || PresentTakesEvaluate()) {
-    if (!source_scope.owner && WantsPresentBaseFrames()) return result;
+    if (!source_scope.owner && ObservesPresentBaseFrames()) return result;
     CapturePresentGuides(
         command_list, handle, parameters,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -22907,7 +22904,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
   // at the present (present_path.hpp).  When the present path cannot serve
   // (starved presents, an unusable swapchain) the after path below runs.
   if (fg::xefg::OwnsStream() || PresentTakesEvaluate()) {
-    if (!source_scope.owner && WantsPresentBaseFrames()) return result;
+    if (!source_scope.owner && ObservesPresentBaseFrames()) return result;
     CapturePresentGuides(
         command_list, handle, parameters,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
