@@ -804,7 +804,9 @@ int main(int argc, char** argv) {
                    || std::strcmp(argv[1], "--nr-edit-reuse-contracts-public") == 0)) {
     return run_edit_reuse_case(nr_edit_reuse_gpu_cases::Run);
   }
-  if (argc == 2 && std::strcmp(argv[1], "--adaptive-inline") == 0) return adaptive_inline_cases::Run();
+  if (argc == 2 && std::strcmp(argv[1], "--adaptive-inline") == 0) {
+    return run_edit_reuse_case(adaptive_inline_cases::Run);
+  }
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-fg-service") == 0) return adaptive_fg_service_cases::Run();
 #if defined(NR_NEXUS_TEST_NATIVE_NGX)
   if (argc == 3 && std::strcmp(argv[1], "--nr-edit-reuse-present-native") == 0) {

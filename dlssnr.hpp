@@ -1077,6 +1077,8 @@ struct BridgeAdaptiveSource {
   uint64_t source_generation = 0;
   uint64_t shared_layout = 0;
   stage_plan::Stage stage = stage_plan::Stage::UPSCALED;
+  uint64_t sr_sequence = 0;
+  ID3D12Resource* output_twin = nullptr;
 };
 static std::atomic_bool bridge_adaptive_experiment{false};
 static std::atomic_uint64_t bridge_adaptive_device_generation{0};
@@ -2476,6 +2478,27 @@ inline std::atomic_uint32_t preset = defaults::kPreset;
 inline std::atomic_uint32_t pass_preset[kMaxNrPasses - 1] = {0u, 0u, 0u};
 inline std::atomic_uint32_t pass_stage[kMaxNrPasses - 1] = {0u, 0u, 0u};
 inline std::atomic_bool stage_source_rr{false};
+inline std::atomic<capability::Api> stage_source_api{capability::Api::UNKNOWN};
+
+inline capability::Api SourceExecutionApi(const NVSDK_NGX_Handle* handle) {
+  const auto source = create_contracts.find(handle);
+  if (source == create_contracts.end() || !source->second.source_type_confirmed
+      || source->second.source_generation == 0) return capability::Api::UNKNOWN;
+  return (source->second.source_device11_identity != nullptr ? capability::Api::DX11 : capability::Api::DX12);
+}
+
+inline capability::Api CurrentExecutionApi() {
+  const auto source = stage_source_api.load(std::memory_order_relaxed);
+  if (source != capability::Api::UNKNOWN) return source;
+  return (D3D12SessionKnown() ? capability::Api::DX12 : D3D11OnlySession() ? capability::Api::DX11
+      : vulkan_present_seen.load() ? capability::Api::VULKAN : capability::Api::UNKNOWN);
+}
+
+inline capability::Backend CurrentExecutionBackend(capability::Api api) {
+  return (api == capability::Api::DX11
+      ? (Dx11NativeRoute() ? capability::Backend::DX11_BRIDGE : capability::Backend::STREAMLINE_FALLBACK)
+      : api == capability::Api::UNKNOWN ? capability::Backend::UNKNOWN : capability::Backend::NATIVE);
+}
 
 inline std::atomic<float> intensity = defaults::kIntensity;
 inline std::atomic_uint32_t style = defaults::kStyle;
@@ -2635,19 +2658,25 @@ inline std::atomic<float> linear_unit_nits = defaults::kLinearUnitNits;
 // have their own intensity and decode-blend strengths so the stack can be
 // tuned pass by pass.
 inline std::atomic_uint32_t stack_passes = defaults::kStackPasses;
-inline stage_plan::Plan RequestedStagePlan(bool ray_reconstruction) {
-  stage_plan::Configuration config{.pass_count = stack_passes.load(), .hook_point = hook_point.load()};
-  for (uint32_t i = 0; i < kMaxNrPasses - 1; ++i) config.stages[i] = pass_stage[i].load();
-  return stage_plan::Build(config, {
-      .mixed_dx12 = !D3D11OnlySession() && !vulkan_present_seen.load(),
-      .mixed_dx11 = D3D11OnlySession() && Dx11NativeRoute(),
+inline stage_plan::Capabilities CurrentStageCapabilities(capability::Api api, bool ray_reconstruction) {
+  return {
+      .mixed_dx12 = api == capability::Api::DX12
+          || (api == capability::Api::UNKNOWN && !D3D11OnlySession() && !vulkan_present_seen.load()),
+      .mixed_dx11 = api == capability::Api::DX11 && Dx11NativeRoute(),
       .ray_reconstruction = ray_reconstruction,
-      .present_available = !vulkan_present_seen.load() && (!D3D11OnlySession() || Dx11NativeRoute()),
+      .present_available = api != capability::Api::VULKAN && (!D3D11OnlySession() || Dx11NativeRoute()),
       .fg_owns_input = fg::xefg::OwnsStream() || auto_fg_fallback_active.load()
           || (experimental_present_chain.load() && (fg::xefg::Enabled() || mixed_present_fg_seen.load() || native_fg_owns.load()
               || native_fg_declaration.load() == NativeFgDeclaration::kOn)),
-      .mixed_present_dx12 = experimental_present_chain.load(),
-  });
+      .mixed_present_dx12 = experimental_present_chain.load() && !D3D11OnlySession(),
+  };
+}
+
+inline stage_plan::Plan RequestedStagePlan(bool ray_reconstruction, capability::Api api = capability::Api::UNKNOWN) {
+  stage_plan::Configuration config{.pass_count = stack_passes.load(), .hook_point = hook_point.load()};
+  for (uint32_t i = 0; i < kMaxNrPasses - 1; ++i) config.stages[i] = pass_stage[i].load();
+  return stage_plan::Build(config, CurrentStageCapabilities(
+      api != capability::Api::UNKNOWN ? api : CurrentExecutionApi(), ray_reconstruction));
 }
 inline stage_plan::Plan RequestedStagePlan() {
   return RequestedStagePlan(stage_source_rr.load(std::memory_order_relaxed));
@@ -11175,6 +11204,7 @@ inline void ObserveSourcePlan(const NVSDK_NGX_Handle* handle, const stage_plan::
   // Present's SR-shaped internal streams use observe_source=false. Only the
   // game source may publish the capability used by menus and preset validation.
   stage_source_rr.store(source_feature == kFeatureDlssd, std::memory_order_relaxed);
+  stage_source_api.store(SourceExecutionApi(handle), std::memory_order_relaxed);
   last_source_plan = observed;
 }
 
@@ -11196,7 +11226,7 @@ inline stage_plan::Plan EvaluationStagePlan(const NVSDK_NGX_Handle* handle, bool
   } else if (const auto source = features.find(handle); source != features.end()) {
     rr = source->second.source_feature == kFeatureDlssd;
   }
-  const auto plan = RequestedStagePlan(rr);
+  const auto plan = RequestedStagePlan(rr, SourceExecutionApi(handle));
   if (observe_source) {
     ObserveSourcePlan(handle, plan);
   }
@@ -11714,16 +11744,49 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
     const BridgeAdaptiveSource* bridge_source = nullptr, const fg::xefg::BridgeOffEvidence* edit_off = nullptr) {
   if (!nr_adaptive_enabled.load() && *owner == nullptr) return {};
   if (*owner == nullptr) *owner = std::make_shared<adaptive_resolution::Session>();
+  capability::Input baseline;
+  baseline.api = (bridge_source != nullptr ? bridge_source->api : capability::Api::DX12);
+  baseline.backend = (bridge_source != nullptr ? bridge_source->backend : capability::Backend::NATIVE);
+  baseline.runtime = capability::Runtime::AVAILABLE;
+  baseline.fg = (native_fg_public_off.load() && native_fg_declaration.load() == NativeFgDeclaration::kOff
+      ? capability::Fg::OFF : native_fg_declaration.load() == NativeFgDeclaration::kOn
+          ? capability::Fg::ON : capability::Fg::UNKNOWN);
+  baseline.fg_owns_input = fg_owned || native_fg_owns.load() || fg::xefg::OwnsStream();
+  baseline.xefg_enabled = fg::xefg::Enabled();
+  baseline.auto_fg_fallback = auto_fg_fallback_active.load();
+  baseline.plan = plan;
+  if (!plan.mixed && plan.group_count == 1) {
+    // A single-stage adapter can deliver after SR when Present is unavailable.
+    // Size policy consumes its actual group, retaining the request for UI.
+    baseline.plan.groups[0] = group;
+    for (uint32_t pass = 0; pass < plan.pass_count; ++pass) baseline.plan.effective[pass] = group.stage;
+  }
+  baseline.mode = capability::GeometryMode::EXECUTION;
+  baseline.delivery = (fg_owned ? capability::Delivery::FG_INPUT : capability::Delivery::ORDINARY);
+  baseline.required_roles = required_roles;
+  baseline.source_outputs = source_outputs;
+  const auto main = EffectivePassResolution(0);
+  baseline.main_resolution = {.follow_input = main.follow_input, .scale = main.scale};
+  for (uint32_t pass = 1; pass < kMaxNrPasses; ++pass) {
+    const auto settings = EffectivePassResolution(pass);
+    baseline.resolutions[pass - 1] = {.mode = (settings.follow_input ? 1u : 2u), .scale = settings.scale};
+  }
+  baseline.geometry[static_cast<size_t>(group.stage)] = {
+      .reference_width = reference_width, .reference_height = reference_height,
+      .guide_width = guide_width, .guide_height = guide_height};
+  uint32_t group_index = baseline.plan.group_count;
+  for (uint32_t index = 0; index < baseline.plan.group_count; ++index) {
+    const auto& planned = baseline.plan.groups[index];
+    if (planned.stage == group.stage && planned.begin == group.begin && planned.count == group.count) group_index = index;
+  }
+  const auto group_capability = capability::EvaluateGroup(baseline, group_index);
+  supported &= group_capability.decision.CanSubmit();
   adaptive_resolution::Sizes upper{}, floor{};
   for (uint32_t pass = group.begin; pass < group.begin + group.count; ++pass) {
-    const auto settings = EffectivePassResolution(pass);
-    const auto size = capability::ResolveWorkingSize({.follow_input = settings.follow_input, .scale = settings.scale},
-        {.reference_width = reference_width, .reference_height = reference_height,
-         .guide_width = guide_width, .guide_height = guide_height});
+    const auto size = group_capability.working_sizes[pass];
     upper[pass] = {.width = size.width, .height = size.height};
     floor[pass] = {.width = std::max(1u, static_cast<uint32_t>(std::llround(reference_width * 0.33))),
                   .height = std::max(1u, static_cast<uint32_t>(std::llround(reference_height * 0.33)))};
-    if (fg_owned && upper[pass] != upper[group.begin]) supported = false;
   }
   gpu_comparison::Identity configuration;
   if (gpu_timers::comparison_settings != nullptr) gpu_timers::comparison_settings(&configuration);
@@ -11770,28 +11833,7 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
   if (edit_off != nullptr) {
     output.available = edit_off->MatchesOutput(output);
   }
-  capability::Input baseline;
-  baseline.api = (bridge_source != nullptr ? bridge_source->api : capability::Api::DX12);
-  baseline.backend = (bridge_source != nullptr ? bridge_source->backend : capability::Backend::NATIVE);
-  baseline.runtime = capability::Runtime::AVAILABLE;
-  baseline.fg = (native_fg_public_off.load() ? capability::Fg::OFF : capability::Fg::UNKNOWN);
-  baseline.fg_owns_input = fg_owned || native_fg_owns.load();
-  baseline.xefg_enabled = fg::xefg::Enabled();
-  baseline.auto_fg_fallback = auto_fg_fallback_active.load();
-  baseline.plan = plan;
-  const auto main = EffectivePassResolution(0);
-  baseline.main_resolution = {.follow_input = main.follow_input, .scale = main.scale};
-  for (uint32_t pass = 1; pass < kMaxNrPasses; ++pass) {
-    const auto settings = EffectivePassResolution(pass);
-    baseline.resolutions[pass - 1] = {.mode = (settings.follow_input ? 1u : 2u), .scale = settings.scale};
-  }
-  for (const auto& planned_group : plan.groups) {
-    baseline.geometry[static_cast<size_t>(planned_group.stage)] = {
-        .reference_width = reference_width, .reference_height = reference_height,
-        .guide_width = guide_width, .guide_height = guide_height};
-  }
-  supported &= capability::Query(baseline).CanSubmit();
-  const uint32_t outputs = (required_roles == 3 ? 2u : 1u) * source_outputs;
+  const uint32_t outputs = std::max(1u, group_capability.output_count);
   const bool explicit_reservation = nr_adaptive_enabled.load() && selected_levels != 0
       && adaptive_feature_mode.load() == AdaptiveFeatureMode::OFF;
   const uint32_t requested_worksets = (explicit_reservation
@@ -13512,6 +13554,21 @@ inline bool EditReuseSourceConfirmed(const NVSDK_NGX_Handle* handle, const Featu
       && created->second.source_generation == feature.source_generation;
 }
 
+inline bool BridgeHasCurrentSrFrame(const BridgeAdaptiveSource& source,
+    const FeatureState& feature, const NVSDK_NGX_Handle* handle, ID3D12Device* device,
+    ID3D12GraphicsCommandList* list, ID3D12Resource* output) {
+  const auto created = create_contracts.find(handle);
+  return source.api == capability::Api::DX11 && source.backend == capability::Backend::DX11_BRIDGE
+      && source.stage == stage_plan::Stage::UPSCALED && source.handle == handle
+      && source.device == device && source.list == list && source.output_twin == output
+      && source.device11_identity != nullptr && source.device_generation != 0 && source.shared_layout != 0
+      && source.source_generation == feature.source_generation
+      && source.sr_sequence != 0 && source.sr_sequence == feature.sr_sequence
+      && created != create_contracts.end() && created->second.source_feature == kFeatureDlss
+      && created->second.source_generation == source.source_generation
+      && created->second.source_device11_identity.Get() == source.device11_identity;
+}
+
 inline EditReuseMonitorFrame ObserveEditReuseMonitorFrame(
     const FeatureState& source, ID3D12Device* device, stage_plan::Stage stage, uint32_t width, uint32_t height) {
   return {.stage = stage, .configuration = configuration_generation.load(), .reset_epoch = history_reset_epoch.load(),
@@ -13553,7 +13610,7 @@ inline bool EditReuseInputsEligible(
     const D3D12_RESOURCE_DESC& depth_desc, uint8_t hdr_mode, bool allow_hdr10,
     uint32_t model_request, bool same_stage_stack = false) {
   return !plan.mixed && group.begin == 0 && (group.count == 1 || same_stage_stack)
-      && !D3D11OnlySession() && !direct_api.borrowed_core_context
+      && !direct_api.borrowed_core_context
       && (model_request == 1u || model_request == 2u)
       && ((hdr_mode == 1 && color_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) || allow_hdr10)
       && (color_desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0
@@ -14323,6 +14380,9 @@ inline bool RecordInline(
       && output_format == DXGI_FORMAT_R16G16B16A16_FLOAT && hdr_mode == 1
       && direct_runtime_requirements.file_version == "310.9.16.0"
       && nr_model::ResolvePreset(preset.load(), 0, direct_runtime_requirements.dual_models) == 2;
+  const bool current_sr_color = (bridge_source != nullptr
+      ? BridgeHasCurrentSrFrame(*bridge_source, feature, handle, device, command_list, output)
+      : successful_sr_device == device);
   const bool bridge_adaptive = bridge_source != nullptr
       && BridgeAdaptiveEligible(*bridge_source, command_list, device, handle, plan);
   fg::xefg::BridgeOffEvidence edit_off;
@@ -14342,8 +14402,8 @@ inline bool RecordInline(
            reinterpret_cast<uintptr_t>(handle) ^ reinterpret_cast<uintptr_t>(device)
                ^ (bridge_source != nullptr ? bridge_source->source_generation : feature.source_generation)
                ^ (static_cast<uint64_t>(output_desc.Format) * 1099511628211ull) ^ feature.create_flags,
-          bridge_adaptive || (bridge_source == nullptr && !D3D11OnlySession() && (present == nullptr
-              || (!present->d3d11_bridge && present->domain == present_restore_scope::Domain::FINAL_PRESENT
+          bridge_adaptive || (bridge_source == nullptr && (present == nullptr
+              || (present != nullptr && !present->d3d11_bridge && present->domain == present_restore_scope::Domain::FINAL_PRESENT
                   && present->stage_execution_plan == nullptr && !present->native_prefg_resolution_pair))),
           0, 1, false, adaptive_output_count, 0, upper_capacity, bridge_source, edit_output_contract));
   SelectAdaptiveTier(&feature, handle, &adaptive, present != nullptr && present->adaptive_frame != nullptr,
@@ -14434,6 +14494,10 @@ inline bool RecordInline(
   stage_stats.width = width;
   stage_stats.height = height;
   const bool edit_reuse_requested = edit_reuse_enabled.load(std::memory_order_relaxed);
+  const edit_reuse_policy::Source inline_source{
+      .generation = feature.source_generation,
+      .sequence = (bridge_source != nullptr ? bridge_source->sr_sequence : feature.sr_sequence),
+      .current_color = present == nullptr && current_sr_color, .ordered = current_sr_color};
   const bool monitor_edit_requested = edit_reuse_requested && monitor_requested.load(std::memory_order_relaxed);
   const bool monitor_present_delivery = monitor_edit_requested && recording != nullptr && present != nullptr
       && present_frame_policy::Known(present->base_frame);
@@ -14465,9 +14529,10 @@ inline bool RecordInline(
 #endif
   const bool edit_reuse_fixed_workset = UsesFixedEditReuseWorkset(feature, adaptive);
   const bool edit_reuse_fixed_inline_route = edit_reuse_requested && edit_reuse_fixed_workset
-      && present == nullptr && bridge_source == nullptr
-      && execution_stage == stage_plan::Stage::UPSCALED && hook_point.load() == kHookUpscaled
-      && successful_sr_device == device
+      && present == nullptr && edit_reuse_policy::CanUseHistory(inline_source)
+      && execution_stage == stage_plan::Stage::UPSCALED
+      && plan.At(stage_plan::Stage::UPSCALED).begin == group.begin
+      && plan.At(stage_plan::Stage::UPSCALED).count == group.count
       && !native_fg_owns.load() && !fg::xefg::OwnsStream() && !auto_fg_fallback_active.load()
       && EditReuseSourceConfirmed(handle, feature);
 #if defined(NR_NEXUS_DEV_CONTROL)
@@ -14554,7 +14619,7 @@ inline bool RecordInline(
   const bool edit_reuse_adaptive_route = edit_reuse_adaptive_contract && adaptive.session->prepared
       && edit_tiers->tiers[0].ready && edit_tiers->tiers[1].ready
       && AdaptiveTierUsable(*edit_tiers, *adaptive.session, 0) && AdaptiveTierUsable(*edit_tiers, *adaptive.session, 1);
-  const uint64_t edit_reuse_sequence = (present != nullptr ? present->base_frame.sequence : feature.sr_sequence);
+  const uint64_t edit_reuse_sequence = (present != nullptr ? present->base_frame.sequence : inline_source.sequence);
   bool edit_reuse_route_eligible = edit_reuse_contract_eligible && !adaptive.preparing && !prepare_models_only
       && ((edit_reuse_fixed_workset
            && (edit_reuse_fixed_bilinear || CanCommitFullSizeEditReuse(feature, width, height, nr_input_width, nr_input_height)))
@@ -14610,7 +14675,7 @@ inline bool RecordInline(
     };
     bool ready = queue_tracking_active.load(std::memory_order_relaxed)
         && SUCCEEDED(device->GetDeviceRemovedReason());
-    const bool ordered_source = successful_sr_device == device
+    const bool ordered_source = current_sr_color
         || present != nullptr || (D3D11OnlySession() && Dx11NativeRoute());
     const bool rebuild_ordered_history = feature.control_mask_stream != nullptr
         && control_mask_execution::GetStatus(feature.control_mask_stream).history_invalidated;
@@ -17496,6 +17561,7 @@ inline bool RecordInlinePreSR(
   const bool same_stage_stack = !plan.mixed && requested_stack > 1;
   bool edit_reuse_eligible = edit_reuse_requested && edit_sequence != 0
       && feature.source_feature == kFeatureDlss && EditReuseSourceConfirmed(handle, feature)
+      && feature.source_device11_identity == nullptr
       && queue_tracking_active.load(std::memory_order_relaxed)
       && !control_mask_eligible && UsesFixedEditReuseWorkset(feature, adaptive)
       && (same_stage_stack || CanCommitFullSizeEditReuse(feature, width, height, nr_input_width, nr_input_height))
@@ -19721,6 +19787,7 @@ inline bool ForgetSourceHandleLocked(const NVSDK_NGX_Handle* handle) {
   if (last_source_plan.source_handle == handle) {
     last_source_plan.source_released = true;
     stage_source_rr.store(false, std::memory_order_relaxed);
+    stage_source_api.store(capability::Api::UNKNOWN, std::memory_order_relaxed);
   }
   const auto entry = features.find(handle);
   if (entry != features.end()) {
@@ -28986,11 +29053,8 @@ inline capability::Result QueryConfigurationCapability(const presets::Json& valu
     return (found->is_number() ? found->get<double>() : current);
   };
   capability::Input input;
-  input.api = (D3D12SessionKnown() ? capability::Api::DX12 : D3D11OnlySession() ? capability::Api::DX11
-      : vulkan_present_seen.load() ? capability::Api::VULKAN : capability::Api::UNKNOWN);
-  input.backend = (input.api == capability::Api::DX11
-      ? (Dx11NativeRoute() ? capability::Backend::DX11_BRIDGE : capability::Backend::STREAMLINE_FALLBACK)
-      : input.api == capability::Api::UNKNOWN ? capability::Backend::UNKNOWN : capability::Backend::NATIVE);
+  input.api = CurrentExecutionApi();
+  input.backend = CurrentExecutionBackend(input.api);
   const auto funnel = CollectFunnelInputs();
   input.runtime = (funnel.runtime_available ? capability::Runtime::AVAILABLE
       : nr_runtime_fault.load() != 0 ? capability::Runtime::UNAVAILABLE : capability::Runtime::UNKNOWN);
@@ -29013,16 +29077,9 @@ inline capability::Result QueryConfigurationCapability(const presets::Json& valu
         .mode = static_cast<uint32_t>(number((prefix + "ResolutionMode").c_str(), pass_resolution_mode[pass - 1].load())),
         .scale = static_cast<float>(number((prefix + "ResolutionScale").c_str(), pass_resolution_scale[pass - 1].load()))};
   }
-  input.plan = stage_plan::Build(config, {
-      .mixed_dx12 = input.api == capability::Api::DX12,
-      .mixed_dx11 = input.backend == capability::Backend::DX11_BRIDGE,
-      .ray_reconstruction = stage_source_rr.load(),
-      .present_available = input.api != capability::Api::VULKAN && input.backend != capability::Backend::STREAMLINE_FALLBACK
-          && !present_unusable.load(),
-      .fg_owns_input = fg::xefg::OwnsStream() || input.auto_fg_fallback
-          || (experimental_present_chain.load() && (input.xefg_enabled || mixed_present_fg_seen.load()
-              || native_fg_owns.load() || declaration == NativeFgDeclaration::kOn)),
-      .mixed_present_dx12 = experimental_present_chain.load()});
+  auto stage_capabilities = CurrentStageCapabilities(input.api, stage_source_rr.load());
+  stage_capabilities.present_available &= input.backend != capability::Backend::STREAMLINE_FALLBACK && !present_unusable.load();
+  input.plan = stage_plan::Build(config, stage_capabilities);
   if (config.hook_point != kHookPresent && !experimental_present_chain.load()) {
     input.fg_owns_input = fg::xefg::OwnsStream();
   }
@@ -34864,6 +34921,7 @@ inline void OnDestroyDevice(reshade::api::device* device) {
       if (released) screenshot::AbortPending();
       // The game's D3D11 features died with it (see the D3D12 case below).
       last_source_plan = {};
+      stage_source_api.store(capability::Api::UNKNOWN, std::memory_order_relaxed);
       stage_source_rr.store(false, std::memory_order_relaxed);
       created_feature_ids.clear();
       native_fg_ui_recomposition.clear();
@@ -34934,6 +34992,7 @@ inline void OnDestroyDevice(reshade::api::device* device) {
     // record left behind would classify a later handle at the same address.
     RuntimeLock lock(runtime_mutex);
     last_source_plan = {};
+    stage_source_api.store(capability::Api::UNKNOWN, std::memory_order_relaxed);
     stage_source_rr.store(false, std::memory_order_relaxed);
     created_feature_ids.clear();
     native_fg_ui_recomposition.clear();

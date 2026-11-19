@@ -16,6 +16,17 @@ enum class EditReuseBlock : uint8_t {
 
 namespace edit_reuse_policy {
 
+struct Source {
+  uint64_t generation = 0;
+  uint64_t sequence = 0;
+  bool current_color = false;
+  bool ordered = false;
+};
+
+constexpr bool CanUseHistory(const Source& source) {
+  return source.generation != 0 && source.sequence != 0 && source.current_color && source.ordered;
+}
+
 enum class Anchors : uint8_t { NONE, TERMINAL, PER_LAYER };
 
 struct Layer {

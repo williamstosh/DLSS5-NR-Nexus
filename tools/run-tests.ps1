@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('all','report','branding','ui','dev-control','presets','unicode-input','native','lastgasp','sdr-policy','hdr-policy','scope','config','constants','control-mask','control-mask-execution','vulkan-control-mask','fg-xefg','fg-native','lifecycle','bridge-motion','stage-plan','edit-reuse-policy','present-frame-policy','adaptive-resolution','copy-slots')]
+    [ValidateSet('all','report','branding','ui','dev-control','presets','unicode-input','native','lastgasp','sdr-policy','hdr-policy','scope','config','constants','control-mask','control-mask-execution','vulkan-control-mask','fg-xefg','fg-native','lifecycle','bridge-motion','stage-plan','edit-reuse-policy','present-frame-policy','capability-policy','adaptive-resolution','copy-slots')]
     [string[]]$Suite = @('all'),
     [string]$SourceRoot = (Split-Path $PSScriptRoot -Parent),
     [string]$HostRoot = (Join-Path (Split-Path $PSScriptRoot -Parent) '.local/renodx'),
@@ -19,7 +19,7 @@ param(
     [string]$NativeNgxSdkLibraryDirectory,
     [string]$NativeNgxRuntimePath = $(if ($env:NR_NEXUS_NGX_RUNTIME_DIR) { Join-Path $env:NR_NEXUS_NGX_RUNTIME_DIR 'nvngx_dlssnr.dll' }),
     [string]$NativeNgxSrRuntimePath,
-    [ValidateSet('dlaa','sr','stage-resolution','same-stage-resolution','render-stage-resolution','present-stage-resolution','ordinary-watchdog','adaptive','adaptive-hardware','adaptive-native-ngx','adaptive-native-snippet')][string[]]$BridgeCase = @(),
+    [ValidateSet('dlaa','sr','stage-resolution','same-stage-resolution','render-stage-resolution','present-stage-resolution','ordinary-watchdog','edit-reuse-production','adaptive','adaptive-hardware','adaptive-native-ngx','adaptive-native-snippet')][string[]]$BridgeCase = @(),
     [switch]$BuildOnly,
     [ValidateSet('Standard','Full','Acceptance')][string]$RetentionMode = $(if ($env:NR_NEXUS_TEST_RETENTION) { $env:NR_NEXUS_TEST_RETENTION } else { 'Standard' }),
     [switch]$SoftwareOnly
@@ -57,10 +57,11 @@ $sources = [ordered]@{
     'stage-plan'='stage_plan_tests'
     'edit-reuse-policy'='edit_reuse_policy_tests'
     'present-frame-policy'='present_frame_policy_tests'
+    'capability-policy'='capability_policy_tests'
     'adaptive-resolution'='adaptive_resolution_tests'
     'copy-slots'='copy_slots_tests'
 }
-$executionPolicySuites = @('edit-reuse-policy','present-frame-policy')
+$executionPolicySuites = @('edit-reuse-policy','present-frame-policy','capability-policy')
 if ($Suite -contains 'all') { $Suite = @($sources.Keys) }
 if ($BuildOnly -and @($Suite | Where-Object { $_ -in @('config','constants','lifecycle','ui') }).Count) {
     throw '-BuildOnly requires explicitly selecting native/policy/scope/fg-xefg/fg-native/bridge-motion suites.'
@@ -264,6 +265,18 @@ foreach ($item in $Suite) {
                 }
                 if ($case -eq 'adaptive') {
                     Invoke-TestProcess $exe $directory "warp$suffix" (@('--warp') + $bridgeArguments)
+                    continue
+                }
+                if ($case -eq 'edit-reuse-production') {
+                    $stdout = Join-Path $directory 'warp-edit-reuse-production.stdout.log'
+                    Invoke-TestProcess $exe $directory 'warp-edit-reuse-production' @('--warp','--edit-reuse-production')
+                    $receipts = @(Get-Content -LiteralPath $stdout | Where-Object {
+                        $_ -ceq 'PASS case=bridge-edit-reuse-production evidence=WARP+MOCK dev=0'
+                    })
+                    if ($receipts.Count -ne 1) {
+                        Complete-TestOutput $directory -Outcome Failed
+                        throw "Missing or ambiguous Bridge production edit reuse receipt: $stdout"
+                    }
                     continue
                 }
                 if (-not $SoftwareOnly) { Invoke-TestProcess $exe $directory "hardware$suffix" $bridgeArguments }

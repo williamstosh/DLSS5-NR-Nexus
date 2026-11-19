@@ -68,6 +68,28 @@ int main() {
   layers[0].temporal_look = true;
   check("dormant layers do not affect temporal anchors", std::span{layers}.first(2), 1, Anchors::PER_LAYER);
 
+  const auto check_source = [&](const policy::Source& source, bool expected, std::string_view name) {
+    ++cases;
+    if (policy::CanUseHistory(source) != expected) {
+      ++failures;
+      std::cerr << "FAIL edit reuse source: " << name << '\n';
+    }
+  };
+  constexpr policy::Source current_source{.generation = 3, .sequence = 8, .current_color = true, .ordered = true};
+  check_source(current_source, true, "current ordered producer can share the history rule");
+  auto source = current_source;
+  source.generation = 0;
+  check_source(source, false, "unregistered generation cannot acquire history");
+  source = current_source;
+  source.sequence = 0;
+  check_source(source, false, "missing producer frame cannot acquire history");
+  source = current_source;
+  source.current_color = false;
+  check_source(source, false, "stale or unrelated color cannot acquire history");
+  source = current_source;
+  source.ordered = false;
+  check_source(source, false, "a routing decision cannot replace producer order");
+
   if (failures != 0) return 1;
   std::cout << "PASS edit reuse policy evidence=CPU cases=" << cases << '\n';
   return 0;

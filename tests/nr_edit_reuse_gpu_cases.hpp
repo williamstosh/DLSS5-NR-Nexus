@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <DirectXPackedVector.h>
 #include <iostream>
@@ -18,10 +19,13 @@
 
 #include <edit_reuse.hpp>
 
+#include "inline_execution_trace.hpp"
+
 // Included after the native fixture's model substitutes and real GPU host.
 namespace nr_edit_reuse_gpu_cases {
 namespace addon = renodx::addons::dlss5;
 namespace reuse = addon::edit_reuse;
+namespace inline_trace = inline_execution_trace;
 
 NVSDK_NGX_Result NVSDK_CONV CopySr(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle*,
     const NVSDK_NGX_Parameter* parameters, PFN_NVSDK_NGX_ProgressCallback) {
@@ -73,9 +77,10 @@ NVSDK_NGX_Result NVSDK_CONV ConstantModel(ID3D12GraphicsCommandList* list, const
   const auto desc = output->GetDesc();
   Check(list == model_gpu->list.Get() && desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT,
         "constant model records encoded FP16 pixels into the current fixture list");
-  const std::array<uint16_t, 4> encoded{
-      DirectX::PackedVector::XMConvertFloatToHalf(.85f), DirectX::PackedVector::XMConvertFloatToHalf(.75f),
-      DirectX::PackedVector::XMConvertFloatToHalf(.9f), DirectX::PackedVector::XMConvertFloatToHalf(.875f)};
+  std::array<uint16_t, 4> encoded;
+  for (size_t channel = 0; channel < encoded.size(); ++channel) {
+    encoded[channel] = DirectX::PackedVector::XMConvertFloatToHalf(inline_trace::MODEL_RGBA[channel]);
+  }
   std::vector<uint16_t> pixels(static_cast<size_t>(desc.Width) * desc.Height * 4);
   for (size_t pixel = 0; pixel < pixels.size() / 4; ++pixel) {
     std::copy(encoded.begin(), encoded.end(), pixels.begin() + pixel * 4);
@@ -693,13 +698,7 @@ int Run() {
     auto output = uav_texture(16, 16, DXGI_FORMAT_R16G16B16A16_FLOAT);
     auto wrapper_motion = gpu.Texture(16, 16, DXGI_FORMAT_R16G16_FLOAT);
     auto wrapper_depth = gpu.Texture(16, 16, DXGI_FORMAT_R32_FLOAT);
-    std::vector<uint16_t> source_values(16 * 16 * 4);
-    for (uint32_t pixel = 0; pixel < 16 * 16; ++pixel) {
-      source_values[pixel * 4] = DirectX::PackedVector::XMConvertFloatToHalf(.25f + pixel / 2048.f);
-      source_values[pixel * 4 + 1] = DirectX::PackedVector::XMConvertFloatToHalf(.375f);
-      source_values[pixel * 4 + 2] = DirectX::PackedVector::XMConvertFloatToHalf(.5f);
-      source_values[pixel * 4 + 3] = DirectX::PackedVector::XMConvertFloatToHalf(.25f + .125f * (pixel % 4));
-    }
+    std::vector<uint16_t> source_values(inline_trace::SOURCE_RGBA.begin(), inline_trace::SOURCE_RGBA.end());
     upload(source.Get(), source_values, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, 16 * 8);
     upload(wrapper_motion.Get(), std::vector<uint16_t>(16 * 16 * 2, 0), D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, 16 * 4);
     upload(wrapper_depth.Get(), std::vector<float>(16 * 16, .5f), D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE, 16 * 4);
@@ -721,7 +720,259 @@ int Run() {
     parameters.Set(NVSDK_NGX_Parameter_MV_Scale_X, 1.f);
     parameters.Set(NVSDK_NGX_Parameter_MV_Scale_Y, 1.f);
     parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, 0.f);
+    const auto parameters_without_jitter_y = parameters;
     parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, 0.f);
+
+    {
+      funnel_accounting_tests::Restore restore;
+      restore.Value(&native::ngx_slot_real[0]);
+      restore.Value(&native::direct_api.evaluate);
+      restore.Atomic(&native::d3d11_swapchain_seen);
+      restore.Atomic(&native::d3d11_present_seen);
+      restore.Atomic(&native::d3d12_swapchain_seen);
+      restore.Atomic(&native::d3d12_present_seen);
+      restore.Atomic(&native::dx11_route);
+      restore.Atomic(&native::control_mask_use_core_context);
+      restore.Atomic(&native::foreign_teardown_due_ns);
+      native::direct_api.evaluate = ConstantModel;
+      native::ngx_slot_real[0].create = reinterpret_cast<void*>(+[](ID3D12GraphicsCommandList* list,
+          NVSDK_NGX_Feature feature, NVSDK_NGX_Parameter*, NVSDK_NGX_Handle** handle) {
+        Check(list == model_gpu->list.Get() && feature == native::kFeatureDlss,
+              "inline real Create receives the D3D12 SR producer");
+        static uint32_t sr_handle = 1;
+        *handle = reinterpret_cast<NVSDK_NGX_Handle*>(&sr_handle);
+        return NVSDK_NGX_Result_Success;
+      });
+      native::ngx_slot_real[0].release = reinterpret_cast<void*>(+[](NVSDK_NGX_Handle*) {
+        return NVSDK_NGX_Result_Success;
+      });
+      static uint32_t sr_calls = 0;
+      native::ngx_slot_real[0].evaluate = reinterpret_cast<void*>(+[](ID3D12GraphicsCommandList* list,
+          const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* block, PFN_NVSDK_NGX_ProgressCallback callback) {
+        Check(list == model_gpu->list.Get(), "inline real Evaluate uses the same D3D12 SR producer");
+        ++sr_calls;
+        return CopySr(list, handle, block, callback);
+      });
+
+      constexpr auto STAGE = addon::stage_plan::Stage::UPSCALED;
+      constexpr size_t FRAME_COUNT = 4;
+      struct BaseResult {
+        inline_trace::Base trace;
+        std::vector<uint8_t> rgba;
+
+        bool operator==(const BaseResult&) const = default;
+      };
+      std::array<BaseResult, FRAME_COUNT> dx12_bases;
+      uint64_t previous_source_generation = 0;
+      for (const bool foreign : {false, true}) {
+        const char* route = (foreign ? "foreign" : "dx12");
+        // Change the presentation observation on the same D3D12 producer and textures.
+        native::d3d11_swapchain_seen = foreign;
+        native::d3d11_present_seen = foreign;
+        native::d3d12_swapchain_seen = !foreign;
+        native::d3d12_present_seen = !foreign;
+        native::dx11_route = (foreign ? native::kDx11RouteForeign : native::kDx11RouteUndecided);
+        Check(native::D3D11OnlySession() == foreign && !native::ForeignD3D12SourceIgnored(),
+              "inline policy contrast reaches the matching producer route");
+
+        auto evaluation = parameters;
+        NVSDK_NGX_Handle* sr = nullptr;
+        Check(NVSDK_NGX_SUCCEED(native::HookedCreateFeatureSlot<0>(gpu.list.Get(), native::kFeatureDlss, &evaluation, &sr))
+                  && sr != nullptr,
+              "inline policy records the real SR Create through its wrapper");
+        const auto& created = native::create_contracts.at(sr);
+        const auto source_generation = created.source_generation;
+        Check(created.source_type_confirmed && created.source_feature == native::kFeatureDlss
+                  && created.source_device11_identity == nullptr && source_generation > previous_source_generation,
+              "each real SR Create provides a new confirmed source generation");
+        previous_source_generation = source_generation;
+
+        const auto& stage = native::stage_telemetry[static_cast<size_t>(STAGE)];
+        const auto evaluate = [&](int reset, bool capture = true) {
+          evaluation.Set(NVSDK_NGX_Parameter_Reset, reset);
+          gpu.list->ClearState(nullptr);
+          const auto sr_before = sr_calls;
+          const auto nr_before = model_calls;
+          const auto resets_before = model_resets.size();
+          const auto sequence_before = native::features.at(sr).sr_sequence;
+          const auto groups_before = stage.groups;
+          const auto skipped_before = stage.skipped;
+          const auto plan_before = native::last_source_plan.sequence;
+          Check(NVSDK_NGX_SUCCEED(native::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), sr, &evaluation, nullptr))
+                    && sr_calls == sr_before + 1,
+                "inline wrapper preserves one successful real SR Evaluate per frame");
+          const auto& feature = native::features.at(sr);
+          const auto advance = (native::ForeignD3D12SourceIgnored() ? 0u : 1u);
+          Check(feature.source_generation == source_generation && feature.sr_sequence == sequence_before + advance
+                    && native::direct_device == gpu.device.Get(),
+                "inline wrapper keeps its source generation and device with the admitted SR sequence");
+          BaseResult result;
+          result.trace.calls = model_calls - nr_before;
+          Check(model_resets.size() - resets_before == result.trace.calls, "every actual NR call has a Reset observation");
+          if (result.trace.calls != 0) {
+            result.trace.reset = model_resets.back();
+          }
+          result.trace.complete = stage.groups == groups_before + 1 && stage.skipped == skipped_before;
+          if (result.trace.complete) {
+            const auto& observed = native::last_source_plan;
+            const auto group = observed.plan.At(STAGE);
+            Check(observed.sequence > plan_before && observed.source_handle == sr && observed.source_generation == source_generation
+                      && observed.source_feature == native::kFeatureDlss && !observed.source_released
+                      && observed.plan.valid && !observed.plan.mixed && observed.plan.pass_count == 1
+                      && observed.plan.group_count == 1 && group.stage == STAGE && group.begin == 0 && group.count == 1
+                      && stage.pass_begin == 0 && stage.pass_count == 1 && feature.slots[0].nr_preset == 2
+                      && stage.width == inline_trace::WIDTH && stage.height == inline_trace::HEIGHT
+                      && stage.work_width == inline_trace::WIDTH && stage.work_height == inline_trace::HEIGHT,
+                  "the actual execution plan is one Upscaled model B Pass on the unchanged full-size D3D12 output");
+          }
+          stage_execution_cases::Snapshot final;
+          std::shared_ptr<addon::submission::RecordingStatus> receipt;
+          if (capture) {
+            final = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            if (result.trace.complete) {
+              receipt = addon::submission::ObserveRecording(gpu.list.Get());
+            }
+          }
+          submit_commands(route);
+          native::DrainRetiredResources(true);
+          const auto reached = gpu.fence->GetCompletedValue();
+          Check(reached != UINT64_MAX && reached >= gpu.serial, "inline SR and writeback complete on the D3D12 fence");
+          Check(receipt == nullptr || (receipt->submitted.load() && receipt->closed.load() && receipt->completed_healthy),
+                "inline NR delivery has a completed submission receipt");
+          if (capture) {
+            result.rgba = final.Pixels();
+          }
+          return result;
+        };
+
+        for (uint32_t warmup = 0; warmup < native::kContractDebounceFrames + 8; ++warmup) {
+          evaluate(1, false);
+        }
+        const auto& warmed = native::features.at(sr);
+        const auto anchor = warmed.slots[0].edit_reuse;
+        Check(anchor != nullptr && anchor->valid && anchor->source_sequence == warmed.sr_sequence,
+              "fixed Upscaled SR warmup leaves a completed current anchor");
+        const auto sequence_origin = warmed.sr_sequence;
+        const auto generation_origin = anchor->anchor_generation;
+        const auto reuses_origin = anchor->reuse_count;
+        auto anchor_generation = generation_origin;
+        auto anchor_sequence = anchor->source_sequence;
+        std::vector<uint8_t> refresh_rgba;
+        for (size_t index = 0; index < FRAME_COUNT; ++index) {
+          if (index == 1) {
+            const auto configuration = native::configuration_generation.load();
+            const auto history = native::history_reset_epoch.load();
+            const auto before = model_calls;
+            addon::presets::Document decoded;
+            const addon::presets::Document saved{
+                .scope = addon::presets::Scope::QUALITY, .settings = native::profile_ui::Snapshot()};
+            std::string error;
+            Check(addon::presets::Parse(addon::presets::Serialize(saved), &decoded, &error)
+                      && native::preset_ui::Apply(decoded, true, false, &error)
+                      && native::configuration_generation.load() == configuration
+                      && native::history_reset_epoch.load() == history && model_calls == before,
+                  "an equivalent preset roundtrip preserves the live source, configuration and history before reuse");
+          }
+          const bool refresh = index % 2 == 0;
+          auto base = evaluate(index == 0 ? 1 : 0);
+          const auto& feature = native::features.at(sr);
+          Check(feature.slots[0].edit_reuse == anchor && anchor->valid && anchor->reused == !refresh
+                    && anchor->reuse_count == reuses_origin + (index + 1) / 2,
+                "reuse retains the valid refresh anchor for one adjacent base");
+          base.trace.base = feature.sr_sequence - sequence_origin;
+          base.trace.history = anchor->source_sequence - sequence_origin;
+          // Reuse advances the history cursor even when the anchor retains its pixels.
+          if (anchor->anchor_generation != anchor_generation) {
+            anchor_generation = anchor->anchor_generation;
+            anchor_sequence = anchor->source_sequence;
+          }
+          base.trace.anchor_base = anchor_sequence - sequence_origin;
+          base.trace.anchor_generation = anchor->anchor_generation - generation_origin;
+          base.trace.anchor_age = feature.sr_sequence - anchor_sequence;
+          Check(base.trace.complete && base.trace.base == index + 1 && base.trace.history == index + 1
+                    && base.trace.calls == (refresh ? 1u : 0u) && base.trace.reset == (refresh ? (index == 0 ? 1 : 0) : -1)
+                    && base.trace.anchor_base == (index / 2) * 2 + 1 && base.trace.anchor_generation == index / 2 + 1
+                    && base.trace.anchor_age == index % 2,
+                "inline delivery preserves source clock, exact NR/Reset cadence and anchor identity");
+          Check(base.rgba.size() == sizeof(inline_trace::SOURCE_RGBA), "inline readback contains the entire FP16 RGBA output");
+          if (refresh) {
+            refresh_rgba = base.rgba;
+          }
+          bool nonneutral = false;
+          for (size_t channel = 0; channel < inline_trace::SOURCE_RGBA.size(); ++channel) {
+            const size_t offset = channel * sizeof(uint16_t);
+            uint16_t pixel, refreshed;
+            std::memcpy(&pixel, base.rgba.data() + offset, sizeof(pixel));
+            if (channel % 4 == 3) {
+              Check(pixel == inline_trace::SOURCE_RGBA[channel], "inline output preserves exact current alpha");
+              continue;
+            }
+            std::memcpy(&refreshed, refresh_rgba.data() + offset, sizeof(refreshed));
+            const float actual = DirectX::PackedVector::XMConvertHalfToFloat(pixel);
+            Check(std::abs(actual - DirectX::PackedVector::XMConvertHalfToFloat(refreshed)) < .003f,
+                  "inline reuse reconstructs the nonzero RGB edit at every pixel");
+            nonneutral |= std::abs(actual - DirectX::PackedVector::XMConvertHalfToFloat(inline_trace::SOURCE_RGBA[channel])) > .05f;
+          }
+          Check(nonneutral, "inline output contains a distinguishable nonzero NR edit");
+          inline_trace::PrintBase(route, base.trace, base.rgba);
+          if (foreign) {
+            Check(base == dx12_bases[index], "foreign and DX12 deliver identical cadence and all FP16 RGBA bits");
+          } else {
+            dx12_bases[index] = std::move(base);
+          }
+        }
+
+        if (foreign) {
+          const auto expect_original = [&](addon::NrDeclineReason reason) {
+            const auto declines = addon::nr_decline_counts[static_cast<size_t>(reason)].load();
+            const auto reuses = native::edit_reuse_reuses.load();
+            const auto rejected = evaluate(0);
+            Check(!rejected.trace.complete && rejected.trace.calls == 0 && native::edit_reuse_reuses.load() == reuses
+                      && addon::nr_decline_counts[static_cast<size_t>(reason)].load() == declines + 1
+                      && rejected.rgba.size() == sizeof(inline_trace::SOURCE_RGBA)
+                      && std::memcmp(rejected.rgba.data(), inline_trace::SOURCE_RGBA.data(), rejected.rgba.size()) == 0,
+                  "inline decline retains the exact real SR output without evaluating or reusing NR");
+          };
+          Check(evaluate(1).trace.calls == 1, "prepare a reuse opportunity for the native route mismatch");
+          native::dx11_route = native::kDx11RouteNative;
+          expect_original(addon::NrDeclineReason::kSourceOther);
+          native::dx11_route = native::kDx11RouteForeign;
+
+          const auto foreign_refresh = evaluate(1);
+          Check(foreign_refresh.trace.complete && foreign_refresh.trace.calls == 1,
+                "restoring the foreign route refreshes before testing the Core switch");
+          native::control_mask_use_core_context = true;
+          expect_original(addon::NrDeclineReason::kNrRuntimeUnavailable);
+          native::control_mask_use_core_context = false;
+          const auto owned_refresh = evaluate(1);
+          const auto owned_reuse = evaluate(0);
+          Check(owned_refresh.trace.complete && owned_refresh.trace.calls == 1 && owned_refresh.trace.reset == 1
+                    && owned_reuse.trace.complete && owned_reuse.trace.calls == 0,
+                "owned runtime recovers refresh and reuse after the Core request is rejected");
+
+          Check(evaluate(1).trace.calls == 1, "prepare a reuse opportunity for the missing jitter component");
+          evaluation = parameters_without_jitter_y;
+          const auto fallbacks = native::edit_reuse_fallbacks.load();
+          const auto reuses = native::edit_reuse_reuses.load();
+          const auto fallback = evaluate(0);
+          Check(fallback.trace.complete && fallback.trace.calls == 1 && native::edit_reuse_fallbacks.load() > fallbacks
+                    && native::edit_reuse_reuses.load() == reuses && native::features.at(sr).slots[0].edit_reuse == nullptr,
+                "missing jitter retires the warm cache and runs the normal model path");
+          evaluation = parameters;
+          const auto recovered = evaluate(1);
+          const auto reused = evaluate(0);
+          const auto& restored_anchor = native::features.at(sr).slots[0].edit_reuse;
+          Check(recovered.trace.complete && recovered.trace.calls == 1 && recovered.trace.reset == 1
+                    && reused.trace.complete && reused.trace.calls == 0 && restored_anchor != nullptr
+                    && restored_anchor->valid && restored_anchor->reused && native::edit_reuse_reuses.load() == reuses + 1,
+                "restoring jitter re-establishes a new anchor and the next-frame reuse");
+        }
+        Check(NVSDK_NGX_SUCCEED(native::HookedReleaseFeatureSlot<0>(sr)), "inline SR release uses the production wrapper");
+        native::DrainRetiredResources(true);
+      }
+      std::cout << "PASS fixed single-Pass Upscaled DX12/foreign equivalence and route/Core/jitter contrasts evidence=WARP+MOCK\n";
+    }
+
     const auto* owner = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xED170});
     native::RegisterCreatedFeatureLocked(owner, native::kFeatureDlss, &parameters);
     native::created_feature_ids[owner] = native::kFeatureDlss;

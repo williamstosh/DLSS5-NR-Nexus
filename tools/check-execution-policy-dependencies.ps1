@@ -2,7 +2,7 @@
 param(
     [Parameter(Mandatory)][string]$DependencyFile,
     [string]$SourceRoot = (Split-Path $PSScriptRoot -Parent),
-    [ValidateSet('edit-reuse-policy','present-frame-policy')][string]$Suite = 'edit-reuse-policy'
+    [ValidateSet('edit-reuse-policy','present-frame-policy','capability-policy')][string]$Suite = 'edit-reuse-policy'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -10,7 +10,9 @@ Set-StrictMode -Version Latest
 $repo = Split-Path $PSScriptRoot -Parent
 $policyName = $Suite.ToLowerInvariant().Replace('-', '_')
 $testSource = [IO.Path]::GetFullPath((Join-Path $repo "tests/${policyName}_tests.cpp"))
-$policyHeader = [IO.Path]::GetFullPath((Join-Path $SourceRoot "$policyName.hpp"))
+$headerName = if ($Suite -eq 'capability-policy') { 'capability.hpp' } else { "$policyName.hpp" }
+$policyHeader = [IO.Path]::GetFullPath((Join-Path $SourceRoot $headerName))
+$stagePlanHeader = if ($Suite -eq 'capability-policy') { [IO.Path]::GetFullPath((Join-Path $SourceRoot 'stage_plan.hpp')) }
 $record = Get-Content -LiteralPath $DependencyFile -Raw | ConvertFrom-Json -AsHashtable
 if ($record -isnot [Collections.IDictionary] -or $record['Data'] -isnot [Collections.IDictionary]) {
     throw "Missing MSVC dependency data: $DependencyFile"
@@ -48,6 +50,7 @@ foreach ($include in $includes) {
         $sawPolicyHeader = $true
         continue
     }
+    if ($path -ieq $stagePlanHeader) { continue }
     if (-not ($standardPrefixes | Where-Object { $path.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) })) {
         throw "Disallowed execution policy dependency: $path"
     }

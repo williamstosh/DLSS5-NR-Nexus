@@ -1278,23 +1278,81 @@ int Run() {
       Check(cache->active == 1 && feature.adaptive_session->status.applied[0].width == 5
           && native::nr_features_created == creates,
           "inline lower tier actually applies its requested size without cold Create");
-      feature.adaptive_session->Request(0, native::SteadyNowNs());
-      Check(record() && record() && cache->active == 0 && native::nr_features_created == creates,
-          "inline prepared upper tier restores without cold Create");
-      const auto deadline = native::SteadyNowNs() + 5'000'000'000;
+      const auto output_configuration = native::configuration_generation.load();
       uint64_t serial = 0;
-      while (feature.adaptive_session->level == 0 && native::SteadyNowNs() < deadline) {
+      const auto record_at_fps = [&](double fps) {
         const auto now = native::SteadyNowNs();
         {
           std::unique_lock lock(addon::output_framerate::internal::state.mutex);
           auto& estimate = addon::output_framerate::internal::state.stream;
           estimate.previous_ns = now;
           estimate.snapshot = {.available = true, .source = addon::output_framerate::Source::PRESENT,
-              .source_generation = 1, .configuration_generation = native::configuration_generation.load(),
+              .source_generation = 1, .configuration_generation = output_configuration,
               .window_serial = ++serial, .window_begin_ns = now - 500'000'000, .window_end_ns = now,
-              .fps = 50., .fg_off = true};
+              .fps = fps, .fg_off = true};
         }
-        record();
+        return record();
+      };
+      if (hook == native::kHookUpscaled) {
+        const auto session = feature.adaptive_session;
+        const auto sample_deadline = native::SteadyNowNs() + 5'000'000'000;
+        double gpu_us = 0., gpu_mad = 0.;
+        while (!session->GpuStatistics(native::SteadyNowNs(), &gpu_us, &gpu_mad)
+               && native::SteadyNowNs() < sample_deadline) {
+          Check(record_at_fps(120.), "prepare a current GPU and output FPS window at the lower tier");
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        Check(session->GpuStatistics(native::SteadyNowNs(), &gpu_us, &gpu_mad)
+            && session->status.output_fps == 120. && cache->active == 1,
+            "the declaration probe starts with valid measurements at an already applied lower tier");
+        const auto generation = session->status.generation;
+        const auto preparation_epoch = session->preparation_epoch;
+        const auto layout = session->resource_identity;
+        const auto reset_epoch = native::history_reset_epoch.load();
+        const auto* lower_model = feature.slots[0].handle;
+        expected_reset_model = lower_model;
+        observed_expected_reset = false;
+        const auto check_lower_tier = [&](const char* message) {
+          Check(feature.adaptive_session == session && feature.adaptive_cache == cache && cache->active == 1
+              && session->level == 1 && session->status.applied[0].width == 5 && session->status.output_fps == 120.
+              && session->status.generation == generation && session->preparation_epoch == preparation_epoch
+              && session->resource_identity == layout && session->TargetReady()
+              && session->GpuStatistics(native::SteadyNowNs(), &gpu_us, &gpu_mad)
+              && feature.slots[0].handle == lower_model && native::nr_features_created == creates
+              && native::history_reset_epoch.load() == reset_epoch && !observed_expected_reset, message);
+        };
+        {
+          const auto requested_present = addon::stage_plan::Build({.hook_point = native::kHookPresent});
+          std::shared_ptr<addon::adaptive_resolution::Session> fallback_session;
+          const auto fallback = native::FreezeAdaptiveFrame(&fallback_session, requested_present,
+              {.stage = addon::stage_plan::Stage::UPSCALED, .count = 1}, 16, 16, 16, 16, 1, true);
+          Check(fallback.enabled && fallback.upper[0].width == 16 && fallback.upper[0].height == 16,
+              "a Present request delivered by the single-stage Upscaled fallback remains adaptively eligible at its actual size");
+        }
+        Check(!native::D3D11OnlySession() && native::SourceExecutionApi(handle) == addon::capability::Api::DX12,
+            "the ready lower tier uses a registered D3D12 SR source before the presentation change");
+        const bool saved_d3d11 = native::d3d11_swapchain_seen.exchange(true);
+        const auto saved_dx11_route = native::dx11_route.exchange(native::kDx11RouteForeign);
+        const bool recorded_foreign = native::D3D11OnlySession() && record() && record();
+        native::d3d11_swapchain_seen = saved_d3d11;
+        native::dx11_route = saved_dx11_route;
+        Check(recorded_foreign, "the same D3D12 SR source records both outputs with foreign D3D11 presentation");
+        check_lower_tier("foreign D3D11 presentation preserves adaptive eligibility and history for the same D3D12 SR source");
+
+        native::OnNativeFgOptions(true);
+        // Keep the output observer fixed to isolate the declaration callback.
+        Check(native::native_fg_declaration.load() == native::NativeFgDeclaration::kOn
+            && record() && record(), "record both outputs with the new FG declaration");
+        check_lower_tier("only changing the FG declaration preserves the ready tier, GPU window and model history");
+        expected_reset_model = nullptr;
+        native::OnNativeFgOptions(false);
+      }
+      feature.adaptive_session->Request(0, native::SteadyNowNs());
+      Check(record() && record() && cache->active == 0 && native::nr_features_created == creates,
+          "inline prepared upper tier restores without cold Create");
+      const auto deadline = native::SteadyNowNs() + 5'000'000'000;
+      while (feature.adaptive_session->level == 0 && native::SteadyNowNs() < deadline) {
+        record_at_fps(50.);
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
       }
       std::cout << "ADAPTIVE_INLINE controller hook=" << hook << " level=" << feature.adaptive_session->level

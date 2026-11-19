@@ -14,6 +14,7 @@
 #include <cstring>
 #include <fstream>
 #include <initializer_list>
+#include <optional>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -77,6 +78,7 @@ int main() { return ProbeFormats(); }
 #include <DirectXPackedVector.h>
 #include <nlohmann/json.hpp>
 #include <dlssnr.hpp>
+#include "inline_execution_trace.hpp"
 // Reuse the established host types and checks, without executing its matrix.
 #define main UnusedXeFgMotionHostMain
 #define FG_XEFG_TEST_CUSTOM_LOGGER
@@ -122,6 +124,7 @@ struct ModelObservation {
 std::vector<ModelObservation> model_observations;
 uint32_t fail_model_call = 0;
 std::array<unsigned short, 2> model_stamps{0x3400, 0x3800};
+std::optional<std::array<unsigned short, 4>> model_rgba;
 NVSDK_NGX_Handle* source_create_result = nullptr;
 NVSDK_NGX_Result NVSDK_CONV MotionCreateSource(ID3D11DeviceContext*, NVSDK_NGX_Feature,
     NVSDK_NGX_Parameter*, NVSDK_NGX_Handle** handle) {
@@ -283,7 +286,13 @@ NVSDK_NGX_Result NVSDK_CONV MotionEvaluateModel(ID3D12GraphicsCommandList* list,
   const unsigned short model_pixel = model_stamps[model_presets.back() == 2 ? 1 : 0];
   for (UINT y = 0; y < desc.Height; ++y) {
     auto* row = reinterpret_cast<unsigned short*>(static_cast<unsigned char*>(mapped) + footprint.Offset + size_t(y) * footprint.Footprint.RowPitch);
-    for (UINT x = 0; x < desc.Width * 4; ++x) row[x] = model_pixel;
+    if (model_rgba.has_value()) {
+      for (UINT x = 0; x < desc.Width; ++x) {
+        std::copy(model_rgba->begin(), model_rgba->end(), row + x * 4);
+      }
+    } else {
+      std::fill_n(row, desc.Width * 4, model_pixel);
+    }
   }
   upload->Unmap(0, nullptr);
   native::Transition(list, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -378,6 +387,7 @@ int main(int argc, char** argv) {
     bool render_stage_resolution = false;
     bool present_stage_resolution = false;
     bool ordinary_watchdog = false;
+    bool edit_reuse_production = false;
     bool adaptive_case = false;
     bool adaptive_hardware = false;
     bool adaptive_native_ngx = false;
@@ -392,6 +402,8 @@ int main(int argc, char** argv) {
         sr_only = true;
       } else if (std::strcmp(argv[arg], "--ordinary-watchdog") == 0) {
         ordinary_watchdog = true;
+      } else if (std::strcmp(argv[arg], "--edit-reuse-production") == 0) {
+        edit_reuse_production = true;
       } else if (std::strcmp(argv[arg], "--adaptive") == 0) {
         Check(!adaptive_case, "one explicit Bridge Adaptive condition per process");
         adaptive_case = true;
@@ -426,11 +438,15 @@ int main(int argc, char** argv) {
 #if defined(NR_NEXUS_TEST_WARP_ONLY)
     Check(warp, "hardware adapter forbidden in WARP-only Bridge test build");
 #endif
-    const bool strict_debug = ordinary_watchdog || adaptive_case || (warp && sr_only);
+    const bool strict_debug = ordinary_watchdog || edit_reuse_production || adaptive_case || (warp && sr_only);
     ComPtr<ID3D12Debug> adaptive_debug;
     if (ordinary_watchdog) {
       Check(!adaptive_case && !stage_resolution && !present_stage_resolution && !dlaa_only && !sr_only,
           "ordinary Bridge watchdog runs without other stage variants");
+    }
+    if (edit_reuse_production) {
+      Check(warp && !ordinary_watchdog && !adaptive_case && !stage_resolution && !present_stage_resolution && !dlaa_only && !sr_only,
+          "production Bridge x2 uses WARP without other stage variants");
     }
     if (adaptive_case) {
       Check(warp != adaptive_hardware && !stage_resolution && !present_stage_resolution && !dlaa_only && !sr_only,
@@ -483,7 +499,8 @@ int main(int argc, char** argv) {
       Check(SUCCEEDED(device.As(&adaptive_info11))
           && SUCCEEDED(native::bridge.device12->QueryInterface(IID_PPV_ARGS(&adaptive_info12))),
           "Bridge requires both real D3D11 and D3D12 InfoQueues");
-      std::cout << (ordinary_watchdog ? "BRIDGE_ORDINARY_WATCHDOG" : (adaptive_case ? "BRIDGE_ADAPTIVE" : "BRIDGE_SR"))
+      std::cout << (edit_reuse_production ? "BRIDGE_EDIT_REUSE_PRODUCTION"
+          : ordinary_watchdog ? "BRIDGE_ORDINARY_WATCHDOG" : adaptive_case ? "BRIDGE_ADAPTIVE" : "BRIDGE_SR")
           << " debug11=1 debug12=1 info11=1 info12=1 adapter="
           << (warp ? "SOFTWARE" : "HARDWARE")
           << " runtime=" << (adaptive_native_snippet ? "PRODUCTION_SNIPPET_INIT"
@@ -558,14 +575,21 @@ int main(int argc, char** argv) {
       return d3d11_present_stage_resolution_cases::Run(context.Get(), make_texture);
     }
     // Non-multiples of eight exercise dispatch edges; selected values cannot survive a float16 detour.
-    const UINT width = (adaptive_hardware ? 1280u : 13u), height = (adaptive_hardware ? 720u : 9u);
-    const UINT adaptive_output_width = (adaptive_hardware ? 1920u : 17u);
-    const UINT adaptive_output_height = (adaptive_hardware ? 1080u : 11u);
+    const UINT width = (edit_reuse_production ? inline_execution_trace::WIDTH : adaptive_hardware ? 1280u : 13u);
+    const UINT height = (edit_reuse_production ? inline_execution_trace::HEIGHT : adaptive_hardware ? 720u : 9u);
+    const UINT adaptive_output_width = (edit_reuse_production ? width : adaptive_hardware ? 1920u : 17u);
+    const UINT adaptive_output_height = (edit_reuse_production ? height : adaptive_hardware ? 1080u : 11u);
     const float values[]{0.f, -0.f, 0.1f, -0.375f, 65537.f, -131071.25f, 1.234567f, -8388607.f};
     std::vector<float> motion_pixels(width * height * 2);
     for (size_t i = 0; i < motion_pixels.size(); ++i) motion_pixels[i] = values[i % std::size(values)];
     std::vector<unsigned short> rg16_pixels(width * height * 2, 0x3400);
     std::vector<unsigned short> color_pixels(width * height * 4, 0x3800);
+    if (edit_reuse_production) {
+      std::fill(rg16_pixels.begin(), rg16_pixels.end(), 0);
+      model_rgba.emplace();
+      std::transform(inline_execution_trace::MODEL_RGBA.begin(), inline_execution_trace::MODEL_RGBA.end(), model_rgba->begin(),
+          DirectX::PackedVector::XMConvertFloatToHalf);
+    }
     if (adaptive_hardware) {
       std::fill(rg16_pixels.begin(), rg16_pixels.end(), 0);
       for (UINT y = 0; y < height; ++y) {
@@ -581,6 +605,9 @@ int main(int argc, char** argv) {
     }
     auto color = make_texture(width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_SHADER_RESOURCE, color_pixels.data(), width * 8);
     std::vector<unsigned short> output_pixels(adaptive_output_width * adaptive_output_height * 4, 0x3800);
+    if (edit_reuse_production) {
+      output_pixels.assign(inline_execution_trace::SOURCE_RGBA.begin(), inline_execution_trace::SOURCE_RGBA.end());
+    }
     if (adaptive_hardware) {
       for (UINT y = 0; y < adaptive_output_height; ++y) {
         for (UINT x = 0; x < adaptive_output_width; ++x) {
@@ -596,7 +623,7 @@ int main(int argc, char** argv) {
         D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, output_pixels.data(), adaptive_output_width * 8);
     auto motion = make_texture(width, height, DXGI_FORMAT_R32G32_FLOAT, D3D11_BIND_SHADER_RESOURCE, motion_pixels.data(), width * 8);
     auto rg16 = make_texture(width, height, DXGI_FORMAT_R16G16_FLOAT, D3D11_BIND_SHADER_RESOURCE, rg16_pixels.data(), width * 4);
-    std::vector<float> depth_pixels(width * height, 0.375f);
+    std::vector<float> depth_pixels(width * height, (edit_reuse_production ? .5f : .375f));
     if (adaptive_hardware) {
       for (UINT y = 0; y < height; ++y) {
         for (UINT x = 0; x < width; ++x) depth_pixels[size_t(y) * width + x] = .2f + .6f * y / (height - 1);
@@ -611,54 +638,122 @@ int main(int argc, char** argv) {
         }
       }
     };
-    if (ordinary_watchdog) {
+    if (ordinary_watchdog || edit_reuse_production) {
       native::d3d11_swapchain_seen.store(true);
       native::dx11_route.store(native::kDx11RouteNative);
       native::dedupe_mode.store(renodx::addons::dlss5::kDedupePerEvaluate);
       native::hook_point.store(native::kHookUpscaled);
-      native::preset.store(1);
+      native::preset.store(edit_reuse_production ? 2 : 1);
       native::intensity.store(1.f);
       native::nr_follow_input_res.store(false);
       native::nr_resolution_scale.store(1.f);
       native::nr_adaptive_enabled.store(false);
-      native::edit_reuse_enabled.store(false);
+      native::edit_reuse_enabled.store(edit_reuse_production);
       native::ngx_loader_staging.nr_ready = true;
       native::ngx_loader_staging.core_ready = true;
       native::PublishNgxLoaderSymbols();
+      if (edit_reuse_production) {
+        native::feed_mode.store(1);
+        native::norm_governor.store(0);
+        native::use_auto_mask.store(false);
+        native::direct_runtime_requirements.dual_models = true;
+        native::direct_runtime_requirements.file_version = "310.9.16.0";
+        native::native_fg_public_off.store(true);
+        native::native_fg_declaration.store(native::NativeFgDeclaration::kOff);
+
+        D3D11_TEXTURE2D_DESC desc{};
+        output->GetDesc(&desc);
+        ComPtr<ID3D11Texture2D> shared11;
+        ComPtr<ID3D12Resource> shared12;
+        const HRESULT shared = native::CreateSharedTwin(desc, desc.Format,
+            D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE, &shared11, &shared12);
+        if (FAILED(shared)) {
+          std::fprintf(stderr, "UNVERIFIED edit-reuse-production: WARP FP16 Output sharing failed (0x%08X)\n", unsigned(shared));
+          native::ReleaseBridge();
+          return 1;
+        }
+      }
 
       params::OwnedParameters parameters;
-      parameters.Set(NVSDK_NGX_Parameter_Width, width);
-      parameters.Set(NVSDK_NGX_Parameter_Height, height);
-      parameters.Set(NVSDK_NGX_Parameter_OutWidth, adaptive_output_width);
-      parameters.Set(NVSDK_NGX_Parameter_OutHeight, adaptive_output_height);
-      parameters.Set(NVSDK_NGX_Parameter_Color, static_cast<ID3D11Resource*>(color.Get()));
-      parameters.Set(NVSDK_NGX_Parameter_Output, static_cast<ID3D11Resource*>(output.Get()));
-      parameters.Set(NVSDK_NGX_Parameter_Depth, static_cast<ID3D11Resource*>(depth_direct.Get()));
-      parameters.Set(NVSDK_NGX_Parameter_MotionVectors, static_cast<ID3D11Resource*>(rg16.Get()));
-      parameters.Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags,
-          int(NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes));
-      parameters.Set(NVSDK_NGX_Parameter_MV_Scale_X, 1.f);
-      parameters.Set(NVSDK_NGX_Parameter_MV_Scale_Y, 1.f);
-      const auto* handle = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xD511});
-      const params::ParameterView create_view(&parameters, nullptr);
-      native::RegisterCreatedFeatureLocked(handle, native::kFeatureDlss, &create_view);
-      const auto frame = [&] {
+      const auto setup_parameters = [&](bool jitter_y) {
+        parameters.Set(NVSDK_NGX_Parameter_Width, width);
+        parameters.Set(NVSDK_NGX_Parameter_Height, height);
+        parameters.Set(NVSDK_NGX_Parameter_OutWidth, adaptive_output_width);
+        parameters.Set(NVSDK_NGX_Parameter_OutHeight, adaptive_output_height);
+        parameters.Set(NVSDK_NGX_Parameter_Color, static_cast<ID3D11Resource*>(color.Get()));
+        parameters.Set(NVSDK_NGX_Parameter_Output, static_cast<ID3D11Resource*>(output.Get()));
+        parameters.Set(NVSDK_NGX_Parameter_Depth, static_cast<ID3D11Resource*>(depth_direct.Get()));
+        parameters.Set(NVSDK_NGX_Parameter_MotionVectors, static_cast<ID3D11Resource*>(rg16.Get()));
+        parameters.Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags,
+            int(NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes));
+        parameters.Set(NVSDK_NGX_Parameter_MV_Scale_X, 1.f);
+        parameters.Set(NVSDK_NGX_Parameter_MV_Scale_Y, 1.f);
+        if (edit_reuse_production) {
+          parameters.Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, width);
+          parameters.Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, height);
+          parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, 0.f);
+          if (jitter_y) parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, 0.f);
+        }
+      };
+      setup_parameters(true);
+      auto* handle = reinterpret_cast<NVSDK_NGX_Handle*>(uintptr_t{0xD511});
+      if (edit_reuse_production) {
+        source_create_result = handle;
+        native::ngx11_slot_real[0].create = reinterpret_cast<void*>(&MotionCreateSource);
+        const auto created = native::HookedCreateFeature11Slot<0>(context.Get(), native::kFeatureDlss, &parameters, &handle);
+        Check(NVSDK_NGX_SUCCEED(created), "production D3D11 Create wrapper registers the mock SR");
+        const auto& source = native::create_contracts.at(handle);
+        Check(source.source_type_confirmed && source.source_generation != 0
+                  && source.source_device11_identity.Get() == renodx::utils::directx::NativeIdentity(device.Get())
+                  && native::features.at(handle).sr_sequence == 0,
+            "registered Bridge source has the original D3D11 device and an unused attempt sequence");
+      } else {
+        const params::ParameterView create_view(&parameters, nullptr);
+        native::RegisterCreatedFeatureLocked(handle, native::kFeatureDlss, &create_view);
+      }
+      const auto frame = [&](bool sr_succeeds = true) {
         ++native::present_generation;
-        const auto result = native::Ngx11Evaluate(0, "ordinary Bridge watchdog", context.Get(), handle, &parameters, [&] {
+        const auto sequence_before = native::features.at(handle).sr_sequence;
+        uint32_t real_calls = 0;
+        const auto mock_sr = [&] {
+          ++real_calls;
           context->UpdateSubresource(output.Get(), 0, nullptr, output_pixels.data(), adaptive_output_width * 8, 0);
-          return NVSDK_NGX_Result_Success;
+          return (sr_succeeds ? NVSDK_NGX_Result_Success : NVSDK_NGX_Result_Fail);
+        };
+        const auto result = native::Ngx11Evaluate(0, "ordinary Bridge SR", context.Get(), handle, &parameters, [&] {
+          return (edit_reuse_production
+              ? native::Ngx11Evaluate(0, "nested Bridge SR mirror", context.Get(), handle, &parameters, mock_sr) : mock_sr());
         });
-        Check(NVSDK_NGX_SUCCEED(result), "ordinary Bridge preserves MOCK SR success");
+        Check(real_calls == 1 && NVSDK_NGX_SUCCEED(result) == sr_succeeds, "Bridge preserves the original MOCK SR result");
+        if (edit_reuse_production) {
+          const auto& source = native::features.at(handle);
+          const auto& plan = native::last_source_plan;
+          Check(source.sr_sequence == sequence_before + 1 && plan.source_handle == handle
+                    && plan.source_generation == source.source_generation && plan.plan.valid
+                    && plan.plan.At(renodx::addons::dlss5::stage_plan::Stage::UPSCALED).count == 1,
+              "one outer SR attempt advances the registered source and publishes its one-pass Upscaled plan");
+        }
       };
 
       auto* const raw_context = native::bridge.context11;
       const auto original = Read11(output.Get(), 8);
+      if (edit_reuse_production) {
+        Check(Read11(color.Get(), 8) != original, "Color and the original SR Output contain distinguishable RGBA");
+      }
       auto consumer = make_texture(adaptive_output_width, adaptive_output_height, DXGI_FORMAT_R16G16B16A16_FLOAT, 0, nullptr, 0);
       ComPtr<ID3D11Device5> fence_device;
       ComPtr<ID3D11Fence> consumer_tail;
       Check(SUCCEEDED(device.As(&fence_device))
                 && SUCCEEDED(fence_device->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(&consumer_tail))),
           "ordinary Bridge D3D11 consumer fence");
+      uint64_t consumer_value = 0;
+      const auto consume_output = [&] {
+        raw_context->CopyResource(consumer.Get(), output.Get());
+        Check(SUCCEEDED(raw_context->Signal(consumer_tail.Get(), ++consumer_value)), "signal after the real D3D11 consumer copy");
+        raw_context->Flush();
+        WaitForGpu(consumer_tail.Get(), consumer_value);
+        return Read11(consumer.Get(), 8);
+      };
 
       {
         // The stalled twin still contains the SR snapshot. An early copy can be byte-identical.
@@ -667,6 +762,7 @@ int main(int argc, char** argv) {
         static CopyRegion original_copy = nullptr;
         static ID3D11DeviceContext4* observed_context = raw_context;
         static ID3D11Resource* observed_output = output.Get();
+        static uint32_t bridge_copies = 0;
         static uint32_t output_copies = 0;
         renodx::utils::vtable::Slot<CopyRegion> copy_slot{
             .object = raw_context,
@@ -675,8 +771,11 @@ int main(int argc, char** argv) {
             .replacement = [](ID3D11DeviceContext4* observed, ID3D11Resource* dst, UINT dst_subresource, UINT x, UINT y,
                                UINT z, ID3D11Resource* src, UINT src_subresource, const D3D11_BOX* box) {
               original_copy(observed, dst, dst_subresource, x, y, z, src, src_subresource, box);
-              if (observed == observed_context && dst == observed_output) {
-                ++output_copies;
+              if (observed == observed_context) {
+                ++bridge_copies;
+                if (dst == observed_output) {
+                  ++output_copies;
+                }
               }
             }};
         renodx::utils::vtable::Install(&copy_slot);
@@ -707,6 +806,120 @@ int main(int argc, char** argv) {
         Check(std::memcmp(warm_pixels.data(), original.data(), 3 * sizeof(uint16_t)) != 0,
             "completed ordinary NR changes game Output RGB");
 
+        const auto edited_pixels = [&](const std::vector<unsigned char>& pixels) {
+          Check(pixels.size() == original.size() && pixels != original, "the D3D11 consumer reads a nonzero NR edit");
+          for (size_t offset = 6; offset < pixels.size(); offset += 8) {
+            Check(std::memcmp(pixels.data() + offset, original.data() + offset, sizeof(uint16_t)) == 0,
+                "the D3D11 consumer preserves every pixel's original FP16 alpha");
+          }
+        };
+        const auto expect_frame = [&](uint32_t calls, int reset) {
+          const auto copies_before = output_copies;
+          const auto calls_before = model_calls;
+          frame();
+          Check(model_calls - calls_before == calls && output_copies - copies_before == 1,
+              "each complete Bridge frame copies back once, including zero-Evaluate reuse");
+          if (calls != 0 && reset >= 0) {
+            Check(model_observations.back().reset == reset, "Bridge model consumes the expected History Reset");
+          }
+          auto pixels = consume_output();
+          edited_pixels(pixels);
+          return pixels;
+        };
+        if (edit_reuse_production) {
+          const auto& warm_feature = native::features.at(handle);
+          const auto& anchor_before = warm_feature.slots[0].edit_reuse;
+          Check(anchor_before != nullptr && anchor_before->valid, "production Bridge warm-up produced a valid edit anchor");
+          const uint64_t warm_sequence = warm_feature.sr_sequence;
+          const uint64_t warm_anchor = anchor_before->anchor_generation;
+          uint64_t anchor_base = 0;
+          std::vector<unsigned char> refresh_pixels;
+          parameters.Set(NVSDK_NGX_Parameter_Reset, 1);
+          for (uint32_t index = 0; index < 4; ++index) {
+            if (index == 1) native::d3d12_swapchain_seen.store(true);
+            const bool refresh = index % 2 == 0;
+            const auto previous_anchor = native::features.at(handle).slots[0].edit_reuse->anchor_generation;
+            const auto calls_before = model_calls;
+            const auto pixels = expect_frame(refresh ? 1u : 0u, index == 0 ? 1 : 0);
+            parameters.Set(NVSDK_NGX_Parameter_Reset, 0);
+            const auto& feature = native::features.at(handle);
+            const auto& anchor = feature.slots[0].edit_reuse;
+            Check(anchor != nullptr && anchor->valid && anchor->source_sequence == feature.sr_sequence
+                      && anchor->anchor_generation == previous_anchor + (refresh ? 1 : 0) && anchor->reused == !refresh,
+                "Bridge anchor follows the real SR sequence and advances only on model refresh");
+            const uint64_t base = feature.sr_sequence - warm_sequence;
+            if (refresh) {
+              Check(model_presets.back() == 2, "Bridge refresh invokes the requested model B");
+              anchor_base = base;
+              refresh_pixels = pixels;
+            } else {
+              for (size_t offset = 0; offset < pixels.size(); offset += sizeof(uint16_t)) {
+                uint16_t refreshed, reused;
+                std::memcpy(&refreshed, refresh_pixels.data() + offset, sizeof(uint16_t));
+                std::memcpy(&reused, pixels.data() + offset, sizeof(uint16_t));
+                Check(std::fabs(DirectX::PackedVector::XMConvertHalfToFloat(refreshed)
+                            - DirectX::PackedVector::XMConvertHalfToFloat(reused)) < .003f,
+                    "zero-motion Bridge reuse transports the refreshed RGBA edit");
+              }
+            }
+            inline_execution_trace::PrintBase("bridge", {
+                .base = base, .calls = model_calls - calls_before, .reset = (refresh ? model_observations.back().reset : -1),
+                .history = anchor->source_sequence - warm_sequence, .anchor_base = anchor_base,
+                .anchor_generation = anchor->anchor_generation - warm_anchor, .anchor_age = base - anchor_base,
+                .complete = true}, pixels);
+          }
+          native::d3d12_swapchain_seen.store(false);
+
+          {
+            ComPtr<ID3D11Device> other_device;
+            Check(SUCCEEDED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0,
+                      D3D11_SDK_VERSION, &other_device, nullptr, nullptr))
+                      && !renodx::utils::directx::SameNativeObject(other_device.Get(), device.Get()),
+                "same-adapter ownership contrast uses a second real D3D11 device");
+            D3D11_TEXTURE2D_DESC guide_desc{}, other_desc{};
+            rg16->GetDesc(&guide_desc);
+            ComPtr<ID3D11Texture2D> other_guide;
+            Check(SUCCEEDED(other_device->CreateTexture2D(&guide_desc, nullptr, &other_guide)),
+                "second D3D11 device creates a guide with the original descriptor");
+            other_guide->GetDesc(&other_desc);
+            Check(native::SameSurface(guide_desc, other_desc), "foreign guide matches the warm Bridge surface cache key");
+
+            const auto layout = native::bridge_sets.at(handle)[0].layout_generation;
+            const auto prior_copies = bridge_copies;
+            const auto prior_calls = model_calls;
+            const auto prior_submit = native::bridge_submitted_value.load();
+            parameters.Set(NVSDK_NGX_Parameter_MotionVectors, static_cast<ID3D11Resource*>(other_guide.Get()));
+            frame();
+            parameters.Set(NVSDK_NGX_Parameter_MotionVectors, static_cast<ID3D11Resource*>(rg16.Get()));
+            Check(bridge_copies == prior_copies && model_calls == prior_calls
+                      && native::bridge_submitted_value.load() == prior_submit
+                      && native::bridge_sets.at(handle)[0].layout_generation == layout && consume_output() == original,
+                "foreign same-shape guide issues no Bridge copies, model calls or submit and preserves SR Output");
+            expect_frame(1, 1);
+            Check(native::bridge_sets.at(handle)[0].layout_generation == layout,
+                "the next SR with its own guide resumes NR and ordered copy-back on the original layout");
+          }
+          const auto complete_parameters = parameters;
+          parameters.Reset();
+          setup_parameters(false);
+          const auto reuse_fallbacks = native::edit_reuse_fallbacks.load();
+          expect_frame(1, -1);
+          expect_frame(1, -1);
+          Check(native::edit_reuse_fallbacks.load() == reuse_fallbacks + 2,
+              "missing jitter Y prevents reuse while both frames retain the normal per-frame NR output");
+          parameters = complete_parameters;
+          expect_frame(1, -1);
+
+          const auto rejected_copies = output_copies;
+          const auto rejected_calls = model_calls;
+          const auto rejected_submit = native::bridge_submitted_value.load();
+          frame(false);
+          Check(output_copies == rejected_copies && model_calls == rejected_calls
+                    && native::bridge_submitted_value.load() == rejected_submit && consume_output() == original,
+              "a failed original SR advances the attempt sequence without NR submit or game Output copy-back");
+          expect_frame(1, 1);
+        }
+
         const auto pending = native::bridge_submitted_value.load() + 1;
         const auto calls_before = model_calls;
         const auto copies_before = output_copies;
@@ -718,8 +931,18 @@ int main(int argc, char** argv) {
         Check(SUCCEEDED(native::bridge.queue->Wait(stalled.Get(), 1)), "stall ordinary Bridge private queue");
         StallRelease stall_release{.gate = stalled.Get()};
         frame();
-        Check(native::bridge_submitted_value.load() == pending && model_calls == calls_before + 1,
-            "stalled ordinary frame submits one real NR recording");
+        const uint32_t stalled_model_calls = (edit_reuse_production ? 0u : 1u);
+        Check(native::bridge_submitted_value.load() == pending && model_calls == calls_before + stalled_model_calls,
+            "the stalled frame submits a real recording with the expected number of model calls");
+        if (edit_reuse_production) {
+          const auto& feature = native::features.at(handle);
+          const auto& slot = feature.slots[0];
+          Check(slot.edit_reuse != nullptr && slot.edit_reuse->source_sequence == feature.sr_sequence
+                    && !slot.edit_reuse->valid && slot.pending_reset
+                    && native::bridge_pending_delivery_value == pending
+                    && !renodx::addons::dlss5::submission::ResourceReleasable(slot.edit_reuse.get()),
+              "unhanded Bridge reuse revokes the candidate and resets History while retaining the in-flight edit state");
+        }
         const auto watchdog_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         while (native::bridge.fence_out12->GetCompletedValue() < pending
                && std::chrono::steady_clock::now() < watchdog_deadline) {
@@ -731,11 +954,7 @@ int main(int argc, char** argv) {
                   && native::bridge.fence_done12->GetCompletedValue() < pending,
             "actual watchdog releases out after the D3D11 input while real D3D12 done is still pending");
 
-        raw_context->CopyResource(consumer.Get(), output.Get());
-        Check(SUCCEEDED(raw_context->Signal(consumer_tail.Get(), 1)), "signal after the real D3D11 consumer copy");
-        raw_context->Flush();
-        WaitForGpu(consumer_tail.Get(), 1);
-        const auto consumed_pixels = Read11(consumer.Get(), 8);
+        const auto consumed_pixels = consume_output();
         const auto done_before_release = native::bridge.fence_done12->GetCompletedValue();
         Check(done_before_release < pending, "D3D11 game consumption finishes before the stalled NR GPU work");
         const auto early_copies = output_copies - copies_before;
@@ -752,18 +971,37 @@ int main(int argc, char** argv) {
         Check(consumed_pixels == original, "stalled ordinary Bridge preserves the SR pixels seen by the game");
         Check(after_done == original && output_copies == copies_before, "late NR completion leaves game Output intact");
 
-        frame();
-        Check(native::bridge_submitted_value.load() == pending + 1 && model_calls == calls_before + 2,
-            "first frame after real completion resumes NR");
-        WaitForGpu(native::bridge.fence_done12, pending + 1);
-        Check(model_observations.back().reset == 1, "first resumed NR frame resets history after the undelivered frame");
-        Check(Read11(output.Get(), 8) == warm_pixels && output_copies == copies_before + 1,
-            "first resumed frame writes the completed NR result to game Output exactly once");
+        if (edit_reuse_production) {
+          expect_frame(1, 1);
+          Check(native::bridge_submitted_value.load() == pending + 1, "the first real frame after GPU done refreshes and delivers");
+          expect_frame(0, 0);
+        } else {
+          frame();
+          Check(native::bridge_submitted_value.load() == pending + 1 && model_calls == calls_before + 2,
+              "first frame after real completion resumes NR");
+          WaitForGpu(native::bridge.fence_done12, pending + 1);
+          Check(model_observations.back().reset == 1, "first resumed NR frame resets history after the undelivered frame");
+          Check(Read11(output.Get(), 8) == warm_pixels && output_copies == copies_before + 1,
+              "first resumed frame writes the completed NR result to game Output exactly once");
+        }
+      }
+      if (edit_reuse_production) {
+        native::ngx11_slot_real[0].release = reinterpret_cast<void*>(&MotionReleaseSource);
+        Check(NVSDK_NGX_SUCCEED(native::HookedReleaseFeature11Slot<0>(handle)), "production D3D11 release retires the tested source");
       }
       native::ReleaseBridge();
       check_debug_messages();
-      std::cout << "PASS ordinary Upscaled watchdog " << (warp ? "WARP" : "NATIVE_GPU")
-                << "+MOCK game consumption and first resumed NR result\n";
+      if (edit_reuse_production) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+        constexpr int dev = 1;
+#else
+        constexpr int dev = 0;
+#endif
+        std::cout << "PASS case=bridge-edit-reuse-production evidence=WARP+MOCK dev=" << dev << '\n';
+      } else {
+        std::cout << "PASS ordinary Upscaled watchdog " << (warp ? "WARP" : "NATIVE_GPU")
+                  << "+MOCK game consumption and first resumed NR result\n";
+      }
       return 0;
     }
     if (adaptive_case) {

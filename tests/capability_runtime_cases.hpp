@@ -185,6 +185,64 @@ for (const bool bridge : {false, true}) {
   }
 }
 
+{
+  struct Device11Identity final : IUnknown {
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
+      if (iid == IID_IUnknown) {
+        *object = static_cast<IUnknown*>(this);
+        AddRef();
+        return S_OK;
+      }
+      *object = nullptr;
+      return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+  } device11_identity;
+  const auto saved_d3d12_present = runtime::d3d12_present_seen.exchange(false);
+  auto mixed_request = pair;
+  mixed_request.update({{"NRHookPoint", 1u}, {"NRPass2Stage", 2u}});
+  Check(runtime::D3D11OnlySession() && apply(mixed_request),
+        "Prepare a Render and Upscaled chain in the D3D11 presentation session.");
+  const auto* bridge_source = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xCA9102});
+  const auto* foreign_source = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xCA9103});
+  renodx::addons::dlss5::bridge::OwnedParameters source_parameters;
+  {
+    renodx::addons::dlss5::RuntimeLock lock(runtime::runtime_mutex);
+    runtime::RegisterCreatedFeatureLocked(bridge_source, runtime::kFeatureDlss, &source_parameters, &device11_identity);
+    runtime::RegisterCreatedFeatureLocked(foreign_source, runtime::kFeatureDlss, &source_parameters);
+  }
+  const auto observe = [&](const NVSDK_NGX_Handle* handle) {
+    renodx::addons::dlss5::RuntimeLock lock(runtime::runtime_mutex);
+    return runtime::EvaluationStagePlan(handle);
+  };
+  const auto bridge_plan = observe(bridge_source);
+  Check(bridge_plan.valid && bridge_plan.mixed && runtime::CurrentExecutionApi() == cap::Api::DX11
+            && runtime::CurrentExecutionBackend(cap::Api::DX11) == cap::Backend::DX11_BRIDGE
+            && runtime::QueryConfigurationCapability(mixed_request).CanSubmit(),
+        "The registered D3D11 source drives the same native Bridge plan in execution and configuration.");
+
+  runtime::dx11_route = runtime::kDx11RouteForeign;
+  const auto foreign_plan = observe(foreign_source);
+  const auto foreign = runtime::QueryConfigurationCapability(mixed_request);
+  Check(runtime::D3D11OnlySession() && foreign_plan.valid && foreign_plan.mixed
+            && runtime::CurrentExecutionApi() == cap::Api::DX12
+            && runtime::CurrentExecutionBackend(cap::Api::DX12) == cap::Backend::NATIVE
+            && foreign.CanSubmit() && foreign.group_count == foreign_plan.group_count,
+        "A registered D3D12 source keeps native execution and configuration eligibility on the D3D11 swapchain.");
+  {
+    renodx::addons::dlss5::RuntimeLock lock(runtime::runtime_mutex);
+    runtime::ForgetSourceHandleLocked(foreign_source);
+    runtime::ForgetSourceHandleLocked(bridge_source);
+  }
+  Check(runtime::CurrentExecutionApi() == cap::Api::DX11
+            && !runtime::QueryConfigurationCapability(mixed_request).CanSubmit(),
+        "Releasing the observed D3D12 source returns configuration to the current D3D11 fallback.");
+  runtime::dx11_route = runtime::kDx11RouteNative;
+  runtime::d3d12_present_seen = saved_d3d12_present;
+  observe_capability_source(false);
+}
+
 runtime::d3d12_swapchain_seen = true;
 runtime::d3d11_swapchain_seen = false;
 auto present = pair;
@@ -210,6 +268,28 @@ runtime::native_fg_declaration = runtime::NativeFgDeclaration::kOn;
 reject_unchanged(change);
 runtime::native_fg_declaration = runtime::NativeFgDeclaration::kOff;
 Check(apply(change), "Same request is revalidated and accepted after FG returns to Off.");
+
+{
+  auto inherited = present;
+  inherited["NRPass2ResolutionMode"] = 0u;
+  Check(apply(inherited) && runtime::CanChooseSetting(runtime::kSetFollowInputRes, 1.f, &error),
+        "The menu accepts Follow Input for a pair that inherits one working size.");
+  inherited["NRFollowInputRes"] = true;
+  const auto snapshot = profile::Snapshot();
+  const auto rows = adapter::Preview({.scope = presets::Scope::FULL, .settings = inherited}, true);
+  Check(std::any_of(rows.begin(), rows.end(), [](const auto& row) {
+          return row.key == "NRFollowInputRes" && std::string_view(row.status) == "Will change";
+        }) && profile::Snapshot() == snapshot, "Preset preview permits the inherited pair and leaves settings intact.");
+  presets::Document decoded;
+  Check(presets::Parse(presets::Serialize({.scope = presets::Scope::FULL, .settings = inherited}), &decoded)
+            && decoded.settings == inherited && apply(decoded.settings),
+        "A serialized Follow Input preset round-trips through the same capability policy.");
+  const auto queried = runtime::QueryConfigurationCapability();
+  Check(queried.CanSubmit() && !queried.execution_proven
+            && queried.working_sizes[0] == cap::Size{} && queried.working_sizes[1] == cap::Size{},
+        "Configuration snapshots leave inherited working sizes unknown without current Guide evidence.");
+  Check(apply(change), "Restore the fixed-size Present pair for the following capability cases.");
+}
 
 runtime::experimental_present_chain = true;
 auto b1 = pair;

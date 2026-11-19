@@ -1024,6 +1024,8 @@ class BridgeDeviceLock {
   BridgeDeviceLock(const BridgeDeviceLock&) = delete;
   BridgeDeviceLock& operator=(const BridgeDeviceLock&) = delete;
 
+  bool OwnsSection() const noexcept { return multithread_ != nullptr; }
+
  private:
   ID3D11Multithread* multithread_ = nullptr;
 };
@@ -1415,11 +1417,17 @@ inline void ReleaseBridge() {
 // for the game's (Color = Output = the back buffer) and the path's own
 // stream handle.  True when NR's result was queued back into the game's
 // surface (the Output copy, or the Color redirect before upscaling).
+struct BridgeSrAttempt {
+  uint64_t generation = 0;
+  uint64_t sequence = 0;
+};
+
 inline bool RunBridge(ID3D11DeviceContext* context,
                       const NVSDK_NGX_Handle* handle,
                       const NVSDK_NGX_Parameter* parameters,
                       bridge::ScopedD3D11Redirect* redirect,
-                      const PresentTarget* present = nullptr) {
+                      const PresentTarget* present = nullptr,
+                      const BridgeSrAttempt* ordered_sr = nullptr) {
   using bridge::ResourceKey;
   stage_plan::Plan plan;
   {
@@ -1515,7 +1523,14 @@ inline bool RunBridge(ID3D11DeviceContext* context,
       return;
     }
 
-    const NrDeclineReason up = EnsureBridgeUp(context);
+    // The ordered SR caller already owns the immediate-context section.
+    // Only the ordinary path can start the bridge or load its runtime.
+    NrDeclineReason up = kBridgeReady;
+    if (ordered_sr == nullptr) {
+      up = EnsureBridgeUp(context);
+    } else if (const auto state = bridge_state.load(std::memory_order_acquire); state != BridgeState::kUp) {
+      up = (state == BridgeState::kLost ? NrDeclineReason::kBridgeLost : NrDeclineReason::kBridgeDown);
+    }
     if (up == NrDeclineReason::kNrRuntimeUnavailable) {
       name(up);
       return;
@@ -1610,13 +1625,50 @@ inline bool RunBridge(ID3D11DeviceContext* context,
       return;
     }
     const auto created = create_contracts.find(handle);
+    IUnknown* const device11_identity = bridge_device11_identity.load(std::memory_order_acquire);
+    bool trusted_sr = false;
+    if (ordered_sr != nullptr && !pre && present == nullptr && !plan.mixed) {
+      if (const auto source = features.find(handle);
+          source != features.end() && created != create_contracts.end() && device11_identity != nullptr
+          && created->second.source_device11_identity.Get() == device11_identity
+          && created->second.source_generation == ordered_sr->generation
+          && source->second.source_generation == ordered_sr->generation
+          && source->second.sr_sequence == ordered_sr->sequence) {
+        // A cached layout can be reused by different texture objects. Prove
+        // that the actual copies in this evaluate belong to the immediate device.
+        for (const auto key : {ResourceKey::kOutput, ResourceKey::kMotionVectors, ResourceKey::kDepth,
+                               ResourceKey::kExposureTexture}) {
+          if (key == ResourceKey::kExposureTexture && set->exposure11 == nullptr) continue;
+          Microsoft::WRL::ComPtr<ID3D11Device> owner;
+          textures[at(key)]->GetDevice(&owner);
+          if (renodx::utils::directx::NativeIdentity(owner.Get()) != device11_identity) {
+            decline(NrDeclineReason::kBridgeFormat, "an SR surface changed to a different D3D11 device");
+            return;
+          }
+        }
+        trusted_sr = output_desc.Usage != D3D11_USAGE_IMMUTABLE;
+      }
+      if (!trusted_sr) {
+        decline(NrDeclineReason::kBridgeFormat, "the successful SR no longer has the ordered Bridge output contract");
+        return;
+      }
+      // The ring owns every one of these recordings. Discard completed lists
+      // so the core can adopt the old workset or recover after a timed-out frame.
+      if (!RetireBridgeRecordings()) {
+        decline(NrDeclineReason::kBridgeDown, "the previous Bridge recording could not be discarded");
+        return;
+      }
+      PruneCompletedSubmissionUses();
+    }
     const BridgeAdaptiveSource bridge_source{
         .api = capability::Api::DX11, .backend = capability::Backend::DX11_BRIDGE,
         .handle = handle, .device = bridge.device12, .list = slot.list,
-        .device11_identity = bridge_device11_identity.load(std::memory_order_acquire),
+        .device11_identity = device11_identity,
         .device_generation = bridge_adaptive_device_generation.load(std::memory_order_relaxed),
         .source_generation = (created != create_contracts.end() ? created->second.source_generation : 0),
-        .shared_layout = set->layout_generation, .stage = stage_plan::Stage::UPSCALED};
+        .shared_layout = set->layout_generation, .stage = stage_plan::Stage::UPSCALED,
+        .sr_sequence = (trusted_sr ? ordered_sr->sequence : 0),
+        .output_twin = (trusted_sr ? set->output12 : nullptr)};
     adaptive_bridge = !pre && present == nullptr
         && BridgeAdaptiveEligible(bridge_source, slot.list, bridge.device12, handle, plan);
     if (bridge_adaptive_experiment.load() && nr_adaptive_enabled.load() && !adaptive_bridge) {
@@ -1646,9 +1698,11 @@ inline bool RunBridge(ID3D11DeviceContext* context,
       const bool* touched;
       const bool* issued;
       bool strict_delivery;
+      bool trusted_sr;
       ~RecordingScope() {
-        if (!strict_delivery || !*touched || *issued) return;
+        if ((!strict_delivery && !trusted_sr) || !*touched || *issued) return;
         submission::OnCommandListReset(list);
+        if (!strict_delivery) return;
         RetireWorkset(key);
         if (auto state = features.find(key.handle); state != features.end()) {
           FeatureState* session = (key.pre_sr && state->second.render_session
@@ -1666,7 +1720,7 @@ inline bool RunBridge(ID3D11DeviceContext* context,
     const RecordingScope recording_scope{
         .list = slot.list,
         .key = {handle, (independent_present_pair ? present->workset_key : nr_twin), pre},
-        .touched = &touched, .issued = &issued, .strict_delivery = strict_delivery};
+        .touched = &touched, .issued = &issued, .strict_delivery = strict_delivery, .trusted_sr = trusted_sr};
     const D3D12_RESOURCE_STATES nr_twin_state =
         pre ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
             : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -1722,12 +1776,13 @@ inline bool RunBridge(ID3D11DeviceContext* context,
             && screenshot::internal::inline_restore_active.load(std::memory_order_acquire);
         completed = ProcessInline(slot.list, handle, &view, &touched,
                                   present != nullptr ? &at_present : nullptr,
-                                  (adaptive_bridge || capture_inline_restore ? &bridge_recording : nullptr), false, capture_inline_restore,
+                                  (adaptive_bridge || trusted_sr || capture_inline_restore ? &bridge_recording : nullptr),
+                                  false, capture_inline_restore,
                                   present == nullptr ? &bridge_source : nullptr);
 #else
         completed = ProcessInline(slot.list, handle, &view, &touched,
                                   present != nullptr ? &at_present : nullptr,
-                                  (adaptive_bridge ? &bridge_recording : nullptr), false,
+                                  (adaptive_bridge || trusted_sr ? &bridge_recording : nullptr), false,
                                   present == nullptr ? &bridge_source : nullptr);
 #endif
       }
@@ -1919,6 +1974,22 @@ inline bool RunBridge(ID3D11DeviceContext* context,
       return;
     }
     bridge_pending_delivery_value = 0;
+    if (trusted_sr) {
+      const auto source = features.find(handle);
+      const bool edits_recorded = bridge_recording.edit_refreshed || bridge_recording.edit_reused
+          || (source != features.end() && std::ranges::any_of(source->second.slots, [&](const NrFeatureSlot& feature_slot) {
+                return feature_slot.edit_reuse != nullptr
+                    && feature_slot.edit_reuse->source_sequence == bridge_source.sr_sequence;
+              }));
+      if (edits_recorded) {
+        if (!completed || !PresentGroupResult(std::span{&bridge_recording, 1}, 1, true).complete
+            || evaluate_chain.configuration_generation != configuration_generation.load()) return;
+      } else if (!bridge_recording.model_recorded) {
+        // Preparation or a failed first model has no color to deliver. A
+        // legacy stack that recorded a mature prefix keeps its normal handoff.
+        return;
+      }
+    }
     if (strict_delivery) {
       if (adaptive_bridge) {
         // Close the recording lifetime only by actually discarding this owned
@@ -1987,6 +2058,10 @@ inline bool RunBridge(ID3D11DeviceContext* context,
     RuntimeLock lock(runtime_mutex);
     if (auto state = features.find(handle); state != features.end()) {
       for (auto& slot : state->second.slots) {
+        if (ordered_sr != nullptr && state->second.source_generation == ordered_sr->generation
+            && slot.edit_reuse != nullptr && slot.edit_reuse->source_sequence == ordered_sr->sequence) {
+          slot.edit_reuse->valid = false;
+        }
         slot.pending_reset = true;
         slot.pending_reset_reasons |= kResetRecovery;
         slot.look_history.valid = false;
@@ -2042,12 +2117,32 @@ inline NVSDK_NGX_Result Ngx11Evaluate(int slot, const char* entry,
     CountNrDecline(NrDeclineReason::kImplausibleArgument);
     return real();
   }
-  // The game's NGX call takes its serial turn inside real(). The device
-  // section must precede that turn. Keep it scoped to the call so loader
-  // priming and bridge bring-up below still run outside every lock.
-  const auto call_real = [&] {
-    const BridgeDeviceLock device_lock(context);
-    return real();
+  BridgeSrAttempt sr_attempt;
+  std::optional<BridgeDeviceLock> sr_section;
+  // Preserve device section -> NGX turn. In the ready Upscaled route the
+  // same section also prevents a later SR from overwriting our inputs.
+  const auto call_real = [&](bool keep_section = false) {
+    sr_section.emplace(context);
+    bool ordered_sr = false;
+    if (handle != nullptr && parameters != nullptr && context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE) {
+      Microsoft::WRL::ComPtr<ID3D11Device> device;
+      context->GetDevice(&device);
+      IUnknown* const identity = renodx::utils::directx::NativeIdentity(device.Get());
+      RuntimeLock lock(runtime_mutex);
+      if (const auto source = features.find(handle);
+          identity != nullptr && source != features.end() && EditReuseSourceConfirmed(handle, source->second)
+          && source->second.source_device11_identity.Get() == identity) {
+        // Match the D3D12 source clock: count outer SR attempts, but lend
+        // the sequence to NR only after success. A failure leaves a gap.
+        sr_attempt = {.generation = source->second.source_generation, .sequence = ++source->second.sr_sequence};
+        ordered_sr = keep_section && source->second.source_feature == kFeatureDlss;
+      }
+    }
+    const NVSDK_NGX_Result result = real();
+    if (!ordered_sr || !sr_section->OwnsSection() || sr_attempt.sequence == 0 || NVSDK_NGX_FAILED(result)) {
+      sr_section.reset();
+    }
+    return result;
   };
   const EvaluateChainScope chain_scope;
   const SourceStageScope source_scope(handle, true);
@@ -2104,7 +2199,10 @@ inline NVSDK_NGX_Result Ngx11Evaluate(int slot, const char* entry,
     RunBridge(context, handle, parameters, nullptr);
     return result;
   }
-  const NVSDK_NGX_Result result = call_real();
+  const bool ordered_upscaled = plan.valid && !plan.mixed && plan.At(stage_plan::Stage::UPSCALED).count == plan.pass_count
+      && enabled.load() && edit_reuse_enabled.load()
+      && bridge_state.load(std::memory_order_acquire) == BridgeState::kUp && NgxLoaderView().nr_ready;
+  const NVSDK_NGX_Result result = call_real(ordered_upscaled);
   if (NVSDK_NGX_FAILED(result)) {
     CountNrDecline(NrDeclineReason::kGameEvaluateFailed);
     return result;
@@ -2141,8 +2239,12 @@ inline NVSDK_NGX_Result Ngx11Evaluate(int slot, const char* entry,
       return result;
     }
   }
-  PrimeNgxLoaderSymbols(nullptr);  // D3D11 route: no D3D12 device to derive identity from
-  RunBridge(context, handle, parameters, nullptr);
+  if (sr_section.has_value()) {
+    RunBridge(context, handle, parameters, nullptr, nullptr, &sr_attempt);
+  } else {
+    PrimeNgxLoaderSymbols(nullptr);  // D3D11 route has no D3D12 device identity
+    RunBridge(context, handle, parameters, nullptr);
+  }
   return result;
 }
 

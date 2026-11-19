@@ -307,6 +307,8 @@ F6 立即提示开关操作，随后状态更新为正在检查、正常运行�
 
 自适应分辨率面向原生 DX12 的单个处理阶段，包括兼容的 XeFG／原生 FG 同尺寸链。跨阶段链、FG 异尺寸、DX11 Bridge 和 Vulkan 继续使用手动分辨率；缺少可靠帧率来源时暂停自动并保留合法尺寸。动态 FG 还需匹配的游戏帧计数；信息不足时暂停试探并等待采样，估算输出帧率仍可显示。更改设置或 GPU A/B 对比期间暂停自动。建议在游戏中比较转动视角时的细节和切档观感；使用限帧时，也可核对显示的帧率。
 
+**开发版（尚未随安装包发布）**按实际 SR 来源识别能力。DX11 游戏经第三方工具提供 D3D12 SR 输出时，也可沿 D3D12 路径使用自适应；相同有效测量下，仅改变 FG 的启用声明不会改档，实测帧率与 GPU 开销仍参与调节。
+
 **档位数量与准备**：可选择「默认」或 2–15 档，数量包含手动上限。「默认」沿用原缓存容量：单颜色、单输出最多 4 档，双颜色通常 2 档，轮换输出会占用相应容量。显式选择档数时按所需颜色和输出准备完整集合，并检查实际显存余量。可用的不同尺寸取决于最低比例和取整：例如最低 67% 的完整范围最多 8 档，最低 33% 最多 15 档；选择更多也不会重复相同尺寸。更多档位带来更细的步距，同时增加首次准备时间和显存使用。
 
 首次准备分步进行，尚不能处理的帧保留游戏原画。开启、修改档数或尺寸范围后，复用兼容档位并准备缺少的尺寸，所选档位全部就绪后再自动调节；单次准备仍可能短暂卡顿。容量不足时保留选择并暂停，可减少档数后重新准备。调整目标 FPS、风格、混合强度或已有遮罩阈值会保留兼容分配。短时暂停不因闲置五秒而丢弃已接纳的档位；真实换源或资源合同变化仍可能需要重新准备。
@@ -450,6 +452,8 @@ F6 立即提示开关操作，随后状态更新为正在检查、正常运行�
 **v0.6.0 安装包**沿用同一个开关。在**处理与兼容性 → 介入点**选择**超分后（Upscaled）**或**渲染（Render）**，可对符合条件的单层及同介入点多层组合启用 x2。模型按实际请求判断，可用 A、B 或解析为受支持模型的 Auto。Render 仍在每个基础帧运行原有 SR，Ray Reconstruction 走兼容的 Upscaled 路径。
 
 复用需要 NR Runtime 310.9.16.0、可写的当帧 HDR 颜色和匹配的深度、运动矢量及两轴 jitter 偏移。每轴偏移最大半个渲染像素，运动矢量须排除 jitter。多层使用时域滤波时，各层须使用当前介入点的完整分辨率。任一层使用更小的工作尺寸时，整组按原设置逐帧处理。仅空间 Look 的异尺寸组可在满足复用条件时使用 x2。单层 Upscaled 在较低工作尺寸且只需普通双线性缩放时也可复用，需要低格 Look 传输时则逐帧处理。跨介入点或实际绑定区域遮罩时继续逐帧处理，自适应分辨率准备与切档沿用原处理流程。
+
+**开发版（尚未随安装包发布）**也将符合上述条件的 DX11 SR 后输出接入同一复用规则：包括第三方提供的 D3D12 输出，以及原生 DX11 Bridge 的共享输出。原生 Bridge 完成 GPU 处理后才向游戏回拷；缺少 jitter 时按原设置逐帧处理，交付未完成时保留游戏原画，恢复后先刷新。此接线的真实 Runtime、游戏表现与动态画质仍待验证。
 
 **普通 D3D12 Present x2**使用单层和固定全幅工作尺寸。FG 关闭时，在**处理与兼容性 → 介入点**选**呈现（Present）**，再在 **FG 高级设置 → FG 帧处理策略**选**游戏帧**（Game frames，`NRPresentFrames=1`）。游戏须把已确认的同帧 SR 图像整幅复制到当前 FP16 scRGB Backbuffer。无法确认同帧来源时保留原画，普通 HDR10/PQ 也保留原画。选择**每帧**（`NRPresentFrames=0`）可恢复按呈现帧处理。
 
@@ -873,6 +877,8 @@ Automatic sizing keeps a lower level when reducing NR resolution helps approach 
 
 Adaptive sizing supports one processing stage on native DX12, including compatible same-size XeFG / native FG chains. Cross-stage chains, FG chains with different sizes, DX11 Bridge and Vulkan retain manual resolution. Automatic sizing pauses without a reliable output-rate source and keeps a legal size. Dynamic FG also needs matching game-frame counts; while those are unavailable, it pauses quality trials and collects samples, and estimated output FPS can still be shown. Editing settings and GPU A/B comparisons pause it. Compare detail and transitions while moving the camera, and check the displayed FPS when using frame caps.
 
+**Development builds (not yet included in a release package)** identify capabilities from the actual SR source. A DX11 game with a third-party D3D12 SR output can also use adaptive sizing through that D3D12 path. With unchanged valid measurements, changing only the FG enabled declaration keeps the current tier; measured FPS and GPU cost still guide adjustments.
+
 **Level count and preparation**: Choose Default or 2–15 levels, including the manual upper limit. Default retains the original cache capacity: up to four levels for one color and one output, usually two for two colors; rotating outputs consume corresponding capacity. An explicit count prepares the complete collection for the required colors and outputs, subject to available video memory. The number of distinct sizes depends on the minimum scale and rounding: a 67% minimum allows up to eight levels, while 33% allows up to fifteen. A higher selection never duplicates identical sizes. More levels give smaller steps and increase initial preparation time and video-memory use.
 
 Initial preparation proceeds in several steps; frames that NR cannot process yet keep the game's image. Enabling automatic sizing or changing the count or size range reuses compatible levels and prepares missing sizes before automatic adjustment begins. Individual preparation steps can still briefly stall. If capacity is insufficient, the selection is kept and adjustment pauses; reduce the count to prepare again. Target FPS, style, blend strength and existing mask thresholds retain compatible allocations. A temporary pause no longer discards admitted levels merely because they have been idle for five seconds. A genuinely replaced source or changed resource contract can still require preparation.
@@ -1016,6 +1022,8 @@ Under the working-resolution controls in **Quality → Core quality**, enable **
 **The v0.6.0 package** uses the same switch. Under **Processing & compatibility → Hook point**, choose Upscaled (after SR) or Render (before SR) for eligible single-pass and same-hook multi-pass D3D12 configurations. Reuse follows the actual model request, which may be A, B or Auto resolving to a supported model. With Render, the game's SR still runs on every base frame. Ray Reconstruction uses the compatible Upscaled path.
 
 Reuse requires NR Runtime 310.9.16.0, writable HDR color for the current frame, matching depth and motion vectors, and both jitter offsets. Each offset may be up to half a render pixel. Motion vectors must exclude jitter. Multi-pass x2 with temporal filtering requires every pass to run at the hook point's full resolution. If any pass uses a smaller working resolution, the group runs every frame with its original settings. Eligible groups with mixed working resolutions and spatial-only Look can still reuse. Single-pass Upscaled can also reuse at a lower resolution with standard bilinear upsampling. It runs every frame when it needs lower-resolution Look transport. Mixed hook points and bound Region masks also run every frame. Adaptive resolution keeps its usual preparation and tier changes.
+
+**Development builds (not yet included in a release package)** also apply the same reuse rules to eligible DX11 post-SR outputs: both third-party D3D12 outputs and shared outputs from the native DX11 Bridge. The native Bridge copies back to the game after GPU processing completes. Missing jitter retains regular per-frame NR; incomplete delivery keeps the game image, with a refresh on recovery. Real Runtime behavior, in-game operation and dynamic quality of these connections still need validation.
 
 **Ordinary D3D12 Present x2** uses one NR pass at a fixed full-frame working resolution. With FG off, choose **Present** under **Processing & compatibility → Hook point** and **Game frames** (`NRPresentFrames=1`) under **FG advanced settings → FG frame processing policy**. The game must copy the complete SR image from the verified source for that frame to the current FP16 scRGB backbuffer. If the source cannot be verified, the game image is kept. Ordinary HDR10/PQ also keeps the game image. Select **Every frame** (`NRPresentFrames=0`) to restore processing on each present.
 

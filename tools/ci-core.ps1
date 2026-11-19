@@ -8,7 +8,7 @@ $repo = Split-Path $PSScriptRoot -Parent
 $OutputDirectory = Initialize-TestOutput $OutputDirectory
 $previousCl = $env:CL
 $outcome = 'Failed'
-$policySuites = @('edit-reuse-policy','present-frame-policy')
+$policySuites = @('edit-reuse-policy','present-frame-policy','capability-policy')
 $suites = @('native','sdr-policy','hdr-policy','scope','config','constants','stage-plan') +
     $policySuites + @('adaptive-resolution','copy-slots','lifecycle','fg-native')
 $independentCases = [ordered]@{
@@ -48,6 +48,8 @@ try {
     $fg = Join-Path $suiteOutput 'fg-native'
     $executable = Join-Path $fg 'fg_native_tests.exe'
     $inputs = @(Get-Content -LiteralPath (Join-Path $fg 'inputs.json') -Raw | ConvertFrom-Json)
+    $summary['adaptiveInlineReceipt'] = Get-CoreCaseReceipt 'adaptive-inline' (Join-Path $fg 'adaptive-inline.stdout.log') `
+        '^PASS case=adaptive-inline evidence=WARP\+MOCK dev=0$'
     foreach ($case in $independentCases.Keys) {
         foreach ($input in $inputs) {
             if ((Get-FileHash -LiteralPath $input.path).Hash -cne $input.sha256) { throw "Core input changed: $($input.path)" }
@@ -65,6 +67,22 @@ try {
     foreach ($input in $inputs) {
         if ((Get-FileHash -LiteralPath $input.path).Hash -cne $input.sha256) { throw "Core input changed: $($input.path)" }
     }
+
+    $bridgeOutput = Join-Path $OutputDirectory 'bridge-suites'
+    & (Join-Path $PSScriptRoot 'run-tests.ps1') -Suite bridge-motion -BridgeCase edit-reuse-production `
+        -SoftwareOnly -UiPreview None -OutputDirectory $bridgeOutput -RetentionMode Standard
+    $bridge = Join-Path $bridgeOutput 'bridge-motion'
+    $bridgeResult = Get-Content -LiteralPath (Join-Path $bridge 'result.json') -Raw | ConvertFrom-Json
+    if ($bridgeResult.suite -cne 'bridge-motion' -or $bridgeResult.build -cne 'passed' -or $bridgeResult.run -cne 'passed') {
+        throw 'Bridge production edit reuse requires a passing Bridge build and run.'
+    }
+    $bridgeStdout = Join-Path $bridge 'warp-edit-reuse-production.stdout.log'
+    $bridgeReceipt = Get-CoreCaseReceipt 'bridge-edit-reuse-production' $bridgeStdout `
+        '^PASS case=bridge-edit-reuse-production evidence=WARP\+MOCK dev=0$'
+    $summary.independent += @{name='bridge-edit-reuse-production';status='Passed';evidence='WARP+MOCK';receipt=$bridgeReceipt
+        executableSha256=(Get-FileHash -LiteralPath (Join-Path $bridge 'd3d11_bridge_motion_tests.exe')).Hash}
+    $summary['inlineFrameTrace'] = & (Join-Path $PSScriptRoot 'check-inline-frame-traces.ps1') `
+        -PublicLog (Join-Path $OutputDirectory 'nr-edit-reuse-contracts-public/test.stdout.log') -BridgeLog $bridgeStdout
 
     # The Native x2 contract selects the DEV macro for this separate FG binary.
     $devOutput = Join-Path $OutputDirectory 'dev-suites'
