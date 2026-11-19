@@ -759,7 +759,7 @@ inline void PublishPresentBaseRejection(PresentStream* stream, const void* backb
       stream->base_frame_attempt, reason, SteadyNowNs(), configuration_generation.load(), history_reset_epoch.load());
 }
 
-inline void InvalidatePresentBaseFrames(PresentStream* stream) {
+inline void InvalidatePresentBaseFrames(PresentStream* stream, bool preserve_observation = false) {
   stream->edit_reuse_monitor.Reset(stream->base_frame_epoch);
   stream->base_frame_clock.frame = {};
   stream->base_frame_clock.complete = false;
@@ -770,7 +770,7 @@ inline void InvalidatePresentBaseFrames(PresentStream* stream) {
       ClearPresentSource(&set);
     }
   }
-  stream->base_frame_epoch = 0;
+  if (!preserve_observation) stream->base_frame_epoch = 0;
   ResetPresentStreamHistory(stream, kResetSourceChange);
 }
 
@@ -4372,7 +4372,7 @@ inline void RunPresentPath(
       if (input.identity == stream.native_output_identity
           && input.owner == &stream && input.route_id == stream.native_route_id
           && input.backbuffer == back && input.marker != nullptr && input.serial != 0) {
-        InvalidatePresentBaseFrames(&stream);
+        InvalidatePresentBaseFrames(&stream, ordinary_base_frames);
         std::vector<std::pair<FenceRef, uint64_t>> tokens;
         const auto proof = submission::UseSubmissionTokens(input.marker, &tokens);
         const ID3D12Fence* own_fence = nullptr;
@@ -4405,7 +4405,8 @@ inline void RunPresentPath(
       // application image will generate frames or go straight to Present.
       native_deferred_present = {.queue = queue, .swapchain = swapchain,
           .identity = base_identity, .route_id = stream.native_route_id, .auto_fallback = auto_fallback};
-      InvalidatePresentBaseFrames(&stream);
+      // Waiting for a routing decision does not change the produced BB or
+      // its source and submission receipts.
       return;
     }
   }
@@ -4610,7 +4611,9 @@ inline void RunPresentPath(
     return;
   }
   ClaimedPresentFrame identified;
-  if (!d3d11 && ordinary_base_frames && !native_passthrough && !deferred) {
+  // SDK forwarding selects this consumer. The SR-to-BB proof and actual
+  // queue order still determine whether it owns a new base frame.
+  if (!d3d11 && ordinary_base_frames) {
     renodx::utils::directx::NativeFromReShadeProxy(&native_queue);
     queue->flush_immediate_command_list();
     identified = IdentifyPresentBaseFrame(native_queue, &stream, back, target);

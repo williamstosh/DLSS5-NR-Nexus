@@ -75,12 +75,51 @@ using Pixel = std::array<uint16_t, 4>;
 constexpr Pixel GAME_PIXEL{0x3400, 0x3600, 0x3800, 0x3900};
 constexpr Pixel OVERWRITE_PIXEL{0x3a00, 0x3400, 0x3600, 0x3800};
 
+// Only the Streamline identity is substituted. DXGI buffers and GPU work are real.
+struct StreamlineSwapchainFace final : IDXGISwapChain {
+  IDXGISwapChain* const base;
+  ULONG references = 1;
+
+  explicit StreamlineSwapchainFace(IDXGISwapChain* base) : base(base) {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** output) override {
+    static constexpr GUID RETRIEVE_BASE = {
+        0xADEC44E2, 0x61F0, 0x45C3, {0xAD, 0x9F, 0x1B, 0x37, 0x37, 0x92, 0x84, 0xFF}};
+    if (output == nullptr) return E_POINTER;
+    if (iid == RETRIEVE_BASE) return base->QueryInterface(IID_IUnknown, output);
+    *output = nullptr;
+    if (iid != IID_IUnknown && iid != __uuidof(IDXGIObject) && iid != __uuidof(IDXGIDeviceSubObject)
+        && iid != __uuidof(IDXGISwapChain)) return E_NOINTERFACE;
+    *output = static_cast<IDXGISwapChain*>(this);
+    AddRef();
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return ++references; }
+  ULONG STDMETHODCALLTYPE Release() override { return --references; }
+  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetParent(REFIID, void**) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetDevice(REFIID, void**) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE Present(UINT, UINT) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetBuffer(UINT, REFIID, void**) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL, IDXGIOutput*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetFullscreenState(BOOL*, IDXGIOutput**) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetDesc(DXGI_SWAP_CHAIN_DESC*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE ResizeBuffers(UINT, UINT, UINT, DXGI_FORMAT, UINT) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE ResizeTarget(const DXGI_MODE_DESC*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetContainingOutput(IDXGIOutput** output) override { return base->GetContainingOutput(output); }
+  HRESULT STDMETHODCALLTYPE GetFrameStatistics(DXGI_FRAME_STATISTICS*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetLastPresentCount(UINT*) override { return E_NOTIMPL; }
+};
+
 struct Swapchain final : reshade::api::swapchain {
   PresentFaceDevice device;
   PresentFaceQueue queue;
   ComPtr<IDXGISwapChain3> swapchain;
   std::array<ComPtr<ID3D12Resource>, 2> buffers;
   HWND window = nullptr;
+  IDXGISwapChain* present_face = nullptr;
 
   Swapchain(const Gpu& gpu, HWND hwnd, uint32_t width, uint32_t height) : window(hwnd) {
     device.native = gpu.device.Get();
@@ -109,7 +148,9 @@ struct Swapchain final : reshade::api::swapchain {
     }
   }
 
-  uint64_t get_native() const override { return reinterpret_cast<uintptr_t>(swapchain.Get()); }
+  uint64_t get_native() const override {
+    return reinterpret_cast<uintptr_t>(present_face != nullptr ? present_face : swapchain.Get());
+  }
   void get_private_data(const uint8_t[16], uint64_t*) const override { throw std::logic_error("unexpected swapchain data"); }
   void set_private_data(const uint8_t[16], uint64_t) override { throw std::logic_error("unexpected swapchain data"); }
   reshade::api::device* get_device() override { return &device; }
@@ -1433,6 +1474,210 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
                 << " recovery_outputs=" << recovered.base_outputs - failed.base_outputs
                 << " recovery_reset=" << model_resets.back() << '\n';
     }
+
+    {
+      namespace options = addon::fg::native_options;
+      namespace directx = renodx::utils::directx;
+      enum class Route { ORDINARY, SDK_FIRST, OUTER_FIRST };
+
+      StreamlineSwapchainFace outer(output.swapchain.Get());
+      const auto* identity = directx::NativeIdentity(output.swapchain.Get());
+      Check(identity != nullptr && directx::NativeIdentity(&outer) != identity
+                && native::StreamlineBaseIdentity(&outer) == identity,
+            "raw Present fixture exposes distinct outer and SDK swapchain identities");
+      funnel_accounting_tests::Restore substitutions;
+      substitutions.Atomic(&options::internal::present_observed);
+      substitutions.Atomic(&options::internal::decisions_ready);
+      substitutions.Atomic(&options::internal::stopped);
+      options::internal::present_observed.store(native::OnNativePresentObserved);
+      options::internal::decisions_ready.store(true);
+      options::internal::stopped.store(false);
+      Check(options::ObservesPresentDecisions() && native::present_frames == 0 && !native::WantsPresentBaseFrames(),
+            "native SDK routing tests start with the file-backed Every present strategy");
+
+      const auto& stream = native::present_streams.at(&output);
+      const auto& clock = stream.base_frame_clock;
+      bool raw_contracts_passed = true;
+      const auto expect = [&](bool ok, const char* scenario, const char* message) {
+        if (ok) return;
+        std::cerr << "FAIL PRESENT_EVERY_RAW " << scenario << ' ' << message << '\n';
+        raw_contracts_passed = false;
+      };
+      const auto forward = [&](Route route, const void* marker = nullptr) {
+        const bool deferred = route == Route::OUTER_FIRST;
+        const auto before = stats();
+        const auto prior_clock = trace::PresentClockState(clock);
+        const auto epoch = stream.base_frame_epoch;
+        const auto fg_submissions = native::native_fg_submitted_frames.load();
+        const auto callbacks = native::present_frames_seen.load();
+        if (deferred) {
+          output.present_face = &outer;
+          event();
+          const auto& pending = native::native_deferred_present;
+          std::cout << "PRESENT_EVERY_RAW_WAIT epoch=" << epoch << ',' << stream.base_frame_epoch
+                    << " claims=" << before.base_claims << ',' << clock.claims
+                    << " outputs=" << before.base_outputs << ',' << clock.outputs
+                    << " calls=" << model_calls - before.calls << " pending=" << (pending.identity == identity) << std::endl;
+          expect(pending.identity == identity && pending.swapchain == &output && pending.queue == &output.queue
+                     && pending.route_id == stream.native_route_id && epoch == stream.base_frame_epoch
+                     && stats() == before && trace::PresentClockState(clock) == prior_clock,
+                 "outer-first", "outer OnPresent waits without consuming the base or changing its history");
+        }
+        {
+          const options::internal::PresentDecisionScope decision(output.swapchain.Get(), 0);
+          const auto& input = native::native_sdk_present_input;
+          Check(input.identity == identity && input.decision_id != 0, "production SDK_BEGIN identifies this decision");
+          if (marker != nullptr) {
+            // Stand in for the same-decision enhanced input from RestoreNativePreFg.
+            native::native_sdk_present_input = {.identity = input.identity, .decision_id = input.decision_id,
+                .owner = &stream, .route_id = stream.native_route_id, .backbuffer = back(),
+                .marker = marker, .serial = input.decision_id};
+          }
+          decision.Publish(S_FALSE, false);
+        }
+        if (deferred) {
+          finish();
+        } else {
+          expect(native::native_passthrough_identity == identity && stats() == before
+                     && trace::PresentClockState(clock) == prior_clock && stream.base_frame_epoch == epoch,
+                 "sdk-first", "SDK_FORWARD only grants routing before the real OnPresent callback");
+          event();
+        }
+        expect(native::native_passthrough_identity == nullptr && native::native_deferred_present.identity == nullptr
+                   && native::present_frames_seen.load() == callbacks + 1
+                   && native::native_fg_submitted_frames.load() == fg_submissions,
+               deferred ? "outer-first" : "sdk-first", "one application callback consumes the route without inventing FG submission");
+        output.present_face = nullptr;
+      };
+      const auto trusted = [&](const char* scenario, Route route, int expected_reset, bool game_reset = false) {
+        const auto before = stats();
+        const auto epoch = stream.base_frame_epoch;
+        const auto sequence = native::features.at(sr_handle).sr_sequence;
+        const auto history_resets = native::present_history_resets.load();
+        const auto queue_entries = native::queue_submit_entries.load();
+        record(game_reset);
+        submit();
+        Check(native::queue_submit_entries.load() == queue_entries + 1, "raw Present producer submits one real SR-to-BB list");
+        if (route == Route::ORDINARY) {
+          event();
+        } else {
+          forward(route);
+        }
+        const auto after = stats();
+        const auto& source = native::features.at(sr_handle);
+        const int reset = (after.calls != before.calls ? model_resets.back() : -1);
+        const auto pixels = read_back();
+        std::cout << "PRESENT_EVERY_RAW " << scenario << " source_sequence=" << source.sr_sequence
+                  << " claimed_sequence=" << clock.frame.sequence << " epoch=" << epoch << ',' << stream.base_frame_epoch
+                  << " claims=" << before.base_claims << ',' << after.base_claims
+                  << " base_outputs=" << before.base_outputs << ',' << after.base_outputs
+                  << " outputs=" << before.outputs << ',' << after.outputs << " complete=" << after.base_complete
+                  << " calls=" << after.calls - before.calls << " reset=" << reset << " expected_reset=" << expected_reset
+                  << " reset_epoch=" << before.reset_epoch << ',' << after.reset_epoch
+                  << " history_unbound=" << stream.base_history_unbound
+                  << " history_resets=" << native::present_history_resets.load() - history_resets << " rgba_crc32="
+                  << renodx::utils::hash::ComputeCRC32(reinterpret_cast<const uint8_t*>(pixels.data()), pixels.size() * sizeof(Pixel))
+                  << std::endl;
+        expect(epoch != 0 && stream.base_frame_epoch == epoch && clock.frame.output_epoch == epoch
+                   && source.sr_sequence == sequence + 1 && clock.frame.sequence == source.sr_sequence
+                   && clock.frame.source == reinterpret_cast<uintptr_t>(sr_handle)
+                   && clock.frame.generation == source.source_generation && clock.frame.kind == native::present_frame_policy::SourceKind::SR
+                   && clock.frame.pass_count == 1 && clock.frame.roles == 1 && !clock.frame.reuse_edits
+                   && after.base_claims == before.base_claims + 1 && after.base_outputs == before.base_outputs + 1
+                   && after.base_complete && !stream.base_history_unbound,
+               scenario, "current ordered SR source publishes one complete Every present base in its existing epoch");
+        expect(after.calls == before.calls + 1 && reset == expected_reset && after.outputs == before.outputs + 1
+                   && after.consumed_serial > before.consumed_serial && after.ring_submissions == before.ring_submissions + 1
+                   && native::PresentRingComplete() && after.reset_epoch == before.reset_epoch + static_cast<uint64_t>(game_reset)
+                   && native::present_frames == 0
+                   && (expected_reset != 0 || native::present_history_resets.load() == history_resets)
+                   && after.refreshes == before.refreshes && after.reuses == before.reuses,
+               scenario, "one model Evaluate and completed submission preserve the requested Reset and Every present strategy");
+        alpha_preserved(pixels);
+        expect(pixels != std::vector(size * size, game_pixel), scenario, "complete GPU readback contains an actual color edit");
+        swap();
+        return pixels;
+      };
+      for (const auto route : {Route::SDK_FIRST, Route::OUTER_FIRST}) {
+        // Keep both failure witnesses runnable when the baseline discarded the prior epoch.
+        if (stream.base_frame_epoch == 0) event();
+        const auto ordinary = trusted("ordinary-warm", Route::ORDINARY, 1, true);
+        const char* scenario = (route == Route::SDK_FIRST ? "sdk-first" : "outer-first");
+        for (int frame = 0; frame < 2; ++frame) {
+          expect(trusted(scenario, route, 0) == ordinary, scenario, "GPU readback matches all ordinary RGBA pixels");
+        }
+        expect(trusted("ordinary-return", Route::ORDINARY, 0) == ordinary, scenario,
+               "switching back to ordinary processing preserves the same source history and RGBA");
+      }
+
+      const auto before_unknown = stats();
+      const auto before_unknown_frame = clock.frame;
+      evaluate_sr(false, true);
+      upload(back(), OVERWRITE_PIXEL, PRESENT);
+      submit();
+      forward(Route::SDK_FIRST);
+      const auto unknown = stats();
+      std::cout << "PRESENT_EVERY_RAW unknown-source epoch=" << stream.base_frame_epoch
+                << " claims=" << before_unknown.base_claims << ',' << unknown.base_claims
+                << " base_outputs=" << before_unknown.base_outputs << ',' << unknown.base_outputs
+                << " complete=" << unknown.base_complete << " calls=" << unknown.calls - before_unknown.calls << std::endl;
+      expect(unknown.base_claims == before_unknown.base_claims && unknown.base_outputs == before_unknown.base_outputs
+                 && !unknown.base_complete && clock.frame.sequence == before_unknown_frame.sequence
+                 && stream.base_frame_epoch == before_unknown_frame.output_epoch,
+             "unknown-source", "SDK_FORWARD cannot identify an independent BB write as the current SR base");
+      read_back();
+      swap();
+      trusted("after-unknown", Route::SDK_FIRST, 1);
+
+      const auto enhanced = gpu.Texture(size, size, FORMAT, PRESENT);
+      for (const bool ordered : {true, false}) {
+        const auto epoch = stream.base_frame_epoch;
+        record();
+        if (!ordered) {
+          submit();
+          reopen();
+        } else {
+          upload(enhanced.Get(), OVERWRITE_PIXEL, PRESENT);
+        }
+        native::fg_service::CopyColor(gpu.list.Get(), back(), PRESENT, enhanced.Get(), PRESENT);
+        if (ordered) {
+          submit();
+        } else {
+          Check(SUCCEEDED(gpu.list->Close()), "close the enhanced recording without executing it");
+        }
+        std::vector<std::pair<addon::FenceRef, uint64_t>> receipts;
+        const auto proof = addon::submission::UseSubmissionTokens(enhanced.Get(), &receipts);
+        Check(ordered ? proof == addon::submission::UseSubmission::kTokens && receipts.size() == 1
+                            && receipts.front().first->GetCompletedValue() >= receipts.front().second
+                      : proof == addon::submission::UseSubmission::kUnsubmitted,
+              "enhanced SDK input has a real copy receipt only when the copy was actually submitted");
+        const auto before_enhanced = stats();
+        const auto decline = (ordered ? addon::NrDeclineReason::kPresentPreFg : addon::NrDeclineReason::kPresentBusy);
+        const auto& declines = addon::nr_decline_counts[static_cast<size_t>(decline)];
+        const auto prior_declines = declines.load();
+        forward(Route::SDK_FIRST, enhanced.Get());
+        const auto after = stats();
+        const char* scenario = (ordered ? "enhanced-ordered" : "enhanced-unsubmitted");
+        std::cout << "PRESENT_EVERY_RAW " << scenario << " token_count=" << receipts.size()
+                  << " epoch=" << epoch << ',' << stream.base_frame_epoch << " complete=" << after.base_complete
+                  << " calls=" << after.calls - before_enhanced.calls << " claims=" << before_enhanced.base_claims << ','
+                  << after.base_claims << " base_outputs=" << before_enhanced.base_outputs << ',' << after.base_outputs
+                  << " decline=" << declines.load() - prior_declines << std::endl;
+        expect(after.calls == before_enhanced.calls && after.ring_submissions == before_enhanced.ring_submissions
+                   && after.outputs == before_enhanced.outputs && after.base_claims == before_enhanced.base_claims
+                   && after.base_outputs == before_enhanced.base_outputs && declines.load() == prior_declines + 1,
+               scenario, "the same SDK decision checks delivery and skips a second NR evaluation");
+        expect(epoch != 0 && stream.base_frame_epoch == epoch && !after.base_complete,
+               scenario, "enhanced input clears the base product while keeping the BB observation epoch active");
+        // Readback recycles the game list, discarding the unsubmitted copy.
+        unchanged_pixels(read_back(), ordered ? OVERWRITE_PIXEL : GAME_PIXEL);
+        swap();
+        trusted(ordered ? "after-enhanced-ordered" : "after-enhanced-unsubmitted", Route::OUTER_FIRST, 1);
+      }
+      trusted("after-enhanced-steady", Route::OUTER_FIRST, 0);
+      Check(raw_contracts_passed, "Every present raw SDK_FORWARD contracts (see PRESENT_EVERY_RAW witnesses)");
+    }
+
     load_present_mode("1");
     const auto before_unproven = stats();
     evaluate_sr(false, true);
