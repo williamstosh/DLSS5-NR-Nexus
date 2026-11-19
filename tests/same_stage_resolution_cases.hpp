@@ -553,6 +553,7 @@ int Run(bool hardware, bool model_pair_only = false, bool render_stage = false) 
             }
             uint32_t declined_width = 0, declined_height = 0;
             Check(!native::ComputeNrGroupWorkingResolution(
+                      addon::stage_plan::Build({.pass_count = 3}),
                       {.stage = addon::stage_plan::Stage::UPSCALED, .begin = 0, .count = 3},
                       16, 16, 8, 8, &declined_width, &declined_height)
                       && native::stage_telemetry[1].resolution_blocked,

@@ -441,7 +441,8 @@ int main() {
         const auto saved = capability_input;
         queried = capability::Query(capability_input);
         const bool supported = runtime == capability::Runtime::AVAILABLE
-            && ((api == capability::Api::DX12 && backend == capability::Backend::NATIVE)
+            && ((api == capability::Api::DX12 && (backend == capability::Backend::NATIVE
+                    || backend == capability::Backend::STREAMLINE_FALLBACK))
                 || (api == capability::Api::DX11 && backend == capability::Backend::DX11_BRIDGE));
         check(queried.CanSubmit() == supported, "unknown/unavailable/mismatched backend cannot admit new independent modes");
         check(capability_input.api == saved.api && capability_input.backend == saved.backend

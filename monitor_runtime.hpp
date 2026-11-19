@@ -587,7 +587,8 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
       MonitorEditReuseResult observed;
       auto* const runtime = monitor_runtime.load();
       if (enabled.load() && runtime != nullptr && plan.valid && plan.group_count == 1
-          && runtime->get_device()->get_api() == reshade::api::device_api::d3d12
+          && (runtime->get_device()->get_api() == reshade::api::device_api::d3d12
+              || runtime->get_device()->get_api() == reshade::api::device_api::d3d11)
           && runtime->get_back_buffer_count() != 0) {
         const auto stage = plan.groups[0].stage;
         auto* const api_device = runtime->get_device();
@@ -641,7 +642,7 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
             if (last_source_plan.source_released || latest == features.end() || &latest->second != selected
                 || selected->source_generation != last_source_plan.source_generation
                 || std::ranges::any_of(live_effect_runtimes, [&](auto* other) {
-                     return other != runtime && other->get_device()->get_api() == reshade::api::device_api::d3d12
+                     return other != runtime && other->get_device()->get_api() == api_device->get_api()
                          && device == renodx::utils::directx::NativeIdentity(
                              reinterpret_cast<IUnknown*>(other->get_device()->get_native()));
                    })) selected = nullptr;

@@ -1445,6 +1445,7 @@ inline bool RunBridge(ID3D11DeviceContext* context,
   bool adaptive_bridge = false;
   bool ordinary_delivery_failed = false;
   NrRecording bridge_recording;
+  EditReuseMonitorFrame monitor_frame;
 #if defined(NR_NEXUS_DEV_CONTROL)
   uint64_t inline_restore_submission = 0;
   bool inline_restore_submitted = false;
@@ -1553,6 +1554,15 @@ inline bool RunBridge(ID3D11DeviceContext* context,
     const BridgeDeviceLock device_lock(context);
     const ngx_serial::Call ngx_turn;
     RuntimeLock lock(runtime_mutex);
+    if (ordered_sr != nullptr && !pre && present == nullptr && !plan.mixed
+        && edit_reuse_enabled.load() && monitor_requested.load()) {
+      if (const auto source = features.find(handle);
+          source != features.end() && source->second.source_generation == ordered_sr->generation
+          && source->second.sr_sequence == ordered_sr->sequence) {
+        monitor_frame = ObserveEditReuseMonitorFrame(source->second, source->second.source_device11_identity.Get(),
+            stage_plan::Stage::UPSCALED, output_desc.Width, output_desc.Height);
+      }
+    }
     if (native != bridge.context_native) {
       decline(NrDeclineReason::kBridgeDown,
               bridge.context_native == nullptr
@@ -2046,6 +2056,23 @@ inline bool RunBridge(ID3D11DeviceContext* context,
       cpu.return_ns += SteadyNowNs() - cpu_start;
     }
   });
+  if (monitor_frame.device != nullptr) {
+    const BridgeDeviceLock device_lock(context);
+    RuntimeLock lock(runtime_mutex);
+    if (auto source = features.find(handle); source != features.end()) {
+      // Only the adapter knows whether done was followed by the D3D11 handoff.
+      monitor_frame.delivery = (delivered ? bridge_recording.edit_monitor_delivery : EditReuseDelivery::NONE);
+      monitor_frame.reason = bridge_recording.edit_monitor_reason;
+      if (bridge_recording.edit_monitor_reset_epoch != 0) {
+        monitor_frame.reset_epoch = bridge_recording.edit_monitor_reset_epoch;
+      }
+      if (!delivered && monitor_frame.reason == EditReuseBlock::NONE) {
+        monitor_frame.reason = EditReuseBlock::ORDER;
+      }
+      monitor_frame.handed_off = delivered;
+      PublishEditReuseMonitorFrame(&source->second, nullptr, std::move(monitor_frame));
+    }
+  }
 #if defined(NR_NEXUS_DEV_CONTROL)
   screenshot::SealInlineRestoreBridge(bridge_recording.inline_restore_serial,
       completed && bridge_recording.output_ready && bridge_recording.group_complete
@@ -2139,6 +2166,18 @@ inline NVSDK_NGX_Result Ngx11Evaluate(int slot, const char* entry,
       }
     }
     const NVSDK_NGX_Result result = real();
+    if (NVSDK_NGX_FAILED(result) && ordered_sr && sr_attempt.sequence != 0
+        && edit_reuse_enabled.load() && monitor_requested.load()) {
+      RuntimeLock lock(runtime_mutex);
+      if (auto source = features.find(handle); source != features.end()
+          && source->second.source_generation == sr_attempt.generation
+          && source->second.sr_sequence == sr_attempt.sequence) {
+        auto observed = ObserveEditReuseMonitorFrame(source->second, source->second.source_device11_identity.Get(),
+            stage_plan::Stage::UPSCALED, source->second.declared_output_width, source->second.declared_output_height);
+        observed.reason = EditReuseBlock::SR_FAILED;
+        PublishEditReuseMonitorFrame(&source->second, nullptr, std::move(observed));
+      }
+    }
     if (!ordered_sr || !sr_section->OwnsSection() || sr_attempt.sequence == 0 || NVSDK_NGX_FAILED(result)) {
       sr_section.reset();
     }

@@ -218,7 +218,6 @@ for (const bool bridge : {false, true}) {
   };
   const auto bridge_plan = observe(bridge_source);
   Check(bridge_plan.valid && bridge_plan.mixed && runtime::CurrentExecutionApi() == cap::Api::DX11
-            && runtime::CurrentExecutionBackend(cap::Api::DX11) == cap::Backend::DX11_BRIDGE
             && runtime::QueryConfigurationCapability(mixed_request).CanSubmit(),
         "The registered D3D11 source drives the same native Bridge plan in execution and configuration.");
 
@@ -227,7 +226,6 @@ for (const bool bridge : {false, true}) {
   const auto foreign = runtime::QueryConfigurationCapability(mixed_request);
   Check(runtime::D3D11OnlySession() && foreign_plan.valid && foreign_plan.mixed
             && runtime::CurrentExecutionApi() == cap::Api::DX12
-            && runtime::CurrentExecutionBackend(cap::Api::DX12) == cap::Backend::NATIVE
             && foreign.CanSubmit() && foreign.group_count == foreign_plan.group_count,
         "A registered D3D12 source keeps native execution and configuration eligibility on the D3D11 swapchain.");
   {
@@ -312,27 +310,111 @@ reject_unchanged(rr);
 observe_capability_source(false);
 
 runtime::d3d12_swapchain_seen = false;
-runtime::vulkan_present_seen = true;
-auto vk = pair;
-const auto vk_result = runtime::QueryConfigurationCapability(vk);
-Check(!vk_result.CanSubmit() && vk_result.configuration.reason == cap::Reason::INDEPENDENT_MODE_UNSUPPORTED,
-      "Vulkan rejects explicit independent resolution modes.");
-reject_unchanged(vk);
-vk["NRPass2ResolutionMode"] = 0u;
-vk["NRResolutionScale"] = 1.f;
-vk["NRFollowInputRes"] = false;
-Check(runtime::QueryConfigurationCapability(vk).CanSubmit(), "Vulkan inherited same-stage sizes remain eligible.");
-auto vk_scaled = vk;
-vk_scaled["NRResolutionScale"] = .67f;
-Check(!runtime::QueryConfigurationCapability(vk_scaled).CanSubmit(), "Vulkan cannot accept a base working size the executor does not consume.");
-reject_unchanged(vk_scaled);
-const Json unavailable_present{{"NRHookPoint", 2u}, {"NRIntensity", .375f}};
-const auto unavailable_rows = adapter::Preview({.scope = presets::Scope::FULL, .settings = unavailable_present}, true);
-Check(std::any_of(unavailable_rows.begin(), unavailable_rows.end(), [](const auto& row) {
-        return row.key == "NRHookPoint" && std::string_view(row.status) == "Unsupported";
-      }), "Vulkan explicit Present request is visibly unsupported in production preview.");
-reject_unchanged(unavailable_present);
-runtime::vulkan_present_seen = false;
+{
+  namespace vk = runtime::vk;
+  std::cout << "capability-ui: CPU + MOCK Vulkan configuration facts consumer\n";
+  const auto saved_vulkan_runtime = vk::runtime;
+  const auto saved_vulkan_facts = vk::configuration_facts;
+  const auto saved_direct_load_state = runtime::direct_load_state;
+  const auto saved_source_api = runtime::stage_source_api.exchange(cap::Api::VULKAN);
+  const bool saved_vulkan_present = runtime::vulkan_present_seen.exchange(true);
+  runtime::direct_load_state = runtime::DirectLoadState::Ready;
+  const bool saved_adaptive_enabled = runtime::nr_adaptive_enabled.exchange(true);
+  const auto adaptive_history = runtime::history_reset_epoch.load();
+  Check(runtime::CopyAdaptiveStatus().reason == renodx::addons::dlss5::adaptive_resolution::Reason::UNSUPPORTED
+            && runtime::nr_adaptive_enabled.load() && runtime::history_reset_epoch.load() == adaptive_history,
+        "Vulkan reports unsupported automatic sizing without changing the saved request or NR History.");
+  runtime::nr_adaptive_enabled = saved_adaptive_enabled;
+  vk::runtime = {.failed = true};
+  vk::configuration_facts = {};
+
+  auto inherited = pair;
+  inherited["NRPass2ResolutionMode"] = 0u;
+  const auto failed_init = runtime::QueryConfigurationCapability(inherited);
+  Check(failed_init.configuration.status == cap::Status::UNAVAILABLE
+            && failed_init.configuration.reason == cap::Reason::RUNTIME_UNAVAILABLE,
+        "Vulkan init failure is unavailable even with the D3D runtime ready.");
+
+  vk::runtime = {.device = reinterpret_cast<VkDevice>(uintptr_t{0xCA9104})};
+  vk::configuration_facts = {
+      .source = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xCA9105}),
+      .source_generation = 1,
+      .ray_reconstruction = true,
+      .geometry = {.reference_width = 2560, .reference_height = 1440},
+      .group = {.stage = plan::Stage::UPSCALED, .begin = 0, .count = 2},
+      .recorded_passes = 2};
+  const auto recorded = runtime::QueryConfigurationCapability(inherited);
+  Check(recorded.CanSubmit() && !recorded.execution_proven
+            && recorded.working_sizes[0] == cap::Size{2560, 1440}
+            && recorded.working_sizes[1] == cap::Size{2560, 1440},
+        "Vulkan Full inherited configuration uses the recorded output size for both passes.");
+
+  const auto independent = runtime::QueryConfigurationCapability(pair);
+  Check(!independent.CanSubmit() && independent.configuration.reason == cap::Reason::INDEPENDENT_MODE_UNSUPPORTED,
+        "Vulkan rejects explicit independent resolution modes.");
+  reject_unchanged(pair);
+  auto scaled = inherited;
+  scaled["NRResolutionScale"] = .67f;
+  const auto scaled_result = runtime::QueryConfigurationCapability(scaled);
+  Check(!scaled_result.CanSubmit() && scaled_result.configuration.reason == cap::Reason::INDEPENDENT_MODE_UNSUPPORTED,
+        "Vulkan rejects a base working size the executor does not consume.");
+  reject_unchanged(scaled);
+  auto render = inherited;
+  render["NRHookPoint"] = 1u;
+  const auto render_result = runtime::QueryConfigurationCapability(render);
+  Check(render_result.CanSubmit() && render_result.plan_reason == plan::Reason::RR_AFTER
+            && render_result.working_sizes[0] == cap::Size{2560, 1440},
+        "Vulkan RR configuration describes its existing effective Upscaled fallback.");
+  vk::configuration_facts.ray_reconstruction = false;
+  const auto unavailable_render = runtime::QueryConfigurationCapability(render);
+  Check(!unavailable_render.CanSubmit() && unavailable_render.configuration.reason == cap::Reason::BACKEND_UNSUPPORTED,
+        "Vulkan DLSS still cannot submit an unimplemented Render operation.");
+  vk::configuration_facts.ray_reconstruction = true;
+  auto present = inherited;
+  present["NRHookPoint"] = 2u;
+  const auto present_result = runtime::QueryConfigurationCapability(present);
+  const auto present_rows = adapter::Preview({.scope = presets::Scope::FULL, .settings = present}, true);
+  Check(present_result.CanSubmit() && present_result.plan_reason == plan::Reason::PRESENT_AFTER
+            && std::any_of(present_rows.begin(), present_rows.end(), [](const auto& row) {
+                 return row.key == "NRHookPoint" && std::string_view(row.status) != "Unsupported";
+               }), "Vulkan preview retains a Present request with its existing effective Upscaled fallback.");
+
+  vk::configuration_facts.recorded_passes = 0;
+  const auto unrecorded = runtime::QueryConfigurationCapability(inherited);
+  Check(unrecorded.CanSubmit() && unrecorded.working_sizes[0] == cap::Size{} && unrecorded.working_sizes[1] == cap::Size{},
+        "Vulkan geometry without a recorded pass leaves both working sizes unknown.");
+  vk::configuration_facts = {};
+  const auto released = runtime::QueryConfigurationCapability(inherited);
+  const auto released_render = runtime::QueryConfigurationCapability(render);
+  Check(released.CanSubmit() && released.working_sizes[0] == cap::Size{} && released.working_sizes[1] == cap::Size{}
+            && released_render.configuration.status == cap::Status::UNSUPPORTED
+            && released_render.configuration.reason == cap::Reason::BACKEND_UNSUPPORTED,
+        "Cleared Vulkan facts leave working sizes and the source unknown despite the earlier D3D observation.");
+
+  vk::configuration_facts = saved_vulkan_facts;
+  vk::runtime = saved_vulkan_runtime;
+  runtime::direct_load_state = saved_direct_load_state;
+  const auto* restored_source = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xCA9106});
+  renodx::addons::dlss5::bridge::OwnedParameters restored_parameters;
+  {
+    renodx::addons::dlss5::RuntimeLock lock(runtime::runtime_mutex);
+    runtime::RegisterCreatedFeatureLocked(restored_source, runtime::kFeatureDlss, &restored_parameters);
+    runtime::EvaluationStagePlan(restored_source);
+  }
+  const auto restored_present = runtime::QueryConfigurationCapability(present);
+  const auto restored_rows = adapter::Preview({.scope = presets::Scope::FULL, .settings = present}, true);
+  Check(restored_present.CanSubmit() && restored_present.plan_reason == plan::Reason::NONE
+            && std::any_of(restored_rows.begin(), restored_rows.end(), [](const auto& row) {
+                 return row.key == "NRHookPoint" && std::string_view(row.status) != "Unsupported";
+               }), "The current DX12 source restores Present capability and preview despite an earlier Vulkan presentation.");
+  {
+    renodx::addons::dlss5::RuntimeLock lock(runtime::runtime_mutex);
+    runtime::ForgetSourceHandleLocked(restored_source);
+  }
+  runtime::vulkan_present_seen = saved_vulkan_present;
+  observe_capability_source(false);
+  runtime::stage_source_api = saved_source_api;
+}
 
 // Loading and inspecting unsupported old saved requests must not normalize them.
 Check(WritePrivateProfileStringA("RenoDX.DLSS5", "NRHookPoint", "2", ini_path.c_str()) != 0,

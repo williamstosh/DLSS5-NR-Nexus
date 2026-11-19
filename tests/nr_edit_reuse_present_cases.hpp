@@ -17,6 +17,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -706,7 +707,10 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
           const auto frame_clock = trace::PresentClockState(clock);
           event();
           ++repeated_callbacks;
-          Check(stream.base_frame_attempt == callback + 1 && stats() == after && trace::PresentClockState(clock) == frame_clock,
+          const auto repeated = stats();
+          Check(repeated.calls == after.calls,
+                ("duplicate OnPresent added " + std::to_string(repeated.calls - after.calls) + " model Evaluate call(s)").c_str());
+          Check(stream.base_frame_attempt == callback + 1 && repeated == after && trace::PresentClockState(clock) == frame_clock,
                 "duplicate OnPresent arrived on the unchanged ordered BB and changed neither history nor submission");
         }
         auto pixels = read_back();
@@ -1280,6 +1284,111 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     }
 
     {
+      // Both SR views are successful on the same queue, but only A supplies the BB.
+      const auto view_a = std::tuple{color, motion, depth, sr_output, base, sr_handle};
+      create_source();
+      auto [view_b_color, view_b_motion, view_b_depth, view_b_output, view_b_parameters, view_b_handle] =
+          std::tuple{color, motion, depth, sr_output, base, sr_handle};
+      std::tie(color, motion, depth, sr_output, base, sr_handle) = view_a;
+      constexpr std::array<float, 2> motion_a{0.f, 0.f};
+      constexpr std::array<float, 2> motion_b{2.f, -3.f};
+      constexpr float depth_a = .5f;
+      constexpr float depth_b = .75f;
+      upload(view_b_motion.Get(), motion_b, NATIVE_INPUT_STATE);
+      upload(view_b_depth.Get(), depth_b, NATIVE_INPUT_STATE);
+      view_b_parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, jitter_x);
+      view_b_parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, jitter_y);
+
+      const auto& stream = native::present_streams.at(&output);
+      const auto& clock = stream.base_frame_clock;
+      for (const bool proven : {true, false, true}) {
+        const auto before = stats();
+        const auto previous = clock.frame;
+        if (proven) {
+          record();
+        } else {
+          evaluate_sr(false, true);
+          upload(back(), OVERWRITE_PIXEL, PRESENT);
+        }
+        Check(NVSDK_NGX_SUCCEED(native::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), view_b_handle,
+                  &view_b_parameters, nullptr)),
+              "second SR view produces its own guides via the wrapped Evaluate");
+        submit();
+        const auto latest_capture = [](const NVSDK_NGX_Handle* source) {
+          const native::PresentGuideSet* guide = nullptr;
+          for (const auto& candidate : native::present_guide_sets) {
+            if (candidate.source_handle == source && (guide == nullptr || candidate.serial > guide->serial)) {
+              guide = &candidate;
+            }
+          }
+          return guide;
+        };
+        const auto* capture_a = latest_capture(sr_handle);
+        const auto* capture_b = latest_capture(view_b_handle);
+        Check(capture_a != nullptr && capture_b != nullptr && capture_a->serial > 0 && capture_b->serial > capture_a->serial
+                  && capture_a->device_identity == capture_b->device_identity
+                  && capture_a->output_width == capture_b->output_width && capture_a->output_height == capture_b->output_height
+                  && capture_b->base_frame.backbuffer == nullptr && capture_a->base_frame.sealed == proven,
+              "newer compatible view B has no SR-to-BB copy and only the ordered A capture can prove this BB");
+
+        stages::Snapshot model_motion, model_depth;
+        const auto* expected = (proven ? capture_a : capture_b);
+        bool expected_inputs = false;
+        model_parameter_observer = [&](const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter* block) {
+          auto* const mv = native::GetD3D12Resource(block, "DLSSNR.MVec");
+          auto* const z = native::GetD3D12Resource(block, "DLSSNR.Depth");
+          expected_inputs = mv == expected->motion && z == expected->depth;
+          if (mv != nullptr && z != nullptr) {
+            model_motion = stages::Capture(gpu, mv, NATIVE_INPUT_STATE);
+            model_depth = stages::Capture(gpu, z, NATIVE_INPUT_STATE);
+          }
+        };
+        event();
+        model_parameter_observer = {};
+        const auto after = stats();
+        const auto all_pixels = [](const stages::Snapshot& snapshot, const auto& pixel) {
+          if (snapshot.readback == nullptr || snapshot.pixel_bytes != sizeof(pixel)) return false;
+          const auto pixels = snapshot.Pixels();
+          for (size_t offset = 0; offset < pixels.size(); offset += sizeof(pixel)) {
+            if (std::memcmp(pixels.data() + offset, &pixel, sizeof(pixel)) != 0) return false;
+          }
+          return !pixels.empty();
+        };
+        const bool motion_matches = all_pixels(model_motion, proven ? motion_a : motion_b);
+        const bool depth_matches = all_pixels(model_depth, proven ? depth_a : depth_b);
+        std::cout << "PRESENT_SOURCE_VIEWS proven=" << proven << " serial_a=" << capture_a->serial
+                  << " serial_b=" << capture_b->serial << " consumed=" << after.consumed_serial
+                  << " motion_match=" << motion_matches << " depth_match=" << depth_matches
+                  << " claims=" << after.base_claims - before.base_claims
+                  << " base_outputs=" << after.base_outputs - before.base_outputs << std::endl;
+        Check(after.calls == before.calls + 1 && after.outputs == before.outputs + 1
+                  && after.ring_submissions == before.ring_submissions + 1 && native::PresentRingComplete(),
+              "two-view Every present records one model call and completes one real GPU submission");
+        Check(expected_inputs && motion_matches && depth_matches && after.consumed_serial == expected->serial,
+              "two-view Every present model must read MV and depth from the SR view that supplies its proven BB");
+        if (proven) {
+          const auto& source = native::features.at(sr_handle);
+          Check(after.base_claims == before.base_claims + 1 && after.base_outputs == before.base_outputs + 1
+                    && after.base_complete && !stream.base_history_unbound && !clock.frame.reuse_edits
+                    && clock.frame.source == reinterpret_cast<uintptr_t>(sr_handle)
+                    && clock.frame.generation == source.source_generation && clock.frame.sequence == source.sr_sequence,
+                "the actual A group owns the complete Every present product");
+          if (!before.base_complete) {
+            Check(model_resets.back() == 1, "the next proven A product resets after unbound Every present execution");
+          }
+        } else {
+          Check(after.base_claims == before.base_claims && after.base_outputs == before.base_outputs
+                    && !after.base_complete && stream.base_history_unbound && clock.frame.sequence == previous.sequence,
+                "legacy Every present can use B guides without claiming the unproven BB as a base frame");
+        }
+        reopen();
+        swap();
+      }
+      Check(NVSDK_NGX_SUCCEED(native::HookedReleaseFeatureSlot<0>(view_b_handle)), "release the second wrapped SR view");
+    }
+
+
+    {
       ComPtr<ID3D12CommandAllocator> writer_allocator;
       ComPtr<ID3D12GraphicsCommandList> writer;
       Check(SUCCEEDED(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&writer_allocator)))
@@ -1301,6 +1410,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
       const auto before_race = stats();
       const auto& stream = native::present_streams.at(&output);
       const auto& clock = stream.base_frame_clock;
+      const auto previous_frame = clock.frame;
       const auto source_sequence = native::features.at(sr_handle).sr_sequence;
       const auto order = native::present_queue_order.load();
       Check(order != nullptr && order->queue == gpu.queue.Get() && native::present_frames == 0,
@@ -1315,13 +1425,11 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
         const std::unique_ptr<int, decltype(clear_observer)> observer_cleanup(&observer_key, clear_observer);
         model_parameter_observer = [&](const NVSDK_NGX_Handle* model, const NVSDK_NGX_Parameter*) {
           Check(observed_gates++ == 0 && model == native::features.at(stream.Handle()).slots[0].handle
-                    && clock.claims == before_race.base_claims + 1 && clock.outputs == before_race.base_outputs
-                    && !clock.complete && clock.frame.source == reinterpret_cast<uintptr_t>(sr_handle)
-                    && clock.frame.generation == native::features.at(sr_handle).source_generation
-                    && clock.frame.sequence == source_sequence && clock.frame.output_epoch == stream.base_frame_epoch
-                    && !clock.frame.reuse_edits && stream.nr_presents == before_race.outputs
+                    && clock.claims == before_race.base_claims && clock.outputs == before_race.base_outputs
+                    && !clock.complete && clock.frame.sequence == previous_frame.sequence
+                    && stream.nr_presents == before_race.outputs
                     && native::present_ring.submitted == before_race.ring_submissions,
-                "Every present has identified the real SR frame before its model call and private submission");
+                "Every present leaves base claims unchanged until the identified SR group is delivered");
           const auto guides = std::ranges::find_if(native::present_guide_sets, [&](const auto& candidate) {
             return candidate.source_handle == sr_handle && candidate.base_frame.sequence == source_sequence
                 && candidate.base_frame.backbuffer == renodx::utils::directx::NativeIdentity(current_buffer);
@@ -1352,13 +1460,13 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
 
       const auto raced = stats();
       const auto raced_reset = model_resets.back();
-      Check(raced.base_claims == before_race.base_claims + 1 && raced.base_outputs == before_race.base_outputs
-                && !raced.base_complete && clock.frame.sequence == source_sequence
+      Check(raced.base_claims == before_race.base_claims && raced.base_outputs == before_race.base_outputs
+                && !raced.base_complete && stream.base_history_unbound && clock.frame.sequence == previous_frame.sequence
                 && raced.calls == before_race.calls + 1 && raced_reset == 0 && raced.outputs == before_race.outputs + 1
                 && raced.ring_submissions == before_race.ring_submissions + 1
                 && raced.refreshes == before_race.refreshes && raced.reuses == before_race.reuses
                 && native::queue_submit_entries.load() == submit_entries + 2 && native::present_frames == 0,
-            "late BB writer prevents complete/base-output publication while Every present still evaluates and submits once");
+            "late BB writer prevents base claim and publication while Every present still evaluates and submits once");
       const auto all_pixels = [&](const stages::Snapshot& snapshot, Pixel expected) {
         const auto bytes = snapshot.Pixels();
         const std::vector pixels(size * size, expected);
@@ -1388,7 +1496,8 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
       alpha_preserved(read_back());
       swap();
       std::cout << "PRESENT_EVERY_ORDER_RACE producer_entry=" << producer_entry
-                << " writer_entry=" << producer_entry + 1 << " claimed_sequence=" << source_sequence
+                << " writer_entry=" << producer_entry + 1 << " candidate_sequence=" << source_sequence
+                << " claims=" << raced.base_claims - before_race.base_claims
                 << " calls=" << raced.calls - before_race.calls << " reset=" << raced_reset
                 << " outputs=" << raced.base_outputs - before_race.base_outputs
                 << " complete=" << raced.base_complete << " recovery_outputs=" << recovered.base_outputs - raced.base_outputs
@@ -1734,6 +1843,71 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     Check(stats().base_outputs == before_ini_recovery.base_outputs + 1 && model_calls == before_ini_recovery.calls + 1
               && model_resets.back() == 1,
           "explicit one recovers when the next producer copies its successful SR output to the current BB");
+
+    read_back();
+    swap();
+
+    {
+      funnel_accounting_tests::Restore source_restore;
+      source_restore.Value(&native::real_streamline_free[0]);
+      load_present_mode("0");
+      native::StreamlineCapture capture{.viewport = 73, .has_viewport = true, .has_constants = true,
+          .hdr = true, .has_options = true, .motion_scale_x = 1.f / size, .motion_scale_y = 1.f / size};
+      capture.color.resource = color.Get();
+      capture.color.state = NATIVE_INPUT_STATE;
+      capture.output.resource = sr_output.Get();
+      capture.output.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      capture.motion.resource = motion.Get();
+      capture.motion.state = NATIVE_INPUT_STATE;
+      capture.depth.resource = depth.Get();
+      capture.depth.state = NATIVE_INPUT_STATE;
+      const auto before = stats();
+      bool delivered = false;
+      for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8 && !delivered; ++attempt) {
+        upload(color.Get(), GAME_PIXEL, NATIVE_INPUT_STATE);
+        upload(sr_output.Get(), GAME_PIXEL, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        upload(back(), GAME_PIXEL, PRESENT);
+        const auto calls = model_calls;
+        const auto captures = native::present_captures.load();
+        {
+          const addon::RuntimeLock lock(native::runtime_mutex);
+          Check(!native::ProcessStreamlineInline(gpu.list.Get(), sl::kFeatureDLSS, capture)
+                    && model_calls == calls && native::present_captures.load() == captures + 1,
+                "standalone Streamline Present records guides without an inline NR pass");
+          const auto* source = native::last_source_plan.source_handle;
+          Check(source != nullptr && native::synthetic_handles.contains(source)
+                    && !native::EditReuseSourceConfirmed(source, native::features.at(source))
+                    && native::QueryConfigurationCapability().CanSubmit()
+                    && native::RequestedStagePlan().At(addon::stage_plan::Stage::PRESENT).count == 1,
+                "Streamline keeps its ordinary Present capability without native SR or strict x2 credentials");
+        }
+        submit();
+        const auto submitted = stats();
+        event();
+        const auto after = stats();
+        Check(after.calls == submitted.calls || after.calls == submitted.calls + 1,
+              "the Streamline ordinary Present consumer cannot issue extra model calls");
+        delivered = after.outputs == submitted.outputs + 1 && after.calls == submitted.calls + 1;
+        const auto pixels = read_back();
+        if (delivered) {
+          Check(after.calls == submitted.calls + 1 && pixels != std::vector(size * size, GAME_PIXEL),
+                "ordinary OnPresent delivers a real edit from the Streamline guides");
+          for (const auto& pixel : pixels) {
+            Check(pixel[3] == GAME_PIXEL[3], "Streamline ordinary Present preserves the game alpha");
+          }
+        }
+        Check(after.base_claims == before.base_claims && after.base_outputs == before.base_outputs
+                  && after.refreshes == before.refreshes && after.reuses == before.reuses,
+              "synthetic Streamline guides alone cannot claim a base frame or enable x2");
+        swap();
+      }
+      Check(delivered, "the existing ordinary Present consumer accepts standalone Streamline guides");
+      native::real_streamline_free[0] = +[](sl::Feature, const sl::ViewportHandle&) { return sl::Result::eOk; };
+      Check(native::HookedStreamlineFreeResources<0>(sl::kFeatureDLSS, sl::ViewportHandle(capture.viewport)) == sl::Result::eOk,
+            "Streamline releases the tested ordinary Present producer");
+      std::cout << "PRESENT_STREAMLINE delivered_frame_calls=1 ordered_rgba=1 alpha=1 base_claims=0 x2=0 evidence=WARP+MOCK\n";
+    }
+    Check(SUCCEEDED(gpu.list->Close()), "close the standalone Streamline consumer recording before teardown");
 
     Check(native::HookedReleaseFeatureSlot<0>(sr_handle) == NVSDK_NGX_Result_Success, "release resized game SR");
     native::RetirePresentStream(&output);

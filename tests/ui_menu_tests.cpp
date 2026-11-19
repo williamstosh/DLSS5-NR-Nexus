@@ -860,6 +860,22 @@ int main() {
       return 0;
     }
     if (std::getenv("NR_NEXUS_ADAPTIVE_UI_ONLY") != nullptr) {
+      {
+        namespace adaptive = renodx::addons::dlss5::adaptive_resolution;
+        const auto saved_api = runtime::stage_source_api.exchange(renodx::addons::dlss5::capability::Api::VULKAN);
+        const bool saved_adaptive_enabled = runtime::nr_adaptive_enabled.exchange(true);
+        const ui::MonitorInputs resolution_view;
+        resolution_observed_fixture = &resolution_view;
+        frame();
+        resolution_observed_fixture = nullptr;
+        const bool kept_adaptive_enabled = runtime::nr_adaptive_enabled.exchange(saved_adaptive_enabled);
+        runtime::stage_source_api = saved_api;
+        check(kept_adaptive_enabled && std::ranges::any_of(rendered_text, [](const TextItem& item) {
+          return item.text == ui::Tr(adaptive::ReasonText(adaptive::Reason::UNSUPPORTED));
+        }) && std::ranges::none_of(rendered_text, [](const TextItem& item) {
+          return item.text == ui::Tr(adaptive::ReasonText(adaptive::Reason::COLLECTING));
+        }), "Vulkan keeps adaptive enabled and shows unsupported sizing in the production resolution panel");
+      }
 #include "adaptive_ui_cases.hpp"
       std::printf("PASS adaptive UI interaction cases; checks=%u\n", checks);
       ImGui::DestroyContext();

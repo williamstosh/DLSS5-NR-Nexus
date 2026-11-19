@@ -26,6 +26,7 @@ namespace addon = renodx::addons::dlss5;
 namespace policy = native::present_frame_policy;
 
 using PresentPixel = std::array<uint16_t, 4>;
+constexpr int32_t UI_TEXTURE = 3;
 constexpr std::array<PresentPixel, 4> PRESENT_SOURCE_PIXELS{{
     {0x3400, 0x3600, 0x3800, 0x3900}, {0x3400, 0x3600, 0x3800, 0x3800},
     {0x3400, 0x3600, 0x3800, 0x3a00}, {0x3400, 0x3600, 0x3800, 0x3b00}}};
@@ -93,10 +94,12 @@ inline std::vector<uint8_t> ConsumeGeneratedOutput(Gpu* gpu, ID3D12Resource* del
 }
 
 static std::function<void(IDXGISwapChain*)> consume_sdk_present;
+static HRESULT sdk_present_result = S_OK;
 
 HRESULT STDMETHODCALLTYPE ConsumeSdkPresent(IDXGISwapChain* swapchain, UINT interval, UINT flags) {
   if (consume_sdk_present) consume_sdk_present(swapchain);
-  return FakePresent(swapchain, interval, flags);
+  FakePresent(swapchain, interval, flags);
+  return sdk_present_result;
 }
 
 NVSDK_NGX_Result NVSDK_CONV EvaluatePresentEdit(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle,
@@ -237,6 +240,8 @@ int Run() {
     adapter::proxies[0].real[1] = reinterpret_cast<void*>(&FakePresent1);
     xefg::Configure(&native::fg_service::Service, &native::fg_service::PrepareCapture,
                     &native::fg_service::Retire, &native::fg_service::Requested);
+    bool sdk_failure_recovered = false;
+    bool composed_group_published = false;
     for (const bool pq : {false, true}) {
       native::direct_api.evaluate = (pq ? EditedModel : nr_edit_reuse_gpu_cases::NeutralModel);
       native::codec_mode = (pq ? 3u : 0u);
@@ -255,7 +260,7 @@ int Run() {
       upload(motion.Get(), std::vector<uint16_t>(guide_width * guide_height * 2, 0), D3D12_RESOURCE_STATE_COMMON,
              NATIVE_INPUT_STATE, guide_width * 4);
       gpu.Submit();
-      Session session(&gpu, pq ? 1 : 0, 0, pq ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT);
+      Session session(&gpu, pq ? 1 : 3, 0, pq ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT);
       Check(Hooks::UiState(session.handle, 0) == 0, "start XeFG without a required HUDLess role");
       session.context->color_space = (pq ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 : DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
       session.extent_left = session.extent_top = 0;
@@ -341,7 +346,8 @@ int Run() {
       };
       enum class Change { NONE, MOTION, DEPTH, COLOR };
       const auto frame = [&](bool reset, bool guides = true, Change change = Change::NONE,
-                             ID3D12Resource* hudless = nullptr, bool unsubmitted_guides = false) {
+                             ID3D12Resource* hudless = nullptr, bool unsubmitted_guides = false,
+                             ID3D12Resource* ui = nullptr) {
         ++source_frame;
         ++present_id;
         ComPtr<ID3D12Resource> backbuffer;
@@ -402,13 +408,16 @@ int Run() {
           }
         }
         if (hudless != nullptr) session.Tag(present_id, HUDLESS, hudless);
+        if (ui != nullptr) session.Tag(present_id, UI_TEXTURE, ui);
         const xefg::abi::Constants constants{.jitter_x = (trace_color != nullptr ? .25f : 0.f),
             .jitter_y = (trace_color != nullptr ? -.25f : 0.f), .motion_scale_x = 1.f, .motion_scale_y = 1.f,
             .reset = (reset ? 1u : 0u), .frame_time_ms = 1000.f / 60.f};
         Check(Hooks::Constants(session.handle, present_id, &constants) == 0, "current XeFG frame constants");
         const auto before_calls = model_calls;
         const auto before_reuses = native::edit_reuse_reuses.load();
-        session.Present(present_id);
+        Check(Hooks::PresentId(session.handle, present_id) == 0, "current XeFG Present ID");
+        Check(adapter::ProxyHooks<0>::Present(session.proxy.Get(), 0, 0) == sdk_present_result,
+              "XeFG proxy preserves the original SDK Present result");
         if (unsubmitted_guides) {
           // Discard the unordered guide copy before the readback submits this list.
           Check(SUCCEEDED(gpu.list->Close()) && SUCCEEDED(gpu.allocator->Reset())
@@ -787,6 +796,35 @@ int Run() {
               "unordered XeFG capture does not publish a group and leaves the current source untouched");
         recover(true);
 
+        native::direct_api.evaluate = EvaluatePresentEdit;
+        const auto before_sdk_failure = stream.submitted;
+        const auto before_sdk_submissions = xefg::SubmittedFrames();
+        const auto before_sdk_history = native::game_window.frames;
+        const auto before_sdk_products = stream.base_frame_clock.outputs;
+        sdk_present_result = E_FAIL;
+        const auto sdk_failed = frame(true);
+        sdk_present_result = S_OK;
+        const bool failed_delivery_cleared = sdk_failed.result == fg::Result::FAILED
+            && stream.result == fg::Result::FAILED && !stream.base_frame_clock.complete
+            && !stream.edit_reuse_monitor[0].handed_off && session.context->last_submission_frame == 0;
+        Check(sdk_failed.evaluates == 1 && sdk_failed.reuses == 0 && !source_matches(sdk_failed.pixels)
+                  && stream.submitted == before_sdk_failure + 1 && xefg::SubmittedFrames() == before_sdk_submissions + 1
+                  && stream.fence->GetCompletedValue() >= stream.submitted
+                  && stream.base_frame_clock.outputs == before_sdk_products + 1
+                  && native::game_window.frames == before_sdk_history + 1,
+              "SDK Present failure retains the completed private WARP work, pixels and execution history");
+        const auto after_sdk_failure = frame(false);
+        sdk_failure_recovered = failed_delivery_cleared && after_sdk_failure.result == fg::Result::SUBMITTED
+            && after_sdk_failure.evaluates == 1 && after_sdk_failure.reuses == 0 && after_sdk_failure.reset == 1
+            && stream.base_frame_clock.complete && stream.base_frame_clock.outputs == before_sdk_products + 2
+            && native::game_window.frames == before_sdk_history + 2;
+        std::cout << "XEFG_SDK_FAILURE cleared=" << failed_delivery_cleared << " recovered=" << sdk_failure_recovered
+                  << " calls=" << sdk_failed.evaluates << '/' << after_sdk_failure.evaluates
+                  << " reset=" << after_sdk_failure.reset << " completed_fence=" << stream.fence->GetCompletedValue()
+                  << " failed_rgba_crc32=" << renodx::utils::hash::ComputeCRC32(sdk_failed.pixels.data(), sdk_failed.pixels.size())
+                  << '\n';
+        native::direct_api.evaluate = nr_edit_reuse_gpu_cases::NeutralModel;
+
         const auto single_role = stream.base_frame_clock.frame;
         const auto before_missing_role = stream.base_frame_clock.outputs;
         Check(Hooks::UiState(session.handle, 1) == 0 && session.context->epoch != single_role.generation,
@@ -826,6 +864,44 @@ int Run() {
                   && stream.base_frame_clock.complete && stream.base_frame_clock.outputs == dual_products + 1,
               "restoring the required HUDLess on the next legal frame refreshes and submits both roles");
 
+        auto ui = gpu.Texture(width, height, DXGI_FORMAT_R8G8B8A8_UNORM);
+        upload(ui.Get(), std::vector<uint32_t>(width * height, 0), D3D12_RESOURCE_STATE_COMMON,
+               D3D12_RESOURCE_STATE_COMMON, width * 4);
+        gpu.Submit();
+        const auto hudless_before = read_output(hudless.Get());
+        const auto before_composition = stream.base_frame_clock.outputs;
+        const auto before_compose_submit = stream.submitted;
+        const auto before_compose_history = native::game_window.frames;
+        const auto before_composed_frames = session.context->interval_nr_composed_frames.load();
+        native::direct_api.evaluate = EvaluatePresentEdit;
+        std::vector<uint8_t> sdk_bb, sdk_hudless;
+        consume_sdk_present = [&](IDXGISwapChain*) {
+          ComPtr<ID3D12Resource> backbuffer;
+          Check(stream.submitted == before_compose_submit + 1
+                    && SUCCEEDED(session.proxy->GetBuffer(session.proxy->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&backbuffer))),
+                "original SDK Present receives the composed group after private submission");
+          sdk_bb = read_output(backbuffer.Get());
+          sdk_hudless = read_output(hudless.Get());
+        };
+        const auto composed = frame(false, true, Change::NONE, hudless.Get(), false, ui.Get());
+        Check(composed.result == fg::Result::SUBMITTED && composed.evaluates == 1 && composed.reuses == 0
+                  && session.context->interval_nr_composed_frames.load() == before_composed_frames + 1
+                  && native::game_window.frames == before_compose_history + 1
+                  && sdk_bb == composed.pixels && !source_matches(sdk_bb) && sdk_hudless != hudless_before,
+              "mode 3 uses one HUDLess model and hands the real SDK both ordered edited colors");
+        const auto composed_clock = PresentClockState(stream.base_frame_clock);
+        const auto composed_calls = model_calls;
+        const auto composed_hudless = sdk_hudless;
+        session.Present(present_id);
+        consume_sdk_present = {};
+        composed_group_published = stream.base_frame_clock.complete && stream.base_frame_clock.frame.roles == 3
+            && stream.base_frame_clock.outputs == before_composition + 1 && PresentClockState(stream.base_frame_clock) == composed_clock
+            && model_calls == composed_calls && native::game_window.frames == before_compose_history + 1
+            && sdk_bb == composed.pixels && sdk_hudless == composed_hudless;
+        std::cout << "XEFG_COMPOSED_GROUP complete=" << composed_group_published << " calls=" << composed.evaluates
+                  << " bb_crc32=" << renodx::utils::hash::ComputeCRC32(sdk_bb.data(), sdk_bb.size())
+                  << " hudless_crc32=" << renodx::utils::hash::ComputeCRC32(sdk_hudless.data(), sdk_hudless.size()) << '\n';
+        native::direct_api.evaluate = nr_edit_reuse_gpu_cases::NeutralModel;
         Check(Hooks::UiState(session.handle, 0) == 0, "return to the original XeFG single BB role");
         recover();
       }
@@ -840,6 +916,8 @@ int Run() {
       Check(!native::fg_service::streams.contains({false, context}) && !native::features.contains(owner)
                 && retired_anchor.expired(), "XeFG source retirement releases the cache after owned recordings and Fence completion");
     }
+    Check(sdk_failure_recovered && composed_group_published,
+          "XeFG revokes delivery after SDK failure and publishes both roles after one-model UI composition");
     model_pixels.clear();
     xefg::Configure(&Service, &Prepare, nullptr, &Requested);
     model_gpu = nullptr;

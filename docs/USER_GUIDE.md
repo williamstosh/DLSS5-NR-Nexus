@@ -281,6 +281,8 @@ F6 立即提示开关操作，随后状态更新为正在检查、正常运行�
 
 兼容的 Pre-FG 先增强游戏帧再交给 FG，成功时优先于普通 Present 的帧处理策略。
 
+开发版按实际入口提示可用位置：独立 Streamline 回退在 DLSS 输出后运行，Render 需要原生 SR 前置入口；Ray Reconstruction 继续采用兼容的 Upscaled 处理。
+
 | 控件 | 默认／选项或范围 | 用途 |
 | --- | --- | --- |
 | 深度与运动 | **Optional／可选**；Required／必需；Never／从不 | 可选优先匹配真实资源，缺失用中性数据；必需缺失则跳过；从不忽略捕获资源、始终用中性数据，适合不可靠资源，但可能损失运动稳定性。 |
@@ -308,9 +310,9 @@ F6 立即提示开关操作，随后状态更新为正在检查、正常运行�
 
 自动功能在 NR 降尺寸确实有助于接近目标时保留较低档，收益不明确时恢复较高画质；持续达到目标后会缓慢尝试恢复细节。顶栏依次显示「帧率／NR GPU／帧生成／NR 分辨率」，标签在上、数值在下，窄面板自动换行。NR 分辨率显示第 1 层当前实际工作比例；悬停可查看实际尺寸及对应介入点的基准，其他数值可查看来源和倍率计算方法。分辨率区保留紧凑自动状态，关键暂停／错误仍直接显示。估算在插件内完成，无需额外安装或运行帧率程序；限帧或其他负载可能使目标无法达到，自动功能不会改变游戏、FG 或限帧设置。
 
-自适应分辨率面向原生 DX12 的单个处理阶段，包括兼容的 XeFG／原生 FG 同尺寸链。跨阶段链、FG 异尺寸、DX11 Bridge 和 Vulkan 继续使用手动分辨率；缺少可靠帧率来源时暂停自动并保留合法尺寸。动态 FG 还需匹配的游戏帧计数；信息不足时暂停试探并等待采样，估算输出帧率仍可显示。更改设置或 GPU A/B 对比期间暂停自动。建议在游戏中比较转动视角时的细节和切档观感；使用限帧时，也可核对显示的帧率。
+自适应分辨率面向原生 DX12 的单个处理阶段，包括兼容的 XeFG／原生 FG 同尺寸链。跨阶段链、FG 异尺寸和 DX11 Bridge 继续使用手动分辨率；Vulkan 使用全输出尺寸。缺少可靠帧率来源时暂停自动并保留合法尺寸。动态 FG 还需匹配的游戏帧计数；信息不足时暂停试探并等待采样，估算输出帧率仍可显示。更改设置或 GPU A/B 对比期间暂停自动。建议在游戏中比较转动视角时的细节和切档观感；使用限帧时，也可核对显示的帧率。
 
-**开发版（尚未随安装包发布）**按实际 SR 来源识别能力。DX11 游戏经第三方工具提供 D3D12 SR 输出时，也可沿 D3D12 路径使用自适应；相同有效测量下，仅改变 FG 的启用声明不会改档，实测帧率与 GPU 开销仍参与调节。
+**开发版（尚未随安装包发布）**按实际 SR 来源识别能力。DX11 游戏经第三方工具提供 D3D12 SR 输出时，也可沿 D3D12 路径使用自适应；相同有效测量下，仅改变 FG 的启用声明不会改档，实测帧率与 GPU 开销仍参与调节。Vulkan 开启自动选项时保留选择，并提示当前路径不支持自动尺寸。
 
 **档位数量与准备**：可选择「默认」或 2–15 档，数量包含手动上限。「默认」沿用原缓存容量：单颜色、单输出最多 4 档，双颜色通常 2 档，轮换输出会占用相应容量。显式选择档数时按所需颜色和输出准备完整集合，并检查实际显存余量。可用的不同尺寸取决于最低比例和取整：例如最低 67% 的完整范围最多 8 档，最低 33% 最多 15 档；选择更多也不会重复相同尺寸。更多档位带来更细的步距，同时增加首次准备时间和显存使用。
 
@@ -854,6 +856,8 @@ New defaults initialize missing values and migrate the exact old `0.7 / 0.9` def
 
 Compatible Pre-FG enhances game frames before FG. When it succeeds, it takes precedence over the ordinary Present frame policy.
 
+Development builds report locations available through the actual input path. Standalone Streamline fallback runs after DLSS; Render requires a native pre-SR entry. Ray Reconstruction retains compatible Upscaled processing.
+
 | Control | Default / options or range | Use |
 | --- | --- | --- |
 | Depth and motion | **Optional** / Required / Never | Optional prefers matching game guides and uses neutral data when unavailable. Required skips without matching guides. Never ignores captured guides and always uses neutral ones; useful when guides are unreliable, but motion stability may suffer. |
@@ -881,9 +885,9 @@ Scale applies to width and height; 50% is about one quarter of the pixels. Rende
 
 Automatic sizing keeps a lower level when reducing NR resolution helps approach the target and restores higher quality when the benefit is unclear. After holding the target, it slowly tries to recover detail. The top summary shows FPS / NR GPU / FG / NR resolution, with labels above values and wrapping in narrow panels. NR resolution shows Pass 1's current actual working scale; hover for its dimensions and the reference size at that hook point. Other values provide their source and multiplier calculation on hover. Resolution controls keep a compact automatic status, while important pause and error states stay visible. Estimation runs inside the add-on, with no extra FPS program to install or run. Frame caps and other workloads can prevent reaching the target; game, FG and frame-cap settings are left to you.
 
-Adaptive sizing supports one processing stage on native DX12, including compatible same-size XeFG / native FG chains. Cross-stage chains, FG chains with different sizes, DX11 Bridge and Vulkan retain manual resolution. Automatic sizing pauses without a reliable output-rate source and keeps a legal size. Dynamic FG also needs matching game-frame counts; while those are unavailable, it pauses quality trials and collects samples, and estimated output FPS can still be shown. Editing settings and GPU A/B comparisons pause it. Compare detail and transitions while moving the camera, and check the displayed FPS when using frame caps.
+Adaptive sizing supports one processing stage on native DX12, including compatible same-size XeFG / native FG chains. Cross-stage chains, FG chains with different sizes and DX11 Bridge retain manual resolution; Vulkan uses full output resolution. Automatic sizing pauses without a reliable output-rate source and keeps a legal size. Dynamic FG also needs matching game-frame counts; while those are unavailable, it pauses quality trials and collects samples, and estimated output FPS can still be shown. Editing settings and GPU A/B comparisons pause it. Compare detail and transitions while moving the camera, and check the displayed FPS when using frame caps.
 
-**Development builds (not yet included in a release package)** identify capabilities from the actual SR source. A DX11 game with a third-party D3D12 SR output can also use adaptive sizing through that D3D12 path. With unchanged valid measurements, changing only the FG enabled declaration keeps the current tier; measured FPS and GPU cost still guide adjustments.
+**Development builds (not yet included in a release package)** identify capabilities from the actual SR source. A DX11 game with a third-party D3D12 SR output can also use adaptive sizing through that D3D12 path. With unchanged valid measurements, changing only the FG enabled declaration keeps the current tier; measured FPS and GPU cost still guide adjustments. Enabling automatic sizing on Vulkan preserves the choice and reports that it is unavailable on this path.
 
 **Level count and preparation**: Choose Default or 2–15 levels, including the manual upper limit. Default retains the original cache capacity: up to four levels for one color and one output, usually two for two colors; rotating outputs consume corresponding capacity. An explicit count prepares the complete collection for the required colors and outputs, subject to available video memory. The number of distinct sizes depends on the minimum scale and rounding: a 67% minimum allows up to eight levels, while 33% allows up to fifteen. A higher selection never duplicates identical sizes. More levels give smaller steps and increase initial preparation time and video-memory use.
 

@@ -14,6 +14,7 @@ $suites = @('native','sdr-policy','hdr-policy','scope','config','constants','sta
 $independentCases = [ordered]@{
     'native-prefg-resolution'='^PASS native-prefg-resolution hardware=0 steady_pairs_observed='
     'present-chain'='^PASS B1 WARP format=DXGI_FORMAT_R8G8B8A8_UNORM source_input='
+    'native-options-delayed'='^PASS case=native-options-delayed evidence=WARP\+MOCK dev=0$'
     'nr-edit-reuse-contracts-public'='^PASS case=nr-edit-reuse-contracts-public evidence=WARP\+MOCK dev=0$'
     'nr-edit-reuse-render-contracts'='^PASS case=nr-edit-reuse-render-contracts evidence=WARP\+MOCK dev=0$'
     'nr-edit-reuse-present-contracts'='^PASS case=nr-edit-reuse-present-contracts evidence=WARP\+MOCK dev=0$'

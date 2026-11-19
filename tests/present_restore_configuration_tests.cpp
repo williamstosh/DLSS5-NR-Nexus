@@ -628,13 +628,14 @@ int main(int argc, char** argv) {
       runtime::pass_resolution_mode[1] = 0;
       renodx::addons::dlss5::stage_plan::Group group{.stage = renodx::addons::dlss5::stage_plan::Stage::UPSCALED,
                                                     .begin = 0, .count = 3};
+      const auto group_plan = renodx::addons::dlss5::stage_plan::Build({.pass_count = 3});
       uint32_t width = 0, height = 0;
-      Check(!runtime::ComputeNrGroupWorkingResolution(group, 1920, 1080, 1280, 720, &width, &height),
+      Check(!runtime::ComputeNrGroupWorkingResolution(group_plan, group, 1920, 1080, 1280, 720, &width, &height),
             "Three-pass shared resources reject incompatible actual sizes without changing other pass settings.");
       Check(runtime::pass_resolution_mode[0].load() == 2 && runtime::pass_resolution_scale[0].load() == .67f,
             "Rejecting incompatible dimensions retains the user's independent request.");
       runtime::pass_resolution_scale[0] = 1.f;
-      Check(runtime::ComputeNrGroupWorkingResolution(group, 1920, 1080, 1280, 720, &width, &height),
+      Check(runtime::ComputeNrGroupWorkingResolution(group_plan, group, 1920, 1080, 1280, 720, &width, &height),
             "Different modes with matching actual pixels do not create a false resolution conflict.");
       runtime::LoadConfiguration();
     }

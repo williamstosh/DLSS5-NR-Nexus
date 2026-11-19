@@ -557,8 +557,9 @@ const auto RunProfileRuntimeCases = [&](const std::filesystem::path& outputdir) 
   const auto present_rows = runtime::preset_ui::Preview(
       {.scope = renodx::addons::dlss5::presets::Scope::FULL, .settings = present_settings}, false);
   Check(std::any_of(present_rows.begin(), present_rows.end(), [](const auto& row) {
-          return row.key == "NRHookPoint" && std::string_view(row.status) == "Unsupported" && !row.apply;
-        }), "Preview reports unsupported Present request.");
+          return row.key == "NRHookPoint" && std::string_view(row.status) == "Unavailable in current environment"
+              && !row.capability_reason.empty();
+        }), "Preview reports the shared capability reason for an unavailable Present request.");
   Check(!profile::ApplySnapshot(present_settings, &error), "ApplySnapshot rejects unsupported Present request.");
   Check(profile::Snapshot() == before_present && Bytes() == before_present_ini && writes.size() == before_present_writes,
         "Unsupported Present request preserves configuration and runtime.");

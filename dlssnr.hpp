@@ -2480,24 +2480,11 @@ inline std::atomic_uint32_t pass_stage[kMaxNrPasses - 1] = {0u, 0u, 0u};
 inline std::atomic_bool stage_source_rr{false};
 inline std::atomic<capability::Api> stage_source_api{capability::Api::UNKNOWN};
 
-inline capability::Api SourceExecutionApi(const NVSDK_NGX_Handle* handle) {
-  const auto source = create_contracts.find(handle);
-  if (source == create_contracts.end() || !source->second.source_type_confirmed
-      || source->second.source_generation == 0) return capability::Api::UNKNOWN;
-  return (source->second.source_device11_identity != nullptr ? capability::Api::DX11 : capability::Api::DX12);
-}
-
 inline capability::Api CurrentExecutionApi() {
   const auto source = stage_source_api.load(std::memory_order_relaxed);
   if (source != capability::Api::UNKNOWN) return source;
   return (D3D12SessionKnown() ? capability::Api::DX12 : D3D11OnlySession() ? capability::Api::DX11
       : vulkan_present_seen.load() ? capability::Api::VULKAN : capability::Api::UNKNOWN);
-}
-
-inline capability::Backend CurrentExecutionBackend(capability::Api api) {
-  return (api == capability::Api::DX11
-      ? (Dx11NativeRoute() ? capability::Backend::DX11_BRIDGE : capability::Backend::STREAMLINE_FALLBACK)
-      : api == capability::Api::UNKNOWN ? capability::Backend::UNKNOWN : capability::Backend::NATIVE);
 }
 
 inline std::atomic<float> intensity = defaults::kIntensity;
@@ -3033,6 +3020,9 @@ inline void PublishAdaptiveStatus(const adaptive_resolution::Status& status) {
 }
 
 inline adaptive_resolution::Status CopyAdaptiveStatus() {
+  if (nr_adaptive_enabled.load() && CurrentExecutionApi() == capability::Api::VULKAN) {
+    return {.reason = adaptive_resolution::Reason::UNSUPPORTED};
+  }
   std::shared_lock lock(adaptive_status.mutex);
   return adaptive_status.status;
 }
@@ -3514,9 +3504,16 @@ inline std::unordered_map<const ID3D12Resource*, std::vector<const void*>>
 inline decltype(processed_outputs) processed_render_outputs;
 constexpr size_t kMaxPassesPerOutput = 4;
 // Addresses of the synthetic Streamline fallback handles (map-node storage in
-// streamline_handle_keys, see ProcessStreamlineInline).  Used only to
-// distinguish the mirroring case in processed_outputs; never dereferenced.
+// streamline_handle_keys, see ProcessStreamlineInline). These identify the
+// actual fallback producer and its mirroring outputs; never dereferenced.
 inline std::unordered_set<const void*> synthetic_handles;
+inline capability::Api SourceExecutionApi(const NVSDK_NGX_Handle* handle) {
+  if (synthetic_handles.contains(handle)) return capability::Api::DX12;
+  const auto source = create_contracts.find(handle);
+  if (source == create_contracts.end() || !source->second.source_type_confirmed
+      || source->second.source_generation == 0) return capability::Api::UNKNOWN;
+  return (source->second.source_device11_identity != nullptr ? capability::Api::DX11 : capability::Api::DX12);
+}
 inline uint64_t present_generation = 1;
 
 // Every hook family that can fail to install shares this schedule, because
@@ -11735,6 +11732,27 @@ inline EditReuseFgEnvironment ReadEditReuseFgEnvironmentLocked() {
 }
 #endif
 
+inline capability::Input FrozenGroupGeometry(const stage_plan::Plan& plan, const stage_plan::Group& group,
+    uint32_t reference_width, uint32_t reference_height, uint32_t guide_width, uint32_t guide_height) {
+  capability::Input input;
+  input.plan = plan;
+  if (!plan.mixed && plan.group_count == 1) {
+    input.plan.groups[0] = group;
+    for (uint32_t pass = 0; pass < plan.pass_count; ++pass) input.plan.effective[pass] = group.stage;
+  }
+  input.mode = capability::GeometryMode::EXECUTION;
+  const auto main = EffectivePassResolution(0);
+  input.main_resolution = {.follow_input = main.follow_input, .scale = main.scale};
+  for (uint32_t pass = 1; pass < kMaxNrPasses; ++pass) {
+    const auto settings = EffectivePassResolution(pass);
+    input.resolutions[pass - 1] = {.mode = (settings.follow_input ? 1u : 2u), .scale = settings.scale};
+  }
+  input.geometry[static_cast<size_t>(group.stage)] = {
+      .reference_width = reference_width, .reference_height = reference_height,
+      .guide_width = guide_width, .guide_height = guide_height};
+  return input;
+}
+
 inline adaptive_resolution::Frame FreezeAdaptiveFrame(
     std::shared_ptr<adaptive_resolution::Session>* owner, const stage_plan::Plan& plan,
     const stage_plan::Group& group, uint32_t reference_width, uint32_t reference_height,
@@ -11744,7 +11762,7 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
     const BridgeAdaptiveSource* bridge_source = nullptr, const fg::xefg::BridgeOffEvidence* edit_off = nullptr) {
   if (!nr_adaptive_enabled.load() && *owner == nullptr) return {};
   if (*owner == nullptr) *owner = std::make_shared<adaptive_resolution::Session>();
-  capability::Input baseline;
+  auto baseline = FrozenGroupGeometry(plan, group, reference_width, reference_height, guide_width, guide_height);
   baseline.api = (bridge_source != nullptr ? bridge_source->api : capability::Api::DX12);
   baseline.backend = (bridge_source != nullptr ? bridge_source->backend : capability::Backend::NATIVE);
   baseline.runtime = capability::Runtime::AVAILABLE;
@@ -11754,30 +11772,15 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
   baseline.fg_owns_input = fg_owned || native_fg_owns.load() || fg::xefg::OwnsStream();
   baseline.xefg_enabled = fg::xefg::Enabled();
   baseline.auto_fg_fallback = auto_fg_fallback_active.load();
-  baseline.plan = plan;
-  if (!plan.mixed && plan.group_count == 1) {
-    // A single-stage adapter can deliver after SR when Present is unavailable.
-    // Size policy consumes its actual group, retaining the request for UI.
-    baseline.plan.groups[0] = group;
-    for (uint32_t pass = 0; pass < plan.pass_count; ++pass) baseline.plan.effective[pass] = group.stage;
-  }
-  baseline.mode = capability::GeometryMode::EXECUTION;
   baseline.delivery = (fg_owned ? capability::Delivery::FG_INPUT : capability::Delivery::ORDINARY);
   baseline.required_roles = required_roles;
   baseline.source_outputs = source_outputs;
-  const auto main = EffectivePassResolution(0);
-  baseline.main_resolution = {.follow_input = main.follow_input, .scale = main.scale};
-  for (uint32_t pass = 1; pass < kMaxNrPasses; ++pass) {
-    const auto settings = EffectivePassResolution(pass);
-    baseline.resolutions[pass - 1] = {.mode = (settings.follow_input ? 1u : 2u), .scale = settings.scale};
-  }
-  baseline.geometry[static_cast<size_t>(group.stage)] = {
-      .reference_width = reference_width, .reference_height = reference_height,
-      .guide_width = guide_width, .guide_height = guide_height};
   uint32_t group_index = baseline.plan.group_count;
   for (uint32_t index = 0; index < baseline.plan.group_count; ++index) {
     const auto& planned = baseline.plan.groups[index];
-    if (planned.stage == group.stage && planned.begin == group.begin && planned.count == group.count) group_index = index;
+    if (planned.stage == group.stage && planned.begin == group.begin && planned.count == group.count) {
+      group_index = index;
+    }
   }
   const auto group_capability = capability::EvaluateGroup(baseline, group_index);
   supported &= group_capability.decision.CanSubmit();
@@ -12964,12 +12967,31 @@ inline void ComputeNrWorkingResolution(
 // One workset owns the proxy/NN surfaces for every pass in a stage group.
 // Reject incompatible sizes before recording any commands with that workset.
 inline bool ComputeNrGroupWorkingResolution(
-    const stage_plan::Group& group,
+    const stage_plan::Plan& plan, const stage_plan::Group& group,
     uint32_t reference_width, uint32_t reference_height,
     uint32_t guide_width, uint32_t guide_height,
     uint32_t* nr_width, uint32_t* nr_height) {
-  ComputeNrWorkingResolution(reference_width, reference_height, guide_width, guide_height,
-                             *nr_width, *nr_height, group.begin);
+  auto input = FrozenGroupGeometry(plan, group, reference_width, reference_height, guide_width, guide_height);
+  input.api = capability::Api::DX12;
+  input.backend = capability::Backend::NATIVE;
+  input.independent_size_bindings = false;
+  if (active_adaptive_frame != nullptr && active_adaptive_frame->enabled) {
+    for (uint32_t pass = group.begin; pass < group.begin + group.count; ++pass) {
+      const auto size = active_adaptive_frame->sizes[pass];
+      input.applied_sizes[pass] = {.width = size.width, .height = size.height};
+    }
+  }
+  uint32_t group_index = input.plan.group_count;
+  for (uint32_t index = 0; index < input.plan.group_count; ++index) {
+    const auto& planned = input.plan.groups[index];
+    if (planned.stage == group.stage && planned.begin == group.begin && planned.count == group.count) {
+      group_index = index;
+    }
+  }
+  const auto evaluated = capability::EvaluateGroup(input, group_index);
+  const auto first_size = evaluated.working_sizes[group.begin];
+  *nr_width = first_size.width;
+  *nr_height = first_size.height;
   auto& stats = stage_telemetry[static_cast<size_t>(group.stage)];
   stats.width = reference_width;
   stats.height = reference_height;
@@ -12978,21 +13000,21 @@ inline bool ComputeNrGroupWorkingResolution(
   for (uint32_t pass = group.begin; pass < group.begin + group.count; ++pass) {
     auto& observed = stats.pass_resolutions[pass];
     observed = {};
-    ComputeNrWorkingResolution(reference_width, reference_height, guide_width, guide_height,
-                               observed.requested_width, observed.requested_height, pass);
+    const auto size = evaluated.working_sizes[pass];
+    observed.requested_width = size.width;
+    observed.requested_height = size.height;
   }
-  for (uint32_t pass = group.begin + 1; pass < group.begin + group.count; ++pass) {
-    uint32_t width = 0, height = 0;
-    ComputeNrWorkingResolution(reference_width, reference_height, guide_width, guide_height,
-                               width, height, pass);
-    if (width == *nr_width && height == *nr_height) continue;
+  if (!evaluated.decision.CanSubmit()) {
+    const uint32_t pass = evaluated.decision.pass;
     CountNrDecline(NrDeclineReason::kStageResolutionMismatch);
     if (!stats.resolution_blocked) {
       Log(reshade::log::level::warning,
           std::string("NR ") + stage_plan::Name(group.stage)
               + " group declined: passes within one stage must use the same working size; pass "
               + std::to_string(group.begin + 1) + "=" + std::to_string(*nr_width) + "x" + std::to_string(*nr_height)
-              + ", pass " + std::to_string(pass + 1) + "=" + std::to_string(width) + "x" + std::to_string(height)
+              + ", pass " + std::to_string(pass + 1) + "="
+              + std::to_string(evaluated.working_sizes[pass].width) + "x"
+              + std::to_string(evaluated.working_sizes[pass].height)
               + "; shared proxy/NN workset cannot change size between passes");
     }
     stats.resolution_blocked = true;
@@ -13488,6 +13510,7 @@ struct NrRecording {
   bool edit_reused = false;
   EditReuseDelivery edit_monitor_delivery = EditReuseDelivery::NONE;
   EditReuseBlock edit_monitor_reason = EditReuseBlock::NONE;
+  uint64_t edit_monitor_reset_epoch = 0;
   bool edit_refreshed = false;
   bool model_recorded = false;
   bool output_ready = false;
@@ -13570,10 +13593,10 @@ inline bool BridgeHasCurrentSrFrame(const BridgeAdaptiveSource& source,
 }
 
 inline EditReuseMonitorFrame ObserveEditReuseMonitorFrame(
-    const FeatureState& source, ID3D12Device* device, stage_plan::Stage stage, uint32_t width, uint32_t height) {
+    const FeatureState& source, const void* device_identity, stage_plan::Stage stage, uint32_t width, uint32_t height) {
   return {.stage = stage, .configuration = configuration_generation.load(), .reset_epoch = history_reset_epoch.load(),
           .source_generation = source.source_generation, .sequence = source.sr_sequence, .recorded_ns = SteadyNowNs(),
-          .device = renodx::utils::directx::NativeIdentity(device), .output_width = width, .output_height = height};
+          .device = device_identity, .output_width = width, .output_height = height};
 }
 
 inline void StoreEditReuseMonitorFrame(std::array<EditReuseMonitorFrame, 2>* frames, EditReuseMonitorFrame frame) {
@@ -14427,7 +14450,7 @@ inline bool RecordInline(
     stage_stats.resolution_blocked = false;
     stage_stats.requested_work_width = nr_input_width;
     stage_stats.requested_work_height = nr_input_height;
-  } else if (!ComputeNrGroupWorkingResolution(group, width, height, current.input_width, current.input_height,
+  } else if (!ComputeNrGroupWorkingResolution(plan, group, width, height, current.input_width, current.input_height,
                                               &nr_input_width, &nr_input_height)) {
     for (auto& slot : feature.slots) {
       slot.pending_reset = true;
@@ -14499,20 +14522,23 @@ inline bool RecordInline(
       .sequence = (bridge_source != nullptr ? bridge_source->sr_sequence : feature.sr_sequence),
       .current_color = present == nullptr && current_sr_color, .ordered = current_sr_color};
   const bool monitor_edit_requested = edit_reuse_requested && monitor_requested.load(std::memory_order_relaxed);
-  const bool monitor_present_delivery = monitor_edit_requested && recording != nullptr && present != nullptr
-      && present_frame_policy::Known(present->base_frame);
+  const bool monitor_adapter_delivery = monitor_edit_requested && recording != nullptr
+      && ((present != nullptr && present_frame_policy::Known(present->base_frame))
+          || (bridge_source != nullptr && current_sr_color));
+  uint64_t monitor_reset_epoch = (monitor_adapter_delivery ? history_reset_epoch.load() : 0);
   EditReuseMonitorFrame edit_monitor;
   if (monitor_edit_requested
       && present == nullptr && bridge_source == nullptr && successful_sr_device == device
       && execution_stage == stage_plan::Stage::UPSCALED && !adaptive.preparing && !prepare_models_only
       && EditReuseSourceConfirmed(handle, feature)) {
-    edit_monitor = ObserveEditReuseMonitorFrame(feature, device, execution_stage,
+    edit_monitor = ObserveEditReuseMonitorFrame(feature, renodx::utils::directx::NativeIdentity(device), execution_stage,
         static_cast<uint32_t>(output_desc.Width), output_desc.Height);
   }
   const auto publish_edit_monitor = [&](EditReuseDelivery delivery, EditReuseBlock reason) {
-    if (monitor_present_delivery) {
+    if (monitor_adapter_delivery) {
       recording->edit_monitor_delivery = delivery;
       recording->edit_monitor_reason = reason;
+      recording->edit_monitor_reset_epoch = monitor_reset_epoch;
     }
     if (edit_monitor.device == nullptr) return;
     edit_monitor.delivery = delivery;
@@ -14647,7 +14673,7 @@ inline bool RecordInline(
   }
   if (edit_reuse_requested && !edit_reuse_route_eligible) ++edit_reuse_fallbacks;
   if (!edit_reuse_route_eligible) {
-    if (edit_monitor.device != nullptr || monitor_present_delivery) {
+    if (edit_monitor.device != nullptr || monitor_adapter_delivery) {
       if (plan.mixed || group.begin != 0 || (group.count != 1 && !same_stage_stack)) edit_monitor.reason = EditReuseBlock::PASSES;
       else if (control_mask_eligible) edit_monitor.reason = EditReuseBlock::MASK;
       else if (!edit_reuse_fixed_workset) edit_monitor.reason = EditReuseBlock::ADAPTIVE;
@@ -15532,6 +15558,8 @@ inline bool RecordInline(
   // chain's resets across two epochs.
   const uint64_t chain_reset_epoch =
       history_reset_epoch.load(std::memory_order_relaxed);
+  monitor_reset_epoch = chain_reset_epoch;
+  edit_monitor.reset_epoch = chain_reset_epoch;
   std::array<uint64_t, 40> edit_contract{};
   EditReuseGroup edit_group;
   if (edit_reuse_route_eligible && same_stage_stack) {
@@ -15578,7 +15606,7 @@ inline bool RecordInline(
   bool edit_reused = false;
   bool edit_reuse_delivery_failed = false;
   const auto* previous_edit = feature.slots[0].edit_reuse.get();
-  const bool edit_monitor_expected_reuse = (edit_monitor.device != nullptr || monitor_present_delivery) && edit_reuse_route_eligible
+  const bool edit_monitor_expected_reuse = (edit_monitor.device != nullptr || monitor_adapter_delivery) && edit_reuse_route_eligible
       && previous_edit != nullptr && previous_edit->valid && !previous_edit->reused;
 #if defined(NR_NEXUS_DEV_CONTROL)
   uint32_t inline_capture_calls = 0, inline_capture_reset_reasons = 0;
@@ -17017,7 +17045,7 @@ inline bool RecordInline(
     CountNrDecline(NrDeclineReason::kSlotWarmupMaturation);
     return true;
   }
-  if ((edit_monitor.device != nullptr || monitor_present_delivery) && stage_scope.complete) {
+  if ((edit_monitor.device != nullptr || monitor_adapter_delivery) && stage_scope.complete) {
     const bool refresh = edit_reuse_route_eligible && !edit_monitor_expected_reuse
         && (same_stage_stack ? group_anchor_ready : edit.cache != nullptr && edit.cache->valid);
     const auto reason = (refresh ? EditReuseBlock::NONE
@@ -17537,7 +17565,7 @@ inline bool RecordInlinePreSR(
     stage_stats.resolution_blocked = false;
     stage_stats.requested_work_width = nr_input_width;
     stage_stats.requested_work_height = nr_input_height;
-  } else if (!ComputeNrGroupWorkingResolution(group, width, height, current.input_width, current.input_height,
+  } else if (!ComputeNrGroupWorkingResolution(plan, group, width, height, current.input_width, current.input_height,
                                               &nr_input_width, &nr_input_height)) {
     for (auto& slot : feature.slots) {
       slot.pending_reset = true;
@@ -17551,7 +17579,7 @@ inline bool RecordInlinePreSR(
       && !adaptive.preparing && !plan.mixed && EditReuseSourceConfirmed(handle, feature)) {
     if (auto* sr_output = GetD3D12Resource(game_parameters, NVSDK_NGX_Parameter_Output); sr_output != nullptr) {
       const auto sr_desc = sr_output->GetDesc();
-      swap.monitor_frame = ObserveEditReuseMonitorFrame(feature, device, stage_plan::Stage::RENDER,
+      swap.monitor_frame = ObserveEditReuseMonitorFrame(feature, renodx::utils::directx::NativeIdentity(device), stage_plan::Stage::RENDER,
           static_cast<uint32_t>(sr_desc.Width), sr_desc.Height);
       swap.monitor_source = handle;
       swap.monitor_list = command_list;
@@ -18161,6 +18189,7 @@ inline bool RecordInlinePreSR(
   // chain's resets across two epochs.
   const uint64_t chain_reset_epoch =
       history_reset_epoch.load(std::memory_order_relaxed);
+  swap.monitor_frame.reset_epoch = chain_reset_epoch;
   int32_t executed = -1;
   // v6 audit issue 23: see ProcessInline - a rule-3 bypass frame sets
   // `executed` via copies only and must not count as a successful NR frame.
@@ -19115,7 +19144,21 @@ inline bool ProcessStreamlineInline(
     sl::Feature streamline_feature,
     const StreamlineCapture& capture,
     bool* command_list_touched = nullptr) {
-  const auto plan = RequestedStagePlan(streamline_feature == sl::kFeatureDLSS_RR);
+  if (!enabled.load() || command_list == nullptr || !IsSupportedInjectionCommandList(command_list)) return false;
+  // Register the observed producer even when this request cannot execute here.
+  // The synthetic key identifies a viewport; it is not a successful NGX SR receipt.
+  uint8_t& synthetic_handle_storage = streamline_handle_keys[
+      StreamlineStreamKey(streamline_feature, capture.viewport)];
+  const auto* synthetic_handle = reinterpret_cast<const NVSDK_NGX_Handle*>(&synthetic_handle_storage);
+  synthetic_handles.insert(&synthetic_handle_storage);
+  const EvaluateChainScope chain_scope;
+  const SourceStageScope source_scope(synthetic_handle, true);
+  auto [entry, inserted] = features.try_emplace(synthetic_handle);
+  if (inserted) {
+    entry->second.source_feature = (streamline_feature == sl::kFeatureDLSS_RR ? kFeatureDlssd : kFeatureDlss);
+    entry->second.source_type_confirmed = true;
+  }
+  const auto plan = EvaluationStagePlan(synthetic_handle);
   if (plan.mixed) {
     auto unavailable = plan;
     unavailable.valid = false;
@@ -19127,10 +19170,7 @@ inline bool ProcessStreamlineInline(
   // finished DLSS output.  With the pre-SR insertion point selected the two
   // are mutually exclusive, exactly as for the NGX evaluate path - except for
   // Ray Reconstruction, which keeps the after insertion point (PreSrTakes).
-  if (!enabled.load()
-      || (nr_before_upscale.load() && streamline_feature != sl::kFeatureDLSS_RR)
-      || command_list == nullptr
-      || !IsSupportedInjectionCommandList(command_list)) {
+  if (nr_before_upscale.load() && streamline_feature != sl::kFeatureDLSS_RR) {
     return false;
   }
   if (capture.color.resource != nullptr) {
@@ -19307,23 +19347,6 @@ inline bool ProcessStreamlineInline(
         parameters, NVSDK_NGX_Parameter_DLSS_Exposure_Scale, 1.0f);
   }
 
-  // A stable map-node address is used solely as an opaque key; it is never
-  // dereferenced as an NGX handle.  Keeping the FeatureState between calls is
-  // important because the NR runtime's temporal history lives in that handle.
-  uint8_t& synthetic_handle_storage = streamline_handle_keys[
-      StreamlineStreamKey(streamline_feature, capture.viewport)];
-  const auto* synthetic_handle = reinterpret_cast<const NVSDK_NGX_Handle*>(
-      &synthetic_handle_storage);
-  // Recorded so OutputPassAllowed can recognize this pass as the Streamline
-  // side of a mirroring pair on one output.
-  synthetic_handles.insert(&synthetic_handle_storage);
-  auto [entry, inserted] = features.try_emplace(synthetic_handle);
-  if (inserted) {
-    entry->second.source_feature = streamline_feature == sl::kFeatureDLSS_RR
-        ? kFeatureDlssd
-        : kFeatureDlss;
-    entry->second.source_type_confirmed = true;
-  }
   // The Present hook point takes the guides here as the NGX hooks do; the
   // tags' own states are the before-states (unknown = the guide 3.4 state).
   const bool present_takes = fg::xefg::OwnsStream() || PresentTakesEvaluate();
@@ -29053,10 +29076,22 @@ inline capability::Result QueryConfigurationCapability(const presets::Json& valu
   };
   capability::Input input;
   input.api = CurrentExecutionApi();
-  input.backend = CurrentExecutionBackend(input.api);
-  const auto funnel = CollectFunnelInputs();
-  input.runtime = (funnel.runtime_available ? capability::Runtime::AVAILABLE
-      : nr_runtime_fault.load() != 0 ? capability::Runtime::UNAVAILABLE : capability::Runtime::UNKNOWN);
+  input.backend = (input.api == capability::Api::DX11
+      ? (Dx11NativeRoute() ? capability::Backend::DX11_BRIDGE : capability::Backend::STREAMLINE_FALLBACK)
+      : input.api == capability::Api::UNKNOWN ? capability::Backend::UNKNOWN : capability::Backend::NATIVE);
+  if (input.api == capability::Api::DX12 && !last_source_plan.source_released
+      && synthetic_handles.contains(last_source_plan.source_handle)) {
+    input.backend = capability::Backend::STREAMLINE_FALLBACK;
+  }
+  vk::ConfigurationFacts vulkan_configuration;
+  if (input.api == capability::Api::VULKAN) {
+    vulkan_configuration = vk::ReadConfigurationFactsLocked();
+    input.runtime = vulkan_configuration.runtime;
+  } else {
+    const auto funnel = CollectFunnelInputs();
+    input.runtime = (funnel.runtime_available ? capability::Runtime::AVAILABLE
+        : nr_runtime_fault.load() != 0 ? capability::Runtime::UNAVAILABLE : capability::Runtime::UNKNOWN);
+  }
   const auto declaration = native_fg_declaration.load();
   input.fg = (declaration == NativeFgDeclaration::kOff && native_fg_public_off.load() ? capability::Fg::OFF
       : declaration == NativeFgDeclaration::kOn ? capability::Fg::ON : capability::Fg::UNKNOWN);
@@ -29066,6 +29101,9 @@ inline capability::Result QueryConfigurationCapability(const presets::Json& valu
   input.native_prefg_resolution_experiment = experimental_native_prefg_resolution.load();
   input.game_source_known = last_source_plan.source_handle != nullptr && !last_source_plan.source_released
       && (last_source_plan.source_feature == kFeatureDlss || last_source_plan.source_feature == kFeatureDlssd);
+  if (input.api == capability::Api::VULKAN) {
+    input.game_source_known = vulkan_configuration.source != nullptr && vulkan_configuration.source_generation != 0;
+  }
   stage_plan::Configuration config{
       .pass_count = static_cast<uint32_t>(number("NRPasses", stack_passes.load())),
       .hook_point = static_cast<uint32_t>(number("NRHookPoint", hook_point.load()))};
@@ -29076,8 +29114,10 @@ inline capability::Result QueryConfigurationCapability(const presets::Json& valu
         .mode = static_cast<uint32_t>(number((prefix + "ResolutionMode").c_str(), pass_resolution_mode[pass - 1].load())),
         .scale = static_cast<float>(number((prefix + "ResolutionScale").c_str(), pass_resolution_scale[pass - 1].load()))};
   }
-  auto stage_capabilities = CurrentStageCapabilities(input.api, stage_source_rr.load());
-  stage_capabilities.present_available &= input.backend != capability::Backend::STREAMLINE_FALLBACK && !present_unusable.load();
+  auto stage_capabilities = CurrentStageCapabilities(input.api,
+      input.api == capability::Api::VULKAN ? vulkan_configuration.ray_reconstruction : stage_source_rr.load());
+  stage_capabilities.mixed_dx12 &= input.backend != capability::Backend::STREAMLINE_FALLBACK;
+  stage_capabilities.present_available &= !present_unusable.load();
   input.plan = stage_plan::Build(config, stage_capabilities);
   if (config.hook_point != kHookPresent && !experimental_present_chain.load()) {
     input.fg_owns_input = fg::xefg::OwnsStream();
@@ -29089,6 +29129,14 @@ inline capability::Result QueryConfigurationCapability(const presets::Json& valu
     const auto& observed = stage_telemetry[stage];
     // Historical geometry can be shown, but cannot prove current Guide identity.
     input.geometry[stage] = {.reference_width = observed.width, .reference_height = observed.height};
+  }
+  if (input.api == capability::Api::VULKAN) {
+    input.geometry = {};
+    if (vulkan_configuration.recorded_passes != 0) {
+      input.geometry[static_cast<size_t>(stage_plan::Stage::UPSCALED)] = {
+          .reference_width = vulkan_configuration.geometry.reference_width,
+          .reference_height = vulkan_configuration.geometry.reference_height};
+    }
   }
   auto result = capability::Query(input);
   for (uint32_t pass = 0; pass < input.plan.pass_count; ++pass) {
@@ -30365,7 +30413,9 @@ inline void DrawResolutionObserved(const ui::PanelText& text, uint32_t pass = 0,
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
         ImGui::BeginTooltip();
         ImGui::PushTextWrapPos(ImGui::GetFontSize() * 32.f);
-        ImGui::TextWrapped("%s", text.Tr("Adaptive resolution controls the current size. Turn it off to edit the saved manual upper limit."));
+        if (reason != adaptive_resolution::Reason::UNSUPPORTED) {
+          ImGui::TextWrapped("%s", text.Tr("Adaptive resolution controls the current size. Turn it off to edit the saved manual upper limit."));
+        }
         ImGui::Text(text.Tr("Saved manual upper limit: %s"), saved_limit);
         ImGui::TextWrapped("%s", text.Tr(adaptive_resolution::ReasonText(reason)));
         ImGui::TextWrapped("%s", text.Tr(output_rate.available
@@ -35072,6 +35122,12 @@ inline void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) 
       stream->second.mixed_capture = 0;
       stream->second.mixed_sources = 0;
       InvalidatePresentBaseFrames(&stream->second);
+      if (resize) {
+        stream->second.prefg_target_valid = false;
+        stream->second.native_route_id = 0;
+        stream->second.native_output_identity = nullptr;
+        GuardHook([&] { RetireNativePresentOwner(&stream->second); });
+      }
     }
   }
   if (resize || swapchain == nullptr) return;

@@ -201,6 +201,7 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeRuntimeEvaluation(
 // The isolated idle test is defined after the existing scenarios.
 int RunNativeOwnerIdleTest();
 int RunNativeOptionsResumeTest(bool delayed_options = false);
+void ResizeNativeTestOutput(Gpu& gpu, IDXGISwapChain3* output, ID3D12Resource* old_input);
 int RunNativeGuideContractTest();
 int RunPresentGuideModelsTest(bool native_ngx = false, const char* project_id_path = nullptr);
 int RunNativePresentDecisionTest();
@@ -1070,7 +1071,9 @@ int main(int argc, char** argv) {
   if (argc == 2 && std::strcmp(argv[1], "--native-required-menu") == 0) return RunNativeRequiredMenuTest();
   if (argc == 2 && std::strcmp(argv[1], "--native-owner-idle") == 0) return RunNativeOwnerIdleTest();
   if (argc == 2 && std::strcmp(argv[1], "--native-options-resume") == 0) return RunNativeOptionsResumeTest();
-  if (argc == 2 && std::strcmp(argv[1], "--native-options-delayed") == 0) return RunNativeOptionsResumeTest(true);
+  if (argc == 2 && std::strcmp(argv[1], "--native-options-delayed") == 0) {
+    return run_edit_reuse_case([] { return RunNativeOptionsResumeTest(true); });
+  }
   if (argc == 2 && std::strcmp(argv[1], "--native-guide-contract") == 0) return RunNativeGuideContractTest();
   if (argc == 2 && std::strcmp(argv[1], "--present-guide-models") == 0) return RunPresentGuideModelsTest();
   if (argc == 2 && std::strcmp(argv[1], "--native-present-decision") == 0) {
@@ -3717,10 +3720,38 @@ int RunNativeOptionsResumeTest(bool delayed_options) {
         check(read_pixels(consumed_backbuffers.back().Get(), 0, 144, false)
                   && read_pixels(late_zero_repeat.Get(), 0, 144, false),
               "zero FrameID same-scope FG and late consumers retain the same NR pixels");
+        parameters.Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, 2u);
+        Check(NVSDK_NGX_SUCCEED(evaluate()), "zero FrameID index2 forwards within the producing SDK scope");
+        check_scope(&opaque_output, true);
+        submit();
+        check(model_calls == models_before_zero + 2
+                  && read_pixels(consumed_backbuffers.back().Get(), 0, 144, false),
+              "zero FrameID index2 in the same decision receives the completed cached colors");
+        const auto base_decision = std::exchange(sdk_decision_id, 0);
+        Check(NVSDK_NGX_SUCCEED(evaluate()), "zero FrameID index2 forwards without a decision receipt");
+        submit();
+        check(model_calls == models_before_zero + 2 && consumed_hudless.back().Get() != hudless.Get()
+                  && read_pixels(consumed_backbuffers.back().Get(), 0, 144, false),
+              "zero FrameID index2 without a decision receipt retains compatibility redelivery");
+        sdk_decision_id = base_decision;
         ++sdk_decision_id;
         gpu.Transition(backbuffer.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
         gpu.Write(backbuffer.Get(), 176);
         gpu.Transition(backbuffer.Get(), D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
+        const auto submissions_before_conflict = native::native_fg_submitted_frames.load();
+        Check(NVSDK_NGX_SUCCEED(evaluate()), "zero FrameID index2 forwards in a different known SDK decision");
+        check_scope(&opaque_output, false, true);
+        submit();
+        const bool raw_consumed = read_pixels(consumed_backbuffers.back().Get(), 176, 176, false);
+        const bool raw_backbuffer = read_pixels(backbuffer.Get(), 176, 176, false);
+        check(model_calls == models_before_zero + 2 && consumed_hudless.back().Get() == hudless.Get()
+                  && native::native_fg_submitted_frames.load() == submissions_before_conflict
+                  && raw_consumed && raw_backbuffer,
+              "zero FrameID index2 in a different known SDK decision preserves current BB and HUDLess");
+        gpu.Transition(backbuffer.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
+        gpu.Write(backbuffer.Get(), 176);
+        gpu.Transition(backbuffer.Get(), D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
+        parameters.Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, 1u);
         const auto models_before_new_scope = model_calls;
         Check(NVSDK_NGX_SUCCEED(evaluate()), "zero FrameID next SDK decision reaches the real FG wrapper");
         auto late_zero_new_scope = late_copy();
@@ -3731,6 +3762,67 @@ int RunNativeOptionsResumeTest(bool delayed_options) {
         check(read_pixels(consumed_backbuffers.back().Get(), 0, 176, false)
                   && read_pixels(late_zero_new_scope.Get(), 0, 176, false),
               "zero FrameID next-scope consumers use newly written raw B as the current NR source");
+        if (c_wrapper) {
+          auto output = gpu.Swapchain();
+          const auto context = reinterpret_cast<uintptr_t>(&owner);
+          const auto old_route_id = owner.native_route_id;
+          const auto old_model_generation = next_handle;
+          auto* const cached = native::fg_service::streams.at({true, context}).cached;
+          const auto* const old_product = cached->color[0];
+          parameters.Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, 2u);
+          Check(NVSDK_NGX_SUCCEED(evaluate()), "old Native MFG consumer records before resize");
+          auto old_output = consumed_backbuffers.back();
+          Check(!submission::ResourceReleasable(old_product), "host recording retains the old Native cache");
+          ResizeNativeTestOutput(gpu, output.Get(), backbuffer.Get());
+          const bool revoked = !owner.prefg_target_valid && owner.native_route_id == 0
+              && !native::fg_service::streams.contains({true, context});
+          check(revoked && !submission::ResourceReleasable(old_product),
+                "same-size resize revokes Native owner and cached eligibility while the host list retains its uses");
+          submit();
+          check(read_pixels(old_output.Get(), 0, 176, false), "already-recorded Native MFG consumes its old cache after resize");
+
+          gpu.Transition(backbuffer.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
+          gpu.Write(backbuffer.Get(), 184);
+          gpu.Transition(backbuffer.Get(), D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
+          Check(NVSDK_NGX_SUCCEED(evaluate()), "old-owner MFG forwards during resize transition");
+          submit();
+          check(consumed_hudless.back().Get() == hudless.Get()
+                    && read_pixels(consumed_backbuffers.back().Get(), 184, 184, false),
+                "old Native cache cannot modify current pixels after same-size resize");
+
+          backbuffer = gpu.Texture();
+          gpu.Write(backbuffer.Get(), 192);
+          gpu.Transition(backbuffer.Get(), D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
+          parameters.Set(NVSDK_NGX_DLSSG_Parameter_Backbuffer, backbuffer.Get());
+          parameters.Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, 1u);
+          owner.prefg_target_valid = true;
+          owner.native_output_identity = &opaque_output;
+          owner.native_route_id = old_route_id + 1;
+          ++sdk_decision_id;
+          const auto before_resize_recovery = model_calls;
+          bool ready = false;
+          uint32_t delivery_evaluates = 0;
+          for (uint32_t attempt = 0; attempt < 4 && !ready; ++attempt) {
+            const auto before_attempt = model_calls;
+            Check(NVSDK_NGX_SUCCEED(evaluate()), "new same-size Native input forwards after owner confirmation");
+            ready = native::native_sdk_present_input.marker != nullptr;
+            if (ready) delivery_evaluates = model_calls - before_attempt;
+            submit();
+          }
+          const bool new_output = read_pixels(consumed_backbuffers.back().Get(), 0, 192, false);
+          // The mock allocator may recycle a freed handle address after the
+          // old recording finishes. Its creation number identifies the model.
+          const bool fresh_models = delivery_evaluates == 2
+              && std::ranges::all_of(std::span{model_evaluated_handles}.last(2), [old_model_generation](const auto* model) {
+                   return *reinterpret_cast<const uint32_t*>(model) > old_model_generation;
+                 });
+          check(ready && new_output && fresh_models,
+                "new Native BB delivers ordered current pixels from fresh model histories after resize");
+          std::cout << "NATIVE_OWNER_RESIZE revoked=" << revoked << " recovered=" << ready
+                    << " new_bb=" << new_output << " fresh_models=" << fresh_models
+                    << " evaluates_total=" << model_calls - before_resize_recovery << " evaluates_delivery=" << delivery_evaluates
+                    << " completed_fence=" << gpu.fence->GetCompletedValue() << '\n';
+        }
         parameters.Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, 2u);
         gpu.Transition(backbuffer.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
         gpu.Write(backbuffer.Get(), 160);
@@ -4081,6 +4173,23 @@ struct PresentRingFaceProbe final : reshade::api::swapchain {
   reshade::api::color_space get_color_space() const override { return reshade::api::color_space::srgb; }
 };
 }  // namespace
+
+void ResizeNativeTestOutput(Gpu& gpu, IDXGISwapChain3* output, ID3D12Resource* old_input) {
+  PresentRingFaceProbe face(&gpu, old_input, output, PresentRingFaceProbe::Mode::NATIVE_ROUTE);
+  auto entry = native::present_streams.extract(nullptr);
+  Check(!entry.empty(), "native resize fixture has an existing owner");
+  entry.key() = &face;
+  native::present_streams.insert(std::move(entry));
+  native::OnDestroySwapchain(&face, true);
+  entry = native::present_streams.extract(&face);
+  Check(!entry.empty(), "resize keeps the Present stream available for rebind");
+  entry.key() = nullptr;
+  native::present_streams.insert(std::move(entry));
+  DXGI_SWAP_CHAIN_DESC1 desc{};
+  Check(SUCCEEDED(output->GetDesc1(&desc))
+            && SUCCEEDED(output->ResizeBuffers(desc.BufferCount, desc.Width, desc.Height, desc.Format, desc.Flags)),
+        "WARP ResizeBuffers retains output dimensions and format");
+}
 
 #include "nr_edit_reuse_present_cases.hpp"
 

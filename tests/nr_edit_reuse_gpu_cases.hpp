@@ -971,6 +971,219 @@ int Run() {
         native::DrainRetiredResources(true);
       }
       std::cout << "PASS fixed single-Pass Upscaled DX12/foreign equivalence and route/Core/jitter contrasts evidence=WARP+MOCK\n";
+
+      funnel_accounting_tests::Restore source_restore;
+      source_restore.Atomic(&native::hook_point);
+      source_restore.Atomic(&native::stack_passes);
+      source_restore.Atomic(&native::pass_stage[1]);
+      source_restore.Atomic(&native::pass_resolution_mode[0]);
+      source_restore.Atomic(&native::pass_resolution_scale[0]);
+      source_restore.Atomic(&native::pass_resolution_mode[1]);
+      source_restore.Atomic(&native::edit_reuse_enabled);
+      source_restore.Atomic(&native::stage_source_api);
+      source_restore.Atomic(&native::stage_source_rr);
+      source_restore.Value(&native::last_source_plan);
+      source_restore.Value(&native::stage_telemetry);
+      source_restore.Value(&native::real_streamline_free[0]);
+      native::d3d11_swapchain_seen = false;
+      native::d3d11_present_seen = false;
+      native::d3d12_swapchain_seen = true;
+      native::d3d12_present_seen = true;
+      native::dx11_route = native::kDx11RouteUndecided;
+      native::edit_reuse_enabled = false;
+      native::stack_passes = 3;
+      native::pass_stage[1] = 0u;
+      native::pass_resolution_mode[0] = 1u;
+      native::pass_resolution_mode[1] = 0u;
+      native::ngx_slot_real[0].evaluate_c = reinterpret_cast<void*>(MirrorSr);
+      auto evaluation = parameters;
+      NVSDK_NGX_Handle* sr = nullptr;
+      Check(NVSDK_NGX_SUCCEED(native::HookedCreateFeatureSlot<0>(gpu.list.Get(), native::kFeatureDlss, &evaluation, &sr))
+                && sr != nullptr,
+            "shared-grid and fallback contrast creates a native SR source through the wrapper");
+      const auto evaluate_native = [&](bool mirror = false) {
+        gpu.list->ClearState(nullptr);
+        const auto sr_before = sr_calls;
+        const auto nr_before = model_calls;
+        const auto sequence = native::features.at(sr).sr_sequence;
+        const auto result = (mirror ? native::HookedEvaluateFeatureCSlot<0>(gpu.list.Get(), sr, &evaluation, nullptr)
+                                    : native::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), sr, &evaluation, nullptr));
+        Check(NVSDK_NGX_SUCCEED(result) && sr_calls == sr_before + 1
+                  && native::features.at(sr).sr_sequence == sequence + 1,
+              "native SR records one original Evaluate and advances one source frame");
+        return model_calls - nr_before;
+      };
+      const auto read_output = [&](const char* phase) {
+        const auto result = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        submit_commands(phase);
+        native::DrainRetiredResources(true);
+        return result.Pixels();
+      };
+      const auto& upscaled = native::stage_telemetry[static_cast<size_t>(STAGE)];
+      bool shared_ready = false;
+      for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8 && !shared_ready; ++attempt) {
+        const auto groups = upscaled.groups;
+        shared_ready = evaluate_native() == 3 && upscaled.groups == groups + 1;
+        submit_commands("warm shared Upscaled grid");
+        native::DrainRetiredResources(true);
+      }
+      Check(shared_ready, "three Upscaled passes warm on the same 16x16 workset");
+
+      // Pass 2 follows the real Guide subrect while Passes 1 and 3 stay at 100% of Output.
+      evaluation.Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, 12u);
+      evaluation.Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, 12u);
+      const auto rejected_calls = evaluate_native();
+      const auto rejected_rgba = read_output("shared Upscaled grid rejection");
+      const bool original_preserved = rejected_rgba.size() == sizeof(inline_trace::SOURCE_RGBA)
+          && std::memcmp(rejected_rgba.data(), inline_trace::SOURCE_RGBA.data(), rejected_rgba.size()) == 0;
+      std::cout << "SHARED_UPSCALED_GRID guide=12x12 calls=" << rejected_calls << " original_rgba=" << original_preserved << '\n';
+      Check(rejected_calls == 0 && original_preserved,
+            "unequal shared grids issue no NR Evaluate and preserve the original SR RGBA");
+      Check(upscaled.resolution_blocked && upscaled.pass_resolutions[0].requested_width == 16
+                && upscaled.pass_resolutions[1].requested_width == 12 && upscaled.pass_resolutions[1].requested_height == 12
+                && upscaled.pass_resolutions[2].requested_width == 16,
+            "the shared group detects 16x16, 12x12 Guide and 16x16 working grids");
+      evaluation = parameters;
+      const auto recovered_calls = evaluate_native();
+      const auto recovered_rgba = read_output("shared Upscaled grid recovery");
+      Check(recovered_calls == 3 && !upscaled.resolution_blocked && recovered_rgba.size() == rejected_rgba.size()
+                && recovered_rgba != rejected_rgba,
+            "restoring the 16x16 Guide recovers all three model calls and the edited output on the next SR");
+      for (size_t offset = 6; offset < recovered_rgba.size(); offset += 8) {
+        Check(std::memcmp(recovered_rgba.data() + offset, rejected_rgba.data() + offset, sizeof(uint16_t)) == 0,
+              "the recovered shared workset preserves every original FP16 alpha");
+      }
+      std::cout << "PASS shared Upscaled grid Guide=12x12 rejected_calls=0 original_rgba=1 recovery_guide=16x16 calls=3 evidence=WARP+MOCK\n";
+
+      native::stack_passes = 1;
+      const addon::presets::Json render{{"NRHookPoint", native::kHookRender}};
+      Check(native::last_source_plan.source_handle == sr && native::QueryConfigurationCapability(render).CanSubmit(),
+            "the ordinary native NGX source allows a Render configuration");
+      native::StreamlineCapture capture{.viewport = 1, .has_viewport = true, .has_constants = true,
+          .motion_scale_x = 1.f / 16.f, .motion_scale_y = 1.f / 16.f};
+      capture.color.resource = source.Get();
+      capture.color.state = NATIVE_INPUT_STATE;
+      capture.output.resource = output.Get();
+      capture.output.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      capture.motion.resource = wrapper_motion.Get();
+      capture.motion.state = NATIVE_INPUT_STATE;
+      capture.depth.resource = wrapper_depth.Get();
+      capture.depth.state = NATIVE_INPUT_STATE;
+      const auto record_fallback = [&] {
+        const addon::RuntimeLock lock(native::runtime_mutex);
+        return native::ProcessStreamlineInline(gpu.list.Get(), sl::kFeatureDLSS, capture);
+      };
+      const auto plan_before_fallback = native::last_source_plan.sequence;
+      native::hook_point = native::kHookRender;
+      const auto calls_before_render = model_calls;
+      const bool rendered = record_fallback();
+      const auto& observed = native::last_source_plan;
+      const auto* fallback = observed.source_handle;
+      const auto first_render_query = native::QueryConfigurationCapability();
+      Check(!rendered && model_calls == calls_before_render && observed.sequence > plan_before_fallback
+                && observed.plan.At(addon::stage_plan::Stage::RENDER).count == 1
+                && fallback != sr && native::synthetic_handles.contains(fallback)
+                && native::stage_source_api.load() == addon::capability::Api::DX12
+                && first_render_query.configuration.reason == addon::capability::Reason::BACKEND_UNSUPPORTED,
+            "the first declined Streamline Render request observes the fallback source before querying capability");
+      native::hook_point = native::kHookUpscaled;
+      const auto plan_before_upscaled = observed.sequence;
+      std::vector<addon::capability::Size> fallback_model_sizes;
+      const auto warm_fallback = [&](uint32_t expected_calls, const char* phase) {
+        for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8; ++attempt) {
+          fallback_model_sizes.clear();
+          gpu.list->ClearState(nullptr);
+          // Streamline supplies a finished image via tags, with no game NGX callback or success scope.
+          upload(output.Get(), source_values, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 16 * 8);
+          const auto nr_before = model_calls;
+          if (record_fallback() && model_calls == nr_before + expected_calls) return read_output(phase);
+          submit_commands("warm Streamline Upscaled fallback");
+          native::DrainRetiredResources(true);
+        }
+        return std::vector<uint8_t>{};
+      };
+      const auto fallback_rgba = warm_fallback(1, "Streamline Upscaled fallback delivery");
+      Check(fallback_rgba.size() == rejected_rgba.size() && fallback_rgba != rejected_rgba,
+            "the standalone Streamline fallback delivers a real Upscaled edit");
+      Check(observed.sequence > plan_before_upscaled && observed.plan.valid && observed.plan.At(STAGE).count == 1
+                && observed.source_handle == fallback && !native::create_contracts.contains(fallback),
+            "Upscaled resumes actual delivery on the same synthetic Streamline source");
+      const auto fallback_render = native::QueryConfigurationCapability(render);
+      Check(native::QueryConfigurationCapability().CanSubmit() && !fallback_render.CanSubmit()
+                && fallback_render.configuration.reason == addon::capability::Reason::BACKEND_UNSUPPORTED,
+            "the observed Streamline fallback admits Upscaled and rejects DLSS Render");
+
+      native::stack_passes = 2;
+      native::pass_resolution_mode[0] = 2u;
+      native::pass_resolution_scale[0] = .75f;
+      const auto split = native::QueryConfigurationCapability();
+      constexpr addon::capability::Size full_grid{.width = 16, .height = 16};
+      constexpr addon::capability::Size tail_grid{.width = 12, .height = 12};
+      Check(split.CanSubmit() && split.group_count == 1 && split.groups[0].independent_sizes_allowed
+                && split.working_sizes[0] == full_grid && split.working_sizes[1] == tail_grid,
+            "Streamline fallback admits the existing independent Upscaled working grids");
+      {
+        funnel_accounting_tests::Restore model_restore;
+        model_restore.Value(&model_parameter_observer);
+        model_parameter_observer = [&](const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter* block) {
+          auto* input = native::GetD3D12Resource(block, "DLSSNR.Color");
+          Check(input != nullptr, "the Streamline fallback model receives a real color texture");
+          const auto desc = input->GetDesc();
+          fallback_model_sizes.push_back({.width = static_cast<uint32_t>(desc.Width), .height = desc.Height});
+        };
+        const auto split_rgba = warm_fallback(2, "Streamline split Upscaled fallback delivery");
+        Check(fallback_model_sizes.size() == 2 && fallback_model_sizes[0] == full_grid && fallback_model_sizes[1] == tail_grid
+                  && split_rgba.size() == rejected_rgba.size() && split_rgba != rejected_rgba,
+              "Streamline fallback delivers two model calls on the 16x16 and 12x12 worksets and edits the full SR output");
+      }
+      std::cout << "PASS Streamline split Upscaled calls=2 grids=16x16/12x12 evidence=WARP+MOCK\n";
+      native::stack_passes = 1;
+      {
+        funnel_accounting_tests::Restore present_restore;
+        present_restore.Atomic(&native::present_unpresented_evaluates);
+        present_restore.Value(&native::present_fallback_episode);
+        native::hook_point = native::kHookPresent;
+        native::edit_reuse_enabled = true;
+        const auto calls_before = model_calls;
+        const auto captures_before = native::present_captures.load();
+        const auto serial_before = native::present_capture_serial;
+        const bool served_inline = record_fallback();
+        submit_commands("Streamline ordinary Present guide capture");
+        const auto present = native::QueryConfigurationCapability();
+        const auto guides = std::ranges::find_if(native::present_guide_sets, [&](const auto& set) {
+          return set.source_handle == fallback && set.serial > serial_before;
+        });
+        Check(!served_inline && model_calls == calls_before && native::present_captures.load() == captures_before + 1
+                  && guides != std::end(native::present_guide_sets) && guides->motion != nullptr && guides->depth != nullptr
+                  && observed.source_handle == fallback && observed.plan.At(addon::stage_plan::Stage::PRESENT).count == 1
+                  && present.CanSubmit() && present.plan_reason == addon::stage_plan::Reason::NONE,
+              "ordinary Streamline Present captures guides with zero inline model calls and remains configurable");
+        const auto& feature = native::features.at(fallback);
+        Check(observed.source_generation == 0 && feature.source_generation == 0 && feature.sr_sequence == 0
+                  && !native::EditReuseSourceConfirmed(fallback, feature) && guides->base_frame.source == nullptr,
+              "ordinary Streamline Present guides carry no successful SR identity for strict edit reuse");
+        const addon::RuntimeLock lock(native::runtime_mutex);
+        native::ClearPresentSource(guides);
+        native::RetirePresentResource(&guides->motion);
+        native::RetirePresentResource(&guides->depth);
+        *guides = {};
+        native::DrainPresentRetired();
+      }
+      std::cout << "PASS Streamline first Render calls=0; ordinary Present captures=1 inline_calls=0 strict_source=0 evidence=WARP+MOCK\n";
+      native::hook_point = native::kHookUpscaled;
+      native::edit_reuse_enabled = false;
+      evaluate_native(true);
+      submit_commands("nested native NGX source after Streamline fallback");
+      Check(native::last_source_plan.source_handle == sr && native::QueryConfigurationCapability(render).CanSubmit(),
+            "a nested native NGX Evaluate restores native Render eligibility while the fallback stream still exists");
+      native::real_streamline_free[0] = +[](sl::Feature, const sl::ViewportHandle&) { return sl::Result::eOk; };
+      Check(native::HookedStreamlineFreeResources<0>(sl::kFeatureDLSS, sl::ViewportHandle(capture.viewport)) == sl::Result::eOk
+                && !native::synthetic_handles.contains(fallback) && !native::features.contains(fallback),
+            "Streamline free releases the fallback source and its synthetic identity");
+      Check(NVSDK_NGX_SUCCEED(native::HookedReleaseFeatureSlot<0>(sr)), "release the native source after the fallback contrast");
+      native::DrainRetiredResources(true);
+      std::cout << "PASS standalone Streamline Upscaled delivery and native/Streamline Render capability contrast evidence=WARP+MOCK\n";
     }
 
     const auto* owner = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xED170});

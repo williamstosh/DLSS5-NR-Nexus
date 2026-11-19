@@ -323,9 +323,6 @@ inline std::vector<Difference> Preview(const presets::Document& document, bool c
       row.status = "Skipped (outside scope)";
     } else if (!ValidateValue(*rule, value)) {
       row.status = "Invalid value";
-    } else if (key == "NRHookPoint" && value == kHookPresent
-               && (vulkan_present_seen.load() || (D3D11OnlySession() && !Dx11NativeRoute()) || present_unusable.load())) {
-      row.status = "Unsupported";
     } else if (rule->category == presets::FieldRule::Category::COMPATIBILITY && !compatibility) {
       row.status = "Skipped (compatibility)";
     } else if (row.before != row.after || inherited_scope) {

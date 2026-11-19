@@ -762,7 +762,12 @@ int main(int argc, char** argv) {
         static CopyRegion original_copy = nullptr;
         static ID3D11DeviceContext4* observed_context = raw_context;
         static ID3D11Resource* observed_output = output.Get();
+        static ID3D11Resource* observed_motion = rg16.Get();
+        static ID3D11Resource* observed_depth = depth_direct.Get();
         static uint32_t bridge_copies = 0;
+        static uint32_t motion_copies = 0;
+        static uint32_t depth_copies = 0;
+        static uint32_t output_uploads = 0;
         static uint32_t output_copies = 0;
         renodx::utils::vtable::Slot<CopyRegion> copy_slot{
             .object = raw_context,
@@ -773,7 +778,13 @@ int main(int argc, char** argv) {
               original_copy(observed, dst, dst_subresource, x, y, z, src, src_subresource, box);
               if (observed == observed_context) {
                 ++bridge_copies;
-                if (dst == observed_output) {
+                if (src == observed_motion) {
+                  ++motion_copies;
+                } else if (src == observed_depth) {
+                  ++depth_copies;
+                } else if (src == observed_output) {
+                  ++output_uploads;
+                } else if (dst == observed_output) {
                   ++output_copies;
                 }
               }
@@ -819,12 +830,33 @@ int main(int argc, char** argv) {
           frame();
           Check(model_calls - calls_before == calls && output_copies - copies_before == 1,
               "each complete Bridge frame copies back once, including zero-Evaluate reuse");
+          const auto done = native::bridge.fence_done12->GetCompletedValue();
+          Check(done != UINT64_MAX && done >= native::bridge_submitted_value.load(),
+              "each Bridge copy-back has real D3D12 done");
           if (calls != 0 && reset >= 0) {
             Check(model_observations.back().reset == reset, "Bridge model consumes the expected History Reset");
           }
           auto pixels = consume_output();
           edited_pixels(pixels);
           return pixels;
+        };
+        using native::EditReuseBlock;
+        using native::EditReuseDelivery;
+        constexpr auto upscaled = renodx::addons::dlss5::stage_plan::Stage::UPSCALED;
+        const auto monitor_matches = [&](EditReuseDelivery delivery, EditReuseBlock reason = EditReuseBlock::NONE) {
+          const auto& feature = native::features.at(handle);
+          const auto& latest = feature.edit_reuse_monitor[0];
+          if (latest.sequence != feature.sr_sequence || latest.source_generation != feature.source_generation
+              || latest.configuration != native::configuration_generation.load()
+              || latest.reset_epoch != native::history_reset_epoch.load() || latest.stage != upscaled
+              || latest.device != renodx::utils::directx::NativeIdentity(device.Get())
+              || latest.handed_off != (delivery != EditReuseDelivery::NONE)
+              || latest.delivery != delivery || latest.reason != reason) return false;
+          if (delivery == EditReuseDelivery::REFRESH) return true;
+          // The monitor displays delivered reuse, while refresh only updates the frame receipt.
+          const auto observed = native::ReadDeliveredEditReuse(feature.edit_reuse_monitor, feature.source_generation,
+              feature.sr_sequence, upscaled, native::SteadyNowNs());
+          return observed.delivery == delivery && observed.reason == reason;
         };
         if (edit_reuse_production) {
           const auto& warm_feature = native::features.at(handle);
@@ -834,12 +866,26 @@ int main(int argc, char** argv) {
           const uint64_t warm_anchor = anchor_before->anchor_generation;
           uint64_t anchor_base = 0;
           std::vector<unsigned char> refresh_pixels;
+          bool monitor_deliveries_match = true;
           parameters.Set(NVSDK_NGX_Parameter_Reset, 1);
           for (uint32_t index = 0; index < 4; ++index) {
             if (index == 1) native::d3d12_swapchain_seen.store(true);
             const bool refresh = index % 2 == 0;
-            const auto previous_anchor = native::features.at(handle).slots[0].edit_reuse->anchor_generation;
+            const bool monitor_on = index != 2;
+            native::monitor_requested.store(monitor_on);
+            const auto& prior_feature = native::features.at(handle);
+            const auto previous_anchor = prior_feature.slots[0].edit_reuse->anchor_generation;
+            const auto prior_monitor_sequence = prior_feature.edit_reuse_monitor[0].sequence;
+            const auto prior_monitor_ns = prior_feature.edit_reuse_monitor[0].recorded_ns;
             const auto calls_before = model_calls;
+            const auto copies_before = bridge_copies;
+            const auto motion_before = motion_copies;
+            const auto depth_before = depth_copies;
+            const auto uploads_before = output_uploads;
+            const auto returns_before = output_copies;
+            const auto queue_waits_before = native::bridge_waits.load();
+            const auto return_waits_before = native::bridge_waits11.load();
+            const auto input_signals_before = native::bridge_signals.load();
             const auto pixels = expect_frame(refresh ? 1u : 0u, index == 0 ? 1 : 0);
             parameters.Set(NVSDK_NGX_Parameter_Reset, 0);
             const auto& feature = native::features.at(handle);
@@ -867,8 +913,46 @@ int main(int argc, char** argv) {
                 .history = anchor->source_sequence - warm_sequence, .anchor_base = anchor_base,
                 .anchor_generation = anchor->anchor_generation - warm_anchor, .anchor_age = base - anchor_base,
                 .complete = true}, pixels);
+            const auto copies = bridge_copies - copies_before;
+            const auto motion = motion_copies - motion_before;
+            const auto depth = depth_copies - depth_before;
+            const auto uploads = output_uploads - uploads_before;
+            const auto returns = output_copies - returns_before;
+            const auto queue_waits = native::bridge_waits.load() - queue_waits_before;
+            const auto return_waits = native::bridge_waits11.load() - return_waits_before;
+            const auto input_signals = native::bridge_signals.load() - input_signals_before;
+            std::cout << "BRIDGE_MONITOR_COST frame=" << base << " requested=" << monitor_on
+                      << " copies=" << copies << " mv=" << motion << " depth=" << depth
+                      << " output_upload=" << uploads << " output_return=" << returns << " queue_waits=" << queue_waits
+                      << " return_waits=" << return_waits << " input_signals=" << input_signals << '\n';
+            Check(copies == 4 && motion == 1 && depth == 1 && uploads == 1 && returns == 1
+                      && queue_waits == 1 && return_waits == 1 && input_signals == 1,
+                "each warmed Bridge frame uses the same copies and fence operations with monitor On or Off");
+            if (monitor_on) {
+              const auto delivery = (refresh ? EditReuseDelivery::REFRESH : EditReuseDelivery::REUSED);
+              monitor_deliveries_match &= monitor_matches(delivery);
+            } else {
+              const auto& latest = feature.edit_reuse_monitor[0];
+              Check(latest.sequence == prior_monitor_sequence && latest.recorded_ns == prior_monitor_ns,
+                  "monitor Off leaves the last Bridge delivery receipt untouched");
+            }
           }
+          Check(monitor_deliveries_match, "copied-back Bridge refresh and reuse publish the current D3D11 monitor delivery");
           native::d3d12_swapchain_seen.store(false);
+
+          const auto saved_upsample = native::look_upsample.load();
+          for (const auto upsample : {renodx::addons::dlss5::look::kUpsampleAreaInput, saved_upsample}) {
+            const auto epoch = native::history_reset_epoch.load();
+            native::look_upsample = upsample;
+            expect_frame(1, 1);
+            const auto& feature = native::features.at(handle);
+            const auto& receipt = feature.edit_reuse_monitor[0];
+            Check(native::history_reset_epoch.load() > epoch && receipt.handed_off
+                      && receipt.sequence == feature.sr_sequence && receipt.reset_epoch == native::history_reset_epoch.load(),
+                "Bridge delivery carries the actual model epoch after a Look input change advances Reset");
+            std::cout << "BRIDGE_MONITOR_EPOCH current=" << native::history_reset_epoch.load()
+                      << " receipt=" << receipt.reset_epoch << " model_reset=" << model_observations.back().reset << '\n';
+          }
 
           {
             ComPtr<ID3D11Device> other_device;
@@ -917,6 +1001,8 @@ int main(int argc, char** argv) {
           Check(output_copies == rejected_copies && model_calls == rejected_calls
                     && native::bridge_submitted_value.load() == rejected_submit && consume_output() == original,
               "a failed original SR advances the attempt sequence without NR submit or game Output copy-back");
+          Check(monitor_matches(EditReuseDelivery::NONE, EditReuseBlock::SR_FAILED),
+              "a failed original SR replaces the prior delivered reuse with its actual failure reason");
           expect_frame(1, 1);
         }
 
@@ -963,6 +1049,10 @@ int main(int argc, char** argv) {
                   << " consumed_sr=" << (consumed_pixels == original)
                   << " completion_wait_ns=" << native::bridge_completion_wait_ns - wait_ns_before << '\n';
 
+        if (edit_reuse_production) {
+          Check(monitor_matches(EditReuseDelivery::NONE, EditReuseBlock::ORDER),
+              "the watchdog publishes an order rejection while GPU done and copy-back are pending");
+        }
         Check(SUCCEEDED(stalled->Signal(1)), "release the ordinary Bridge test gate");
         stall_release.gate = nullptr;
         WaitForGpu(native::bridge.fence_done12, pending);
@@ -972,9 +1062,14 @@ int main(int argc, char** argv) {
         Check(after_done == original && output_copies == copies_before, "late NR completion leaves game Output intact");
 
         if (edit_reuse_production) {
+          Check(monitor_matches(EditReuseDelivery::NONE, EditReuseBlock::ORDER),
+              "late GPU done leaves the undelivered Bridge monitor frame rejected");
           expect_frame(1, 1);
           Check(native::bridge_submitted_value.load() == pending + 1, "the first real frame after GPU done refreshes and delivers");
+          Check(monitor_matches(EditReuseDelivery::REFRESH), "Bridge monitor recovers with the next delivered refresh");
           expect_frame(0, 0);
+          Check(monitor_matches(EditReuseDelivery::REUSED), "the next delivered Bridge reuse is visible again");
+          native::monitor_requested.store(false);
         } else {
           frame();
           Check(native::bridge_submitted_value.load() == pending + 1 && model_calls == calls_before + 2,

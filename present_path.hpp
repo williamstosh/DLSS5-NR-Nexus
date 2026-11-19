@@ -2885,6 +2885,10 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
   bool submitted = false;
   NrRecording recording;
   const auto cancel = [&](int*) {
+    if (identified_frame && !base_frame && !submitted) {
+      stream.base_frame_clock.complete = false;
+      stream.base_history_unbound = true;
+    }
     if ((!mixed && !independent_pair && !base_frame && !identified_frame) || !recording_started || submitted) return;
     // CPU-side NGX/state ledgers may have advanced even if Close failed.
     // Discard the recording and retire its private state before another try.
@@ -2966,19 +2970,13 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
       present_order = std::unique_lock(base_order->submit_mutex, std::try_to_lock);
       frame_ordered = present_order && base_order->entered.load() == guides->base_frame.queue_entry;
     }
-    if (!frame_ordered) {
+    if (base_frame && !frame_ordered) {
       stream.base_frame_clock.complete = false;
       stream.base_history_unbound = true;
-      if (!base_frame) {
-        // Preserve Every present execution, but do not attribute a later BB
-        // write to the SR whose producer receipt was inspected earlier.
-        target.base_frame = {};
-      } else {
-        ++edit_reuse_fallbacks;
-        CountNrDecline(NrDeclineReason::kPresentBaseUnproven);
-        PublishPresentBaseRejection(&stream, guides->base_frame.backbuffer, target.hdr_color_space);
-        return false;
-      }
+      ++edit_reuse_fallbacks;
+      CountNrDecline(NrDeclineReason::kPresentBaseUnproven);
+      PublishPresentBaseRejection(&stream, guides->base_frame.backbuffer, target.hdr_color_space);
+      return false;
     }
   }
   // After the capture's copies: only this queue's own tokens are left here,
@@ -3006,7 +3004,7 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
   submitted = true;
   slot->value = ++present_ring.submitted;
   const bool signaled = SUCCEEDED(native_queue->Signal(present_ring.fence, slot->value));
-  if (identified_frame && !signaled) {
+  if (base_frame && !signaled) {
     stream.base_frame_clock.complete = false;
     stream.base_history_unbound = true;
   }
@@ -3050,12 +3048,18 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     }
   }
   ++stream.nr_presents;
-  if (!identified_frame && present_frame_policy::Known(stream.base_frame_clock.frame)) {
-    stream.base_history_unbound = true;
-  }
   if (identified_frame && !base_frame) {
     const auto group_result = PresentGroupResult(std::span{&recording, 1}, 1, false);
-    present_frame_policy::Publish(&stream.base_frame_clock, target.base_frame, signaled && frame_ordered, group_result.complete);
+    if (signaled && frame_ordered && group_result.complete) {
+      present_frame_policy::Observe(&stream.base_frame_clock, target.base_frame);
+      present_frame_policy::Publish(&stream.base_frame_clock, target.base_frame, true, true);
+      stream.base_history_unbound = false;
+    } else {
+      stream.base_frame_clock.complete = false;
+      stream.base_history_unbound = true;
+    }
+  } else if (!identified_frame && stream.base_frame_epoch != 0) {
+    stream.base_history_unbound = true;
   }
   if (guides != nullptr) {
     stream.consumed_serial = guides->serial;
@@ -3783,14 +3787,8 @@ inline ClaimedPresentFrame IdentifyPresentBaseFrame(ID3D12CommandQueue* native_q
     }
   }
   frame.queue_entry = order->producer_entry;
-  gate.unlock();
-  const auto previous = stream->base_frame_clock.frame;
-  const auto claim = present_frame_policy::Observe(&stream->base_frame_clock, current);
+  const auto claim = present_frame_policy::Classify(stream->base_frame_clock, current);
   if (claim != present_frame_policy::Claim::NEW_FRAME) return {};
-  if (present_frame_policy::NeedsReset(previous, current, previous.sequence, false, stream->base_history_unbound)) {
-    ResetPresentStreamHistory(stream);
-  }
-  stream->base_history_unbound = false;
   return {.guides = guides, .order = order, .frame = current, .claim = claim};
 }
 
@@ -3811,6 +3809,12 @@ inline bool RunPresentBaseFrame(ID3D12CommandQueue* native_queue, reshade::api::
     CountNrDecline(NrDeclineReason::kPresentRepeat);
     return stream.base_frame_clock.complete && guides->serial == stream.consumed_serial;
   }
+  const auto previous = stream.base_frame_clock.frame;
+  present_frame_policy::Observe(&stream.base_frame_clock, identified.frame);
+  if (present_frame_policy::NeedsReset(previous, identified.frame, previous.sequence, false, stream.base_history_unbound)) {
+    ResetPresentStreamHistory(&stream);
+  }
+  stream.base_history_unbound = false;
   const auto& contract = guides->contract;
   auto& block = FillPresentBlock(&stream, back, guides->motion, guides->depth, contract,
       guides->output_width, guides->output_height, 1.f, contract.frame_reset, false, guides->source_handle);
@@ -4617,9 +4621,6 @@ inline void RunPresentPath(
     renodx::utils::directx::NativeFromReShadeProxy(&native_queue);
     queue->flush_immediate_command_list();
     identified = IdentifyPresentBaseFrame(native_queue, &stream, back, target);
-    if (identified.guides == nullptr) {
-      stream.base_frame_clock.complete = false;
-    }
   } else {
     InvalidatePresentBaseFrames(&stream);
   }
@@ -4639,10 +4640,19 @@ inline void RunPresentPath(
       }
     }
   }
-  PresentGuideSet* guides = nullptr;
+  // An ordered SR-to-BB proof identifies both the color and its guides.
+  // The latest compatible capture is only a fallback for the legacy path.
+  auto* guides = identified.guides;
+  if (guides == nullptr || !fresh(*guides) || (comparing_clean_frame && guides->serial != comparison_serial)) {
+    identified = {};
+    guides = nullptr;
+  }
+  if (identified.claim != present_frame_policy::Claim::REPEATED) {
+    stream.base_frame_clock.complete = false;
+  }
   std::vector<std::pair<FenceRef, uint64_t>> waits;
   uint64_t in_flight_serial = 0;
-  if (guides_mode != kPresentGuidesNever) {
+  if (guides == nullptr && guides_mode != kPresentGuidesNever) {
     const ID3D12Fence* own_fence = nullptr;
     if (!d3d11) {
       std::shared_lock map(queue_completion_mutex);
@@ -4723,14 +4733,19 @@ inline void RunPresentPath(
     // frame retires the uncertainty from an earlier inline fallback.
     present_inline_fallback_pending = false;
   }
-  if (guides != nullptr && guides == identified.guides) {
-    target.base_frame = identified.frame;
-  }
   const bool new_frame = guides != nullptr && guides->serial != stream.consumed_serial;
   if (present_frames.load() == 1 && guides != nullptr && !new_frame) {
     gap.ran = true;
     CountNrDecline(NrDeclineReason::kPresentRepeat);
     return;
+  }
+  if (identified.guides != nullptr) {
+    target.base_frame = identified.frame;
+    const auto& previous = stream.base_frame_clock.frame;
+    if (identified.claim == present_frame_policy::Claim::NEW_FRAME
+        && present_frame_policy::NeedsReset(previous, identified.frame, previous.sequence, false, stream.base_history_unbound)) {
+      ResetPresentStreamHistory(&stream);
+    }
   }
 
   if (guides == nullptr && d3d11) {
@@ -4877,8 +4892,7 @@ inline void RunPresentPath(
   }
 
   gap.ran = SubmitPresentGroup(native_queue, queue, slot, stream, block,
-                               guides, target, neutral_model, waits,
-                               identified.guides == guides ? identified.order.get() : nullptr);
+                               guides, target, neutral_model, waits, identified.order.get());
 }
 
 inline void OnNativePresentObserved(IDXGISwapChain* swapchain, UINT flags,

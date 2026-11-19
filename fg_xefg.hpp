@@ -1440,12 +1440,15 @@ struct PresentFrame {
   bool continuing_submission = false;
   uint64_t service_stats_serial = 0;
   Result service_result = Result::NOT_SERVED;
+  void (*on_service_failure)(const FrameInput&) noexcept = nullptr;
   bool repeated = false;
 #if defined(NR_NEXUS_DEV_CONTROL)
   edit_fg_observation::Ticket edit_fg_ticket;
   int64_t edit_fg_return_ns = 0;
 #endif
 };
+
+inline thread_local PresentFrame* recording_service = nullptr;
 
 #if defined(NR_NEXUS_DEV_CONTROL)
 inline void ObserveEditPresent(PresentFrame* present, IDXGISwapChain* swapchain,
@@ -1605,13 +1608,20 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
   }
   const auto callback = service.load(std::memory_order_acquire);
   if (callback != nullptr && copies_ordered) {
+    auto* const previous = std::exchange(recording_service, &present);
     present.service_result = callback(present.input);
+    recording_service = previous;
   }
   return present;
 }
 
 inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL) {
   if (present->context == nullptr) return;
+  const bool failed_delivery = present->service_result == Result::SUBMITTED
+      && present->on_service_failure != nullptr && FAILED(present_result);
+  if (failed_delivery) {
+    present->on_service_failure(present->input);
+  }
   uint64_t value = 0;
   bool needs_consumer_fence = false;
   {
@@ -1661,7 +1671,12 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL) {
   context.interval_submitted += present->service_result == Result::SUBMITTED;
   if (present->service_result == Result::SUBMITTED) {
     submitted_frames.fetch_add(1, std::memory_order_relaxed);
-    if (context.epoch == present->input.epoch) context.last_submission_frame = present->input.application_frame;
+    if (context.epoch == present->input.epoch && context.application_frame == present->input.application_frame) {
+      context.last_submission_frame = (failed_delivery ? 0 : present->input.application_frame);
+      if (failed_delivery) {
+        PublishResult(Result::FAILED);
+      }
+    }
   }
   if (has_status) {
     context.interval_displayed += status.frames_presented;
@@ -1690,6 +1705,8 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL) {
     const char* last_nr_route_reason = "not_served";
     if (!present->service_owned) {
       last_nr_route_reason = (present->input.fg_enabled ? "nr_off" : "fg_off");
+    } else if (failed_delivery) {
+      last_nr_route_reason = "sdk_present_failed";
     } else if (present->service_result == Result::FAILED) {
       last_nr_route_reason = "failed";
     } else if (present->service_result == Result::SUBMITTED) {
@@ -2564,6 +2581,14 @@ inline std::array<void*, EXPORTS.size()> SdkDetours() {
   };
 }
 }  // namespace internal
+
+inline void SetPresentFailureHandler(const FrameInput& input, void (*callback)(const FrameInput&) noexcept) {
+  // Register on this borrow only, so direct service calls and other contexts
+  // cannot attach their recovery to an unrelated SDK Present.
+  if (auto* present = internal::recording_service; present != nullptr && &present->input == &input) {
+    present->on_service_failure = callback;
+  }
+}
 
 #if defined(NR_NEXUS_DEV_CONTROL)
 // Snapshot only: reading events neither consumes them nor changes source/Off evidence.

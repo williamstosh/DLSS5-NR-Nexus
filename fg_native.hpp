@@ -9,6 +9,7 @@ namespace fg_service {
 
 struct Slot {
   present_frame_policy::Frame base_frame;
+  present_frame_policy::GroupResult base_frame_group;
   ID3D12CommandAllocator* allocator = nullptr;
   ID3D12GraphicsCommandList* list = nullptr;
   ID3D12Resource* color[2] = {};
@@ -1064,7 +1065,32 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
   }
   *output_ready = true;
   slot->base_frame = base_frame;
+  slot->base_frame_group = group_result;
   return fg::Result::PREPARED;
+}
+
+inline void OnXeFGPresentFailure(const fg::FrameInput& input) noexcept {
+  GuardHook([&] {
+    RuntimeLock lock(runtime_mutex);
+    const auto it = streams.find({false, input.context});
+    if (it == streams.end()) return;
+    auto& stream = it->second;
+    if (stream.epoch != input.epoch || stream.application_frame != input.application_frame
+        || stream.result != fg::Result::SUBMITTED) return;
+    // The private list was submitted on the SDK queue. Keep its slot and
+    // receipts while making the next application frame start fresh history.
+    stream.base_frame_clock.complete = false;
+    stream.result = fg::Result::FAILED;
+    for (auto& receipt : stream.edit_reuse_monitor) {
+      if (receipt.delivery_epoch == input.epoch && receipt.sequence == input.application_frame) {
+        receipt = {};
+      }
+    }
+    ResetPresentStreamHistory(&stream.roles[0]);
+    if (input.hudless != nullptr && input.hudless != input.backbuffer) {
+      ResetPresentStreamHistory(&stream.roles[1]);
+    }
+  });
 }
 
 inline fg::Result Service(const fg::FrameInput& input) noexcept {
@@ -1393,8 +1419,8 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
       return stream.result;
     }
     stream.result = fg::Result::SUBMITTED;
-    const auto group_result = PresentGroupResult(recordings, slot->base_frame.roles, slot->base_frame.reuse_edits);
-    present_frame_policy::Publish(&stream.base_frame_clock, slot->base_frame, true, group_result.complete);
+    present_frame_policy::Publish(&stream.base_frame_clock, slot->base_frame, true, slot->base_frame_group.complete);
+    fg::xefg::SetPresentFailureHandler(input, OnXeFGPresentFailure);
     if (recordings[0].edit_monitor_delivery != EditReuseDelivery::NONE && nr_input.hudless == nullptr) {
       const auto surface = renodx::utils::directx::NativeIdentity(input.backbuffer);
       StoreEditReuseMonitorFrame(&stream.edit_reuse_monitor, {
@@ -1482,10 +1508,8 @@ inline void OnNativeFgFeatureReleased(const NVSDK_NGX_Handle* handle) {
   fg_service::native_bindings.erase(binding);
 }
 
-inline void OnNativePresentStreamRetired(const void* owner) {
-#if defined(NR_NEXUS_DEV_CONTROL)
-  native_tag_source::Reset();
-#endif
+// Caller holds runtime_mutex. Native game list generations retain their uses.
+inline void RetireNativePresentOwner(const void* owner) {
   const auto context = reinterpret_cast<uintptr_t>(owner);
   for (auto binding = fg_service::native_bindings.begin(); binding != fg_service::native_bindings.end();) {
     if (binding->second == context) {
@@ -1506,6 +1530,13 @@ inline void OnNativePresentStreamRetired(const void* owner) {
     fg_service::Release(&entry->second);
     fg_service::streams.erase(entry);
   }
+}
+
+inline void OnNativePresentStreamRetired(const void* owner) {
+#if defined(NR_NEXUS_DEV_CONTROL)
+  native_tag_source::Reset();
+#endif
+  RetireNativePresentOwner(owner);
 }
 
 inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
@@ -2110,10 +2141,11 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
   }
   // NGX DLSS-FG requires NPS for every input on both direct and compute lists.
   constexpr auto input_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-  const bool same_sdk_frame = frame_id == 0 && stream.source_frame_id == 0
-      && native_sdk_present_input.decision_id != 0
+  const uint64_t sdk_decision = (owner->native_output_identity != nullptr
       && native_sdk_present_input.identity == owner->native_output_identity
-      && stream.source_sdk_decision == native_sdk_present_input.decision_id;
+      ? native_sdk_present_input.decision_id : 0);
+  const bool same_sdk_frame = frame_id == 0 && stream.source_frame_id == 0
+      && sdk_decision != 0 && stream.source_sdk_decision == sdk_decision;
   bool repeated_frame = ((frame_id != 0 && frame_id == stream.source_frame_id) || same_sdk_frame)
       && stream.cached != nullptr && stream.result == fg::Result::PREPARED
       && stream.source_backbuffer == backbuffer && stream.source_hudless == hudless && stream.source_ui == ui;
@@ -2131,6 +2163,12 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
   }
 #endif
   if (index > 1 || repeated_frame) {
+    if (!repeated_frame && frame_id == 0 && sdk_decision != 0 && stream.source_sdk_decision != 0
+        && stream.source_sdk_decision != sdk_decision) {
+      diagnostic.reason = "mfg_sdk_decision_mismatch";
+      display_recording.preserve_current = true;
+      return nullptr;
+    }
     diagnostic.reason = "mfg_cache_unavailable";
     if (stream.cached == nullptr && stream.result == fg::Result::PREPARED) {
       display_recording.result = fg::Result::PREPARED;
@@ -2365,8 +2403,7 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     stream.native_edit_ui_alpha = ui_alpha;
 #endif
     stream.source_frame_id = frame_id;
-    stream.source_sdk_decision = (native_sdk_present_input.identity == owner->native_output_identity
-        ? native_sdk_present_input.decision_id : 0);
+    stream.source_sdk_decision = sdk_decision;
     stream.result = fg::Result::PREPARED;
     stream.native_serial = native_fg_recording_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
     stream.native_display_epoch = display_epoch;
