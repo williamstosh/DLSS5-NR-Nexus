@@ -17561,7 +17561,6 @@ inline bool RecordInlinePreSR(
   const bool same_stage_stack = !plan.mixed && requested_stack > 1;
   bool edit_reuse_eligible = edit_reuse_requested && edit_sequence != 0
       && feature.source_feature == kFeatureDlss && EditReuseSourceConfirmed(handle, feature)
-      && feature.source_device11_identity == nullptr
       && queue_tracking_active.load(std::memory_order_relaxed)
       && !control_mask_eligible && UsesFixedEditReuseWorkset(feature, adaptive)
       && (same_stage_stack || CanCommitFullSizeEditReuse(feature, width, height, nr_input_width, nr_input_height))

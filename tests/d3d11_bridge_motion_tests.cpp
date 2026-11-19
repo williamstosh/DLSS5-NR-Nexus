@@ -988,6 +988,75 @@ int main(int argc, char** argv) {
       if (edit_reuse_production) {
         native::ngx11_slot_real[0].release = reinterpret_cast<void*>(&MotionReleaseSource);
         Check(NVSDK_NGX_SUCCEED(native::HookedReleaseFeature11Slot<0>(handle)), "production D3D11 release retires the tested source");
+
+        source_create_result = reinterpret_cast<NVSDK_NGX_Handle*>(uintptr_t{0xD512});
+        Check(NVSDK_NGX_SUCCEED(native::HookedCreateFeature11Slot<0>(context.Get(), native::kFeatureDlss, &parameters, &handle))
+                  && native::features.at(handle).sr_sequence == 0,
+            "Before-SR contrast starts with a new registered native D3D11 source");
+        native::hook_point.store(native::kHookRender);
+        const auto before_color = Read11(color.Get(), 8);
+        const auto refreshes = native::edit_reuse_refreshes.load();
+        const auto reuses = native::edit_reuse_reuses.load();
+        const auto before_sr = [&](bool reuse_requested, bool sr_succeeds, bool require_nr) {
+          native::edit_reuse_enabled.store(reuse_requested);
+          parameters.Set(NVSDK_NGX_Parameter_Reset, 0);
+          ++native::present_generation;
+          const auto prior_sequence = native::features.at(handle).sr_sequence;
+          const auto calls_before = model_calls;
+          uint32_t sr_calls = 0;
+          bool redirected = false;
+          std::vector<unsigned char> consumed;
+          const auto result = native::Ngx11Evaluate(0, "Before-SR sequence fallback", context.Get(), handle, &parameters, [&] {
+            ++sr_calls;
+            Check(native::features.at(handle).sr_sequence == prior_sequence + 1,
+                "native source sequence advances at the original SR call after Bridge's preceding NR");
+            auto* input = params::GetD3D11Resource(&parameters, NVSDK_NGX_Parameter_Color);
+            redirected = input != color.Get();
+            if (redirected) {
+              const auto done = native::bridge.fence_done12->GetCompletedValue();
+              Check(done != UINT64_MAX && done >= native::bridge_submitted_value.load(),
+                  "original SR consumes redirected Color only after actual Bridge GPU done");
+            }
+            context->CopyResource(output.Get(), input);
+            consumed = Read11(output.Get(), 8);
+            return (sr_succeeds ? NVSDK_NGX_Result_Success : NVSDK_NGX_Result_Fail);
+          });
+          const auto& source = native::features.at(handle);
+          const auto calls = model_calls - calls_before;
+          Check(sr_calls == 1 && NVSDK_NGX_SUCCEED(result) == sr_succeeds
+                    && source.source_device11_identity.Get() == renodx::utils::directx::NativeIdentity(device.Get())
+                    && source.slots[0].edit_reuse == nullptr && native::edit_reuse_refreshes.load() == refreshes
+                    && native::edit_reuse_reuses.load() == reuses,
+              "native Before-SR has no current tracked SR sequence: neither the first nor a later frame enters x2");
+          Check(params::GetD3D11Resource(&parameters, NVSDK_NGX_Parameter_Color) == color.Get()
+                    && params::GetD3D11Resource(&parameters, NVSDK_NGX_Parameter_Output) == output.Get()
+                    && params::GetD3D11Resource(&parameters, NVSDK_NGX_Parameter_MotionVectors) == rg16.Get()
+                    && params::GetD3D11Resource(&parameters, NVSDK_NGX_Parameter_Depth) == depth_direct.Get()
+                    && Read11(color.Get(), 8) == before_color,
+              "Before-SR success and failure restore original bindings and protect all original Color bytes");
+          if (require_nr) {
+            Check(calls == 1 && redirected && consumed != before_color,
+                "native Before-SR keeps one fresh NR Evaluate and gives its actual Color result to original SR");
+          }
+          std::cout << "OBS Bridge Before-SR request=" << reuse_requested << " prior_sequence=" << prior_sequence
+                    << " sequence=" << source.sr_sequence << " calls=" << calls << " redirected=" << redirected
+                    << " anchor=0 refreshes=0 reuses=0 restored=1 sr_success=" << sr_succeeds << '\n';
+          return std::pair{redirected, consumed};
+        };
+        bool warmed = false;
+        for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8 && !warmed; ++attempt) {
+          warmed = before_sr(false, true, false).first;
+        }
+        Check(warmed, "ordinary native Before-SR reaches its Color delivery");
+        const auto per_frame = before_sr(false, true, true).second;
+        for (uint32_t frame = 0; frame < 4; ++frame) {
+          Check(before_sr(true, true, true).second == per_frame,
+              "requesting x2 without a current Before-SR sequence preserves exact ordinary RGBA every frame");
+        }
+        before_sr(true, false, true);
+        Check(before_sr(true, true, true).second == per_frame,
+            "the next original SR recovers the same ordinary Color delivery after an SR rejection");
+        Check(NVSDK_NGX_SUCCEED(native::HookedReleaseFeature11Slot<0>(handle)), "Before-SR source releases through its real wrapper");
       }
       native::ReleaseBridge();
       check_debug_messages();
