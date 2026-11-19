@@ -447,7 +447,7 @@ F6 立即提示开关操作，随后状态更新为正在检查、正常运行�
 
 在**画质 → 核心画质**的工作分辨率设置下方，打开**隔帧编辑复用 x2（实验）**，无需重启。关闭后恢复常规 NR，Present 按所选帧处理策略运行。开关随画质方案和共享预设保存。已有 `[RenoDX.DLSS5]` 配置键 `NREditReuse` 继续有效。
 
-**v0.6.0 普通构建候选**沿用同一个开关。在**处理与兼容性 → 介入点**选择**超分后（Upscaled）**或**渲染（Render）**，可对符合条件的单层及同介入点多层组合启用 x2。模型按实际请求判断，可用 A、B 或解析为受支持模型的 Auto。Render 仍在每个基础帧运行原有 SR，Ray Reconstruction 走兼容的 Upscaled 路径。
+**v0.6.0 安装包**沿用同一个开关。在**处理与兼容性 → 介入点**选择**超分后（Upscaled）**或**渲染（Render）**，可对符合条件的单层及同介入点多层组合启用 x2。模型按实际请求判断，可用 A、B 或解析为受支持模型的 Auto。Render 仍在每个基础帧运行原有 SR，Ray Reconstruction 走兼容的 Upscaled 路径。
 
 复用需要 NR Runtime 310.9.16.0、可写的当帧 HDR 颜色和匹配的深度、运动矢量及两轴 jitter 偏移。每轴偏移最大半个渲染像素，运动矢量须排除 jitter。多层使用时域滤波时，各层须使用当前介入点的完整分辨率。任一层使用更小的工作尺寸时，整组按原设置逐帧处理。仅空间 Look 的异尺寸组可在满足复用条件时使用 x2。单层 Upscaled 在较低工作尺寸且只需普通双线性缩放时也可复用，需要低格 Look 传输时则逐帧处理。跨介入点或实际绑定区域遮罩时继续逐帧处理，自适应分辨率准备与切档沿用原处理流程。
 
@@ -1013,7 +1013,7 @@ When reuse is available, NR generates a new edit every two base frames and repro
 
 Under the working-resolution controls in **Quality → Core quality**, enable **x2 edit reuse (experimental)** without restarting. Turn it off to restore regular NR. Present follows the selected frame policy. The toggle is saved with quality profiles and shared presets. The existing `NREditReuse` key under `[RenoDX.DLSS5]` remains supported.
 
-**The standard v0.6.0 build candidate** uses the same switch. Under **Processing & compatibility → Hook point**, choose Upscaled (after SR) or Render (before SR) for eligible single-pass and same-hook multi-pass D3D12 configurations. Reuse follows the actual model request, which may be A, B or Auto resolving to a supported model. With Render, the game's SR still runs on every base frame. Ray Reconstruction uses the compatible Upscaled path.
+**The v0.6.0 package** uses the same switch. Under **Processing & compatibility → Hook point**, choose Upscaled (after SR) or Render (before SR) for eligible single-pass and same-hook multi-pass D3D12 configurations. Reuse follows the actual model request, which may be A, B or Auto resolving to a supported model. With Render, the game's SR still runs on every base frame. Ray Reconstruction uses the compatible Upscaled path.
 
 Reuse requires NR Runtime 310.9.16.0, writable HDR color for the current frame, matching depth and motion vectors, and both jitter offsets. Each offset may be up to half a render pixel. Motion vectors must exclude jitter. Multi-pass x2 with temporal filtering requires every pass to run at the hook point's full resolution. If any pass uses a smaller working resolution, the group runs every frame with its original settings. Eligible groups with mixed working resolutions and spatial-only Look can still reuse. Single-pass Upscaled can also reuse at a lower resolution with standard bilinear upsampling. It runs every frame when it needs lower-resolution Look transport. Mixed hook points and bound Region masks also run every frame. Adaptive resolution keeps its usual preparation and tier changes.
 
