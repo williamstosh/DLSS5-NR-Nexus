@@ -59,6 +59,9 @@ try {
         $summary.independent += @{name=$case;status='Passed';evidence='WARP+MOCK';receipt=$receipt
             executableSha256=(Get-FileHash -LiteralPath $executable).Hash}
     }
+    $summary['presentFrameTrace'] = & (Join-Path $PSScriptRoot 'check-present-frame-traces.ps1') `
+        -OrdinaryLog (Join-Path $OutputDirectory 'nr-edit-reuse-present-contracts/test.stdout.log') `
+        -XefgLog (Join-Path $OutputDirectory 'nr-edit-reuse-xefg-contracts/test.stdout.log')
     foreach ($input in $inputs) {
         if ((Get-FileHash -LiteralPath $input.path).Hash -cne $input.sha256) { throw "Core input changed: $($input.path)" }
     }
