@@ -146,12 +146,13 @@ struct ReceiptDeviceIdentity : IUnknown {
     return remaining;
   }
 };
-struct ReceiptSwapchain : IDXGISwapChain {
+struct ReceiptSwapchain : IDXGISwapChain3 {
   ULONG references = 1;
   uint32_t get_device_calls = 0;
   ComPtr<IUnknown> reported_device;
   ComPtr<IDXGISwapChain> native_swapchain;
   ComPtr<IUnknown> reported_device12;
+  ComPtr<IUnknown> current_back_buffer;
   HRESULT device11_result = S_OK;
   HRESULT device12_result = S_OK;
   bool null_device11 = false;
@@ -164,6 +165,11 @@ struct ReceiptSwapchain : IDXGISwapChain {
     *output = nullptr;
     if (iid == __uuidof(renodx::utils::directx::ReShadeRetrieveBaseInterface) && native_swapchain != nullptr) {
       return native_swapchain->QueryInterface(__uuidof(IDXGISwapChain), output);
+    }
+    if (iid == __uuidof(IDXGISwapChain3) && current_back_buffer != nullptr) {
+      *output = static_cast<IDXGISwapChain3*>(this);
+      AddRef();
+      return S_OK;
     }
     if (iid != IID_IUnknown && iid != __uuidof(IDXGIObject) && iid != __uuidof(IDXGIDeviceSubObject)
         && iid != __uuidof(IDXGISwapChain)) return E_NOINTERFACE;
@@ -210,7 +216,9 @@ struct ReceiptSwapchain : IDXGISwapChain {
   HRESULT STDMETHODCALLTYPE Present(UINT interval, UINT flags) override {
     return (present_callback != nullptr ? present_callback(this, interval, flags) : E_NOTIMPL);
   }
-  HRESULT STDMETHODCALLTYPE GetBuffer(UINT, REFIID, void**) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetBuffer(UINT index, REFIID iid, void** output) override {
+    return (index == 0 && current_back_buffer != nullptr ? current_back_buffer->QueryInterface(iid, output) : E_NOTIMPL);
+  }
   HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL, IDXGIOutput*) override { return E_NOTIMPL; }
   HRESULT STDMETHODCALLTYPE GetFullscreenState(BOOL*, IDXGIOutput**) override { return E_NOTIMPL; }
   HRESULT STDMETHODCALLTYPE GetDesc(DXGI_SWAP_CHAIN_DESC*) override { return E_NOTIMPL; }
@@ -219,6 +227,30 @@ struct ReceiptSwapchain : IDXGISwapChain {
   HRESULT STDMETHODCALLTYPE GetContainingOutput(IDXGIOutput**) override { return E_NOTIMPL; }
   HRESULT STDMETHODCALLTYPE GetFrameStatistics(DXGI_FRAME_STATISTICS*) override { return E_NOTIMPL; }
   HRESULT STDMETHODCALLTYPE GetLastPresentCount(UINT*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetDesc1(DXGI_SWAP_CHAIN_DESC1*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetHwnd(HWND*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetCoreWindow(REFIID, void**) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE Present1(UINT, UINT, const DXGI_PRESENT_PARAMETERS*) override { return E_NOTIMPL; }
+  BOOL STDMETHODCALLTYPE IsTemporaryMonoSupported() override { return FALSE; }
+  HRESULT STDMETHODCALLTYPE GetRestrictToOutput(IDXGIOutput**) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE SetBackgroundColor(const DXGI_RGBA*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetBackgroundColor(DXGI_RGBA*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE SetRotation(DXGI_MODE_ROTATION) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetRotation(DXGI_MODE_ROTATION*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE SetSourceSize(UINT, UINT) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetSourceSize(UINT*, UINT*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT*) override { return E_NOTIMPL; }
+  HANDLE STDMETHODCALLTYPE GetFrameLatencyWaitableObject() override { return nullptr; }
+  HRESULT STDMETHODCALLTYPE SetMatrixTransform(const DXGI_MATRIX_3X2_F*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetMatrixTransform(DXGI_MATRIX_3X2_F*) override { return E_NOTIMPL; }
+  UINT STDMETHODCALLTYPE GetCurrentBackBufferIndex() override { return 0; }
+  HRESULT STDMETHODCALLTYPE CheckColorSpaceSupport(DXGI_COLOR_SPACE_TYPE, UINT*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE SetColorSpace1(DXGI_COLOR_SPACE_TYPE) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE ResizeBuffers1(UINT, UINT, UINT, DXGI_FORMAT, UINT, const UINT*, IUnknown* const*) override {
+    return E_NOTIMPL;
+  }
 };
 xefg::BridgeSourceIdentity receipt_source;
 bool receipt_source_available = true;
@@ -431,10 +463,12 @@ void TestRouteDiagnostics(Gpu* gpu) {
   std::cout << "PASS last Present route/reason diagnostics: successful roles, SDK consumers, Off, skipped and failed\n";
 }
 }  // namespace
+#include "output_framerate_sdk_cases.hpp"
 int main(int argc, char** argv) {
   try {
     const bool bridge_off_cpu = argc == 2 && std::strcmp(argv[1], "--bridge-off-cpu") == 0;
     reshade::internal::get_reshade_module_handle(GetModuleHandleW(nullptr));
+    output_framerate_sdk_cases::Run();
     TestDiagnosticBudgets();
     std::cout << "PASS bounded XeFG contract diagnostics\n";
     fg::native_options::internal::state.real = &FakeOptions;

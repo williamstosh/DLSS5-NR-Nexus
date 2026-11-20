@@ -166,7 +166,7 @@ int Run() {
         if (verify_limited_commit && stream->second.adaptive_session->settings.limited_residency
             && stream->second.adaptive_frame.slot == stream->second.adaptive_session->level) {
           Check(stream->second.adaptive_session->status.applied == before_limited_commit
-              && stream->second.adaptive_session->applied_ns == 0,
+              && stream->second.adaptive_session->applied_generation != stream->second.adaptive_session->status.generation,
               "neither color nor an earlier Pass can commit the requested target before the complete Service output group");
         }
         bool identified = false;
@@ -247,6 +247,11 @@ int Run() {
       reset_pass_masks = {};
       const auto before_list_calls = list_calls.size();
       const auto result = native::fg_service::Service(input);
+      if (result == fg::Result::SUBMITTED) {
+        // This Service-only fixture supplies the consumer receipt explicitly.
+        // The XeFG proxy fixture covers issuing it after the original Present.
+        native::fg_service::OnXeFGPresentDelivery(input, true);
+      }
       for (size_t index = before_list_calls; index < list_calls.size(); ++index) {
         const auto& call = list_calls[index];
         bool closed_twice = false;
@@ -574,6 +579,14 @@ int Run() {
         "dual-color cold maturation observes partial Pass masks without treating them as a complete color group");
     const auto role_models = native::nr_features_created;
     const auto role_worksets = native::worksets_created;
+    const auto confirmed_generation = dual.adaptive_session->applied_generation;
+    const auto confirmed_at = dual.adaptive_session->applied_ns;
+    Check(confirmed_generation == dual.adaptive_session->status.generation && confirmed_at != 0,
+        "the complete dual-color upper has a final delivery receipt before the interruptions");
+    const auto retains_confirmation = [&] {
+      return dual.adaptive_session->applied_generation == confirmed_generation
+          && dual.adaptive_session->applied_ns == confirmed_at;
+    };
     auto paused_primary_readback = gpu.CreateTextureTransfer(color.Get());
     auto paused_auxiliary_readback = gpu.CreateTextureTransfer(hudless.Get());
     const auto seed_paused_colors = [&] {
@@ -617,12 +630,12 @@ int Run() {
     Check(service() == fg::Result::SUBMITTED && dual.adaptive_session->prepared
         && !dual.adaptive_role_unavailable && reset_pass_masks[0] == 3 && reset_pass_masks[1] == 3
         && dual.adaptive_session->status.ready_levels == 2
-        && dual.adaptive_session->stable_after_ns >= short_resume_ns + addon::adaptive_resolution::WARMUP_NS
+        && dual.adaptive_session->stable_after_ns >= short_resume_ns && dual.adaptive_session->gpu_count == 0
+        && retains_confirmation()
         && native::nr_features_created == role_models && native::worksets_created == role_worksets,
-        "both retained colors and both Passes resume with Reset and one new warmup without additional preparation allocation");
-    const auto short_resume_stable_ns = dual.adaptive_session->stable_after_ns;
-    Check(service() == fg::Result::SUBMITTED && dual.adaptive_session->stable_after_ns == short_resume_stable_ns,
-        "a subsequent healthy frame does not restart the resumed collection's warmup");
+        "both retained colors and both Passes resume with Reset and fresh comparison without reapplying the same confirmed tier");
+    Check(service() == fg::Result::SUBMITTED && retains_confirmation(),
+        "a subsequent healthy frame preserves the tier's first confirmed timestamp");
 
     seed_paused_colors();
     input.hudless = nullptr;
@@ -651,12 +664,12 @@ int Run() {
         && !dual.adaptive_role_unavailable && !dual.adaptive_session->failed
         && reset_pass_masks[0] == 3 && reset_pass_masks[1] == 3
         && dual.adaptive_session->status.ready_levels == 2
-        && dual.adaptive_session->stable_after_ns >= long_resume_ns + addon::adaptive_resolution::WARMUP_NS
+        && dual.adaptive_session->stable_after_ns >= long_resume_ns && dual.adaptive_session->gpu_count == 0
+        && retains_confirmation()
         && native::nr_features_created == role_models && native::worksets_created == role_worksets,
         "a long missing-input pause resumes both complete color/Pass groups with Reset and retained allocations");
-    const auto long_resume_stable_ns = dual.adaptive_session->stable_after_ns;
-    Check(service() == fg::Result::SUBMITTED && dual.adaptive_session->stable_after_ns == long_resume_stable_ns,
-        "continuous healthy output after a long pause preserves the resumed warmup deadline");
+    Check(service() == fg::Result::SUBMITTED && retains_confirmation(),
+        "continuous healthy output after a long pause preserves the tier's first confirmed timestamp");
 
     const auto dual_models = native::nr_features_created;
     const auto dual_worksets = native::worksets_created;
@@ -706,8 +719,17 @@ int Run() {
     native::kSetAdaptiveMinScale.Store(.8f);
     service();
     Check(primary->active == 0 && auxiliary->active == 0
-        && dual.adaptive_session->status.applied[0].width == 16 && !dual.adaptive_session->failed,
-        "a new minimum restores the complete legal upper group while the new selected endpoint prepares");
+        && dual.adaptive_session->status.requested == dual.adaptive_session->status.upper
+        && dual.adaptive_session->status.applied[0].width == 8
+        && dual.adaptive_session->applied_generation != dual.adaptive_session->status.generation
+        && !dual.adaptive_session->failed,
+        "a new minimum renders the legal upper while the newly selected collection prepares");
+    for (uint32_t frame = 0; frame < 20 && dual.adaptive_session->applied_generation != dual.adaptive_session->status.generation; ++frame) {
+      service();
+    }
+    Check(dual.adaptive_session->prepared && dual.adaptive_session->applied_generation == dual.adaptive_session->status.generation
+        && dual.adaptive_session->status.applied == dual.adaptive_session->status.upper,
+        "the eligible upper confirms after preparation and complete dual-color delivery");
 
     native::kSetPassPreset[0].Store(1.f);
     native::ApplySettingEffect(native::kSetPassPreset[0].effect);
@@ -959,7 +981,8 @@ int Run() {
     verify_limited_commit = false;
     Check(limited_primary->active == 3 && limited_auxiliary->active == 3 && limited.adaptive_session->TargetReady()
         && limited.adaptive_session->status.applied == limited.adaptive_session->ladder.sizes[3]
-        && limited.adaptive_session->applied_ns != 0 && !limited.adaptive_session->prepared
+        && limited.adaptive_session->applied_generation == limited.adaptive_session->status.generation
+        && !limited.adaptive_session->prepared
         && native::nr_features_created == before_limited_models + 8,
         "only complete successful output for both colors commits a cold target and starts its measurement warmup");
     limited.adaptive_session->Request(2, native::SteadyNowNs());

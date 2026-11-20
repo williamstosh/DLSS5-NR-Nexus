@@ -8,23 +8,34 @@ $repo = Split-Path $PSScriptRoot -Parent
 $OutputDirectory = Initialize-TestOutput $OutputDirectory
 $previousCl = $env:CL
 $outcome = 'Failed'
-$policySuites = @('edit-reuse-policy','present-frame-policy','capability-policy')
+$policySuites = @('edit-reuse-policy','present-frame-policy','capability-policy','adaptive-resolution')
 $suites = @('native','sdr-policy','hdr-policy','scope','config','constants','stage-plan') +
-    $policySuites + @('adaptive-resolution','copy-slots','lifecycle','fg-native')
+    $policySuites + @('copy-slots','lifecycle','fg-native')
 $independentCases = [ordered]@{
     'native-prefg-resolution'='^PASS native-prefg-resolution hardware=0 steady_pairs_observed='
     'present-chain'='^PASS B1 WARP format=DXGI_FORMAT_R8G8B8A8_UNORM source_input='
+    'adaptive-status'='^PASS case=adaptive-status evidence=MOCK$'
+    'output-framerate-registration'='^PASS case=output-framerate-registration evidence=WARP\+MOCK dev=0$'
+    'output-framerate-sdk'='^PASS output SDK callback ownership and count provenance evidence=MOCK$'
     'native-options-delayed'='^PASS case=native-options-delayed evidence=WARP\+MOCK dev=0$'
     'nr-edit-reuse-contracts-public'='^PASS case=nr-edit-reuse-contracts-public evidence=WARP\+MOCK dev=0$'
     'nr-edit-reuse-render-contracts'='^PASS case=nr-edit-reuse-render-contracts evidence=WARP\+MOCK dev=0$'
     'nr-edit-reuse-present-contracts'='^PASS case=nr-edit-reuse-present-contracts evidence=WARP\+MOCK dev=0$'
     'nr-edit-reuse-xefg-contracts'='^PASS case=nr-edit-reuse-xefg-contracts evidence=WARP\+MOCK dev=0$'
 }
+$adaptiveContractReceipts = @{
+    'nr-edit-reuse-render-contracts'='^ADAPTIVE_DELIVERY_RENDER evidence=WARP\+MOCK rejected_sr_color_restored=1 recovered_reset=1$'
+    'nr-edit-reuse-present-contracts'=@(
+        '^ADAPTIVE_DELIVERY_PRESENT evidence=WARP\+MOCK failed_signal_writes=1 recovered_reset=1 base_claim_delta=0$'
+        '^ADAPTIVE_OUTPUT_SOURCE evidence=WARP\+MOCK framed_tags=1 legacy_tags=1 actual_sr=1 release_revoked=1$'
+    )
+    'nr-edit-reuse-xefg-contracts'='^ADAPTIVE_DELIVERY_XEFG evidence=WARP\+MOCK rejected_proxy=1 restored_anchor=1 late_receipt=ignored$'
+}
 $devCases = @('nr-edit-reuse-native-contracts','native-present-decision')
 $summary = [ordered]@{ schema='nr-nexus-ci-core/1'; status='Running'
     sourceCommit=(& git --no-optional-locks -C $repo rev-parse HEAD)
     sourceTree=(& git --no-optional-locks -C $repo rev-parse 'HEAD^{tree}')
-    evidence='STATIC / CPU / WARP+MOCK'; suites=$suites; independent=@() }
+    evidence='STATIC / CPU / MOCK / WARP+MOCK'; suites=$suites; independent=@() }
 
 function Get-CoreCaseReceipt([string]$Case, [string]$Stdout, [string]$Pattern) {
     # A mistyped flag can return zero after running the default FG group.
@@ -51,16 +62,26 @@ try {
     $inputs = @(Get-Content -LiteralPath (Join-Path $fg 'inputs.json') -Raw | ConvertFrom-Json)
     $summary['adaptiveInlineReceipt'] = Get-CoreCaseReceipt 'adaptive-inline' (Join-Path $fg 'adaptive-inline.stdout.log') `
         '^PASS case=adaptive-inline evidence=WARP\+MOCK dev=0$'
+    $summary['adaptiveFgServiceReceipt'] = Get-CoreCaseReceipt 'adaptive-fg-service' (Join-Path $fg 'adaptive-fg-service.stdout.log') `
+        '^PASS adaptive single/dual-color two-Pass Service evidence=WARP\+MOCK frames=[0-9]+ source_successes=[0-9]+ model_calls=[0-9]+ preparation_calls=[0-9]+ preparation_failures=[0-9]+$'
     foreach ($case in $independentCases.Keys) {
         foreach ($input in $inputs) {
             if ((Get-FileHash -LiteralPath $input.path).Hash -cne $input.sha256) { throw "Core input changed: $($input.path)" }
         }
         $directory = Initialize-TestOutput (Join-Path $OutputDirectory $case)
         Invoke-TestProcess $executable $directory 'test' @("--$case") -TimeoutMilliseconds 180000
-        $receipt = Get-CoreCaseReceipt $case (Join-Path $directory 'test.stdout.log') $independentCases[$case]
-        Complete-TestOutput $directory
-        $summary.independent += @{name=$case;status='Passed';evidence='WARP+MOCK';receipt=$receipt
+        $stdout = Join-Path $directory 'test.stdout.log'
+        $receipt = Get-CoreCaseReceipt $case $stdout $independentCases[$case]
+        $caseResult = @{name=$case;status='Passed';receipt=$receipt
+            evidence=$(if ($case -in @('adaptive-status','output-framerate-sdk')) { 'MOCK' } else { 'WARP+MOCK' })
             executableSha256=(Get-FileHash -LiteralPath $executable).Hash}
+        if ($adaptiveContractReceipts.ContainsKey($case)) {
+            $caseResult.adaptiveContractReceipts = @(foreach ($pattern in $adaptiveContractReceipts[$case]) {
+                Get-CoreCaseReceipt "$case adaptive contract $pattern" $stdout $pattern
+            })
+        }
+        Complete-TestOutput $directory
+        $summary.independent += $caseResult
     }
     $summary['presentFrameTrace'] = & (Join-Path $PSScriptRoot 'check-present-frame-traces.ps1') `
         -OrdinaryLog (Join-Path $OutputDirectory 'nr-edit-reuse-present-contracts/test.stdout.log') `

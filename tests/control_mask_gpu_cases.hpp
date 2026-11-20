@@ -4043,6 +4043,10 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       Check(completed >= gpu.serial && completed != UINT64_MAX && SUCCEEDED(gpu.device->GetDeviceRemovedReason()),
             "resize submission completes on a healthy device before resetting or releasing its references");
       gpu.submission_pending = false;
+      {
+        std::scoped_lock runtime_lock(addon::runtime_mutex);
+        addon::ResolveAdaptiveBorrowedDeliveries();
+      }
       if (reset) {
         Check(SUCCEEDED(gpu.allocator->Reset()) && SUCCEEDED(gpu.list->Reset(gpu.allocator.Get(), nullptr)),
               "resize completed recording reset");
@@ -6865,6 +6869,15 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       bool demand_lower_applied = false, demand_returned_upper = false;
       namespace output_rate = renodx::addons::dlss5::output_framerate;
       namespace adaptive = renodx::addons::dlss5::adaptive_resolution;
+      const auto output_fixture = reinterpret_cast<uintptr_t>(owner);
+      output_rate::OutputIdentity fixture_output;
+      if (native_resize_ready) {
+        const std::array buffers{
+            reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(output.Get()))};
+        output_rate::RegisterPresentOutput(output_fixture,
+            reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(gpu.device.Get())), 0, buffers);
+        fixture_output = output_rate::MatchPresentOutput(output_fixture, buffers[0]);
+      }
       uint32_t automatic_phase = 0, automatic_pending_frames = 0, automatic_peak_features = 0;
       std::array<uint32_t, 3> automatic_slot_creates{};
       const NVSDK_NGX_Handle* automatic_anchor = nullptr;
@@ -7014,10 +7027,10 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                 : (applied == session.ladder.sizes[2][0] ? 60. : 80.));
           }
           std::unique_lock lock(output_rate::internal::state.mutex);
-          auto& estimate = output_rate::internal::state.stream;
+          auto& estimate = output_rate::internal::state.present.at(output_fixture).stream;
           estimate.previous_ns = mock_window_end_ns;
           estimate.snapshot = {.available = true, .reason = output_rate::Reason::kREADY, .source = output_rate::Source::PRESENT,
-              .source_generation = 1, .configuration_generation = addon::configuration_generation.load(),
+              .source_generation = fixture_output.generation, .configuration_generation = fixture_output.generation,
               .window_serial = frame + 1, .window_begin_ns = mock_window_end_ns - 500'000'000,
               .window_end_ns = mock_window_end_ns, .fps = mock_output_fps, .fps_mad = 0., .fg_off = true};
         }
@@ -7399,7 +7412,8 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
             auto& automatic = report["selected_collection"]["limited_residency"]["automatic"];
             const auto now_ns = addon::SteadyNowNs();
             const bool applied_target = session.TargetReady() && cache->active == session.level
-                && session.status.applied == cache->ladder.sizes[cache->active] && session.applied_ns != 0;
+                && session.status.applied == cache->ladder.sizes[cache->active]
+                && session.applied_generation == session.status.generation && session.applied_ns != 0;
             Check(cache->count == 3 && session.settings.selected_levels == 3 && session.settings.limited_residency
                 && !session.settings.legacy_preparation && !addon::async_autoscale_preparation.load()
                 && addon::adaptive_feature_mode.load() == addon::AdaptiveFeatureMode::OFF,
@@ -7420,7 +7434,8 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
             if (session.level != active) {
               ++automatic_pending_frames;
               Check(session.status.applied == automatic_applied_before
-                  && session.applied_ns == 0 && session.gpu_count == 0,
+                  && session.applied_generation != session.status.generation
+                  && session.applied_ns == automatic_applied_ns_before && session.gpu_count == 0,
                   "cold waiting preserves the real Applied output and does not measure fallback GPU work for the target");
             }
             if (active != demand_active_before) {
@@ -8186,9 +8201,8 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       native_resize_create_gpu = false;
       native_resize_create_calls.clear();
       native_resize_evaluate_cpu_ms.clear();
-      if (demand_prepare || automatic_limited) {
-        std::unique_lock lock(output_rate::internal::state.mutex);
-        output_rate::internal::state.stream = {};
+      if (fixture_output) {
+        output_rate::DestroyPresentOutput(output_fixture);
       }
       report["fixed_input_patterns"] = nlohmann::json::array();
       for (const auto& [size, input] : native_resize_fixed_inputs) {
@@ -9022,9 +9036,11 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     if (demand_prepare || selected_sequence) {
       resize_report["failed_create_calls"] = native_resize_create_calls;
     }
-    if (demand_prepare || automatic_limited) {
+    if (demand_prepare || automatic_limited || resize_test) {
       std::unique_lock lock(renodx::addons::dlss5::output_framerate::internal::state.mutex);
-      renodx::addons::dlss5::output_framerate::internal::state.stream = {};
+      renodx::addons::dlss5::output_framerate::internal::state.present.clear();
+      renodx::addons::dlss5::output_framerate::internal::state.xefg.clear();
+      renodx::addons::dlss5::output_framerate::internal::state.native_options.clear();
     }
     native_resize_create_calls.clear();
     native_resize_evaluate_cpu_ms.clear();
@@ -9066,9 +9082,11 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
     if (demand_prepare || selected_sequence) {
       resize_report["failed_create_calls"] = native_resize_create_calls;
     }
-    if (demand_prepare || automatic_limited) {
+    if (demand_prepare || automatic_limited || resize_test) {
       std::unique_lock lock(renodx::addons::dlss5::output_framerate::internal::state.mutex);
-      renodx::addons::dlss5::output_framerate::internal::state.stream = {};
+      renodx::addons::dlss5::output_framerate::internal::state.present.clear();
+      renodx::addons::dlss5::output_framerate::internal::state.xefg.clear();
+      renodx::addons::dlss5::output_framerate::internal::state.native_options.clear();
     }
     native_resize_create_calls.clear();
     native_resize_evaluate_cpu_ms.clear();

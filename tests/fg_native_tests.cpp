@@ -206,6 +206,7 @@ int RunNativeGuideContractTest();
 int RunPresentGuideModelsTest(bool native_ngx = false, const char* project_id_path = nullptr);
 int RunNativePresentDecisionTest();
 int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_only = false);
+int RunOutputFramerateRegistrationCases();
 
 int RunNativeRequiredMenuTest() {
   try {
@@ -753,6 +754,7 @@ int RunNativeRequiredMenuTest() {
 #include "control_mask_capture_cases.hpp"
 #include "adaptive_fg_service_cases.hpp"
 #include "adaptive_inline_cases.hpp"
+#include "adaptive_status_cases.hpp"
 #if defined(NR_NEXUS_DEV_CONTROL)
 #include "inline_restore_roi_cases.hpp"
 #include "native_fg_frame_cases.hpp"
@@ -763,6 +765,19 @@ int RunNativeRequiredMenuTest() {
 #endif
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--adaptive-status") == 0) return adaptive_status_cases::Run();
+  if (argc == 2 && std::strcmp(argv[1], "--output-framerate-sdk") == 0) {
+    try {
+      reshade::internal::get_reshade_module_handle(GetModuleHandleW(nullptr));
+      output_framerate_sdk_cases::Run();
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << "FAIL output-framerate-sdk: " << error.what() << '\n';
+      return 1;
+    } catch (...) {
+      return 1;
+    }
+  }
   const auto run_edit_reuse_case = [argv](auto run) {
     const int result = run();
     if (result == 0) {
@@ -807,6 +822,9 @@ int main(int argc, char** argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-inline") == 0) {
     return run_edit_reuse_case(adaptive_inline_cases::Run);
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--output-framerate-registration") == 0) {
+    return run_edit_reuse_case(RunOutputFramerateRegistrationCases);
   }
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-fg-service") == 0) return adaptive_fg_service_cases::Run();
 #if defined(NR_NEXUS_TEST_NATIVE_NGX)
@@ -4192,6 +4210,7 @@ void ResizeNativeTestOutput(Gpu& gpu, IDXGISwapChain3* output, ID3D12Resource* o
 }
 
 #include "nr_edit_reuse_present_cases.hpp"
+#include "output_framerate_registration_cases.hpp"
 
 int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
   try {

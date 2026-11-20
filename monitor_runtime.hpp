@@ -12,6 +12,8 @@ struct MonitorSnapshot {
   ui::MonitorInputs monitor;
   ui::StatusSummaryFields summary;
   ui::frame_metrics::Sample frame;
+  output_framerate::OutputIdentity output;
+  std::array<uint64_t, 3> adaptive_sources{};
   std::string execution;
   unsigned warnings = 0;
   uint64_t key = 0;
@@ -48,6 +50,7 @@ inline thread_local MonitorHistoryRuntime monitor_history;
 
 struct MonitorCadence {
   const reshade::api::effect_runtime* owner = nullptr;
+  output_framerate::OutputIdentity output;
   int frame = -1;
   uint64_t epoch = 0;
   unsigned samples = 0;
@@ -61,6 +64,7 @@ struct MonitorCadence {
   uint64_t consumed = 0;
   bool recording = false;
   bool fps_uses_output = false;
+  output_framerate::OutputIdentity fps_output;
   output_framerate::Source fps_output_source = output_framerate::Source::NONE;
   uint64_t fps_output_generation = 0;
   uint64_t fps_output_serial = 0;
@@ -96,6 +100,7 @@ inline void UpdateMonitorCadence(reshade::api::effect_runtime* runtime) {
     cadence = {.owner = runtime, .epoch = epoch, .first_ns = now};
   }
   if (runtime == nullptr || cadence.frame == ImGui::GetFrameCount()) return;
+  cadence.output = MatchRuntimeOutput(runtime);
   cadence.frame = ImGui::GetFrameCount();
   cadence.last_ns = now;
   ++cadence.samples;
@@ -113,10 +118,11 @@ inline void UpdateMonitorCadence(reshade::api::effect_runtime* runtime) {
   cadence.present = present_metrics.stream;
   pacing_lock.unlock();
   const auto selected = ui::frame_metrics::Select(cadence.present.Read(now), cadence.fallback.Read(now), target, now);
-  const auto output = output_framerate::Read(now);
+  const auto output = output_framerate::Read(cadence.output, now);
   const bool output_available = output.available && std::isfinite(output.fps) && output.fps > 0.;
   const bool fps_changed = output_available != cadence.fps_uses_output
-      || (output_available && (output.source != cadence.fps_output_source
+      || (output_available && (output.output != cadence.fps_output
+          || output.source != cadence.fps_output_source
           || output.source_generation != cadence.fps_output_generation));
   const bool changed = selected.source != cadence.selected.source || selected.identity != cadence.selected.identity
       || selected.generation != cadence.selected.generation;
@@ -157,6 +163,7 @@ inline void UpdateMonitorCadence(reshade::api::effect_runtime* runtime) {
     cadence.consumed = stream.published;
   }
   cadence.fps_uses_output = output_available;
+  cadence.fps_output = output.output;
   cadence.fps_output_source = output.source;
   cadence.fps_output_generation = output.source_generation;
   cadence.fps_output_serial = output.window_serial;
@@ -175,6 +182,7 @@ inline uint64_t MonitorSnapshotKey() {
   mix(profile_commit_epoch.load());
   mix(profile_reload_epoch.load());
   mix(enabled.load());
+  mix(nr_adaptive_enabled.load());
   mix(edit_reuse_enabled.load());
   mix(reinterpret_cast<uintptr_t>(monitor_runtime.load()));
   mix(hook_point.load());
@@ -318,15 +326,29 @@ inline void (*monitor_snapshot_before_lock)() = nullptr;
 inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
   auto& cached = monitor_snapshot;
   auto now = SteadyNowNs();
-  const auto& frame = monitor_cadence.selected;
+  const auto& cadence = monitor_cadence;
+  const auto owner = monitor_runtime.load();
+  const auto epoch = monitor_history_epoch.load();
+  const auto& frame = cadence.selected;
   const bool frame_current = frame.valid && now >= frame.time_ns
       && now - frame.time_ns <= ui::frame_metrics::Stream::STALE_NS
-      && frame.identity.runtime == reinterpret_cast<uint64_t>(monitor_runtime.load())
-      && frame.identity.epoch == monitor_history_epoch.load()
+      && frame.identity.runtime == reinterpret_cast<uint64_t>(owner)
+      && frame.identity.epoch == epoch
       && frame.identity.configuration == configuration_generation.load();
   cached.frame = frame;
   cached.frame.valid = frame_current;
-  const auto output_rate = output_framerate::Read(now);
+  const auto matched_output = (cadence.owner == owner && cadence.epoch == epoch
+      ? cadence.output : output_framerate::OutputIdentity{});
+  const auto output_rate = output_framerate::Read(matched_output, now);
+  const auto& output = output_rate.output;
+  const bool adaptive_sizing = nr_adaptive_enabled.load();
+  std::array<uint64_t, 3> adaptive_sources{};
+  if (need_monitor && adaptive_sizing && output) {
+    for (size_t stage = 0; stage < adaptive_sources.size(); ++stage) {
+      adaptive_sources[stage] = CopyAdaptiveStatus(output, static_cast<stage_plan::Stage>(stage), now)
+          .display_source_generation;
+    }
+  }
   monitor_cadence.FormatRate(output_rate, cached.frame);
   if (!frame_current && monitor_history.active && monitor_requested.load()) {
     monitor_history.values.Add(ui::MonitorMetric::INTERVAL, now, 0.f, false);
@@ -339,7 +361,7 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
   cached.summary.fps_tip = cached.monitor.summary.fps_tip = monitor_cadence.fps_tip;
   cached.card.frame_ms = cached.monitor.card.frame_ms = (frame_current ? frame.interval_ms : 0.f);
   const auto key = MonitorSnapshotKey();
-  const bool changed = key != cached.key;
+  const bool changed = key != cached.key || cached.output != output || cached.adaptive_sources != adaptive_sources;
   const bool edit_reuse_changed = need_monitor && cached.edit_reuse_revision
       != present_edit_reuse_monitor_revision.load(std::memory_order_acquire);
   if (!changed && !edit_reuse_changed && (!need_monitor || cached.complete)
@@ -353,6 +375,8 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
     cached.card.frame_ms = cached.monitor.card.frame_ms = (frame_current ? frame.interval_ms : 0.f);
   }
   cached.key = key;
+  cached.output = output;
+  cached.adaptive_sources = adaptive_sources;
   cached.attempted_ns = now;
 #if defined(IMGUI_ENABLE_TEST_ENGINE)
   if (monitor_snapshot_before_lock != nullptr) {
@@ -394,6 +418,7 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
   gpu_comparison::Identity current_identity;
   if (gpu_timers::comparison_settings != nullptr) gpu_timers::comparison_settings(&current_identity);
   std::array<bool, 3> timing_current{}, proof_current{}, completion_fallback{};
+  std::array<const gpu_timers::Stats*, 3> adaptive_completions{};
   for (size_t stage = 0; stage < timings.size(); ++stage) {
     const auto group = plan.At(static_cast<stage_plan::Stage>(stage));
     timing_current[stage] = CurrentCompletedGroup(timings[stage], group, now, &current_identity);
@@ -412,6 +437,15 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
     }
     completion_fallback[stage] = !timing_current[stage] && !proof_current[stage]
         && CurrentCompletedGroup(completions[stage], group, now, &current_identity);
+    if (!need_monitor || !adaptive_sizing || !output) continue;
+    // The publisher can change while the monitor waits for the runtime lock.
+    cached.adaptive_sources[stage] = CopyAdaptiveStatus(output, group.stage, now).display_source_generation;
+    const AdaptiveCompletionKey scope_key{output.generation, cached.adaptive_sources[stage]};
+    const auto& scopes = adaptive_completion_scopes[stage];
+    if (const auto it = scopes.find(scope_key); it != scopes.end()
+        && CurrentCompletedGroup(it->second.retained, group, now, nullptr, &scope_key)) {
+      adaptive_completions[stage] = &it->second.retained;
+    }
   }
   std::array<PassResolutionSettings, kMaxNrPasses> resolutions;
   std::array<uint32_t, kMaxNrPasses> models{};
@@ -723,7 +757,7 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
       const auto resolution = resolutions[pass];
       row.requested_size = resolution.follow_input ? ui::Tr("Follow input")
           : std::to_string(static_cast<int>(std::lround(resolution.scale * 100.f))) + "%";
-      if (nr_adaptive_enabled.load()) {
+      if (adaptive_sizing) {
         row.saved_manual_limit = row.requested_size;
         row.requested_size = ui::Tr("Pending confirmation");
       }
@@ -735,6 +769,9 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
       if (proof_current[stage] && (completed == nullptr || proof.sequence > completed->sequence)) completed = &proof;
       if (completed == nullptr && completion_fallback[stage]) {
         completed = &completions[stage];
+      }
+      if (adaptive_sizing) {
+        completed = adaptive_completions[stage];
       }
       if (completed != nullptr) {
         for (const auto& sample : completed->passes) {
@@ -763,7 +800,7 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
                   + ui::Tr(reference) + ": " + std::to_string(completed->width) + " x "
                   + std::to_string(completed->height);
             }
-            if (nr_adaptive_enabled.load()) {
+            if (adaptive_sizing) {
               row.requested_size = ratio;
             }
           }
@@ -802,6 +839,8 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
         proofs[stage].recorded_ns + gpu_timers::internal::kSampleAgeNs);
     if (completion_fallback[stage]) cached.valid_until_ns = (std::min)(cached.valid_until_ns,
         completions[stage].recorded_ns + gpu_timers::internal::kSampleAgeNs);
+    if (adaptive_completions[stage] != nullptr) cached.valid_until_ns = (std::min)(cached.valid_until_ns,
+        adaptive_completions[stage]->recorded_ns + gpu_timers::internal::kSampleAgeNs);
   }
   cached.complete = need_monitor;
   ++cached.refreshes;

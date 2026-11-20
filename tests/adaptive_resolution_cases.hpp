@@ -48,7 +48,8 @@ inline bool Run() {
   const auto tick = [&](int64_t now, double fps, double gpu_us) {
     session.ObserveGpu({.generation = session.status.generation, .frame = ++sequence,
         .sequence = sequence, .context = 1, .recorded_ns = now, .completed_ns = now,
-        .total_us = gpu_us, .valid = true, .stable = true}, now);
+        .total_us = gpu_us, .valid = true, .stable = true,
+        .sampling_generation = session.sampling_generation}, now);
     output.serial++;
     output.begin_ns = now - 2'000'000'000;
     output.end_ns = now;
@@ -62,6 +63,57 @@ inline bool Run() {
   for (int i = 1; i <= 13; ++i) tick(start + i * adaptive::SAMPLE_INTERVAL_NS, 50., 3000.);
   check(session.level == 1 && session.trial, "sustained low FPS probes the next prepared size without a prior NR cost increase");
   const auto lower_generation = session.status.generation;
+  {
+    auto frozen_trial = session;
+    const auto lower_sizes = frozen_trial.status.applied;
+    const auto lower_applied_ns = frozen_trial.applied_ns;
+    const auto freeze_ns = output.end_ns + adaptive::SAMPLE_INTERVAL_NS;
+    const auto thaw_ns = freeze_ns + 4 * adaptive::SAMPLE_INTERVAL_NS;
+    const auto prepare = [&](adaptive::Session* controller, int64_t now, bool supported, bool frozen,
+                             uint64_t measurement_identity = 1) {
+      controller->Prepare(controller->settings, upper, floor, measurement_identity, output, now, supported, frozen, 1);
+    };
+    frozen_trial.ObserveMaskSettings(1, 0, 1, freeze_ns - 1);
+    prepare(&frozen_trial, freeze_ns, true, true);
+    prepare(&frozen_trial, thaw_ns - adaptive::SAMPLE_INTERVAL_NS, true, true, 2);
+    frozen_trial.ObserveMaskSettings(1, 0, 2, thaw_ns - 2);
+    frozen_trial.SetPairedSampling(true, 1, thaw_ns - 1);
+    check(lower_sizes != upper && frozen_trial.status.reason == adaptive::Reason::FROZEN
+              && frozen_trial.status.requested == lower_sizes && frozen_trial.status.applied == lower_sizes
+              && frozen_trial.status.generation == lower_generation && frozen_trial.applied_generation == lower_generation
+              && frozen_trial.applied_ns == lower_applied_ns && frozen_trial.trial && frozen_trial.previous_level == 0,
+          "comparison holds the delivered trial size and generation while retaining its accepted anchor");
+    const auto frozen_sampling_generation = frozen_trial.sampling_generation;
+    prepare(&frozen_trial, thaw_ns, true, false);
+    check(!frozen_trial.trial && frozen_trial.status.requested == upper && frozen_trial.status.applied == lower_sizes
+              && frozen_trial.applied_generation == lower_generation && frozen_trial.gpu_count == 0
+              && frozen_trial.sampling_generation > frozen_sampling_generation && frozen_trial.stable_after_ns >= thaw_ns,
+          "thaw requests the accepted anchor and starts a fresh measurement window");
+
+    auto pending_trial = session;
+    pending_trial.Request(2, freeze_ns - 1);
+    const auto pending_generation = pending_trial.status.generation;
+    const auto pending_sizes = pending_trial.status.requested;
+    prepare(&pending_trial, freeze_ns, true, true);
+    const auto held_generation = pending_trial.status.generation;
+    pending_trial.Applied(pending_generation, pending_sizes, freeze_ns + 1);
+    prepare(&pending_trial, freeze_ns + 2, true, true);
+    check(pending_sizes != lower_sizes && pending_trial.status.reason == adaptive::Reason::FROZEN
+              && pending_trial.status.requested == lower_sizes && pending_trial.status.applied == lower_sizes
+              && pending_trial.applied_generation == lower_generation && held_generation != pending_generation
+              && pending_trial.status.generation == held_generation,
+          "comparison holds the last delivery during a cumulative trial and rejects the withdrawn pending tier");
+    prepare(&pending_trial, thaw_ns, true, false);
+    check(!pending_trial.trial && pending_trial.status.requested == upper
+              && pending_trial.status.generation > held_generation && pending_trial.stable_after_ns >= thaw_ns,
+          "thaw restores the accepted anchor after a cumulative trial was interrupted");
+
+    auto unsupported = session;
+    prepare(&unsupported, freeze_ns, false, true);
+    check(unsupported.status.reason == adaptive::Reason::UNSUPPORTED && unsupported.status.requested == upper
+              && !unsupported.trial,
+          "comparison preserves the unsupported path's upper-bound fallback");
+  }
   for (int i = 14; i <= 100; ++i) tick(start + i * adaptive::SAMPLE_INTERVAL_NS, 50., 2400.);
   check(session.level == 0 && session.blocked && !session.trial,
         "a bounded descent without output FPS benefit restores quality and stops probing");
@@ -122,6 +174,7 @@ inline bool Run() {
     adaptive::Session profiling;
     profiling.prepared = true;
     profiling.status.generation = 1;
+    profiling.applied_generation = 1;
     profiling.applied_ns = start;
     profiling.stable_after_ns = start;
     for (int i = 0; i < frequency * 2; ++i) {
@@ -151,6 +204,7 @@ inline bool Run() {
     adaptive::Session profiling;
     profiling.prepared = true;
     profiling.status.generation = 1;
+    profiling.applied_generation = 1;
     profiling.applied_ns = profiling.stable_after_ns = start;
     profiling.SetPairedSampling(true);
     uint32_t measured_sources = 0;
@@ -172,6 +226,7 @@ inline bool Run() {
     adaptive::Session pairing;
     pairing.prepared = true;
     pairing.status.generation = 1;
+    pairing.applied_generation = 1;
     pairing.applied_ns = pairing.stable_after_ns = start;
     pairing.SetPairedSampling(true, 0xA1);
     const auto feed = [&](uint64_t frame, uint64_t first, bool valid = true, uint64_t context = 1) {
@@ -273,6 +328,7 @@ inline bool Run() {
   adaptive::Session dual;
   dual.prepared = true;
   dual.status.generation = 1;
+  dual.applied_generation = 1;
   dual.applied_ns = dual.stable_after_ns = start;
   dual.ObserveGpu({.generation = 1, .frame = 4, .sequence = 2, .context = 1,
       .recorded_ns = start, .completed_ns = start, .total_us = 2000.,
@@ -329,7 +385,8 @@ inline bool Run() {
       const uint64_t sequence = ++observation->serial;
       controller->ObserveGpu({.generation = controller->status.generation, .frame = sequence,
           .sequence = sequence, .context = 1, .recorded_ns = now, .completed_ns = now,
-          .total_us = gpu_us, .valid = true, .stable = true}, now);
+          .total_us = gpu_us, .valid = true, .stable = true,
+          .sampling_generation = controller->sampling_generation}, now);
       observation->begin_ns = now - 2'000'000'000;
       observation->end_ns = now;
       observation->fps = fps;
@@ -443,9 +500,13 @@ inline bool Run() {
   check(!gated.prepared, "old epochs and a partial group's smaller required count cannot open the selected-set gate");
   const int64_t ready_ns = start + 6'000'000'000;
   gated.UpdatePreparation(gated_epoch, 4, 4, adaptive::Reason::PREPARING, ready_ns);
-  check(gated.prepared && gated.stable_after_ns == ready_ns + adaptive::WARMUP_NS
-      && gated.status.reason == adaptive::Reason::WARMING,
-      "complete owner readiness starts a fresh observation window after preparation");
+  check(gated.prepared && gated.applied_ns == 0 && gated.stable_after_ns == 0
+      && gated.status.reason == adaptive::Reason::PREPARING,
+      "complete owner readiness cannot confirm a size or consume its delivery warmup");
+  gated.Applied(gated.status.generation, gated.status.requested, ready_ns);
+  check(gated.applied_generation == gated.status.generation && gated.applied_ns == ready_ns
+      && gated.stable_after_ns == ready_ns + adaptive::WARMUP_NS,
+      "the first complete delivery starts the warmup after resource readiness");
   gated.Prepare(settings, upper, floor, 1, gated_output, ready_ns, true, false, 10);
   check(!gated.trial && gated.level == 0, "the completion observation itself does not start an automatic size request");
   gated.UpdatePreparation(gated_epoch, 3, 4, adaptive::Reason::PREPARING, ready_ns + 1);
@@ -469,7 +530,9 @@ inline bool Run() {
   settings.target_fps = 116.f;
   reused.Prepare(settings, upper, floor, 2, {}, start + 2, true, false, 20);
   check(reused.ladder.sizes == original.sizes && reused.level == 3 && reused.status.requested == lower
-      && reused.status.generation > generation && reused.gpu_count == 0 && !reused.blocked
+      && reused.status.generation == generation && reused.gpu_count == 0 && !reused.blocked
+      && reused.applied_generation == generation && reused.applied_ns == start + 1
+      && reused.last_switch_ns == start + 1 && reused.stable_after_ns == start + adaptive::WARMUP_NS + 1
       && reused.prepared && reused.preparation_epoch == original_epoch,
       "target FPS and measurement edits retain the active allocation set and only restart observation");
   for (int index = 0; index < 32; ++index) {
@@ -587,7 +650,7 @@ inline bool Run() {
     const int64_t now = start + static_cast<int64_t>(index) * adaptive::SAMPLE_INTERVAL_NS;
     legacy_automatic.ObserveGpu({.generation = legacy_automatic.status.generation, .frame = index, .sequence = index,
         .context = 1, .recorded_ns = now, .completed_ns = now, .total_us = 3000.,
-        .valid = true, .stable = true}, now);
+        .valid = true, .stable = true, .sampling_generation = legacy_automatic.sampling_generation}, now);
     ++legacy_output.serial;
     legacy_output.begin_ns = now - 2'000'000'000;
     legacy_output.end_ns = now;
@@ -632,7 +695,8 @@ inline bool Run() {
   }
   check(limited.level == 1 && limited.trial && limited.previous_level == 0 && limited.baseline_fps == 100.
       && limited.status.applied == full_upper && limited.active_level == 0 && limited.status.coefficient == 1.f
-      && limited.applied_ns == 0 && limited.gpu_count == 0 && !limited.TargetReady(),
+      && limited.applied_ns == start && limited.applied_generation != cold_generation
+      && limited.gpu_count == 0 && !limited.TargetReady(),
       "a cold target keeps the actual output and cumulative anchor without measuring fallback work as benefit");
   const int64_t target_ready_ns = start + 7'000'000'000;
   limited.UpdateTargetPreparation(limited.preparation_epoch, cold_generation - 1, 2, 15,
@@ -642,7 +706,8 @@ inline bool Run() {
   check(!limited.TargetReady(), "stale targets and partial logical contracts cannot publish target readiness");
   limited.UpdateTargetPreparation(limited.preparation_epoch, cold_generation, 2, 15,
       true, adaptive::Reason::PREPARING, target_ready_ns);
-  check(limited.TargetReady() && !limited.prepared && limited.applied_ns == 0,
+  check(limited.TargetReady() && !limited.prepared && limited.applied_ns == start
+      && limited.applied_generation != cold_generation,
       "a complete target receipt is distinct from actual application and full-ladder readiness");
   const int64_t applied_now = target_ready_ns + adaptive::WARMUP_NS;
   limited.Applied(cold_generation, cold_target, applied_now);
@@ -692,7 +757,8 @@ inline bool Run() {
     const double coefficient = limited_curve.status.coefficient;
     limited_curve.ObserveGpu({.generation = limited_curve.status.generation, .frame = index + 1,
         .sequence = index + 1, .context = 1, .recorded_ns = now, .completed_ns = now,
-        .total_us = 4000. * coefficient, .valid = true, .stable = true}, now);
+        .total_us = 4000. * coefficient, .valid = true, .stable = true,
+        .sampling_generation = limited_curve.sampling_generation}, now);
     limited_output.serial++;
     limited_output.begin_ns = now - 2'000'000'000;
     limited_output.end_ns = now;
@@ -760,7 +826,7 @@ inline bool Run() {
     automatic_player.ObserveGpu({.generation = automatic_player.status.generation,
         .frame = index + 1, .sequence = index + 1, .context = 1, .recorded_ns = now, .completed_ns = now,
         .total_us = (actual_slot == 0 ? 4000. : (actual_slot == 1 ? 3000. : 2000.)),
-        .valid = true, .stable = true}, now);
+        .valid = true, .stable = true, .sampling_generation = automatic_player.sampling_generation}, now);
     ++automatic_output.serial;
     automatic_output.begin_ns = now - 500'000'000;
     automatic_output.end_ns = now;
@@ -819,6 +885,60 @@ inline bool Run() {
       "synthetic CPU input validates two automatic cold descents, no-benefit rollback and workload-triggered re-exploration");
   std::cout << "ADAPTIVE_AUTOMATIC_DESIGN evidence=CPU synthetic_FPS_GPU_completion_time=1 completed_phase=" << automatic_phase
       << " hot_rollback_same_tick=" << same_tick_rollback << '\n';
+  for (const bool limited_residency : {false, true}) {
+    adaptive::Session delivered;
+    const adaptive::Settings delivery_settings{.enabled = true, .target_fps = 100.f, .minimum_scale = .5f,
+        .prepared_levels = 2, .selected_levels = 2, .limited_residency = limited_residency};
+    adaptive::Output observed{.available = true, .source = 1, .generation = 1, .configuration = 1,
+        .serial = 1, .begin_ns = start, .end_ns = start, .fps = 80.};
+    delivered.Prepare(delivery_settings, full_upper, full_floor, 1, observed, start, true, false, 80);
+    const auto ready = [&](int64_t now) {
+      if (limited_residency) {
+        delivered.UpdateTargetPreparation(delivered.preparation_epoch, delivered.status.generation, 2, 2,
+            true, adaptive::Reason::PREPARING, now);
+      } else {
+        delivered.UpdatePreparation(delivered.preparation_epoch, 2, 2, adaptive::Reason::PREPARING, now);
+      }
+    };
+    ready(start);
+    check(delivered.TargetReady() && delivered.applied_ns == 0 && delivered.last_switch_ns == 0,
+        "resource readiness cannot start the first delivery clock in either residency mode");
+    delivered.Applied(delivered.status.generation, full_upper, start);
+    const auto accepted_generation = delivered.applied_generation;
+    const auto accepted_stability = delivered.stable_after_ns;
+    delivered.trial = true;
+    delivered.previous_level = 0;
+    delivered.Request(1, start + 4'000'000'000);
+    const auto rejected_generation = delivered.status.generation;
+    const auto rejected_sizes = delivered.status.requested;
+    ready(start + 5'000'000'000);
+    check(delivered.TargetReady() && delivered.status.applied == full_upper && delivered.status.coefficient == 1.f
+        && delivered.applied_generation == accepted_generation && delivered.applied_ns == start
+        && delivered.last_switch_ns == start && delivered.stable_after_ns == accepted_stability,
+        "request and ready preserve the last delivered size, coefficient, switch time and warmup");
+    delivered.ObserveGpu({.generation = rejected_generation, .frame = 1, .sequence = 1, .context = 1,
+        .recorded_ns = start + 5'000'000'000, .completed_ns = start + 5'000'000'000,
+        .total_us = 10., .valid = true, .stable = true,
+        .sampling_generation = delivered.sampling_generation}, start + 5'000'000'000);
+    check(delivered.gpu_count == 0, "a completed candidate cannot contribute costs before its successful delivery");
+    observed.available = false;
+    delivered.Prepare(delivery_settings, full_upper, full_floor, 1, observed,
+        start + 6'000'000'000, true, false, 80);
+    check(!delivered.trial && delivered.level == 0 && delivered.status.requested == full_upper
+        && delivered.status.applied == full_upper && delivered.applied_ns == start
+        && delivered.status.reason == adaptive::Reason::OUTPUT_UNAVAILABLE,
+        "a failed comparison returns the next request to the accepted anchor without inventing delivery");
+    delivered.Applied(rejected_generation, rejected_sizes, start + 7'000'000'000);
+    check(delivered.applied_generation == accepted_generation && delivered.applied_ns == start,
+        "late delivery of the withdrawn trial cannot confirm its old request");
+    const auto resumed_ns = start + 8'000'000'000;
+    ready(resumed_ns);
+    delivered.Applied(delivered.status.generation, full_upper, resumed_ns);
+    delivered.Applied(delivered.status.generation, full_upper, resumed_ns + 1'000'000'000);
+    check(delivered.applied_generation == delivered.status.generation && delivered.applied_ns == resumed_ns
+        && delivered.last_switch_ns == resumed_ns && delivered.stable_after_ns == resumed_ns + adaptive::WARMUP_NS,
+        "the recovered request confirms once and repeated consumption cannot restart its warmup");
+  }
   return passed;
 }
 }  // namespace adaptive_resolution_cases

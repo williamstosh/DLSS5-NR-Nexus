@@ -2330,7 +2330,7 @@ inline constexpr Translation kFr[] = {
     {"Declared %ux", "Déclaré %ux"},
     {"Up to %ux", "Jusqu'à %ux"},
     {"Dynamic", "Dynamique"},
-    {"Present cadence estimate", "Estimation selon la cadence Present"},
+    {"Application Present submission estimate", "Estimation du rythme des appels Present"},
     {"XeFG SDK output estimate", "Estimation de sortie du SDK XeFG"},
     {"DLSS FG SDK output estimate", "Estimation de sortie du SDK DLSS FG"},
     {"Fixed FG multiplier estimate", "Estimation par multiplicateur FG fixe"},

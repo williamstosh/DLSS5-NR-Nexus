@@ -863,18 +863,20 @@ int main() {
       {
         namespace adaptive = renodx::addons::dlss5::adaptive_resolution;
         const auto saved_api = runtime::stage_source_api.exchange(renodx::addons::dlss5::capability::Api::VULKAN);
+        auto* const saved_output_owner = runtime::monitor_runtime.exchange(nullptr);
         const bool saved_adaptive_enabled = runtime::nr_adaptive_enabled.exchange(true);
         const ui::MonitorInputs resolution_view;
         resolution_observed_fixture = &resolution_view;
         frame();
         resolution_observed_fixture = nullptr;
         const bool kept_adaptive_enabled = runtime::nr_adaptive_enabled.exchange(saved_adaptive_enabled);
+        runtime::monitor_runtime = saved_output_owner;
         runtime::stage_source_api = saved_api;
         check(kept_adaptive_enabled && std::ranges::any_of(rendered_text, [](const TextItem& item) {
           return item.text == ui::Tr(adaptive::ReasonText(adaptive::Reason::UNSUPPORTED));
         }) && std::ranges::none_of(rendered_text, [](const TextItem& item) {
           return item.text == ui::Tr(adaptive::ReasonText(adaptive::Reason::COLLECTING));
-        }), "Vulkan keeps adaptive enabled and shows unsupported sizing in the production resolution panel");
+        }), "Vulkan without an output scope keeps adaptive enabled and shows unsupported sizing in the resolution panel");
       }
 #include "adaptive_ui_cases.hpp"
       std::printf("PASS adaptive UI interaction cases; checks=%u\n", checks);

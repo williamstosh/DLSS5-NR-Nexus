@@ -2330,7 +2330,7 @@ inline constexpr Translation kPtBr[] = {
     {"Declared %ux", "Declarado %ux"},
     {"Up to %ux", "Até %ux"},
     {"Dynamic", "Dinâmico"},
-    {"Present cadence estimate", "Estimativa pela cadência de Present"},
+    {"Application Present submission estimate", "Estimativa do ritmo de envio de Present"},
     {"XeFG SDK output estimate", "Estimativa de saída do SDK XeFG"},
     {"DLSS FG SDK output estimate", "Estimativa de saída do SDK DLSS FG"},
     {"Fixed FG multiplier estimate", "Estimativa por multiplicador FG fixo"},

@@ -2330,7 +2330,7 @@ inline constexpr Translation kDe[] = {
     {"Declared %ux", "Gemeldet %ux"},
     {"Up to %ux", "Bis zu %ux"},
     {"Dynamic", "Dynamisch"},
-    {"Present cadence estimate", "Schätzung aus Present-Abständen"},
+    {"Application Present submission estimate", "Geschätzte Present-Abgaberate der Anwendung"},
     {"XeFG SDK output estimate", "XeFG-SDK-Ausgabeschätzung"},
     {"DLSS FG SDK output estimate", "DLSS-FG-SDK-Ausgabeschätzung"},
     {"Fixed FG multiplier estimate", "Schätzung mit festem FG-Faktor"},

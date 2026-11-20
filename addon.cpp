@@ -13,6 +13,9 @@
 
 #include <windows.h>
 
+#include <cstdint>
+#include <vector>
+
 #include "brand.h"
 #include "dlssnr.hpp"
 
@@ -20,20 +23,60 @@
 #include "output_framerate.hpp"
 
 namespace {
-void ObserveOutputPresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain,
-    const reshade::api::rect*, const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
-  if (queue == nullptr || swapchain == nullptr || swapchain->get_back_buffer_count() == 0) return;
+void ObserveOutputInit(reshade::api::swapchain* swapchain, bool) {
+  if (swapchain == nullptr) return;
+  auto* device = swapchain->get_device();
+  if (device == nullptr || (device->get_api() != reshade::api::device_api::d3d12
+      && device->get_api() != reshade::api::device_api::d3d11)) return;
   namespace nr = renodx::addons::dlss5;
-  const bool fg_active = nr::internal::present_fg_multiplier.load(std::memory_order_relaxed) > 1
-      || nr::internal::native_fg_declaration.load(std::memory_order_relaxed)
-          == nr::internal::NativeFgDeclaration::kOn;
-  nr::output_framerate::ObservePresent(reinterpret_cast<uintptr_t>(swapchain),
-      nr::internal::configuration_generation.load(std::memory_order_relaxed),
-      fg_active, nr::output_framerate::NowNs());
+  nr::internal::GuardHook([&] {
+    std::vector<uintptr_t> back_buffers;
+    const auto count = swapchain->get_back_buffer_count();
+    back_buffers.reserve(count);
+    for (uint32_t index = 0; index < count; ++index) {
+      const auto buffer = static_cast<uintptr_t>(swapchain->get_back_buffer(index).handle);
+      back_buffers.push_back(buffer);
+      const auto canonical = reinterpret_cast<uintptr_t>(
+          renodx::utils::directx::NativeIdentity(reinterpret_cast<IUnknown*>(buffer)));
+      if (canonical != 0 && canonical != buffer) {
+        back_buffers.push_back(canonical);
+      }
+    }
+    const auto native_swapchain = renodx::utils::directx::NativeIdentity(
+        reinterpret_cast<IUnknown*>(swapchain->get_native()));
+    const auto native_device = renodx::utils::directx::NativeIdentity(
+        reinterpret_cast<IUnknown*>(device->get_native()));
+    nr::output_framerate::RegisterPresentOutput(reinterpret_cast<uintptr_t>(swapchain),
+        reinterpret_cast<uintptr_t>(native_device), reinterpret_cast<uintptr_t>(native_swapchain), back_buffers);
+  });
 }
 
-void ObserveOutputDestroy(reshade::api::swapchain*, bool) {
-  renodx::addons::dlss5::output_framerate::Invalidate();
+void ObserveOutputPresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain,
+    const reshade::api::rect*, const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
+  namespace nr = renodx::addons::dlss5;
+  if (queue == nullptr || swapchain == nullptr || queue->get_device() != swapchain->get_device()
+      || swapchain->get_back_buffer_count() == 0 || nr::fg::xefg::InProxyPresent()) return;
+  const auto identity = nr::output_framerate::MatchPresentOutput(reinterpret_cast<uintptr_t>(swapchain),
+      static_cast<uintptr_t>(swapchain->get_current_back_buffer().handle));
+  // A Native SDK can forward ordinary Presents while Off. The observer
+  // rejects this output only once its actual Native route owns the cadence.
+  nr::output_framerate::ObservePresent(identity, nr::output_framerate::NowNs());
+}
+
+void ObserveOutputDestroy(reshade::api::swapchain* swapchain, bool) {
+  renodx::addons::dlss5::output_framerate::DestroyPresentOutput(reinterpret_cast<uintptr_t>(swapchain));
+}
+
+void RegisterOutputSampling() {
+  reshade::register_event<reshade::addon_event::init_swapchain>(ObserveOutputInit);
+  reshade::register_event<reshade::addon_event::present>(ObserveOutputPresent);
+  reshade::register_event<reshade::addon_event::destroy_swapchain>(ObserveOutputDestroy);
+}
+
+void UnregisterOutputSampling() {
+  reshade::unregister_event<reshade::addon_event::init_swapchain>(ObserveOutputInit);
+  reshade::unregister_event<reshade::addon_event::present>(ObserveOutputPresent);
+  reshade::unregister_event<reshade::addon_event::destroy_swapchain>(ObserveOutputDestroy);
 }
 }  // namespace
 
@@ -57,8 +100,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
       renodx::addons::dlss5::lastgasp::Uninstall();
       return FALSE;
     }
-    reshade::register_event<reshade::addon_event::present>(ObserveOutputPresent);
-    reshade::register_event<reshade::addon_event::destroy_swapchain>(ObserveOutputDestroy);
+    RegisterOutputSampling();
   }
 
   renodx::addons::dlss5::Use(reason, module, reserved);
@@ -73,8 +115,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
 #endif
 
   if (reason == DLL_PROCESS_DETACH) {
-    reshade::unregister_event<reshade::addon_event::present>(ObserveOutputPresent);
-    reshade::unregister_event<reshade::addon_event::destroy_swapchain>(ObserveOutputDestroy);
+    UnregisterOutputSampling();
     reshade::unregister_addon(module);
     // `reserved` is null for FreeLibrary and non-null at process exit.
     // [exit] (lastgasp.hpp): the session ended here, not in a silent death.

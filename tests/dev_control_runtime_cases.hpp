@@ -3,9 +3,14 @@
  * SPDX-License-Identifier: MIT
  */
 
-// Included in the existing real-ImGui fixture; only host configuration and
-// execution observations are synthetic. No device, model or game is created.
+// Included in the existing real-ImGui fixture. ReShade interfaces and execution
+// observations are CPU substitutes, with no GPU allocation or model execution.
+#define NR_NEXUS_TEST_OUTPUT_RUNTIME_ONLY
+#include "adaptive_ui_cases.hpp"
+#undef NR_NEXUS_TEST_OUTPUT_RUNTIME_ONLY
 {
+  OutputRuntimeFixture output_runtime;
+  check(static_cast<bool>(output_runtime.output), "DEV diagnostics resolve their registered runtime backbuffer");
   namespace control = runtime::dev_control;
   namespace xefg = renodx::addons::dlss5::fg::xefg;
   using Json = control::Json;
@@ -313,13 +318,6 @@
     runtime::edit_reuse_fallbacks = std::get<3>(saved_counters);
     runtime::features.erase(source);
   }
-  rate::Stream saved_output;
-  const auto saved_adaptive = runtime::CopyAdaptiveStatus();
-  {
-    std::unique_lock lock(rate::internal::state.mutex);
-    saved_output = rate::internal::state.stream;
-    rate::internal::state.stream = {};
-  }
   status = control::Snapshot();
   check(!status["output_framerate"]["available"].get<bool>() && status["output_framerate"]["fps"].is_null()
           && status["output_framerate"]["fps_mad"].is_null() && status["output_framerate"]["observed_multiplier"].is_null()
@@ -327,9 +325,17 @@
       "an unavailable output source cannot publish valid frame rate or observed multiplier values");
   const auto sampled_ns = runtime::SteadyNowNs();
   constexpr uint64_t output_context = 0xCEF0;
+  const auto sdk_output = rate::RegisterXeFGOutput(0xCEF1, output_runtime.device.get_native(), output_context,
+      reinterpret_cast<uintptr_t>(&output_runtime));
+  rate::ObserveXeFGOutputLink(sdk_output, reinterpret_cast<uintptr_t>(&output_runtime),
+      reinterpret_cast<uintptr_t>(&output_runtime));
+  rate::ObserveXeFGMetadata(sdk_output, 4, 4);
+  check(runtime::MatchRuntimeOutput(&output_runtime) == sdk_output
+          && rate::Read(sdk_output, sampled_ns).output == sdk_output,
+      "DEV output ownership follows the runtime backbuffer and observed SDK link");
   {
     std::unique_lock lock(rate::internal::state.mutex);
-    auto& stream = rate::internal::state.stream;
+    auto& stream = rate::internal::state.xefg.at(sdk_output.view).stream;
     stream.previous_ns = sampled_ns;
     stream.identity = output_context;
     stream.snapshot = {.available = true, .reason = rate::Reason::kREADY, .source = rate::Source::XEFG_STATUS,
@@ -337,9 +343,23 @@
         .window_begin_ns = sampled_ns - 2'000'000'000, .window_end_ns = sampled_ns,
         .fps = 144., .fps_mad = 2., .requested_multiplier = 4, .observed_multiplier = 3.6};
   }
+  constexpr uintptr_t secondary_swapchain = 0xCEF2;
+  const std::array<uintptr_t, 1> secondary_buffers{0xCEF3};
+  rate::RegisterPresentOutput(secondary_swapchain, output_runtime.device.get_native(), 0, secondary_buffers);
+  const auto secondary_output = rate::FindPresentOutput(output_runtime.device.get_native(), secondary_buffers[0]);
+  for (int tick = 0; tick <= 240; ++tick) {
+    rate::ObservePresent(secondary_output, sampled_ns - 2'400'000'000LL + tick * 10'000'000LL);
+  }
+  check(rate::Read(secondary_output, sampled_ns).available
+          && rate::Read(sampled_ns).reason == rate::Reason::kAMBIGUOUS,
+      "two valid outputs require the diagnostics consumer's exact runtime owner");
+  const auto output_plan = runtime::RequestedStagePlan();
+  check(output_plan.valid && output_plan.pass_count != 0, "the diagnostic output fixture has an effective stage");
   runtime::PublishAdaptiveStatus({.reason = adaptive::Reason::OBSERVING,
       .generation = 7, .output_fps = 144., .gpu_ms = 2., .prepared_levels = 3,
-      .preparation_cpu_ms = 5., .preparation_vram_delta_bytes = 4096, .peak_process_vram_bytes = 8192});
+      .preparation_cpu_ms = 5., .preparation_vram_delta_bytes = 4096, .peak_process_vram_bytes = 8192,
+      .display_output_generation = sdk_output.generation, .display_source_generation = 3,
+      .display_stage = static_cast<uint32_t>(output_plan.effective[0])});
   status = control::Snapshot();
   check(status["output_framerate"]["available"] && status["output_framerate"]["source"] == rate::SourceText(rate::Source::XEFG_STATUS)
           && status["output_framerate"]["source_generation"] == 9 && status["output_framerate"]["configuration_generation"] == 11
@@ -354,10 +374,87 @@
           && status["adaptive"]["peak_process_vram_bytes"] == 8192,
       "controller observations and preparation counters remain distinct from current GPU completion proof");
   {
+    namespace timers = renodx::addons::dlss5::gpu_timers;
+    const auto group = output_plan.At(output_plan.effective[0]);
+    const auto stage = static_cast<size_t>(group.stage);
+    const runtime::AdaptiveCompletionKey selected{sdk_output.generation, 3};
+    const runtime::AdaptiveCompletionKey other_output{secondary_output.generation, 3};
+    const runtime::AdaptiveCompletionKey other_source{sdk_output.generation, 4};
+    renodx::addons::dlss5::RuntimeLock lock(runtime::runtime_mutex);
+    const auto saved_telemetry = runtime::stage_telemetry;
+    const auto saved_epochs = runtime::comparison_stable_epochs;
+    const auto saved_stable_after = runtime::comparison_stable_after_ns;
+    const auto saved_sequence = timers::internal::next_sequence;
+    timers::Stats proof{.valid = true, .state = timers::SampleState::VALID,
+        .sequence = ++timers::internal::next_sequence, .measured_ns = runtime::SteadyNowNs()};
+    proof.recorded_ns = proof.measured_ns;
+    const std::array<const char*, 3> paths{"preSR", "after", "present"};
+    std::strcpy(proof.path, paths[stage]);
+    runtime::comparison_ui::CaptureSettings(&proof.identity);
+    proof.identity.device_session = timers::device_session;
+    proof.identity.stable_epoch = runtime::comparison_stable_epochs[stage];
+    proof.identity.display_output_generation = sdk_output.generation;
+    proof.identity.source_generation = 3;
+    runtime::stage_telemetry[stage].last_evaluate = {.source_generation = 3};
+    for (uint32_t pass = 0; pass < group.count; ++pass) {
+      proof.passes[pass] = {.id = group.begin + pass, .state = timers::SampleState::VALID};
+    }
+    const auto current = [&] {
+      return runtime::CurrentCompletedGroup(proof, group, runtime::SteadyNowNs(), nullptr, &selected);
+    };
+    const auto evaluate = [&](const runtime::AdaptiveCompletionKey& key, NVSDK_NGX_Result result) {
+      const auto& [output, source] = key;
+      auto session = std::make_shared<adaptive::Session>();
+      session->status.display_output_generation = output;
+      session->status.display_source_generation = source;
+      session->status.display_stage = static_cast<uint32_t>(stage);
+      const adaptive::Frame frame{.session = session};
+      const runtime::AdaptiveFrameScope scope(&frame);
+      runtime::FeatureState feature;
+      feature.source_generation = source;
+      runtime::ObserveNrEvaluation(group.stage, nullptr, feature, {}, group.begin, result, output_plan);
+    };
+    check(current(), "a completion receipt matches the selected output, source and Stage");
+    const auto checked_ns = runtime::SteadyNowNs();
+    check(runtime::CurrentGpuSample(proof, checked_ns, &proof.identity), "the matching receipt is also current for GPU cost");
+    using ComparisonIdentity = renodx::addons::dlss5::gpu_comparison::Identity;
+    for (const auto field : {&ComparisonIdentity::fg, &ComparisonIdentity::route, &ComparisonIdentity::settings_hash,
+             &ComparisonIdentity::resolution_hash, &ComparisonIdentity::config_epoch}) {
+      auto comparison_identity = proof.identity;
+      ++(comparison_identity.*field);
+      check(!runtime::CurrentGpuSample(proof, checked_ns, &comparison_identity)
+                && runtime::CurrentCompletedGroup(proof, group, checked_ns, &comparison_identity, &selected),
+            "a changed comparison identity invalidates GPU cost while the selected scope keeps its completed dimensions");
+    }
+    ++proof.identity.configuration_generation;
+    check(!current(), "a different recreation generation invalidates the selected scope's completed dimensions");
+    --proof.identity.configuration_generation;
+    proof.passes[0].state = timers::SampleState::PENDING;
+    check(!current(), "the selected scope needs completion proof for every Pass in its Stage");
+    proof.passes[0].state = timers::SampleState::VALID;
+    evaluate(other_output, NVSDK_NGX_Result_FAIL_UnableToInitializeFeature);
+    evaluate(other_source, NVSDK_NGX_Result_FAIL_UnableToInitializeFeature);
+    check(current(), "a later failed Evaluate in another output or source preserves the selected receipt");
+    evaluate(selected, NVSDK_NGX_Result_FAIL_UnableToInitializeFeature);
+    evaluate(other_source, NVSDK_NGX_Result_Success);
+    check(!current(), "a later successful Evaluate from another source cannot restore a receipt invalidated by its own failure");
+    proof.sequence = ++timers::internal::next_sequence;
+    proof.recorded_ns = proof.measured_ns = runtime::SteadyNowNs();
+    check(current(), "a fresh completion sequence restores proof for the selected scope");
+    for (const auto& key : {selected, other_output, other_source}) {
+      runtime::adaptive_completion_scopes[stage].erase(key);
+    }
+    runtime::stage_telemetry = saved_telemetry;
+    runtime::comparison_stable_epochs = saved_epochs;
+    runtime::comparison_stable_after_ns = saved_stable_after;
+    timers::internal::next_sequence = saved_sequence;
+  }
+  {
     std::unique_lock lock(rate::internal::state.mutex);
-    rate::internal::state.stream.snapshot.fg_off = true;
-    rate::internal::state.stream.snapshot.requested_multiplier = 0;
-    rate::internal::state.stream.snapshot.observed_multiplier = 1.;
+    auto& snapshot = rate::internal::state.xefg.at(sdk_output.view).stream.snapshot;
+    snapshot.fg_off = true;
+    snapshot.requested_multiplier = 0;
+    snapshot.observed_multiplier = 1.;
   }
   status = control::Snapshot();
   check(status["output_framerate"]["identity"] == output_context && status["output_framerate"]["fg_off"]
@@ -366,18 +463,15 @@
       "an observed SDK Off flag retains its provider identity without inventing a linked source");
   {
     std::unique_lock lock(rate::internal::state.mutex);
-    rate::internal::state.stream.previous_ns = sampled_ns - rate::Stream::STALE_NS - 1;
+    rate::internal::state.xefg.at(sdk_output.view).stream.previous_ns = sampled_ns - rate::Stream::STALE_NS - 1;
   }
   status = control::Snapshot();
   check(!status["output_framerate"]["available"].get<bool>() && status["output_framerate"]["fps"].is_null()
           && status["output_framerate"]["fps_mad"].is_null() && status["adaptive"]["output_fps"].is_null()
           && status["output_framerate"]["identity"] == output_context && !status["output_framerate"]["fg_off"].get<bool>(),
       "stale SDK observations keep their source metadata but do not expose a valid current FPS");
-  {
-    std::unique_lock lock(rate::internal::state.mutex);
-    rate::internal::state.stream = saved_output;
-  }
-  runtime::PublishAdaptiveStatus(saved_adaptive);
+  rate::DestroyPresentOutput(secondary_swapchain);
+  rate::ReleaseXeFGOutput(sdk_output);
   check(set("EnableHooks", 0)["reason"] == "invalid_setting", "startup hook policy stays outside the control whitelist");
   check(set("NREditReuse", 1)["reason"] == "invalid_value", "x2 requires a JSON boolean");
   {

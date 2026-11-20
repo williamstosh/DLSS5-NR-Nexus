@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <atomic>
 
+#include "output_framerate.hpp"
+
 namespace renodx::addons::dlss5::fg {
 
 inline std::atomic_bool runtime_callback_pinned{false};
@@ -70,6 +72,7 @@ struct FrameInput {
   // Internal diagnostics only. This points at the live XeFG Context held by
   // PresentFrame; it is never exposed to the SDK or used for routing.
   uintptr_t diagnostic_context = 0;
+  output_framerate::OutputIdentity output;
 };
 
 using Service = Result (*)(const FrameInput&) noexcept;

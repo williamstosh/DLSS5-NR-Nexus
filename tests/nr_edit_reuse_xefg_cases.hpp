@@ -823,6 +823,166 @@ int Run() {
                   << " reset=" << after_sdk_failure.reset << " completed_fence=" << stream.fence->GetCompletedValue()
                   << " failed_rgba_crc32=" << renodx::utils::hash::ComputeCRC32(sdk_failed.pixels.data(), sdk_failed.pixels.size())
                   << '\n';
+
+        native::edit_reuse_enabled = false;
+        native::nr_adaptive_enabled = true;
+        native::nr_adaptive_selected_levels = 2;
+        native::nr_adaptive_limited_residency = true;
+        auto* const previous_status = session.context->get_status;
+        session.context->get_status = +[](void*, xefg::abi::PresentStatus* status) -> int32_t {
+          *status = {.frames_presented = 2, .frame_gen_result = 0, .enabled = 1};
+          return 0;
+        };
+        for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 24; ++attempt) {
+          frame(false);
+          const auto& adaptive = stream.adaptive_session;
+          if (adaptive != nullptr && adaptive->TargetReady() && adaptive->applied_generation == adaptive->status.generation) break;
+        }
+        const auto adaptive = stream.adaptive_session;
+        Check(adaptive != nullptr && adaptive->TargetReady() && adaptive->ladder.count == 2
+                  && adaptive->status.applied == adaptive->status.upper
+                  && adaptive->applied_generation == adaptive->status.generation,
+              "limited XeFG confirms the upper after the actual proxy accepts the ordered private group");
+
+        const auto warm_output = [&] {
+          const auto output = session.context->output_identity;
+          Check(static_cast<bool>(output), "adaptive XeFG has a registered live proxy output");
+          addon::output_framerate::Invalidate(output);
+          const auto end = addon::output_framerate::NowNs() - 10'000'000;
+          for (int bin = 4; bin >= 0; --bin) {
+            const auto serial = ++session.context->present_serial;
+            const auto sample_ns = end - bin * addon::output_framerate::Stream::BIN_NS;
+            addon::output_framerate::ObserveXeFG(output, serial, sample_ns, true, true, 60, true, false);
+          }
+          Check(addon::output_framerate::Read(output, end).available, "complete current-output window before XeFG trial");
+        };
+        warm_output();
+        frame(false);
+        const auto upper_generation = adaptive->applied_generation;
+        const auto upper_applied_ns = adaptive->applied_ns;
+        adaptive->previous_level = 0;
+        adaptive->trial = true;
+        adaptive->Request(1, native::SteadyNowNs());
+        const auto failed_generation = adaptive->status.generation;
+        fg::FrameInput old_receipt;
+        bool fault_reached = false;
+        bool original_started_unconfirmed = false;
+        consume_sdk_present = [&](IDXGISwapChain*) {
+          const auto& pending = stream.pending_xefg_delivery;
+          if (!pending.complete || pending.frame.generation != failed_generation
+              || pending.actual != adaptive->ladder.sizes[1]) return;
+          original_started_unconfirmed = adaptive->TargetReady() && adaptive->applied_generation == upper_generation
+              && adaptive->applied_ns == upper_applied_ns;
+          old_receipt.context = context;
+          old_receipt.epoch = stream.epoch;
+          old_receipt.application_frame = stream.application_frame;
+          old_receipt.output = session.context->output_identity;
+          fault_reached = true;
+          sdk_present_result = E_FAIL;
+        };
+        for (uint32_t attempt = 0; attempt < 24 && !fault_reached; ++attempt) frame(false);
+        consume_sdk_present = {};
+        sdk_present_result = S_OK;
+        Check(fault_reached && original_started_unconfirmed,
+            "the complete ready lower tier remains pending as the original proxy starts consuming it");
+        Check(fault_reached && stream.result == fg::Result::FAILED && !stream.base_frame_clock.complete
+                  && adaptive->TargetReady() && adaptive->applied_generation == upper_generation
+                  && adaptive->applied_ns == upper_applied_ns && adaptive->gpu_count == 0
+                  && stream.fence->GetCompletedValue() >= stream.submitted
+                  && !addon::output_framerate::Read(session.context->output_identity, addon::output_framerate::NowNs()).available,
+              "outer E_FAIL rejects the low tier and its cost, preserves executed WARP resources, and withdraws its window");
+        const auto fallback = frame(false);
+        Check(fallback.result == fg::Result::SUBMITTED && fallback.reset == 1 && !adaptive->trial
+                  && adaptive->status.generation != failed_generation
+                  && adaptive->applied_generation == adaptive->status.generation
+                  && adaptive->status.applied == adaptive->status.upper,
+              "the next legal XeFG frame resets locally and the rejected output window sends the trial back to the upper anchor");
+        const auto fallback_applied = adaptive->applied_ns;
+        native::fg_service::OnXeFGPresentDelivery(old_receipt, true);
+        Check(adaptive->applied_ns == fallback_applied && adaptive->status.applied == adaptive->status.upper,
+              "late success for the withdrawn XeFG application frame cannot confirm the old trial");
+        warm_output();
+        frame(false);
+        adaptive->Request(1, native::SteadyNowNs());
+        const auto next_request = adaptive->status.generation;
+        for (uint32_t attempt = 0; attempt < 24 && adaptive->applied_generation != next_request; ++attempt) frame(false);
+        Check(adaptive->applied_generation == next_request && adaptive->status.applied == adaptive->ladder.sizes[1]
+                  && adaptive->applied_ns > fallback_applied,
+              "the next legal lower request confirms only after successful original proxy delivery");
+        const auto confirmed_at = adaptive->applied_ns;
+        session.Present(present_id);
+        Check(adaptive->applied_ns == confirmed_at, "repeat XeFG consumption does not start a second warmup");
+
+        const auto observe_steady_delivery = [&](HRESULT original_result) {
+          namespace timers = addon::gpu_timers;
+          warm_output();
+          frame(false);
+          adaptive->InvalidateSampling();
+          adaptive->stable_after_ns = native::SteadyNowNs() - 1;
+          adaptive->next_measure_ns = 0;
+          timers::Segment* completed = nullptr;
+          uint64_t sequence = 0;
+          consume_sdk_present = [&](IDXGISwapChain*) {
+            Check(adaptive->applied_generation == next_request && adaptive->applied_ns == confirmed_at,
+                  "the original proxy is testing a steady already-confirmed tier");
+            const auto& delivery = stream.pending_xefg_delivery;
+            Check(delivery.complete && delivery.frame.delivery != nullptr,
+                  "the steady adaptive GPU measurement belongs to the current whole-group delivery");
+            wait_service();
+            const addon::RuntimeLock lock(native::runtime_mutex);
+            const auto slot = std::ranges::find_if(stream.slots, [&](const auto& entry) {
+              return entry.fence_value == stream.submitted;
+            });
+            Check(slot != stream.slots.end() && SUCCEEDED(slot->allocator->Reset())
+                      && SUCCEEDED(slot->list->Reset(slot->allocator, nullptr)),
+                  "the exact completed private list is discarded against replay before polling inside the original SDK call");
+            addon::submission::OnCommandListReset(slot->list);
+            Check(SUCCEEDED(slot->list->Close()), "close the discarded XeFG fixture list");
+            native::PruneCompletedSubmissionUses();
+            const auto segment = std::ranges::find_if(timers::internal::segments, [&](const auto& entry) {
+              return entry.recorded && entry.measure && entry.adaptive.delivery == delivery.frame.delivery;
+            });
+            Check(segment != std::end(timers::internal::segments) && segment->adaptive_stable
+                      && segment->proof == timers::SampleState::VALID,
+                  "steady XeFG NR has exact completed WARP timing before SDK return");
+            completed = &*segment;
+            sequence = segment->sequence;
+            timers::Poll(true, false);
+            Check(completed->recorded && completed->completed_ns != 0 && adaptive->gpu_count == 0
+                      && timers::completed_stats[2].sequence != sequence,
+                  "a GPU-completed steady frame awaiting SDK delivery cannot add cost or replace current dimensions");
+            sdk_present_result = original_result;
+          };
+          const auto observed = frame(false);
+          consume_sdk_present = {};
+          sdk_present_result = S_OK;
+          {
+            const addon::RuntimeLock lock(native::runtime_mutex);
+            timers::Poll(true, false);
+          }
+          Check(completed != nullptr && !completed->recorded && adaptive->applied_ns == confirmed_at,
+                "the exact completed segment drains once after the matching final receipt");
+          if (original_result == S_OK) {
+            Check(observed.result == fg::Result::SUBMITTED && adaptive->gpu_count == 1
+                      && timers::completed_stats[2].sequence == sequence,
+                  "successful delivery admits the buffered cost and dimensions from the same completed GPU frame");
+          } else {
+            Check(observed.result == fg::Result::FAILED && adaptive->gpu_count == 0
+                      && timers::completed_stats[2].sequence != sequence,
+                  "rejected steady delivery contributes no cost or current dimensions despite completed GPU work");
+          }
+        };
+        observe_steady_delivery(E_FAIL);
+        observe_steady_delivery(S_OK);
+
+        native::nr_adaptive_enabled = false;
+        native::nr_adaptive_selected_levels = 0;
+        native::nr_adaptive_limited_residency = false;
+        native::edit_reuse_enabled = true;
+        session.context->get_status = previous_status;
+        recover();
+        std::cout << "ADAPTIVE_DELIVERY_XEFG evidence=WARP+MOCK rejected_proxy=1 restored_anchor=1 late_receipt=ignored\n";
+
         native::direct_api.evaluate = nr_edit_reuse_gpu_cases::NeutralModel;
 
         const auto single_role = stream.base_frame_clock.frame;

@@ -233,6 +233,7 @@ int Run() {
       const auto wait = (SUCCEEDED(signal) ? WaitForSingleObject(event, 10000) : WAIT_FAILED);
       CloseHandle(event);
       Check(wait == WAIT_OBJECT_0, "inline adaptive bounded GPU completion");
+      native::ResolveAdaptiveBorrowedDeliveries();
       if (reset) {
         Check(SUCCEEDED(gpu.allocator->Reset()) && SUCCEEDED(gpu.list->Reset(gpu.allocator.Get(), nullptr)),
             "inline adaptive completed recording reset");
@@ -877,9 +878,15 @@ int Run() {
     uint32_t preparation_failures = 0;
     const NVSDK_NGX_Handle* expected_reset_model = nullptr;
     bool observed_expected_reset = false;
+    ID3D12Resource* observed_mask = nullptr;
+    uint32_t observed_blend = 0;
+    uint32_t observed_grid = 0;
     model_parameter_observer = [&](const NVSDK_NGX_Handle* model, const NVSDK_NGX_Parameter* model_parameters) {
       if (model == expected_reset_model && native::preparing_adaptive_frame == nullptr) {
         observed_expected_reset |= native::GetInt(model_parameters, "DLSSNR.Reset") != 0;
+        observed_mask = native::GetD3D12Resource(model_parameters, "DLSSNR.ControlMask");
+        observed_blend = native::GetUInt(model_parameters, "DLSSNR.MaskBlendMode");
+        observed_grid = native::GetUInt(model_parameters, "DLSSNR.OutputSubrectWidth");
       }
       const bool failing = model_calls + 1 == fail_call;
       if (native::preparing_adaptive_frame != nullptr) {
@@ -910,10 +917,14 @@ int Run() {
           const addon::SourceStageScope source(handle, true);
           if (hook == native::kHookRender) {
             native::PreSrSwap swap;
-            accepted = native::ProcessInlinePreSR(gpu.list.Get(), handle, &parameters, swap);
+            accepted = native::ProcessInlinePreSR(gpu.list.Get(), handle, &parameters, swap, nullptr, true);
             native::RestorePreSrColor(&parameters, swap);
           } else {
-            accepted = native::ProcessInline(gpu.list.Get(), handle, &parameters);
+            accepted = native::ProcessInline(gpu.list.Get(), handle, &parameters, nullptr, nullptr, nullptr, false,
+#if defined(NR_NEXUS_DEV_CONTROL)
+                false,
+#endif
+                nullptr, true);
           }
         }
         const uint64_t completed_active = active_successes - before_active;
@@ -1101,8 +1112,10 @@ int Run() {
             "resolve-only strength changes keep all allocations and do not request a model History reset");
 
         const auto saved_target = native::kSetAdaptiveTargetFps.Get();
+        const auto target_preparation_epoch = feature.adaptive_session->preparation_epoch;
         set(native::kSetAdaptiveTargetFps, saved_target + 1.f);
         Check(record() && record() && feature.adaptive_cache == cache
+            && feature.adaptive_session->preparation_epoch == target_preparation_epoch
             && native::nr_features_created == models && native::worksets_created == allocations,
             "target FPS edits retain the entire selected collection");
         set(native::kSetAdaptiveTargetFps, saved_target);
@@ -1178,18 +1191,45 @@ int Run() {
             "an explicit selection rechecks budget and rebuilds the retired lower tier while retaining its healthy upper");
         const auto recovered_models = native::nr_features_created;
 
+        const bool render = hook == native::kHookRender;
+        const auto* bound_output = (render ? colors[0].Get() : outputs[0].Get());
+        const native::WorksetKey upper_key{handle, bound_output, render, 0};
+        const native::WorksetKey lower_key{handle, bound_output, render, 1};
+        const auto* upper_workset = native::worksets.at(upper_key).proxy;
+        const auto old_lower_completion = cache->tiers[1].completion;
+        const auto old_lower_token = cache->tiers[1].recording_token;
+        const auto old_preparation = feature.adaptive_session->preparation_epoch;
+        const auto previous_extent = cache->ladder.sizes[1][0];
+        const auto* old_lower_model = cache->tiers[1].state.slots[0].handle;
+        Check(previous_extent.width == 5 && previous_extent.height == 5 && old_lower_completion != nullptr
+            && old_lower_model != nullptr,
+            "the extent edit starts with a complete 16x16 and 5x5 collection");
+        const auto old_lower_create = *reinterpret_cast<const uint32_t*>(old_lower_model);
         set(native::kSetAdaptiveMinScale, .5f);
         record();
-        Check(!feature.adaptive_session->prepared && !feature.adaptive_session->trial && cache->active == 0,
-            "a committed missing endpoint enters preparation before any automatic request");
+        Check(!feature.adaptive_session->prepared && !feature.adaptive_session->trial && cache->active == 0
+            && feature.adaptive_session->preparation_epoch > old_preparation && !cache->tiers[1].ready
+            && cache->tiers[1].completion != old_lower_completion && cache->tiers[1].recording_token != old_lower_token,
+            "a healthy 5x5 completion cannot mark the new 8x8 endpoint ready");
         for (uint32_t warmup = 0; warmup < 24; ++warmup) record();
+        const auto& new_lower = cache->tiers[1].state.slots[0];
+        auto* lower_workset = native::worksets.at(lower_key).proxy;
         Check(feature.adaptive_cache == cache && feature.adaptive_session->prepared && cache->tiers[1].ready
-            && cache->ladder.sizes[1][0].width == 8 && feature.slots[0].handle == upper_model
+            && cache->ladder.sizes[1][0].width == 8 && cache->ladder.sizes[1][0].height == 8
+            && feature.slots[0].handle == upper_model && new_lower.create_input_width == 8
+            && new_lower.create_input_height == 8 && new_lower.handle != nullptr
+            && *reinterpret_cast<const uint32_t*>(new_lower.handle) != old_lower_create
+            && lower_workset->GetDesc().Width == 8 && lower_workset->GetDesc().Height == 8
+            && native::worksets.at(upper_key).proxy == upper_workset
             && native::nr_features_created == recovered_models + 1,
-            "editing the minimum prepares the missing endpoint while retaining the complete upper allocation");
+            "8x8 gets a new Create and real working surfaces while preserving the complete 16x16 allocation");
+        expected_reset_model = new_lower.handle;
+        observed_expected_reset = false;
         feature.adaptive_session->Request(1, native::SteadyNowNs());
-        Check(record() && record() && cache->active == 1 && feature.input_width == 8,
-            "the prepared endpoint is available immediately when it is requested");
+        Check(record() && record() && cache->active == 1 && feature.input_width == 8 && observed_grid == 8
+            && observed_expected_reset && feature.adaptive_session->status.applied[0].width == 8,
+            "the prepared endpoint becomes active with an actual 8x8 evaluation and local history reset");
+        expected_reset_model = nullptr;
         feature.adaptive_session->Request(0, native::SteadyNowNs());
         Check(record() && record() && cache->active == 0, "the legal upper remains available during selection edits");
         const auto reused_upper = cache->tiers[1].state.slots[0].handle;
@@ -1221,6 +1261,21 @@ int Run() {
         Check(record() && record(), "reuse regression restores the original Evaluate and resolve controls");
         native::adaptive_feature_mode = native::AdaptiveFeatureMode::OFF;
         const auto saved_preset = native::kSetPreset.Get();
+        const auto model_request = addon::nr_model::ResolvePreset(static_cast<uint32_t>(saved_preset), 0,
+            native::direct_runtime_requirements.dual_models);
+        if (model_request == addon::nr_model::ResolvePreset(0, 0, native::direct_runtime_requirements.dual_models)) {
+          const auto before_auto_models = native::nr_features_created;
+          const auto before_auto_worksets = native::worksets_created;
+          const auto before_auto_epoch = feature.adaptive_session->preparation_epoch;
+          const auto before_auto_measurement = feature.adaptive_session->identity;
+          native::kSetPreset.Commit(saved_preset == 0.f ? static_cast<float>(model_request) : 0.f);
+          Check(record() && record() && feature.adaptive_cache == cache
+              && feature.adaptive_session->preparation_epoch == before_auto_epoch
+              && feature.adaptive_session->identity == before_auto_measurement
+              && native::nr_features_created == before_auto_models && native::worksets_created == before_auto_worksets,
+              "Auto and its resolved explicit Create model retain the same prepared collection and comparison identity");
+          native::kSetPreset.Commit(saved_preset);
+        }
         native::comparison_ui::CaptureAdaptiveSettings(&resources_before);
         native::kSetPreset.Store(saved_preset == 1.f ? 2.f : 1.f);
         native::comparison_ui::CaptureAdaptiveSettings(&resources_after);
@@ -1278,16 +1333,23 @@ int Run() {
       Check(cache->active == 1 && feature.adaptive_session->status.applied[0].width == 5
           && native::nr_features_created == creates,
           "inline lower tier actually applies its requested size without cold Create");
-      const auto output_configuration = native::configuration_generation.load();
+      namespace framerate = addon::output_framerate;
+      const auto fixture_swapchain = reinterpret_cast<uintptr_t>(handle);
+      const std::array fixture_buffers{
+          reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(outputs[0].Get())),
+          reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(outputs[1].Get()))};
+      framerate::RegisterPresentOutput(fixture_swapchain,
+          reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(gpu.device.Get())), 0, fixture_buffers);
+      const auto fixture_output = framerate::MatchPresentOutput(fixture_swapchain, fixture_buffers[0]);
       uint64_t serial = 0;
       const auto record_at_fps = [&](double fps) {
         const auto now = native::SteadyNowNs();
         {
-          std::unique_lock lock(addon::output_framerate::internal::state.mutex);
-          auto& estimate = addon::output_framerate::internal::state.stream;
+          std::unique_lock lock(framerate::internal::state.mutex);
+          auto& estimate = framerate::internal::state.present.at(fixture_swapchain).stream;
           estimate.previous_ns = now;
-          estimate.snapshot = {.available = true, .source = addon::output_framerate::Source::PRESENT,
-              .source_generation = 1, .configuration_generation = output_configuration,
+          estimate.snapshot = {.available = true, .source = framerate::Source::PRESENT,
+              .source_generation = fixture_output.generation, .configuration_generation = fixture_output.generation,
               .window_serial = ++serial, .window_begin_ns = now - 500'000'000, .window_end_ns = now,
               .fps = fps, .fg_off = true};
         }
@@ -1344,8 +1406,71 @@ int Run() {
         Check(native::native_fg_declaration.load() == native::NativeFgDeclaration::kOn
             && record() && record(), "record both outputs with the new FG declaration");
         check_lower_tier("only changing the FG declaration preserves the ready tier, GPU window and model history");
-        expected_reset_model = nullptr;
         native::OnNativeFgOptions(false);
+
+        const auto saved_blend = native::kSetControlMaskBlendMode.Get();
+        const auto dormant_blend = native::kSetPassControlMaskBlendMode[0].Get();
+        const auto sampling_generation = session->sampling_generation;
+        native::kSetPassControlMaskBlendMode[0].Commit(dormant_blend == 0.f ? 1.f : 0.f);
+        Check(record_at_fps(120.) && session->sampling_generation == sampling_generation,
+            "a dormant pass's Blend does not invalidate the active group's measurement");
+        native::kSetPassControlMaskBlendMode[0].Commit(dormant_blend);
+        native::kSetControlMaskBlendMode.Commit(saved_blend);
+        Check(record_at_fps(120.) && session->sampling_generation == sampling_generation,
+            "committing an equivalent Blend retains the comparison");
+        const auto* bound_mask = observed_mask;
+        const auto applied_ns = session->applied_ns;
+        const auto retired = native::nr_features_retired;
+        const auto released = native::nr_features_released;
+        const auto worksets_created = native::worksets_created;
+        const auto worksets_retired = native::worksets_retired;
+        const auto worksets_released = native::worksets_released;
+        const auto* upper_model = cache->tiers[0].state.slots[0].handle;
+        Check(bound_mask != nullptr && observed_blend == static_cast<uint32_t>(saved_blend)
+            && session->GpuStatistics(native::SteadyNowNs(), &gpu_us, &gpu_mad),
+            "Blend starts on a complete measured lower tier with a bound mask");
+        const float next_blend = (saved_blend == 0.f ? 1.f : 0.f);
+        const int64_t changed_at = native::SteadyNowNs();
+        native::kSetControlMaskBlendMode.Commit(next_blend);
+        Check(record_at_fps(120.) && record_at_fps(120.) && observed_mask == bound_mask
+            && observed_blend == static_cast<uint32_t>(next_blend)
+            && session->sampling_generation > sampling_generation && session->stable_after_ns >= changed_at
+            && !session->GpuStatistics(native::SteadyNowNs(), &gpu_us, &gpu_mad)
+            && session->applied_ns == applied_ns && session->status.generation == generation,
+            "effective Blend updates the next bound Evaluate and discards pre-change comparison samples");
+        Check(feature.adaptive_session == session && feature.adaptive_cache == cache && cache->active == 1
+            && cache->tiers[0].state.slots[0].handle == upper_model && feature.slots[0].handle == lower_model
+            && cache->tiers[0].ready && cache->tiers[1].ready && session->TargetReady()
+            && session->resource_identity == layout && session->preparation_epoch == preparation_epoch
+            && native::nr_features_created == creates && native::nr_features_retired == retired
+            && native::nr_features_released == released && native::worksets_created == worksets_created
+            && native::worksets_retired == worksets_retired && native::worksets_released == worksets_released
+            && native::history_reset_epoch.load() == reset_epoch && !observed_expected_reset,
+            "effective Blend keeps the active and standby allocations and model history");
+        const auto resample_deadline = native::SteadyNowNs() + 5'000'000'000;
+        while (!session->GpuStatistics(native::SteadyNowNs(), &gpu_us, &gpu_mad)
+               && native::SteadyNowNs() < resample_deadline) {
+          Check(record_at_fps(120.), "recollect GPU samples after the real Blend edit");
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        Check(session->GpuStatistics(native::SteadyNowNs(), &gpu_us, &gpu_mad)
+            && session->gpu_recorded_ns.front() >= changed_at && session->status.applied[0].width == 5
+            && cache->active == 1, "the next complete comparison uses only post-change GPU work at the retained tier");
+        native::kSetControlMaskBlendMode.Commit(saved_blend);
+        native::kSetControlMaskEnabled.Commit(0.f);
+        Check(record_at_fps(120.) && record_at_fps(120.) && observed_mask == nullptr,
+            "the same lower model can evaluate without a bound mask");
+        const auto unbound_generation = session->sampling_generation;
+        native::kSetControlMaskBlendMode.Commit(next_blend);
+        Check(record_at_fps(120.) && record_at_fps(120.) && observed_mask == nullptr
+            && session->sampling_generation == unbound_generation && !observed_expected_reset,
+            "changing an unbound Blend leaves measurement and model history untouched");
+        native::kSetControlMaskBlendMode.Commit(saved_blend);
+        native::kSetControlMaskEnabled.Commit(1.f);
+        for (uint32_t frame = 0; frame < 8; ++frame) record_at_fps(120.);
+        Check(cache->active == 1 && session->TargetReady() && native::nr_features_created == creates,
+            "rebinding the mask satisfies the real surface requirement for both tiers without replacing their models");
+        expected_reset_model = nullptr;
       }
       feature.adaptive_session->Request(0, native::SteadyNowNs());
       Check(record() && record() && cache->active == 0 && native::nr_features_created == creates,
@@ -1362,10 +1487,7 @@ int Run() {
       Check(feature.adaptive_session->level == 1 && cache->active == 1
           && feature.adaptive_session->status.applied[0].width == 5 && native::nr_features_created == creates,
           "real GPU samples and mocked low output FPS drive the production inline controller into its ready lower tier");
-      {
-        std::unique_lock lock(addon::output_framerate::internal::state.mutex);
-        addon::output_framerate::internal::state.stream = {};
-      }
+      framerate::DestroyPresentOutput(fixture_swapchain);
       auto& failing_tier = cache->tiers[(cache->active + 1) % cache->count];
       failing_tier.output_completions.clear();
       failing_tier.ready = false;
@@ -1564,10 +1686,14 @@ int Run() {
           const addon::SourceStageScope source(wide_handle, true);
           if (native::hook_point.load() == native::kHookRender) {
             native::PreSrSwap swap;
-            accepted = native::ProcessInlinePreSR(gpu.list.Get(), wide_handle, &wide_parameters, swap);
+            accepted = native::ProcessInlinePreSR(gpu.list.Get(), wide_handle, &wide_parameters, swap, nullptr, true);
             native::RestorePreSrColor(&wide_parameters, swap);
           } else {
-            accepted = native::ProcessInline(gpu.list.Get(), wide_handle, &wide_parameters);
+            accepted = native::ProcessInline(gpu.list.Get(), wide_handle, &wide_parameters, nullptr, nullptr, nullptr, false,
+#if defined(NR_NEXUS_DEV_CONTROL)
+                false,
+#endif
+                nullptr, true);
           }
         }
         if (verify_writeback) {
@@ -1739,11 +1865,14 @@ int Run() {
           && native::AdaptiveResidentWorksetCount(wide.adaptive_session) == 2,
           "limited residency retains fifteen logical sizes but initially creates only the complete upper on both outputs");
       const auto upper_applied = wide.adaptive_session->status.applied;
+      const auto upper_applied_ns = wide.adaptive_session->applied_ns;
       wide.adaptive_session->Request(6, native::SteadyNowNs());
       wide_record();
       Check(wide.adaptive_session->settings.prepared_levels == 15 && wide.adaptive_session->level == 6
           && !wide.adaptive_session->TargetReady() && limited->active == 0
-          && wide.adaptive_session->status.applied == upper_applied && wide.adaptive_session->applied_ns == 0,
+          && wide.adaptive_session->status.applied == upper_applied
+          && wide.adaptive_session->applied_ns == upper_applied_ns
+          && wide.adaptive_session->applied_generation != wide.adaptive_session->status.generation,
           "a cold target preserves the actually applied upper until both output receipts are healthy");
       for (uint32_t source = 0; source < 32 && limited->active != 6; ++source) wide_record();
       Check(limited->active == 6 && wide.adaptive_session->TargetReady()
@@ -1764,6 +1893,11 @@ int Run() {
           && native::InstallCommandListStateHooks(gpu.list.Get()), "limited residency replacement recording");
       wide.adaptive_session->Request(0, native::SteadyNowNs());
       wide_record();
+      wide_record();
+      Check(limited->active == 0 && wide.adaptive_session->applied_generation == wide.adaptive_session->status.generation
+          && !native::AdaptiveRetirementPending(wide_handle)
+          && !addon::submission::ResourceReleasable(retained_model),
+          "the upper handoff confirms after submit and protects the previous tier through that recording");
       wide_record();
       Check(limited->active == 0 && native::AdaptiveRetirementPending(wide_handle)
           && !wide.adaptive_session->failed && !limited->standby_retired,
@@ -1801,6 +1935,7 @@ int Run() {
       gpu.allocator = retained_allocator;
       gpu.list = retained_list;
       wide.adaptive_session->Request(0, native::SteadyNowNs());
+      wide_record();
       wide_record();
       wide_record();
       Check(limited->active == 0 && native::AdaptiveRetirementPending(wide_handle)
@@ -1884,6 +2019,79 @@ int Run() {
       native::MaybeEmitStatusCard(verdict, tick_ns);
       Check(count_lines("NR-CARD v1 ") == cards_before + 1 && count_lines("NR-CARD evidence ") == evidence_before + 1,
           "production token exhaustion suppresses both the card and evidence lines");
+    }
+    {
+      namespace timers = addon::gpu_timers;
+      namespace rate = addon::output_framerate;
+      using Delivery = addon::adaptive_resolution::DeliveryReceipt;
+      const auto previous_observer = std::exchange(timers::completed_observer, &native::ObserveAdaptiveCompletion);
+      const auto device_identity = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(gpu.device.Get()));
+      const std::array<uintptr_t, 1> buffers_a{reinterpret_cast<uintptr_t>(outputs[0].Get())};
+      const std::array<uintptr_t, 1> buffers_b{reinterpret_cast<uintptr_t>(outputs[1].Get())};
+      constexpr uintptr_t swapchain_a = 0xADA930;
+      constexpr uintptr_t swapchain_b = 0xADA931;
+      rate::RegisterPresentOutput(swapchain_a, device_identity, 0, buffers_a);
+      rate::RegisterPresentOutput(swapchain_b, device_identity, 0, buffers_b);
+      const auto output_a = rate::FindPresentOutput(device_identity, buffers_a[0]);
+      const auto output_b = rate::FindPresentOutput(device_identity, buffers_b[0]);
+      Check(output_a && output_b && output_a != output_b, "scope proof fixture identifies two WARP outputs");
+      const auto plan = addon::stage_plan::Build({.pass_count = 1, .hook_point = native::kHookUpscaled});
+      const auto group = plan.At(addon::stage_plan::Stage::UPSCALED);
+      const auto stage = static_cast<size_t>(group.stage);
+      const auto record = [&](bool measure, const native::AdaptiveCompletionKey& key, uint32_t width,
+                              const std::shared_ptr<Delivery>& delivery) {
+        Check(timers::Begin(gpu.list.Get(), gpu.device.Get(), "after", 16, 16, group.begin, group.count, measure),
+            "scope proof begins a real WARP recording");
+        auto& segment = timers::internal::segments[timers::internal::current.idx];
+        auto session = std::make_shared<addon::adaptive_resolution::Session>();
+        const auto& [output, source] = key;
+        session->status.display_output_generation = output;
+        session->status.display_source_generation = source;
+        session->status.display_stage = static_cast<uint32_t>(stage);
+        const addon::adaptive_resolution::Frame frame{.session = session};
+        const native::AdaptiveFrameScope active(&frame);
+        native::FeatureState feature;
+        feature.source_generation = source;
+        native::BindComparisonContext(feature, feature, 0, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, plan);
+        segment.adaptive.delivery = delivery;
+        timers::SetPass(0, 0, 1, width, width, width, width);
+        const D3D12_RESOURCE_BARRIER barrier{.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV};
+        gpu.list->ResourceBarrier(1, &barrier);
+        for (const auto marker : {timers::PassEncodeStart(0), timers::PassEncodeEnd(0), timers::PassEvalStart(0),
+                 timers::PassEvalEnd(0), timers::PassResolveEnd(0), timers::kSlotCopyBackEnd}) {
+          timers::Mark(gpu.list.Get(), marker);
+        }
+        timers::End(gpu.list.Get());
+        return segment.sequence;
+      };
+      for (const bool measure : {true, false}) {
+        const native::AdaptiveCompletionKey key_a{output_a.generation, (measure ? 0xADA932u : 0xADA933u)};
+        const native::AdaptiveCompletionKey key_b{output_b.generation, (measure ? 0xADA934u : 0xADA935u)};
+        auto delivery_a = std::make_shared<Delivery>(Delivery::PENDING);
+        const auto sequence_a = record(measure, key_a, 8, delivery_a);
+        submit();
+        auto& scopes = native::adaptive_completion_scopes[stage];
+        Check(!scopes.at(key_a).retained.valid, "a completed WARP fence without final delivery cannot publish a scoped proof");
+        const auto sequence_b = record(measure, key_b, 12, std::make_shared<Delivery>(Delivery::DELIVERED));
+        submit();
+        Check(timers::completed_stats[stage].sequence == sequence_b && scopes.at(key_b).retained.sequence == sequence_b,
+            "B publishes its WARP completion and takes the current Stage slot");
+        *delivery_a = Delivery::DELIVERED;
+        timers::Poll(true, false);
+        const auto& completed_a = scopes.at(key_a).retained;
+        Check(timers::completed_stats[stage].sequence == sequence_b && completed_a.sequence == sequence_a
+                && completed_a.passes[0].width == 8 && completed_a.measured_ns > 0
+                && native::CurrentCompletedGroup(completed_a, group, timers::NowNs(), nullptr, &key_a),
+            "A's older recording retains its completed dimensions once delivered while the shared Stage slot still holds B");
+        record(measure, key_a, 16, std::make_shared<Delivery>(Delivery::REJECTED));
+        submit();
+        Check(scopes.at(key_a).retained.sequence == sequence_a && timers::completed_stats[stage].sequence == sequence_b,
+            "a rejected final delivery cannot replace the accepted scoped completion");
+      }
+      rate::DestroyPresentOutput(swapchain_a);
+      rate::DestroyPresentOutput(swapchain_b);
+      timers::completed_observer = previous_observer;
+      std::cout << "ADAPTIVE_COMPLETION_SCOPE evidence=WARP+MOCK measured=1 proof_only=1 pending=blocked rejected=blocked superseded=retained\n";
     }
     if (info != nullptr) {
       for (UINT64 index = 0; index < info->GetNumStoredMessages(); ++index) {

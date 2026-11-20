@@ -12,6 +12,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <memory>
@@ -75,6 +76,13 @@ constexpr auto PRESENT = D3D12_RESOURCE_STATE_PRESENT;
 using Pixel = std::array<uint16_t, 4>;
 constexpr Pixel GAME_PIXEL{0x3400, 0x3600, 0x3800, 0x3900};
 constexpr Pixel OVERWRITE_PIXEL{0x3a00, 0x3400, 0x3600, 0x3800};
+
+struct OutputFrameToken : sl::FrameToken {
+  uint32_t value;
+  explicit OutputFrameToken(uint32_t frame) : value(frame) {}
+  operator uint32_t() const override { return value; }
+};
+inline std::function<void()> output_source_evaluate;
 
 // Only the Streamline identity is substituted. DXGI buffers and GPU work are real.
 struct StreamlineSwapchainFace final : IDXGISwapChain {
@@ -1769,6 +1777,100 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
                 << " complete=" << failed.base_complete << " base_outputs=" << failed.base_outputs - first.base_outputs
                 << " recovery_outputs=" << recovered.base_outputs - failed.base_outputs
                 << " recovery_reset=" << model_resets.back() << '\n';
+
+      auto& present_stream = native::present_streams.at(&output);
+      const std::array back_buffers{reinterpret_cast<uintptr_t>(output.buffers[0].Get()),
+          reinterpret_cast<uintptr_t>(output.buffers[1].Get())};
+      const auto swapchain_key = reinterpret_cast<uintptr_t>(&output);
+      const auto native_device = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(gpu.device.Get()));
+      addon::output_framerate::RegisterPresentOutput(swapchain_key, native_device,
+          reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(output.swapchain.Get())), back_buffers);
+      substitutions.Atomic(&native::nr_adaptive_enabled);
+      substitutions.Atomic(&native::nr_adaptive_selected_levels);
+      substitutions.Atomic(&native::nr_adaptive_limited_residency);
+      const auto unregister = [&](int*) { addon::output_framerate::DestroyPresentOutput(swapchain_key); };
+      const std::unique_ptr<int, decltype(unregister)> output_registration(&hook_key, unregister);
+      native::nr_adaptive_enabled = true;
+      native::nr_adaptive_selected_levels = 2;
+      native::nr_adaptive_limited_residency = false;
+      using AdaptiveReceipt = addon::adaptive_resolution::DeliveryReceipt;
+      const auto compatible_frame = [&](std::shared_ptr<AdaptiveReceipt>* receipt = nullptr) {
+        // Guides accompany successful SR. The game writes a separate scene to
+        // BB, so this compatibility frame has no exact SR-to-BB provenance.
+        const auto previous_timing = addon::gpu_timers::internal::next_sequence;
+        evaluate_sr(false, false);
+        upload(back(), game_pixel, PRESENT);
+        submit();
+        event();
+        if (receipt != nullptr) {
+          const auto& segments = addon::gpu_timers::internal::segments;
+          const auto timing = std::ranges::find_if(segments, [&](const auto& segment) {
+            return segment.recorded && segment.measure && segment.sequence > previous_timing
+                && std::strcmp(segment.path, "present") == 0 && segment.adaptive.delivery != nullptr;
+          });
+          Check(timing != std::end(segments), "compatibility Present records an adaptive GPU segment for the actual frame");
+          *receipt = timing->adaptive.delivery;
+        }
+        const auto edited = read_back();
+        swap();
+        return edited;
+      };
+      const auto claim_count = present_stream.base_frame_clock.claims;
+      std::shared_ptr<addon::adaptive_resolution::Session> adaptive;
+      for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 24; ++attempt) {
+        compatible_frame();
+        const auto producer = native::features.find(present_stream.Handle());
+        if (producer == native::features.end()) continue;
+        adaptive = producer->second.adaptive_session;
+        if (adaptive != nullptr && adaptive->TargetReady() && adaptive->applied_generation == adaptive->status.generation) break;
+      }
+      Check(adaptive != nullptr && adaptive->TargetReady() && adaptive->ladder.count == 2
+                && adaptive->status.applied == adaptive->status.upper
+                && adaptive->applied_generation == adaptive->status.generation,
+            "Every present compatibility confirms the upper tier after a complete ordered two-tier preparation");
+      const auto sampled_output = addon::output_framerate::MatchPresentOutput(swapchain_key, back_buffers[0]);
+      const auto output_end = addon::output_framerate::NowNs() - 10'000'000;
+      for (int index = 240; index >= 0; --index) {
+        addon::output_framerate::ObservePresent(sampled_output, output_end - index * int64_t{8'333'334});
+      }
+      Check(addon::output_framerate::Read(sampled_output, output_end).available,
+            "ordinary adaptive trial has an independent valid output window");
+      compatible_frame();
+      const auto upper_generation = adaptive->applied_generation;
+      const auto upper_applied_ns = adaptive->applied_ns;
+      adaptive->previous_level = 0;
+      adaptive->trial = true;
+      adaptive->Request(1, native::SteadyNowNs());
+      const auto low_request = adaptive->status.generation;
+      const auto before_fault = stats();
+      const auto before_fault_stamp = execution_stamp();
+      adaptive->next_measure_ns = 0;
+      signal_fault::fail_signal = true;
+      std::shared_ptr<AdaptiveReceipt> failed_receipt;
+      const auto failed_pixels = compatible_frame(&failed_receipt);
+      Check(!signal_fault::fail_signal && stats().ring_submissions == before_fault.ring_submissions + 1
+                && *failed_receipt == AdaptiveReceipt::REJECTED
+                && execution_stamp() > before_fault_stamp && !native::PresentRingComplete()
+                && failed_pixels != std::vector(size * size, GAME_PIXEL)
+                && adaptive->TargetReady() && adaptive->status.generation == low_request
+                && adaptive->applied_generation == upper_generation && adaptive->applied_ns == upper_applied_ns
+                && adaptive->status.applied == adaptive->status.upper && adaptive->gpu_count == 0
+                && addon::output_framerate::Read(sampled_output, addon::output_framerate::NowNs()).available
+                && present_stream.base_frame_clock.claims == claim_count,
+            "failed compatibility Signal retains actual WARP writes and upper confirmation, with no base claim or low-tier sample");
+      adaptive->next_measure_ns = 0;
+      std::shared_ptr<AdaptiveReceipt> recovered_receipt;
+      compatible_frame(&recovered_receipt);
+      Check(adaptive->applied_generation == low_request && adaptive->status.applied == adaptive->ladder.sizes[1]
+                && *recovered_receipt == AdaptiveReceipt::DELIVERED
+                && adaptive->applied_ns > upper_applied_ns && model_resets.back() == 1
+                && native::PresentRingComplete() && present_stream.base_frame_clock.claims == claim_count,
+            "the next unclaimed compatibility frame resets locally and confirms the complete low tier only after Signal");
+      const auto confirmed_at = adaptive->applied_ns;
+      compatible_frame();
+      Check(adaptive->applied_ns == confirmed_at && present_stream.base_frame_clock.claims == claim_count,
+            "subsequent compatibility delivery leaves first confirmation and base claims unchanged");
+      std::cout << "ADAPTIVE_DELIVERY_PRESENT evidence=WARP+MOCK failed_signal_writes=1 recovered_reset=1 base_claim_delta=0\n";
     }
 
     {
@@ -1995,6 +2097,103 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
 
     read_back();
     swap();
+
+    if (config_fixture) {
+      namespace rate = addon::output_framerate;
+      funnel_accounting_tests::Restore source_restore;
+      source_restore.Value(&native::real_streamline_set_tag_for_frame);
+      source_restore.Value(&native::real_streamline_set_tag);
+      source_restore.Value(&native::real_streamline_evaluate);
+      source_restore.Value(&native::real_streamline_free[0]);
+      source_restore.Value(&output_source_evaluate);
+      source_restore.Atomic(&native::nr_adaptive_enabled);
+      native::nr_adaptive_enabled.store(true);
+      std::array<uintptr_t, 2> buffers{};
+      for (size_t index = 0; index < buffers.size(); ++index) {
+        buffers[index] = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(output.buffers[index].Get()));
+      }
+      rate::RegisterPresentOutput(reinterpret_cast<uintptr_t>(&output),
+          reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(gpu.device.Get())),
+          reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(output.swapchain.Get())), buffers);
+      const auto owner = rate::FindPresentOutput(0, buffers[output.get_current_back_buffer_index()]);
+      Check(static_cast<bool>(owner), "Streamline source fixture has an actual output owner");
+      sl::Resource buffer(sl::ResourceType::eTex2d, back());
+      sl::Resource source(sl::ResourceType::eTex2d, sr_output.Get());
+      const sl::ResourceTag tags[] = {
+          {&buffer, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilEvaluate},
+          {&source, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate},
+      };
+      OutputFrameToken frame(37);
+      sl::ViewportHandle viewport(91);
+      native::real_streamline_set_tag_for_frame = +[](const sl::FrameToken&, const sl::ViewportHandle&,
+          const sl::ResourceTag*, uint32_t, sl::CommandBuffer*) { return sl::Result::eOk; };
+      Check(native::HookedStreamlineSetTagForFrame(frame, viewport, tags, static_cast<uint32_t>(std::size(tags)),
+                reinterpret_cast<sl::CommandBuffer*>(gpu.list.Get())) == sl::Result::eOk,
+            "successful actual framed tag wrapper binds the output and SR texture");
+      output_source_evaluate = [&] { evaluate_sr(false, true); };
+      native::real_streamline_evaluate = +[](sl::Feature, const sl::FrameToken&, const sl::BaseStructure**,
+          uint32_t, sl::CommandBuffer*) {
+        output_source_evaluate();
+        return sl::Result::eOk;
+      };
+      const sl::BaseStructure* inputs[]{&viewport};
+      const auto evaluate_output = [&](const sl::BaseStructure** selected_inputs, uint32_t count) {
+        const auto result = native::HookedStreamlineEvaluate(sl::kFeatureDLSS, frame, selected_inputs, count,
+            reinterpret_cast<sl::CommandBuffer*>(gpu.list.Get()));
+        // Guide captures remain replayable until the producing list is reset.
+        // Complete each source call before the next independent application frame.
+        submit();
+        event();
+        reopen();
+        return result;
+      };
+      Check(evaluate_output(inputs, 1) == sl::Result::eOk,
+            "actual Streamline Evaluate forwards through the successful NGX SR wrapper");
+      const rate::SourceIdentity identity{.handle = reinterpret_cast<uintptr_t>(sr_handle),
+          .generation = native::create_contracts.at(sr_handle).source_generation, .device = owner.device,
+          .resource = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(sr_output.Get())),
+          .resource_generation = native::AdaptiveResourceGeneration(sr_output.Get())};
+      Check(!rate::FindPresentOutput(identity.device, identity.resource) && rate::FindSourceOutput(identity) == owner,
+            "the real framed production relation associates a distinct SR output without a strict x2 pixel copy");
+      native::real_streamline_free[0] = +[](sl::Feature, const sl::ViewportHandle&) { return sl::Result::eOk; };
+      Check(native::HookedStreamlineFreeResources<0>(sl::kFeatureDLSS, viewport) == sl::Result::eOk
+                && !rate::FindSourceOutput(identity),
+            "actual Streamline resource release revokes the old SR output owner");
+      native::real_streamline_set_tag = +[](const sl::ViewportHandle&, const sl::ResourceTag*, uint32_t,
+          sl::CommandBuffer*) { return sl::Result::eOk; };
+      native::nr_adaptive_enabled.store(false);
+      Check(native::HookedStreamlineSetTag(viewport, tags, static_cast<uint32_t>(std::size(tags)),
+                reinterpret_cast<sl::CommandBuffer*>(gpu.list.Get())) == sl::Result::eOk
+                && evaluate_output(inputs, 1) == sl::Result::eOk
+                && rate::FindSourceOutput(identity) == owner,
+            "valid unframed Streamline tags observe the successful SR output while adaptive control is off");
+      native::nr_adaptive_enabled.store(true);
+      Check(evaluate_output(inputs, 1) == sl::Result::eOk
+                && rate::FindSourceOutput(identity) == owner,
+            "enabling adaptive control keeps the live persistent tag relation without requiring another tag call");
+      Check(native::HookedStreamlineFreeResources<0>(sl::kFeatureDLSS, viewport) == sl::Result::eOk
+                && evaluate_output(inputs, 1) == sl::Result::eOk
+                && !rate::FindSourceOutput(identity),
+            "a released unframed tag cannot rebind the next successful SR evaluation");
+      sl::Resource different_texture(sl::ResourceType::eTex2d, color.Get());
+      sl::ResourceTag local_back_buffer = tags[0];
+      sl::ResourceTag local_source(&different_texture, sl::kBufferTypeScalingOutputColor,
+          sl::ResourceLifecycle::eOnlyValidNow);
+      local_source.next = &local_back_buffer;
+      const sl::BaseStructure* local_inputs[]{&viewport, &local_source};
+      Check(evaluate_output(local_inputs, 2) == sl::Result::eOk
+                && !rate::FindSourceOutput(identity),
+            "a local SR tag pointing to a different texture cannot substitute for the actual nested NGX output");
+      local_source.resource = &source;
+      Check(evaluate_output(local_inputs, 2) == sl::Result::eOk
+                && rate::FindSourceOutput(identity) == owner && !rate::CaptureNativeLegacySourceTag(91),
+            "Evaluate-local chained tags prove the nested NGX output without installing a global tag");
+      Check(native::HookedStreamlineFreeResources<0>(sl::kFeatureDLSS, viewport) == sl::Result::eOk
+                && !rate::FindSourceOutput(identity),
+            "resource release withdraws the relation established by the local tags");
+      rate::DestroyPresentOutput(reinterpret_cast<uintptr_t>(&output));
+      std::cout << "ADAPTIVE_OUTPUT_SOURCE evidence=WARP+MOCK framed_tags=1 legacy_tags=1 actual_sr=1 release_revoked=1\n";
+    }
 
     {
       funnel_accounting_tests::Restore source_restore;

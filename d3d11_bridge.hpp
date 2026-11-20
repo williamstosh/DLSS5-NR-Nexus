@@ -1681,6 +1681,12 @@ inline bool RunBridge(ID3D11DeviceContext* context,
         .output_twin = (trusted_sr ? set->output12 : nullptr)};
     adaptive_bridge = !pre && present == nullptr
         && BridgeAdaptiveEligible(bridge_source, slot.list, bridge.device12, handle, plan);
+    bool poll_adaptive_timers = false;
+    const auto settle_adaptive = [&](NrRecording* recording) {
+      if (adaptive_bridge) ResolveAdaptiveDelivery(recording->adaptive_delivery, delivered);
+      if (poll_adaptive_timers) gpu_timers::Poll(true, false);
+    };
+    const std::unique_ptr<NrRecording, decltype(settle_adaptive)> adaptive_delivery(&bridge_recording, settle_adaptive);
     if (bridge_adaptive_experiment.load() && nr_adaptive_enabled.load() && !adaptive_bridge) {
       decline(NrDeclineReason::kBridgeDown,
           "Bridge Adaptive experiment requires an identified Upscaled source, one Pass, two full-prepared tiers, FG Off and x2 Off; native SR retained");
@@ -2015,7 +2021,9 @@ inline bool RunBridge(ID3D11DeviceContext* context,
         }
         slot.value = 0;
         PruneCompletedSubmissionUses();
-        gpu_timers::Poll(true, false);
+        // The GPU has completed the private list. The timer can enter
+        // adaptive history only after this call settles the D3D11 handoff.
+        poll_adaptive_timers = true;
         if (const auto state = features.find(handle); state != features.end() && state->second.adaptive_cache != nullptr) {
           PollAdaptiveCache(state->second.adaptive_cache.get());
         }

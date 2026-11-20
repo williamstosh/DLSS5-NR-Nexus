@@ -2330,7 +2330,7 @@ inline constexpr Translation kSl[] = {
     {"Declared %ux", "Deklarirano %ux"},
     {"Up to %ux", "Do %ux"},
     {"Dynamic", "Dinamično"},
-    {"Present cadence estimate", "Ocena iz ritma Present"},
+    {"Application Present submission estimate", "Ocena pogostosti klicev Present aplikacije"},
     {"XeFG SDK output estimate", "Ocena izhoda SDK XeFG"},
     {"DLSS FG SDK output estimate", "Ocena izhoda SDK DLSS FG"},
     {"Fixed FG multiplier estimate", "Ocena s fiksnim množiteljem FG"},

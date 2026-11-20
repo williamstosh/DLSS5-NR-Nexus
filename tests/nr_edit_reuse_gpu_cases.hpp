@@ -1818,10 +1818,15 @@ int Run() {
         const auto saved_stability = session->stable_after_ns;
         const auto saved_comparison_stability = native::comparison_stable_after_ns[1];
         const auto saved_measure = session->next_measure_ns;
-        const auto saved_output = [] {
-          std::unique_lock lock(addon::output_framerate::internal::state.mutex);
-          return addon::output_framerate::internal::state.stream;
-        }();
+        namespace rate = addon::output_framerate;
+        const auto output_fixture = reinterpret_cast<uintptr_t>(session.get());
+        const std::array fixture_buffers{
+            reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(output.Get()))};
+        rate::RegisterPresentOutput(output_fixture,
+            reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(gpu.device.Get())), 0, fixture_buffers);
+        const auto fixture_output = rate::MatchPresentOutput(output_fixture, fixture_buffers[0]);
+        session->output_source = static_cast<uint64_t>(rate::Source::PRESENT);
+        session->output_generation = session->output_configuration = fixture_output.generation;
         Check(!native::gpu_timers_enabled.load() && !native::cost_meter_enabled.load(),
               "paired WARP recording is driven by adaptive sampling without profiling");
         timers::Poll(true, false);
@@ -1834,10 +1839,10 @@ int Run() {
           const auto now = native::SteadyNowNs();
           {
             std::unique_lock lock(addon::output_framerate::internal::state.mutex);
-            auto& estimate = addon::output_framerate::internal::state.stream;
+            auto& estimate = addon::output_framerate::internal::state.present.at(output_fixture).stream;
             estimate.previous_ns = now;
             estimate.snapshot = {.available = true, .source = addon::output_framerate::Source::PRESENT,
-                .source_generation = 1, .configuration_generation = native::configuration_generation.load(),
+                .source_generation = fixture_output.generation, .configuration_generation = fixture_output.generation,
                 .window_serial = 1, .window_begin_ns = now - 500'000'000, .window_end_ns = now,
                 .fps = 60., .fg_off = true};
           }
@@ -1867,6 +1872,7 @@ int Run() {
           CloseHandle(event);
           Check(wait == WAIT_OBJECT_0 && SUCCEEDED(gpu.device->GetDeviceRemovedReason()), "paired healthy bounded completion");
           gpu.submission_pending = false;
+          native::ResolveAdaptiveBorrowedDeliveries();
           Check(SUCCEEDED(gpu.allocator->Reset()) && SUCCEEDED(gpu.list->Reset(gpu.allocator.Get(), nullptr)),
                 "paired completed recording reset");
           native::DrainRetiredResources(true);
@@ -1894,10 +1900,7 @@ int Run() {
         session->stable_after_ns = saved_stability;
         native::comparison_stable_after_ns[1] = saved_comparison_stability;
         session->next_measure_ns = saved_measure;
-        {
-          std::unique_lock lock(addon::output_framerate::internal::state.mutex);
-          addon::output_framerate::internal::state.stream = saved_output;
-        }
+        rate::DestroyPresentOutput(output_fixture);
       }
       std::weak_ptr<reuse::State> retired_lower = low_anchor;
       low_anchor.reset();

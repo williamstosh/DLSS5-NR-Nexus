@@ -12,7 +12,7 @@ param(
     [string]$DetoursLibrary,
     [string]$PythonExecutable,
     [ValidateSet('Auto','Quick','Full','None')][string]$UiPreview = 'Auto',
-    [ValidateSet('inline-restore-roi','control-mask','control-mask-safety','control-mask-safety-hardware','control-mask-capture','control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','control-mask-native-ngx-fg','gpu-pass-diagnostics','native-required-menu','native-owner-idle','native-options-resume','native-options-delayed','native-guide-contract','present-guide-models','adaptive-fg-service','adaptive-inline','vulkan-recorded-use-contract','native-present-decision','trace-metadata','stage-chain','stage-resolution','stage-resolution-hardware','same-stage-resolution','same-stage-resolution-hardware','render-stage-resolution','render-stage-resolution-hardware','present-stage-resolution','present-stage-resolution-hardware','native-prefg-resolution','native-prefg-resolution-hardware','native-frame-identity','same-stage-model-pair','same-stage-mixed-pair','source-lifecycle','feature-switch','feature-switch-hardware','f5-mixed','present-chain','present-chain-hardware','present-chain-scrgb','present-chain-hdr10','native-full','native-full-hardware','nr-edit-reuse-contracts','nr-edit-reuse-contracts-public','nr-edit-reuse-render-contracts','nr-edit-reuse-present-contracts','nr-edit-reuse-present-diagnostic','nr-edit-reuse-present-native','nr-edit-reuse-xefg-contracts','nr-edit-reuse-native-contracts','native-frame-source','nr-fg-output-marker','fg-consumer-capture','xefg-present-probe')]
+    [ValidateSet('inline-restore-roi','control-mask','control-mask-safety','control-mask-safety-hardware','control-mask-capture','control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','control-mask-native-ngx-fg','gpu-pass-diagnostics','native-required-menu','native-owner-idle','native-options-resume','native-options-delayed','native-guide-contract','present-guide-models','adaptive-fg-service','adaptive-inline','adaptive-status','output-framerate-registration','output-framerate-sdk','vulkan-recorded-use-contract','native-present-decision','trace-metadata','stage-chain','stage-resolution','stage-resolution-hardware','same-stage-resolution','same-stage-resolution-hardware','render-stage-resolution','render-stage-resolution-hardware','present-stage-resolution','present-stage-resolution-hardware','native-prefg-resolution','native-prefg-resolution-hardware','native-frame-identity','same-stage-model-pair','same-stage-mixed-pair','source-lifecycle','feature-switch','feature-switch-hardware','f5-mixed','present-chain','present-chain-hardware','present-chain-scrgb','present-chain-hdr10','native-full','native-full-hardware','nr-edit-reuse-contracts','nr-edit-reuse-contracts-public','nr-edit-reuse-render-contracts','nr-edit-reuse-present-contracts','nr-edit-reuse-present-diagnostic','nr-edit-reuse-present-native','nr-edit-reuse-xefg-contracts','nr-edit-reuse-native-contracts','native-frame-source','nr-fg-output-marker','fg-consumer-capture','xefg-present-probe')]
     [string[]]$NativeCase = @(),
     [switch]$VulkanNativeNgx,
     [string]$NativeNgxProjectIdPath,
@@ -62,6 +62,7 @@ $sources = [ordered]@{
     'copy-slots'='copy_slots_tests'
 }
 $executionPolicySuites = @('edit-reuse-policy','present-frame-policy','capability-policy')
+$dependencyCheckedSuites = $executionPolicySuites + @('adaptive-resolution')
 if ($Suite -contains 'all') { $Suite = @($sources.Keys) }
 if ($BuildOnly -and @($Suite | Where-Object { $_ -in @('config','constants','lifecycle','ui') }).Count) {
     throw '-BuildOnly requires explicitly selecting native/policy/scope/fg-xefg/fg-native/bridge-motion suites.'
@@ -174,7 +175,7 @@ foreach ($item in $Suite) {
     $name = $sources[$item]
     $exe = Join-Path $directory "$name.exe"
     $arguments = $common + @($includes | ForEach-Object { "/I$_" })
-    if ($item -in $executionPolicySuites) {
+    if ($item -in $dependencyCheckedSuites) {
         $msvcInclude = Join-Path $env:VCToolsInstallDir 'include'
         $ucrtInclude = Join-Path $env:WindowsSdkDir "Include/$($env:WindowsSDKVersion.TrimEnd('\'))/ucrt"
         $arguments = $common + @('/X', '/Y-', '/UNR_NEXUS_DEV_CONTROL', "/I$SourceRoot", "/I$msvcInclude", "/I$ucrtInclude")
@@ -183,7 +184,7 @@ foreach ($item in $Suite) {
         $arguments += "/I$HostRoot/external/reshade/include"
     }
     $link = $libraries
-    if ($item -in $executionPolicySuites -or $item -in @('branding','sdr-policy','hdr-policy','scope','stage-plan','adaptive-resolution','control-mask')) { $link = @() }
+    if ($item -in $dependencyCheckedSuites -or $item -in @('branding','sdr-policy','hdr-policy','scope','stage-plan','control-mask')) { $link = @() }
     if ($item -in @('fg-native','bridge-motion','vulkan-control-mask')) {
         if (-not (Test-Path -LiteralPath "$ShaderIncludeDirectory/embed/shaders.h")) { throw 'Build new shaders first.' }
         $arguments += @('/bigobj','/Gy','/Gw','/DNDEBUG','/DRESHADE_ADDON=1',
@@ -215,7 +216,7 @@ foreach ($item in $Suite) {
     if ($LASTEXITCODE -ne 0) { throw "Compile/link failed: $item; see $directory/compile.log" }
     $dependencyFile = Join-Path $directory 'dependencies.json'
     $inputPaths = @((Join-Path $testRoot "$name.cpp"), $PSCommandPath)
-    if ($item -in $executionPolicySuites) {
+    if ($item -in $dependencyCheckedSuites) {
         $policyChecker = Join-Path $PSScriptRoot 'check-execution-policy-dependencies.ps1'
         $inputPaths += $policyChecker
         & $policyChecker -DependencyFile $dependencyFile -SourceRoot $SourceRoot -Suite $item
@@ -412,7 +413,7 @@ foreach ($item in $Suite) {
         }
     }
     $result = @{suite=$item; build='passed'; run=$(if ($BuildOnly -or $skipVulkanRun) { 'not_run' } else { 'passed' })}
-    if ($item -in $executionPolicySuites) { $result.dependency_policy = 'passed' }
+    if ($item -in $dependencyCheckedSuites) { $result.dependency_policy = 'passed' }
     if ($skipVulkanRun) { $result.skip_reason = 'software_only_native_gpu_required' }
     $result | ConvertTo-Json | Set-Content -LiteralPath "$directory/result.json" -Encoding utf8
     if (-not $BuildOnly) { Complete-TestOutput $directory }
@@ -446,7 +447,7 @@ if ($Suite -contains 'ui' -and -not $BuildOnly -and $UiPreview -ne 'None') {
 } catch {
     if ($OutputDirectory -and (Test-Path -LiteralPath (Join-Path $OutputDirectory 'artifact-lifecycle.json'))) {
         if ($testWorkspaceStarted) {
-            foreach ($policySuite in $executionPolicySuites) {
+            foreach ($policySuite in $dependencyCheckedSuites) {
                 Complete-TestOutput (Join-Path $OutputDirectory $policySuite) -Outcome Failed
             }
         }

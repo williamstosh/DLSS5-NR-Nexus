@@ -2330,7 +2330,7 @@ inline constexpr Translation kJa[] = {
     {"Declared %ux", "宣言値 %u 倍"},
     {"Up to %ux", "最大 %u 倍"},
     {"Dynamic", "動的"},
-    {"Present cadence estimate", "Present 間隔による推定"},
+    {"Application Present submission estimate", "アプリの Present 送信頻度の推定"},
     {"XeFG SDK output estimate", "XeFG SDK の出力推定"},
     {"DLSS FG SDK output estimate", "DLSS FG SDK の出力推定"},
     {"Fixed FG multiplier estimate", "固定 FG 倍率による推定"},

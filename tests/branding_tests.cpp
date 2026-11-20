@@ -61,7 +61,7 @@ int main() {
       "Declared %ux",
       "Up to %ux",
       "Dynamic",
-      "Present cadence estimate",
+      "Application Present submission estimate",
       "XeFG SDK output estimate",
       "DLSS FG SDK output estimate",
       "Fixed FG multiplier estimate",

@@ -275,7 +275,6 @@ inline constexpr uint32_t kPresentPreFgMisses = 2 | 8 | 16 | 32 | 128 | 1024;
 inline uint32_t present_prefg_miss_streak = 0;
 inline uint32_t present_prefg_clear_streak = 0;
 inline uint32_t present_prefg_episodes_logged = 0;
-inline std::atomic_bool present_prefg_upscaled_active{false};
 // Under runtime_mutex: the last successful pre-FG frame's clocks and
 // multiplier, plus the swapchain's target and size from its last present.
 inline int64_t present_prefg_served_ns = 0;
@@ -285,7 +284,6 @@ inline PresentTarget present_prefg_target;
 inline uint32_t present_prefg_target_multiplier = 1;
 inline uint32_t present_prefg_width = 0;
 inline uint32_t present_prefg_height = 0;
-inline const void* present_prefg_served_swapchain = nullptr;
 // The two pre-FG NR streams' keys in present_streams (never dereferenced).
 inline const uint8_t present_prefg_keys[2] = {};
 // Under runtime_mutex: NR's copy of DLSS-G's HUDLess (at rest in the selected
@@ -334,6 +332,7 @@ inline constexpr uint32_t kPresentPreFgComposeSets = 16;
 inline constexpr uint32_t kPresentPreFgComposeDescriptors = 6;
 inline constexpr uint32_t kPresentPreFgComposeDepthNullSrv = kPresentPreFgComposeSets * kPresentPreFgComposeDescriptors;
 inline constexpr uint32_t kPresentPreFgComposeMotionNullSrv = kPresentPreFgComposeDepthNullSrv + 1;
+inline constexpr uint32_t kPresentPreFgComposeDepthProofNullCbv = kPresentPreFgComposeMotionNullSrv + 1;
 // Per slot: [HUD pixels, serial, grain-sized pixels] (the shader's Stats).
 inline constexpr uint32_t kPresentPreFgStatsWords = 3;
 // Under runtime_mutex.  The composite's objects, made in the world (device
@@ -367,7 +366,6 @@ inline std::atomic_uint64_t present_prefg_two_pass{0};
 inline std::atomic_uint32_t present_prefg_hud_permille{0};
 // The last present ran no NR because a pre-FG frame served it (the status
 // card's "NR once per game frame, before frame generation").
-inline std::atomic_bool present_prefg_active{false};
 // Evaluates since the last present (PresentTakesEvaluate).
 inline std::atomic_uint32_t present_unpresented_evaluates{0};
 inline constexpr uint32_t kPresentStarvedEvaluates = 3;
@@ -410,6 +408,7 @@ struct PresentBaseFrame {
   const void* backbuffer = nullptr;
   uint64_t sequence = 0;
   uint64_t source_generation = 0;
+  uint64_t source_resource_generation = 0;
   uint64_t configuration = 0;
   uint64_t queue_entry = 0;
   bool source_ready = false;
@@ -613,7 +612,6 @@ struct AutoFgObservation {
 inline AutoFgObservation auto_fg_observation;
 // Last admitted owner for a nonblocking Present observation. It is compared
 // only; RunPresentPath revalidates the locked state before recording work.
-inline std::atomic<const void*> auto_fg_fallback_swapchain{nullptr};
 inline std::vector<PresentRetired> present_retired;
 // Under runtime_mutex: an evaluate fallback episode is logged once.
 inline bool present_fallback_episode = false;
@@ -809,6 +807,11 @@ inline void RetirePresentStream(const void* swapchain) {
     present_prefg_served_swapchain = nullptr;
     present_prefg_served_ns = 0;
     present_prefg_hudless_source = nullptr;
+    present_prefg_active.store(false, std::memory_order_relaxed);
+  }
+  if (present_prefg_upscaled_output.swapchain == reinterpret_cast<uintptr_t>(swapchain)) {
+    present_prefg_upscaled_output = {};
+    present_prefg_upscaled_active.store(false, std::memory_order_relaxed);
   }
   if (auto_fg_observation.swapchain == swapchain) {
     auto_fg_observation = {};
@@ -839,6 +842,7 @@ inline void ResetPresentPathState() {
   present_prefg_miss_streak = 0;
   present_prefg_clear_streak = 0;
   present_prefg_upscaled_active.store(false, std::memory_order_relaxed);
+  present_prefg_upscaled_output = {};
 }
 
 // The composite's objects retire like the path's others; without submission
@@ -1259,6 +1263,7 @@ inline void CapturePresentGuides(
           .recording = submission::RecordingIdentity(command_list),
           .native_list = native_list,
           .sequence = source->second.sr_sequence, .source_generation = source->second.source_generation,
+          .source_resource_generation = (nr_adaptive_enabled.load() ? AdaptiveResourceGeneration(output) : 0),
           .configuration = configuration_generation.load(std::memory_order_relaxed)};
     }
   }
@@ -1765,7 +1770,7 @@ inline uint32_t ComposePresentPreFg(ID3D12GraphicsCommandList* command_list,
   if (compose.heap == nullptr) {
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heap_desc.NumDescriptors = kPresentPreFgComposeMotionNullSrv + 1;
+    heap_desc.NumDescriptors = kPresentPreFgComposeDepthProofNullCbv + 1;
     heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&compose.heap)))) {
       compose.heap = nullptr;
@@ -1785,6 +1790,9 @@ inline uint32_t ComposePresentPreFg(ID3D12GraphicsCommandList* command_list,
       device->CreateShaderResourceView(nullptr, &null_guide,
           DescriptorHeapSlot(compose.heap->GetCPUDescriptorHandleForHeapStart(),
               kPresentPreFgComposeMotionNullSrv, compose.descriptor_size));
+      device->CreateConstantBufferView(nullptr,
+          DescriptorHeapSlot(compose.heap->GetCPUDescriptorHandleForHeapStart(),
+              kPresentPreFgComposeDepthProofNullCbv, compose.descriptor_size));
     }
   }
   if (compose.heap == nullptr || !SupportsCodecFormat(device, format)
@@ -2006,6 +2014,8 @@ inline uint32_t ComposePresentPreFg(ID3D12GraphicsCommandList* command_list,
       3, DescriptorHeapSlot(gpu_start, kPresentPreFgComposeDepthNullSrv, compose.descriptor_size));
   command_list->SetComputeRootDescriptorTable(
       4, DescriptorHeapSlot(gpu_start, kPresentPreFgComposeMotionNullSrv, compose.descriptor_size));
+  command_list->SetComputeRootDescriptorTable(
+      5, DescriptorHeapSlot(gpu_start, kPresentPreFgComposeDepthProofNullCbv, compose.descriptor_size));
   // The shader's ComposeConstants (9 of the codec signature's 28 dwords).
   // Difference-mask mode needs stage 0's current-frame count before stage 1;
   // exact UI-alpha modes have no statistics dependency and run stage 1 once.
@@ -2384,6 +2394,10 @@ inline ID3D12Resource* RunPresentPreFg(ID3D12GraphicsCommandList* command_list,
     if (bit == 1) present_prefg_upscaled_active.store(false, std::memory_order_relaxed);
     if ((bit & kPresentPreFgMisses) != 0) {
       present_prefg_clear_streak = 0;
+      if (present_prefg_miss_streak + 1 >= kPresentPreFgMissFrames) {
+        present_prefg_upscaled_output = output_framerate::FindPresentOutput(0,
+            reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(backbuffer)));
+      }
       if (++present_prefg_miss_streak >= kPresentPreFgMissFrames
           && !present_prefg_upscaled_active.exchange(true, std::memory_order_relaxed)
           && present_prefg_episodes_logged++ < 16) {
@@ -2881,15 +2895,20 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
   const bool base_frame = target.base_frame_epoch != 0;
   const bool identified_frame = present_frame_policy::Known(target.base_frame);
   target.independent_resolution_pair = target.independent_resolution_pair
-      && stream.fg_multiplier == 1 && present_fg_multiplier.load(std::memory_order_relaxed) == 1
-      && !present_prefg_active.load(std::memory_order_relaxed)
-      && !present_prefg_upscaled_active.load(std::memory_order_relaxed);
+      && stream.fg_multiplier == 1;
   const bool independent_pair = PresentResolutionPairAllowed(target);
   const auto* const handle = stream.Handle(neutral_model);
+  const auto existing_feature = features.find(handle);
+  const bool report_adaptive = target.adaptive_output
+      && (nr_adaptive_enabled.load() || (existing_feature != features.end() && existing_feature->second.adaptive_session));
   bool recording_started = false;
   bool submitted = false;
+  bool adaptive_delivered = false;
   NrRecording recording;
   const auto cancel = [&](int*) {
+    if (target.adaptive_output && !adaptive_delivered && recording.adaptive_delivery.frame.session != nullptr) {
+      ResolveAdaptiveDelivery(recording.adaptive_delivery, false);
+    }
     if (identified_frame && !base_frame && !submitted) {
       stream.base_frame_clock.complete = false;
       stream.base_history_unbound = true;
@@ -2960,7 +2979,11 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     const auto previous_capture_serial = screenshot::PendingModelCaptureSerial(slot->list);
     // From here ProcessInline names the terminal.
     const bool accepted = ProcessInline(slot->list, handle, &block, &touched, &target,
-        (mixed || base_frame || identified_frame) ? &recording : nullptr);
+        (mixed || base_frame || identified_frame || report_adaptive) ? &recording : nullptr);
+    if (report_adaptive && !mixed && !base_frame && !identified_frame && recording.output_ready) {
+      PublishPresentRestoreOwner(target.domain, target.restore_decision.reason, target.restore_contract_compatible,
+          target.service_serial, target.restore_config_epoch, "nr_recorded");
+    }
     if (base_frame && !accepted) {
       slot->list->Close();
       return false;
@@ -3046,6 +3069,14 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
   submitted = true;
   slot->value = ++present_ring.submitted;
   const bool signaled = SUCCEEDED(native_queue->Signal(present_ring.fence, slot->value));
+  if (target.adaptive_output && signaled && (!identified_frame || frame_ordered)
+      && recording.adaptive_delivery.complete && recording.output_ready && recording.group_complete) {
+    ResolveAdaptiveDelivery(recording.adaptive_delivery, true);
+    adaptive_delivered = true;
+  }
+  if (!signaled && target.adaptive_output && recording.adaptive_delivery.frame.session != nullptr) {
+    ResetPresentStreamHistory(&stream, kResetRecovery);
+  }
   if (target.control_mask_depth_proof != nullptr) {
     const auto capture_serial = screenshot::PendingModelCaptureSerial(slot->list);
     if (capture_serial != 0) {
@@ -3845,6 +3876,12 @@ inline ClaimedPresentFrame IdentifyPresentBaseFrame(ID3D12CommandQueue* native_q
   frame.queue_entry = order->producer_entry;
   const auto claim = present_frame_policy::Classify(stream->base_frame_clock, current);
   if (claim != present_frame_policy::Claim::NEW_FRAME) return {};
+  if (target.adaptive_output) {
+    output_framerate::BindSourceOutput({.handle = current.source, .generation = frame.source_generation,
+        .device = reinterpret_cast<uintptr_t>(guides->device_identity),
+        .resource = reinterpret_cast<uintptr_t>(frame.source),
+        .resource_generation = frame.source_resource_generation}, target.adaptive_output);
+  }
   return {.guides = guides, .order = order, .frame = current, .claim = claim};
 }
 
@@ -4189,6 +4226,7 @@ inline void RunPresentPath(
   target.domain = present_restore_scope::Domain::FINAL_PRESENT;
   SnapshotPresentRestoreConfiguration(&target);
   target.swapchain_identity = reinterpret_cast<uintptr_t>(swapchain);
+  target.adaptive_output = output_framerate::MatchPresentOutput(target.swapchain_identity, back_handle);
   target.swapchain_format = back_format;
   target.hdr_color_space = color_space;
   target.d3d11_bridge = d3d11;
@@ -4493,7 +4531,9 @@ inline void RunPresentPath(
         other.backbuffer_width, other.backbuffer_height, back_width, back_height);
   }
   uint32_t declared_multiplier = 0;
-  const bool public_fg_off = native_passthrough || native_fg_public_off.load(std::memory_order_acquire);
+  capability::Input output_environment;
+  SetGroupFgEnvironment(&output_environment, target.adaptive_output);
+  const bool public_fg_off = native_passthrough || output_environment.fg == capability::Fg::OFF;
   const auto options_changed_ns = native_fg_options_changed_ns.load(std::memory_order_acquire);
   if (!d3d11 && !public_fg_off && present_fg_declaration.multiplier != 0
       && present_fg_declaration.observed_ns > options_changed_ns
@@ -4572,7 +4612,8 @@ inline void RunPresentPath(
   // Pre-FG cannot serve frame generation (kPresentPreFgMissFrames): the
   // evaluates run the Upscaled hook point, which DLSS-G interpolates from, so
   // NR here would enhance the real frames twice and the generated ones never.
-  if (!d3d11 && present_prefg_upscaled_active.load(std::memory_order_relaxed)) {
+  if (!d3d11 && present_prefg_upscaled_active.load(std::memory_order_relaxed)
+      && (!target.adaptive_output || !present_prefg_upscaled_output || target.adaptive_output == present_prefg_upscaled_output)) {
     PublishPresentRestoreOwner(present_restore_scope::Domain::UPSCALED_FALLBACK,
         present_restore_scope::Reason::INACTIVE_DOMAIN, true, 0, 0, "upscaled_fallback_serves_present_idle");
     InvalidatePresentBaseFrames(&stream);
@@ -4918,9 +4959,6 @@ inline void RunPresentPath(
 
   target.independent_resolution_pair = !native_passthrough && !auto_fallback
       && hook_point.load(std::memory_order_relaxed) == kHookPresent && stream.fg_multiplier == 1
-      && present_fg_multiplier.load(std::memory_order_relaxed) == 1
-      && !present_prefg_active.load(std::memory_order_relaxed)
-      && !present_prefg_upscaled_active.load(std::memory_order_relaxed)
       && stack_passes.load(std::memory_order_relaxed) == 2;
   if (d3d11) {
     if (!ResumeOrdinaryPresentLocked()) return;

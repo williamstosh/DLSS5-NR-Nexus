@@ -2330,7 +2330,7 @@ inline constexpr Translation kKo[] = {
     {"Declared %ux", "선언 %u배"},
     {"Up to %ux", "최대 %u배"},
     {"Dynamic", "동적"},
-    {"Present cadence estimate", "Present 간격 기반 추정"},
+    {"Application Present submission estimate", "앱의 Present 제출 주기 추정"},
     {"XeFG SDK output estimate", "XeFG SDK 출력 추정"},
     {"DLSS FG SDK output estimate", "DLSS FG SDK 출력 추정"},
     {"Fixed FG multiplier estimate", "고정 FG 배율 추정"},

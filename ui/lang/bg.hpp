@@ -2330,7 +2330,7 @@ inline constexpr Translation kBg[] = {
     {"Declared %ux", "Декларирано %ux"},
     {"Up to %ux", "До %ux"},
     {"Dynamic", "Динамично"},
-    {"Present cadence estimate", "Оценка по ритъма на Present"},
+    {"Application Present submission estimate", "Оценка на честотата на Present от приложението"},
     {"XeFG SDK output estimate", "Оценка на изхода от XeFG SDK"},
     {"DLSS FG SDK output estimate", "Оценка на изхода от DLSS FG SDK"},
     {"Fixed FG multiplier estimate", "Оценка с фиксиран FG множител"},

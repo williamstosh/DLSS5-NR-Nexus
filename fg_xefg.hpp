@@ -171,9 +171,11 @@ struct BridgeOffEvidence {
   uintptr_t context_identity = 0;
   uint32_t source_present_thread_id = 0;
   uint32_t source_present_proxy_entry_depth = 0;
+  output_framerate::OutputIdentity output_identity;
   bool MatchesOutput(const output_framerate::Snapshot& output) const {
     return available && context_identity != 0 && output.available && output.fg_off
-        && output.source == output_framerate::Source::XEFG_STATUS && output.identity == context_identity;
+        && output.source == output_framerate::Source::XEFG_STATUS && output.identity == context_identity
+        && output_identity && output.output == output_identity;
   }
   bool operator==(const BridgeOffEvidence&) const = default;
 };
@@ -366,7 +368,11 @@ struct Context {
   uint64_t bridge_off_link_generation = 0;
   uint32_t requested_interpolated = 0;
   bool requested_interpolated_known = false;
-  uint64_t framerate_configuration = 0;
+  output_framerate::OutputIdentity output_identity;
+  uintptr_t application_swapchain_identity = 0;
+  uint64_t present_serial = 0;
+  uint64_t status_ambiguous_through = 0;
+  uint32_t presents_in_flight = 0;
   bool omit_optional_hudless = false;
   bool ui_composition = false;
   // Lifetime budgets: at most 3 tagged frame samples + 8 contract changes per
@@ -464,6 +470,7 @@ inline void RevokeBridgeSourceLinkLocked(Context* context, const char* reason
 #endif
   if (context->bridge_source_swapchain != 0) {
     context->bridge_link_generation = ++state.bridge_link_generation;
+    output_framerate::ObserveXeFGOutputLink(context->output_identity, 0, 0);
   }
   context->bridge_source_swapchain = 0;
   context->bridge_source_generation = 0;
@@ -730,7 +737,8 @@ inline std::shared_ptr<Frame> GetFrame(Context* context, uint32_t id) {
 }
 
 inline void ReleaseFrames(Context* context) {
-  output_framerate::Invalidate();
+  output_framerate::ReleaseXeFGOutput(context->output_identity);
+  context->output_identity = {};
   for (const auto& [id, frame] : context->frames) {
     for (const auto& resource : frame->resources) {
       if (resource.copy != nullptr) resource.copy->unproven = true;
@@ -755,6 +763,19 @@ inline void ReleaseFrames(Context* context) {
       context->fg_environment_generation);
 #endif
 #endif
+}
+
+inline void RegisterOutput(Context* context) {
+  if (output_framerate::IsCurrentOutput(context->output_identity)) return;
+  context->output_identity = output_framerate::RegisterXeFGOutput(context->proxy_identity,
+      reinterpret_cast<uintptr_t>(context->device_identity.Get()), reinterpret_cast<uintptr_t>(context),
+      context->application_swapchain_identity);
+  output_framerate::ObserveXeFGMetadata(context->output_identity, context->init.max_interpolated + 1,
+      context->requested_interpolated_known ? context->requested_interpolated + 1 : 0);
+  if (BridgeSourceLinkCurrentLocked(*context)) {
+    const auto& source = *state.bridge_swapchains.at(context->bridge_source_swapchain);
+    output_framerate::ObserveXeFGOutputLink(context->output_identity, source.owner, source.identity);
+  }
 }
 
 inline std::shared_ptr<Surface> AcquireSurface(const std::shared_ptr<Context>& context,
@@ -854,10 +875,11 @@ inline void Initialize(void* handle, ID3D12CommandQueue* queue, const abi::Init*
   auto context = std::make_shared<Context>();
   context->queue = queue;
   context->init = *parameters;
+  context->application_swapchain_identity = reinterpret_cast<uintptr_t>(
+      renodx::utils::directx::NativeIdentity(parameters->application_swapchain));
   context->bridge_init_kind = init_kind;
   context->bridge_application_device11 = BridgeDeviceIdentity(parameters->application_swapchain,
       &context->bridge_application_observation);
-  output_framerate::ObserveXeFGMetadata(reinterpret_cast<uintptr_t>(context.get()), parameters->max_interpolated + 1);
   context->omit_optional_hudless = block_optional_hudless.load(std::memory_order_acquire)
       && parameters->ui_mode == kUiModeAuto;
   if (sdk_module != nullptr) {
@@ -882,6 +904,7 @@ inline void Initialize(void* handle, ID3D12CommandQueue* queue, const abi::Init*
       .current_epoch = context->epoch, .current_generation = context->fg_environment_generation};
 #endif
   if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
+    output_framerate::ReleaseXeFGOutput(it->second->output_identity);
     state.retired_contexts.push_back(it->second);
   }
   state.contexts[handle] = std::move(context);
@@ -1053,6 +1076,7 @@ inline void RecordSourcePresentMapping(const BridgeSourcePresentMapping& mapping
 #endif
   }
   context->bridge_link_reason = observed_reason;
+  output_framerate::ObserveXeFGOutputLink(context->output_identity, registration->owner, registration->identity);
 }
 
 struct D3D12ProxyPresentObservation {
@@ -1435,12 +1459,17 @@ struct PresentFrame {
   ComPtr<IDXGISwapChain3> swapchain;
   ComPtr<ID3D12Resource> backbuffer;
   FrameInput input;
+  uintptr_t proxy_identity = 0;
+  uint64_t serial = 0;
+  bool test_present = false;
+  bool completed = false;
   bool service_owned = false;
   bool service_eligible = false;
   bool continuing_submission = false;
   uint64_t service_stats_serial = 0;
   Result service_result = Result::NOT_SERVED;
   void (*on_service_failure)(const FrameInput&) noexcept = nullptr;
+  void (*on_delivery)(const FrameInput&, bool) noexcept = nullptr;
   bool repeated = false;
 #if defined(NR_NEXUS_DEV_CONTROL)
   edit_fg_observation::Ticket edit_fg_ticket;
@@ -1454,7 +1483,7 @@ inline thread_local PresentFrame* recording_service = nullptr;
 inline void ObserveEditPresent(PresentFrame* present, IDXGISwapChain* swapchain,
                                uint32_t method, UINT interval, UINT flags) {
   const auto generation = edit_fg_observation::CaptureGeneration();
-  if (generation == 0 || present->context == nullptr) return;
+  if (generation == 0 || present->context == nullptr || present->test_present) return;
   edit_fg_observation::XefgPresentObservation observation{
       .sdk_context = present->input.context, .context_identity = present->input.diagnostic_context,
       .epoch = present->input.epoch, .present_id = present->input.present_id,
@@ -1480,18 +1509,27 @@ inline void ObserveEditPresent(PresentFrame* present, IDXGISwapChain* swapchain,
 
 inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
   PresentFrame present;
-  if ((flags & DXGI_PRESENT_TEST) != 0 || proxy_depth != 0) {
-    if ((flags & DXGI_PRESENT_TEST) != 0) output_framerate::Invalidate(output_framerate::Reason::kTEST_PRESENT);
-    return present;
-  }
+  if (proxy_depth != 0 || stopped.load(std::memory_order_acquire)) return present;
   const bool service_requested = Requested();
   const auto identity = Identity(swapchain);
   bool repeated = false;
   {
     std::unique_lock lock(state.mutex);
+    if (identity == 0 || std::ranges::count_if(state.contexts, [&](const auto& entry) {
+          return entry.second->proxy_identity == identity;
+        }) != 1) return present;
     for (const auto& [handle, context] : state.contexts) {
       if (context->proxy_identity != identity) continue;
       present.context = context;
+      present.proxy_identity = identity;
+      present.serial = ++context->present_serial;
+      present.test_present = (flags & DXGI_PRESENT_TEST) != 0;
+      if (++context->presents_in_flight > 1) {
+        context->status_ambiguous_through = present.serial;
+        output_framerate::Invalidate(context->output_identity, output_framerate::Reason::kAMBIGUOUS);
+      }
+      if (present.test_present) return present;
+      RegisterOutput(context.get());
       present.service_stats_serial = context->service_stats_serial;
       present.service_owned = service_requested && context->enabled;
       const bool has_present_id = context->fresh_id;
@@ -1517,6 +1555,7 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
           .has_present_id = has_present_id, .fg_enabled = context->enabled,
           .ui_composition = context->ui_composition,
           .diagnostic_context = reinterpret_cast<uintptr_t>(context.get())};
+      present.input.output = context->output_identity;
       present.service_eligible = present.service_owned && !repeated;
       present.continuing_submission = context->last_submission_frame != 0
           && context->last_submission_frame + 1 == present.input.application_frame;
@@ -1615,38 +1654,47 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
   return present;
 }
 
-inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL) {
-  if (present->context == nullptr) return;
-  const bool failed_delivery = present->service_result == Result::SUBMITTED
-      && present->on_service_failure != nullptr && FAILED(present_result);
-  if (failed_delivery) {
-    present->on_service_failure(present->input);
+inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
+                       int64_t presented_ns = output_framerate::NowNs()) {
+  if (present->context == nullptr || std::exchange(present->completed, true)) return;
+  auto& context = *present->context;
+  if (present->test_present) {
+    std::unique_lock lock(state.mutex);
+    --context.presents_in_flight;
+    return;
   }
+  const auto current = [&] {
+    const auto it = state.contexts.find(reinterpret_cast<void*>(present->input.context));
+    return it != state.contexts.end() && it->second == present->context
+        && context.epoch == present->input.epoch && context.proxy_identity == present->proxy_identity
+        && context.output_identity == present->input.output
+        && (!present->input.output || output_framerate::IsCurrentOutput(present->input.output));
+  };
   uint64_t value = 0;
   bool needs_consumer_fence = false;
+  bool status_queried = false;
   {
     std::unique_lock lock(state.mutex);
     needs_consumer_fence = present->frame != nullptr && !present->frame->captures.empty();
-    if (needs_consumer_fence) value = ++present->context->next_fence;
+    if (needs_consumer_fence) value = ++context.next_fence;
+    status_queried = present_result == S_OK && current() && context.get_status != nullptr
+        && present->serial == context.present_serial && present->serial > context.status_ambiguous_through;
   }
   // Intel permits tagged input reuse after matching proxy Present. This
   // marker orders our copies behind that public consumption boundary.
   const bool signaled = !needs_consumer_fence
-      || SUCCEEDED(present->context->queue->Signal(present->context->fence.Get(), value));
+      || SUCCEEDED(context.queue->Signal(context.fence.Get(), value));
   abi::PresentStatus status{};
-#if defined(NR_NEXUS_DEV_CONTROL)
-  const bool status_queried = present_result == S_OK && present->context->get_status != nullptr;
   const int32_t status_result = (status_queried
-      ? present->context->get_status(reinterpret_cast<void*>(present->input.context), &status) : 0);
+      ? context.get_status(reinterpret_cast<void*>(present->input.context), &status) : 0);
   const bool has_status = status_queried && status_result == 0;
+#if defined(NR_NEXUS_DEV_CONTROL)
   edit_fg_observation::RecordResult(present->edit_fg_ticket, present_result, present->edit_fg_return_ns,
       {.queried = status_queried, .api_result = status_result, .frames_presented = status.frames_presented,
           .frame_gen_result = status.frame_gen_result, .enabled = status.enabled});
-#else
-  const bool has_status = present_result == S_OK && present->context->get_status != nullptr
-      && present->context->get_status(reinterpret_cast<void*>(present->input.context), &status) == 0;
 #endif
   std::unique_lock lock(state.mutex);
+  --context.presents_in_flight;
   if (present->frame != nullptr) {
     for (const auto& copy : present->frame->captures) {
       copy->consumer_fence = present->context->fence;
@@ -1659,21 +1707,25 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL) {
       present->context->frames.erase(it);
     }
   }
-  auto& context = *present->context;
-  output_framerate::ObserveXeFG(reinterpret_cast<uintptr_t>(present->context.get()),
-      (context.epoch << 32) ^ context.framerate_configuration,
-      output_framerate::NowNs(), present_result == S_OK, has_status && status.frame_gen_result >= 0,
-      present->repeated, status.frames_presented,
-      (context.requested_interpolated_known ? context.requested_interpolated + 1 : 0),
-      (has_status ? status.frames_presented : 0), context.init.max_interpolated + 1,
-      has_status && status.enabled == 0);
+  const bool same_output = current();
+  const bool submitted = present->service_result == Result::SUBMITTED;
+  const bool delivered = same_output && present_result == S_OK;
+  const bool failed_delivery = submitted && !delivered;
+  if (same_output && present->serial == context.present_serial) {
+    const bool status_valid = has_status && status.frame_gen_result >= 0
+        && present->serial > context.status_ambiguous_through;
+    // Intel updates LastPresentStatus on each proxy Present. A separate
+    // successful call can therefore report output for a repeated Present ID.
+    output_framerate::ObserveXeFG(present->input.output, present->serial, presented_ns, present_result == S_OK,
+        status_valid, status.frames_presented, !present->repeated, status.enabled == 0);
+  }
   ++context.interval_presents;
-  context.interval_submitted += present->service_result == Result::SUBMITTED;
-  if (present->service_result == Result::SUBMITTED) {
+  context.interval_submitted += submitted;
+  if (submitted) {
     submitted_frames.fetch_add(1, std::memory_order_relaxed);
-    if (context.epoch == present->input.epoch && context.application_frame == present->input.application_frame) {
-      context.last_submission_frame = (failed_delivery ? 0 : present->input.application_frame);
-      if (failed_delivery) {
+    if (same_output && context.application_frame == present->input.application_frame) {
+      context.last_submission_frame = (delivered ? present->input.application_frame : 0);
+      if (!delivered) {
         PublishResult(Result::FAILED);
       }
     }
@@ -1765,6 +1817,15 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL) {
     lock.unlock();
     reshade::log::message(reshade::log::level::info, message);
   }
+  if (lock.owns_lock()) lock.unlock();
+  if (submitted) {
+    if (failed_delivery && present->on_service_failure != nullptr) {
+      present->on_service_failure(present->input);
+    }
+    if (present->on_delivery != nullptr) {
+      present->on_delivery(present->input, delivered);
+    }
+  }
 }
 
 inline void BeforeResize(IDXGISwapChain* swapchain) {
@@ -1806,13 +1867,14 @@ struct ProxyHooks {
 #endif
     if (present.service_owned) ++proxy_depth;
     const HRESULT status = reinterpret_cast<PresentFn>(proxies[Index].real[0])(swapchain, interval, flags);
+    const int64_t presented_ns = output_framerate::NowNs();
 #if defined(NR_NEXUS_DEV_CONTROL)
     if (present.edit_fg_ticket.call_id != 0) {
       present.edit_fg_return_ns = edit_fg_observation::NowNs();
     }
 #endif
     if (present.service_owned) --proxy_depth;
-    try { EndPresent(&present, status); } catch (...) { PublishResult(Result::FAILED); }
+    try { EndPresent(&present, status, presented_ns); } catch (...) { PublishResult(Result::FAILED); }
     bridge_present.Finish(status);
     return status;
   }
@@ -1835,13 +1897,14 @@ struct ProxyHooks {
 #endif
     if (present.service_owned) ++proxy_depth;
     const HRESULT status = reinterpret_cast<Present1Fn>(proxies[Index].real[1])(swapchain, interval, flags, parameters);
+    const int64_t presented_ns = output_framerate::NowNs();
 #if defined(NR_NEXUS_DEV_CONTROL)
     if (present.edit_fg_ticket.call_id != 0) {
       present.edit_fg_return_ns = edit_fg_observation::NowNs();
     }
 #endif
     if (present.service_owned) --proxy_depth;
-    try { EndPresent(&present, status); } catch (...) { PublishResult(Result::FAILED); }
+    try { EndPresent(&present, status, presented_ns); } catch (...) { PublishResult(Result::FAILED); }
     bridge_present.Finish(status);
     return status;
   }
@@ -2055,8 +2118,12 @@ struct SdkHooks {
         {
           std::unique_lock lock(state.mutex);
           if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
-            it->second->proxy_identity = identity;
             if (it->second->bridge_declaration == declaration) {
+              if (it->second->proxy_identity != 0 && it->second->proxy_identity != identity) {
+                ReleaseFrames(it->second.get());
+              }
+              it->second->proxy_identity = identity;
+              RegisterOutput(it->second.get());
               retired_device11 = std::move(it->second->bridge_proxy_device11);
               it->second->bridge_proxy_device11 = std::move(device11);
               it->second->bridge_proxy_observation = device_observation;
@@ -2389,7 +2456,7 @@ struct SdkHooks {
           && attempt->bridge_enable_inflight == 0 && attempt->epoch == epoch && attempt->proxy_identity == proxy
           && (!uses_source_link || (BridgeSourceLinkCurrentLocked(*attempt)
               && attempt->bridge_link_generation == link_generation && attempt->bridge_link_source == linked_source));
-      if (status == 0 && it != state.contexts.end()) {
+      if (status == 0 && same_context && attempt->epoch == epoch) {
         if (it->second->enabled != (enabled != 0)) {
           ReleaseFrames(it->second.get());
         }
@@ -2503,7 +2570,6 @@ struct SdkHooks {
     if (status == 0) {
       std::unique_lock lock(state.mutex);
       if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
-        output_framerate::Invalidate();
         ReleaseFrames(it->second.get());
         // Keep recordings that can still replay alive; submission owns only
         // tokens, never COM references to their operands.
@@ -2520,17 +2586,24 @@ struct SdkHooks {
   }
   static int32_t NumInterpolated(void* handle, uint32_t count) {
     if (!stopped.load()) PinRuntimeCallback();
-    const auto status = reinterpret_cast<int32_t (*)(void*, uint32_t)>(modules[Index].real[9])(handle, count);
-    if (status == 0) {
-      std::unique_lock lock(state.mutex);
+    std::shared_ptr<Context> entered_context;
+    uint64_t epoch = 0;
+    {
+      std::shared_lock lock(state.mutex);
       if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
+        entered_context = it->second;
+        epoch = entered_context->epoch;
+      }
+    }
+    const auto status = reinterpret_cast<int32_t (*)(void*, uint32_t)>(modules[Index].real[9])(handle, count);
+    if (status == 0 && entered_context != nullptr) {
+      std::unique_lock lock(state.mutex);
+      if (const auto it = state.contexts.find(handle); it != state.contexts.end()
+          && it->second == entered_context && entered_context->epoch == epoch) {
         auto& context = *it->second;
-        if (!context.requested_interpolated_known || context.requested_interpolated != count) {
-          ++context.framerate_configuration;
-          output_framerate::Invalidate();
-        }
         context.requested_interpolated = count;
         context.requested_interpolated_known = true;
+        output_framerate::ObserveXeFGMetadata(context.output_identity, context.init.max_interpolated + 1, count + 1);
       }
     }
     return status;
@@ -2589,6 +2662,14 @@ inline void SetPresentFailureHandler(const FrameInput& input, void (*callback)(c
     present->on_service_failure = callback;
   }
 }
+
+inline void RegisterDeliveryCallback(void (*callback)(const FrameInput&, bool) noexcept) {
+  if (auto* present = internal::recording_service; present != nullptr) {
+    present->on_delivery = callback;
+  }
+}
+
+inline bool InProxyPresent() noexcept { return internal::proxy_entry_depth != 0; }
 
 #if defined(NR_NEXUS_DEV_CONTROL)
 // Snapshot only: reading events neither consumes them nor changes source/Off evidence.
@@ -2754,6 +2835,7 @@ inline BridgeOffEvidence QueryBridgeOff(const BridgeSourceIdentity& source) {
   const auto& [handle, context] = *internal::state.contexts.begin();
   evidence.context = reinterpret_cast<uintptr_t>(handle);
   evidence.context_identity = reinterpret_cast<uintptr_t>(context.get());
+  evidence.output_identity = context->output_identity;
   evidence.proxy = context->proxy_identity;
   evidence.application_device11 = reinterpret_cast<uintptr_t>(context->bridge_application_device11.Get());
   evidence.proxy_device11 = reinterpret_cast<uintptr_t>(context->bridge_proxy_device11.Get());
@@ -2821,8 +2903,21 @@ inline bool Enabled() noexcept {
   return internal::owns_stream.load(std::memory_order_acquire);
 }
 
+inline bool Enabled(const output_framerate::OutputIdentity& output) {
+  if (!output) return Enabled();
+  std::shared_lock lock(internal::state.mutex);
+  for (const auto& [handle, context] : internal::state.contexts) {
+    if (context->output_identity == output) return context->enabled;
+  }
+  return false;
+}
+
 inline bool OwnsStream() noexcept {
   return internal::Requested() && (internal::proxy_depth != 0 || internal::owns_stream.load(std::memory_order_acquire));
+}
+
+inline bool OwnsStream(const output_framerate::OutputIdentity& output) {
+  return (!output ? OwnsStream() : internal::Requested() && Enabled(output));
 }
 
 inline Result CurrentResult() noexcept {
@@ -2851,6 +2946,8 @@ inline void Stop() noexcept {
     std::unique_lock lock(internal::state.mutex);
     for (const auto& [handle, context] : internal::state.contexts) {
       internal::RevokeBridgeSourceLinkLocked(context.get(), "source_observation_stopped");
+      output_framerate::ReleaseXeFGOutput(context->output_identity);
+      context->output_identity = {};
     }
     removed_sources.swap(internal::state.bridge_swapchains);
   }

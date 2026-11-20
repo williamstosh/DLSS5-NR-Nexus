@@ -2330,7 +2330,7 @@ inline constexpr Translation kIt[] = {
     {"Declared %ux", "Dichiarato %ux"},
     {"Up to %ux", "Fino a %ux"},
     {"Dynamic", "Dinamico"},
-    {"Present cadence estimate", "Stima dalla cadenza Present"},
+    {"Application Present submission estimate", "Stima della frequenza di invio Present"},
     {"XeFG SDK output estimate", "Stima dell'uscita SDK XeFG"},
     {"DLSS FG SDK output estimate", "Stima dell'uscita SDK DLSS FG"},
     {"Fixed FG multiplier estimate", "Stima con moltiplicatore FG fisso"},

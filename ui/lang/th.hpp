@@ -2330,7 +2330,7 @@ inline constexpr Translation kTh[] = {
     {"Declared %ux", "ประกาศ %ux"},
     {"Up to %ux", "สูงสุด %ux"},
     {"Dynamic", "ไดนามิก"},
-    {"Present cadence estimate", "ค่าประมาณจากจังหวะ Present"},
+    {"Application Present submission estimate", "ค่าประมาณอัตราการส่ง Present ของแอป"},
     {"XeFG SDK output estimate", "ค่าประมาณเอาต์พุตจาก XeFG SDK"},
     {"DLSS FG SDK output estimate", "ค่าประมาณเอาต์พุตจาก DLSS FG SDK"},
     {"Fixed FG multiplier estimate", "ค่าประมาณจากตัวคูณ FG คงที่"},

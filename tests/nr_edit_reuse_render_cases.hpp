@@ -272,10 +272,13 @@ int Run() {
       uint64_t model_calls = 0;
       uint64_t model_calls_before_sr = 0;
       bool swapped_color = false;
+      bool adaptive_waiting_for_submit = false;
       std::vector<ColorPixel> sr_tile;
       std::vector<uint8_t> sr_rgba;
       uint64_t timer_sequence = 0;
       uint64_t timer_written = 0;
+      std::shared_ptr<addon::adaptive_resolution::DeliveryReceipt> adaptive_receipt;
+      bool timer_awaited_delivery = false;
       bool timer_published = false;
       timers::Stats completed_timer;
     };
@@ -326,6 +329,9 @@ int Run() {
             "wrapper restores the original Color binding on return from SR");
       FrameResult result{.model_calls = model_calls - before,
           .model_calls_before_sr = consumer.model_calls_at_entry - before, .swapped_color = consumer.swapped_color};
+      if (const auto& adaptive = native::features.at(handle).adaptive_session; adaptive != nullptr) {
+        result.adaptive_waiting_for_submit = adaptive->applied_generation != adaptive->status.generation;
+      }
       const timers::Segment* timer = nullptr;
       // A mixed frame can also record an Upscaled segment after original SR.
       const auto render_segment = std::ranges::find_if(timers::internal::segments, [timer_sequence_before](const auto& segment) {
@@ -339,6 +345,9 @@ int Run() {
               "PreSR wrapper recorded an unresolved production timestamp segment");
         result.timer_sequence = timer->sequence;
         result.timer_written = timer->written;
+        result.adaptive_receipt = timer->adaptive.delivery;
+        result.timer_awaited_delivery = result.adaptive_receipt != nullptr
+            && *result.adaptive_receipt == addon::adaptive_resolution::DeliveryReceipt::PENDING;
       }
       if (!submit) {
         gpu.Retain(consumer.motion.readback.Get());
@@ -359,6 +368,7 @@ int Run() {
       const auto completed_fence = gpu.fence->GetCompletedValue();
       Check(wait == WAIT_OBJECT_0 && completed_fence != UINT64_MAX && completed_fence >= gpu.serial,
             "Render wrapper recording completes on the GPU fence");
+      native::ResolveAdaptiveBorrowedDeliveries();
       Check(SUCCEEDED(gpu.allocator->Reset()) && SUCCEEDED(gpu.list->Reset(gpu.allocator.Get(), nullptr)),
             "close Render wrapper submission generation against replay");
       native::DrainRetiredResources(true);
@@ -600,6 +610,51 @@ int Run() {
     timers::benchmark_observer = nullptr;
     std::cout << "PASS Render sr_benchmark_v1 source, timing, Color and crossover evidence\n";
 #endif
+
+    {
+      native::RecreateFeatures();
+      model_parameter_observer = {};
+      native::direct_api.evaluate = nr_edit_reuse_gpu_cases::ConstantModel;
+      native::edit_reuse_enabled = false;
+      native::nr_adaptive_enabled = true;
+      native::nr_adaptive_selected_levels = 2;
+      std::shared_ptr<addon::adaptive_resolution::Session> adaptive;
+      for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 24; ++attempt) {
+        frame({});
+        adaptive = native::features.at(handle).adaptive_session;
+        if (adaptive != nullptr && adaptive->TargetReady() && adaptive->applied_generation == adaptive->status.generation) break;
+      }
+      Check(adaptive != nullptr && adaptive->TargetReady() && adaptive->ladder.count == 2
+                && adaptive->status.applied == adaptive->status.upper
+                && adaptive->applied_generation == adaptive->status.generation,
+            "Render confirms the upper tier through a successful original SR and tracked WARP submission");
+      const auto upper_generation = adaptive->applied_generation;
+      const auto upper_applied_ns = adaptive->applied_ns;
+      adaptive->Request(1, native::SteadyNowNs());
+      const auto low_request = adaptive->status.generation;
+      adaptive->next_measure_ns = 0;
+      const auto rejected = frame({.sr_result = NVSDK_NGX_Result_FAIL_InvalidParameter});
+      Check(rejected.swapped_color && rejected.adaptive_waiting_for_submit && adaptive->TargetReady()
+                && rejected.adaptive_receipt != nullptr
+                && *rejected.adaptive_receipt == addon::adaptive_resolution::DeliveryReceipt::REJECTED
+                && adaptive->status.generation == low_request && adaptive->applied_generation == upper_generation
+                && adaptive->applied_ns == upper_applied_ns && adaptive->gpu_count == 0,
+            "rejected original SR consumes and restores the stand-in binding without confirming the requested lower tier");
+      adaptive->next_measure_ns = 0;
+      const auto accepted = frame({});
+      Check(accepted.swapped_color && accepted.adaptive_waiting_for_submit && model_resets.back() == 1
+                && accepted.timer_awaited_delivery && accepted.adaptive_receipt != nullptr
+                && *accepted.adaptive_receipt == addon::adaptive_resolution::DeliveryReceipt::DELIVERED
+                && adaptive->applied_generation == low_request && adaptive->status.applied == adaptive->ladder.sizes[1]
+                && adaptive->applied_ns > upper_applied_ns,
+            "the next successful SR resets locally and the exact borrowed Execute confirms the complete lower tier");
+      const auto confirmed_at = adaptive->applied_ns;
+      frame({});
+      Check(adaptive->applied_ns == confirmed_at, "another successful Render frame does not restart the warmup");
+      native::nr_adaptive_enabled = false;
+      native::nr_adaptive_selected_levels = 0;
+      std::cout << "ADAPTIVE_DELIVERY_RENDER evidence=WARP+MOCK rejected_sr_color_restored=1 recovered_reset=1\n";
+    }
 
     // Keep the real SR consumer and Color restoration checks for the two-Pass chain.
     model_parameter_observer = {};

@@ -2339,7 +2339,7 @@ inline constexpr Translation kZhHans[] = {
     {"Declared %ux", "声明 %u 倍"},
     {"Up to %ux", "至多 %u 倍"},
     {"Dynamic", "动态"},
-    {"Present cadence estimate", "基于 Present 节奏的估算"},
+    {"Application Present submission estimate", "应用 Present 提交节奏估算"},
     {"XeFG SDK output estimate", "XeFG SDK 输出估算"},
     {"DLSS FG SDK output estimate", "DLSS FG SDK 输出估算"},
     {"Fixed FG multiplier estimate", "固定帧生成倍率估算"},

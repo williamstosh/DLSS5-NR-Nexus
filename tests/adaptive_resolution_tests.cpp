@@ -33,7 +33,8 @@ int main() {
       const int64_t now = start + step * adaptive::SAMPLE_INTERVAL_NS;
       session.ObserveGpu({.generation = session.status.generation, .frame = ++sequence,
           .sequence = sequence, .context = 1, .recorded_ns = now, .completed_ns = now,
-          .total_us = gpu_us, .valid = true, .stable = true}, now);
+          .total_us = gpu_us, .valid = true, .stable = true,
+          .sampling_generation = session.sampling_generation}, now);
       ++output.serial;
       output.begin_ns = now - 2'000'000'000;
       output.end_ns = now;

@@ -2330,7 +2330,7 @@ inline constexpr Translation kTr[] = {
     {"Declared %ux", "Bildirilen %ux"},
     {"Up to %ux", "En fazla %ux"},
     {"Dynamic", "Dinamik"},
-    {"Present cadence estimate", "Present sıklığı tahmini"},
+    {"Application Present submission estimate", "Uygulama Present gönderim hızı tahmini"},
     {"XeFG SDK output estimate", "XeFG SDK çıkış tahmini"},
     {"DLSS FG SDK output estimate", "DLSS FG SDK çıkış tahmini"},
     {"Fixed FG multiplier estimate", "Sabit FG çarpanı tahmini"},

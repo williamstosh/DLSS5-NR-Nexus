@@ -121,7 +121,7 @@ inline Json Snapshot() {
       sizes[name].push_back({{"pass", pass + 1}, {"width", (*values)[pass].width}, {"height", (*values)[pass].height}});
     }
   }
-  const auto output = output_framerate::Read(now);
+  const auto output = output_framerate::Read(MatchRuntimeOutput(monitor_runtime.load()), now);
   const auto fg_environment = ReadEditReuseFgEnvironmentLocked();
   Json native_evaluate = nullptr;
   if (edit_reuse_enabled.load() && edit_reuse_fg_experiment.load()) {

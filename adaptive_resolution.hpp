@@ -124,6 +124,8 @@ struct Status {
   uint32_t ready_levels = 0, prepared_levels = 0;
   double preparation_cpu_ms = 0.;
   uint64_t preparation_vram_delta_bytes = 0, peak_process_vram_bytes = 0;
+  uint64_t display_output_generation = 0, display_source_generation = 0;
+  uint32_t display_stage = 0;
 };
 struct GpuSample {
   uint64_t generation = 0, frame = 0, sequence = 0, context = 0;
@@ -143,12 +145,14 @@ struct Session {
   uint64_t resource_identity = 0;
   uint64_t configuration_epoch = 0;
   uint64_t preparation_epoch = 0;
+  uint64_t applied_generation = 0;
   bool prepared = false;
   bool target_ready = false;
   Reason preparation_reason = Reason::PREPARING;
   Sizes minimum{};
   uint64_t last_output_serial = 0, last_sequence = 0, gpu_context = 0;
   size_t level = 0, previous_level = 0, active_level = 0;
+  size_t frozen_resume_level = MAX_LEVELS;
   int64_t applied_ns = 0, stable_after_ns = 0, last_switch_ns = 0, at_target_since_ns = 0;
   int64_t next_measure_ns = 0;
   int64_t failed_raise_until_ns = 0;
@@ -169,6 +173,8 @@ struct Session {
   uint64_t paired_identity = 0;
   uint64_t sampling_generation = 0, measure_pair_first_frame = 0;
   GpuSample pending_pair;
+  std::array<std::array<uint64_t, MAX_PASSES>, 2> mask_settings{};
+  std::array<uint64_t, 2> normalization_settings{};
 
   void ResetMeasurements() {
     gpu_count = 0;
@@ -182,18 +188,48 @@ struct Session {
     at_target_since_ns = 0;
   }
 
-  void InvalidateSampling() {
+  void InvalidateSampling(int64_t now_ns = 0) {
     ++sampling_generation;
     ResetMeasurements();
+    if (now_ns > 0) stable_after_ns = std::max(stable_after_ns, now_ns);
   }
 
-  void SetPairedSampling(bool enabled, uint64_t sampling_identity = 0) {
+  void ObserveEffectiveSettings(uint64_t& previous, uint64_t effective_settings, int64_t now_ns) {
+    const bool changed = previous != 0 && previous != effective_settings;
+    previous = effective_settings;
+    if (!changed) return;
+    blocked = false;
+    blocked_until_ns = 0;
+    InvalidateSampling(now_ns);
+    if (frozen_resume_level == MAX_LEVELS) {
+      if (trial) {
+        Request(previous_level, now_ns);
+        trial = false;
+      }
+      status.reason = Reason::COLLECTING;
+    }
+  }
+
+  void ObserveMaskSettings(uint32_t role, uint32_t pass, uint64_t effective_settings, int64_t now_ns) {
+    if ((role != 1 && role != 2) || pass >= MAX_PASSES || effective_settings == 0) return;
+    ObserveEffectiveSettings(mask_settings[role - 1][pass], effective_settings, now_ns);
+  }
+
+  void ObserveNormalizationSettings(uint32_t role, uint64_t effective_settings, int64_t now_ns) {
+    if ((role != 1 && role != 2) || effective_settings == 0) return;
+    ObserveEffectiveSettings(normalization_settings[role - 1], effective_settings, now_ns);
+  }
+
+  void SetPairedSampling(bool enabled, uint64_t sampling_identity = 0, int64_t now_ns = 0) {
     if (!enabled) sampling_identity = 0;
     if (paired_sampling == enabled && paired_identity == sampling_identity) return;
     paired_sampling = enabled;
     paired_identity = sampling_identity;
-    InvalidateSampling();
-    trial = false;
+    if (trial && frozen_resume_level == MAX_LEVELS) {
+      Request(previous_level, now_ns);
+      trial = false;
+    }
+    InvalidateSampling(now_ns);
   }
 
   uint64_t SelectMeasurementPair(uint64_t source_frame, bool first_due) {
@@ -223,7 +259,7 @@ struct Session {
     return (settings.limited_residency ? target_ready : prepared);
   }
 
-  void Request(size_t candidate, int64_t now_ns) {
+  void Request(size_t candidate, int64_t) {
     if (candidate >= ladder.count) return;
     if (!IsLegal(ladder.sizes[candidate])) {
       candidate = 0;
@@ -232,13 +268,8 @@ struct Session {
     ++status.generation;
     if (settings.limited_residency) {
       target_ready = false;
-    } else {
-      status.coefficient = ladder.coefficients[level];
     }
     status.requested = ladder.sizes[level];
-    applied_ns = 0;
-    stable_after_ns = now_ns + WARMUP_NS;
-    last_switch_ns = now_ns;
     ResetMeasurements();
   }
 
@@ -286,17 +317,17 @@ struct Session {
   }
 
   void Applied(uint64_t generation, const Sizes& actual, int64_t now_ns) {
-    if (generation != status.generation || actual != status.requested) return;
-    if (settings.enabled && settings.limited_residency && !target_ready) return;
+    if (failed || generation != status.generation || actual != status.requested || now_ns <= 0) return;
+    if (settings.enabled && !settings.legacy_preparation && !TargetReady()) return;
+    if (applied_generation == generation && applied_ns != 0) return;
     status.applied = actual;
     active_level = level;
-    if (applied_ns != 0) return;
+    applied_generation = generation;
     applied_ns = now_ns;
     stable_after_ns = now_ns + WARMUP_NS;
-    if (settings.limited_residency) {
-      status.coefficient = ladder.coefficients[level];
-      last_switch_ns = now_ns;
-    }
+    status.coefficient = ladder.coefficients[level];
+    last_switch_ns = now_ns;
+    if (settings.enabled) status.reason = Reason::WARMING;
   }
 
   void Fail(uint64_t generation) {
@@ -333,8 +364,7 @@ struct Session {
     const bool complete = required == ladder.count && required != 0 && ready != 0 && target_complete;
     if (!complete) {
       if (target_ready) {
-        ResetMeasurements();
-        applied_ns = 0;
+        InvalidateSampling(now_ns);
       }
       target_ready = false;
       preparation_reason = Reason::PREPARING;
@@ -344,9 +374,8 @@ struct Session {
     if (!target_ready) {
       target_ready = true;
       ResetMeasurements();
-      stable_after_ns = now_ns + WARMUP_NS;
       preparation_reason = Reason::PREPARING;
-      status.reason = Reason::WARMING;
+      status.reason = Reason::PREPARING;
     }
   }
 
@@ -379,7 +408,7 @@ struct Session {
     const bool complete = required == ladder.count && required != 0 && ready == required;
     if (!complete) {
       if (prepared) {
-        ResetMeasurements();
+        InvalidateSampling(now_ns);
       }
       prepared = false;
       trial = false;
@@ -390,23 +419,24 @@ struct Session {
     if (!prepared) {
       prepared = true;
       ResetMeasurements();
-      stable_after_ns = now_ns + WARMUP_NS;
       preparation_reason = Reason::PREPARING;
-      status.reason = Reason::WARMING;
+      status.reason = Reason::PREPARING;
     }
   }
 
   void ObserveGpu(const GpuSample& sample, int64_t now_ns) {
-    if (sample.paired != paired_sampling || sample.sampling_generation != sampling_generation
+    if (frozen_resume_level != MAX_LEVELS
+        || sample.paired != paired_sampling || sample.sampling_generation != sampling_generation
         || (sample.paired && sample.pair_first_frame == 0)) return;
     if ((!TargetReady() && !settings.legacy_preparation) || sample.generation != status.generation
         || (sample.sequence <= last_sequence && (pending_roles == 0 || sample.frame != pending.frame))) return;
     last_sequence = std::max(last_sequence, sample.sequence);
     if (!sample.valid || !sample.stable || sample.recorded_ns < stable_after_ns || applied_ns == 0
+        || applied_generation != status.generation
         || sample.recorded_ns > sample.completed_ns || sample.completed_ns > now_ns
         || now_ns - sample.recorded_ns > SAMPLE_MAX_AGE_NS
         || now_ns - sample.completed_ns > SAMPLE_MAX_AGE_NS
-        || (sample.paired && (!std::isfinite(sample.total_us) || sample.total_us <= 0.))) {
+        || !std::isfinite(sample.total_us) || sample.total_us <= 0.) {
       pending_roles = 0;
       pending_pair = {};
       if (sample.paired && measure_pair_first_frame == sample.pair_first_frame) {
@@ -415,8 +445,11 @@ struct Session {
       return;
     }
     if (gpu_context != 0 && gpu_context != sample.context) {
-      ResetMeasurements();
+      if (trial) Request(previous_level, now_ns);
+      InvalidateSampling(now_ns);
       trial = false;
+      gpu_context = sample.context;
+      return;
     }
     gpu_context = sample.context;
     auto complete = sample;
@@ -506,7 +539,8 @@ struct Session {
     const bool toggled = settings.enabled != next.enabled;
     const bool preparation_mode_changed = settings.legacy_preparation != next.legacy_preparation
         || settings.limited_residency != next.limited_residency;
-    const bool changed = identity != source_identity || settings != next || status.upper != upper || selection_changed;
+    const bool changed = (!frozen && identity != source_identity)
+        || settings != next || status.upper != upper || selection_changed;
     if (resources_changed) {
       const uint64_t generation = status.generation + 1;
       const uint64_t epoch = preparation_epoch + 1;
@@ -555,6 +589,7 @@ struct Session {
         }
       }
       trial = false;
+      frozen_resume_level = MAX_LEVELS;
       raising = false;
       extra_window = false;
       blocked = false;
@@ -564,11 +599,18 @@ struct Session {
       failed_raise_level = MAX_LEVELS;
       failed_raise_until_ns = 0;
       previous_level = candidate;
-      Request(candidate, now_ns);
+      if (!selection_changed && !toggled && !preparation_mode_changed && !retry_budget
+          && applied_generation == status.generation && level == candidate
+          && status.requested == ladder.sizes[candidate]) {
+        InvalidateSampling(now_ns);
+      } else {
+        Request(candidate, now_ns);
+      }
     }
     if (!settings.enabled || !supported) {
       if (level != 0) Request(0, now_ns);
       trial = false;
+      frozen_resume_level = MAX_LEVELS;
       minimum_pending = false;
       status.reason = (settings.enabled ? Reason::UNSUPPORTED : Reason::DISABLED);
       return;
@@ -578,10 +620,28 @@ struct Session {
       return;
     }
     if (frozen) {
-      trial = false;
-      ResetMeasurements();
+      if (frozen_resume_level == MAX_LEVELS) {
+        frozen_resume_level = (trial ? previous_level : level);
+        if (applied_ns != 0 && status.requested != status.applied) {
+          const auto end = ladder.sizes.begin() + ladder.count;
+          const auto confirmed = std::find(ladder.sizes.begin(), end, status.applied);
+          if (confirmed != end && IsLegal(*confirmed)) {
+            // Replace the pending generation before a ready tier can hot-switch.
+            Request(static_cast<size_t>(confirmed - ladder.sizes.begin()), now_ns);
+          }
+        }
+        InvalidateSampling(now_ns);
+      }
       status.reason = Reason::FROZEN;
       return;
+    }
+    if (frozen_resume_level != MAX_LEVELS) {
+      if (level != frozen_resume_level) {
+        Request(frozen_resume_level, now_ns);
+      }
+      frozen_resume_level = MAX_LEVELS;
+      trial = false;
+      InvalidateSampling(now_ns);
     }
     if (!settings.legacy_preparation && (preparation_reason == Reason::BUDGET
         || (!settings.limited_residency && ladder.count > settings.prepared_levels))) {
@@ -604,7 +664,7 @@ struct Session {
       blocked = false;
       blocked_until_ns = 0;
       minimum_pending = false;
-      ResetMeasurements();
+      InvalidateSampling(now_ns);
       output_source = output.source;
       output_generation = output.generation;
       output_configuration = output.configuration;
@@ -617,7 +677,7 @@ struct Session {
     if (output.multiplier_variable && (!std::isfinite(output.observed_multiplier) || output.observed_multiplier <= 0.)) {
       if (trial) Request(previous_level, now_ns);
       trial = false;
-      ResetMeasurements();
+      InvalidateSampling(now_ns);
       status.reason = Reason::COLLECTING;
       return;
     }
@@ -633,7 +693,7 @@ struct Session {
       status.reason = Reason::COLLECTING;
       return;
     }
-    if (applied_ns == 0 || now_ns < stable_after_ns) {
+    if (applied_generation != status.generation || applied_ns == 0 || now_ns < stable_after_ns) {
       status.reason = Reason::WARMING;
       return;
     }
@@ -764,6 +824,8 @@ struct Session {
   }
 };
 
+enum class DeliveryReceipt : uint8_t { PENDING, DELIVERED, REJECTED };
+
 struct Frame {
   std::shared_ptr<Session> session;
   Sizes sizes{}, upper{};
@@ -778,6 +840,8 @@ struct Frame {
   bool upper_capacity = false;
   bool paired = false;
   uint64_t pair_first_frame = 0, sampling_generation = 0;
+  // Instrumented color roles share the consumer's decision.
+  mutable std::shared_ptr<DeliveryReceipt> delivery;
 };
 
 }  // namespace renodx::addons::dlss5::adaptive_resolution

@@ -2330,7 +2330,7 @@ inline constexpr Translation kEs[] = {
     {"Declared %ux", "Declarado %ux"},
     {"Up to %ux", "Hasta %ux"},
     {"Dynamic", "Dinámico"},
-    {"Present cadence estimate", "Estimación por cadencia de Present"},
+    {"Application Present submission estimate", "Estimación de envíos Present de la aplicación"},
     {"XeFG SDK output estimate", "Estimación de salida del SDK XeFG"},
     {"DLSS FG SDK output estimate", "Estimación de salida del SDK DLSS FG"},
     {"Fixed FG multiplier estimate", "Estimación por multiplicador FG fijo"},

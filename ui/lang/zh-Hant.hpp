@@ -2329,7 +2329,7 @@ inline constexpr Translation kZhHant[] = {
     {"Declared %ux", "宣告 %u 倍"},
     {"Up to %ux", "最多 %u 倍"},
     {"Dynamic", "動態"},
-    {"Present cadence estimate", "依 Present 節奏估算"},
+    {"Application Present submission estimate", "應用程式 Present 提交節奏估算"},
     {"XeFG SDK output estimate", "XeFG SDK 輸出估算"},
     {"DLSS FG SDK output estimate", "DLSS FG SDK 輸出估算"},
     {"Fixed FG multiplier estimate", "固定影格生成倍率估算"},

@@ -10,6 +10,8 @@ namespace fg_service {
 struct Slot {
   present_frame_policy::Frame base_frame;
   present_frame_policy::GroupResult base_frame_group;
+  AdaptiveDelivery adaptive_delivery;
+  std::pair<uint64_t, uint64_t> adaptive_recording{};
   ID3D12CommandAllocator* allocator = nullptr;
   ID3D12GraphicsCommandList* list = nullptr;
   ID3D12Resource* color[2] = {};
@@ -31,6 +33,9 @@ struct Stream {
   present_frame_policy::Clock base_frame_clock;
   std::shared_ptr<adaptive_resolution::Session> adaptive_session;
   adaptive_resolution::Frame adaptive_frame;
+  AdaptiveDelivery pending_xefg_delivery;
+  output_framerate::OutputIdentity xefg_delivery_output;
+  bool awaiting_xefg_delivery = false;
   uint32_t adaptive_model_roles = 0;
   uint32_t adaptive_required_roles = 0;
   bool adaptive_role_unavailable = false;
@@ -298,7 +303,7 @@ inline bool PrepareNativeColorInputs(Stream* stream, Slot* slot, const fg::Frame
   }
   if (slot->color_heap == nullptr) {
     const D3D12_DESCRIPTOR_HEAP_DESC desc{.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-        .NumDescriptors = 8, .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+        .NumDescriptors = 9, .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
     if (FAILED(stream->device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&slot->color_heap)))) return false;
     const auto cpu = slot->color_heap->GetCPUDescriptorHandleForHeapStart();
     const auto stride = stream->device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -309,6 +314,7 @@ inline bool PrepareNativeColorInputs(Stream* stream, Slot* slot, const fg::Frame
     stream->device->CreateShaderResourceView(nullptr, &null_srv, DescriptorHeapSlot(cpu, 6, stride));
     null_srv.Format = DXGI_FORMAT_R16G16_FLOAT;
     stream->device->CreateShaderResourceView(nullptr, &null_srv, DescriptorHeapSlot(cpu, 7, stride));
+    stream->device->CreateConstantBufferView(nullptr, DescriptorHeapSlot(cpu, 8, stride));
   }
   return true;
 }
@@ -343,10 +349,11 @@ inline void RecordNativeColorInputs(Stream* stream, Slot* slot, ID3D12GraphicsCo
   const auto gpu = slot->color_heap->GetGPUDescriptorHandleForHeapStart();
   list->SetComputeRootDescriptorTable(0, gpu);
   list->SetComputeRootDescriptorTable(1, {gpu.ptr + static_cast<uint64_t>(4) * stride});
-  // The shared codec root signature also retains depth/motion tables across
+  // The shared codec root signature also retains guide/proof tables across
   // heap switches, even though this color shader does not read them.
   list->SetComputeRootDescriptorTable(3, {gpu.ptr + static_cast<uint64_t>(6) * stride});
   list->SetComputeRootDescriptorTable(4, {gpu.ptr + static_cast<uint64_t>(7) * stride});
+  list->SetComputeRootDescriptorTable(5, {gpu.ptr + static_cast<uint64_t>(8) * stride});
   const uint32_t size[4]{input.color_width, input.color_height};
   list->SetComputeRoot32BitConstants(2, 4, size, 0);
   list->Dispatch((input.color_width + 15) / 16, (input.color_height + 15) / 16, 1);
@@ -400,12 +407,15 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
                          bool ui_recomposition = true) {
   *output_ready = false;
   *recordings = {};
+  slot->adaptive_delivery = {};
+  slot->adaptive_recording = {};
   slot->color_inputs_prepared = false;
   slot->pipeline_pending = false;
 #if defined(NR_NEXUS_DEV_CONTROL)
   slot->native_edit_fixed_workset = false;
 #endif
   const PipelinePreparationScope pipeline_scope;
+  ResolveAdaptiveBorrowedDeliveries();
   if (!enabled.load(std::memory_order_relaxed)) return fg::Result::NOT_SERVED;
   if (nr_adaptive_enabled.load(std::memory_order_relaxed) || codec_pipeline.incremental_preparation) {
     // Runtime/device adoption can release the old global codec. It must run
@@ -469,7 +479,8 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
            ^ (static_cast<uint64_t>(input.backbuffer->GetDesc().Format) * 1099511628211ull) ^ contract.create_flags
           ^ (static_cast<uint64_t>(coupled_ui) << 40) ^ (static_cast<uint64_t>(may_compose) << 41),
       !base.d3d11_bridge && !base.native_prefg_resolution_pair,
-      input.application_frame, roles, true, 1, stream->adaptive_model_roles);
+      input.application_frame, roles, true, 1, stream->adaptive_model_roles, false, nullptr, nullptr,
+      input.output, input.epoch);
   };
   stream->adaptive_frame = freeze_adaptive(missing_prepared_role ? stream->adaptive_required_roles : required_model_roles);
   if (missing_prepared_role && previous_adaptive_layout == stream->adaptive_frame.layout_identity
@@ -797,6 +808,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     role.parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, input.jitter_y);
     PresentTarget target = base;
     target.base_frame = base_frame;
+    target.adaptive_output = input.output;
     target.native_fg_inputs = native_parameters != nullptr;
     auto adaptive_role = stream->adaptive_frame;
     adaptive_role.role = (i == 0 ? 1u : 2u);
@@ -817,6 +829,9 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     const EvaluateInFlightScope attempt(true);
     const uint64_t previous_capture_serial = screenshot::PendingModelCaptureSerial(list);
     const bool accepted = ProcessInline(list, role.Handle(), &role.parameters, &touched, &target, &recording);
+    if (recording.adaptive_delivery.frame.delivery != nullptr) {
+      stream->adaptive_frame.delivery = recording.adaptive_delivery.frame.delivery;
+    }
     if (log_frame) {
       std::ostringstream line;
       line << "NR FG frame: route=" << (stream->native ? "native" : "xefg")
@@ -1034,17 +1049,32 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
 #endif
   // Composition can consume only HUDLess; a failed composition falls back to
   // two model colors. Freeze the actual complete role set before submission.
-  uint32_t measured_roles = 0;
+  const uint32_t model_roles = output_roles & ~composed_roles;
+  const auto& primary_delivery = (*recordings)[(model_roles & 1u) != 0 ? 0u : 1u].adaptive_delivery;
+  auto& delivery = slot->adaptive_delivery;
+  delivery = primary_delivery;
+  delivery.frame.delivery = stream->adaptive_frame.delivery;
+  delivery.complete &= group_result.complete;
   for (uint32_t i = 0; i < recordings->size(); ++i) {
-    if ((*recordings)[i].model_recorded) measured_roles |= 1u << i;
+    if ((model_roles & (1u << i)) == 0) continue;
+    const auto& role = (*recordings)[i].adaptive_delivery;
+    delivery.complete &= role.complete && role.frame.role == (1u << i)
+        && role.source == stream->roles[i].Handle() && role.output == input.output
+        && role.frame.session == delivery.frame.session
+        && role.frame.application_frame == delivery.frame.application_frame
+        && role.frame.generation == delivery.frame.generation
+        && role.frame.preparation_epoch == delivery.frame.preparation_epoch
+        && role.frame.layout_identity == delivery.frame.layout_identity
+        && (role.frame.delivery == nullptr || role.frame.delivery == delivery.frame.delivery)
+        && role.actual == delivery.actual;
   }
-  stream->adaptive_model_roles = measured_roles;
-  stream->adaptive_required_roles = measured_roles;
-  for (auto& segment : gpu_timers::internal::segments) {
-    if (segment.adaptive.session == stream->adaptive_session
-        && segment.adaptive.application_frame == stream->adaptive_frame.application_frame
-        && segment.adaptive.generation == stream->adaptive_frame.generation) {
-      segment.adaptive.required_roles = measured_roles;
+  stream->adaptive_model_roles = model_roles;
+  stream->adaptive_required_roles = model_roles;
+  if (delivery.frame.delivery != nullptr) {
+    for (auto& segment : gpu_timers::internal::segments) {
+      if (segment.adaptive.delivery == delivery.frame.delivery) {
+        segment.adaptive.required_roles = model_roles;
+      }
     }
   }
   if (input.application_frame != 0) {
@@ -1057,26 +1087,24 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
       }
     }
   }
-  if (stream->adaptive_session != nullptr && stream->adaptive_session->settings.limited_residency
-      && (stream->adaptive_frame.enabled || !stream->adaptive_session->settings.enabled)) {
-    // A role's ProcessInline success cannot commit the whole color group.
-    stream->adaptive_session->Applied(stream->adaptive_frame.generation, stream->adaptive_frame.sizes, SteadyNowNs());
-    PublishAdaptiveStatus(stream->adaptive_session->status);
-  }
   *output_ready = true;
   slot->base_frame = base_frame;
   slot->base_frame_group = group_result;
   return fg::Result::PREPARED;
 }
 
-inline void OnXeFGPresentFailure(const fg::FrameInput& input) noexcept {
+inline void OnXeFGPresentDelivery(const fg::FrameInput& input, bool succeeded) noexcept {
   GuardHook([&] {
     RuntimeLock lock(runtime_mutex);
     const auto it = streams.find({false, input.context});
     if (it == streams.end()) return;
     auto& stream = it->second;
     if (stream.epoch != input.epoch || stream.application_frame != input.application_frame
-        || stream.result != fg::Result::SUBMITTED) return;
+        || stream.result != fg::Result::SUBMITTED || stream.xefg_delivery_output != input.output
+        || !std::exchange(stream.awaiting_xefg_delivery, false)) return;
+    const auto delivery = std::exchange(stream.pending_xefg_delivery, {});
+    ResolveAdaptiveDelivery(delivery, succeeded);
+    if (succeeded) return;
     // The private list was submitted on the SDK queue. Keep its slot and
     // receipts while making the next application frame start fresh history.
     stream.base_frame_clock.complete = false;
@@ -1155,6 +1183,9 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     stream.gpu_capture_entry_ns = service_entry_ns;
     stream.has_frame = true;
     stream.application_frame = input.application_frame;
+    ResolveAdaptiveDelivery(stream.pending_xefg_delivery, false);
+    stream.pending_xefg_delivery = {};
+    stream.awaiting_xefg_delivery = false;
     stream.result = fg::Result::NOT_SERVED;
     const uint64_t completed = stream.fence->GetCompletedValue();
     if (completed == UINT64_MAX) return fg::Result::FAILED;
@@ -1367,6 +1398,9 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
         hudless_processes != 0 && backbuffer_processes != 0,
         exact_ui && hudless_processes != 0 && backbuffer_processes == 0 && output_ready);
     if (!output_ready) {
+      for (const auto& recording : recordings) {
+        ResolveAdaptiveDelivery(recording.adaptive_delivery, false);
+      }
       finish_capture();
       const bool closed = SUCCEEDED(close_recording());
       if (recorded == fg::Result::PREPARED && closed) {
@@ -1400,6 +1434,7 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     }
     finish_capture();
     if (FAILED(close_recording())) {
+      ResolveAdaptiveDelivery(slot->adaptive_delivery, false);
       submission::OnCommandListReset(slot->list);
       Invalidate(&stream);
       stream.result = fg::Result::FAILED;
@@ -1413,14 +1448,25 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     submitted = true;
     slot->fence_value = ++stream.submitted;
     if (FAILED(queue->Signal(stream.fence, slot->fence_value))) {
+      ResolveAdaptiveDelivery(slot->adaptive_delivery, false);
       slot->quarantined = true;
-      Invalidate(&stream);
+      if (slot->adaptive_delivery.frame.enabled) {
+        stream.base_frame_clock.complete = false;
+        for (auto& role : stream.roles) {
+          ResetPresentStreamHistory(&role);
+        }
+      } else {
+        Invalidate(&stream);
+      }
       stream.result = fg::Result::FAILED;
       return stream.result;
     }
     stream.result = fg::Result::SUBMITTED;
+    stream.pending_xefg_delivery = std::exchange(slot->adaptive_delivery, {});
+    stream.xefg_delivery_output = input.output;
+    stream.awaiting_xefg_delivery = true;
     present_frame_policy::Publish(&stream.base_frame_clock, slot->base_frame, true, slot->base_frame_group.complete);
-    fg::xefg::SetPresentFailureHandler(input, OnXeFGPresentFailure);
+    fg::xefg::RegisterDeliveryCallback(OnXeFGPresentDelivery);
     if (recordings[0].edit_monitor_delivery != EditReuseDelivery::NONE && nr_input.hudless == nullptr) {
       const auto surface = renodx::utils::directx::NativeIdentity(input.backbuffer);
       StoreEditReuseMonitorFrame(&stream.edit_reuse_monitor, {
@@ -1475,6 +1521,7 @@ inline void OnNativePresentPassthrough(const PresentStream* owner) {
   if (binding == fg_service::native_bindings.end()
       || binding->second != reinterpret_cast<uintptr_t>(owner)) return;
   native_fg_owner = nullptr;
+  native_fg_owner_identity.store(0, std::memory_order_release);
   native_fg_owns.store(false, std::memory_order_release);
   native_fg_marker.store(nullptr, std::memory_order_release);
   native_fg_continuing_submission.store(false, std::memory_order_release);
@@ -1483,6 +1530,7 @@ inline void OnNativePresentPassthrough(const PresentStream* owner) {
 
 inline void OnNativeFgFeatureReleased(const NVSDK_NGX_Handle* handle) {
   if (handle == nullptr) return;
+  output_framerate::ReleaseNativeFeature(reinterpret_cast<uintptr_t>(handle));
 #if defined(NR_NEXUS_DEV_CONTROL)
   if (const auto source = created_feature_ids.find(handle);
       source != created_feature_ids.end() && source->second == NVSDK_NGX_Feature_FrameGeneration) {
@@ -1491,8 +1539,8 @@ inline void OnNativeFgFeatureReleased(const NVSDK_NGX_Handle* handle) {
   }
 #endif
   if (native_fg_owner == handle) {
-    output_framerate::ReleaseNative();
     native_fg_owner = nullptr;
+    native_fg_owner_identity.store(0, std::memory_order_release);
     native_fg_owns.store(false, std::memory_order_release);
     native_fg_marker.store(nullptr, std::memory_order_release);
     native_fg_continuing_submission.store(false, std::memory_order_release);
@@ -1513,9 +1561,10 @@ inline void RetireNativePresentOwner(const void* owner) {
   const auto context = reinterpret_cast<uintptr_t>(owner);
   for (auto binding = fg_service::native_bindings.begin(); binding != fg_service::native_bindings.end();) {
     if (binding->second == context) {
+      output_framerate::ReleaseNativeFeature(reinterpret_cast<uintptr_t>(binding->first));
       if (native_fg_owner == binding->first) {
-        output_framerate::ReleaseNative();
         native_fg_owner = nullptr;
+        native_fg_owner_identity.store(0, std::memory_order_release);
         native_fg_owns.store(false, std::memory_order_release);
         native_fg_marker.store(nullptr, std::memory_order_release);
         native_fg_continuing_submission.store(false, std::memory_order_release);
@@ -2269,6 +2318,7 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     }
     fg::FrameInput input;
     input.backbuffer = backbuffer;
+    input.output = output_framerate::MatchNativeSwapchain(reinterpret_cast<uintptr_t>(owner->native_output_identity));
     input.hudless = hudless;
     input.backbuffer_state = input_state;
     input.hudless_state = input_state;
@@ -2372,6 +2422,9 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
       return nullptr;
     }
     if (!output_ready) {
+      for (const auto& recording : recordings) {
+        ResolveAdaptiveDelivery(recording.adaptive_delivery, false);
+      }
       diagnostic.reason = (result == fg::Result::PREPARED ? "nr_group_warming_or_incomplete" : "nr_group_failed");
       if (result != fg::Result::PREPARED) fg_service::Invalidate(&stream);
       for (uint32_t i = 0; i < recordings.size(); ++i) {
@@ -2385,6 +2438,9 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     // their recordings cannot overwrite a snapshot used by another queue.
     fg_service::CopyColor(list, slot->original_backbuffer, input_state, backbuffer, input_state);
     stream.cached = slot;
+    if (slot->adaptive_delivery.frame.session != nullptr) {
+      slot->adaptive_recording = submission::RecordingIdentity(list);
+    }
     stream.native_resolution_pair = resolution_pair;
     stream.native_pair_resolutions = pair_resolutions;
     if (!protect_recording) {
@@ -2480,6 +2536,20 @@ inline void RestoreNativePreFg(ID3D12GraphicsCommandList* list,
                                         NVSDK_NGX_DLSSG_Parameter_UI, stream.source_ui);
     }
   }
+  bool adaptive_rejected = false;
+  if (backbuffer_replaced && list != nullptr && stream.cached != nullptr
+      && stream.cached->adaptive_delivery.frame.session != nullptr
+      && stream.cached->adaptive_recording == submission::RecordingIdentity(list)) {
+    const auto delivery = std::exchange(stream.cached->adaptive_delivery, {});
+    const bool restored = (hudless == nullptr || PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_HUDLess) == hudless)
+        && (!stream.cached->color_inputs_prepared || PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_UI) == stream.source_ui);
+    if (succeeded && restored) {
+      StageAdaptiveBorrowedDelivery(list, delivery);
+    } else {
+      ResolveAdaptiveDelivery(delivery, false);
+      adaptive_rejected = delivery.frame.enabled;
+    }
+  }
   // Older internal consumers return the borrowed HUDLess without the BB flag.
   // A declined invocation owns neither binding and cannot retract another base.
   if (!succeeded && (backbuffer_replaced || hudless != nullptr)) {
@@ -2492,7 +2562,11 @@ inline void RestoreNativePreFg(ID3D12GraphicsCommandList* list,
           .guides_unavailable = input.guides_unavailable};
     }
     native_fg_continuing_submission.store(false, std::memory_order_release);
-    fg_service::Invalidate(&stream);
+    if (adaptive_rejected) {
+      fg_service::ResetNativeFrame(&stream);
+    } else {
+      fg_service::Invalidate(&stream);
+    }
     stream.result = fg::Result::FAILED;
     native_fg_marker.store(nullptr, std::memory_order_release);
     native_fg_result.store(fg::Result::FAILED, std::memory_order_release);

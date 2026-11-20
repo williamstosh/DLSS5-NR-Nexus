@@ -2330,7 +2330,7 @@ inline constexpr Translation kRu[] = {
     {"Declared %ux", "Заявлено %ux"},
     {"Up to %ux", "До %ux"},
     {"Dynamic", "Динамический"},
-    {"Present cadence estimate", "Оценка по интервалам Present"},
+    {"Application Present submission estimate", "Оценка частоты вызовов Present приложением"},
     {"XeFG SDK output estimate", "Оценка вывода SDK XeFG"},
     {"DLSS FG SDK output estimate", "Оценка вывода SDK DLSS FG"},
     {"Fixed FG multiplier estimate", "Оценка с фиксированным множителем FG"},
