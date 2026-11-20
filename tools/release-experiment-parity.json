@@ -125,7 +125,7 @@
           "scenarios": ["completion-scope"],
           "expect": { "completion-scope": "^ADAPTIVE_COMPLETION_SCOPE evidence=WARP\\+MOCK measured=1 proof_only=1 pending=blocked rejected=blocked superseded=retained$" } },
         { "suite": "adaptive-resolution", "name": "test", "log": "test", "receipt": "^NR_RELEASE_PARITY dx12-upscaled-adaptive-x2 controller ", "scenarios": ["controller"],
-          "expect": { "controller": "^paired_mean_us=2000 lower_us=1500 preserved_trial=1 accepted=1 rollback=1 bounded_missing_cost=1 evidence=CPU$" } }
+          "expect": { "controller": "^paired_mean_us=2000 lower_us=1500 preserved_trial=1 accepted=1 rollback=1 bounded_missing_cost=1 persistent_gap_no_reprobe=1 context_gap_no_reprobe=1 recovery_new_baseline=1 recovered_same_context=1 evidence=CPU$" } }
       ]
     },
     {

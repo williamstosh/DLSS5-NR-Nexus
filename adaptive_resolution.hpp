@@ -166,6 +166,7 @@ struct Session {
   Reason preparation_reason = Reason::PREPARING;
   Sizes minimum{};
   uint64_t last_output_serial = 0, last_sequence = 0, gpu_context = 0;
+  uint64_t lower_cost_anchor_context = 0;
   size_t level = 0, previous_level = 0, active_level = 0;
   size_t frozen_resume_level = MAX_LEVELS;
   int64_t applied_ns = 0, stable_after_ns = 0, last_switch_ns = 0, at_target_since_ns = 0;
@@ -174,6 +175,8 @@ struct Session {
   int64_t blocked_until_ns = 0;
   size_t failed_raise_level = MAX_LEVELS;
   bool trial = false, raising = false, extra_window = false, blocked = false, failed = false;
+  // Healthy anchor samples do not establish that the lower tier's missing coverage recovered.
+  bool lower_cost_recovery_pending = false;
   bool defer_preparation = false;
   bool minimum_pending = false;
   double baseline_fps = 0., baseline_fps_mad = 0., baseline_gpu_us = 0., baseline_gpu_mad = 0.;
@@ -464,7 +467,13 @@ struct Session {
       return;
     }
     if (gpu_context != 0 && gpu_context != sample.context) {
-      if (trial) Request(previous_level, now_ns);
+      if (trial) {
+        if (!raising) {
+          lower_cost_recovery_pending = true;
+          lower_cost_anchor_context = gpu_context;
+        }
+        Request(previous_level, now_ns);
+      }
       InvalidateSampling(now_ns);
       trial = false;
       gpu_context = sample.context;
@@ -576,6 +585,9 @@ struct Session {
       status.prepared_levels = static_cast<uint32_t>(ladder.count);
       Request(0, now_ns);
     } else if (changed) {
+      if (identity != source_identity) {
+        lower_cost_recovery_pending = false;
+      }
       const auto retained = (trial ? ladder.sizes[previous_level] : status.applied);
       const bool defer_legacy = retain_legacy && (defer_preparation || settings.minimum_scale != next.minimum_scale);
       const bool retry_budget = preparation_reason == Reason::BUDGET
@@ -678,6 +690,9 @@ struct Session {
     }
     const bool output_changed = output_source != output.source || output_generation != output.generation
         || output_configuration != output.configuration;
+    if (output_changed && output.available) {
+      lower_cost_recovery_pending = false;
+    }
     if (output_changed || !output.available) {
       if (trial) Request(previous_level, now_ns);
       trial = false;
@@ -720,6 +735,10 @@ struct Session {
     double gpu = 0., gpu_mad = 0.;
     const bool gpu_available = GpuStatistics(now_ns, &gpu, &gpu_mad);
     if (trial && !gpu_available && now_ns - stable_after_ns >= SAMPLE_MAX_AGE_NS) {
+      if (!raising) {
+        lower_cost_recovery_pending = true;
+        lower_cost_anchor_context = gpu_context;
+      }
       Request(previous_level, now_ns);
       trial = false;
       status.reason = Reason::COLLECTING;
@@ -731,6 +750,9 @@ struct Session {
       return;
     }
     status.gpu_ms = gpu / 1000.;
+    if (lower_cost_recovery_pending && !trial && gpu_context != lower_cost_anchor_context) {
+      lower_cost_recovery_pending = false;
+    }
     if (last_output_serial == output.serial) return;
     last_output_serial = output.serial;
     const auto adjacent = [&](bool higher, size_t steps) {
@@ -814,7 +836,8 @@ struct Session {
       at_target_since_ns = 0;
     }
     size_t candidate = level;
-    if (output.fps < settings.target_fps * 0.95 && !blocked && now_ns - last_switch_ns >= 3'000'000'000) {
+    if (output.fps < settings.target_fps * 0.95 && !blocked && !lower_cost_recovery_pending
+        && now_ns - last_switch_ns >= 3'000'000'000) {
       candidate = (settings.legacy_preparation && minimum_pending ? MAX_LEVELS
           : adjacent(false, settings.legacy_preparation && settings.prepared_levels == 0 ? 2 : 1));
       if (settings.legacy_preparation && candidate == level && ladder.sizes[level] != minimum) {
@@ -828,8 +851,12 @@ struct Session {
       raising = true;
     }
     if (candidate == level) {
-      status.reason = (blocked ? Reason::NO_BENEFIT
-          : (ladder.sizes[level] == minimum && output.fps < settings.target_fps * 0.95 ? Reason::AT_MINIMUM : Reason::OBSERVING));
+      if (lower_cost_recovery_pending) {
+        status.reason = Reason::COLLECTING;
+      } else {
+        status.reason = (blocked ? Reason::NO_BENEFIT
+            : (ladder.sizes[level] == minimum && output.fps < settings.target_fps * 0.95 ? Reason::AT_MINIMUM : Reason::OBSERVING));
+      }
       return;
     }
     previous_level = level;

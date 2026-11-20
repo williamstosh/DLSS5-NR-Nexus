@@ -397,6 +397,220 @@ inline bool Run() {
           deadline + 1, true, false);
       check(missing_cost.status.generation == rollback_generation && !missing_cost.trial,
           "a persistent completion gap cannot repeatedly request the same rollback");
+      int64_t gap_now = deadline + 1;
+      uint64_t gap_source = source;
+      uint32_t repeated_trials = 0, upper_windows = 0;
+      auto gap_settings = transition_settings;
+      for (uint32_t tick = 0; tick < 240; ++tick) {
+        missing_cost.SetPairedSampling(missing_cost.level == 0, 0, gap_now);
+        missing_cost.Applied(missing_cost.status.generation, missing_cost.status.requested, gap_now);
+        gap_now += adaptive::SAMPLE_INTERVAL_NS;
+        if (missing_cost.level == 0) {
+          const auto first = ++gap_source;
+          missing_cost.ObserveGpu(paired_sample(missing_cost, first, first, gap_now, 3000.), gap_now);
+          gap_now += 8'333'333;
+          missing_cost.ObserveGpu(paired_sample(missing_cost, ++gap_source, first, gap_now, 1000.), gap_now);
+          double median = 0., mad = 0.;
+          if (missing_cost.GpuStatistics(gap_now, &median, &mad)) {
+            ++upper_windows;
+          }
+        }
+        if (tick == 120) {
+          gap_settings.target_fps = 120.f;
+        }
+        new_output.available = tick != 80;
+        new_output.serial++;
+        new_output.begin_ns = gap_now - adaptive::WARMUP_NS;
+        new_output.end_ns = gap_now;
+        new_output.fps = 80.;
+        const auto previous_generation = missing_cost.status.generation;
+        missing_cost.Prepare(gap_settings, transition_upper, transition_floor, 1, new_output,
+            gap_now, true, false);
+        if (missing_cost.status.generation != previous_generation && missing_cost.trial && missing_cost.level == 1) {
+          ++repeated_trials;
+        }
+      }
+      std::cout << "OBS adaptive missing-cost delivered-anchor upper_windows=" << upper_windows
+                << " repeated_trials=" << repeated_trials << " elapsed_ns=" << gap_now - deadline << '\n';
+      check(upper_windows != 0 && repeated_trials == 0 && missing_cost.level == 0 && !missing_cost.trial
+                && missing_cost.status.generation == rollback_generation && missing_cost.status.applied == transition_upper,
+          "a fully delivered and measured anchor never reprobes the same missing-cost tier after cooldown");
+      for (uint32_t recovery = 0; recovery < 3; ++recovery) {
+        auto recovered = missing_cost;
+        auto recovery_output = new_output;
+        int64_t recovery_now = gap_now + 1;
+        uint64_t recovery_source = gap_source;
+        const uint64_t measurement_identity = (recovery == 1 ? 2 : 1);
+        const uint64_t context = (recovery == 2 ? 2 : 1);
+        const auto upper_sample = [&](uint64_t sample_context, double refresh_us, double reuse_us, double fps) {
+          recovery_now += adaptive::SAMPLE_INTERVAL_NS;
+          const auto first = ++recovery_source;
+          recovered.ObserveGpu(paired_sample(recovered, first, first,
+              recovery_now, refresh_us, true, sample_context), recovery_now);
+          recovery_now += 8'333'333;
+          recovered.ObserveGpu(paired_sample(recovered, ++recovery_source, first,
+              recovery_now, reuse_us, true, sample_context), recovery_now);
+          recovery_output.serial++;
+          recovery_output.begin_ns = recovery_now - adaptive::WARMUP_NS;
+          recovery_output.end_ns = recovery_now;
+          recovery_output.fps = fps;
+          recovered.Prepare(transition_settings, transition_upper, transition_floor, measurement_identity,
+              recovery_output, recovery_now, true, false, 1);
+        };
+        if (recovery == 0) {
+          recovered.Prepare(transition_settings, transition_upper, transition_floor, measurement_identity,
+              {}, recovery_now, true, false, 1);
+          check(!recovered.trial && recovered.level == 0 && recovered.status.reason == adaptive::Reason::OUTPUT_UNAVAILABLE,
+              "losing output ownership cannot itself start another lower-tier trial");
+          ++recovery_output.generation;
+          ++recovery_output.configuration;
+        }
+        if (recovery == 2) {
+          const auto invalid_frame = ++recovery_source;
+          recovered.ObserveGpu(paired_sample(recovered, invalid_frame, invalid_frame,
+              recovery_now, 3600., false, context), recovery_now);
+          for (uint32_t tick = 0; tick < 8; ++tick) {
+            upper_sample(1, 3000., 1000., 80.);
+          }
+          check(!recovered.trial && recovered.level == 0 && recovered.status.generation == rollback_generation,
+              "an invalid foreign-context receipt cannot unlock retries using normal anchor samples");
+          for (uint32_t tick = 0; tick < 2; ++tick) {
+            upper_sample(context, 3600., 1200., 75.);
+          }
+          for (uint32_t tick = 0; tick < 8; ++tick) {
+            upper_sample(1, 3000., 1000., 80.);
+          }
+          check(!recovered.trial && recovered.level == 0 && recovered.status.generation == rollback_generation,
+              "an incomplete new-context baseline cannot unlock the original anchor context");
+        }
+        recovered.Prepare(transition_settings, transition_upper, transition_floor, measurement_identity,
+            recovery_output, recovery_now, true, false, 1);
+        check(!recovered.trial && recovered.level == 0,
+            "a recovered output or measurement scope cannot reuse the old anchor's cost window");
+        for (uint32_t tick = 0; tick < 16 && !recovered.trial; ++tick) {
+          upper_sample(context, 3600., 1200., 75.);
+          if (tick < 4) {
+            check(!recovered.trial && recovered.level == 0,
+                "restored coverage still waits for five fresh comparable upper-tier samples");
+          }
+        }
+        check(recovered.trial && recovered.level == 1 && recovered.baseline_fps == 75.
+                  && recovered.baseline_gpu_us == 2400. && recovered.status.applied == transition_upper,
+            "restored ownership or measurement coverage retries with a new upper-tier baseline");
+        recovered.SetPairedSampling(false, 0, recovery_now);
+        recovered.Applied(recovered.status.generation, recovered.status.requested, recovery_now);
+        for (uint32_t tick = 0; tick < 24 && recovered.trial; ++tick) {
+          recovery_now += adaptive::SAMPLE_INTERVAL_NS;
+          recovered.ObserveGpu({.generation = recovered.status.generation, .frame = ++recovery_source,
+              .sequence = recovery_source, .context = context, .recorded_ns = recovery_now,
+              .completed_ns = recovery_now, .total_us = 1500., .valid = true, .stable = true,
+              .sampling_generation = recovered.sampling_generation}, recovery_now);
+          recovery_output.serial++;
+          recovery_output.begin_ns = recovery_now - adaptive::WARMUP_NS;
+          recovery_output.end_ns = recovery_now;
+          recovery_output.fps = 100.;
+          recovered.Prepare(transition_settings, transition_upper, transition_floor, measurement_identity,
+              recovery_output, recovery_now, true, false, 1);
+        }
+        check(!recovered.trial && recovered.level == 1 && !recovered.blocked,
+            "a recovered lower tier can complete and accept the newly based trial");
+      }
+      auto context_gap = controller;
+      auto context_output = transition_output;
+      int64_t context_now = now;
+      uint64_t context_source = source;
+      uint32_t context_rollbacks = 0, context_retries = 0, context_upper_windows = 0;
+      adaptive::Session first_context_rollback;
+      for (uint32_t tick = 0; tick < 240; ++tick) {
+        const auto before_level = context_gap.level;
+        const auto before_generation = context_gap.status.generation;
+        context_gap.SetPairedSampling(context_gap.level == 0, 0, context_now);
+        context_gap.Applied(context_gap.status.generation, context_gap.status.requested, context_now);
+        context_now += adaptive::SAMPLE_INTERVAL_NS;
+        if (context_gap.level == 0) {
+          const auto first = ++context_source;
+          context_gap.ObserveGpu(paired_sample(context_gap, first, first, context_now, 3000.), context_now);
+          context_now += 8'333'333;
+          context_gap.ObserveGpu(paired_sample(context_gap, ++context_source, first, context_now, 1000.), context_now);
+          double median = 0., mad = 0.;
+          if (context_gap.GpuStatistics(context_now, &median, &mad)) {
+            ++context_upper_windows;
+          }
+        } else {
+          context_gap.ObserveGpu({.generation = context_gap.status.generation, .frame = ++context_source,
+              .sequence = context_source, .context = 2, .recorded_ns = context_now, .completed_ns = context_now,
+              .total_us = 1500., .valid = true, .stable = true,
+              .sampling_generation = context_gap.sampling_generation}, context_now);
+        }
+        context_output.serial++;
+        context_output.begin_ns = context_now - adaptive::WARMUP_NS;
+        context_output.end_ns = context_now;
+        context_output.fps = 80.;
+        context_gap.Prepare(transition_settings, transition_upper, transition_floor, 1, context_output,
+            context_now, true, false);
+        if (context_gap.status.generation != before_generation) {
+          if (before_level == 1 && context_gap.level == 0) {
+            ++context_rollbacks;
+            if (context_rollbacks == 1) {
+              first_context_rollback = context_gap;
+            }
+          } else if (before_level == 0 && context_gap.level == 1) {
+            ++context_retries;
+          }
+        }
+      }
+      std::cout << "OBS adaptive context-gap delivered-anchor upper_windows=" << context_upper_windows
+                << " rollbacks=" << context_rollbacks << " repeated_trials=" << context_retries << '\n';
+      check(context_upper_windows != 0 && context_rollbacks == 1 && context_retries == 0
+                && context_gap.level == 0 && !context_gap.trial && context_gap.status.applied == transition_upper,
+          "a persistent upper-A lower-B timing mismatch returns once without retrying after A recovers");
+      auto aligned_context = first_context_rollback;
+      auto aligned_output = context_output;
+      int64_t aligned_now = context_now + 1;
+      uint64_t aligned_source = context_source;
+      aligned_context.SetPairedSampling(true, 0, aligned_now);
+      aligned_context.Applied(aligned_context.status.generation, aligned_context.status.requested, aligned_now);
+      check(aligned_context.gpu_context == 2 && aligned_context.status.applied == transition_upper,
+          "recovered anchor can use B even when the last observed context was already B");
+      for (uint32_t tick = 0; tick < 24 && !aligned_context.trial; ++tick) {
+        aligned_now += adaptive::SAMPLE_INTERVAL_NS;
+        const auto first = ++aligned_source;
+        aligned_context.ObserveGpu(paired_sample(aligned_context, first, first,
+            aligned_now, 3600., true, 2), aligned_now);
+        aligned_now += 8'333'333;
+        aligned_context.ObserveGpu(paired_sample(aligned_context, ++aligned_source, first,
+            aligned_now, 1200., true, 2), aligned_now);
+        aligned_output.serial++;
+        aligned_output.begin_ns = aligned_now - adaptive::WARMUP_NS;
+        aligned_output.end_ns = aligned_now;
+        aligned_output.fps = 75.;
+        const auto upper_sample_count = aligned_context.gpu_count;
+        aligned_context.Prepare(transition_settings, transition_upper, transition_floor, 1, aligned_output,
+            aligned_now, true, false);
+        if (upper_sample_count < 5) {
+          check(!aligned_context.trial, "aligned queues still require a new complete upper-tier baseline");
+        }
+      }
+      check(aligned_context.trial && aligned_context.level == 1 && aligned_context.baseline_gpu_us == 2400.
+                && aligned_context.baseline_fps == 75.,
+          "an upper B baseline reopens the lower B trial without needing another context change");
+      aligned_context.SetPairedSampling(false, 0, aligned_now);
+      aligned_context.Applied(aligned_context.status.generation, aligned_context.status.requested, aligned_now);
+      for (uint32_t tick = 0; tick < 24 && aligned_context.trial; ++tick) {
+        aligned_now += adaptive::SAMPLE_INTERVAL_NS;
+        aligned_context.ObserveGpu({.generation = aligned_context.status.generation, .frame = ++aligned_source,
+            .sequence = aligned_source, .context = 2, .recorded_ns = aligned_now, .completed_ns = aligned_now,
+            .total_us = 1500., .valid = true, .stable = true,
+            .sampling_generation = aligned_context.sampling_generation}, aligned_now);
+        aligned_output.serial++;
+        aligned_output.begin_ns = aligned_now - adaptive::WARMUP_NS;
+        aligned_output.end_ns = aligned_now;
+        aligned_output.fps = 100.;
+        aligned_context.Prepare(transition_settings, transition_upper, transition_floor, 1, aligned_output,
+            aligned_now, true, false);
+      }
+      check(!aligned_context.trial && aligned_context.level == 1 && !aligned_context.blocked,
+          "the newly aligned lower B tier completes the recovered trial");
     }
     for (uint32_t tick = 0; tick < 24 && controller.trial; ++tick) {
       now += adaptive::SAMPLE_INTERVAL_NS;
@@ -411,7 +625,7 @@ inline bool Run() {
                   : "fresh lower-tier cost without output benefit returns the original trial to its anchor once");
   }
   if (passed) {
-    std::cout << "NR_RELEASE_PARITY dx12-upscaled-adaptive-x2 controller paired_mean_us=2000 lower_us=1500 preserved_trial=1 accepted=1 rollback=1 bounded_missing_cost=1 evidence=CPU\n";
+    std::cout << "NR_RELEASE_PARITY dx12-upscaled-adaptive-x2 controller paired_mean_us=2000 lower_us=1500 preserved_trial=1 accepted=1 rollback=1 bounded_missing_cost=1 persistent_gap_no_reprobe=1 context_gap_no_reprobe=1 recovery_new_baseline=1 recovered_same_context=1 evidence=CPU\n";
   }
 
   adaptive::Session dual;

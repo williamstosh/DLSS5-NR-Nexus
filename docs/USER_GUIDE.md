@@ -473,7 +473,7 @@ F6 立即提示开关操作，随后状态更新为正在检查、正常运行�
 
 **开发版 v0.7.0-dev.1（尚未发布）**也将符合上述条件的 DX11 SR 后输出接入同一复用规则：包括第三方提供的 D3D12 输出，以及原生 DX11 Bridge 的共享输出。原生 Bridge 完成 GPU 处理后才向游戏回拷；缺少 jitter 时按原设置逐帧处理，交付未完成时保留游戏原画，恢复后先刷新。
 
-同开**自适应分辨率**和 **x2** 即请求组合：兼容的上限工作集继续复用，真实换档后先刷新。原生 DX12 超分后的低档组合目前支持两档全预备、单层模型 B、关闭 Look、Detail Stability=1、不跟随输入，以及有可靠同输出 FG 关闭凭据的全幅 FP16 输入。缺少低档组合凭据时，自动调档仍可运行，合格上限保持 x2，低档改为逐帧处理；缺可靠成本时等待采样。原生 Bridge 的自适应低档按逐帧 NR 处理。
+同开**自适应分辨率**和 **x2** 即请求组合：兼容的上限工作集继续复用，真实换档后先刷新。原生 DX12 超分后的低档组合目前支持两档全预备、单层模型 B、关闭 Look、Detail Stability=1、不跟随输入，以及有可靠同输出 FG 关闭凭据的全幅 FP16 输入。缺少低档组合凭据时，自动调档仍可运行，合格上限保持 x2，低档改为逐帧处理。低档持续缺少完整成本回执时仅回收益锚一次，等待可靠测量恢复并取得新的上档基线后再试。原生 Bridge 的自适应低档按逐帧 NR 处理。
 
 原生 DLSS FG 的 **Pre-FG Present x2** 也使用同一开关：选择 Present 并启用既有 Pre-FG 处理后，具有可靠游戏帧身份及完整颜色输入的路径可刷新／复用，同帧后续 MFG 沿用已有结果。缺少严格复用输入时保留普通 Pre-FG 处理。《巫师 3》的早侧颜色交接及晚侧整组内容版本仍有阻塞，在这些场景继续走原退路；普通 Present 保留默认「每帧」。上述开发版能力的动态画质和主观流畅度留待人工验收。
 
@@ -1065,7 +1065,7 @@ Reuse requires NR Runtime 310.9.16.0, writable HDR color for the current frame, 
 
 **Development version v0.7.0-dev.1 (not yet released)** also applies the same reuse rules to eligible DX11 post-SR outputs: third-party D3D12 outputs and shared native DX11 Bridge outputs. The native Bridge copies back after GPU processing completes. Missing jitter retains regular per-frame NR; incomplete delivery keeps the game image, with a refresh on recovery.
 
-Enable **Adaptive resolution** and **x2** together to request the combination. Compatible upper worksets keep reusing; a real level change refreshes first. The native D3D12 Upscaled lower-tier combination currently supports two fully prepared levels, one model B pass, Look off, Detail Stability=1, Follow Input off, and full-frame FP16 inputs with reliable FG-off evidence for the same output. Without lower-tier reuse evidence, automatic sizing continues: eligible upper levels keep x2 and lower levels run per frame. Missing reliable costs wait for samples. Native Bridge adaptive lower levels use per-frame NR.
+Enable **Adaptive resolution** and **x2** together to request the combination. Compatible upper worksets keep reusing; a real level change refreshes first. The native D3D12 Upscaled lower-tier combination currently supports two fully prepared levels, one model B pass, Look off, Detail Stability=1, Follow Input off, and full-frame FP16 inputs with reliable FG-off evidence for the same output. Without lower-tier reuse evidence, automatic sizing continues: eligible upper levels keep x2 and lower levels run per frame. A persistent gap in complete lower-tier cost receipts returns to the accepted anchor once; retries wait for reliable measurements to recover and a new upper-tier baseline. Native Bridge adaptive lower levels use per-frame NR.
 
 Native DLSS FG **Pre-FG Present x2** uses the same switch. Select Present and enable the existing Pre-FG processing option; paths with reliable game-frame identity and complete color inputs can refresh/reuse, while subsequent MFG consumption uses the same result. Missing strict reuse inputs retain ordinary Pre-FG processing. The Witcher 3 still has blocked early color handoff and late complete-content-version paths, which retain their existing fallback. Ordinary Present keeps its default Every present policy. Dynamic quality and subjective smoothness of these development features await manual acceptance.
 
