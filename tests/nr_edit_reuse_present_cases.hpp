@@ -1466,7 +1466,28 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     }
 
 
-    {
+    for (const uint32_t mask_case : {0u, 1u, 2u}) {
+      const bool depth_mask = mask_case != 0;
+      const bool motion_mask = mask_case == 2;
+      if (depth_mask) {
+        native::control_mask_enabled = true;
+        native::control_mask_mode = native::kControlMaskDepthFar;
+        native::control_mask_red = .8f;
+        native::control_mask_green = .6f;
+        native::control_mask_blue = .4f;
+        native::control_mask_depth_near = 0.f;
+        native::control_mask_depth_far = .2f;
+        native::control_mask_motion_enabled = motion_mask;
+        native::control_mask_motion_start = 0.f;
+        native::control_mask_motion_end = .01f;
+        if (motion_mask) {
+          upload(motion.Get(), std::array<float, 2>{2.f, -3.f}, NATIVE_INPUT_STATE);
+        }
+        present_frame();
+        reopen();
+        swap();
+      }
+      stages::Snapshot raced_mask, recovered_mask;
       ComPtr<ID3D12CommandAllocator> writer_allocator;
       ComPtr<ID3D12GraphicsCommandList> writer;
       Check(SUCCEEDED(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&writer_allocator)))
@@ -1501,7 +1522,12 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
         const auto clear_observer = [](int*) { model_parameter_observer = {}; };
         int observer_key = 0;
         const std::unique_ptr<int, decltype(clear_observer)> observer_cleanup(&observer_key, clear_observer);
-        model_parameter_observer = [&](const NVSDK_NGX_Handle* model, const NVSDK_NGX_Parameter*) {
+        model_parameter_observer = [&](const NVSDK_NGX_Handle* model, const NVSDK_NGX_Parameter* parameters) {
+          if (depth_mask) {
+            auto* mask = native::GetD3D12Resource(parameters, "DLSSNR.ControlMask");
+            Check(mask != nullptr, "late writer reaches a real mask-bound model call");
+            raced_mask = stages::Capture(gpu, mask, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+          }
           Check(observed_gates++ == 0 && model == native::features.at(stream.Handle()).slots[0].handle
                     && clock.claims == before_race.base_claims && clock.outputs == before_race.base_outputs
                     && !clock.complete && clock.frame.sequence == previous_frame.sequence
@@ -1553,6 +1579,21 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
       };
       Check(all_pixels(produced, GAME_PIXEL) && all_pixels(written, OVERWRITE_PIXEL),
             "racing game list reads the successful SR image then writes every expected FP16 Backbuffer pixel on the GPU");
+      if (depth_mask) {
+        const auto pixels = raced_mask.Pixels();
+        const std::array<uint8_t, 4> expected_mask{static_cast<uint8_t>(motion_mask ? 0 : 204), 153, 102, 255};
+        bool matches = !pixels.empty();
+        for (size_t offset = 0; offset < pixels.size(); offset += expected_mask.size()) {
+          matches &= std::memcmp(pixels.data() + offset, expected_mask.data(), expected_mask.size()) == 0;
+        }
+        std::cout << "PRESENT_DEPTH_LATE motion=" << motion_mask << " current_bb_overwritten=1 complete=" << raced.base_complete
+                  << " calls=" << raced.calls - before_race.calls << " outputs=" << raced.outputs - before_race.outputs
+                  << " rgba=" << static_cast<uint32_t>(pixels[0]) << ',' << static_cast<uint32_t>(pixels[1]) << ','
+                  << static_cast<uint32_t>(pixels[2]) << ',' << static_cast<uint32_t>(pixels[3])
+                  << " expected_r=" << static_cast<uint32_t>(expected_mask[0])
+                  << std::endl;
+        Check(matches, "late BB replacement revokes only depth attenuation before the original NR submission");
+      }
       const auto raced_pixels = read_back();
       Check(raced_pixels != std::vector(size * size, OVERWRITE_PIXEL)
                 && std::ranges::all_of(raced_pixels, [](const Pixel& pixel) { return pixel[3] == OVERWRITE_PIXEL[3]; }),
@@ -1560,7 +1601,18 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
       const auto raced_frame = clock.frame;
       swap();
       const auto before_recovery = stats();
-      present_frame();
+      {
+        funnel_accounting_tests::Restore observer;
+        observer.Value(&model_parameter_observer);
+        if (depth_mask) {
+          model_parameter_observer = [&](const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter* parameters) {
+            auto* mask = native::GetD3D12Resource(parameters, "DLSSNR.ControlMask");
+            Check(mask != nullptr, "next proven frame still binds the depth mask");
+            recovered_mask = stages::Capture(gpu, mask, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+          };
+        }
+        present_frame();
+      }
       const auto recovered = stats();
       Check(recovered.base_claims == before_recovery.base_claims + 1
                 && recovered.base_outputs == before_recovery.base_outputs + 1 && recovered.base_complete
@@ -1571,6 +1623,16 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
                 && recovered.ring_submissions == before_recovery.ring_submissions + 1
                 && recovered.refreshes == before_recovery.refreshes && recovered.reuses == before_recovery.reuses,
             "the next actual ordered SR copy recovers a complete Every present base product and sends model Reset");
+      if (depth_mask) {
+        const auto pixels = recovered_mask.Pixels();
+        const std::array<uint8_t, 4> expected_mask{0, 153, 102, 255};
+        bool matches = !pixels.empty();
+        for (size_t offset = 0; offset < pixels.size(); offset += expected_mask.size()) {
+          matches &= std::memcmp(pixels.data() + offset, expected_mask.data(), expected_mask.size()) == 0;
+        }
+        Check(matches, "next proven frame restores depth R attenuation and preserves manual G/B");
+        std::cout << "PRESENT_DEPTH_LATE recovery=1 rgba=0,153,102,255 calls=1 outputs=1\n";
+      }
       alpha_preserved(read_back());
       swap();
       std::cout << "PRESENT_EVERY_ORDER_RACE producer_entry=" << producer_entry
@@ -1580,6 +1642,15 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
                 << " outputs=" << raced.base_outputs - before_race.base_outputs
                 << " complete=" << raced.base_complete << " recovery_outputs=" << recovered.base_outputs - raced.base_outputs
                 << " recovery_reset=" << model_resets.back() << '\n';
+      if (depth_mask) {
+        if (motion_mask) {
+          upload(motion.Get(), std::array<float, 2>{0.f, 0.f}, NATIVE_INPUT_STATE);
+        }
+        load_present_mode("0");
+        present_frame();
+        reopen();
+        swap();
+      }
     }
 
     {

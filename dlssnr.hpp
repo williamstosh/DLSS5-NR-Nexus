@@ -872,7 +872,10 @@ constexpr uint32_t kDescriptorControlMaskDepthNullSrv = kDescriptorControlMaskUa
 constexpr uint32_t kDescriptorControlMaskDepthSrv = kDescriptorControlMaskDepthNullSrv + 1;
 constexpr uint32_t kDescriptorControlMaskMotionNullSrv = kDescriptorControlMaskDepthSrv + kControlMaskDepthRingSize;
 constexpr uint32_t kDescriptorControlMaskMotionSrv = kDescriptorControlMaskMotionNullSrv + 1;
-constexpr uint32_t kDescriptorHeapSize = kDescriptorControlMaskMotionSrv + kMotionRingSize;
+constexpr uint32_t kControlMaskDepthProofRingSize = 8;
+constexpr uint32_t kDescriptorControlMaskDepthProofNullCbv = kDescriptorControlMaskMotionSrv + kMotionRingSize;
+constexpr uint32_t kDescriptorControlMaskDepthProofCbv = kDescriptorControlMaskDepthProofNullCbv + 1;
+constexpr uint32_t kDescriptorHeapSize = kDescriptorControlMaskDepthProofCbv + kControlMaskDepthProofRingSize;
 
 // FinalResources::look_surfaces bits: what a workset allocated for the look.
 constexpr uint32_t kLookSurfaceOutput = 1u;     // look_output, the look set
@@ -1026,6 +1029,9 @@ struct FinalResources {
   // until the submission tracker proves its resource idle.
   ID3D12Resource* control_mask_depth_views[kControlMaskDepthRingSize] = {};
   ID3D12Resource* control_mask_motion_views[kMotionRingSize] = {};
+  // Present slots keep each proof buffer alive; the view holds its own reference
+  // so an immutable CBV also survives workset retirement and pointer reuse.
+  ID3D12Resource* control_mask_depth_proof_views[kControlMaskDepthProofRingSize] = {};
   // The pre-SR path's game color, held for the same reason (v7.0.0-rc10):
   // the workset is keyed by its pointer and its views are written once, so
   // a same-size color the game recreated at a freed one's address matched
@@ -1160,6 +1166,9 @@ struct PresentTarget {
   // Ordinary source tracking distinguishes compatible NR guides from depth
   // matching this color. Other adapters retain their existing guide contract.
   std::optional<bool> depth_matches_color;
+  // Borrowed from the Present slot through submission completion. Its first
+  // uint is finalized under the queue's submit lock before ExecuteCommandLists.
+  ID3D12Resource* control_mask_depth_proof = nullptr;
   // Each adapter proves the current producer and color ownership before
   // supplying a frame. The ordinary route also carries its borrowed BB epoch.
   present_frame_policy::Frame base_frame;
@@ -2628,6 +2637,8 @@ inline std::atomic_uint64_t control_mask_motion_ring_recycled{0};
 inline std::atomic_uint64_t control_mask_motion_ring_full{0};
 inline std::atomic_uint64_t control_mask_depth_ring_recycled{0};
 inline std::atomic_uint64_t control_mask_depth_ring_full{0};
+inline std::atomic_uint64_t control_mask_depth_proof_ring_recycled{0};
+inline std::atomic_uint64_t control_mask_depth_proof_ring_full{0};
 inline std::atomic_bool ui_correction = defaults::kUiCorrection;
 // NR codec operating mode.  0 = classic: the codec input gain is the raw
 // paper-white scale (a scene-linear multiplier).  1 = anchored: the gain is
@@ -5361,6 +5372,7 @@ inline void ReleaseFinalResources(FinalResources& resources) {
   for (ID3D12Resource*& exposure : resources.exposure_views) ReleaseCom(exposure);
   for (ID3D12Resource*& depth : resources.control_mask_depth_views) ReleaseCom(depth);
   for (ID3D12Resource*& motion : resources.control_mask_motion_views) ReleaseCom(motion);
+  for (ID3D12Resource*& proof : resources.control_mask_depth_proof_views) ReleaseCom(proof);
   ReleaseCom(resources.pre_sr_source);
   resources = {};
 }
@@ -6735,7 +6747,7 @@ inline bool EnsureCodecRootSignature(ID3D12Device* device) {
     return false;
   }
 
-  D3D12_DESCRIPTOR_RANGE ranges[4]{};
+  D3D12_DESCRIPTOR_RANGE ranges[5]{};
   ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
   ranges[0].NumDescriptors = 4;
   ranges[0].BaseShaderRegister = 0;
@@ -6749,7 +6761,10 @@ inline bool EnsureCodecRootSignature(ID3D12Device* device) {
   ranges[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
   ranges[3].NumDescriptors = 1;
   ranges[3].BaseShaderRegister = 5;
-  D3D12_ROOT_PARAMETER root_parameters[5]{};
+  ranges[4].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
+  ranges[4].NumDescriptors = 1;
+  ranges[4].BaseShaderRegister = 1;
+  D3D12_ROOT_PARAMETER root_parameters[6]{};
   root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
   root_parameters[0].DescriptorTable.NumDescriptorRanges = 1;
   root_parameters[0].DescriptorTable.pDescriptorRanges = &ranges[0];
@@ -6772,7 +6787,10 @@ inline bool EnsureCodecRootSignature(ID3D12Device* device) {
   root_parameters[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
   root_parameters[4].DescriptorTable.NumDescriptorRanges = 1;
   root_parameters[4].DescriptorTable.pDescriptorRanges = &ranges[3];
-  root_desc.NumParameters = 5;
+  root_parameters[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  root_parameters[5].DescriptorTable.NumDescriptorRanges = 1;
+  root_parameters[5].DescriptorTable.pDescriptorRanges = &ranges[4];
+  root_desc.NumParameters = 6;
   root_desc.pParameters = root_parameters;
   ID3DBlob* serialized = nullptr;
   ID3DBlob* errors = nullptr;
@@ -8260,6 +8278,8 @@ inline FinalResources* EnsureWorkset(
   device->CreateShaderResourceView(
       nullptr, &null_depth_srv,
       DescriptorHeapSlot(heap_start, kDescriptorControlMaskMotionNullSrv, resources.descriptor_size));
+  device->CreateConstantBufferView(nullptr,
+      DescriptorHeapSlot(heap_start, kDescriptorControlMaskDepthProofNullCbv, resources.descriptor_size));
   D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
   srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
   srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -9600,12 +9620,14 @@ inline void BindCodec(
   command_list->SetPipelineState(pipeline);
   const D3D12_GPU_DESCRIPTOR_HANDLE heap_start =
       resources.descriptors->GetGPUDescriptorHandleForHeapStart();
-  // The shared root signature can retain ControlMask's depth table from
-  // another workset. Rebind it whenever this codec selects its own heap.
+  // The shared root signature can retain ControlMask's guide and proof tables
+  // from another workset. Rebind them whenever this codec selects its own heap.
   command_list->SetComputeRootDescriptorTable(
       3, DescriptorHeapSlot(heap_start, kDescriptorControlMaskDepthNullSrv, resources.descriptor_size));
   command_list->SetComputeRootDescriptorTable(
       4, DescriptorHeapSlot(heap_start, kDescriptorControlMaskMotionNullSrv, resources.descriptor_size));
+  command_list->SetComputeRootDescriptorTable(
+      5, DescriptorHeapSlot(heap_start, kDescriptorControlMaskDepthProofNullCbv, resources.descriptor_size));
   command_list->SetComputeRootDescriptorTable(
       0,
       DescriptorHeapSlot(
@@ -9862,8 +9884,9 @@ inline bool DispatchControlMask(
     const D3D12_RESOURCE_DESC& depth_desc, const EvaluationContract& frame,
     uint32_t width, uint32_t height, const ControlMaskParameters& parameters,
     bool depth_has_provenance = true, bool motion_has_provenance = true,
-    uint32_t motion_reference_width = 0, uint32_t motion_reference_height = 0) {
-  const bool depth_usable = parameters.mode == kControlMaskDepthFar
+    uint32_t motion_reference_width = 0, uint32_t motion_reference_height = 0,
+    ID3D12Resource* depth_proof = nullptr) {
+  bool depth_usable = parameters.mode == kControlMaskDepthFar
       && depth != nullptr && depth_has_provenance
       && depth_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
       && depth_desc.DepthOrArraySize == 1 && depth_desc.SampleDesc.Count == 1
@@ -9920,6 +9943,13 @@ inline bool DispatchControlMask(
     Log(reshade::log::level::info,
         "ControlMask motion uses the game's MVJittered vectors, including jitter and camera motion; no de-jitter or object separation");
   }
+  uint32_t depth_proof_ring = kControlMaskDepthProofRingSize;
+  if (depth_usable && depth_proof != nullptr) {
+    depth_proof_ring = RingSlot(resources.control_mask_depth_proof_views, depth_proof,
+                               &control_mask_depth_proof_ring_recycled, &control_mask_depth_proof_ring_full,
+                               "ControlMask depth rule uses depth keep=1");
+    depth_usable = depth_proof_ring < kControlMaskDepthProofRingSize;
+  }
   uint32_t depth_ring = kControlMaskDepthRingSize;
   if (depth_usable) {
     depth_ring = RingSlot(resources.control_mask_depth_views, depth,
@@ -9970,6 +10000,22 @@ inline bool DispatchControlMask(
   }
   command_list->SetComputeRootDescriptorTable(
       4, DescriptorHeapSlot(heap_start, motion_descriptor, resources.descriptor_size));
+  uint32_t depth_proof_descriptor = kDescriptorControlMaskDepthProofNullCbv;
+  if (depth_usable && depth_proof != nullptr) {
+    if (resources.control_mask_depth_proof_views[depth_proof_ring] == nullptr) {
+      depth_proof->AddRef();
+      resources.control_mask_depth_proof_views[depth_proof_ring] = depth_proof;
+      const D3D12_CONSTANT_BUFFER_VIEW_DESC proof_view{
+          .BufferLocation = depth_proof->GetGPUVirtualAddress(),
+          .SizeInBytes = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT};
+      device->CreateConstantBufferView(&proof_view,
+          DescriptorHeapSlot(heap_cpu, kDescriptorControlMaskDepthProofCbv + depth_proof_ring, resources.descriptor_size));
+    }
+    submission::TrackUse(command_list, depth_proof);
+    depth_proof_descriptor = kDescriptorControlMaskDepthProofCbv + depth_proof_ring;
+  }
+  command_list->SetComputeRootDescriptorTable(
+      5, DescriptorHeapSlot(heap_start, depth_proof_descriptor, resources.descriptor_size));
   struct ControlMaskConstants {
     uint32_t width, height, mode, rect_width, rect_height;
     float red, green, blue;
@@ -9979,7 +10025,8 @@ inline bool DispatchControlMask(
     uint32_t motion_enabled;
     uint32_t motion_base_x, motion_base_y, motion_width, motion_height;
     float motion_scale_x, motion_scale_y, motion_start, motion_end;
-    uint32_t padding[4];
+    uint32_t check_depth_proof;
+    uint32_t padding[3];
   } constants{
       width, height, parameters.mode, width / 2, height / 2,
       parameters.rgb[0], parameters.rgb[1], parameters.rgb[2],
@@ -9988,7 +10035,7 @@ inline bool DispatchControlMask(
       parameters.depth_near, parameters.depth_far, motion_usable ? 1u : 0u,
       frame.motion_x, frame.motion_y, frame.motion_width, frame.motion_height,
       motion_usable ? motion_scale_x : 0.f, motion_usable ? motion_scale_y : 0.f,
-      parameters.motion_start, parameters.motion_end, {}};
+      parameters.motion_start, parameters.motion_end, (depth_usable && depth_proof != nullptr ? 1u : 0u), {}};
   static_assert(sizeof(ControlMaskConstants) == 28 * sizeof(uint32_t));
   command_list->SetComputeRoot32BitConstants(2, 28, &constants, 0);
   command_list->Dispatch((width + 15) / 16, (height + 15) / 16, 1);
@@ -14465,7 +14512,8 @@ inline bool RecordInline(
   const uint32_t requested_stack = group.count;
   const bool control_mask_guides_have_provenance = present == nullptr || present->guide_serial != 0;
   const bool control_mask_depth_has_provenance = control_mask_guides_have_provenance
-      && (present == nullptr || present->depth_matches_color.value_or(true));
+      && (present == nullptr || present->depth_matches_color.value_or(true))
+      && (present == nullptr || !present->depth_matches_color.has_value() || present->control_mask_depth_proof != nullptr);
   const bool control_mask_render_upscaled_chain = plan.mixed
       && plan.At(stage_plan::Stage::RENDER).count != 0
       && plan.At(stage_plan::Stage::UPSCALED).count != 0
@@ -15974,7 +16022,8 @@ inline bool RecordInline(
             nr_input_width, nr_input_height, mask_parameters,
             control_mask_depth_has_provenance, control_mask_guides_have_provenance,
             adaptive.enabled ? adaptive.upper[group.begin + pass].width : 0u,
-            adaptive.enabled ? adaptive.upper[group.begin + pass].height : 0u);
+            adaptive.enabled ? adaptive.upper[group.begin + pass].height : 0u,
+            present != nullptr ? present->control_mask_depth_proof : nullptr);
       }
       EvaluationContract model_frame = frame;
       if (edit.composed_motion) {

@@ -141,6 +141,7 @@ inline constexpr uint32_t kPresentGuidesNever = 2;
 // ring of 3.  Eight slots cover DXGI's frame latency plus 4x frame
 // generation's burst; past that the present waits for its slot (below).
 inline constexpr uint32_t kPresentRing = 8;
+static_assert(kPresentRing <= kControlMaskDepthProofRingSize);
 // The bounded CPU wait for the next slot, on the present thread under
 // ReShade's queue lock.  The slot was submitted kPresentRing presents earlier
 // on this queue, which executes in order, so it completes as soon as the GPU
@@ -455,6 +456,8 @@ struct PresentSlot {
   ID3D12CommandAllocator* allocator = nullptr;
   ID3D12GraphicsCommandList* list = nullptr;
   uint64_t value = 0;
+  ID3D12Resource* control_mask_depth_proof = nullptr;
+  uint32_t* control_mask_depth_proof_value = nullptr;
 };
 
 // One ring per device face (NGX records in the world of its list, so the
@@ -682,6 +685,10 @@ inline bool ReleasePresentRing() {
     if (slot.list != nullptr) submission::OnCommandListDestroyed(slot.list);
     ReleaseCom(slot.list);
     ReleaseCom(slot.allocator);
+    if (slot.control_mask_depth_proof_value != nullptr) {
+      slot.control_mask_depth_proof->Unmap(0, nullptr);
+    }
+    ReleaseCom(slot.control_mask_depth_proof);
   }
   ReleaseCom(present_ring.fence);
   ReleaseCom(present_ring.queue);
@@ -2911,6 +2918,39 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
   }
   recording_started = true;
   submission::OnCommandListReset(slot->list);
+  target.control_mask_depth_proof = nullptr;
+  bool depth_rule_requested = false;
+  if (!base_frame && identified_frame && target.depth_matches_color.value_or(false)
+      && control_mask_enabled.load(std::memory_order_relaxed)) {
+    const auto group = RequestedStagePlan().At(stage_plan::Stage::PRESENT);
+    for (uint32_t pass = group.begin; pass < group.begin + group.count; ++pass) {
+      depth_rule_requested |= ResolveControlMaskParameters(pass).mode == kControlMaskDepthFar;
+    }
+  }
+  if (depth_rule_requested) {
+    // The caller has already waited for this slot's previous submission. Its
+    // upload data is immutable from Execute until that same fence completes.
+    if (slot->control_mask_depth_proof == nullptr) {
+      const D3D12_HEAP_PROPERTIES heap{.Type = D3D12_HEAP_TYPE_UPLOAD};
+      const D3D12_RESOURCE_DESC desc{.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
+          .Width = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, .Height = 1, .DepthOrArraySize = 1,
+          .MipLevels = 1, .SampleDesc = {1, 0}, .Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+      const D3D12_RANGE no_read{0, 0};
+      void* value = nullptr;
+      if (SUCCEEDED(present_ring.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+              D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&slot->control_mask_depth_proof)))
+          && SUCCEEDED(slot->control_mask_depth_proof->Map(0, &no_read, &value))) {
+        slot->control_mask_depth_proof_value = static_cast<uint32_t*>(value);
+      } else {
+        ReleaseCom(slot->control_mask_depth_proof);
+      }
+    }
+    if (slot->control_mask_depth_proof_value != nullptr) {
+      const uint32_t unproven = 0;
+      std::memcpy(slot->control_mask_depth_proof_value, &unproven, sizeof(unproven));
+      target.control_mask_depth_proof = slot->control_mask_depth_proof;
+    }
+  }
   // Our own list has no host state for the restore-target gate to wait on.
   gate_ever_opened.store(true, std::memory_order_relaxed);
   bool touched = false;
@@ -2988,6 +3028,10 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
   if (queue != nullptr && !base_frame && !identified_frame) queue->flush_immediate_command_list();
   ID3D12CommandList* list = slot->list;
   renodx::utils::directx::NativeFromReShadeProxy(&list);
+  const uint32_t depth_current = (frame_ordered ? 1u : 0u);
+  if (target.control_mask_depth_proof != nullptr) {
+    std::memcpy(slot->control_mask_depth_proof_value, &depth_current, sizeof(depth_current));
+  }
   {
     // Our own Execute joins the existing tracker without reopening the
     // application's handoff or being counted as a later game submission.
@@ -3002,6 +3046,16 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
   submitted = true;
   slot->value = ++present_ring.submitted;
   const bool signaled = SUCCEEDED(native_queue->Signal(present_ring.fence, slot->value));
+  if (target.control_mask_depth_proof != nullptr) {
+    const auto capture_serial = screenshot::PendingModelCaptureSerial(slot->list);
+    if (capture_serial != 0) {
+      std::scoped_lock capture_lock(screenshot::internal::state_mutex);
+      if (screenshot::internal::pending && screenshot::internal::pending->serial == capture_serial) {
+        screenshot::internal::pending->meta += "control_mask_depth_proof_source=present_queue_entry\n"
+            "control_mask_depth_proof_at_submit=" + std::to_string(depth_current) + "\n";
+      }
+    }
+  }
   if (base_frame && !signaled) {
     stream.base_frame_clock.complete = false;
     stream.base_history_unbound = true;

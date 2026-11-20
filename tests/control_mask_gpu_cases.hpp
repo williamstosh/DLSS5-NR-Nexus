@@ -2032,6 +2032,9 @@ void RunInline(Gpu& gpu, bool hardware, bool safety) {
     recovered.list->SetComputeRootDescriptorTable(4, addon::DescriptorHeapSlot(
         rebuilt->descriptors->GetGPUDescriptorHandleForHeapStart(), addon::kDescriptorControlMaskMotionNullSrv,
         rebuilt->descriptor_size));
+    recovered.list->SetComputeRootDescriptorTable(5, addon::DescriptorHeapSlot(
+        rebuilt->descriptors->GetGPUDescriptorHandleForHeapStart(), addon::kDescriptorControlMaskDepthProofNullCbv,
+        rebuilt->descriptor_size));
     const std::array<uint32_t, 28> constants{8, 8, addon::kControlMaskNeutral, 4, 4, 0, 0, 0,
         0, 0, 0, 0, 0, std::bit_cast<uint32_t>(0.7f), std::bit_cast<uint32_t>(0.9f), 0};
     recovered.list->SetComputeRoot32BitConstants(2, static_cast<UINT>(constants.size()), constants.data(), 0);
@@ -2119,6 +2122,9 @@ void Dispatch(Gpu& gpu, ID3D12Resource* texture, ID3D12DescriptorHeap* heap,
   gpu.list->SetComputeRootDescriptorTable(3, srv);
   gpu.list->SetComputeRootDescriptorTable(4, addon::DescriptorHeapSlot(
       heap->GetGPUDescriptorHandleForHeapStart(), addon::kDescriptorControlMaskMotionNullSrv,
+      gpu.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)));
+  gpu.list->SetComputeRootDescriptorTable(5, addon::DescriptorHeapSlot(
+      heap->GetGPUDescriptorHandleForHeapStart(), addon::kDescriptorControlMaskDepthProofNullCbv,
       gpu.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)));
   const std::array<uint32_t, 28> constants{
       static_cast<uint32_t>(texture->GetDesc().Width), texture->GetDesc().Height,
@@ -2294,6 +2300,10 @@ int RunSafety(bool hardware, bool safety = true) {
     gpu.device->CreateShaderResourceView(nullptr, &null_depth_srv,
         addon::DescriptorHeapSlot(heap->GetCPUDescriptorHandleForHeapStart(),
             addon::kDescriptorControlMaskMotionNullSrv,
+            gpu.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)));
+    gpu.device->CreateConstantBufferView(nullptr,
+        addon::DescriptorHeapSlot(heap->GetCPUDescriptorHandleForHeapStart(),
+            addon::kDescriptorControlMaskDepthProofNullCbv,
             gpu.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)));
     D3D12_UNORDERED_ACCESS_VIEW_DESC view{.Format = DXGI_FORMAT_R8G8B8A8_UNORM,
         .ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D};
