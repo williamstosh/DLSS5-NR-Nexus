@@ -464,6 +464,10 @@ inline bool Run() {
               "losing output ownership cannot itself start another lower-tier trial");
           ++recovery_output.generation;
           ++recovery_output.configuration;
+          recovery_output.available = false;
+          recovered.Prepare(transition_settings, transition_upper, transition_floor, measurement_identity,
+              recovery_output, ++recovery_now, true, false, 1);
+          recovery_output.available = true;
         }
         if (recovery == 2) {
           const auto invalid_frame = ++recovery_source;

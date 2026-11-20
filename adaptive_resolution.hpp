@@ -157,6 +157,8 @@ struct Session {
   Settings settings;
   Ladder ladder;
   uint64_t identity = 0, output_source = 0, output_generation = 0, output_configuration = 0;
+  // A new output tuple can appear before its first complete FPS window.
+  uint64_t output_scope_epoch = 0, lower_cost_output_epoch = 0;
   uint64_t resource_identity = 0;
   uint64_t configuration_epoch = 0;
   uint64_t preparation_epoch = 0;
@@ -471,6 +473,7 @@ struct Session {
         if (!raising) {
           lower_cost_recovery_pending = true;
           lower_cost_anchor_context = gpu_context;
+          lower_cost_output_epoch = output_scope_epoch;
         }
         Request(previous_level, now_ns);
       }
@@ -690,8 +693,8 @@ struct Session {
     }
     const bool output_changed = output_source != output.source || output_generation != output.generation
         || output_configuration != output.configuration;
-    if (output_changed && output.available) {
-      lower_cost_recovery_pending = false;
+    if (output_changed) {
+      ++output_scope_epoch;
     }
     if (output_changed || !output.available) {
       if (trial) Request(previous_level, now_ns);
@@ -738,6 +741,7 @@ struct Session {
       if (!raising) {
         lower_cost_recovery_pending = true;
         lower_cost_anchor_context = gpu_context;
+        lower_cost_output_epoch = output_scope_epoch;
       }
       Request(previous_level, now_ns);
       trial = false;
@@ -750,7 +754,8 @@ struct Session {
       return;
     }
     status.gpu_ms = gpu / 1000.;
-    if (lower_cost_recovery_pending && !trial && gpu_context != lower_cost_anchor_context) {
+    if (lower_cost_recovery_pending && !trial
+        && (gpu_context != lower_cost_anchor_context || output_scope_epoch != lower_cost_output_epoch)) {
       lower_cost_recovery_pending = false;
     }
     if (last_output_serial == output.serial) return;
