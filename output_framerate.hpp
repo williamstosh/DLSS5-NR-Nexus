@@ -461,12 +461,15 @@ inline void BindSourceOutput(const SourceIdentity& source, const OutputIdentity&
   internal::BindSourceOutput(source, internal::FindOutput(identity));
 }
 
-inline void ForgetSourceOutput(uintptr_t handle) {
+inline void ForgetSourceOutput(uintptr_t handle, const SourceIdentity* exact_source = nullptr) {
   std::unique_lock lock(internal::state.mutex);
   for (auto* outputs : {&internal::state.present, &internal::state.xefg}) {
     for (auto& [key, output] : *outputs) {
-      std::erase_if(output.sources, [&](const auto& source) { return source.handle == handle; });
-      if (output.native.legacy_source_binding && output.native.legacy_source_binding->handle == handle) {
+      std::erase_if(output.sources, [&](const auto& source) {
+        return source.handle == handle && (exact_source == nullptr || source == *exact_source);
+      });
+      if (output.native.legacy_source_binding && output.native.legacy_source_binding->handle == handle
+          && (exact_source == nullptr || output.native.legacy_source_binding == *exact_source)) {
         output.native.legacy_source_binding.reset();
       }
     }

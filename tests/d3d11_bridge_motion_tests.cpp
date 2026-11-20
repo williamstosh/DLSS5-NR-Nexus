@@ -1436,7 +1436,11 @@ int main(int argc, char** argv) {
         Check(NVSDK_NGX_SUCCEED(created) && native::create_contracts.contains(handle),
             "mock SDK uses the production D3D11 Create hook to capture the source device identity");
       }
-      const auto frame = [&](bool wait_gpu = true, const char* phase = "preparing") {
+      const auto frame = [&](bool wait_gpu = true, const char* phase = "preparing",
+                             const NVSDK_NGX_Handle* source_handle = nullptr) {
+        if (source_handle == nullptr) {
+          source_handle = handle;
+        }
         ++native::present_generation;
         const auto cpu_before = native::bridge_cpu_timing[0];
         const auto completion_before = native::bridge_completion_wait_ns;
@@ -1447,11 +1451,11 @@ int main(int argc, char** argv) {
 #if defined(NR_NEXUS_TEST_NATIVE_NGX)
         if (adaptive_native_ngx) {
           parameters.Set(NVSDK_NGX_Parameter_Reset, bridge_native_sr_calls == 0 ? 1 : 0);
-          result = native::HookedEvaluateFeature11Slot<0>(context.Get(), handle, &parameters, nullptr);
+          result = native::HookedEvaluateFeature11Slot<0>(context.Get(), source_handle, &parameters, nullptr);
         } else
 #endif
         {
-          result = native::Ngx11Evaluate(0, "adaptive Bridge", context.Get(), handle, &parameters, [&] {
+          result = native::Ngx11Evaluate(0, "adaptive Bridge", context.Get(), source_handle, &parameters, [&] {
             context->UpdateSubresource(output.Get(), 0, nullptr, output_pixels.data(), adaptive_output_width * 8, 0);
             return NVSDK_NGX_Result_Success;
           });
@@ -1475,7 +1479,7 @@ int main(int argc, char** argv) {
         }
         if (adaptive_hardware) {
           const auto& cpu = native::bridge_cpu_timing[0];
-          const auto state = native::features.find(handle);
+          const auto state = native::features.find(source_handle);
           std::cout << nlohmann::json{{"event", "bridge_source"}, {"phase", phase}, {"source", native::present_generation},
               {"evidence", adaptive_native_ngx ? "NATIVE_GPU+NATIVE_NGX" : "NATIVE_GPU+MOCK"},
               {"nr_provider", adaptive_native_snippet ? "production snippet Init_Ext"
@@ -1536,7 +1540,9 @@ int main(int argc, char** argv) {
       if (adaptive_hardware) {
         mature();
       } else {
+        namespace adaptive = renodx::addons::dlss5::adaptive_resolution;
         namespace receipt_adapter = xefg::internal;
+        namespace framerate = renodx::addons::dlss5::output_framerate;
         // Real WARP COM identities and production source observer, with only
         // the XeFG SDK calls/proxy-hook installation boundary mocked.
         ComPtr<IDXGISwapChain1> receipt_swapchain;
@@ -1570,7 +1576,11 @@ int main(int argc, char** argv) {
           ~ReceiptCleanup() {
             {
               std::unique_lock lock(receipt_adapter::state.mutex);
-              receipt_adapter::state.contexts.erase(handle);
+              if (const auto it = receipt_adapter::state.contexts.find(handle);
+                  it != receipt_adapter::state.contexts.end()) {
+                framerate::ReleaseXeFGOutput(it->second->output_identity);
+                receipt_adapter::state.contexts.erase(it);
+              }
             }
             receipt_adapter::modules[0].real = real;
             receipt_adapter::modules[0].complete = complete;
@@ -1589,6 +1599,8 @@ int main(int argc, char** argv) {
         receipt_adapter::modules[0].real[2] = reinterpret_cast<void*>(&FakeReceiptGetSwapchain);
         receipt_adapter::modules[0].real[6] = reinterpret_cast<void*>(&FakeReceiptEnable);
         receipt_adapter::proxies[0].installed = receipt_adapter::proxies[0].complete = true;
+        receipt_adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakePresent);
+        receipt_adapter::proxies[0].real[2] = (*reinterpret_cast<void***>(receipt_swapchain3.Get()))[13];
         receipt_adapter::proxies[0].records[0].target = static_cast<uint8_t*>(
             (*reinterpret_cast<void***>(receipt_swapchain3.Get()))[8]);
         xefg::ConfigureBridgeSource(&native::ObserveBridgeSourceForXefg);
@@ -1613,14 +1625,27 @@ int main(int argc, char** argv) {
                   && receipt_context->bridge_application_observation.device11_interface_result == S_OK
                   && receipt_context->bridge_application_observation.device12_interface_result == E_NOINTERFACE,
             "the Init callback verifies the real D3D11 interface and holds the exact normalized source identity");
+        ComPtr<IDXGISwapChain3> observed_proxy;
+        Check(Hooks::GetSwapchain(receipt_cleanup.handle, IID_PPV_ARGS(&observed_proxy)) == 0
+                  && receipt_context->proxy_identity == receipt_adapter::Identity(observed_proxy.Get())
+                  && receipt_context->bridge_proxy_ready && !xefg::QueryBridgeOff(receipt_source).available,
+            "a completed GetSwapchain establishes the public proxy before a later observation races Enable");
+        observed_proxy.Reset();
         receipt_during_sdk = +[] {
           receipt_during_sdk = nullptr;
           Hooks::Enable(receipt_context_handle, 0);
         };
-        ComPtr<IDXGISwapChain3> observed_proxy;
-        Check(Hooks::GetSwapchain(receipt_cleanup.handle, IID_PPV_ARGS(&observed_proxy)) == 0
-                  && receipt_context->proxy_identity == receipt_adapter::Identity(receipt_swapchain.Get())
-                  && !receipt_context->bridge_proxy_ready && !xefg::QueryBridgeOff(receipt_source).available,
+        const auto stale_proxy_result = Hooks::GetSwapchain(receipt_cleanup.handle, IID_PPV_ARGS(&observed_proxy));
+        const auto stale_proxy_off = xefg::QueryBridgeOff(receipt_source);
+        const auto expected_proxy_identity = receipt_adapter::Identity(receipt_swapchain.Get());
+        std::cout << "BRIDGE_ADAPTIVE stale_proxy sdk_result=" << stale_proxy_result
+            << " identity_matches=" << (receipt_context->proxy_identity == expected_proxy_identity)
+            << " proxy_identity=" << reinterpret_cast<void*>(receipt_context->proxy_identity)
+            << " returned_identity=" << reinterpret_cast<void*>(expected_proxy_identity)
+            << " bridge_proxy_ready=" << receipt_context->bridge_proxy_ready
+            << " off_available=" << stale_proxy_off.available << " reason=" << stale_proxy_off.reason << '\n';
+        Check(stale_proxy_result == 0 && receipt_context->proxy_identity == expected_proxy_identity
+                  && !receipt_context->bridge_proxy_ready && !stale_proxy_off.available,
             "concurrent Enable cannot discard the successful public proxy registration or accept the stale experiment declaration");
         observed_proxy.Reset();
         Check(Hooks::GetSwapchain(receipt_cleanup.handle, IID_PPV_ARGS(&observed_proxy)) == 0
@@ -1634,6 +1659,102 @@ int main(int argc, char** argv) {
         mature();
         Check(!native::native_fg_public_off.load() && native::features.at(handle).adaptive_session->prepared,
             "the real Bridge source reaches full two-tier readiness via XeFG receipt without fabricating native SetOptions Off");
+        const auto preparation_epoch = native::features.at(handle).adaptive_session->preparation_epoch;
+        const auto check_unavailable_window = [&](const framerate::OutputIdentity& identity, const char* message) {
+          const auto& session = *native::features.at(handle).adaptive_session;
+          Check(framerate::IsCurrentOutput(identity) && session.status.display_output_generation == identity.generation
+                    && session.prepared && session.status.ready_levels == 2 && session.preparation_epoch == preparation_epoch
+                    && session.status.output_fps == 0.,
+              message);
+        };
+        check_unavailable_window(xefg::QueryBridgeOff(receipt_source).output_identity,
+            "Bridge retains the live output identity and prepares both tiers before the first SDK sample");
+
+        receipt_context->get_status = &FakeReceiptPresentStatus;
+        const auto present = [&] {
+          return receipt_adapter::ProxyHooks<0>::Present(receipt_swapchain.Get(), 0, 0);
+        };
+        const auto warm_sdk_window = [&] {
+          for (size_t bin = 0; bin < 4; ++bin) {
+            std::this_thread::sleep_for(std::chrono::nanoseconds(framerate::Stream::BIN_NS));
+            Check(present() == S_OK, "the XeFG proxy forwards each successful Present and reads its SDK status");
+          }
+          return framerate::Read(receipt_context->output_identity, framerate::NowNs());
+        };
+        const auto read_bridge_window = [&] {
+          const auto sdk_window = warm_sdk_window();
+          const auto evidence = xefg::QueryBridgeOff(receipt_source);
+          Check(evidence.MatchesOutput(sdk_window) && sdk_window.fps > 0., "the exact XeFG Off output has a complete SDK window");
+          frame();
+          const auto& status = native::features.at(handle).adaptive_session->status;
+          Check(status.output_fps == sdk_window.fps && status.display_output_generation == sdk_window.output.generation,
+              "Bridge Adaptive consumes the SDK FPS and generation from its XeFG Off receipt");
+          return sdk_window.output;
+        };
+        Check(present() == S_OK, "the first off-state proxy Present opens the SDK window");
+        const auto first_output = read_bridge_window();
+
+        NVSDK_NGX_Handle* other_source = nullptr;
+        source_create_result = reinterpret_cast<NVSDK_NGX_Handle*>(uintptr_t{0xD5AE});
+        auto& sdk_slot = native::ngx11_slot_real[0];
+        const auto old_create = std::exchange(sdk_slot.create, reinterpret_cast<void*>(&MotionCreateSource));
+        const auto other_created = native::HookedCreateFeature11Slot<0>(context.Get(), native::kFeatureDlss, &parameters, &other_source);
+        sdk_slot.create = old_create;
+        Check(NVSDK_NGX_SUCCEED(other_created) && native::create_contracts.contains(other_source),
+            "a second live SR source on the same D3D11 device is registered by the real Create wrapper");
+        const auto submitted = native::bridge_submits.load();
+        frame(true, "wrong source", other_source);
+        Check(native::bridge_submits.load() == submitted && framerate::Read(first_output, framerate::NowNs()).available,
+            "the wrong Bridge source cannot use the existing SDK window even on the same device");
+        const auto old_release = std::exchange(sdk_slot.release, reinterpret_cast<void*>(&MotionReleaseSource));
+        const auto other_released = native::HookedReleaseFeature11Slot<0>(other_source);
+        sdk_slot.release = old_release;
+        Check(NVSDK_NGX_SUCCEED(other_released), "the second source releases through its real wrapper");
+
+        receipt_sdk_status = -1;
+        Check(Hooks::Enable(receipt_cleanup.handle, 0) == -1 && !xefg::QueryBridgeOff(receipt_source).available,
+            "a failed Disable withdraws the existing Off receipt");
+        frame();
+        Check(native::bridge_submits.load() == submitted && framerate::Read(first_output, framerate::NowNs()).available,
+            "a still-fresh SDK window cannot authorize Bridge after a failed Disable");
+        receipt_sdk_status = 0;
+
+        Check(receipt_adapter::ProxyHooks<0>::Resize(receipt_swapchain.Get(), 0, 9, 8, DXGI_FORMAT_UNKNOWN, 0) == S_OK
+                  && !framerate::IsCurrentOutput(first_output),
+            "resizing the same proxy retires its old SDK output generation");
+        Check(Hooks::Enable(receipt_cleanup.handle, 0) == 0 && present() == S_OK,
+            "the resized proxy has a fresh Off receipt and a first SDK sample");
+        frame();
+        check_unavailable_window(xefg::QueryBridgeOff(receipt_source).output_identity,
+            "Bridge uses the resized proxy identity and preserves preparation while the SDK window is incomplete");
+        const auto resized_output = read_bridge_window();
+        Check(resized_output.generation != first_output.generation,
+            "Bridge reads the newly completed window on the new generation of the same proxy");
+
+        receipt_adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FailedReceiptPresent);
+        Check(present() == E_FAIL && xefg::QueryBridgeOff(receipt_source).available,
+            "a rejected proxy Present fails its output observation independently of the Disable receipt");
+        frame();
+        check_unavailable_window(resized_output,
+            "a failed proxy Present preserves the Bridge output identity and preparation while withdrawing FPS");
+        Check(native::features.at(handle).adaptive_session->status.reason == adaptive::Reason::OUTPUT_UNAVAILABLE
+                  && framerate::Read(resized_output, framerate::NowNs()).reason == framerate::Reason::kFAILED,
+            "Bridge withdraws the SDK FPS window after proxy Present fails");
+
+        receipt_adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakePresent);
+        receipt_context->get_status = +[](void*, xefg::abi::PresentStatus* status) {
+          *status = {.frames_presented = 2, .enabled = 1};
+          return 0;
+        };
+        Check(present() == S_OK, "the proxy reports its first SDK sample with FG enabled");
+        const auto enabled_window = warm_sdk_window();
+        Check(enabled_window.available && !enabled_window.fg_off && enabled_window.output == resized_output
+                  && xefg::QueryBridgeOff(receipt_source).available,
+            "the complete FG On SDK window conflicts with the matching Disable receipt");
+        frame();
+        check_unavailable_window(resized_output,
+            "Bridge keeps the output identity and preparation while rejecting an SDK window reporting FG On");
+        std::cout << "PASS Bridge Adaptive XeFG Off output ownership, resize and failure revocation\n";
       }
       auto& feature = native::features.at(handle);
 #if defined(NR_NEXUS_TEST_NATIVE_NGX)

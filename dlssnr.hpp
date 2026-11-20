@@ -3830,6 +3830,9 @@ inline void NgxLifecycleTick();
 inline bool PresentTakesEvaluate();
 inline bool WantsPresentBaseFrames();
 inline bool ObservesPresentBaseFrames();
+// NGX wrappers precede the Present source-proof storage and copy hooks.
+inline void CaptureAdaptivePresentSource(ID3D12GraphicsCommandList* list,
+    const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* parameters);
 // The wrapper must invalidate a still-writable source before calling NGX,
 // whose command traffic is hidden from the regular observation hooks.
 inline void ObservePresentSourceWork(ID3D12GraphicsCommandList* list, bool unknown_layout);
@@ -11943,6 +11946,9 @@ inline fg::xefg::BridgeSourceObservation ObserveBridgeSourceForXefg(uintptr_t de
 inline bool BridgeAdaptiveEligible(const BridgeAdaptiveSource& source,
     ID3D12GraphicsCommandList* list, ID3D12Device* device, const NVSDK_NGX_Handle* handle,
     const stage_plan::Plan& plan, output_framerate::OutputIdentity* matched_output = nullptr) {
+  if (matched_output != nullptr) {
+    *matched_output = {};
+  }
   if (!bridge_adaptive_experiment.load(std::memory_order_relaxed)) return false;
   const auto created = create_contracts.find(handle);
   bool fg_off = native_fg_public_off.load();
@@ -12004,11 +12010,9 @@ inline bool BridgeAdaptiveEligible(const BridgeAdaptiveSource& source,
       append_device("proxy", evidence.proxy_device);
       Log(reshade::log::level::info, text.str());
     }
-    if (matched_output != nullptr && evidence.available) {
-      *matched_output = output_framerate::MatchNativeSwapchain(evidence.proxy);
-      if (!*matched_output && evidence.source_swapchain != 0) {
-        *matched_output = output_framerate::MatchNativeSwapchain(evidence.source_swapchain);
-      }
+    if (matched_output != nullptr && evidence.available
+        && output_framerate::IsCurrentOutput(evidence.output_identity)) {
+      *matched_output = evidence.output_identity;
     }
     fg_off |= evidence.available;
   }
@@ -12278,6 +12282,8 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
   auto output = output_framerate::Read(output_identity, now_ns);
   if (edit_off != nullptr) {
     output.available = edit_off->MatchesOutput(output);
+  } else if (bridge_source != nullptr && output.source == output_framerate::Source::XEFG_STATUS) {
+    output.available &= output.fg_off;
   }
   const uint32_t outputs = std::max(1u, group_capability.output_count);
   const bool explicit_reservation = nr_adaptive_enabled.load() && selected_levels != 0
@@ -23271,7 +23277,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
   // injection would double-run are dedup-skipped inside ProcessInline.
   ComputeStateEnvelope state_envelope(
       (!nested_in_c_wrapper && !InsideDirectCall()) ? command_list : nullptr);
-  if (source_scope.owner && present_base_capture_active.load(std::memory_order_relaxed)) {
+  if (source_scope.owner) {
     auto* native_list = command_list;
     renodx::utils::directx::NativeFromReShadeProxy(&native_list);
     ObservePresentSourceWork(native_list, false);
@@ -23399,7 +23405,12 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
     return result;
   }
   if (!StagePlanAdmitted(EvaluationStagePlan(handle))) return result;
-  if (PreSrTakes(handle) && !EvaluationStagePlan(handle).mixed) return result;
+  if (PreSrTakes(handle) && !EvaluationStagePlan(handle).mixed) {
+    if (source_scope.owner && pre_sr.result != nullptr) {
+      CaptureAdaptivePresentSource(command_list, handle, parameters);
+    }
+    return result;
+  }
   // The Present hook point: this evaluate lends NR its guides and NR runs
   // at the present (present_path.hpp).  When the present path cannot serve
   // (starved presents, an unusable swapchain) the after path below runs.
@@ -23439,6 +23450,9 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
         , nullptr, source_scope.owner);
   }
   RecordInjectionCpu(started_ns);
+  if (source_scope.owner && command_list_touched) {
+    CaptureAdaptivePresentSource(command_list, handle, parameters);
+  }
   if (command_list_touched) state_envelope.MarkInjectionCommandsRecorded();
   return result;
 }
@@ -23606,7 +23620,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
   inside_game_evaluate_wrapper = true;
   ComputeStateEnvelope state_envelope(
       InsideDirectCall() ? nullptr : command_list);
-  if (source_scope.owner && present_base_capture_active.load(std::memory_order_relaxed)) {
+  if (source_scope.owner) {
     auto* native_list = command_list;
     renodx::utils::directx::NativeFromReShadeProxy(&native_list);
     ObservePresentSourceWork(native_list, false);
@@ -23701,7 +23715,12 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
     return result;
   }
   if (!StagePlanAdmitted(EvaluationStagePlan(handle))) return result;
-  if (PreSrTakes(handle) && !EvaluationStagePlan(handle).mixed) return result;
+  if (PreSrTakes(handle) && !EvaluationStagePlan(handle).mixed) {
+    if (source_scope.owner && pre_sr.result != nullptr) {
+      CaptureAdaptivePresentSource(command_list, handle, parameters);
+    }
+    return result;
+  }
   // The Present hook point: this evaluate lends NR its guides and NR runs
   // at the present (present_path.hpp).  When the present path cannot serve
   // (starved presents, an unusable swapchain) the after path below runs.
@@ -23735,6 +23754,9 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
         , nullptr, source_scope.owner);
   }
   RecordInjectionCpu(started_ns);
+  if (source_scope.owner && command_list_touched) {
+    CaptureAdaptivePresentSource(command_list, handle, parameters);
+  }
   if (command_list_touched) state_envelope.MarkInjectionCommandsRecorded();
   return result;
 }

@@ -517,7 +517,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
       }
       Check(NVSDK_NGX_SUCCEED(result) && sr_handle != nullptr, "Present x2 wrapped game SR Create");
     };
-    const auto evaluate_sr = [&](bool reset, bool jitter, bool jitter_x_present = true) {
+    const auto evaluate_sr = [&](bool reset, bool jitter, bool jitter_x_present = true, bool c_export = false) {
       if (!native_ngx) {
         upload(color.Get(), game_pixel, NATIVE_INPUT_STATE);
       }
@@ -537,7 +537,9 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
       } else
 #endif
       {
-        result = native::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), sr_handle, evaluate_parameters, nullptr);
+        result = c_export
+            ? native::HookedEvaluateFeatureCSlot<0>(gpu.list.Get(), sr_handle, evaluate_parameters, nullptr)
+            : native::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), sr_handle, evaluate_parameters, nullptr);
       }
       Check(NVSDK_NGX_SUCCEED(result), "Present x2 wrapped game SR Evaluate succeeds");
     };
@@ -2255,7 +2257,216 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
             "Streamline releases the tested ordinary Present producer");
       std::cout << "PRESENT_STREAMLINE delivered_frame_calls=1 ordered_rgba=1 alpha=1 base_claims=0 x2=0 evidence=WARP+MOCK\n";
     }
-    Check(SUCCEEDED(gpu.list->Close()), "close the standalone Streamline consumer recording before teardown");
+    if (config_fixture) {
+      namespace rate = addon::output_framerate;
+      funnel_accounting_tests::Restore settings;
+      settings.Atomic(&native::nr_adaptive_enabled);
+      settings.Atomic(&native::nr_adaptive_selected_levels);
+      settings.Atomic(&native::nr_adaptive_target_fps);
+      settings.Atomic(&native::edit_reuse_enabled);
+      settings.Atomic(&native::hook_point);
+      settings.Value(&native::ngx_slot_real[0].evaluate);
+      settings.Value(&native::ngx_slot_real[0].evaluate_c);
+      settings.Value(&native::ngx_slot_real[0].create);
+      native::ngx_slot_real[0].create = reinterpret_cast<void*>(+[](ID3D12GraphicsCommandList*, NVSDK_NGX_Feature,
+          NVSDK_NGX_Parameter*, NVSDK_NGX_Handle** handle) -> NVSDK_NGX_Result {
+        static uint32_t foreign_handle = 1;
+        *handle = reinterpret_cast<NVSDK_NGX_Handle*>(&foreign_handle);
+        return NVSDK_NGX_Result_Success;
+      });
+      static ID3D12Resource* ordinary_game_color = nullptr;
+      static bool ordinary_sr_fail = false;
+      settings.Value(&ordinary_game_color);
+      settings.Value(&ordinary_sr_fail);
+      ordinary_game_color = color.Get();
+      native::ngx_slot_real[0].evaluate_c = reinterpret_cast<void*>(+[](ID3D12GraphicsCommandList* list,
+          const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* parameters,
+          PFN_NVSDK_NGX_ProgressCallback_C) -> NVSDK_NGX_Result {
+        // Exercise the C export's outer source scope and its nested C++ delegate.
+        return native::HookedEvaluateFeatureSlot<0>(list, handle, parameters, nullptr);
+      });
+      native::ngx_slot_real[0].evaluate = reinterpret_cast<void*>(+[](ID3D12GraphicsCommandList* list,
+          const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter* parameters,
+          PFN_NVSDK_NGX_ProgressCallback) -> NVSDK_NGX_Result {
+        auto* input = native::GetD3D12Resource(parameters, NVSDK_NGX_Parameter_Color);
+        auto* result = native::GetD3D12Resource(parameters, NVSDK_NGX_Parameter_Output);
+        const auto state = (input == ordinary_game_color ? NATIVE_INPUT_STATE : native::kPreSrReadable);
+        native::Transition(list, input, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        native::Transition(list, result, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyResource(result, input);
+        native::Transition(list, result, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        native::Transition(list, input, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
+        return (ordinary_sr_fail ? NVSDK_NGX_Result_FAIL_UnableToInitializeFeature : NVSDK_NGX_Result_Success);
+      });
+      native::nr_adaptive_enabled = true;
+      native::nr_adaptive_selected_levels = 2;
+      native::nr_adaptive_target_fps = 100.f;
+      native::edit_reuse_enabled = false;
+      const std::array buffers{
+          reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(output.buffers[0].Get())),
+          reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(output.buffers[1].Get())),
+          reinterpret_cast<uintptr_t>(output.buffers[0].Get()), reinterpret_cast<uintptr_t>(output.buffers[1].Get())};
+      const auto identity = [&] {
+        return rate::SourceIdentity{.handle = reinterpret_cast<uintptr_t>(sr_handle),
+            .generation = native::features.at(sr_handle).source_generation,
+            .device = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(gpu.device.Get())),
+            .resource = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(sr_output.Get())),
+            .resource_generation = native::AdaptiveResourceGeneration(sr_output.Get())};
+      };
+      const auto copy_output = [&](bool full) {
+        gpu.Transition(sr_output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        gpu.Transition(back(), PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (full) {
+          gpu.list->CopyResource(back(), sr_output.Get());
+        } else {
+          const D3D12_TEXTURE_COPY_LOCATION from{.pResource = sr_output.Get(),
+              .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = 0};
+          const D3D12_TEXTURE_COPY_LOCATION to{.pResource = back(),
+              .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = 0};
+          const D3D12_BOX box{0, 0, 0, size - 1, size, 1};
+          gpu.list->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
+        }
+        gpu.Transition(back(), D3D12_RESOURCE_STATE_COPY_DEST, PRESENT);
+        gpu.Transition(sr_output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      };
+      for (const auto hook : {native::kHookRender, native::kHookUpscaled}) {
+        native::kSetHookPoint.Store(static_cast<float>(hook));
+        rate::DestroyPresentOutput(reinterpret_cast<uintptr_t>(&output));
+        rate::RegisterPresentOutput(reinterpret_cast<uintptr_t>(&output), identity().device,
+            reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(output.swapchain.Get())), buffers);
+        const auto owner = rate::MatchPresentOutput(reinterpret_cast<uintptr_t>(&output),
+            reinterpret_cast<uintptr_t>(back()));
+        Check(static_cast<bool>(owner), "the live ordinary output registers its native and canonical backbuffer identities");
+        Check(!rate::FindSourceOutput(identity()), "a pure NGX stage starts without a prefilled output relation");
+        event();
+
+        evaluate_sr(false, true);
+        copy_output(false);
+        submit();
+        event();
+        Check(!rate::FindSourceOutput(identity()), "a partial copy cannot associate the intermediate NGX output");
+        reopen();
+
+        evaluate_sr(false, true);
+        submit();
+        reopen();
+        copy_output(true);
+        submit();
+        event();
+        Check(!rate::FindSourceOutput(identity()), "a full copy on a different recording cannot associate the NGX output");
+        reopen();
+
+        {
+          evaluate_sr(false, true);
+          copy_output(true);
+          // event() finishes only prior queue work. Keep this unsubmitted
+          // fixture recording's model uploads alive until its own submit.
+          const auto pending_uploads = gpu.uploads;
+          const auto pending_resources = gpu.retained_resources;
+          event();
+          Check(!rate::FindSourceOutput(identity()), "an unsubmitted copy cannot associate the NGX output");
+          submit();
+          event();
+          Check(!rate::FindSourceOutput(identity()), "a late producer cannot reopen a rejected output observation");
+          reopen();
+        }
+
+        NVSDK_NGX_Handle* foreign_source = nullptr;
+        Check(native::HookedCreateFeatureSlot<0>(gpu.list.Get(), native::kFeatureDlss,
+                  source_parameters, &foreign_source) == NVSDK_NGX_Result_Success && foreign_source != sr_handle,
+              "the failed overwrite comes from an independent registered NGX source");
+        evaluate_sr(false, true);
+        ordinary_sr_fail = true;
+        Check(NVSDK_NGX_FAILED(native::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), foreign_source,
+                  source_parameters, nullptr)), "the second NGX source writes the intermediate output and fails");
+        ordinary_sr_fail = false;
+        copy_output(true);
+        submit();
+        event();
+        Check(!rate::FindSourceOutput(identity()), "a failed opaque NGX overwrite revokes the earlier source proof");
+        reopen();
+        Check(native::HookedReleaseFeatureSlot<0>(foreign_source) == NVSDK_NGX_Result_Success,
+              "release the failed independent source after its GPU work completes");
+
+        {
+          const auto other_window = CreateWindowExW(0, L"STATIC", L"NR Nexus ambiguous ordinary output", WS_OVERLAPPED,
+              0, 0, size, size, nullptr, nullptr, module, nullptr);
+          Check(other_window != nullptr, "the second output has its own hidden window");
+          const std::unique_ptr<std::remove_pointer_t<HWND>, decltype(&DestroyWindow)> other_owner(other_window, &DestroyWindow);
+          Swapchain other(gpu, other_window, size, size);
+          native::OnPresent(&other.queue, &other, nullptr, nullptr, 0, nullptr);
+          evaluate_sr(false, true, true, true);
+          copy_output(true);
+          submit();
+          event();
+          Check(rate::FindSourceOutput(identity()) == owner, "the first full delivery establishes an ordinary owner");
+          reopen();
+          evaluate_sr(false, true);
+          copy_output(true);
+          auto* other_back = other.buffers.at(other.get_current_back_buffer_index()).Get();
+          gpu.Transition(sr_output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+          gpu.Transition(other_back, PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+          gpu.list->CopyResource(other_back, sr_output.Get());
+          gpu.Transition(other_back, D3D12_RESOURCE_STATE_COPY_DEST, PRESENT);
+          gpu.Transition(sr_output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+          submit();
+          event();
+          Check(!rate::FindSourceOutput(identity()), "one SR source fully delivered to two outputs is not a unique FPS owner");
+          reopen();
+          native::RetirePresentStream(&other);
+        }
+
+        if (hook == native::kHookRender) {
+          Check(std::ranges::any_of(native::present_guide_sets, [](const auto& set) {
+                    return set.motion != nullptr || set.depth != nullptr;
+                  }), "the inactive Present path still owns real guide textures before idle cleanup");
+          const auto cache = native::features.at(sr_handle).adaptive_cache;
+          const auto epoch = native::present_streams.at(&output).base_frame_epoch;
+          native::present_served_ns = native::SteadyNowNs() - native::kWorksetIdleRetireNs - 1;
+          event();
+          Check(std::ranges::all_of(native::present_guide_sets, [](const auto& set) {
+                    return set.motion == nullptr && set.depth == nullptr;
+                  }) && native::present_ring.fence == nullptr && native::present_prefg_hudless == nullptr
+                    && native::present_streams.at(&output).base_frame_epoch == epoch
+                    && native::features.at(sr_handle).adaptive_cache == cache,
+                "idle cleanup retires legacy Present GPU objects while keeping the live source observer and NR cache");
+        }
+
+        const auto start = std::chrono::steady_clock::now();
+        for (uint32_t frame = 0; frame < 260; ++frame) {
+          std::this_thread::sleep_until(start + std::chrono::nanoseconds(8'333'333) * frame);
+          evaluate_sr(false, true, true, frame % 2 == 0);
+          copy_output(true);
+          submit();
+          const auto calls = model_calls;
+          const auto clock_sequence = native::present_streams.at(&output).base_frame_clock.frame.sequence;
+          event();
+          rate::ObservePresent(owner, rate::NowNs());
+          Check(model_calls == calls
+                    && native::present_streams.at(&output).base_frame_clock.frame.sequence == clock_sequence,
+                "ordinary source association adds no Present NR pass or base-frame claim");
+          Check(rate::FindSourceOutput(identity()) == owner,
+                "a successful NGX source and ordered same-list full copy bind its actual current backbuffer");
+          reopen();
+        }
+        evaluate_sr(false, true);
+        copy_output(true);
+        submit();
+        event();
+        const auto sample = rate::Read(owner, rate::NowNs());
+        const auto& session = native::features.at(sr_handle).adaptive_session;
+        Check(sample.available && sample.source == rate::Source::PRESENT && sample.fps > 100.
+                  && session != nullptr && session->status.output_fps > 100.
+                  && session->status.display_output_generation == owner.generation
+                  && session->status.applied[0].width != 0,
+              "Render and Upscaled consume their attributed ordinary FPS from an intermediate pure NGX output");
+        reopen();
+        rate::DestroyPresentOutput(reinterpret_cast<uintptr_t>(&output));
+        Check(!rate::FindSourceOutput(identity()), "destroying the matched output removes the learned NGX relation");
+      }
+      std::cout << "ADAPTIVE_OUTPUT_NGX evidence=WARP+MOCK stages=Render,Upscaled intermediate=1 full_copy=1 rejected_partial_recording_unsubmitted=1\n";
+    }
+    Check(SUCCEEDED(gpu.list->Close()), "close the source consumer recording before teardown");
 
     Check(native::HookedReleaseFeatureSlot<0>(sr_handle) == NVSDK_NGX_Result_Success, "release resized game SR");
     native::RetirePresentStream(&output);

@@ -28,6 +28,7 @@ $adaptiveContractReceipts = @{
     'nr-edit-reuse-present-contracts'=@(
         '^ADAPTIVE_DELIVERY_PRESENT evidence=WARP\+MOCK failed_signal_writes=1 recovered_reset=1 base_claim_delta=0$'
         '^ADAPTIVE_OUTPUT_SOURCE evidence=WARP\+MOCK framed_tags=1 legacy_tags=1 actual_sr=1 release_revoked=1$'
+        '^ADAPTIVE_OUTPUT_NGX evidence=WARP\+MOCK stages=Render,Upscaled intermediate=1 full_copy=1 rejected_partial_recording_unsubmitted=1$'
     )
     'nr-edit-reuse-xefg-contracts'='^ADAPTIVE_DELIVERY_XEFG evidence=WARP\+MOCK rejected_proxy=1 restored_anchor=1 late_receipt=ignored$'
 }
@@ -108,7 +109,8 @@ try {
 
     # The Native x2 contract selects the DEV macro for this separate FG binary.
     $devOutput = Join-Path $OutputDirectory 'dev-suites'
-    & (Join-Path $PSScriptRoot 'run-tests.ps1') -Suite fg-native -NativeCase $devCases -SoftwareOnly -UiPreview None -OutputDirectory $devOutput -RetentionMode Standard
+    & (Join-Path $PSScriptRoot 'run-tests.ps1') -Suite fg-native,bridge-motion -NativeCase $devCases -BridgeCase adaptive `
+        -SoftwareOnly -UiPreview None -OutputDirectory $devOutput -RetentionMode Standard
     $devFg = Join-Path $devOutput 'fg-native'
     $devResult = Get-Content -LiteralPath (Join-Path $devFg 'result.json') -Raw | ConvertFrom-Json
     if ($devResult.suite -cne 'fg-native' -or $devResult.build -cne 'passed' -or $devResult.run -cne 'passed') {
@@ -120,6 +122,15 @@ try {
         $summary.independent += @{name=$case;status='Passed';evidence='WARP+MOCK';receipt=$receipt
             executableSha256=$devExecutableHash}
     }
+    $devBridge = Join-Path $devOutput 'bridge-motion'
+    $devBridgeResult = Get-Content -LiteralPath (Join-Path $devBridge 'result.json') -Raw | ConvertFrom-Json
+    if ($devBridgeResult.suite -cne 'bridge-motion' -or $devBridgeResult.build -cne 'passed' -or $devBridgeResult.run -cne 'passed') {
+        throw 'Bridge adaptive XeFG Off requires a passing DEV Bridge build and run.'
+    }
+    $devBridgeReceipt = Get-CoreCaseReceipt 'bridge-adaptive-xefg-off' (Join-Path $devBridge 'warp-adaptive.stdout.log') `
+        '^PASS Bridge Adaptive XeFG Off output ownership, resize and failure revocation$'
+    $summary.independent += @{name='bridge-adaptive-xefg-off';status='Passed';evidence='WARP+MOCK';receipt=$devBridgeReceipt
+        executableSha256=(Get-FileHash -LiteralPath (Join-Path $devBridge 'd3d11_bridge_motion_tests.exe')).Hash}
     $outcome = 'Passed'
 } finally {
     $env:CL = $previousCl
