@@ -215,7 +215,7 @@ inline void Run() {
   Check(native_adapter::HookedSetOptions(viewport, options) == sl::Result::eOk
             && rate::BindNativeTaggedSourceOutput(7, 13, framed_source),
         "fixed SDK control starts with the live tagged output and accepted On options");
-  constexpr adaptive::Settings target{.enabled = true, .target_fps = 100.f, .prepared_levels = 2};
+  constexpr adaptive::Settings target{.enabled = true, .target_fps = 100.f, .minimum_scale = 0.33f, .prepared_levels = 2};
   adaptive::Sizes upper{}, floor{};
   upper[0] = {.width = 1920, .height = 1080};
   floor[0] = {.width = 634, .height = 356};
@@ -278,6 +278,7 @@ inline void Run() {
     accepted = low_generation != 0 && !controller.trial;
   }
   Check(accepted && controller.level == 1 && controller.active_level == 1
+            && controller.status.applied == floor
             && controller.applied_generation == low_generation && controller.status.reason == adaptive::Reason::OBSERVING
             && sample.available && sample.output == output && sample.source == rate::Source::NATIVE_STATE
             && !sample.multiplier_variable && sample.observed_multiplier == 0
