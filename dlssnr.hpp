@@ -1157,6 +1157,9 @@ struct PresentTarget {
   uint32_t sdr_restore_effective_mode = 0;
   std::array<float, kMaxNrPasses> pass_color_strength{};
   uint64_t guide_serial = 0;
+  // Ordinary source tracking distinguishes compatible NR guides from depth
+  // matching this color. Other adapters retain their existing guide contract.
+  std::optional<bool> depth_matches_color;
   // Each adapter proves the current producer and color ownership before
   // supplying a frame. The ordinary route also carries its borrowed BB epoch.
   present_frame_policy::Frame base_frame;
@@ -14461,6 +14464,8 @@ inline bool RecordInline(
   }
   const uint32_t requested_stack = group.count;
   const bool control_mask_guides_have_provenance = present == nullptr || present->guide_serial != 0;
+  const bool control_mask_depth_has_provenance = control_mask_guides_have_provenance
+      && (present == nullptr || present->depth_matches_color.value_or(true));
   const bool control_mask_render_upscaled_chain = plan.mixed
       && plan.At(stage_plan::Stage::RENDER).count != 0
       && plan.At(stage_plan::Stage::UPSCALED).count != 0
@@ -15967,7 +15972,7 @@ inline bool RecordInline(
         pass_control_mask_eligible = DispatchControlMask(
             device, command_list, res, frame.depth, depth_desc, frame,
             nr_input_width, nr_input_height, mask_parameters,
-            control_mask_guides_have_provenance, control_mask_guides_have_provenance,
+            control_mask_depth_has_provenance, control_mask_guides_have_provenance,
             adaptive.enabled ? adaptive.upper[group.begin + pass].width : 0u,
             adaptive.enabled ? adaptive.upper[group.begin + pass].height : 0u);
       }
@@ -16389,7 +16394,7 @@ inline bool RecordInline(
                                                 model_resources.control_mask, capture_serial);
           Transition(command_list, model_resources.control_mask, D3D12_RESOURCE_STATE_COPY_SOURCE,
                      model_resources.control_mask_state, 0u);
-          if (last_model_control_mask_mode == kControlMaskDepthFar
+          if (last_model_control_mask_mode == kControlMaskDepthFar && control_mask_depth_has_provenance
               && screenshot::PrepareDiagnosticPlane(
                   device, "control_mask_depth", frame.depth, frame.input_width, frame.input_height,
                   screenshot::CaptureRect{frame.depth_x, frame.depth_y, frame.input_width, frame.input_height},

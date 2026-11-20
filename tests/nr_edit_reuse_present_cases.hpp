@@ -1332,11 +1332,30 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
         bool jitter_x = true;
         bool jitter_y = true;
         const char* present_frames = "0";
+        bool depth_mask = false;
+        bool motion_mask = false;
       };
       for (const auto& scenario : std::array{SourceCase{}, SourceCase{.jitter_y = false}, SourceCase{},
                SourceCase{.jitter_x = false, .present_frames = nullptr}, SourceCase{},
-               SourceCase{.proven = false}, SourceCase{}}) {
+               SourceCase{.proven = false}, SourceCase{},
+               SourceCase{.jitter_y = false, .depth_mask = true},
+               SourceCase{.proven = false, .depth_mask = true}, SourceCase{.depth_mask = true},
+               SourceCase{.proven = false, .depth_mask = true, .motion_mask = true}, SourceCase{}}) {
         load_present_mode(scenario.present_frames);
+        if (scenario.depth_mask) {
+          native::control_mask_enabled = true;
+          native::control_mask_mode = native::kControlMaskDepthFar;
+          native::control_mask_red = .8f;
+          native::control_mask_green = .6f;
+          native::control_mask_blue = .4f;
+          // Both views' depth values lie past this far endpoint, with either
+          // depth direction. B must visibly change R if incorrectly admitted.
+          native::control_mask_depth_near = 0.f;
+          native::control_mask_depth_far = .2f;
+          native::control_mask_motion_enabled = scenario.motion_mask;
+          native::control_mask_motion_start = 0.f;
+          native::control_mask_motion_end = .01f;
+        }
         const bool proven = scenario.proven;
         const auto before = stats();
         const auto previous = clock.frame;
@@ -1367,7 +1386,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
                   && capture_b->base_frame.backbuffer == nullptr,
               "newer compatible view B has no SR-to-BB copy and cannot identify the current A picture");
 
-        stages::Snapshot model_motion, model_depth;
+        stages::Snapshot model_motion, model_depth, model_mask;
         const auto* expected = (proven ? capture_a : capture_b);
         bool expected_inputs = false;
         model_parameter_observer = [&](const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter* block) {
@@ -1377,6 +1396,9 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
           if (mv != nullptr && z != nullptr) {
             model_motion = stages::Capture(gpu, mv, NATIVE_INPUT_STATE);
             model_depth = stages::Capture(gpu, z, NATIVE_INPUT_STATE);
+          }
+          if (auto* mask = native::GetD3D12Resource(block, "DLSSNR.ControlMask")) {
+            model_mask = stages::Capture(gpu, mask, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
           }
         };
         event();
@@ -1406,6 +1428,20 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
               "two-view Every present records one model call and completes one real GPU submission");
         Check(expected_inputs && motion_matches && depth_matches && after.consumed_serial == expected->serial,
               "two-view Every present model must read MV and depth from the SR view that supplies its proven BB");
+        if (scenario.depth_mask) {
+          Check(model_mask.readback != nullptr && model_mask.format == DXGI_FORMAT_R8G8B8A8_UNORM,
+                "ordinary Present binds the generated Control Mask to the actual model call");
+          const std::array<uint8_t, 4> expected_mask{
+              static_cast<uint8_t>((proven || scenario.motion_mask) ? 0 : 204), 153, 102, 255};
+          const auto pixels = model_mask.Pixels();
+          std::cout << "PRESENT_DEPTH_MASK proven=" << proven << " motion=" << scenario.motion_mask
+                    << " consumed=" << after.consumed_serial << " rgba="
+                    << static_cast<uint32_t>(pixels[0]) << ',' << static_cast<uint32_t>(pixels[1]) << ','
+                    << static_cast<uint32_t>(pixels[2]) << ',' << static_cast<uint32_t>(pixels[3])
+                    << " expected_r=" << static_cast<uint32_t>(expected_mask[0]) << std::endl;
+          Check(all_pixels(model_mask, expected_mask),
+                "only proven current depth may attenuate mask R; compatibility keeps manual RGB and existing motion");
+        }
         if (proven) {
           const auto& source = native::features.at(sr_handle);
           Check(after.base_claims == before.base_claims + 1 && after.base_outputs == before.base_outputs + 1

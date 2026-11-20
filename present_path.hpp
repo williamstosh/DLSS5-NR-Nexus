@@ -4850,6 +4850,11 @@ inline void RunPresentPath(
       guides != nullptr ? guides->source_handle : nullptr);
   target.workset_key = reinterpret_cast<const ID3D12Resource*>(&stream);
   target.guide_serial = (guides != nullptr ? guides->serial : 0u);
+  // This route observes SR-to-BB correspondence independently of x2 eligibility.
+  if (!d3d11 && ordinary_base_frames && target.hdr_mode == 1
+      && target.hdr_color_space == reshade::api::color_space::scrgb) {
+    target.depth_matches_color = identified.guides != nullptr && guides == identified.guides;
+  }
   target.diagnostic_source_generation = (guides != nullptr ? guides->contract.source_generation : 0);
   target.diagnostic_source_feature = (guides != nullptr ? guides->contract.source_feature : NVSDK_NGX_Feature_Reserved_Unknown);
 
