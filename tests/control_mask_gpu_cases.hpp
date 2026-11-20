@@ -3056,7 +3056,7 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeResizeCreate(
       const auto& session = *frame->session;
       native_resize_create_calls.back()["session"] = {{"requested_slot", session.level}, {"source_active_slot", session.active_level},
           {"preparing_slot", frame->slot}, {"preparing", frame->preparing}, {"trial", session.trial},
-          {"blocked", session.blocked}, {"defer_preparation", session.defer_preparation}};
+          {"defer_preparation", session.defer_preparation}};
     }
   }
   return result;
@@ -6743,7 +6743,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       }
       native_resize_demand_prepare = demand_prepare;
       native_resize_create_gpu = demand_adjacent;
-      const uint32_t frame_count = (automatic_limited ? selected_source_limit : (demand_prepare ? 900u : (settings_reuse ? 360u : 180u)));
+      const uint32_t frame_count = (automatic_limited ? selected_source_limit : (demand_prepare ? (demand_adjacent ? 1200u : 900u) : (settings_reuse ? 360u : 180u)));
       const UINT intervals_per_frame = (demand_adjacent ? 4u : (native_resize_ready ? 3u : 2u));
       auto queries = d3d12_test::CreateTimestampQueries(gpu, frame_count * intervals_per_frame);
       ComPtr<IDXGIAdapter3> adapter;
@@ -6868,12 +6868,12 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       double demand_startup_create_ms = 0., demand_total_create_ms = 0.;
       uint64_t demand_peak_bytes = 0;
       size_t demand_previous_active = 0;
-      size_t demand_previous_requested = 0;
-      bool demand_previous_trial = false;
-      std::array<bool, 3> demand_trial_accepted{}, demand_applied_slots{}, demand_standby_evaluated{};
+      std::array<bool, 3> demand_fps_decided{}, demand_applied_slots{}, demand_standby_evaluated{};
       bool demand_initial_neighbor_ready = false;
       bool demand_second_prefetch_observed = false;
-      bool demand_lower_applied = false, demand_returned_upper = false;
+      bool demand_lower_applied = false;
+      int64_t next_mock_present_ns = 0;
+      double previous_mock_fps = 0.;
       namespace output_rate = renodx::addons::dlss5::output_framerate;
       namespace adaptive = renodx::addons::dlss5::adaptive_resolution;
       const auto output_fixture = reinterpret_cast<uintptr_t>(owner);
@@ -6887,15 +6887,12 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       }
       uint32_t automatic_phase = 0, automatic_pending_frames = 0, automatic_peak_features = 0;
       std::array<uint32_t, 3> automatic_slot_creates{};
-      const NVSDK_NGX_Handle* automatic_anchor = nullptr;
-      int64_t automatic_cooldown_deadline = 0;
       std::string automatic_failure;
       if (automatic_limited) {
         report["selected_collection"]["limited_residency"]["automatic"] = {
-            {"input_evidence", "MOCK FPS by actual Applied size: upper 80; first 75% 84; 50% 60; returned 75% 60"},
+            {"input_evidence", "MOCK FPS by actual Applied size: upper 80; 75% 84; 50% 60 stays at minimum"},
             {"gpu_evidence", "NATIVE_GPU production timestamps and actual Session median/MAD; no injected GPU samples"},
-            {"clock", "real SteadyNowNs/steady_clock; no time, level, Request or blocked-state edits"},
-            {"cooldown_scope", "30-second expiry NotRun; synthetic 84-to-60 FPS workload change reopens production blocked gate"},
+            {"clock", "real SteadyNowNs/steady_clock; synthetic application cadence through the production output stream"},
             {"feature_count_scope", "sampled after each source submit/Reset/drain; live plus pending retired NR Features, not an instantaneous SDK allocation peak"},
             {"frame_limit", frame_count}, {"wall_limit_ms_including_prefix", 20000}, {"source_cadence_hz", 60},
             {"target_fps", 100}, {"mock_fps_mad", 0}, {"logical_levels", 3}, {"minimum_scale", .5},
@@ -6909,7 +6906,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                   && upper.create_input_height == height, "demand fixture starts with the existing real upper Feature");
         report["probe_execution"] = "Running";
         report["teardown_status"] = "NotRun";
-        report["demand_preparation"] = {{"fps_evidence", "MOCK: synthetic windows through the existing output_framerate test state"},
+        report["demand_preparation"] = {{"fps_evidence", "MOCK: synthetic application cadence through the production output stream"},
             {"gpu_evidence", "NATIVE_GPU: production adaptive timestamps, no injected GPU samples"},
             {"target_fps", 100}, {"mock_fps_before_frame_360", 120}, {"mock_fps_from_frame_360", 80},
             {"mock_fps_mad", 0}, {"frame_count", frame_count}, {"direct_session_requests", false},
@@ -7008,9 +7005,10 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         std::array<bool, renodx::addons::dlss5::adaptive_resolution::MAX_LEVELS> demand_ready_before{};
         double mock_output_fps = (frame < 360 ? 120. : 80.);
         size_t demand_active_before = 0;
-        int64_t mock_window_end_ns = 0;
+        int64_t mock_read_ns = 0;
+        output_rate::Snapshot mock_window;
         if (demand_prepare || automatic_limited) {
-          mock_window_end_ns = addon::SteadyNowNs();
+          mock_read_ns = addon::SteadyNowNs();
           const auto& feature = addon::features.at(owner);
           if (feature.adaptive_cache != nullptr) {
             demand_active_before = feature.adaptive_cache->active;
@@ -7024,22 +7022,27 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
             Check(demand_active_before < 3, "consecutive MOCK output uses the actual three-slot active state");
             mock_output_fps = 80. + 10. * demand_active_before;
           }
+          if (demand_prepare && !demand_adjacent && demand_active_before == 1) {
+            mock_output_fps = 100.;
+          }
           if (automatic_limited) {
             const auto& session = *feature.adaptive_session;
             Check(session.ladder.count == 3 && session.settings.limited_residency
                 && !session.settings.legacy_preparation && !addon::async_autoscale_preparation.load(),
                 "automatic player mode keeps three logical tiers with legacy and private PSO experiments off");
             const auto applied = session.status.applied[0];
-            mock_output_fps = (applied == session.ladder.sizes[1][0] ? (automatic_phase >= 6 ? 60. : 84.)
+            mock_output_fps = (applied == session.ladder.sizes[1][0] ? 84.
                 : (applied == session.ladder.sizes[2][0] ? 60. : 80.));
           }
-          std::unique_lock lock(output_rate::internal::state.mutex);
-          auto& estimate = output_rate::internal::state.present.at(output_fixture).stream;
-          estimate.previous_ns = mock_window_end_ns;
-          estimate.snapshot = {.available = true, .reason = output_rate::Reason::kREADY, .source = output_rate::Source::PRESENT,
-              .source_generation = fixture_output.generation, .configuration_generation = fixture_output.generation,
-              .window_serial = frame + 1, .window_begin_ns = mock_window_end_ns - 500'000'000,
-              .window_end_ns = mock_window_end_ns, .fps = mock_output_fps, .fps_mad = 0., .fg_off = true};
+          if (mock_output_fps != previous_mock_fps) {
+            next_mock_present_ns = mock_read_ns;
+            previous_mock_fps = mock_output_fps;
+          }
+          const auto cadence_ns = static_cast<int64_t>(1'000'000'000 / mock_output_fps);
+          for (; next_mock_present_ns <= mock_read_ns; next_mock_present_ns += cadence_ns) {
+            output_rate::ObservePresent(fixture_output, next_mock_present_ns);
+          }
+          mock_window = output_rate::Read(fixture_output, mock_read_ns);
         }
         const auto automatic_session_before = (automatic_limited ? addon::features.at(owner).adaptive_session : nullptr);
         const auto automatic_applied_before = (automatic_limited ? automatic_session_before->status.applied : adaptive::Sizes{});
@@ -7053,7 +7056,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         const double automatic_baseline_before = (automatic_limited ? automatic_session_before->baseline_gpu_us : 0.);
         double automatic_gpu_before = 0., automatic_gpu_mad_before = 0.;
         const bool automatic_gpu_valid_before = automatic_limited
-            && automatic_session_before->GpuStatistics(mock_window_end_ns, &automatic_gpu_before, &automatic_gpu_mad_before);
+            && automatic_session_before->GpuStatistics(mock_read_ns, &automatic_gpu_before, &automatic_gpu_mad_before);
         if (settings_reuse) {
           switch (frame) {
             case 180:
@@ -7461,47 +7464,29 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                   "player on-demand startup has only the actual complete upper");
               ++automatic_phase;
             } else if (automatic_phase == 1 && session.level == 1 && session.trial && session.previous_level == 0) {
-              Check(session.baseline_fps == 80. && !demand_ready_before[1],
+              Check(std::abs(session.status.output_fps - 80.) < 0.01 && !demand_ready_before[1],
                   "the real Controller requests its first cold adjacent tier from the injected 80 FPS upper window");
               ++automatic_phase;
             } else if (automatic_phase == 2 && applied_target && active == 1) {
-              automatic_anchor = addon::features.at(owner).slots[0].handle;
               Check(automatic_slot_creates[1] == 1 && actual_resident_features == 2,
                   "first automatic cold preparation actually applies the 75-percent model while retaining its upper anchor");
               ++automatic_phase;
             } else if (automatic_phase == 3 && session.level == 2 && session.trial && session.previous_level == 1) {
-              Check(session.baseline_fps == 84. && !demand_ready_before[2],
-                  "the Controller accepts the real cheaper 75-percent trial before requesting a second cold descent from its 84 FPS anchor");
+              Check(std::abs(session.status.output_fps - 84.) < 0.01 && !demand_ready_before[2],
+                  "a completed post-warmup 84 FPS window requests the adjacent cold minimum");
               ++automatic_phase;
             } else if (automatic_phase == 4 && applied_target && active == 2) {
               Check(automatic_slot_creates[2] == 1 && addon::nr_features_created - selected_features_before == 3,
                   "the second automatically requested target reaches real 50-percent Applied dimensions");
               ++automatic_phase;
-            } else if (automatic_phase == 5 && automatic_trial_before && automatic_requested_before == 2
-                && automatic_previous_before == 1 && automatic_baseline_fps_before == 84.
-                && session.status.generation > automatic_generation_before && session.blocked && !session.trial
-                && session.level == 1) {
-              // A ready rollback may already have replaced the display reason
-              // with WARMING in this source. Observe the decision transition.
-              Check(session.baseline_fps == 84. && session.status.requested == session.ladder.sizes[1],
-                  "the worse 60 FPS result returns through the actual no-benefit branch to the accepted 75-percent anchor");
-              automatic_cooldown_deadline = session.blocked_until_ns;
-              ++automatic_phase;
-            } else if (automatic_phase == 6 && applied_target && active == 1) {
-              Check(addon::features.at(owner).slots[0].handle == automatic_anchor
-                  && automatic_slot_creates[1] == 1 && session.blocked,
-                  "the observed rollback Applied uses the original accepted 75-percent Feature without recreating it");
-              ++automatic_phase;
-            } else if (automatic_phase == 7 && session.level == 2 && session.trial && session.previous_level == 1) {
-              Check(!session.blocked && now_ns < automatic_cooldown_deadline && session.baseline_fps == 60.
-                  && !demand_ready_before[2],
-                  "a synthetic 84-to-60 workload change reopens the real controller before cooldown expiry after the old 50-percent target retired");
-              ++automatic_phase;
-            } else if (automatic_phase == 8 && applied_target && active == 2) {
-              Check(automatic_slot_creates == std::array<uint32_t, 3>{1, 1, 2}
-                  && addon::nr_features_created - selected_features_before == 4
-                  && cache->tiers[1].state.slots[0].handle == automatic_anchor,
-                  "automatic re-exploration cold-creates a new 50-percent target while preserving the accepted rollback Feature");
+            } else if (automatic_phase == 5 && applied_target && active == 2
+                && session.status.reason == adaptive::Reason::AT_MINIMUM) {
+              Check(session.status.generation == automatic_generation_before
+                  && session.applied_ns == automatic_applied_ns_before
+                  && mock_window.window_begin_ns >= session.stable_after_ns
+                  && std::abs(session.status.output_fps - 60.) < 0.01
+                  && automatic_slot_creates == std::array<uint32_t, 3>{1, 1, 1},
+                  "the completed 60 FPS window holds the delivered minimum without a rollback or another Create");
               ++automatic_phase;
             }
             double gpu_median = 0., gpu_mad = 0.;
@@ -7511,8 +7496,8 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                 {"target_ready", session.TargetReady()}, {"full_prepared", session.prepared}, {"applied_ns", session.applied_ns},
                 {"applied_size", {session.status.applied[0].width, session.status.applied[0].height}},
                 {"mock_fps", mock_output_fps}, {"reason", adaptive::ReasonText(session.status.reason)},
-                {"trial", session.trial}, {"previous_level", session.previous_level}, {"blocked", session.blocked},
-                {"blocked_until_ns", session.blocked_until_ns}, {"baseline_fps", session.baseline_fps},
+                {"trial", session.trial}, {"previous_level", session.previous_level}, {"baseline_fps", session.baseline_fps},
+                {"output_window", {mock_window.window_begin_ns, mock_window.window_end_ns}},
                 {"baseline_gpu_us", session.baseline_gpu_us}, {"baseline_gpu_mad", session.baseline_gpu_mad},
                 {"gpu_sample_count", session.gpu_count}, {"gpu_statistics_available", gpu_valid},
                 {"gpu_median_us", gpu_valid ? nlohmann::json(gpu_median) : nlohmann::json(nullptr)},
@@ -7530,15 +7515,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
             if (automatic_phase != phase_before) {
               automatic["events"].push_back(automatic["states"].back());
               auto& event = automatic["events"].back();
-              event["event"] = (phase_before == 5 ? "no_benefit_rollback_decision"
-                  : (phase_before == 6 ? "accepted_anchor_applied_observed" : "controller_progress_observed"));
-              if (phase_before == 5) {
-                event["rollback_applied_in_same_source"] = applied_target && active == 1
-                    && session.status.applied != automatic_applied_before;
-              }
-            }
-            if (session.blocked && automatic_phase >= 2 && automatic_phase <= 4) {
-              automatic_failure = "the genuine GPU/FPS acceptance gate rejected an earlier trial; later automatic stages were not reached";
+              event["event"] = (phase_before == 5 ? "minimum_deficit_observed" : "controller_progress_observed");
             }
           } else if (limited_sequence) {
             auto& session = *addon::features.at(owner).adaptive_session;
@@ -7816,31 +7793,17 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           }
           if (demand_adjacent) {
             demand_applied_slots[active] = true;
-            if (demand_previous_trial && demand_previous_requested == 1 && session.level == 2 && !demand_trial_accepted[1]) {
-              // Prepare can accept trial 1 and request tier 2 in the same call.
-              demand_trial_accepted[1] = true;
-              demand["first_trial_accepted_frame"] = frame;
-              demand["first_trial_acceptance_observation"] = "inferred from Session accepting trial 1 before requesting tier 2 in the same Prepare";
-            }
-            if (active != 0 && session.level == active && demand_previous_requested == active && demand_previous_trial
-                && !session.trial && !session.blocked && session.status.reason == adaptive::Reason::OBSERVING
-                && !demand_trial_accepted[active]) {
-              demand_trial_accepted[active] = true;
-              const char* key = (active == 1 ? "first_trial_accepted_frame" : "second_trial_accepted_frame");
-              demand[key] = frame;
-              if (active == 1) {
-                demand["first_trial_acceptance_observation"] = "observed trial completion while tier 1 remained active and requested";
-              }
+            if (session.level == 2 && mock_window.split_available
+                && std::abs(session.status.output_fps - 90.) < 0.01 && !demand_fps_decided[1]) {
+              demand_fps_decided[1] = true;
+              demand["first_deficit_observed_frame"] = frame;
             }
           }
-          if (demand_lower_applied && active == 0 && session.level == 0 && session.status.reason == adaptive::Reason::NO_BENEFIT) {
-            demand_returned_upper = true;
-            Check(reinterpret_cast<uintptr_t>(addon::features.at(owner).slots[0].handle) == initial_models[0]
-                      && reinterpret_cast<uintptr_t>(addon::features.at(owner).slots[0].parameters) == initial_parameters[0],
-                  "Session no-benefit recovery returns to the same upper Feature and parameters");
-            if (!demand.contains("first_no_benefit_upper_frame")) {
-              demand["first_no_benefit_upper_frame"] = frame;
-            }
+          if (active != 0 && session.level == active && !session.trial
+              && session.status.reason == adaptive::Reason::OBSERVING && session.status.output_fps == 100.
+              && mock_window.window_begin_ns >= session.stable_after_ns && !demand_fps_decided[active]) {
+            demand_fps_decided[active] = true;
+            demand["target_fps_observed_frame"] = frame;
           }
           if (frame == 359) {
             demand["startup"] = {{"configured_slots", cache->count}, {"actual_resident_features", actual_resident_features},
@@ -7852,8 +7815,6 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
             }
           }
           demand_previous_active = active;
-          demand_previous_requested = session.level;
-          demand_previous_trial = session.trial;
         }
         Check(gpu.fence->GetCompletedValue() >= gpu.serial && gpu.fence->GetCompletedValue() != UINT64_MAX
                   && SUCCEEDED(gpu.device->GetDeviceRemovedReason()), "resize GPU fence completes on healthy device");
@@ -7932,8 +7893,8 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
           const auto& session = *addon::features.at(owner).adaptive_session;
           report["frames"].back()["create_calls"] = native_resize_create_calls;
           report["frames"].back()["demand"] = {{"fps_evidence", "MOCK"}, {"mock_output_fps", mock_output_fps},
-              {"window_serial", frame + 1}, {"window_begin_ns", mock_window_end_ns - 500'000'000}, {"window_end_ns", mock_window_end_ns},
-              {"reason", adaptive::ReasonText(session.status.reason)}, {"trial", session.trial}, {"blocked", session.blocked},
+              {"window_serial", mock_window.window_serial}, {"window_begin_ns", mock_window.window_begin_ns}, {"window_end_ns", mock_window.window_end_ns},
+              {"reason", adaptive::ReasonText(session.status.reason)}, {"trial", session.trial},
               {"gpu_sample_count", session.gpu_count}, {"production_gpu_ms", session.status.gpu_ms},
               {"production_timer_state", renodx::addons::dlss5::gpu_timers::StateText(renodx::addons::dlss5::gpu_timers::stage_stats[1].state)},
               {"production_timer_sequence", renodx::addons::dlss5::gpu_timers::stage_stats[1].sequence},
@@ -7978,7 +7939,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
                     << " completion_ms=" << std::chrono::duration<double, std::milli>(completed - start).count() << std::endl;
         }
         previous = start;
-        if ((automatic_limited && (automatic_phase == 9 || !automatic_failure.empty()))
+        if ((automatic_limited && (automatic_phase == 6 || !automatic_failure.empty()))
             || (limited_sequence && !automatic_limited && limited_phase == 7)
             || (selected_sequence && !limited_sequence && selected_request_index == selected_requests.size())) break;
         deadline = std::max(deadline + std::chrono::microseconds(16667), std::chrono::steady_clock::now());
@@ -7991,8 +7952,8 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
         if (wall_ms > 20000. && automatic_failure.empty()) {
           automatic_failure = "automatic sequence exceeded the fixed 20-second real wall bound including prefix";
         }
-        const bool passed = automatic_phase == 9 && automatic_failure.empty() && recorded_ready
-            && automatic_slot_creates == std::array<uint32_t, 3>{1, 1, 2} && automatic_pending_frames != 0;
+        const bool passed = automatic_phase == 6 && automatic_failure.empty() && recorded_ready
+            && automatic_slot_creates == std::array<uint32_t, 3>{1, 1, 1} && automatic_pending_frames != 0;
         if (!passed && automatic_failure.empty()) {
           automatic_failure = "900-source bound reached without all automatic stages; inspect real GPU median/MAD and controller reasons";
         }
@@ -8003,7 +7964,7 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
             {"slot_create_counts", automatic_slot_creates}, {"waiting_target_source_frames", automatic_pending_frames},
             {"peak_features_including_retirement", automatic_peak_features}, {"sampled_peak_process_local_bytes", selected_peak_local_bytes},
             {"direct_session_requests", false}, {"injected_gpu_samples", false}, {"synthetic_time", false},
-            {"async_autoscale", false}, {"cooldown_expiry_tested", false},
+            {"async_autoscale", false},
             {"not_tested", "game output-FPS accuracy, dynamic visual quality, full 15-level automatic exploration and allocation failure"}};
         report["probe_execution"] = (passed ? "Passed" : "Failed");
         demand_validation_failed |= !passed;
@@ -8077,36 +8038,35 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
               {"total_standby_create_count", demand_total_creates}, {"cpu_create_total_ms", demand_total_create_ms},
               {"slot_create_counts", demand_slot_creates}, {"requested_slots", demand_requested_slots},
               {"pending_upper_source_frames", demand_wait_frames}, {"lower_actually_applied", demand_lower_applied},
-              {"no_benefit_returned_original_upper", demand_returned_upper}, {"peak_local_bytes", demand_peak_bytes}};
+              {"target_fps_observed", demand_fps_decided}, {"peak_local_bytes", demand_peak_bytes}};
           bool passed = false;
           if (demand_adjacent) {
             auto& result = report["demand_preparation"]["result"];
             result.erase("pending_upper_source_frames");
-            result.erase("no_benefit_returned_original_upper");
             result["pending_legal_source_frames"] = demand_wait_frames;
             result["applied_slots"] = demand_applied_slots;
-            result["trial_accepted"] = demand_trial_accepted;
             result["second_standby_unrequested_create"] = demand_second_prefetch_observed;
             result["final_active_slot"] = addon::features.at(owner).adaptive_cache->active;
             passed = preparing_evaluates != 0 && demand_startup_creates == (adjacent_ready ? 1u : 0u)
                 && demand_total_creates == 2 && demand_slot_creates[1] == 1 && demand_slot_creates[2] == 1
                 && demand_requested_slots[1] && demand_requested_slots[2] && demand_applied_slots[1] && demand_applied_slots[2]
-                && demand_trial_accepted[1] && demand_trial_accepted[2] && (!adjacent_ready || demand_initial_neighbor_ready)
+                && demand_fps_decided[1] && demand_fps_decided[2] && (!adjacent_ready || demand_initial_neighbor_ready)
                 && addon::features.at(owner).adaptive_cache->active == 2 && addon::nr_resolution_scale.load() == 1.f;
           } else {
             passed = preparing_evaluates != 0 && demand_startup_creates == (on_demand ? 0u : 2u)
                     && demand_total_creates == (on_demand ? 1u : 2u)
                     && demand_slot_creates[1] == 1 && demand_slot_creates[2] == (on_demand ? 0u : 1u)
                     && !demand_requested_slots[2] && demand_requested_slots[1]
-                    && demand_lower_applied && demand_returned_upper && (!on_demand || demand_wait_frames != 0)
+                    && demand_lower_applied && demand_fps_decided[1] && addon::features.at(owner).adaptive_cache->active == 1
+                    && (!on_demand || demand_wait_frames != 0)|| demand_wait_frames != 0)
                     && addon::nr_resolution_scale.load() == 1.f;
           }
           report["probe_execution"] = (passed ? "Passed" : "Failed");
           if (!passed) {
             demand_validation_failed = true;
             report["failure"] = (demand_adjacent
-                ? "real Session did not accept both consecutive healthy lower tiers with the expected standby Create counts and initial adjacent readiness"
-                : "real Session demand trial did not reach its completed lower tier and return to the original upper with the expected standby Create counts");
+                ? "real Session did not descend through both adjacent tiers and hold the target with the expected standby Create counts"
+                : "real Session did not deliver and hold the lower tier at the target with the expected standby Create counts");
           }
         } else {
           Check(recorded_ready && addon::nr_resolution_scale.load() == 1.f,

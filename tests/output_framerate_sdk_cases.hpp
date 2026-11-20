@@ -237,7 +237,10 @@ inline void Run() {
          .serial = output_sample.window_serial, .begin_ns = output_sample.window_begin_ns,
          .end_ns = output_sample.window_end_ns, .fps = output_sample.fps, .mad = output_sample.fps_mad,
          .observed_multiplier = output_sample.observed_multiplier,
-         .multiplier_variable = output_sample.multiplier_variable}, now_ns, true, false);
+         .multiplier_variable = output_sample.multiplier_variable,
+         .split_available = output_sample.split_available, .split_fps = output_sample.split_fps,
+         .owner = output_sample.output.generation, .rate_multiplier = output_sample.rate_multiplier,
+         .rate_comparable = output_sample.rate_comparable}, now_ns, true, false);
   };
   adaptive::Session controller;
   uint64_t low_generation = 0;
@@ -265,7 +268,7 @@ inline void Run() {
                 && !sample.multiplier_variable && sample.observed_multiplier == 0
                 && std::abs(sample.fps - 80.) < 2. && controller.status.ready_levels == 2
                 && controller.level == 1 && controller.active_level == 0 && controller.status.applied == upper
-                && controller.baseline_gpu_us == MOCK_UPPER_GPU_US,
+                && sample.split_available && sample.split_fps == std::array{80., 80.},
             "fixed 80 FPS SDK counts without outer Presents request a ready lower tier automatically");
       low_generation = controller.status.generation;
     }
@@ -280,7 +283,7 @@ inline void Run() {
             && !sample.multiplier_variable && sample.observed_multiplier == 0
             && std::abs(sample.fps - 100.) < 2. && sample.window_begin_ns >= controller.stable_after_ns
             && std::abs(controller.status.gpu_ms - MOCK_LOWER_GPU_US / 1000.) < 0.001,
-        "fixed 100 FPS SDK counts and cheaper MOCK NR accept the delivered lower tier");
+        "fixed 100 FPS SDK counts hold the delivered lower tier while independent MOCK costs remain observable");
   std::cout << "PASS Native fixed low-frequency SDK counts request and accept the lower tier evidence=MOCK"
             << " baseline_fps=" << controller.baseline_fps << " accepted_fps=" << sample.fps << '\n';
   std::cout << "NR_RELEASE_PARITY native-application-frame-count fixed-state"
@@ -336,6 +339,8 @@ inline void Run() {
   Check(sample.available && sample.source == rate::Source::NATIVE_STATE && sample.multiplier_variable
             && std::abs(sample.observed_multiplier - 2.) < 0.001 && dynamic.trial && dynamic.active_level == 1,
         "full current-backbuffer token coverage restores dynamic sampling and requests the lower tier");
+  const auto dynamic_low_generation = dynamic.applied_generation;
+  const auto dynamic_low_applied_ns = dynamic.applied_ns;
   for (int frame = 0; frame < 60; ++frame) {
     now_ns += 25'000'000;
     if (frame == 0 || frame == 59) {
@@ -353,14 +358,19 @@ inline void Run() {
   sample = rate::Read(output, now_ns);
   prepare_from_sdk(&dynamic, sample, now_ns);
   Check(sample.available && sample.source == rate::Source::NATIVE_STATE && sample.observed_multiplier == 0
-            && std::abs(sample.fps - 80.) < 0.001 && !dynamic.trial && dynamic.level == 0
-            && dynamic.status.requested == upper,
-        "fresh endpoint tags cannot bridge a middle gap or keep a dynamic trial alive");
-  for (int interval = 0; interval < 9 && !dynamic.trial; ++interval) {
+            && std::abs(sample.fps - 80.) < 0.001 && !dynamic.trial && dynamic.level == 1
+            && dynamic.status.requested == floor && dynamic.status.applied == floor
+            && dynamic.applied_generation == dynamic_low_generation && dynamic.applied_ns == dynamic_low_applied_ns
+            && dynamic.status.reason == adaptive::Reason::COLLECTING,
+        "fresh endpoint tags cannot bridge a middle gap and the already delivered lower tier remains active");
+  for (int interval = 0; interval < 9 && dynamic.status.reason != adaptive::Reason::AT_MINIMUM; ++interval) {
     dynamic_interval(0, 59);
   }
-  Check(sample.available && std::abs(sample.observed_multiplier - 2.) < 0.001 && dynamic.trial,
-        "a continuous fresh token window can drive a new trial after the gap");
+  Check(sample.available && std::abs(sample.observed_multiplier - 2.) < 0.001
+            && sample.window_begin_ns >= dynamic.stable_after_ns && sample.split_available
+            && dynamic.status.reason == adaptive::Reason::AT_MINIMUM
+            && dynamic.applied_generation == dynamic_low_generation && dynamic.applied_ns == dynamic_low_applied_ns,
+        "a continuous new token window resumes FPS decisions on the same delivered minimum");
   const auto old_binding = rate::NativeBindingGeneration(output);
   static const sl::ResourceTag* replacement_binding_tag = nullptr;
   replacement_binding_tag = tags;
@@ -384,7 +394,7 @@ inline void Run() {
   std::cout << "PASS Native dynamic SDK coverage and recovery evidence=MOCK\n";
   std::cout << "NR_RELEASE_PARITY native-application-frame-count dynamic-state"
                " source=NATIVE_STATE fps=80 marker-only=collecting full-tags=trial"
-               " middle-gap=rollback full-window=recovered old-binding=discarded\n";
+               " middle-gap=kept-low full-window=at-minimum old-binding=discarded\n";
 
   rate::DestroyPresentOutput(owner);
   rate::ReleaseNative();
@@ -439,25 +449,24 @@ inline void Run() {
   Check(!rate::IsCurrentOutput(xe_output) && !context->output_identity,
         "XeFG never publishes an old invocation against the resized output");
 
-  // Poll the controller at a fixed cadence long enough to compare complete
-  // windows. The application's 60 Hz schedule continues through both tiers.
-  constexpr auto application_interval = std::chrono::nanoseconds(16'666'667);
-  constexpr int DECISION_FRAMES = 180;
-  constexpr int SETTER_FRAME = 2 * DECISION_FRAMES;
-  constexpr int COUNTS_CHANGE_FRAME = 3 * DECISION_FRAMES;
+  // Each successful SDK call contributes to its measured interval. Keep the
+  // application cadence fixed while changing only the counts.
+  constexpr int APP_FPS = 60;
+  constexpr int SETTER_FRAME = 5 * APP_FPS;
+  constexpr int COUNTS_CHANGE_FRAME = 6 * APP_FPS;
   adaptive::Session xe_controller;
-  const auto xe_begin = std::chrono::steady_clock::now();
+  const auto xe_begin = rate::NowNs();
+  int64_t counts_changed_ns = 0;
   uint64_t xe_low_generation = 0;
   double upper_fps = 0.;
-  bool returned_to_upper = false;
+  bool held_minimum = false;
   Check(Hooks::NumInterpolated(handle, 1) == 0, "XeFG fixed-cadence control starts with a successful 2x request");
-  for (int frame = 0; frame <= 7 * DECISION_FRAMES && !returned_to_upper; ++frame) {
-    std::this_thread::sleep_until(xe_begin + frame * application_interval);
+  for (int frame = 0; frame <= 20 * APP_FPS && !held_minimum; ++frame) {
+    rate::test_now_ns = xe_begin + frame * 1'000'000'000LL / APP_FPS;
     Check(Hooks::PresentId(handle, ++id) == 0 && adapter::ProxyHooks<0>::Present(proxy.Get(), 0, 0) == S_OK,
           "the XeFG proxy completes one application Present at 60 Hz with its own SDK count");
     const auto now_ns = rate::NowNs();
     observe_mock_gpu(&xe_controller, static_cast<uint64_t>(frame + 1), now_ns);
-    if (frame % DECISION_FRAMES != 0) continue;
     sample = rate::Read(context->output_identity, now_ns);
     prepare_from_sdk(&xe_controller, sample, now_ns);
     if (frame == 0) {
@@ -480,41 +489,41 @@ inline void Run() {
               "the real XeFG setter leaves the 120 FPS window intact before the SDK count changes");
       } else {
         xe_reported_frames = 1;
+        counts_changed_ns = now_ns;
       }
     }
     if (xe_controller.trial && xe_low_generation == 0) {
       Check(frame > COUNTS_CHANGE_FRAME && sample.available && sample.source == rate::Source::XEFG_STATUS
+                && sample.window_begin_ns >= counts_changed_ns && sample.split_available
                 && std::abs(sample.fps - 60.) < 2. && std::abs(sample.observed_multiplier - 1.) < 0.01
                 && xe_controller.level == 1 && xe_controller.active_level == 0
-                && xe_controller.status.applied == upper && xe_controller.status.ready_levels == 2
-                && xe_controller.baseline_gpu_us == MOCK_UPPER_GPU_US,
+                && xe_controller.status.applied == upper && xe_controller.status.ready_levels == 2,
             "only the changed XeFG SDK count requests the ready lower tier automatically");
       xe_low_generation = xe_controller.status.generation;
     }
-    if (xe_low_generation != 0 && !xe_controller.trial) {
+    if (xe_low_generation != 0 && xe_controller.status.reason == adaptive::Reason::AT_MINIMUM) {
       Check(sample.available && sample.source == rate::Source::XEFG_STATUS
                 && sample.window_begin_ns >= xe_controller.stable_after_ns
                 && std::abs(sample.fps - 60.) < 2. && std::abs(sample.observed_multiplier - 1.) < 0.01
                 && std::abs(xe_controller.status.gpu_ms - MOCK_LOWER_GPU_US / 1000.) < 0.001
-                && xe_controller.status.reason == adaptive::Reason::NO_BENEFIT && xe_controller.level == 0
-                && xe_controller.active_level == 1 && xe_controller.applied_generation == xe_low_generation
-                && xe_controller.status.requested == upper,
-            "full 60 FPS windows at both tiers return to the upper tier despite cheaper MOCK NR");
-      returned_to_upper = true;
+                && xe_controller.level == 1 && xe_controller.active_level == 1
+                && xe_controller.applied_generation == xe_low_generation && xe_controller.status.requested == floor,
+            "full 60 FPS windows at both tiers hold the delivered minimum while independent MOCK costs remain observable");
+      held_minimum = true;
     }
     if (xe_controller.status.generation != xe_controller.applied_generation) {
       xe_controller.Applied(xe_controller.status.generation, xe_controller.status.requested, now_ns);
     }
   }
-  Check(returned_to_upper && xe_controller.active_level == 0 && xe_controller.status.applied == upper,
-        "the XeFG controller applied the automatically restored upper tier");
-  std::cout << "PASS XeFG SDK counts drive trial and rollback at fixed application cadence evidence=MOCK"
-            << " upper_fps=" << upper_fps << " trial_fps=" << xe_controller.baseline_fps
-            << " rollback_fps=" << sample.fps << '\n';
+  Check(held_minimum && xe_controller.active_level == 1 && xe_controller.status.applied == floor,
+        "the XeFG controller remains at the automatically delivered minimum");
+  std::cout << "PASS XeFG SDK counts drive descent and hold the minimum at fixed application cadence evidence=MOCK"
+            << " upper_fps=" << upper_fps << " minimum_fps=" << sample.fps << '\n';
   rate::ReleaseXeFGOutput(context->output_identity);
   adapter::state.contexts.erase(handle);
   adapter::modules[0].real = original_sdk;
   adapter::proxies[0].real = original_proxy;
+  rate::test_now_ns = 0;
   std::cout << "PASS output SDK callback ownership and count provenance evidence=MOCK\n";
 }
 }  // namespace output_framerate_sdk_cases

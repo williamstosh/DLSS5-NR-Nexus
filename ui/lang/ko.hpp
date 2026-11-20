@@ -2320,7 +2320,7 @@ inline constexpr Translation kKo[] = {
     {"Adaptive resolution", "적응형 해상도"},
     {"Adjust NR working resolution toward your target output FPS, including generated frames. Manual resolutions are the upper limits. No extra program is required.", "생성된 프레임을 포함한 목표 출력 FPS에 맞춰 NR 작업 해상도를 조정합니다. 수동 해상도가 상한입니다. 추가 프로그램은 필요하지 않습니다."},
     {"Target output FPS", "목표 출력 FPS"},
-    {"The target includes generated frames. If lowering NR brings no FPS benefit, the previous quality is restored.", "목표에는 생성된 프레임이 포함됩니다. NR 해상도를 낮춰도 FPS가 개선되지 않으면 이전 화질을 복원합니다."},
+    {"The target includes generated frames. Lower one tier while below target; hold at target. Raise only with sustained headroom. GPU timing is diagnostic.", "목표에는 생성된 프레임이 포함됩니다. 목표 미만이면 해상도를 한 단계씩 낮추고, 목표에 도달하면 유지합니다. FPS가 목표를 충분히 웃도는 상태가 지속될 때만 높입니다. GPU 시간 측정은 진단용입니다."},
     {"Minimum relative scale", "최소 상대 배율"},
     {"Minimum width and height relative to each pass's manual upper limit. Existing stage limits still apply.", "각 패스의 수동 상한 대비 최소 너비와 높이 비율입니다. 기존 단계 제한도 적용됩니다."},
     {"Estimated output FPS: %.1f", "추정 출력 FPS: %.1f"},

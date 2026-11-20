@@ -2320,7 +2320,7 @@ inline constexpr Translation kTh[] = {
     {"Adaptive resolution", "ความละเอียดแบบปรับอัตโนมัติ"},
     {"Adjust NR working resolution toward your target output FPS, including generated frames. Manual resolutions are the upper limits. No extra program is required.", "ปรับความละเอียดการทำงานของ NR เพื่อเข้าใกล้ FPS เอาต์พุตเป้าหมาย รวมเฟรมที่สร้างขึ้น โดยใช้ความละเอียดที่ตั้งเองเป็นเพดาน ไม่ต้องใช้โปรแกรมเพิ่มเติม"},
     {"Target output FPS", "FPS เอาต์พุตเป้าหมาย"},
-    {"The target includes generated frames. If lowering NR brings no FPS benefit, the previous quality is restored.", "เป้าหมายรวมเฟรมที่สร้างขึ้น หากลดความละเอียด NR แล้ว FPS ไม่ดีขึ้น จะคืนค่าคุณภาพก่อนหน้า"},
+    {"The target includes generated frames. Lower one tier while below target; hold at target. Raise only with sustained headroom. GPU timing is diagnostic.", "เป้าหมายรวมเฟรมที่สร้างขึ้น หาก FPS ต่ำกว่าเป้าหมาย จะลดความละเอียดลงทีละขั้น เมื่อถึงเป้าหมายจะคงระดับไว้ จะเพิ่มความละเอียดเมื่อ FPS สูงกว่าเป้าหมายมากพออย่างต่อเนื่องเท่านั้น ใช้ข้อมูลเวลา GPU เพื่อการวินิจฉัย"},
     {"Minimum relative scale", "สัดส่วนสัมพัทธ์ต่ำสุด"},
     {"Minimum width and height relative to each pass's manual upper limit. Existing stage limits still apply.", "สัดส่วนความกว้างและความสูงต่ำสุดเทียบกับเพดานที่ตั้งเองของแต่ละพาส ข้อจำกัดของขั้นตอนยังมีผล"},
     {"Estimated output FPS: %.1f", "FPS เอาต์พุตโดยประมาณ: %.1f"},

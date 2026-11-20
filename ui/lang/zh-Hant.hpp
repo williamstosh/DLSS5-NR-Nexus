@@ -2319,7 +2319,7 @@ inline constexpr Translation kZhHant[] = {
     {"Adaptive resolution", "自適應解析度"},
     {"Adjust NR working resolution toward your target output FPS, including generated frames. Manual resolutions are the upper limits. No extra program is required.", "自動調整 NR 工作解析度，盡量達到包含生成影格的目標輸出影格率。手動解析度作為上限，無需額外程式。"},
     {"Target output FPS", "目標輸出影格率"},
-    {"The target includes generated frames. If lowering NR brings no FPS benefit, the previous quality is restored.", "目標包含生成影格。降低 NR 解析度若未明顯提高影格率，將恢復先前畫質。"},
+    {"The target includes generated frames. Lower one tier while below target; hold at target. Raise only with sustained headroom. GPU timing is diagnostic.", "目標影格率包含生成影格。低於目標時逐級降低解析度，達到目標時維持目前檔位。僅在影格率持續高於目標且有足夠餘裕時升檔。GPU 計時僅供診斷。"},
     {"Minimum relative scale", "最低相對比例"},
     {"Minimum width and height relative to each pass's manual upper limit. Existing stage limits still apply.", "相對於各 Pass 手動解析度上限的最低寬高比例，仍受現有階段限制。"},
     {"Estimated output FPS: %.1f", "估算輸出影格率：%.1f"},

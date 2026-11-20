@@ -306,15 +306,21 @@ F6 立即提示开关操作，随后状态更新为正在检查、正常运行�
 
 比例作用于宽高，50% 约四分之一像素。Render 基准为可用渲染区域，Upscaled 为 DLSS 输出区域，Present 为呈现帧。跟随输入时禁用比例滑条，保留其保存值。设置区显示已确认的实际尺寸，历史在诊断页。
 
+<a id="zh-adaptive-resolution"></a>
+
 **自适应分辨率**：在核心画质中开启后，设置**目标输出 FPS**和**最低相对比例**，默认分别为 **60 FPS／67%**，范围为 **30–360 FPS／33–100%**。目标包含生成帧；各层手动分辨率作为上限，最低比例相对于各自上限计算。例如上限为 2560×1440，最低 67% 约为 1715×965，仍须满足原有阶段尺寸限制。目标既可拖动滑条，也可直接在数字框输入，例如 **116**。自动运行时，工作分辨率和比例显示只读的实际值；保存的手动上限可悬停查看，关闭自动后恢复原手动编辑。
 
-自动功能在 NR 降尺寸确实有助于接近目标时保留较低档，收益不明确时恢复较高画质；持续达到目标后会缓慢尝试恢复细节。顶栏依次显示「帧率／NR GPU／帧生成／NR 分辨率」，标签在上、数值在下，窄面板自动换行。NR 分辨率显示第 1 层当前实际工作比例；悬停可查看实际尺寸及对应介入点的基准，其他数值可查看来源和倍率计算方法。分辨率区保留紧凑自动状态，关键暂停／错误仍直接显示。估算在插件内完成，无需额外安装或运行帧率程序；限帧或其他负载可能使目标无法达到，自动功能不会改变游戏、FG 或限帧设置。
+顶栏依次显示「帧率／NR GPU／帧生成／NR 分辨率」，标签在上、数值在下，窄面板自动换行。NR 分辨率显示第 1 层当前实际工作比例。悬停可查看实际尺寸及对应介入点的基准，其他数值可查看来源和倍率计算方法。分辨率区保留紧凑自动状态，关键暂停／错误仍直接显示。估算在插件内完成，无需额外安装或运行帧率程序。限帧或其他负载可能使目标无法达到，游戏、FG 和限帧仍按玩家设置运行。
 
 自适应分辨率面向原生 DX12 的单个处理阶段，包括兼容的 XeFG／原生 FG 同尺寸链。跨阶段链、FG 异尺寸和 DX11 Bridge 继续使用手动分辨率；Vulkan 使用全输出尺寸。缺少可靠帧率来源时暂停自动并保留合法尺寸。动态 FG 还需匹配的游戏帧计数；信息不足时暂停试探并等待采样，估算输出帧率仍可显示。更改设置或 GPU A/B 对比期间暂停自动。建议在游戏中比较转动视角时的细节和切档观感；使用限帧时，也可核对显示的帧率。
 
 **开发版 v0.7.0-dev.1（尚未发布）**让符合条件的原生 DX11 Bridge 超分后输出直接使用同一个自适应开关；第三方工具提供的 D3D12 SR 输出仍沿 D3D12 路径工作。已经开启自动的旧配置会在取得可靠输出和可用档位后开始调节，关闭自动即可恢复保存的手动上限。Bridge 的渲染介入点和普通 DX11 Present 仍沿手动设置处理。实验功能可在普通构建中使用，无需诊断控制通道。
 
-帧率采样对应当前画面：普通路径标为「应用 Present 提交节奏估算」，FG 路径优先使用对应 SDK 的输出计数；无法确认归属时等待采样。有效计数和比较条件不变时，其他画面或无关 FG 请求不会打断调节。新档完整交付后才开始暖机和观察收益，准备或失败期间保留最近确认的档位。修改已绑定遮罩的混合方式会保留兼容的已准备档位，并重新观察收益。原生 FG 缺可靠游戏帧标签时，固定倍率估算或动态试档会暂停；同画面的 SDK 实测帧率仍可显示。Vulkan 保留自动选项的选择，并提示当前路径不支持自动尺寸。
+**开发版如何升降档。** 当前画面的可靠输出 FPS 持续低于目标时，NR 每次只降到相邻的可用档位。新档完整交付并暖机后，按新的帧率样本判断。达到目标就停止降档，恰好等于目标时保持当前档。仍然欠帧就继续逐档降低，最低档仍欠帧时保持最低档并显示未达目标。
+
+只有输出 FPS 持续高出目标且有足够余量时，才试升一档。高档暖机后能稳定守住目标就保留，持续欠帧则回到原低档。同样条件下，重试还要求低档的稳定帧率明显高于上次试升前的水平。目标、实际负载或输出统计方式变化后，先重新收集稳定样本，再评估是否试升。NR GPU 耗时只用于诊断，升降档依据输出 FPS。开发版的动态画质和切档流畅度仍待实机人工验收。
+
+帧率采样对应当前画面。普通路径标为「应用 Present 提交节奏估算」，FG 路径优先使用对应 SDK 的输出计数。无法确认归属时等待采样。有效计数和比较条件不变时，其他画面或无关 FG 请求不会打断调节。等待新档准备或交付时，继续使用上一次确认的健康档位。修改已绑定遮罩的混合方式会保留兼容的已准备档位，并重新采样。原生 FG 缺可靠游戏帧标签时，固定倍率估算或动态试档会暂停，同画面的 SDK 实测帧率仍可显示。Vulkan 保留自动选项的选择，并提示当前路径不支持自动尺寸。
 
 **档位数量与准备**：可选择「默认」或 2–15 档，数量包含手动上限。「默认」沿用原缓存容量：单颜色、单输出最多 4 档，双颜色通常 2 档，轮换输出会占用相应容量。显式选择档数时按所需颜色和输出准备完整集合，并检查实际显存余量。可用的不同尺寸取决于最低比例和取整：例如最低 67% 的完整范围最多 8 档，最低 33% 最多 15 档；选择更多也不会重复相同尺寸。更多档位带来更细的步距，同时增加首次准备时间和显存使用。
 
@@ -333,7 +339,7 @@ F6 立即提示开关操作，随后状态更新为正在检查、正常运行�
 
 备用策略当前主要用于 Runtime 310.9.16.0 的 FP16 超分后单层模型 B；容量复用还要求单输出和可支持的完整档位集合。超出范围时按该组原预备方式工作。回到默认策略可恢复原资源管理方式。旧版读取新共享预设时忽略策略扩展；退回 v0.6.0 后，方案槽保留原有内容，仅新策略不生效。
 
-自动降档会累计比较连续细档的收益；收益仍不明确时恢复较高画质，并在冷却后重新采样。准备中的资源分配失败会停止新增档位，保留安全可用的画面并回收未使用的备用资源；重新开启须等这次失败遗留的资源可以安全释放后再准备。「关闭 NR 时保留资源」仍控制正常关闭时的行为。
+准备中的资源分配失败会停止新增档位，保留安全可用的画面并回收未使用的备用资源；重新开启须等这次失败遗留的资源可以安全释放后再准备。「关闭 NR 时保留资源」仍控制正常关闭时的行为。
 
 | 上采样选项 | NR 低于输出尺寸时的行为 |
 | --- | --- |
@@ -473,7 +479,7 @@ F6 立即提示开关操作，随后状态更新为正在检查、正常运行�
 
 **开发版 v0.7.0-dev.1（尚未发布）**也将符合上述条件的 DX11 SR 后输出接入同一复用规则：包括第三方提供的 D3D12 输出，以及原生 DX11 Bridge 的共享输出。原生 Bridge 完成 GPU 处理后才向游戏回拷；缺少 jitter 时按原设置逐帧处理，交付未完成时保留游戏原画，恢复后先刷新。
 
-同开**自适应分辨率**和 **x2** 即请求组合：兼容的上限工作集继续复用，真实换档后先刷新。原生 DX12 超分后的低档组合目前支持两档全预备、单层模型 B、关闭 Look、Detail Stability=1、不跟随输入，以及有可靠同输出 FG 关闭凭据的全幅 FP16 输入。缺少低档组合凭据时，自动调档仍可运行，合格上限保持 x2，低档改为逐帧处理。低档持续缺少完整成本回执时仅回收益锚一次，等待可靠测量恢复并取得新的上档基线后再试。原生 Bridge 的自适应低档按逐帧 NR 处理。
+同开**自适应分辨率**和 **x2** 即请求组合：兼容的上限工作集继续复用，真实换档后先刷新。原生 DX12 超分后的低档组合目前支持两档全预备、单层模型 B、关闭 Look、Detail Stability=1、不跟随输入，以及有可靠同输出 FG 关闭凭据的全幅 FP16 输入。缺少低档组合凭据时，自动调档仍可运行，合格上限保持 x2，低档改为逐帧处理。原生 Bridge 的自适应低档按逐帧 NR 处理。
 
 原生 DLSS FG 的 **Pre-FG Present x2** 也使用同一开关：选择 Present 并启用既有 Pre-FG 处理后，具有可靠游戏帧身份及完整颜色输入的路径可刷新／复用，同帧后续 MFG 沿用已有结果。缺少严格复用输入时保留普通 Pre-FG 处理。《巫师 3》的早侧颜色交接及晚侧整组内容版本仍有阻塞，在这些场景继续走原退路；普通 Present 保留默认「每帧」。上述开发版能力的动态画质和主观流畅度留待人工验收。
 
@@ -898,15 +904,21 @@ Every frame remains the default. When a usable Render/Upscaled or Pre-FG entry e
 
 Scale applies to width and height; 50% is about one quarter of the pixels. Render uses the available render region, Upscaled the DLSS output region and Present the presented frame. Follow input disables the slider while retaining its value. Read current actual size in settings and history in Diagnostics.
 
+<a id="en-adaptive-resolution"></a>
+
 **Adaptive resolution**: Enable it in Core quality, then set **Target output FPS** and **Minimum relative scale**. Defaults are **60 FPS / 67%**, with ranges of **30–360 FPS / 33–100%**. The target includes generated frames. Each pass's manual resolution is its upper limit, and the minimum is relative to that limit. For example, a 2560×1440 upper limit at 67% gives approximately 1715×965, subject to existing stage limits. Drag the slider or enter an exact target, such as **116**, in the number box. While automatic sizing is on, working resolution and scale show read-only actual values; hover for the saved manual upper limit. Turning it off restores manual editing.
 
-Automatic sizing keeps a lower level when reducing NR resolution helps approach the target and restores higher quality when the benefit is unclear. After holding the target, it slowly tries to recover detail. The top summary shows FPS / NR GPU / FG / NR resolution, with labels above values and wrapping in narrow panels. NR resolution shows Pass 1's current actual working scale; hover for its dimensions and the reference size at that hook point. Other values provide their source and multiplier calculation on hover. Resolution controls keep a compact automatic status, while important pause and error states stay visible. Estimation runs inside the add-on, with no extra FPS program to install or run. Frame caps and other workloads can prevent reaching the target; game, FG and frame-cap settings are left to you.
+The top summary shows FPS / NR GPU / FG / NR resolution, with labels above values and wrapping in narrow panels. NR resolution shows Pass 1's current working scale. Hover for its dimensions and the reference size at that hook point. Other values provide their source and multiplier calculation on hover. Resolution controls keep a compact automatic status, while important pause and error states stay visible. The add-on estimates FPS internally, without an extra FPS program. Frame caps and other workloads can prevent reaching the target. Your game, FG and frame-cap settings still apply.
 
 Adaptive sizing supports one processing stage on native DX12, including compatible same-size XeFG / native FG chains. Cross-stage chains, FG chains with different sizes and DX11 Bridge retain manual resolution; Vulkan uses full output resolution. Automatic sizing pauses without a reliable output-rate source and keeps a legal size. Dynamic FG also needs matching game-frame counts; while those are unavailable, it pauses quality trials and collects samples, and estimated output FPS can still be shown. Editing settings and GPU A/B comparisons pause it. Compare detail and transitions while moving the camera, and check the displayed FPS when using frame caps.
 
 **Development version v0.7.0-dev.1 (not yet released)** connects eligible native DX11 Bridge post-SR outputs to the same adaptive switch. Third-party D3D12 SR outputs continue through the D3D12 path. Existing configurations with automatic sizing enabled start adjusting once a reliable output and ready levels are available. Turning it off restores the saved manual upper limit. Bridge Render and ordinary DX11 Present retain manual sizing. Experimental features work in ordinary builds without a diagnostic control channel.
 
-FPS samples belong to the current picture: the ordinary path reports an Application Present submission estimate, while FG paths prefer the matching SDK's output counts. Sampling waits if ownership is unknown. Unrelated pictures or FG requests leave unchanged valid comparisons running. Warmup starts after complete delivery of the new level; preparation or failure keeps the last confirmed level. Changing a bound mask's blend mode retains compatible prepared levels and collects fresh benefit samples. Without reliable game-frame tags, native FG pauses fixed-multiplier estimates or dynamic trials; measured SDK output FPS for the same picture remains visible. Vulkan retains the automatic-size selection and reports that its current path does not support it.
+**How the development version changes levels.** When reliable FPS for the current output stays below target, NR lowers its resolution by one available level at a time. After the new level delivers a complete result and warms up, fresh FPS samples guide the next decision. Reaching the target stops the descent. At exactly the target, NR holds its current level. If FPS stays below target at the minimum, NR holds that level and reports that FPS is below target.
+
+NR tries one level higher only when output FPS stays far enough above target. It keeps the higher level if FPS consistently meets the target after warmup and returns to the previous lower level if FPS stays below target. Under the same conditions, retrying that step also requires the lower level's stable FPS to be clearly higher than before the failed raise. If the target, actual workload or output measurement changes, NR collects fresh stable samples before deciding whether to raise. Output FPS drives level changes. NR GPU timing is diagnostic. Dynamic image quality and smoothness during level changes still await manual in-game review in the development version.
+
+FPS samples belong to the current output. The ordinary path reports an Application Present submission estimate, while FG paths prefer the matching SDK's output counts. Sampling waits if output ownership is unknown. Unrelated outputs or FG requests leave valid comparisons running when the measurement and its conditions stay the same. The last confirmed healthy level stays in use while a new level is being prepared or awaiting delivery. Changing a bound mask's blend mode retains compatible prepared levels and starts fresh sampling. Without reliable game-frame tags, native FG pauses fixed-multiplier estimates or dynamic trials. Measured SDK output FPS for the same output remains visible. Vulkan retains the automatic-size selection and reports that its current path does not support it.
 
 **Level count and preparation**: Choose Default or 2–15 levels, including the manual upper limit. Default retains the original cache capacity: up to four levels for one color and one output, usually two for two colors; rotating outputs consume corresponding capacity. An explicit count prepares the complete collection for the required colors and outputs, subject to available video memory. The number of distinct sizes depends on the minimum scale and rounding: a 67% minimum allows up to eight levels, while 33% allows up to fifteen. A higher selection never duplicates identical sizes. More levels give smaller steps and increase initial preparation time and video-memory use.
 
@@ -925,7 +937,7 @@ Development builds also offer **Resource strategy**, saved with quality settings
 
 Alternate strategies currently target Runtime 310.9.16.0, FP16 Upscaled and a single model B pass. Capacity reuse also requires one output and a supported complete level set. Other groups fall back to their saved preparation mode. Choosing the default restores ordinary resource management. Older versions ignore the new shared-preset extension; reverting to v0.6.0 keeps existing profile-slot contents and leaves the new strategy inactive.
 
-Downscaling compares the cumulative benefit of successive fine steps. If the benefit remains unclear, it restores higher quality and collects fresh samples after a cooldown. An allocation failure during preparation stops new levels, retains a safe available image and reclaims unused standby resources. Re-enabling waits until resources left by that failed preparation can be safely released before preparing again. The option to retain resources when NR is turned off still controls normal shutdown behavior.
+An allocation failure during preparation stops new levels, retains a safe available image and reclaims unused standby resources. Re-enabling waits until resources left by that failed preparation can be safely released before preparing again. The option to retain resources when NR is turned off still controls normal shutdown behavior.
 
 | Upsampling choice | Behaviour below output size |
 | --- | --- |
@@ -1065,7 +1077,7 @@ Reuse requires NR Runtime 310.9.16.0, writable HDR color for the current frame, 
 
 **Development version v0.7.0-dev.1 (not yet released)** also applies the same reuse rules to eligible DX11 post-SR outputs: third-party D3D12 outputs and shared native DX11 Bridge outputs. The native Bridge copies back after GPU processing completes. Missing jitter retains regular per-frame NR; incomplete delivery keeps the game image, with a refresh on recovery.
 
-Enable **Adaptive resolution** and **x2** together to request the combination. Compatible upper worksets keep reusing; a real level change refreshes first. The native D3D12 Upscaled lower-tier combination currently supports two fully prepared levels, one model B pass, Look off, Detail Stability=1, Follow Input off, and full-frame FP16 inputs with reliable FG-off evidence for the same output. Without lower-tier reuse evidence, automatic sizing continues: eligible upper levels keep x2 and lower levels run per frame. A persistent gap in complete lower-tier cost receipts returns to the accepted anchor once; retries wait for reliable measurements to recover and a new upper-tier baseline. Native Bridge adaptive lower levels use per-frame NR.
+Enable **Adaptive resolution** and **x2** together to request the combination. Compatible upper worksets keep reusing; a real level change refreshes first. The native D3D12 Upscaled lower-tier combination currently supports two fully prepared levels, one model B pass, Look off, Detail Stability=1, Follow Input off, and full-frame FP16 inputs with reliable FG-off evidence for the same output. Without lower-tier reuse evidence, automatic sizing continues: eligible upper levels keep x2 and lower levels run per frame. Native Bridge adaptive lower levels use per-frame NR.
 
 Native DLSS FG **Pre-FG Present x2** uses the same switch. Select Present and enable the existing Pre-FG processing option; paths with reliable game-frame identity and complete color inputs can refresh/reuse, while subsequent MFG consumption uses the same result. Missing strict reuse inputs retain ordinary Pre-FG processing. The Witcher 3 still has blocked early color handoff and late complete-content-version paths, which retain their existing fallback. Ordinary Present keeps its default Every present policy. Dynamic quality and subjective smoothness of these development features await manual acceptance.
 

@@ -2320,7 +2320,7 @@ inline constexpr Translation kTr[] = {
     {"Adaptive resolution", "Uyarlanabilir çözünürlük"},
     {"Adjust NR working resolution toward your target output FPS, including generated frames. Manual resolutions are the upper limits. No extra program is required.", "Üretilen kareler dahil hedef çıkış FPS değerine ulaşmak için NR çalışma çözünürlüğünü ayarlar. Elle seçilen çözünürlükler üst sınırdır. Ek program gerekmez."},
     {"Target output FPS", "Hedef çıkış FPS"},
-    {"The target includes generated frames. If lowering NR brings no FPS benefit, the previous quality is restored.", "Hedef, üretilen kareleri de içerir. NR çözünürlüğünü düşürmek FPS kazandırmazsa önceki kalite geri yüklenir."},
+    {"The target includes generated frames. Lower one tier while below target; hold at target. Raise only with sustained headroom. GPU timing is diagnostic.", "Hedef, üretilen kareleri de içerir. FPS hedefin altındayken çözünürlük birer kademe düşer, hedefe ulaşıldığında sabit kalır. Yalnızca FPS yeterli bir farkla hedefin üzerinde kalırsa yükselir. GPU süreleri tanılama amaçlıdır."},
     {"Minimum relative scale", "En düşük göreli ölçek"},
     {"Minimum width and height relative to each pass's manual upper limit. Existing stage limits still apply.", "Her geçişin elle belirlenen üst sınırına göre en düşük genişlik ve yükseklik oranı. Mevcut aşama sınırları geçerlidir."},
     {"Estimated output FPS: %.1f", "Tahmini çıkış FPS: %.1f"},

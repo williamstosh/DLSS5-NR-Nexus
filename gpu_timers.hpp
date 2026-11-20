@@ -30,6 +30,7 @@
 
 #include "brand.h"
 #include "adaptive_resolution.hpp"
+#include "output_framerate.hpp"
 
 #include <algorithm>
 #include <array>
@@ -257,8 +258,7 @@ inline bool ComparisonActive() {
 }
 
 inline int64_t NowNs() {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             std::chrono::steady_clock::now().time_since_epoch()).count();
+  return output_framerate::NowNs();
 }
 
 inline uint32_t StageIndex(const char* path) {

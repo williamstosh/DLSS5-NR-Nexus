@@ -3655,9 +3655,7 @@ inline uint64_t NoteHookInstallFailure(uint32_t& attempts,
 }
 
 inline int64_t SteadyNowNs() {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
+  return output_framerate::NowNs();
 }
 
 inline bool AdaptivePreparationActive() {
@@ -12128,6 +12126,13 @@ inline capability::Input FrozenGroupGeometry(const stage_plan::Plan& plan, const
   return input;
 }
 
+struct AdaptiveEditCadence {
+  bool upper = false;
+  bool reduced_upper = false;
+  bool lower = false;
+  uint32_t stack_encoding = 0;
+};
+
 inline adaptive_resolution::Frame FreezeAdaptiveFrame(
     std::shared_ptr<adaptive_resolution::Session>* owner, const stage_plan::Plan& plan,
     const stage_plan::Group& group, uint32_t reference_width, uint32_t reference_height,
@@ -12135,7 +12140,8 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
     bool supported, uint64_t application_frame = 0, uint32_t required_roles = 1, bool fg_owned = false,
     uint32_t source_outputs = 1, uint32_t observed_model_roles = 0, bool feature_reuse_binding = false,
     const BridgeAdaptiveSource* bridge_source = nullptr,
-    const output_framerate::OutputIdentity& output_identity = {}, uint64_t display_source_generation = 0) {
+    const output_framerate::OutputIdentity& output_identity = {}, uint64_t display_source_generation = 0,
+    AdaptiveEditCadence edit_cadence = {}) {
   if (!nr_adaptive_enabled.load() && *owner == nullptr) return {};
   if (*owner == nullptr) *owner = std::make_shared<adaptive_resolution::Session>();
   auto baseline = FrozenGroupGeometry(plan, group, reference_width, reference_height, guide_width, guide_height);
@@ -12209,30 +12215,47 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
     *hash *= 1099511628211ull;
   };
   uint64_t layout_identity = source_identity;
-  for (const uint64_t value : {layout.configuration_generation, layout.settings_hash,
+  append(&layout_identity, layout.configuration_generation);
+  uint64_t work_identity = source_identity;
+  for (const uint64_t value : {layout.settings_hash,
            static_cast<uint64_t>(reference_width), static_cast<uint64_t>(reference_height),
            static_cast<uint64_t>(group.stage), static_cast<uint64_t>(group.begin), static_cast<uint64_t>(group.count),
            static_cast<uint64_t>(control_mask_use_core_context.load()),
            static_cast<uint64_t>(direct_api.borrowed_core_context), static_cast<uint64_t>(upper_capacity)}) {
     append(&layout_identity, value);
+    append(&work_identity, value);
   }
   if (upper_capacity) {
     append(&layout_identity, upper[group.begin].width);
     append(&layout_identity, upper[group.begin].height);
+    append(&work_identity, upper[group.begin].width);
+    append(&work_identity, upper[group.begin].height);
   }
   uint64_t measurement_identity = layout_identity;
-  for (const uint32_t value : {guide_width, guide_height, required_roles, observed_model_roles}) {
+  // Failure memory follows effective work, including after a temporary
+  // settings excursion. Allocation generations still protect GPU resources.
+  const auto append_measurement = [&](uint64_t value) {
     append(&measurement_identity, value);
+    append(&work_identity, value);
+  };
+  // Identify the cadence contract of both endpoints before choosing a tier.
+  const bool upper_full_size = upper[group.begin] == adaptive_resolution::Size{reference_width, reference_height};
+  bool upper_edit_reuse = edit_cadence.upper && (upper_full_size || edit_cadence.reduced_upper);
+  bool lower_edit_reuse = edit_cadence.lower && selected_levels == 2 && source_outputs == 1
+      && effective_strategy == AdaptiveFeatureMode::OFF && !limited_residency;
+  for (const uint32_t value : {guide_width, guide_height, required_roles, observed_model_roles}) {
+    append_measurement(value);
   }
   {
     std::shared_lock config_lock(present_restore_configuration.mutex);
     const auto append_float = [&](float value) {
-      append(&measurement_identity, value == 0.f ? 0u : std::bit_cast<uint32_t>(value));
+      append_measurement(value == 0.f ? 0u : std::bit_cast<uint32_t>(value));
     };
     // Effective per-pass steering and resolve values are independent of
     // layout and of the UI/restore configuration counters.
     const bool post_sr = group.stage != stage_plan::Stage::RENDER;
     const auto main_look = LookSettingsSnapshot(post_sr, false, 0, false);
+    std::array<edit_reuse_policy::Layer, kMaxNrPasses> edit_layers{};
     for (uint32_t pass = group.begin; pass < group.begin + group.count; ++pass) {
       const bool auto_mask = PassModel(pass, use_auto_mask, pass_auto_mask);
       const auto skin = SentSkinSteering(PassModel(pass, local_structure_strength, pass_local_structure),
@@ -12241,27 +12264,45 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
       append_float(PassModel(pass, local_tone_strength, pass_local_tone));
       append_float(skin.structure);
       append_float(skin.skin);
-      append(&measurement_identity, PassModel(pass, style, pass_style));
-      append(&measurement_identity, auto_mask);
-      append(&measurement_identity, PassModel(pass, ui_correction, pass_ui_correction));
-      append_float(PassColorStrength(pass));
-      append_float(PassTransferStrength(pass));
+      append_measurement(PassModel(pass, style, pass_style));
+      append_measurement(auto_mask);
+      append_measurement(PassModel(pass, ui_correction, pass_ui_correction));
+      const float color_strength = PassColorStrength(pass);
+      const float transfer_strength = PassTransferStrength(pass);
+      append_float(color_strength);
+      append_float(transfer_strength);
       const auto look_settings = (pass == 0 || pass_look_result[pass - 1].follow.load()
           ? main_look : LookSettingsSnapshot(post_sr, false, pass, false));
-      append(&measurement_identity, look_settings.upsample);
+      append_measurement(look_settings.upsample);
+      if (upper_edit_reuse && group.count > 1) {
+        const auto grid = upper[pass];
+        const auto look_surfaces = RequiredLookSurfaces(look_settings,
+            look::TransportWanted(look_settings, grid.width, grid.height, reference_width, reference_height));
+        edit_layers[pass - group.begin] = {.transfer_strength = transfer_strength, .color_strength = color_strength,
+            .temporal_look = !look_unavailable.load() && (look_surfaces & kLookSurfaceOutput) != 0 && look_settings.stabilize != 0,
+            .working_width = grid.width, .working_height = grid.height,
+            .full_width = reference_width, .full_height = reference_height};
+      } else if (group.count == 1 && transfer_strength <= 0.f && color_strength <= 0.f) {
+        upper_edit_reuse = lower_edit_reuse = false;
+      }
       if (look::Dispatched(look_settings, false)) {
         const auto constants = look::MakeConstants(look_settings, {.nr_width = upper[pass].width, .nr_height = upper[pass].height,
             .full_width = reference_width, .full_height = reference_height});
         for (auto value : std::bit_cast<std::array<uint32_t, sizeof(constants) / sizeof(uint32_t)>>(constants)) {
-          append(&measurement_identity, value);
+          append_measurement(value);
         }
       }
     }
+    if (upper_edit_reuse && group.count > 1) {
+      const auto decision = edit_reuse_policy::DecideGroup(std::span{edit_layers}.first(group.count), edit_cadence.stack_encoding);
+      upper_edit_reuse = decision.anchors != edit_reuse_policy::Anchors::NONE;
+    }
+    append_measurement(static_cast<uint32_t>(upper_edit_reuse) | (static_cast<uint32_t>(lower_edit_reuse) << 1));
     for (const uint32_t value : {codec_mode.load(), source_encoding.load(), transfer_mode.load(),
              display_pedestal.load(), sdr_black_restore.load(), depth_mode.load(),
              static_cast<uint32_t>(neural_floor_guard.load()),
              static_cast<uint32_t>(group.count > 1 && chained_temporal_history.load())}) {
-      append(&measurement_identity, value);
+      append_measurement(value);
     }
     for (const float value : {linear_unit_nits.load(), motion_scale_x_multiplier.load(), motion_scale_y_multiplier.load(),
              paper_white_scale.load(), proxy_anchor_nits.load(), diffuse_white_nits.load(), chroma_clamp_stops.load(),
@@ -12298,8 +12339,11 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
        .generation = output.source_generation, .configuration = output.configuration_generation,
        .serial = output.window_serial, .begin_ns = output.window_begin_ns, .end_ns = output.window_end_ns,
        .fps = output.fps, .mad = output.fps_mad, .observed_multiplier = output.observed_multiplier,
-       .multiplier_variable = output.multiplier_variable},
-       now_ns, eligible, frozen, layout_identity);
+       .multiplier_variable = output.multiplier_variable, .split_available = output.split_available,
+       .split_fps = output.split_fps, .owner = output_identity.generation, .rate_multiplier = output.rate_multiplier,
+       .rate_comparable = output.rate_comparable},
+       now_ns, eligible, frozen, layout_identity, work_identity,
+       (observed_model_roles != 0 ? observed_model_roles : required_roles));
   auto& session = **owner;
   session.status.display_output_generation = output_identity.generation;
   session.status.display_source_generation = (display_source_generation != 0
@@ -12322,7 +12366,7 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
           .required_roles = required_roles, .output_count = source_outputs,
            .enabled = eligible && nr_adaptive_enabled.load(),
            .measure = measure && (session.settings.legacy_preparation || session.TargetReady()), .immediate = same_resources,
-           .upper_capacity = upper_capacity};
+           .upper_capacity = upper_capacity, .comparison_generation = session.comparison_generation};
 }
 
 inline void PollAdaptiveCache(AdaptiveFeatureCache* cache) {
@@ -13207,7 +13251,7 @@ inline void PrepareAdaptiveTier(FeatureState* feature, const adaptive_resolution
   const bool adjacent_preparation = frame.upper_capacity && mode == AdaptiveFeatureMode::UPPER_CAPACITY_ADJACENT;
   size_t preparation_slot = frame.session->level;
   if (adjacent_preparation && cache->active == frame.session->level
-      && !frame.session->trial && !frame.session->blocked && !frame.session->defer_preparation) {
+      && !frame.session->trial && !frame.session->defer_preparation) {
     preparation_slot = cache->count;
     for (size_t index = 0; index < cache->count; ++index) {
       if (!frame.session->IsLegal(frame.session->ladder.sizes[index])) continue;
@@ -14037,7 +14081,7 @@ inline void ResolveAdaptiveDelivery(const AdaptiveDelivery& delivery, bool deliv
       *frame.delivery = adaptive_resolution::DeliveryReceipt::DELIVERED;
     }
     session.Applied(frame.generation, delivery.actual, SteadyNowNs());
-  } else if (frame.sampling_generation == session.sampling_generation) {
+  } else if (frame.comparison_generation == session.comparison_generation) {
     session.InvalidateSampling(SteadyNowNs());
   }
   PublishAdaptiveStatus(session.status);
@@ -14974,6 +15018,30 @@ inline bool RecordInline(
     }
   }
 
+  const uint32_t requested_stack = group.count;
+  const bool control_mask_render_upscaled_chain = plan.mixed
+      && plan.At(stage_plan::Stage::RENDER).count != 0
+      && plan.At(stage_plan::Stage::UPSCALED).count != 0
+      && evaluate_chain.render_complete;
+  const bool control_mask_final_present_route = present != nullptr
+      && execution_stage == stage_plan::Stage::PRESENT
+      && present->domain == present_restore_scope::Domain::FINAL_PRESENT
+      && present->stage_execution_plan == nullptr && present->source_color == nullptr
+      && (!present->d3d11_bridge || Dx11NativeRoute()) && !plan.mixed;
+  const bool control_mask_pre_fg_route = present != nullptr
+      && execution_stage == stage_plan::Stage::PRESENT
+      && (present->domain == present_restore_scope::Domain::PRE_FG_BACKBUFFER
+          || present->domain == present_restore_scope::Domain::PRE_FG_HUDLESS)
+      && !present->native_prefg_resolution_pair && !plan.mixed;
+  const bool control_mask_present_route = control_mask_final_present_route || control_mask_pre_fg_route;
+  const bool control_mask_route_eligible = ((present == nullptr
+      && execution_stage == stage_plan::Stage::UPSCALED
+      && (!plan.mixed || control_mask_render_upscaled_chain))
+      || control_mask_present_route)
+      && nr_model::SupportsControlMask(direct_runtime_requirements.file_version);
+  const bool control_mask_requested = control_mask_enabled.load(std::memory_order_relaxed);
+  const bool control_mask_eligible = control_mask_requested && control_mask_route_eligible;
+
   // NR working resolution (v5).  Shared controls with the pre-SR path; the
   // reference here is the DLSS output resolution.  The NR feature always
   // runs 1:1 at this working resolution and the decode stage upscales,
@@ -14996,10 +15064,6 @@ inline bool RecordInline(
   output_framerate::OutputIdentity bridge_adaptive_output;
   const bool bridge_adaptive = bridge_source != nullptr
       && BridgeAdaptiveEligible(*bridge_source, command_list, device, handle, plan, &bridge_adaptive_output);
-  fg::xefg::BridgeOffEvidence edit_off;
-  if (edit_reuse_enabled.load() && present == nullptr && bridge_source == nullptr) {
-    edit_off = EditReuseXefgOffLocked(handle, feature.source_generation);
-  }
   auto adaptive_output_owner = (present != nullptr ? present->adaptive_output : bridge_adaptive_output);
   if (!adaptive_output_owner && present == nullptr && (nr_adaptive_enabled.load() || feature.adaptive_session != nullptr)) {
     const output_framerate::SourceIdentity source{
@@ -15012,6 +15076,55 @@ inline bool RecordInline(
       adaptive_output_owner = output_framerate::FindPresentOutput(source.device, source.resource);
     }
   }
+  const bool edit_reuse_requested = edit_reuse_enabled.load(std::memory_order_relaxed);
+  const edit_reuse_policy::Source inline_source{
+      .generation = feature.source_generation,
+      .sequence = (bridge_source != nullptr ? bridge_source->sr_sequence : feature.sr_sequence),
+      .current_color = present == nullptr && current_sr_color, .ordered = current_sr_color};
+  const auto no_fg_owner = [&] {
+    return !native_fg_owns.load() && !fg::xefg::OwnsStream() && !auto_fg_fallback_active.load();
+  };
+  const bool fixed_inline_source = edit_reuse_requested && present == nullptr
+      && edit_reuse_policy::CanUseHistory(inline_source)
+      && execution_stage == stage_plan::Stage::UPSCALED
+      && plan.At(stage_plan::Stage::UPSCALED).begin == group.begin
+      && plan.At(stage_plan::Stage::UPSCALED).count == group.count
+      && EditReuseSourceConfirmed(handle, feature);
+  const bool edit_reuse_stack_shape = requested_stack > 1 && !plan.mixed && group.begin == 0;
+  const uint32_t edit_reuse_model_request = nr_model::ResolvePreset(preset.load(), 0, direct_runtime_requirements.dual_models);
+  const auto edit_reuse_inputs_eligible = [&](bool allow_hdr10, bool same_stage_stack) {
+    return !control_mask_eligible
+        && output_rect.x == 0 && output_rect.y == 0 && width == output_desc.Width && height == output_desc.Height
+        && EditReuseInputsEligible(plan, group, current, output_desc, motion_desc, depth_desc,
+                                  hdr_mode, allow_hdr10, edit_reuse_model_request, same_stage_stack);
+  };
+  fg::xefg::BridgeOffEvidence edit_off;
+  const auto adaptive_reuse_route = [&] {
+    if (present != nullptr || bridge_source != nullptr || hook_point.load() != kHookUpscaled
+        || successful_sr_device != device || fg::xefg::Enabled() || mixed_present_fg_seen.load()
+        || !nr_adaptive_enabled.load() || !no_fg_owner()) return false;
+    if (output_framerate::NativeMode(adaptive_output_owner) == 0u) {
+      edit_off = {};
+      return true;
+    }
+    edit_off = EditReuseXefgOffLocked(handle, feature.source_generation);
+    return edit_off.available && edit_off.output_identity == adaptive_output_owner
+        && edit_off.MatchesOutput(output_framerate::Read(adaptive_output_owner, SteadyNowNs()));
+  };
+  const bool lower_reuse_shape = requested_stack == 1 && !look_mode.load() && detail_stability.load() == 1u
+      && !nr_follow_input_res.load() && edit_reuse_model_request == 2u
+      && execution_stage == stage_plan::Stage::UPSCALED && !nr_adaptive_limited_residency.load();
+  const bool potential_fixed_reuse = nr_adaptive_enabled.load() && fixed_inline_source && no_fg_owner()
+      && edit_reuse_inputs_eligible(false, edit_reuse_stack_shape);
+  const AdaptiveEditCadence edit_cadence{
+      .upper = potential_fixed_reuse,
+      .reduced_upper = potential_fixed_reuse && [&] {
+        const auto settings = LookSettingsSnapshot(true, false, group.begin, false);
+        return settings.upsample == look::kUpsampleClassic && !look::Dispatched(settings, false);
+      }(),
+      .lower = edit_reuse_requested && lower_reuse_shape && edit_reuse_inputs_eligible(false, false)
+          && adaptive_reuse_route(),
+      .stack_encoding = (potential_fixed_reuse && edit_reuse_stack_shape ? V6EncodingConstant(InterpretSourceUnits(hdr_mode)) : 0u)};
   auto adaptive = (preparing_adaptive_frame != nullptr ? *preparing_adaptive_frame
       : present != nullptr && present->adaptive_frame != nullptr ? *present->adaptive_frame
       : FreezeAdaptiveFrame(&feature.adaptive_session, plan, group, width, height,
@@ -15024,7 +15137,7 @@ inline bool RecordInline(
                   && present->stage_execution_plan == nullptr && !present->native_prefg_resolution_pair))),
           0, 1, false, adaptive_output_count, 0, feature_reuse_binding, bridge_source,
           adaptive_output_owner,
-          present != nullptr ? present->diagnostic_source_generation : feature.source_generation));
+           (present != nullptr ? present->diagnostic_source_generation : feature.source_generation), edit_cadence));
   SelectAdaptiveTier(&feature, handle, &adaptive, present != nullptr && present->adaptive_frame != nullptr,
       present != nullptr ? present->workset_key : output, false, &group, present);
   if (feature.adaptive_output_blocked || feature.adaptive_retirement_blocked) {
@@ -15063,31 +15176,10 @@ inline bool RecordInline(
     device->Release();
     return false;
   }
-  const uint32_t requested_stack = group.count;
   const bool control_mask_guides_have_provenance = present == nullptr || present->guide_serial != 0;
   const bool control_mask_depth_has_provenance = control_mask_guides_have_provenance
       && (present == nullptr || present->depth_matches_color.value_or(true))
       && (present == nullptr || !present->depth_matches_color.has_value() || present->control_mask_depth_proof != nullptr);
-  const bool control_mask_render_upscaled_chain = plan.mixed
-      && plan.At(stage_plan::Stage::RENDER).count != 0
-      && plan.At(stage_plan::Stage::UPSCALED).count != 0
-      && evaluate_chain.render_complete;
-  const bool control_mask_final_present_route = present != nullptr
-      && execution_stage == stage_plan::Stage::PRESENT
-      && present->domain == present_restore_scope::Domain::FINAL_PRESENT
-      && present->stage_execution_plan == nullptr && present->source_color == nullptr
-      && (!present->d3d11_bridge || Dx11NativeRoute()) && !plan.mixed;
-  const bool control_mask_pre_fg_route = present != nullptr
-      && execution_stage == stage_plan::Stage::PRESENT
-      && (present->domain == present_restore_scope::Domain::PRE_FG_BACKBUFFER
-          || present->domain == present_restore_scope::Domain::PRE_FG_HUDLESS)
-      && !present->native_prefg_resolution_pair && !plan.mixed;
-  const bool control_mask_present_route = control_mask_final_present_route || control_mask_pre_fg_route;
-  const bool control_mask_route_eligible = ((present == nullptr
-      && execution_stage == stage_plan::Stage::UPSCALED
-      && (!plan.mixed || control_mask_render_upscaled_chain))
-      || control_mask_present_route)
-      && nr_model::SupportsControlMask(direct_runtime_requirements.file_version);
   const bool control_mask_capture_route_eligible = ((present == nullptr
       && execution_stage == stage_plan::Stage::UPSCALED) || control_mask_present_route)
       && !plan.mixed && group.begin == 0
@@ -15096,7 +15188,6 @@ inline bool RecordInline(
       && !xefg_gpu_capture_enabled.load(std::memory_order_relaxed)
       && gpu_timers_enabled.load(std::memory_order_relaxed)
       && control_mask_capture_route_eligible;
-  const bool control_mask_requested = control_mask_enabled.load(std::memory_order_relaxed);
 #if defined(NR_NEXUS_DEV_CONTROL)
   const auto inline_capture_environment = (control_mask_capture_eligible && edit_reuse_fg_experiment.load()
       ? ReadEditReuseFgEnvironmentLocked() : EditReuseFgEnvironment{});
@@ -15112,8 +15203,6 @@ inline bool RecordInline(
 #else
       false;
 #endif
-  const bool control_mask_eligible = control_mask_requested
-      && control_mask_route_eligible;
   if (control_mask_requested && !control_mask_route_eligible
       && !control_mask_refusal_logged.exchange(true, std::memory_order_relaxed)) {
     Log(reshade::log::level::warning,
@@ -15123,11 +15212,6 @@ inline bool RecordInline(
   }
   stage_stats.width = width;
   stage_stats.height = height;
-  const bool edit_reuse_requested = edit_reuse_enabled.load(std::memory_order_relaxed);
-  const edit_reuse_policy::Source inline_source{
-      .generation = feature.source_generation,
-      .sequence = (bridge_source != nullptr ? bridge_source->sr_sequence : feature.sr_sequence),
-      .current_color = present == nullptr && current_sr_color, .ordered = current_sr_color};
   const bool monitor_edit_requested = edit_reuse_requested && monitor_requested.load(std::memory_order_relaxed);
   const bool monitor_adapter_delivery = monitor_edit_requested && recording != nullptr
       && ((present != nullptr && present_frame_policy::Known(present->base_frame))
@@ -15152,25 +15236,8 @@ inline bool RecordInline(
     edit_monitor.reason = reason;
     PublishEditReuseMonitorFrame(&feature, command_list, std::move(edit_monitor));
   };
-  // Tier preparation can yield to a public FG call. Recheck the Off receipt
-  // required by adaptive reuse at admission.
-  const auto edit_native_mode = output_framerate::NativeMode(adaptive_output_owner);
-  const bool edit_reuse_current_native_off = edit_native_mode.has_value() && *edit_native_mode == 0;
-  if (edit_reuse_current_native_off) edit_off = {};
-  else if (present == nullptr && bridge_source == nullptr && edit_reuse_requested) {
-    edit_off = EditReuseXefgOffLocked(handle, feature.source_generation);
-  }
-  const bool edit_reuse_current_xefg_off = edit_off.available
-      && edit_off.output_identity == adaptive_output_owner
-      && edit_off.MatchesOutput(output_framerate::Read(adaptive_output_owner, SteadyNowNs()));
   const bool edit_reuse_fixed_workset = UsesFixedEditReuseWorkset(feature, adaptive);
-  const bool edit_reuse_fixed_inline_route = edit_reuse_requested && edit_reuse_fixed_workset
-      && present == nullptr && edit_reuse_policy::CanUseHistory(inline_source)
-      && execution_stage == stage_plan::Stage::UPSCALED
-      && plan.At(stage_plan::Stage::UPSCALED).begin == group.begin
-      && plan.At(stage_plan::Stage::UPSCALED).count == group.count
-      && !native_fg_owns.load() && !fg::xefg::OwnsStream() && !auto_fg_fallback_active.load()
-      && EditReuseSourceConfirmed(handle, feature);
+  const bool edit_reuse_fixed_inline_route = edit_reuse_fixed_workset && fixed_inline_source && no_fg_owner();
 #if defined(NR_NEXUS_DEV_CONTROL)
   EditReuseFgEnvironment edit_fg_environment;
   bool edit_reuse_dev_inline_route = false;
@@ -15190,14 +15257,9 @@ inline bool RecordInline(
     }
   }
 #endif
-  // Fixed Upscaled has the current successful SR output on its producer's
-  // list. Adaptive still needs provider Off evidence for its paired timing.
-  const bool edit_reuse_adaptive_inline_route = present == nullptr && bridge_source == nullptr
-      && hook_point.load() == kHookUpscaled && successful_sr_device == device
-      && !fg::xefg::Enabled() && !mixed_present_fg_seen.load() && nr_adaptive_enabled.load()
-      && !native_fg_owns.load() && !fg::xefg::OwnsStream() && !auto_fg_fallback_active.load()
-      && (edit_reuse_current_native_off
-          || edit_reuse_current_xefg_off);
+  // Tier preparation can yield to a public FG call. Recheck the Off receipt
+  // required by adaptive reuse at admission.
+  const bool edit_reuse_adaptive_inline_route = edit_reuse_requested && adaptive_reuse_route();
   const bool edit_reuse_prefg_route = present != nullptr && present_frame_policy::Known(present->base_frame)
       && present->base_frame.reuse_edits
       && hook_point.load() == kHookPresent && !present->d3d11_bridge
@@ -15213,15 +15275,10 @@ inline bool RecordInline(
       && output_desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM
       && present->units.encoding == codec::Encoding::Pq && present->units.absolute
       && present->units.unit_nits == 10000.f && present->units.bt2020 && present->hdr_encoding == 4u;
-  const uint32_t edit_reuse_model_request = nr_model::ResolvePreset(preset.load(), 0, direct_runtime_requirements.dual_models);
-  const bool same_stage_stack = requested_stack > 1 && edit_reuse_fixed_inline_route && !plan.mixed
-      && group.begin == 0 && group.count == requested_stack;
+  const bool same_stage_stack = edit_reuse_stack_shape && edit_reuse_fixed_inline_route;
   const bool edit_reuse_contract_eligible = edit_reuse_requested
       && (edit_reuse_fixed_inline_route || edit_reuse_adaptive_inline_route || edit_reuse_prefg_route || edit_reuse_present_route)
-      && !control_mask_eligible
-      && output_rect.x == 0 && output_rect.y == 0 && width == output_desc.Width && height == output_desc.Height
-      && EditReuseInputsEligible(plan, group, current, output_desc, motion_desc, depth_desc,
-                                 hdr_mode, edit_reuse_hdr10, edit_reuse_model_request, same_stage_stack);
+      && edit_reuse_inputs_eligible(edit_reuse_hdr10, same_stage_stack);
   std::optional<std::array<look::Settings, kMaxNrPasses>> fixed_edit_look;
   if (edit_reuse_contract_eligible && edit_reuse_fixed_inline_route
       && (nr_input_width != width || nr_input_height != height
@@ -15236,13 +15293,11 @@ inline bool RecordInline(
   const auto& edit_tiers = feature.adaptive_cache;
   // Establish the same ordered-history provenance while both tiers prepare.
   // Otherwise the first x2 frame must discard their unguarded ready objects.
-  const bool edit_reuse_adaptive_contract = edit_reuse_contract_eligible && requested_stack == 1
+  const bool edit_reuse_adaptive_contract = edit_reuse_contract_eligible && lower_reuse_shape
       // The existing private low tier has its own resolve and history contract.
-      && !look_mode.load() && detail_stability.load() == 1u && !nr_follow_input_res.load() && edit_reuse_model_request == 2u
-      && edit_reuse_adaptive_inline_route && execution_stage == stage_plan::Stage::UPSCALED
-      && nr_adaptive_enabled.load() && adaptive.enabled
+      && edit_reuse_adaptive_inline_route && adaptive.enabled
       && adaptive.session != nullptr && adaptive.session == feature.adaptive_session && !adaptive.session->failed
-      && !nr_adaptive_limited_residency.load() && !adaptive.session->settings.limited_residency
+      && !adaptive.session->settings.limited_residency
       && !adaptive.session->settings.legacy_preparation
       && adaptive.session->settings.resource_strategy == AdaptiveFeatureMode::OFF
       && nr_adaptive_selected_levels.load() == 2 && adaptive.session->settings.selected_levels == 2
@@ -18176,13 +18231,28 @@ inline bool RecordInlinePreSR(
       adaptive_output_owner = output_framerate::FindPresentOutput(adaptive_source.device, adaptive_source.resource);
     }
   }
+  const uint64_t edit_sequence = (tracked_sr_call ? feature.sr_sequence : 0);
+  const uint32_t edit_model_request = nr_model::ResolvePreset(preset.load(), 0, direct_runtime_requirements.dual_models);
+  const bool same_stage_stack = !plan.mixed && requested_stack > 1;
+  const bool edit_reuse_contract_eligible = edit_reuse_requested && edit_sequence != 0
+      && feature.source_feature == kFeatureDlss && EditReuseSourceConfirmed(handle, feature)
+      && queue_tracking_active.load(std::memory_order_relaxed) && !control_mask_eligible
+      && width == color_w && height == color_h && current.input_width == width && current.input_height == height
+      && GetUInt(game_parameters, NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_X) == 0
+      && GetUInt(game_parameters, NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_Y) == 0
+      && !motion_window.contradicted && motion_window.width == width && motion_window.height == height
+      && valid_edit_motion_scale
+      && EditReuseInputsEligible(plan, group, current, color_desc, motion_desc, depth_desc,
+                                 hdr_mode, false, edit_model_request, same_stage_stack);
   auto adaptive = (preparing_adaptive_frame != nullptr ? *preparing_adaptive_frame
       : FreezeAdaptiveFrame(&feature.adaptive_session, plan, group, width, height,
       current.input_width, current.input_height,
        reinterpret_cast<uintptr_t>(handle) ^ reinterpret_cast<uintptr_t>(device) ^ feature.source_generation
            ^ (static_cast<uint64_t>(color_desc.Format) * 1099511628211ull) ^ feature.create_flags,
       !D3D11OnlySession(), 0, 1, false, AdaptiveOutputCount(&feature, handle, color, true, width, height, color_desc.Format, color),
-      0, false, nullptr, adaptive_output_owner, feature.source_generation));
+      0, false, nullptr, adaptive_output_owner, feature.source_generation,
+      {.upper = edit_reuse_contract_eligible, .reduced_upper = same_stage_stack,
+       .stack_encoding = (edit_reuse_contract_eligible && same_stage_stack ? V6EncodingConstant(InterpretSourceUnits(hdr_mode)) : 0u)}));
   SelectAdaptiveTier(&feature, handle, &adaptive, false, color, true, &group);
   if (feature.adaptive_output_blocked || feature.adaptive_retirement_blocked) {
     device->Release();
@@ -18220,7 +18290,6 @@ inline bool RecordInlinePreSR(
     device->Release();
     return false;
   }
-  const uint64_t edit_sequence = (tracked_sr_call ? feature.sr_sequence : 0);
   if (edit_reuse_requested && edit_sequence != 0 && monitor_requested.load(std::memory_order_relaxed)
       && !adaptive.preparing && !plan.mixed && EditReuseSourceConfirmed(handle, feature)) {
     if (auto* sr_output = GetD3D12Resource(game_parameters, NVSDK_NGX_Parameter_Output); sr_output != nullptr) {
@@ -18231,20 +18300,8 @@ inline bool RecordInlinePreSR(
       swap.monitor_list = command_list;
     }
   }
-  const uint32_t edit_model_request = nr_model::ResolvePreset(preset.load(), 0, direct_runtime_requirements.dual_models);
-  const bool same_stage_stack = !plan.mixed && requested_stack > 1;
-  bool edit_reuse_eligible = edit_reuse_requested && edit_sequence != 0
-      && feature.source_feature == kFeatureDlss && EditReuseSourceConfirmed(handle, feature)
-      && queue_tracking_active.load(std::memory_order_relaxed)
-      && !control_mask_eligible && UsesFixedEditReuseWorkset(feature, adaptive)
-      && (same_stage_stack || CanCommitFullSizeEditReuse(feature, width, height, nr_input_width, nr_input_height))
-      && width == color_w && height == color_h && current.input_width == width && current.input_height == height
-      && GetUInt(game_parameters, NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_X) == 0
-      && GetUInt(game_parameters, NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_Y) == 0
-      && !motion_window.contradicted && motion_window.width == width && motion_window.height == height
-      && valid_edit_motion_scale
-      && EditReuseInputsEligible(plan, group, current, color_desc, motion_desc, depth_desc,
-                                 hdr_mode, false, edit_model_request, same_stage_stack);
+  bool edit_reuse_eligible = edit_reuse_contract_eligible && UsesFixedEditReuseWorkset(feature, adaptive)
+      && (same_stage_stack || CanCommitFullSizeEditReuse(feature, width, height, nr_input_width, nr_input_height));
   if (!edit_reuse_eligible) {
     if (swap.monitor_source != nullptr) {
       if (group.begin != 0 || (group.count != 1 && !same_stage_stack)) {
@@ -31386,7 +31443,7 @@ inline void DrawResolutionControls(const ui::PanelText& text) {
       ImGui::TextWrapped("%s", text.Tr(levels_tip));
     }
     SliderSetting(text, kSetAdaptiveTargetFps, "Target output FPS", 30.f, 360.f, "%.0f FPS",
-        "The target includes generated frames. If lowering NR brings no FPS benefit, the previous quality is restored.");
+        "The target includes generated frames. Lower one tier while below target; hold at target. Raise only with sustained headroom. GPU timing is diagnostic.");
     ui::RowLabel("Exact target FPS", "Enter the target output frame rate directly (30-360). Press Enter to apply.");
     char target[16];
     std::snprintf(target, sizeof(target), "%.0f", kSetAdaptiveTargetFps.Get());

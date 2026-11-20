@@ -2320,7 +2320,7 @@ inline constexpr Translation kPtBr[] = {
     {"Adaptive resolution", "Resolução adaptativa"},
     {"Adjust NR working resolution toward your target output FPS, including generated frames. Manual resolutions are the upper limits. No extra program is required.", "Ajusta a resolução de trabalho do NR para o FPS de saída desejado, incluindo quadros gerados. As resoluções manuais são os limites superiores. Não requer programas adicionais."},
     {"Target output FPS", "FPS de saída desejado"},
-    {"The target includes generated frames. If lowering NR brings no FPS benefit, the previous quality is restored.", "A meta inclui quadros gerados. Se reduzir o NR não melhorar o FPS, a qualidade anterior será restaurada."},
+    {"The target includes generated frames. Lower one tier while below target; hold at target. Raise only with sustained headroom. GPU timing is diagnostic.", "A meta inclui quadros gerados. Abaixo da meta, a resolução cai um nível. Ao atingir a meta, ela é mantida. Só aumenta quando o FPS se mantém acima da meta com folga. Os tempos de GPU servem para diagnóstico."},
     {"Minimum relative scale", "Escala relativa mínima"},
     {"Minimum width and height relative to each pass's manual upper limit. Existing stage limits still apply.", "Largura e altura mínimas em relação ao limite manual de cada passagem. Os limites da etapa continuam válidos."},
     {"Estimated output FPS: %.1f", "FPS de saída estimado: %.1f"},

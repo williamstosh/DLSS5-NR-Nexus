@@ -2320,7 +2320,7 @@ inline constexpr Translation kJa[] = {
     {"Adaptive resolution", "適応解像度"},
     {"Adjust NR working resolution toward your target output FPS, including generated frames. Manual resolutions are the upper limits. No extra program is required.", "生成フレームを含む目標出力 FPS に向けて NR の処理解像度を調整します。手動解像度が上限です。追加プログラムは不要です。"},
     {"Target output FPS", "目標出力 FPS"},
-    {"The target includes generated frames. If lowering NR brings no FPS benefit, the previous quality is restored.", "目標には生成フレームを含みます。NR の解像度を下げても FPS が改善しない場合は、元の画質に戻します。"},
+    {"The target includes generated frames. Lower one tier while below target; hold at target. Raise only with sustained headroom. GPU timing is diagnostic.", "目標には生成フレームを含みます。目標を下回る間は解像度を一段ずつ下げ、目標に達したら維持します。FPS に十分な余裕が続く場合にだけ上げます。GPU の処理時間は診断用です。"},
     {"Minimum relative scale", "最小相対倍率"},
     {"Minimum width and height relative to each pass's manual upper limit. Existing stage limits still apply.", "各パスの手動上限に対する幅と高さの最小比率です。既存のステージ制限も適用されます。"},
     {"Estimated output FPS: %.1f", "推定出力 FPS: %.1f"},

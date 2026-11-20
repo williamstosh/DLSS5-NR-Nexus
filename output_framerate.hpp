@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -105,9 +106,20 @@ struct Snapshot {
   bool multiplier_variable = false;
   uint64_t identity = 0;
   OutputIdentity output;
+  bool split_available = false;
+  std::array<double, 2> split_fps{};
+  double rate_multiplier = 0.;
+  bool rate_comparable = true;
 };
 
+#if defined(NR_NEXUS_TEST_NATIVE_SDK_CLOCK)
+static thread_local int64_t test_now_ns = 0;
+#endif
+
 inline int64_t NowNs() {
+#if defined(NR_NEXUS_TEST_NATIVE_SDK_CLOCK)
+  if (test_now_ns != 0) return test_now_ns;
+#endif
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -126,6 +138,8 @@ struct Stream {
     double frames = 0;
     uint64_t applications = 0;
     bool applications_known = true;
+    double minimum_multiplier = std::numeric_limits<double>::infinity();
+    double maximum_multiplier = 0.;
   };
   Snapshot snapshot;
   std::array<Bin, 4> bins{};
@@ -140,6 +154,9 @@ struct Stream {
     snapshot.reason = reason;
     snapshot.window_begin_ns = snapshot.window_end_ns = 0;
     snapshot.fps = snapshot.fps_mad = 0;
+    snapshot.split_available = false;
+    snapshot.split_fps = {};
+    snapshot.rate_comparable = true;
     snapshot.observed_multiplier = 0;
     snapshot.requested_multiplier = snapshot.maximum_multiplier = snapshot.declared_multiplier = 0;
     snapshot.dynamic = snapshot.fg_off = false;
@@ -186,6 +203,14 @@ struct Stream {
     } else {
       pending.applications_known = false;
     }
+    if (source == Source::NATIVE_STATE) {
+      // Several SDK reads can contribute to one bin. Keep the interval range
+      // so an unchanged aggregate ratio cannot hide a change within the bin.
+      const uint64_t interval_applications = applications.value_or(0);
+      const double multiplier = (interval_applications != 0 ? frames / static_cast<double>(interval_applications) : 0.);
+      pending.minimum_multiplier = std::min(pending.minimum_multiplier, multiplier);
+      pending.maximum_multiplier = std::max(pending.maximum_multiplier, multiplier);
+    }
     if (pending.end_ns - pending.begin_ns < BIN_NS) return;
     bins[next] = pending;
     next = (next + 1) % bins.size();
@@ -197,6 +222,8 @@ struct Stream {
     bool applications_known = true;
     int64_t total_ns = 0;
     std::array<double, 4> rates{};
+    double minimum_multiplier = std::numeric_limits<double>::infinity();
+    double maximum_multiplier = 0.;
     for (size_t index = 0; index < bins.size(); ++index) {
       const auto& bin = bins[index];
       total_frames += bin.frames;
@@ -204,6 +231,8 @@ struct Stream {
       applications_known &= bin.applications_known;
       total_ns += bin.end_ns - bin.begin_ns;
       rates[index] = bin.frames * 1e9 / static_cast<double>(bin.end_ns - bin.begin_ns);
+      minimum_multiplier = std::min(minimum_multiplier, bin.minimum_multiplier);
+      maximum_multiplier = std::max(maximum_multiplier, bin.maximum_multiplier);
     }
     std::sort(rates.begin(), rates.end());
     const double median = (rates[1] + rates[2]) * 0.5;
@@ -215,9 +244,24 @@ struct Stream {
     snapshot.window_end_ns = now_ns;
     snapshot.fps = total_frames * 1e9 / static_cast<double>(total_ns);
     snapshot.fps_mad = (rates[1] + rates[2]) * 0.5;
+    // Preserve complete SDK intervals and use their actual covered duration.
+    // Ring storage order is independent of chronological half-window order.
+    for (size_t half = 0; half < snapshot.split_fps.size(); ++half) {
+      double frames = 0.;
+      int64_t covered_ns = 0;
+      for (size_t index = 0; index < bins.size() / 2; ++index) {
+        const auto& bin = bins[(next + half * (bins.size() / 2) + index) % bins.size()];
+        frames += bin.frames;
+        covered_ns += bin.end_ns - bin.begin_ns;
+      }
+      snapshot.split_fps[half] = frames * 1e9 / static_cast<double>(covered_ns);
+    }
+    snapshot.split_available = true;
     snapshot.observed_multiplier = ((source == Source::XEFG_STATUS || source == Source::NATIVE_STATE)
         && applications_known && total_applications != 0
         ? total_frames / static_cast<double>(total_applications) : 0);
+    snapshot.rate_comparable = source != Source::NATIVE_STATE
+        || (minimum_multiplier > 0. && maximum_multiplier <= minimum_multiplier * 1.10);
     ++snapshot.window_serial;
   }
 
@@ -364,17 +408,24 @@ inline Snapshot ReadOutput(const Output& output, int64_t now_ns) {
   const auto& native = output.native;
   const auto* options = Options(native);
   const auto fixed_multiplier = FixedMultiplier(native, options, now_ns);
-  if (snapshot.source == Source::NATIVE_FIXED
-      && (fixed_multiplier == 0 || native.fixed_since_ns > snapshot.window_begin_ns)) {
+  const bool fixed_for_window = fixed_multiplier != 0 && native.fixed_since_ns <= snapshot.window_begin_ns;
+  if (snapshot.source == Source::NATIVE_FIXED && !fixed_for_window) {
     snapshot.available = false;
     snapshot.reason = Reason::kUNKNOWN_FG;
   }
   if (snapshot.source == Source::NATIVE_STATE) {
-    snapshot.multiplier_variable = fixed_multiplier == 0 || native.fixed_since_ns > snapshot.window_begin_ns;
-    if (snapshot.multiplier_variable
-        && (!Fresh(native.application_ns, now_ns) || native.state_coverage != native.coverage)) {
+    snapshot.multiplier_variable = !fixed_for_window;
+    if (fixed_for_window) {
+      snapshot.rate_comparable = true;
+    } else if (!Fresh(native.application_ns, now_ns) || native.state_coverage != native.coverage) {
       snapshot.observed_multiplier = 0.;
+      snapshot.rate_comparable = false;
     }
+  }
+  if ((snapshot.source == Source::NATIVE_STATE || snapshot.source == Source::NATIVE_FIXED) && fixed_for_window) {
+    snapshot.rate_multiplier = fixed_multiplier;
+  } else {
+    snapshot.rate_multiplier = snapshot.observed_multiplier;
   }
   if (native.routed && options != nullptr) {
     snapshot.dynamic = options->mode == 3;

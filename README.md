@@ -39,7 +39,7 @@ NR Nexus 通过 [ReShade](https://reshade.me/) 为兼容游戏提供 NVIDIA DLSS
 
 | 能力 | 玩家用途 |
 | --- | --- |
-| **设定目标帧率，自动调整 NR 分辨率** | 设置目标输出 FPS、最低比例和默认或 2–15 档，选择全档预备或按需备档（实验）；在可用档位间调整 NR 工作尺寸。目标包含生成帧，无需额外安装帧率程序。[自适应分辨率与支持范围](docs/USER_GUIDE.md#zh-resolution) |
+| **设定目标帧率，自动调整 NR 分辨率** | 设置含生成帧的目标输出 FPS、最低比例和默认或 2–15 档，选择全档预备或按需备档（实验）。**未发布的开发版**在持续欠帧时逐档降低 NR 分辨率，恰好达标即保持，持续有帧率余量才试升。[自适应分辨率与支持范围](docs/USER_GUIDE.md#zh-adaptive-resolution) |
 | **隔帧复用 NR 编辑（实验）** | 在画质页开启 x2，每两个基础帧更新一次 NR 编辑，中间帧将编辑随运动应用于新画面，用于降低 NR 开销。默认关闭，支持符合条件的 DX12 Render／Upscaled 同阶段多层；Present 维持单层限制，动态画质与帧节奏仍待验收。[操作与条件](docs/USER_GUIDE.md#zh-edit-reuse) |
 | **区域遮罩，按深度或运动减弱 NR** | 分别调节 NR 应用量、色调和结构，按深度淡出远景，或在快速运动区域减少 NR。画质页与每层叠层共用控件，支持继承或独立设置。[区域遮罩操作](docs/USER_GUIDE.md#zh-region-mask) |
 | **最多四层，分别塑造外观和结果** | 在一次 NR 调整之外继续叠加处理，例如自然底层＋电影感第二层。每层分别调模型风格、人物／皮肤及亮暗、颜色、细节和光晕；可共享第 1 层设置，也可独立编辑。增加层数会增加 GPU 工作量，建议从单层开始。[两层实例](docs/USER_GUIDE.md#zh-two-pass-example) · [阶段与 FG 兼容性](#zh-compatibility) |
@@ -268,7 +268,7 @@ This page describes the features in v0.6.0. See the guide for compatibility cond
 
 | Feature | What you can use it for |
 | --- | --- |
-| **Set a target FPS and adjust NR resolution automatically** | Set target output FPS, a minimum scale and Default or 2–15 levels. Choose Prepare all levels or experimental On-demand preparation, then adjust NR working size between available levels. The target includes generated frames, without an extra FPS program. [Adaptive resolution and supported paths](docs/USER_GUIDE.md#en-resolution) |
+| **Set a target FPS and adjust NR resolution automatically** | Set a target output FPS including generated frames, a minimum scale and Default or 2–15 levels. Choose Prepare all levels or experimental On-demand preparation. The **unreleased development version** lowers NR resolution one level at a time while FPS stays below target, holds at the exact target and tries a higher level only with sustained FPS headroom. [Adaptive resolution and supported paths](docs/USER_GUIDE.md#en-adaptive-resolution) |
 | **Reuse NR edits every other frame (experimental)** | Enable x2 on the Quality page to refresh the NR edit every two base frames and apply its motion-reprojected edit to the new image between refreshes, aiming to lower NR cost. Off by default, with eligible same-hook multi-pass DX12 Render/Upscaled paths. Present remains single-pass; dynamic quality and frame pacing await acceptance. [Usage and requirements](docs/USER_GUIDE.md#en-edit-reuse) |
 | **Region masks that reduce NR by depth or motion** | Tune NR intensity, tone and structure separately, fade distant areas by depth, or reduce NR in fast-moving regions. Quality and every pass share controls, with inheritance or independent settings. [Region mask controls](docs/USER_GUIDE.md#en-region-mask) |
 | **Up to four passes, with separate look and result controls** | Build on one NR adjustment with another, such as a Natural base plus a Cinematic second layer. Tune model styling, characters/skin, brightness, colour, detail and halos per pass, sharing Pass 1 settings or editing independently. More passes add GPU work; start with one. [Two-pass example](docs/USER_GUIDE.md#en-two-pass-example) · [Stage and FG compatibility](#en-compatibility) |

@@ -102,9 +102,9 @@
       "commands": ["edit_reuse_adaptive_experiment"],
       "producer": "Successful D3D12 SR and ordinary Present output, with independent Native/XeFG Off evidence for qualifying low-grid x2",
       "consumer": "Frozen adaptive measurement -> actual active workset reuse -> complete GPU cycles and adaptive Session trial",
-      "success": "Compatible fixed worksets keep reusing. A real grid change refreshes. Qualifying low-tier x2 and no-Off per-frame trials each deliver and evaluate within the original trial.",
-      "refusal": "Missing half-pair, changed output or source, unconfirmed delivery and old GPU completion cannot advance the trial or reuse the anchor.",
-      "fallback": "Keep valid fixed x2 or use per-frame adaptive NR. Return to the accepted anchor after a confirmed no-gain trial.",
+      "success": "Compatible fixed worksets keep reusing. A real grid change refreshes. Completed output windows control the move to paired or per-frame low-tier delivery and the post-warmup decision.",
+      "refusal": "Incomplete timestamp coverage yields no complete cost. Changed output or source, unconfirmed delivery and old GPU completion cannot confirm a tier or reuse a stale anchor.",
+      "fallback": "Keep valid fixed x2 or use per-frame adaptive NR. Hold the delivered low tier at the exact target or report continued deficit at the minimum.",
       "sources": [
         ["dlssnr.hpp", "fg::xefg::ConfigureD3D12Source("],
         ["dlssnr.hpp", "fg::xefg::RegisterD3D12SourceSwapchain("],
@@ -113,19 +113,19 @@
         ["adaptive_resolution.hpp", "SetPairedSampling("]
       ],
       "cases": [
-        { "suite": "fg-native", "name": "nr-edit-reuse-contracts", "log": "nr-edit-reuse-contracts", "receipt": "^PASS case=nr-edit-reuse-contracts evidence=WARP\\+MOCK dev={dev}$", "scenarios": ["fixed-active", "paired-low", "unpaired-accept", "unpaired-rollback"],
+        { "suite": "fg-native", "name": "nr-edit-reuse-contracts", "log": "nr-edit-reuse-contracts", "receipt": "^PASS case=nr-edit-reuse-contracts evidence=WARP\\+MOCK dev={dev}$", "scenarios": ["fixed-active", "paired-low", "unpaired-target", "unpaired-minimum"],
           "expect": {
             "fixed-active": "^grid=16x16 cadence=1/0 eligibility_keeps_anchor=1 same_grid_source_refresh=1 model_refresh=1 evidence=WARP\\+MOCK$",
-            "paired-low": "^output=PRESENT grid=12x12 calls=1/0 upper_us=2000 low_us=1500 discarded=1 recovered=1 stale_half_rejected=1 off_revocation_keeps_upper=1 accepted_100fps=1 output_replacement_rejected=1 evidence=WARP\\+MOCK$",
-            "unpaired-accept": "^output=PRESENT grid=12x12 calls=1 upper_us=2000 low_us=1500 trial_preserved=1 warmed_after_delivery=1 accepted_100fps=1 output_replacement_rejected=1 evidence=WARP\\+MOCK$",
-            "unpaired-rollback": "^output=PRESENT grid=12x12 calls=1 upper_us=2000 low_us=1500 trial_preserved=1 warmed_after_delivery=1 returned_80fps=1 cooldown=1 output_replacement_rejected=1 evidence=WARP\\+MOCK$"
+            "paired-low": "^output=PRESENT grid=12x12 calls=1/0 upper_us=2000 low_us=1500 discarded=1 recovered=1 stale_half_rejected=1 off_revocation_keeps_upper=1 held_100fps=1 output_replacement_rejected=1 evidence=WARP\\+MOCK$",
+            "unpaired-target": "^output=PRESENT request=16x16/12x12 delivered=12x12 calls=1 warmup_ns=1000000000 low_fps=100 decision=OBSERVING request_ns=[1-9][0-9]+ delivery_ns=[1-9][0-9]+ decision_window_ns=[1-9][0-9]+/[1-9][0-9]+ decision_ns=[1-9][0-9]+ timestamps=full/half/none costs=2000/1500,missing,missing output_replacement_rejected=1 evidence=WARP\\+MOCK$",
+            "unpaired-minimum": "^output=PRESENT request=16x16/12x12 delivered=12x12 calls=1 warmup_ns=1000000000 low_fps=80 decision=AT_MINIMUM request_ns=[1-9][0-9]+ delivery_ns=[1-9][0-9]+ decision_window_ns=[1-9][0-9]+/[1-9][0-9]+ decision_ns=[1-9][0-9]+ timestamps=full/half/none costs=2000/1500,missing,missing output_replacement_rejected=1 evidence=WARP\\+MOCK$"
           } },
         { "suite": "fg-native", "name": "adaptive-inline", "log": "adaptive-inline", "receipt": "^PASS case=adaptive-inline evidence=WARP\\+MOCK dev={dev}$",
           "existingTrace": true,
           "scenarios": ["completion-scope"],
           "expect": { "completion-scope": "^ADAPTIVE_COMPLETION_SCOPE evidence=WARP\\+MOCK measured=1 proof_only=1 pending=blocked rejected=blocked superseded=retained$" } },
         { "suite": "adaptive-resolution", "name": "test", "log": "test", "receipt": "^NR_RELEASE_PARITY dx12-upscaled-adaptive-x2 controller ", "scenarios": ["controller"],
-          "expect": { "controller": "^paired_mean_us=2000 lower_us=1500 preserved_trial=1 accepted=1 rollback=1 bounded_missing_cost=1 persistent_gap_no_reprobe=1 context_gap_no_reprobe=1 recovery_new_baseline=1 recovered_same_context=1 evidence=CPU$" } }
+          "expect": { "controller": "^paired_mean_us=2000 lower_us=1500 missing-cost=fps-controlled queue-change=preserved target=exact failed-raise=workload-scoped evidence=CPU$" } }
       ]
     },
     {
@@ -191,11 +191,11 @@
           "expect": {
             "marker-only": "^fixed-fps=unavailable$",
             "fixed-state": "^source=NATIVE_STATE intervals-ms=1500 denominator=unknown trial-fps=80 accepted-fps=100$",
-            "dynamic-state": "^source=NATIVE_STATE fps=80 marker-only=collecting full-tags=trial middle-gap=rollback full-window=recovered old-binding=discarded$",
+            "dynamic-state": "^source=NATIVE_STATE fps=80 marker-only=collecting full-tags=trial middle-gap=kept-low full-window=at-minimum old-binding=discarded$",
             "fixed-estimate": "^source=NATIVE_FIXED fps=80 denominator-hz=40 multiplier=2 duplicate=deduplicated conflicting-marker=ignored ambiguous/wrong-bb=unavailable$"
           } },
         { "suite": "adaptive-resolution", "name": "test", "log": "test", "receipt": "^NR_RELEASE_PARITY native-application-frame-count controller ", "scenarios": ["controller"],
-          "expect": { "controller": "^fixed=trial-accepted-80-to-100 dynamic-no-denominator=collecting dynamic-ratio-shift=rollback gap-denominator=unavailable full-tags=recovered evidence=CPU$" } }
+          "expect": { "controller": "^fixed=hold-80-to-100 dynamic-no-denominator=collecting dynamic-ratio-shift=recollect gap-denominator=unavailable full-tags=recovered evidence=CPU$" } }
       ]
     }
   ],

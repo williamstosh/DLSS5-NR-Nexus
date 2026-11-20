@@ -2320,7 +2320,7 @@ inline constexpr Translation kSl[] = {
     {"Adaptive resolution", "Prilagodljiva ločljivost"},
     {"Adjust NR working resolution toward your target output FPS, including generated frames. Manual resolutions are the upper limits. No extra program is required.", "Prilagaja delovno ločljivost NR ciljnemu izhodnemu FPS, vključno z ustvarjenimi sličicami. Ročne ločljivosti določajo zgornje meje. Dodatni program ni potreben."},
     {"Target output FPS", "Ciljni izhodni FPS"},
-    {"The target includes generated frames. If lowering NR brings no FPS benefit, the previous quality is restored.", "Cilj vključuje ustvarjene sličice. Če znižanje ločljivosti NR ne izboljša FPS, se obnovi prejšnja kakovost."},
+    {"The target includes generated frames. Lower one tier while below target; hold at target. Raise only with sustained headroom. GPU timing is diagnostic.", "Cilj vključuje ustvarjene sličice. Pod ciljnim FPS se ločljivost zniža za eno stopnjo, ob doseženem cilju pa se ohrani. Zviša se le, če FPS dalj časa ostaja dovolj nad ciljem. Meritve časa GPU so namenjene diagnostiki."},
     {"Minimum relative scale", "Najmanjše relativno merilo"},
     {"Minimum width and height relative to each pass's manual upper limit. Existing stage limits still apply.", "Najmanjša širina in višina glede na ročno zgornjo mejo vsakega prehoda. Omejitve stopnje še vedno veljajo."},
     {"Estimated output FPS: %.1f", "Ocenjeni izhodni FPS: %.1f"},

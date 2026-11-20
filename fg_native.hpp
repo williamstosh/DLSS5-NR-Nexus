@@ -506,17 +506,44 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
       ? 2u : (has_hudless && !coupled_ui ? 3u : 1u));
   const bool missing_prepared_role = nr_adaptive_enabled.load() && (stream->adaptive_required_roles & 2u) != 0 && !has_hudless;
   const auto adaptive_plan = EvaluationStagePlan(stream->roles[0].Handle(), false);
+  const stage_plan::Group adaptive_group{.stage = stage_plan::Stage::PRESENT, .count = adaptive_plan.pass_count};
+  const auto backbuffer_desc = input.backbuffer->GetDesc();
+  const bool mask_pipeline = control_mask_enabled.load(std::memory_order_relaxed)
+      && nr_model::SupportsControlMask(direct_runtime_requirements.file_version)
+      && !base.native_prefg_resolution_pair;
+  const bool xefg_edit_reuse_frame = edit_reuse_enabled.load(std::memory_order_relaxed)
+      && !stream->native && native_parameters == nullptr && !has_hudless && !input.ui_composition
+      && input.fg_enabled && input.has_present_id && input.has_constants && input.application_frame != 0
+      && present_frame_policy::Known(base_frame)
+      && real_guides && input.color_x == 0 && input.color_y == 0
+      && backbuffer_desc.Width == input.color_width && backbuffer_desc.Height == input.color_height;
+  bool xefg_adaptive_upper_reuse = false;
+  if (xefg_edit_reuse_frame && !mask_pipeline && hook_point.load() == kHookPresent && !base.d3d11_bridge
+      && base.stage_execution_plan == nullptr && !base.native_prefg_resolution_pair) {
+    auto reuse_inputs = contract;
+    reuse_inputs.has_jitter = true;
+    reuse_inputs.jitter_x = input.jitter_x;
+    reuse_inputs.jitter_y = input.jitter_y;
+    auto private_color = backbuffer_desc;
+    private_color.Flags = D3D12_RESOURCE_FLAG_NONE;
+    const bool hdr10 = base.hdr_mode == 2 && private_color.Format == DXGI_FORMAT_R10G10B10A2_UNORM
+        && base.units.encoding == codec::Encoding::Pq && base.units.absolute && base.units.unit_nits == 10000.f
+        && base.units.bt2020 && base.hdr_encoding == 4u;
+    xefg_adaptive_upper_reuse = EditReuseInputsEligible(adaptive_plan, adaptive_group, reuse_inputs, private_color,
+        input.motion->GetDesc(), input.depth->GetDesc(), base.hdr_mode, hdr10,
+        nr_model::ResolvePreset(preset.load(), 0, direct_runtime_requirements.dual_models));
+  }
+  // Native FG x2 is admitted below only with the adaptive workset disabled.
   const auto freeze_adaptive = [&](uint32_t roles) {
-    return FreezeAdaptiveFrame(&stream->adaptive_session, adaptive_plan,
-      {.stage = stage_plan::Stage::PRESENT, .count = adaptive_plan.pass_count},
+    return FreezeAdaptiveFrame(&stream->adaptive_session, adaptive_plan, adaptive_group,
       input.color_width, input.color_height, contract.input_width, contract.input_height,
       reinterpret_cast<uintptr_t>(stream) ^ reinterpret_cast<uintptr_t>(stream->device)
           ^ reinterpret_cast<uintptr_t>(stream->queue) ^ input.epoch ^ static_cast<uint64_t>(base.hdr_mode)
-           ^ (static_cast<uint64_t>(input.backbuffer->GetDesc().Format) * 1099511628211ull) ^ contract.create_flags
+          ^ (static_cast<uint64_t>(backbuffer_desc.Format) * 1099511628211ull) ^ contract.create_flags
           ^ (static_cast<uint64_t>(coupled_ui) << 40) ^ (static_cast<uint64_t>(may_compose) << 41),
       !base.d3d11_bridge && !base.native_prefg_resolution_pair,
       input.application_frame, roles, true, 1, stream->adaptive_model_roles, false, nullptr,
-      input.output, input.epoch);
+      input.output, input.epoch, {.upper = xefg_adaptive_upper_reuse});
   };
   stream->adaptive_frame = freeze_adaptive(missing_prepared_role ? stream->adaptive_required_roles : required_model_roles);
   if (missing_prepared_role && previous_adaptive_layout == stream->adaptive_frame.layout_identity
@@ -635,9 +662,6 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
       }
     }
   }
-  const bool mask_pipeline = control_mask_enabled.load(std::memory_order_relaxed)
-      && nr_model::SupportsControlMask(direct_runtime_requirements.file_version)
-      && !base.native_prefg_resolution_pair;
   const auto pipeline_wait = [&](PipelinePreparationResult result) {
     CountNrDecline(result == PipelinePreparationResult::PENDING
         ? NrDeclineReason::kSlotWarmupMaturation : NrDeclineReason::kFailureBackoff);
@@ -754,15 +778,6 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     Transition(list, depth, kRead, depth_state, 0u);
     Transition(list, motion, kRead, motion_state, 0u);
   };
-  // XeFG full-frame inputs can feed the core's original copy directly while
-  // output stays private. Composition needs the unmodified staged backbuffer.
-  const auto backbuffer_desc = input.backbuffer->GetDesc();
-  const bool xefg_edit_reuse_frame = edit_reuse_enabled.load(std::memory_order_relaxed)
-      && !stream->native && native_parameters == nullptr && !has_hudless && !input.ui_composition
-      && input.fg_enabled && input.has_present_id && input.has_constants && input.application_frame != 0
-      && present_frame_policy::Known(base_frame)
-      && real_guides && input.color_x == 0 && input.color_y == 0
-      && backbuffer_desc.Width == input.color_width && backbuffer_desc.Height == input.color_height;
   bool native_edit_reuse_frame = false;
   auto fixed_workset = stream->adaptive_frame;
   if (stream->native && native_parameters != nullptr && base.base_frame.reuse_edits

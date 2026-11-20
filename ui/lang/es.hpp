@@ -2320,7 +2320,7 @@ inline constexpr Translation kEs[] = {
     {"Adaptive resolution", "Resolución adaptativa"},
     {"Adjust NR working resolution toward your target output FPS, including generated frames. Manual resolutions are the upper limits. No extra program is required.", "Ajusta la resolución de trabajo de NR hacia los FPS de salida objetivo, incluidos los fotogramas generados. Las resoluciones manuales son los límites superiores. No requiere programas adicionales."},
     {"Target output FPS", "FPS de salida objetivo"},
-    {"The target includes generated frames. If lowering NR brings no FPS benefit, the previous quality is restored.", "El objetivo incluye fotogramas generados. Si reducir NR no mejora los FPS, se restaura la calidad anterior."},
+    {"The target includes generated frames. Lower one tier while below target; hold at target. Raise only with sustained headroom. GPU timing is diagnostic.", "El objetivo incluye fotogramas generados. Por debajo del objetivo, la resolución baja un nivel. Al alcanzarlo, se mantiene. Solo sube si los FPS superan el objetivo con margen sostenido. Los tiempos de GPU se usan para diagnóstico."},
     {"Minimum relative scale", "Escala relativa mínima"},
     {"Minimum width and height relative to each pass's manual upper limit. Existing stage limits still apply.", "Anchura y altura mínimas respecto al límite manual de cada pasada. Siguen aplicándose los límites de la etapa."},
     {"Estimated output FPS: %.1f", "FPS de salida estimados: %.1f"},

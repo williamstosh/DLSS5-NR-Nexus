@@ -2320,7 +2320,7 @@ inline constexpr Translation kBg[] = {
     {"Adaptive resolution", "Адаптивна резолюция"},
     {"Adjust NR working resolution toward your target output FPS, including generated frames. Manual resolutions are the upper limits. No extra program is required.", "Настройва работната резолюция на NR към целевия изходен FPS, включително генерираните кадри. Ръчните резолюции са горни граници. Не е нужна допълнителна програма."},
     {"Target output FPS", "Целеви изходен FPS"},
-    {"The target includes generated frames. If lowering NR brings no FPS benefit, the previous quality is restored.", "Целта включва генерираните кадри. Ако понижаването на NR не подобри FPS, предишното качество се възстановява."},
+    {"The target includes generated frames. Lower one tier while below target; hold at target. Raise only with sustained headroom. GPU timing is diagnostic.", "Целта включва генерираните кадри. Под целта резолюцията се понижава с една степен. При достигане на целта се запазва. Повишава се само при устойчив запас от FPS. Измерването на времето на GPU служи за диагностика."},
     {"Minimum relative scale", "Минимален относителен мащаб"},
     {"Minimum width and height relative to each pass's manual upper limit. Existing stage limits still apply.", "Минимални ширина и височина спрямо ръчната горна граница за всеки проход. Ограниченията на етапа остават в сила."},
     {"Estimated output FPS: %.1f", "Приблизителен изходен FPS: %.1f"},

@@ -2320,7 +2320,7 @@ inline constexpr Translation kRu[] = {
     {"Adaptive resolution", "Адаптивное разрешение"},
     {"Adjust NR working resolution toward your target output FPS, including generated frames. Manual resolutions are the upper limits. No extra program is required.", "Подстраивает рабочее разрешение NR под целевой выходной FPS с учётом сгенерированных кадров. Ручные разрешения задают верхние пределы. Дополнительные программы не нужны."},
     {"Target output FPS", "Целевой выходной FPS"},
-    {"The target includes generated frames. If lowering NR brings no FPS benefit, the previous quality is restored.", "Цель включает сгенерированные кадры. Если снижение разрешения NR не повышает FPS, восстанавливается прежнее качество."},
+    {"The target includes generated frames. Lower one tier while below target; hold at target. Raise only with sustained headroom. GPU timing is diagnostic.", "Цель учитывает сгенерированные кадры. Пока FPS ниже цели, разрешение снижается на одну ступень за раз. При достижении цели оно сохраняется. Повышение возможно только при устойчивом запасе FPS. Замеры времени GPU служат для диагностики."},
     {"Minimum relative scale", "Минимальный относительный масштаб"},
     {"Minimum width and height relative to each pass's manual upper limit. Existing stage limits still apply.", "Минимальные ширина и высота относительно ручного предела каждого прохода. Ограничения этапа сохраняются."},
     {"Estimated output FPS: %.1f", "Оценка выходного FPS: %.1f"},

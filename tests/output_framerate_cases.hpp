@@ -5,7 +5,7 @@
 #pragma once
 
 #include <cmath>
-#include "adaptive_resolution.hpp"
+
 #include "output_framerate.hpp"
 
 template <typename Check>
@@ -21,7 +21,8 @@ void RunOutputFramerateCases(const Check& check) {
   check(snapshot.available && std::abs(snapshot.fps - 300) < 0.001
           && snapshot.window_begin_ns == start && snapshot.window_end_ns == start + 200 * step
           && snapshot.fps_mad == 0 && snapshot.requested_multiplier == 4 && snapshot.observed_multiplier == 3
-          && snapshot.identity == 1,
+          && snapshot.identity == 1 && snapshot.split_available
+          && snapshot.split_fps[0] == 300. && snapshot.split_fps[1] == 300.,
       "SDK counts establish four complete output bins independently of requested multiplier");
   const auto generation = snapshot.source_generation;
   stream.Observe(rate::Source::XEFG_STATUS, 1, 3, start + 201 * step, 4, 4, 4);
@@ -31,11 +32,12 @@ void RunOutputFramerateCases(const Check& check) {
     stream.Observe(rate::Source::XEFG_STATUS, 1, 3, start + index * step, 0, 4, 0);
   }
   snapshot = stream.Read(start + 401 * step);
-  check(snapshot.available && snapshot.fps == 0 && snapshot.observed_multiplier == 0,
+  check(snapshot.available && snapshot.fps == 0 && snapshot.observed_multiplier == 0
+          && snapshot.split_available && snapshot.split_fps[0] == 0. && snapshot.split_fps[1] == 0.,
       "zero SDK frames remain a valid measured zero rather than missing telemetry");
   check(!stream.Read(start + 502 * step).available, "stale output samples are unavailable");
   stream.Reset(rate::Reason::kDUPLICATE);
-  check(!stream.snapshot.available && stream.snapshot.reason == rate::Reason::kDUPLICATE,
+  check(!stream.snapshot.available && !stream.snapshot.split_available && stream.snapshot.reason == rate::Reason::kDUPLICATE,
       "duplicate application frames clear the output window");
   stream.Observe(rate::Source::PRESENT, 2, 3, start + 503 * step, 1, 1, 1);
   check(stream.snapshot.source == rate::Source::PRESENT && !stream.snapshot.available,
@@ -242,6 +244,25 @@ void RunOutputFramerateCases(const Check& check) {
       "native SDK intervals slightly slower than 1 Hz retain complete intervals and a fresh window");
   check(!slow_sdk.Read(start + 4 * sdk_period + 2'000'000'001).available,
       "native SDK observations still expire after the bounded two-second interval");
+  rate::Stream uneven_sdk;
+  uneven_sdk.Observe(rate::Source::NATIVE_STATE, 1, 1, start, 0);
+  uneven_sdk.Observe(rate::Source::NATIVE_STATE, 1, 1, start + 500'000'000, 20);
+  uneven_sdk.Observe(rate::Source::NATIVE_STATE, 1, 1, start + 2'000'000'000, 90);
+  uneven_sdk.Observe(rate::Source::NATIVE_STATE, 1, 1, start + 2'750'000'000, 60);
+  check(!uneven_sdk.Read(start + 2'750'000'000).split_available, "three completed intervals leave the split unavailable");
+  uneven_sdk.Observe(rate::Source::NATIVE_STATE, 1, 1, start + 4'000'000'000, 125);
+  snapshot = uneven_sdk.Read(start + 4'000'000'000);
+  check(snapshot.available && snapshot.split_available && snapshot.window_begin_ns == start
+          && snapshot.window_end_ns == start + 4'000'000'000 && snapshot.fps == 73.75
+          && snapshot.split_fps[0] == 55. && snapshot.split_fps[1] == 92.5,
+      "each SDK half uses complete chronological counts divided by covered time");
+  uneven_sdk.Observe(rate::Source::NATIVE_STATE, 1, 1, start + 4'500'000'000, 5);
+  snapshot = uneven_sdk.Read(start + 4'500'000'000);
+  check(snapshot.available && snapshot.split_available && snapshot.window_begin_ns == start + 500'000'000
+          && snapshot.window_end_ns == start + 4'500'000'000 && snapshot.fps == 70.
+          && std::abs(snapshot.split_fps[0] - 150. / 2.25) < 0.001
+          && std::abs(snapshot.split_fps[1] - 130. / 1.75) < 0.001,
+      "the rolling ring still reports chronological weighted halves after the oldest bucket is replaced");
   rate::Stream fast_present;
   for (int64_t index = 0; index <= 200; ++index) {
     fast_present.Observe(rate::Source::PRESENT, 1, 1, start + index * step, 1);
@@ -249,78 +270,44 @@ void RunOutputFramerateCases(const Check& check) {
   check(!fast_present.Read(start + 200 * step + 1'100'000'000).available,
       "the longer SDK allowance does not extend ordinary Present freshness");
 
-  namespace adaptive = renodx::addons::dlss5::adaptive_resolution;
-  const auto controller_output = [](const rate::Snapshot& sample) {
-    return adaptive::Output{.available = sample.available, .source = static_cast<uint64_t>(sample.source),
-        .generation = sample.source_generation, .configuration = sample.configuration_generation,
-        .serial = sample.window_serial, .begin_ns = sample.window_begin_ns, .end_ns = sample.window_end_ns,
-        .fps = sample.fps, .mad = sample.fps_mad, .observed_multiplier = sample.observed_multiplier,
-        .multiplier_variable = sample.multiplier_variable};
-  };
-  adaptive::Sizes upper{}, floor{};
-  upper[0] = {.width = 1920, .height = 1080};
-  floor[0] = {.width = 634, .height = 356};
-  const adaptive::Settings controller_settings{.enabled = true, .target_fps = 250.f, .prepared_levels = 4};
   rate::ReleaseNative();
   rate::BindNativeOutput(native_output, 7);
   rate::ObserveNativeOptions(7, 5, 3, 4);
-  adaptive::Session unpaired;
   for (int64_t index = 0; index <= 400; ++index) {
     const int64_t now = start + index * step;
     rate::ObserveNativePresent(native_output, true, now);
     observe_state(7, 2, now);
-    unpaired.ObserveGpu({.generation = unpaired.status.generation,
-        .frame = static_cast<uint64_t>(index + 1), .sequence = static_cast<uint64_t>(index + 1),
-        .context = 1, .recorded_ns = now, .completed_ns = now,
-        .total_us = 3000., .valid = true, .stable = true,
-        .sampling_generation = unpaired.sampling_generation}, now);
-    unpaired.Prepare(controller_settings, upper, floor, 1,
-        controller_output(rate::Read(native_output, now)), now, true, false);
-    unpaired.UpdatePreparation(unpaired.preparation_epoch, static_cast<uint32_t>(unpaired.ladder.count),
-        static_cast<uint32_t>(unpaired.ladder.count), adaptive::Reason::PREPARING, now);
-    unpaired.Applied(unpaired.status.generation, unpaired.status.requested, now);
   }
-  check(rate::Read(native_output, start + 400 * step).available && unpaired.level == 0 && !unpaired.trial
-          && unpaired.status.reason == adaptive::Reason::COLLECTING,
-      "successful outer SDK calls without frame identity cannot provide a dynamic denominator or start a trial");
+  snapshot = rate::Read(native_output, start + 400 * step);
+  check(snapshot.available && snapshot.fps == 200. && snapshot.multiplier_variable && snapshot.observed_multiplier == 0.,
+      "successful outer SDK calls without frame identity preserve output counts and leave the dynamic denominator unknown");
 
   rate::ReleaseNative();
   rate::BindNativeOutput(native_output, 7);
   rate::ObserveNativeOptions(7, 5, 3, 4);
   observe_application(0, start);
   observe_state(7, 0, start + 1);
-  adaptive::Session paired;
-  bool raised_multiplier = false, accepted_confounded_quality = false, saw_native_ratio = false;
+  constexpr int64_t multiplier_change_frame = 840;
+  bool saw_native_ratio = false;
   uint32_t queued_frames = 0;
   for (int64_t index = 1; index <= 2200; ++index) {
     const int64_t now = start + index * step;
     observe_application(static_cast<uint32_t>(index), now);
     observe_application(static_cast<uint32_t>(index), now + 1);
-    queued_frames += (raised_multiplier ? 4u : 2u);
+    queued_frames += (index > multiplier_change_frame ? 4u : 2u);
     if (index % 105 == 0) {
       observe_state(7, queued_frames, now + 1);
       queued_frames = 0;
     }
-    const auto sample = rate::Read(native_output, now + 1);
-    saw_native_ratio |= sample.available && std::abs(sample.observed_multiplier - 2.) < 0.001;
-    paired.ObserveGpu({.generation = paired.status.generation,
-        .frame = static_cast<uint64_t>(index), .sequence = static_cast<uint64_t>(index),
-        .context = 1, .recorded_ns = now, .completed_ns = now + 1,
-        .total_us = (paired.level == 0 ? 3000. : 2900.), .valid = true, .stable = true,
-        .sampling_generation = paired.sampling_generation}, now + 1);
-    paired.Prepare(controller_settings, upper, floor, 1,
-        controller_output(sample), now + 1, true, false);
-    paired.UpdatePreparation(paired.preparation_epoch, static_cast<uint32_t>(paired.ladder.count),
-        static_cast<uint32_t>(paired.ladder.count), adaptive::Reason::PREPARING, now + 1);
-    paired.Applied(paired.status.generation, paired.status.requested, now + 1);
-    if (paired.trial && paired.level != 0) raised_multiplier = true;
-    accepted_confounded_quality |= raised_multiplier && paired.level != 0 && !paired.trial;
+    if (index == multiplier_change_frame) {
+      const auto sample = rate::Read(native_output, now + 1);
+      saw_native_ratio = sample.available && std::abs(sample.observed_multiplier - 2.) < 0.001;
+    }
   }
   snapshot = rate::Read(native_output, start + 2200 * step + 1);
-  check(saw_native_ratio && raised_multiplier && !accepted_confounded_quality && paired.level == 0
-          && snapshot.available && snapshot.source == rate::Source::NATIVE_STATE
-          && std::abs(snapshot.observed_multiplier - 4.) < 0.001,
-      "identified native frames and their same-frame re-deliveries preserve coverage and reject a 2x to 4x false NR benefit");
+  check(saw_native_ratio && snapshot.available && snapshot.source == rate::Source::NATIVE_STATE
+          && std::abs(snapshot.observed_multiplier - 4.) < 0.001 && std::abs(snapshot.fps - 400.) < 0.001,
+      "identified Native frames and their same-frame redeliveries preserve coverage across a measured 2x to 4x change");
   const auto native_generation = snapshot.source_generation;
   rate::ObserveNativePresent(native_output, true, start + 2201 * step);
   snapshot = rate::Read(native_output, start + 2201 * step);
@@ -333,33 +320,83 @@ void RunOutputFramerateCases(const Check& check) {
   rate::ReleaseNative();
   rate::BindNativeOutput(native_output, 7);
   rate::ObserveNativeOptions(7, 5, 1, 2);
-  adaptive::Session fixed_counts;
-  constexpr adaptive::Settings target{.enabled = true, .target_fps = 100.f, .prepared_levels = 2};
   constexpr int64_t interval_ns = 1'500'000'000;
-  bool fixed_trial_started = false;
-  bool fixed_trial_accepted = false;
+  bool measured_80 = false;
   for (int64_t index = 0; index <= 2400; ++index) {
     const int64_t ns = start + index * step;
     rate::ObserveNativeEvaluation(native_output, 2, true, ns);
     if ((index * step) % interval_ns == 0) {
-      observe_state(7, fixed_counts.level != 0 ? 150u : 120u, ns);
+      observe_state(7, index <= 1200 ? 120u : 150u, ns);
     }
-    const auto sample = rate::Read(native_output, ns);
-    fixed_counts.ObserveGpu({.generation = fixed_counts.status.generation,
-        .frame = static_cast<uint64_t>(index + 1), .sequence = static_cast<uint64_t>(index + 1),
-        .context = 1, .recorded_ns = ns, .completed_ns = ns,
-        .total_us = (fixed_counts.level == 0 ? 3100. : 2200.), .valid = true, .stable = true,
-        .sampling_generation = fixed_counts.sampling_generation}, ns);
-    fixed_counts.Prepare(target, upper, floor, 1, controller_output(sample), ns, true, false);
-    fixed_counts.UpdatePreparation(fixed_counts.preparation_epoch, static_cast<uint32_t>(fixed_counts.ladder.count),
-        static_cast<uint32_t>(fixed_counts.ladder.count), adaptive::Reason::PREPARING, ns);
-    fixed_counts.Applied(fixed_counts.status.generation, fixed_counts.status.requested, ns);
-    fixed_trial_started |= sample.available && !sample.multiplier_variable && sample.observed_multiplier == 0
-        && fixed_counts.level != 0 && fixed_counts.trial;
-    fixed_trial_accepted |= fixed_trial_started && fixed_counts.level != 0 && !fixed_counts.trial;
+    if (index == 1200) {
+      const auto sample = rate::Read(native_output, ns);
+      measured_80 = sample.available && sample.fps == 80. && !sample.multiplier_variable && sample.rate_comparable
+          && sample.observed_multiplier == 0.;
+    }
   }
-  check(fixed_trial_started && fixed_trial_accepted,
-      "fixed SDK counts can trial and accept 80 to 100 FPS without an application-frame denominator");
+  snapshot = rate::Read(native_output, start + 2400 * step);
+  check(measured_80 && snapshot.available && snapshot.fps == 100. && !snapshot.multiplier_variable && snapshot.rate_comparable
+          && snapshot.observed_multiplier == 0. && snapshot.split_available
+          && snapshot.split_fps[0] == 100. && snapshot.split_fps[1] == 100.,
+      "fixed SDK counts retain both measured cadences and complete halves without a denominator");
+  constexpr int64_t fixed_state_end = start + 2400 * step;
+  for (int64_t index = 1; index <= 8; ++index) {
+    const int64_t now = fixed_state_end + index * (interval_ns / 2);
+    rate::ObserveNativeEvaluation(native_output, 2, true, now);
+    if (index % 2 == 0) {
+      observe_state(7, 0, now);
+    }
+  }
+  snapshot = rate::Read(native_output, fixed_state_end + 4 * interval_ns);
+  check(snapshot.available && snapshot.rate_comparable && snapshot.fps == 0.
+          && snapshot.observed_multiplier == 0. && snapshot.rate_multiplier == 2.,
+      "fixed Native evidence permits a complete measured zero-FPS window without a denominator");
+
+  rate::ReleaseNative();
+  rate::BindNativeOutput(native_output, 7);
+  rate::ObserveNativeOptions(7, 5, 3, 4);
+  constexpr uint32_t applications_per_interval = 30;
+  constexpr int64_t application_period_ns = interval_ns / applications_per_interval;
+  observe_application(0, start);
+  observe_state(7, 0, start);
+  for (uint32_t application = 1; application <= 8 * applications_per_interval; ++application) {
+    const int64_t now = start + application * application_period_ns;
+    observe_application(application, now);
+    if (application % applications_per_interval != 0) continue;
+    const uint32_t interval = application / applications_per_interval;
+    observe_state(7, (interval <= 4 && interval % 2 == 0 ? 120u : 60u), now);
+    snapshot = rate::Read(native_output, now);
+    if (interval == 4) {
+      check(snapshot.available && snapshot.source == rate::Source::NATIVE_STATE && snapshot.multiplier_variable
+              && snapshot.fps == 60. && snapshot.observed_multiplier == 3.
+              && snapshot.split_available && snapshot.split_fps[0] == 60. && snapshot.split_fps[1] == 60.
+              && !snapshot.rate_comparable,
+          "alternating Native 2x and 4x intervals retain their measured FPS and reject adaptive comparison");
+    } else if (interval == 7) {
+      check(snapshot.available && !snapshot.rate_comparable,
+          "Native comparison remains blocked while the last 4x interval is in the window");
+    } else if (interval == 8) {
+      check(snapshot.available && snapshot.rate_comparable && snapshot.fps == 40. && snapshot.observed_multiplier == 2.,
+          "four stable Native intervals restore adaptive comparison");
+    }
+  }
+
+  rate::Stream frequent_sdk;
+  constexpr int64_t sdk_step_ns = rate::Stream::BIN_NS / 2;
+  frequent_sdk.Observe(rate::Source::NATIVE_STATE, 1, 1, start, 0);
+  for (int64_t read = 1; read <= 16; ++read) {
+    const int64_t now = start + read * sdk_step_ns;
+    const double frames = (read % 2 != 0 ? 10. : (read <= 8 ? 20. : 11.));
+    frequent_sdk.Observe(rate::Source::NATIVE_STATE, 1, 1, now, frames, 0, 0, false, 0, false, 5);
+    if (read == 8) {
+      snapshot = frequent_sdk.Read(now);
+      check(snapshot.available && snapshot.fps == 60. && snapshot.fps_mad == 0. && !snapshot.rate_comparable,
+          "Native SDK reads that alternate within every bin are incomparable despite identical bin rates");
+    }
+  }
+  snapshot = frequent_sdk.Read(start + 16 * sdk_step_ns);
+  check(snapshot.available && snapshot.rate_comparable && snapshot.fps == 42.,
+      "Native SDK intervals within ten percent remain comparable");
 
   rate::ReleaseNative();
   rate::BindNativeOutput(native_output, 7);
@@ -375,7 +412,7 @@ void RunOutputFramerateCases(const Check& check) {
     }
   }
   snapshot = rate::Read(native_output, start + 600 * step);
-  check(snapshot.available && snapshot.fps == 80 && snapshot.multiplier_variable
+  check(snapshot.available && snapshot.fps == 80 && snapshot.multiplier_variable && !snapshot.rate_comparable
           && snapshot.observed_multiplier == 0,
       "fresh application endpoints cannot cover a missing middle segment of a variable-rate SDK interval");
   for (int64_t index = 601; index <= 1200; ++index) {
@@ -386,7 +423,8 @@ void RunOutputFramerateCases(const Check& check) {
     }
   }
   snapshot = rate::Read(native_output, start + 1200 * step);
-  check(snapshot.available && snapshot.multiplier_variable && std::abs(snapshot.observed_multiplier - 0.8) < 0.001,
+  check(snapshot.available && snapshot.multiplier_variable && snapshot.rate_comparable
+          && std::abs(snapshot.observed_multiplier - 0.8) < 0.001,
       "complete subsequent intervals restore the observed variable-rate ratio");
 
   rate::ReleaseNative();

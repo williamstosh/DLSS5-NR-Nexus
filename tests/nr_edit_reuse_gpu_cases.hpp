@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <DirectXPackedVector.h>
@@ -1934,7 +1933,9 @@ int Run() {
           "source release retires submitted and discarded cache references");
     anchor_state.reset();
 
-    const auto automatic_trial = [&](const NVSDK_NGX_Handle* trial_source, bool native_off, int low_fps) {
+    enum class TimingCoverage { FULL, HALF, NONE };
+    const auto automatic_descent = [&](const NVSDK_NGX_Handle* trial_source, bool native_off, int low_fps,
+                                       TimingCoverage timing) {
       const AdaptivePresentRegistration registration;
       AdaptivePresentOutput present(gpu, output.Get());
       const auto output_identity = present.Identity();
@@ -1959,27 +1960,24 @@ int Run() {
       native::RegisterCreatedFeatureLocked(trial_source, native::kFeatureDlss, &parameters);
       auto& feature = native::features.at(trial_source);
 
-      std::atomic_int fps{80};
-      std::mutex output_cadence_mutex;
-      std::condition_variable output_cadence_changed;
-      std::jthread producer([&](std::stop_token stop) {
-        // A delayed provider still has to collect all four real cadence bins.
-        if (!native_off && low_fps == 80) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      funnel_accounting_tests::Restore clock;
+      clock.Value(&rate::test_now_ns);
+      rate::test_now_ns = rate::NowNs();
+      const auto cadence_begin_ns = rate::NowNs();
+      int64_t next_present_ns = cadence_begin_ns;
+      int64_t cadence_ns = 1'000'000'000 / 80;
+      const auto advance = [&](int64_t until_ns) {
+        Check(until_ns >= rate::NowNs(), "advance the shared fixture clock monotonically");
+        while (next_present_ns <= until_ns) {
+          rate::test_now_ns = next_present_ns;
+          present.Present();
+          unrelated.Present();
+          next_present_ns += cadence_ns;
         }
-        auto deadline = std::chrono::steady_clock::now();
-        while (!stop.stop_requested()) {
-          {
-            std::lock_guard lock(output_cadence_mutex);
-            present.Present();
-            unrelated.Present();
-          }
-          output_cadence_changed.notify_one();
-          deadline += std::chrono::nanoseconds(1'000'000'000 / fps.load());
-          std::this_thread::sleep_until(deadline);
-        }
-      });
+        rate::test_now_ns = until_ns;
+      };
       for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 32; ++attempt) {
+        advance(rate::NowNs() + cadence_ns);
         source_frame(trial_source, 0, true, false);
         if (feature.adaptive_session != nullptr && feature.adaptive_session->prepared
             && feature.adaptive_session->status.applied[0].width == 16) break;
@@ -1993,8 +1991,10 @@ int Run() {
       auto lower_model = tiers->tiers[1].state.slots[0].handle;
       Check(upper_model != nullptr && lower_model != nullptr && upper_model != lower_model,
             "the two prepared grids have distinct model histories");
-      Check(source_frame(trial_source, 1, true, false) == 1 && source_frame(trial_source, 0, true, false) == 0
-                && session->paired_sampling,
+      advance(rate::NowNs() + cadence_ns);
+      Check(source_frame(trial_source, 1, true, false) == 1, "the delivered upper tier refreshes in fixed x2");
+      advance(rate::NowNs() + cadence_ns);
+      Check(source_frame(trial_source, 0, true, false) == 0 && session->paired_sampling,
             "even without combination Off the delivered upper tier runs fixed x2");
 
       const AdaptiveGpuSubmission queue{.gpu = &gpu};
@@ -2010,126 +2010,83 @@ int Run() {
         });
         return Recording{.calls = calls, .timer = (segment != std::end(timers::internal::segments) ? &*segment : nullptr)};
       };
-      const auto wait_until_ns = [](int64_t timestamp_ns) {
-        std::this_thread::sleep_until(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(timestamp_ns)));
-      };
-      const auto describe_output_window = [&](const char* checkpoint, const rate::Snapshot& sample, int64_t read_ns) {
-        std::cout << "OBS adaptive output checkpoint=" << checkpoint << " source_handle=" << trial_source
-                  << " off=" << native_off << " low_target_fps=" << low_fps
-                  << " available=" << sample.available << " reason=" << static_cast<int>(sample.reason)
-                  << " source=" << static_cast<int>(sample.source) << " fps=" << sample.fps
-                  << " mad=" << sample.fps_mad << " serial=" << sample.window_serial
-                  << " output_generation=" << sample.output.generation << '/' << output_identity.generation
-                  << " source_generation=" << sample.source_generation << " configuration=" << sample.configuration_generation
-                  << " window_begin_ns=" << sample.window_begin_ns << " window_end_ns=" << sample.window_end_ns
-                  << " read_ns=" << read_ns << " applied_ns=" << session->applied_ns
-                  << " stable_after_ns=" << session->stable_after_ns;
-        std::shared_lock lock(rate::internal::state.mutex);
-        const auto found = rate::internal::state.present.find(output_identity.swapchain);
-        if (found != rate::internal::state.present.end()) {
-          const auto& stream = found->second.stream;
-          std::cout << " bins=" << stream.count << '/' << stream.bins.size()
-                    << " previous_ns=" << stream.previous_ns << " pending_begin_ns=" << stream.pending.begin_ns
-                    << " pending_end_ns=" << stream.pending.end_ns << " pending_frames=" << stream.pending.frames;
-          for (size_t index = 0; index < stream.count; ++index) {
-            const auto& bin = stream.bins[index];
-            std::cout << " bin" << index << "_ns=" << bin.end_ns - bin.begin_ns
-                      << " bin" << index << "_frames=" << bin.frames;
-          }
-        }
-        std::cout << '\n';
-      };
 #if defined(NR_NEXUS_DEV_CONTROL)
       funnel_accounting_tests::Restore adaptive_diagnostic;
       adaptive_diagnostic.Atomic(&native::edit_reuse_adaptive_experiment);
 #endif
       rate::Snapshot upper_output;
-      int64_t upper_read_ns = 0;
-      const auto upper_deadline = std::chrono::steady_clock::time_point(std::chrono::nanoseconds(
-          session->stable_after_ns + static_cast<int64_t>(rate::Stream{}.bins.size()) * rate::Stream::BIN_NS));
-      {
-        std::unique_lock lock(output_cadence_mutex);
-        output_cadence_changed.wait_until(lock, upper_deadline, [&] {
-          // Stream::Read rejects a caller time older than its latest callback.
-          // Keep the clock read and public Read together between callbacks.
-          upper_read_ns = rate::NowNs();
-          upper_output = rate::Read(output_identity, upper_read_ns);
-          // An available but inaccurate rate must fail the original check.
-          return upper_output.available;
-        });
-      }
-      describe_output_window("upper", upper_output, upper_read_ns);
-      Check(upper_output.available && upper_output.source == rate::Source::PRESENT && upper_output.output == output_identity
-                && std::abs(upper_output.fps - 80.) < 3.,
-            "real registered Present callbacks produced the main output's complete 80 FPS window");
+      advance(std::max({session->stable_after_ns, rate::NowNs(), cadence_begin_ns + 4 * rate::Stream::BIN_NS}));
       const auto upper_applied_ns = session->applied_ns;
       const auto upper_generation = session->applied_generation;
       adaptive::GpuSample old_half;
       Recording first_lower;
-      bool saw_half = false;
-      for (uint32_t cycle = 0; cycle < 12; ++cycle) {
-        wait_until_ns(session->next_measure_ns + 2'000'000);
+      for (uint32_t cycle = 0; cycle < 20; ++cycle) {
+        advance(std::max(session->next_measure_ns, rate::NowNs() + cadence_ns));
+        upper_output = rate::Read(output_identity, rate::NowNs());
         const auto refresh = record();
         if (tiers->active == 1) {
           first_lower = refresh;
           break;
         }
+        Check(upper_output.available && upper_output.source == rate::Source::PRESENT
+                  && upper_output.output == output_identity && session->status.output_fps == 80.,
+              "the main output's measured cadence stays available during the upper timing probes");
         Check(refresh.calls == 1 && refresh.timer != nullptr && refresh.timer->measure && refresh.timer->adaptive.paired,
               "an actual upper refresh records the first member of an x2 cost cycle");
         const auto first_tag = refresh.timer->adaptive;
         const auto samples_before = session->gpu_count;
-        queue.Complete(refresh.timer, 3000);
-        Check(session->gpu_count == samples_before && session->pending_pair.frame == first_tag.application_frame
-                  && session->status.output_fps > 77. && session->output_source == static_cast<uint64_t>(rate::Source::PRESENT),
-              "an upper half pair leaves cost unchanged while the real PRESENT window remains available");
-        old_half = session->pending_pair;
-        if (samples_before == 0) {
-          Check(session->status.reason == adaptive::Reason::COLLECTING && !session->trial,
-                "a first upper half pair cannot request a lower tier");
-          saw_half = true;
-          if (native_off) {
-            SetAdaptiveOutputMode(&present, 71, sl::DLSSGMode::eOn);
-          }
+        queue.Complete(refresh.timer, timing == TimingCoverage::NONE ? 0 : 3000);
+        Check(session->gpu_count == samples_before
+                  && session->pending_pair.frame == (timing == TimingCoverage::NONE ? 0 : first_tag.application_frame),
+              "a half pair or absent timing leaves complete costs unchanged");
+        if (session->pending_pair.frame != 0) old_half = session->pending_pair;
+        if (cycle == 0 && native_off) {
+          SetAdaptiveOutputMode(&present, 71, sl::DLSSGMode::eOn);
         }
 #if defined(NR_NEXUS_DEV_CONTROL)
-        const bool toggle_diagnostic = samples_before == 1 && native_off;
+        const bool toggle_diagnostic = cycle == 1 && native_off;
         if (toggle_diagnostic) {
           native::edit_reuse_adaptive_experiment = true;
         }
 #endif
+        // Both SR recordings observe the same completed output window.
+        advance(rate::NowNs() + 1);
         const auto reused = record();
-        if (tiers->active == 1) {
-          first_lower = reused;
-          break;
-        }
         Check(reused.calls == 0 && reused.timer != nullptr && reused.timer->measure
                   && reused.timer->adaptive.application_frame == first_tag.application_frame + 1
                   && reused.timer->adaptive.pair_first_frame == first_tag.pair_first_frame,
               "the adjacent, delivered zero-call upper reuse records the other half of the same cycle");
-        queue.Complete(reused.timer, 1000);
-        Check(session->gpu_count == std::min(samples_before + 1, session->gpu_us.size())
-                  && session->gpu_us[session->gpu_count - 1] == 2000. && session->pending_pair.frame == 0,
-              "delivered WARP refresh and reuse publish exactly one 2 ms base-frame cost");
-        if (samples_before == 0 && native_off) {
-          Check(session->sampling_generation == first_tag.sampling_generation && session->status.output_fps > 77.,
-                "withdrawing Off alone preserves a healthy fixed anchor, cost pair and independent output window");
+        queue.Complete(reused.timer, timing == TimingCoverage::FULL ? 1000 : 0);
+        if (timing == TimingCoverage::FULL) {
+          Check(session->gpu_count == std::min(samples_before + 1, session->gpu_us.size())
+                    && session->gpu_us[session->gpu_count - 1] == 2000. && session->pending_pair.frame == 0,
+                "delivered WARP refresh and reuse publish exactly one 2 ms base-frame cost");
+        } else {
+          Check(session->gpu_count == 0, "incomplete timing never publishes an upper cycle");
+        }
+        if (cycle == 0 && native_off) {
+          Check(session->sampling_generation == first_tag.sampling_generation && session->status.output_fps == 80.,
+                "withdrawing Off alone preserves a healthy fixed anchor and cost pair");
           SetAdaptiveOutputMode(&present, 71);
         }
 #if defined(NR_NEXUS_DEV_CONTROL)
         if (toggle_diagnostic) {
-          Check(session->sampling_generation == first_tag.sampling_generation && session->status.output_fps > 77.,
+          Check(session->sampling_generation == first_tag.sampling_generation && session->status.output_fps == 80.,
                 "enabling diagnostic logging preserves the actual upper x2 pair and independent output window");
           native::edit_reuse_adaptive_experiment = false;
         }
 #endif
       }
-      Check(saw_half && tiers->active == 1, "production output and complete upper cost cycles select the real lower grid");
-      Check(session->trial && session->level == 1 && session->previous_level == 0
-                && session->baseline_gpu_us == 2000. && std::abs(session->baseline_fps - 80.) < 3.
-                && session->status.requested[0].width == 12,
-            "actual low-tier selection preserves the automatic request and its frozen upper trial baseline");
-      const auto trial_generation = session->status.generation;
-      const auto baseline_fps = session->baseline_fps;
+      const auto requested_ns = rate::NowNs();
+      Check(upper_output.available && upper_output.source == rate::Source::PRESENT && upper_output.output == output_identity
+                && upper_output.window_begin_ns >= upper_applied_ns + adaptive::WARMUP_NS
+                && upper_output.window_end_ns - upper_output.window_begin_ns >= 4 * rate::Stream::BIN_NS
+                && upper_output.fps == 80. && upper_output.split_available
+                && upper_output.split_fps == std::array{80., 80.},
+            "registered Present callbacks produce a complete 80 FPS window with two deficient halves after warmup");
+      Check(tiers->active == 1 && session->level == 1 && session->status.requested[0].width == 12,
+            "the completed output window requests the adjacent low tier independently of timestamp coverage");
+      const auto low_generation = session->status.generation;
       Check(first_lower.calls == 1 && feature.slots[0].handle == lower_model && feature.input_width == 12
                 && model_resets.back() == 1 && session->paired_sampling == native_off
                 && session->pending_pair.frame == 0 && session->applied_generation == upper_generation
@@ -2146,10 +2103,11 @@ int Run() {
         timers::Poll(true, false);
         gpu.uploads.clear();
         gpu.retained_resources.clear();
-        Check(discarded->closed.load() && !discarded->submitted.load() && session->trial
+        Check(discarded->closed.load() && !discarded->submitted.load() && session->level == 1
                   && session->applied_generation == upper_generation && session->applied_ns == upper_applied_ns
                   && session->gpu_count == 0 && session->pending_pair.frame == 0,
               "discarded first low refresh leaves the upper confirmation and warmup unmodified");
+        advance(rate::NowNs() + cadence_ns);
         const auto maturation = record();
         lower_model = feature.slots[0].handle;
         Check(maturation.calls == 0 && tiers->active == 1 && feature.input_width == 12
@@ -2162,39 +2120,43 @@ int Run() {
         const auto original_pixels = original.Pixels();
         Check(original_pixels.size() == source_values.size() * sizeof(uint16_t)
                   && std::memcmp(original_pixels.data(), source_values.data(), original_pixels.size()) == 0
-                  && session->trial && session->applied_generation == upper_generation && session->applied_ns == upper_applied_ns
+                  && session->level == 1 && session->applied_generation == upper_generation && session->applied_ns == upper_applied_ns
                   && session->gpu_count == 0,
               "the maturation frame delivers original SR bits and leaves the old tier confirmation and costs intact");
+        advance(rate::NowNs() + cadence_ns);
         first_lower = record();
         Check(first_lower.calls == 1 && feature.slots[0].handle == lower_model && model_resets.back() == 1
-                  && session->status.generation == trial_generation,
+                  && session->status.generation == low_generation,
               "the first mature replacement refreshes within the original automatic trial");
       }
 
       const auto capture = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-      queue.Complete(first_lower.timer, native_off ? 2000 : 1500);
+      queue.Complete(first_lower.timer, timing == TimingCoverage::FULL ? (native_off ? 2000 : 1500) : 0);
       const auto pixels = capture.Pixels();
       Check(pixels.size() == source_values.size() * sizeof(uint16_t)
                 && std::memcmp(pixels.data(), source_values.data(), pixels.size()) != 0
                 && std::memcmp(pixels.data() + 6, source_values.data() + 3, sizeof(uint16_t)) == 0,
             "first confirmed lower work really edits the game's WARP output and preserves its alpha");
       const auto low_applied_ns = session->applied_ns;
-      Check(session->trial && session->applied_generation == trial_generation && session->status.applied[0].width == 12
+      Check(session->applied_generation == low_generation && session->status.applied[0].width == 12
                 && low_applied_ns > upper_applied_ns && session->stable_after_ns == low_applied_ns + adaptive::WARMUP_NS
-                && session->gpu_count == 0 && session->baseline_gpu_us == 2000. && session->baseline_fps == baseline_fps,
-            "only complete low delivery starts warmup with the original upper baseline and no inherited cost");
+                && session->gpu_count == 0,
+            "only complete low delivery starts its warmup with no inherited cost");
       if (!native_off) {
-        Check(session->sampling_generation > old_half.sampling_generation && feature.slots[0].edit_reuse == nullptr,
-              "low-tier single timing retires the upper sampling generation and cannot reuse without matching Off");
+        Check(feature.slots[0].edit_reuse == nullptr, "low-tier execution cannot reuse without matching Off");
       }
-      Check(old_half.frame != 0 && old_half.generation == upper_generation,
-            "the delayed input is a real completed upper half from the old request");
-      session->ObserveGpu(old_half, native::SteadyNowNs());
+      if (timing != TimingCoverage::NONE) {
+        Check(old_half.frame != 0 && old_half.generation == upper_generation
+                  && session->sampling_generation > old_half.sampling_generation,
+              "the delayed input is a real completed upper half from the old request and sampling generation");
+        session->ObserveGpu(old_half, rate::NowNs());
+      }
       Check(session->pending_pair.frame == 0 && session->gpu_count == 0 && session->applied_ns == low_applied_ns,
             "the completed old-generation half cannot publish cost or restart the low warmup");
-
-      fps = low_fps;
+      cadence_ns = 1'000'000'000 / low_fps;
+      next_present_ns = rate::NowNs() + cadence_ns;
       if (native_off) {
+        advance(rate::NowNs() + cadence_ns);
         const auto next = record();
         Check(next.calls == 0 && feature.slots[0].edit_reuse != nullptr && feature.slots[0].edit_reuse->width == 12,
               "matching Native Off delivers a real zero-call low-grid reuse after recovery");
@@ -2202,30 +2164,26 @@ int Run() {
         Check(session->applied_ns == low_applied_ns && session->gpu_count == 0,
               "a low reuse during warmup cannot confirm or measure twice");
       }
-      wait_until_ns(session->stable_after_ns + 2'000'000);
-      bool low_cost_observed = false;
-      for (uint32_t cycle = 0; cycle < 25; ++cycle) {
-        wait_until_ns(session->next_measure_ns + 2'000'000);
+      advance(std::max(session->stable_after_ns, rate::NowNs() + cadence_ns));
+      rate::Snapshot lower_output;
+      int64_t decision_ns = 0;
+      bool observed_independent_window = false;
+      const auto expected_reason = (low_fps == 100 ? adaptive::Reason::OBSERVING : adaptive::Reason::AT_MINIMUM);
+      for (uint32_t cycle = 0; cycle < 30; ++cycle) {
+        advance(std::max(session->next_measure_ns, rate::NowNs() + cadence_ns));
+        const auto window = rate::Read(output_identity, rate::NowNs());
         const auto low = record();
-        if (session->level == 0) {
-          Check(low_fps == 80 && !session->trial && session->blocked && session->status.reason == adaptive::Reason::NO_BENEFIT
-                    && session->status.applied[0].width == 12 && tiers->active == 0 && low.calls == 1 && model_resets.back() == 1,
-                "a full 80 FPS low comparison requests the upper anchor and records a fresh upper model result");
-          queue.Complete(low.timer, 3000);
-          Check(session->status.applied[0].width == 16 && session->blocked_until_ns > session->applied_ns
-                    && session->stable_after_ns == session->applied_ns + adaptive::WARMUP_NS,
-                "upper re-delivery confirms the anchor and keeps the no-benefit cooldown");
-          break;
-        }
         Check(tiers->active == 1 && feature.slots[0].handle == lower_model && feature.input_width == 12
-                  && session->applied_ns == low_applied_ns && session->paired_sampling == native_off && low.calls == 1
+                  && session->applied_ns == low_applied_ns && session->status.generation == low_generation
+                  && session->paired_sampling == native_off && low.calls == 1
                   && low.timer != nullptr && low.timer->measure && low.timer->adaptive.paired == native_off,
               "each measured low refresh uses the new grid, model and sampling route");
         const auto before_low_sample = session->gpu_count;
-        queue.Complete(low.timer, native_off ? 2000 : 1500);
+        queue.Complete(low.timer, timing == TimingCoverage::FULL ? (native_off ? 2000 : 1500) : 0);
         if (native_off) {
           Check(session->gpu_count == before_low_sample && session->pending_pair.frame == feature.sr_sequence,
                 "a completed low refresh on its own still cannot publish a cycle");
+          advance(rate::NowNs() + cadence_ns);
           const auto reused = record();
           Check(reused.calls == 0 && reused.timer != nullptr && reused.timer->measure
                     && reused.timer->adaptive.pair_first_frame == session->pending_pair.frame,
@@ -2235,29 +2193,31 @@ int Run() {
                     && session->gpu_us[session->gpu_count - 1] == 1500. && session->pending_pair.frame == 0,
                 "the complete low x2 pair publishes the mean of its 2 ms refresh and 1 ms reuse");
         }
-        if (session->gpu_count == session->gpu_us.size()) {
-          Check(std::ranges::all_of(session->gpu_us, [](double cost) { return cost == 1500.; }),
-                "the lower comparison uses a fresh 1.5 ms cost window in its actual sampling mode");
-          low_cost_observed = true;
+        if (decision_ns == 0 && window.available && window.window_begin_ns >= session->stable_after_ns
+            && session->status.reason == expected_reason && session->status.output_fps == low_fps) {
+          decision_ns = rate::NowNs();
+          lower_output = window;
         }
-        if (!session->trial) break;
+        // Keep supplying output through a further independent full window.
+        if (decision_ns != 0 && window.window_begin_ns >= lower_output.window_end_ns) {
+          observed_independent_window = true;
+          break;
+        }
       }
-      rate::Snapshot lower_output;
-      int64_t lower_read_ns = 0;
-      {
-        std::lock_guard lock(output_cadence_mutex);
-        lower_read_ns = rate::NowNs();
-        lower_output = rate::Read(output_identity, lower_read_ns);
-      }
-      describe_output_window("lower", lower_output, lower_read_ns);
-      Check(low_cost_observed && !session->trial && lower_output.available && lower_output.source == rate::Source::PRESENT
-                && lower_output.output == output_identity && lower_output.window_serial > upper_output.window_serial
+      double gpu_us = 0., gpu_mad = 0.;
+      Check(session->GpuStatistics(rate::NowNs(), &gpu_us, &gpu_mad) == (timing == TimingCoverage::FULL)
+                && (timing != TimingCoverage::FULL || (gpu_us == 1500. && gpu_mad == 0.)),
+            "only complete timestamp evidence supplies the fresh low-grid cost window");
+      Check(observed_independent_window && decision_ns != 0
+                && lower_output.source == rate::Source::PRESENT && lower_output.output == output_identity
+                && lower_output.window_serial > upper_output.window_serial
                 && lower_output.window_begin_ns >= low_applied_ns + adaptive::WARMUP_NS
-                && std::abs(lower_output.fps - low_fps) < 3. && std::abs(session->status.output_fps - low_fps) < 3.
-                && session->level == (low_fps == 100 ? 1u : 0u),
-            "the same trial accepts 100 FPS or returns at 80 FPS using a complete new window on the same output");
-      producer.request_stop();
-      producer.join();
+                && lower_output.window_end_ns - lower_output.window_begin_ns >= 4 * rate::Stream::BIN_NS
+                && lower_output.fps == low_fps && lower_output.split_available
+                && lower_output.split_fps == std::array{double(low_fps), double(low_fps)}
+                && session->status.output_fps == low_fps && session->status.reason == expected_reason
+                && session->level == 1 && session->active_level == 1 && !session->trial,
+            "the full post-warmup output holds an exactly on-target low grid or reports the deficient minimum");
       Dispatch<reshade::addon_event::destroy_swapchain>(&present, true);
       Dispatch<reshade::addon_event::init_swapchain>(&present, true);
       const auto replacement = present.Identity();
@@ -2271,26 +2231,32 @@ int Run() {
       rate::ReleaseNativeViewport(71);
       native::ForgetSourceHandleLocked(trial_source);
       native::DrainRetiredResources(true);
-      std::cout << "OBS Upscaled adaptive production off=" << native_off << " upper_fps=" << baseline_fps
-                << " low_fps=" << lower_output.fps << " upper_gpu_us=2000 low_gpu_us=1500"
-                << " output_serial=" << upper_output.window_serial << '/' << lower_output.window_serial << '\n';
-      std::cout << "PASS Upscaled adaptive production off=" << native_off << " upper=80fps/2ms low=" << low_fps
-                << "fps/1.5ms delivery=" << (low_fps == 100 ? "accepted" : "returned") << " evidence=WARP+MOCK\n";
       if (native_off) {
         std::cout << "NR_RELEASE_PARITY dx12-upscaled-adaptive-x2 paired-low output=PRESENT grid=12x12"
                      " calls=1/0 upper_us=2000 low_us=1500 discarded=1 recovered=1 stale_half_rejected=1 off_revocation_keeps_upper=1"
-                     " accepted_100fps=1 output_replacement_rejected=1 evidence=WARP+MOCK\n";
-      } else {
-        std::cout << "NR_RELEASE_PARITY dx12-upscaled-adaptive-x2 "
-                  << (low_fps == 100 ? "unpaired-accept" : "unpaired-rollback")
-                  << " output=PRESENT grid=12x12 calls=1 upper_us=2000 low_us=1500 trial_preserved=1 warmed_after_delivery=1 "
-                  << (low_fps == 100 ? "accepted_100fps=1" : "returned_80fps=1 cooldown=1")
-                  << " output_replacement_rejected=1 evidence=WARP+MOCK\n";
+                     " held_100fps=1 output_replacement_rejected=1 evidence=WARP+MOCK\n";
       }
+      return std::array{requested_ns - upper_applied_ns, low_applied_ns - upper_applied_ns,
+          lower_output.window_begin_ns - low_applied_ns, lower_output.window_end_ns - low_applied_ns,
+          decision_ns - low_applied_ns};
     };
-    automatic_trial(reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xED171}), false, 100);
-    automatic_trial(reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xED172}), false, 80);
-    automatic_trial(reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xED173}), true, 100);
+    uintptr_t next_adaptive_source = 0xED171;
+    for (const int low_fps : {100, 80}) {
+      const auto full = automatic_descent(reinterpret_cast<const NVSDK_NGX_Handle*>(next_adaptive_source++),
+          false, low_fps, TimingCoverage::FULL);
+      const auto half = automatic_descent(reinterpret_cast<const NVSDK_NGX_Handle*>(next_adaptive_source++),
+          false, low_fps, TimingCoverage::HALF);
+      const auto none = automatic_descent(reinterpret_cast<const NVSDK_NGX_Handle*>(next_adaptive_source++),
+          false, low_fps, TimingCoverage::NONE);
+      Check(full == half && full == none, "identical output coverage gives identical request, delivery and FPS decision across timestamp inputs");
+      std::cout << "NR_RELEASE_PARITY dx12-upscaled-adaptive-x2 " << (low_fps == 100 ? "unpaired-target" : "unpaired-minimum")
+                << " output=PRESENT request=16x16/12x12 delivered=12x12 calls=1 warmup_ns=" << adaptive::WARMUP_NS
+                << " low_fps=" << low_fps << " decision=" << (low_fps == 100 ? "OBSERVING" : "AT_MINIMUM")
+                << " request_ns=" << full[0] << " delivery_ns=" << full[1]
+                << " decision_window_ns=" << full[2] << '/' << full[3] << " decision_ns=" << full[4]
+                << " timestamps=full/half/none costs=2000/1500,missing,missing output_replacement_rejected=1 evidence=WARP+MOCK\n";
+    }
+    automatic_descent(reinterpret_cast<const NVSDK_NGX_Handle*>(next_adaptive_source), true, 100, TimingCoverage::FULL);
     native::kSetAdaptiveEnabled.Store(0.f);
     native::kSetAdaptiveLevelCount.Store(0.f);
     native::kSetAdaptiveTargetFps.Store(native::kSetAdaptiveTargetFps.fallback);

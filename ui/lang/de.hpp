@@ -2320,7 +2320,7 @@ inline constexpr Translation kDe[] = {
     {"Adaptive resolution", "Adaptive Auflösung"},
     {"Adjust NR working resolution toward your target output FPS, including generated frames. Manual resolutions are the upper limits. No extra program is required.", "Passt die NR-Arbeitsauflösung an die Ziel-Ausgabe-FPS einschließlich erzeugter Frames an. Manuelle Auflösungen sind die Obergrenzen. Kein Zusatzprogramm erforderlich."},
     {"Target output FPS", "Ziel-Ausgabe-FPS"},
-    {"The target includes generated frames. If lowering NR brings no FPS benefit, the previous quality is restored.", "Das Ziel umfasst erzeugte Frames. Bringt eine niedrigere NR-Auflösung keinen FPS-Vorteil, wird die vorherige Qualität wiederhergestellt."},
+    {"The target includes generated frames. Lower one tier while below target; hold at target. Raise only with sustained headroom. GPU timing is diagnostic.", "Das Ziel umfasst erzeugte Frames. Unter dem Ziel sinkt die Auflösung um eine Stufe. Beim Ziel bleibt sie unverändert. Sie steigt nur bei dauerhaft ausreichender FPS-Reserve. GPU-Zeiten dienen der Diagnose."},
     {"Minimum relative scale", "Minimale relative Skalierung"},
     {"Minimum width and height relative to each pass's manual upper limit. Existing stage limits still apply.", "Minimale Breite und Höhe relativ zur manuellen Obergrenze jedes Durchlaufs. Vorhandene Stufenlimits gelten weiterhin."},
     {"Estimated output FPS: %.1f", "Geschätzte Ausgabe-FPS: %.1f"},

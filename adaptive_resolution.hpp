@@ -10,13 +10,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <utility>
+#include <vector>
 
 namespace renodx::addons::dlss5::adaptive_resolution {
 
 constexpr int64_t SAMPLE_INTERVAL_NS = 250'000'000;
 constexpr int64_t SAMPLE_MAX_AGE_NS = 2'000'000'000;
 constexpr int64_t WARMUP_NS = 1'000'000'000;
-constexpr int64_t RETRY_COOLDOWN_NS = 30'000'000'000;
 constexpr size_t MAX_PASSES = 4, MAX_LEVELS = 16;
 constexpr uint32_t MINIMUM_SCALE_PERCENT = 33, SCALE_STEP_PERCENT = 5;
 constexpr float MINIMUM_SCALE = static_cast<float>(MINIMUM_SCALE_PERCENT) / 100.f;
@@ -84,6 +85,11 @@ struct Output {
   double fps = 0., mad = 0.;
   double observed_multiplier = 0.;
   bool multiplier_variable = false;
+  bool split_available = false;
+  std::array<double, 2> split_fps{};
+  uint64_t owner = 0;
+  double rate_multiplier = 0.;
+  bool rate_comparable = true;
 };
 struct Ladder {
   std::array<Sizes, MAX_LEVELS> sizes{};
@@ -153,12 +159,29 @@ struct GpuSample {
 };
 
 struct Session {
+  struct Conditions {
+    uint64_t workload = 0, owner = 0, source = 0;
+    float target_fps = 0.;
+    Sizes upper{};
+    bool multiplier_variable = false;
+    std::array<std::array<uint64_t, MAX_PASSES>, 2> mask{};
+    std::array<uint64_t, 2> normalization{};
+    bool operator==(const Conditions&) const = default;
+  };
+  struct FailedRaise {
+    Sizes lower{}, upper{};
+    Conditions conditions;
+    double multiplier = 0., fps = 0., mad = 0.;
+  };
+  struct WindowEvidence {
+    int64_t end_ns = 0, duration_ns = 0;
+    double fps = 0., mad = 0.;
+  };
   Status status;
   Settings settings;
   Ladder ladder;
   uint64_t identity = 0, output_source = 0, output_generation = 0, output_configuration = 0;
-  // A new output tuple can appear before its first complete FPS window.
-  uint64_t output_scope_epoch = 0, lower_cost_output_epoch = 0;
+  uint64_t workload_identity = 0, output_owner = 0;
   uint64_t resource_identity = 0;
   uint64_t configuration_epoch = 0;
   uint64_t preparation_epoch = 0;
@@ -168,22 +191,20 @@ struct Session {
   Reason preparation_reason = Reason::PREPARING;
   Sizes minimum{};
   uint64_t last_output_serial = 0, last_sequence = 0, gpu_context = 0;
-  uint64_t lower_cost_anchor_context = 0;
   size_t level = 0, previous_level = 0, active_level = 0;
   size_t frozen_resume_level = MAX_LEVELS;
-  int64_t applied_ns = 0, stable_after_ns = 0, last_switch_ns = 0, at_target_since_ns = 0;
+  int64_t applied_ns = 0, stable_after_ns = 0, last_switch_ns = 0;
   int64_t next_measure_ns = 0;
-  int64_t failed_raise_until_ns = 0;
-  int64_t blocked_until_ns = 0;
-  size_t failed_raise_level = MAX_LEVELS;
-  bool trial = false, raising = false, extra_window = false, blocked = false, failed = false;
-  // Healthy anchor samples do not establish that the lower tier's missing coverage recovered.
-  bool lower_cost_recovery_pending = false;
+  bool trial = false, raising = false, failed = false;
   bool defer_preparation = false;
   bool minimum_pending = false;
   double baseline_fps = 0., baseline_fps_mad = 0., baseline_gpu_us = 0., baseline_gpu_mad = 0.;
   double baseline_multiplier = 0.;
-  double blocked_fps = 0., blocked_gpu_us = 0.;
+  double output_multiplier = 0.;
+  bool output_variable = false;
+  Conditions trial_conditions;
+  std::vector<FailedRaise> failed_raises;
+  WindowEvidence deficit_window, target_window, surplus_window;
   std::array<double, 5> gpu_us{};
   std::array<int64_t, 5> gpu_recorded_ns{};
   size_t gpu_count = 0;
@@ -192,11 +213,13 @@ struct Session {
   bool paired_sampling = false;
   uint64_t paired_identity = 0;
   uint64_t sampling_generation = 0, measure_pair_first_frame = 0;
+  uint64_t comparison_generation = 0;
+  uint32_t measurement_roles = 3;
   GpuSample pending_pair;
   std::array<std::array<uint64_t, MAX_PASSES>, 2> mask_settings{};
   std::array<uint64_t, 2> normalization_settings{};
 
-  void ResetMeasurements() {
+  void ResetGpuMeasurements() {
     gpu_count = 0;
     gpu_us = {};
     gpu_recorded_ns = {};
@@ -204,12 +227,18 @@ struct Session {
     pending_roles = 0;
     measure_pair_first_frame = 0;
     pending_pair = {};
+    status.gpu_ms = 0.;
+  }
+
+  void ResetMeasurements() {
+    ResetGpuMeasurements();
     last_output_serial = 0;
-    at_target_since_ns = 0;
+    deficit_window = target_window = surplus_window = {};
   }
 
   void InvalidateSampling(int64_t now_ns = 0) {
     ++sampling_generation;
+    ++comparison_generation;
     ResetMeasurements();
     if (now_ns > 0) stable_after_ns = std::max(stable_after_ns, now_ns);
   }
@@ -218,12 +247,10 @@ struct Session {
     const bool changed = previous != 0 && previous != effective_settings;
     previous = effective_settings;
     if (!changed) return;
-    blocked = false;
-    blocked_until_ns = 0;
     InvalidateSampling(now_ns);
     if (frozen_resume_level == MAX_LEVELS) {
       if (trial) {
-        Request(previous_level, now_ns);
+        if (raising || applied_generation != status.generation) Request(previous_level, now_ns);
         trial = false;
       }
       status.reason = Reason::COLLECTING;
@@ -240,20 +267,13 @@ struct Session {
     ObserveEffectiveSettings(normalization_settings[role - 1], effective_settings, now_ns);
   }
 
-  void SetPairedSampling(bool enabled, uint64_t sampling_identity = 0, int64_t now_ns = 0) {
+  void SetPairedSampling(bool enabled, uint64_t sampling_identity = 0, int64_t = 0) {
     if (!enabled) sampling_identity = 0;
     if (paired_sampling == enabled && paired_identity == sampling_identity) return;
-    const bool context_changed = paired_sampling && enabled && paired_identity != sampling_identity;
     paired_sampling = enabled;
     paired_identity = sampling_identity;
-    if (context_changed && trial && frozen_resume_level == MAX_LEVELS) {
-      Request(previous_level, now_ns);
-      trial = false;
-    }
-    // Both modes measure a complete NR chain per base frame. A new mode
-    // needs fresh GPU samples, while the output window and frozen trial
-    // baseline remain comparable until their own owner or context changes.
-    InvalidateSampling(context_changed ? now_ns : 0);
+    ++sampling_generation;
+    ResetGpuMeasurements();
   }
 
   uint64_t SelectMeasurementPair(uint64_t source_frame, bool first_due) {
@@ -469,16 +489,8 @@ struct Session {
       return;
     }
     if (gpu_context != 0 && gpu_context != sample.context) {
-      if (trial) {
-        if (!raising) {
-          lower_cost_recovery_pending = true;
-          lower_cost_anchor_context = gpu_context;
-          lower_cost_output_epoch = output_scope_epoch;
-        }
-        Request(previous_level, now_ns);
-      }
-      InvalidateSampling(now_ns);
-      trial = false;
+      ++sampling_generation;
+      ResetGpuMeasurements();
       gpu_context = sample.context;
       return;
     }
@@ -542,9 +554,90 @@ struct Session {
     return true;
   }
 
+  static bool ComparableMultiplier(double first, double second) {
+    return (first <= 0. && second <= 0.)
+        || (first > 0. && second > 0. && std::abs(second / first - 1.) <= 0.10);
+  }
+
+  static bool Smaller(const Sizes& first, const Sizes& second) {
+    for (size_t pass = 0; pass < MAX_PASSES; ++pass) {
+      if (first[pass].width != second[pass].width) return first[pass].width < second[pass].width;
+      if (first[pass].height != second[pass].height) return first[pass].height < second[pass].height;
+    }
+    return false;
+  }
+
+  size_t Adjacent(bool higher) const {
+    size_t nearest = level;
+    for (size_t slot = 0; slot < ladder.count; ++slot) {
+      if (!IsLegal(ladder.sizes[slot])) continue;
+      if (higher ? !Smaller(ladder.sizes[level], ladder.sizes[slot])
+                 : !Smaller(ladder.sizes[slot], ladder.sizes[level])) continue;
+      if (nearest == level || (higher ? Smaller(ladder.sizes[slot], ladder.sizes[nearest])
+                                     : Smaller(ladder.sizes[nearest], ladder.sizes[slot]))) {
+        nearest = slot;
+      }
+    }
+    return nearest;
+  }
+
+  static bool AccumulateWindow(WindowEvidence* evidence, const Output& output) {
+    if (evidence->end_ns != 0 && output.begin_ns < evidence->end_ns) return false;
+    const int64_t duration_ns = output.end_ns - output.begin_ns;
+    if (evidence->end_ns != 0 && output.begin_ns == evidence->end_ns) {
+      evidence->fps = (evidence->fps * static_cast<double>(evidence->duration_ns)
+          + output.fps * static_cast<double>(duration_ns)) / static_cast<double>(evidence->duration_ns + duration_ns);
+      evidence->duration_ns += duration_ns;
+      evidence->end_ns = output.end_ns;
+      evidence->mad = std::max(evidence->mad, output.mad);
+      return true;
+    }
+    *evidence = {.end_ns = output.end_ns, .duration_ns = duration_ns, .fps = output.fps, .mad = output.mad};
+    return false;
+  }
+
+  Conditions CurrentConditions(const Output& output) const {
+    Conditions result{.workload = workload_identity, .owner = output.owner, .source = output.source,
+        .target_fps = settings.target_fps, .upper = status.upper, .multiplier_variable = output.multiplier_variable,
+        .mask = mask_settings, .normalization = normalization_settings};
+    for (size_t role = 0; role < result.mask.size(); ++role) {
+      if ((measurement_roles & (1u << role)) == 0) {
+        result.mask[role] = {};
+        result.normalization[role] = 0;
+      } else {
+        for (size_t pass = 0; pass < MAX_PASSES; ++pass) {
+          if (status.upper[pass].width == 0) result.mask[role][pass] = 0;
+        }
+      }
+    }
+    return result;
+  }
+
+  const FailedRaise* FindFailedRaise(const Sizes& lower, const Sizes& upper, const Conditions& conditions,
+                                    double multiplier) const {
+    for (const auto& edge : failed_raises) {
+      if (edge.lower == lower && edge.upper == upper && edge.conditions == conditions
+          && ComparableMultiplier(edge.multiplier, multiplier)) return &edge;
+    }
+    return nullptr;
+  }
+
+  void RememberFailedRaise() {
+    const FailedRaise failed_raise{.lower = ladder.sizes[previous_level], .upper = ladder.sizes[level],
+        .conditions = trial_conditions, .multiplier = baseline_multiplier, .fps = baseline_fps, .mad = baseline_fps_mad};
+    for (auto& edge : failed_raises) {
+      if (edge.lower == failed_raise.lower && edge.upper == failed_raise.upper && edge.conditions == failed_raise.conditions
+          && ComparableMultiplier(edge.multiplier, failed_raise.multiplier)) {
+        edge = failed_raise;
+        return;
+      }
+    }
+    failed_raises.push_back(failed_raise);
+  }
+
   void Prepare(const Settings& requested_settings, const Sizes& upper, const Sizes& floor,
                uint64_t source_identity, const Output& output, int64_t now_ns, bool supported, bool frozen,
-               uint64_t allocation_identity = 0) {
+               uint64_t allocation_identity = 0, uint64_t work_identity = 0, uint32_t model_roles = 3) {
     Settings next = requested_settings;
     next.target_fps = (std::isfinite(next.target_fps) ? std::clamp(next.target_fps, 30.f, 360.f) : 60.f);
     next.minimum_scale = (std::isfinite(next.minimum_scale) ? std::clamp(next.minimum_scale, MINIMUM_SCALE, 1.f) : 0.67f);
@@ -555,6 +648,7 @@ struct Session {
     if (allocation_identity == 0) {
       allocation_identity = source_identity;
     }
+    if (work_identity == 0) work_identity = source_identity;
     const uint32_t selected_levels = (next.selected_levels != 0 ? next.selected_levels
         : (next.legacy_preparation ? next.prepared_levels : std::max(2u, next.prepared_levels)));
     auto selected = BuildLadder(upper, floor, next.minimum_scale, selected_levels);
@@ -571,16 +665,20 @@ struct Session {
     const bool toggled = settings.enabled != next.enabled;
     const bool preparation_mode_changed = settings.legacy_preparation != next.legacy_preparation
         || settings.limited_residency != next.limited_residency || settings.resource_strategy != next.resource_strategy;
-    const bool changed = (!frozen && identity != source_identity)
+    const bool changed = (!frozen && (identity != source_identity || workload_identity != work_identity
+        || measurement_roles != model_roles))
         || settings != next || status.upper != upper || selection_changed;
     if (resources_changed) {
       const uint64_t generation = status.generation + 1;
       const uint64_t epoch = preparation_epoch + 1;
+      auto retained_failures = std::move(failed_raises);
       *this = Session{};
+      failed_raises = std::move(retained_failures);
       status.generation = generation;
       preparation_epoch = epoch;
       settings = next;
       identity = source_identity;
+      workload_identity = work_identity;
       resource_identity = allocation_identity;
       status.upper = upper;
       ladder = selected;
@@ -588,10 +686,7 @@ struct Session {
       status.prepared_levels = static_cast<uint32_t>(ladder.count);
       Request(0, now_ns);
     } else if (changed) {
-      if (identity != source_identity) {
-        lower_cost_recovery_pending = false;
-      }
-      const auto retained = (trial ? ladder.sizes[previous_level] : status.applied);
+      const auto retained = (trial && raising ? ladder.sizes[previous_level] : status.applied);
       const bool defer_legacy = retain_legacy && (defer_preparation || settings.minimum_scale != next.minimum_scale);
       const bool retry_budget = preparation_reason == Reason::BUDGET
           && (selection_edited || settings.limited_residency != next.limited_residency);
@@ -610,6 +705,7 @@ struct Session {
       }
       settings = next;
       identity = source_identity;
+      workload_identity = work_identity;
       status.upper = upper;
       ladder = selected;
       minimum = next_minimum;
@@ -626,13 +722,8 @@ struct Session {
       trial = false;
       frozen_resume_level = MAX_LEVELS;
       raising = false;
-      extra_window = false;
-      blocked = false;
-      blocked_until_ns = 0;
       minimum_pending = false;
       defer_preparation = defer_legacy;
-      failed_raise_level = MAX_LEVELS;
-      failed_raise_until_ns = 0;
       previous_level = candidate;
       if (!selection_changed && !toggled && !preparation_mode_changed && !retry_budget
           && applied_generation == status.generation && level == candidate
@@ -642,6 +733,7 @@ struct Session {
         Request(candidate, now_ns);
       }
     }
+    measurement_roles = model_roles;
     if (!settings.enabled || !supported) {
       if (level != 0) Request(0, now_ns);
       trial = false;
@@ -656,13 +748,15 @@ struct Session {
     }
     if (frozen) {
       if (frozen_resume_level == MAX_LEVELS) {
-        frozen_resume_level = (trial ? previous_level : level);
+        frozen_resume_level = level;
         if (applied_ns != 0 && status.requested != status.applied) {
           const auto end = ladder.sizes.begin() + ladder.count;
           const auto confirmed = std::find(ladder.sizes.begin(), end, status.applied);
           if (confirmed != end && IsLegal(*confirmed)) {
             // Replace the pending generation before a ready tier can hot-switch.
             Request(static_cast<size_t>(confirmed - ladder.sizes.begin()), now_ns);
+            frozen_resume_level = level;
+            trial = false;
           }
         }
         InvalidateSampling(now_ns);
@@ -675,7 +769,6 @@ struct Session {
         Request(frozen_resume_level, now_ns);
       }
       frozen_resume_level = MAX_LEVELS;
-      trial = false;
       InvalidateSampling(now_ns);
     }
     if (!settings.legacy_preparation && (preparation_reason == Reason::BUDGET
@@ -687,199 +780,132 @@ struct Session {
       status.reason = Reason::PREPARING;
       return;
     }
-    if (!settings.legacy_preparation && ladder.count == 1) {
+    if (ladder.count == 1 && ladder.sizes[0] == minimum) {
       status.reason = Reason::NO_RANGE;
       return;
     }
     const bool output_changed = output_source != output.source || output_generation != output.generation
-        || output_configuration != output.configuration;
-    if (output_changed) {
-      ++output_scope_epoch;
-    }
-    if (output_changed || !output.available) {
-      if (trial) Request(previous_level, now_ns);
+        || output_configuration != output.configuration || output_owner != output.owner;
+    const double multiplier = (output.rate_multiplier > 0. ? output.rate_multiplier : output.observed_multiplier);
+    const bool rate_changed = output_variable != output.multiplier_variable
+        || (output_multiplier > 0. && multiplier > 0. && !ComparableMultiplier(output_multiplier, multiplier));
+    const bool reliable_output = output.available && std::isfinite(output.fps) && output.fps >= 0.
+        && std::isfinite(output.mad) && output.mad >= 0. && output.begin_ns > 0 && output.end_ns > output.begin_ns
+        && output.end_ns <= now_ns && now_ns - output.end_ns <= SAMPLE_MAX_AGE_NS
+        && output.rate_comparable
+        && (!output.multiplier_variable || (std::isfinite(output.observed_multiplier) && output.observed_multiplier > 0.));
+    if (output_changed || rate_changed || !reliable_output) {
+      // Missing comparison evidence cancels a pending request or an unjudged
+      // quality increase. A successfully delivered lower tier remains in use.
+      if (trial && (raising || applied_generation != status.generation)) Request(previous_level, now_ns);
       trial = false;
-      blocked = false;
-      blocked_until_ns = 0;
-      minimum_pending = false;
       InvalidateSampling(now_ns);
       output_source = output.source;
       output_generation = output.generation;
       output_configuration = output.configuration;
+      output_owner = output.owner;
+      output_variable = output.multiplier_variable;
+      output_multiplier = multiplier;
+    } else if (output_multiplier == 0.) {
+      output_multiplier = multiplier;
     }
     status.output_fps = (output.available ? output.fps : 0.);
-    if (!output.available) {
-      status.reason = Reason::OUTPUT_UNAVAILABLE;
-      return;
-    }
-    if (output.multiplier_variable && (!std::isfinite(output.observed_multiplier) || output.observed_multiplier <= 0.)) {
-      if (trial) Request(previous_level, now_ns);
-      trial = false;
-      InvalidateSampling(now_ns);
-      status.reason = Reason::COLLECTING;
+    double gpu = 0., gpu_mad = 0.;
+    const bool gpu_available = GpuStatistics(now_ns, &gpu, &gpu_mad);
+    status.gpu_ms = (gpu_available ? gpu / 1000. : 0.);
+    if (!reliable_output) {
+      status.reason = (output.available ? Reason::COLLECTING : Reason::OUTPUT_UNAVAILABLE);
       return;
     }
     if (settings.limited_residency && !target_ready) {
       status.reason = Reason::PREPARING;
       return;
     }
-    if (blocked && now_ns >= blocked_until_ns) {
-      blocked = false;
-      blocked_until_ns = 0;
-      ResetMeasurements();
-      stable_after_ns = now_ns;
-      status.reason = Reason::COLLECTING;
-      return;
-    }
     if (applied_generation != status.generation || applied_ns == 0 || now_ns < stable_after_ns) {
       status.reason = Reason::WARMING;
       return;
     }
-    double gpu = 0., gpu_mad = 0.;
-    const bool gpu_available = GpuStatistics(now_ns, &gpu, &gpu_mad);
-    if (trial && !gpu_available && now_ns - stable_after_ns >= SAMPLE_MAX_AGE_NS) {
-      if (!raising) {
-        lower_cost_recovery_pending = true;
-        lower_cost_anchor_context = gpu_context;
-        lower_cost_output_epoch = output_scope_epoch;
-      }
-      Request(previous_level, now_ns);
-      trial = false;
+    if (output.begin_ns < stable_after_ns) {
       status.reason = Reason::COLLECTING;
       return;
-    }
-    if (output.begin_ns < stable_after_ns || output.end_ns > now_ns || now_ns - output.end_ns > SAMPLE_MAX_AGE_NS
-        || !gpu_available) {
-      status.reason = Reason::COLLECTING;
-      return;
-    }
-    status.gpu_ms = gpu / 1000.;
-    if (lower_cost_recovery_pending && !trial
-        && (gpu_context != lower_cost_anchor_context || output_scope_epoch != lower_cost_output_epoch)) {
-      lower_cost_recovery_pending = false;
     }
     if (last_output_serial == output.serial) return;
     last_output_serial = output.serial;
-    const auto adjacent = [&](bool higher, size_t steps) {
-      size_t result = level;
-      for (size_t step = 0; step < steps; ++step) {
-        size_t nearest = result;
-        for (size_t slot = 0; slot < ladder.count; ++slot) {
-          if (!IsLegal(ladder.sizes[slot])) continue;
-          if (higher ? ladder.coefficients[slot] <= ladder.coefficients[result]
-                     : ladder.coefficients[slot] >= ladder.coefficients[result]) continue;
-          if (nearest == result || (higher ? ladder.coefficients[slot] < ladder.coefficients[nearest]
-                                          : ladder.coefficients[slot] > ladder.coefficients[nearest])) {
-            nearest = slot;
-          }
-        }
-        if (nearest == result) break;
-        result = nearest;
-      }
-      return result;
-    };
-    if (trial) {
-      const bool multiplier_changed = baseline_multiplier > 0. && output.observed_multiplier > 0.
-          && std::abs(output.observed_multiplier / baseline_multiplier - 1.) > 0.10;
-      if (multiplier_changed && !extra_window) {
-        extra_window = true;
-        stable_after_ns = output.end_ns;
-        return;
-      }
-      const bool on_target = output.fps >= settings.target_fps * 0.95;
-      const double fps_margin = std::max({1., baseline_fps * 0.02, 2. * output.mad, 2. * baseline_fps_mad});
-      const bool cheaper = baseline_gpu_us - gpu > std::max({1., 2. * baseline_gpu_mad, 2. * gpu_mad});
-      const bool improved = output.fps - baseline_fps > fps_margin;
-      if (!multiplier_changed && ((raising && on_target) || (!raising && cheaper && (on_target || improved)))) {
-        trial = false;
-        status.reason = Reason::OBSERVING;
-      } else {
-        const bool uncertain = !multiplier_changed && !raising && cheaper && output.fps >= baseline_fps
-            && output.fps - baseline_fps <= fps_margin && output.mad > 0.;
-        if (uncertain && !extra_window) {
-          extra_window = true;
-          stable_after_ns = output.end_ns;
-          return;
-        }
-        if (!settings.legacy_preparation && TargetReady() && !raising && !multiplier_changed && cheaper
-            && output.fps >= baseline_fps - fps_margin) {
-          const size_t candidate = adjacent(false, 1);
-          if (candidate != level) {
-            // Compare cumulative savings with the accepted anchor. A small
-            // adjacent step cannot establish that every lower ready tier is useless.
-            if (now_ns - last_switch_ns >= 3'000'000'000) {
-              extra_window = false;
-              Request(candidate, now_ns);
-            }
-            status.reason = Reason::LOWERING;
-            return;
-          }
-        }
-        if (raising) {
-          failed_raise_level = level;
-          failed_raise_until_ns = now_ns + RETRY_COOLDOWN_NS;
-        } else {
-          blocked = true;
-          blocked_until_ns = now_ns + RETRY_COOLDOWN_NS;
-          blocked_fps = (multiplier_changed ? output.fps : baseline_fps);
-          blocked_gpu_us = baseline_gpu_us;
-        }
+    const bool split = output.split_available && std::isfinite(output.split_fps[0])
+        && std::isfinite(output.split_fps[1]) && output.split_fps[0] >= 0. && output.split_fps[1] >= 0.;
+    bool deficit = false, on_target = false;
+    if (output.fps < settings.target_fps) {
+      target_window = surplus_window = {};
+      deficit = (split && output.split_fps[0] < settings.target_fps && output.split_fps[1] < settings.target_fps)
+          || AccumulateWindow(&deficit_window, output);
+    } else {
+      deficit_window = {};
+      on_target = (split && output.split_fps[0] >= settings.target_fps && output.split_fps[1] >= settings.target_fps)
+          || AccumulateWindow(&target_window, output);
+    }
+    if (trial && raising) {
+      if (deficit) {
+        RememberFailedRaise();
         Request(previous_level, now_ns);
         trial = false;
         status.reason = Reason::NO_BENEFIT;
-        return;
-      }
-    }
-    if (blocked && (std::abs(output.fps - blocked_fps) > std::max(3., blocked_fps * 0.15)
-        || std::abs(gpu - blocked_gpu_us) > std::max(100., blocked_gpu_us * 0.2))) {
-      blocked = false;
-      blocked_until_ns = 0;
-    }
-    if (output.fps >= settings.target_fps * 0.99) {
-      if (at_target_since_ns == 0) at_target_since_ns = output.begin_ns;
-    } else {
-      at_target_since_ns = 0;
-    }
-    size_t candidate = level;
-    if (output.fps < settings.target_fps * 0.95 && !blocked && !lower_cost_recovery_pending
-        && now_ns - last_switch_ns >= 3'000'000'000) {
-      candidate = (settings.legacy_preparation && minimum_pending ? MAX_LEVELS
-          : adjacent(false, settings.legacy_preparation && settings.prepared_levels == 0 ? 2 : 1));
-      if (settings.legacy_preparation && candidate == level && ladder.sizes[level] != minimum) {
-        candidate = MAX_LEVELS;
-      }
-      raising = false;
-    } else if (level != 0 && at_target_since_ns != 0 && now_ns - at_target_since_ns >= 6'000'000'000
-        && now_ns - last_switch_ns >= 10'000'000'000
-        && (adjacent(true, 1) != failed_raise_level || now_ns >= failed_raise_until_ns)) {
-      candidate = adjacent(true, 1);
-      raising = true;
-    }
-    if (candidate == level) {
-      if (lower_cost_recovery_pending) {
-        status.reason = Reason::COLLECTING;
+      } else if (on_target) {
+        trial = false;
+        status.reason = Reason::OBSERVING;
       } else {
-        status.reason = (blocked ? Reason::NO_BENEFIT
-            : (ladder.sizes[level] == minimum && output.fps < settings.target_fps * 0.95 ? Reason::AT_MINIMUM : Reason::OBSERVING));
+        status.reason = Reason::COLLECTING;
       }
       return;
     }
-    previous_level = level;
-    baseline_fps = output.fps;
-    baseline_fps_mad = output.mad;
-    baseline_gpu_us = gpu;
-    baseline_gpu_mad = gpu_mad;
-    baseline_multiplier = output.observed_multiplier;
-    extra_window = false;
-    trial = true;
-    if (candidate == MAX_LEVELS) {
-      if (!RequestMinimum(now_ns)) {
-        trial = false;
+    if (deficit || on_target) trial = false;
+    if (deficit) {
+      const size_t candidate = (settings.legacy_preparation && minimum_pending ? level : Adjacent(false));
+      if (candidate == level && ladder.sizes[level] == minimum) {
+        status.reason = Reason::AT_MINIMUM;
+        return;
       }
-    } else {
-      Request(candidate, now_ns);
+      previous_level = level;
+      baseline_fps = output.fps;
+      baseline_fps_mad = output.mad;
+      baseline_gpu_us = gpu;
+      baseline_gpu_mad = gpu_mad;
+      baseline_multiplier = multiplier;
+      raising = false;
+      trial = true;
+      if (candidate == level) {
+        if (!settings.legacy_preparation || !RequestMinimum(now_ns)) trial = false;
+      } else {
+        Request(candidate, now_ns);
+      }
+      status.reason = (trial ? Reason::LOWERING : Reason::PREPARING);
+      return;
     }
-    status.reason = (raising ? Reason::RAISING : (trial ? Reason::LOWERING : Reason::PREPARING));
+    const size_t candidate = Adjacent(true);
+    const auto conditions = CurrentConditions(output);
+    const auto* failed_raise = FindFailedRaise(ladder.sizes[level], ladder.sizes[candidate], conditions, multiplier);
+    const double margin = std::max({1., static_cast<double>(settings.target_fps) * 0.02, 2. * output.mad});
+    bool headroom = output.fps >= settings.target_fps + margin;
+    if (failed_raise != nullptr) {
+      const double recovery_margin = std::max({1., static_cast<double>(settings.target_fps) * 0.02,
+          2. * std::max(failed_raise->mad, output.mad)});
+      headroom &= output.fps >= failed_raise->fps + recovery_margin;
+    }
+    if (!headroom) surplus_window = {};
+    if (candidate != level && headroom && AccumulateWindow(&surplus_window, output)) {
+      previous_level = level;
+      baseline_fps = surplus_window.fps;
+      baseline_fps_mad = surplus_window.mad;
+      baseline_gpu_us = gpu;
+      baseline_gpu_mad = gpu_mad;
+      baseline_multiplier = multiplier;
+      trial_conditions = conditions;
+      trial = raising = true;
+      Request(candidate, now_ns);
+      status.reason = Reason::RAISING;
+      return;
+    }
+    status.reason = (ladder.sizes[level] == minimum && output.fps < settings.target_fps
+        ? Reason::AT_MINIMUM : Reason::OBSERVING);
   }
 };
 
@@ -899,6 +925,7 @@ struct Frame {
   bool upper_capacity = false;
   bool paired = false;
   uint64_t pair_first_frame = 0, sampling_generation = 0;
+  uint64_t comparison_generation = 0;
   // Instrumented color roles share the consumer's decision.
   mutable std::shared_ptr<DeliveryReceipt> delivery;
 };

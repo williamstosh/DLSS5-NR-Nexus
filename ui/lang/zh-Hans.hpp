@@ -2329,7 +2329,7 @@ inline constexpr Translation kZhHans[] = {
     {"Adaptive resolution", "自适应分辨率"},
     {"Adjust NR working resolution toward your target output FPS, including generated frames. Manual resolutions are the upper limits. No extra program is required.", "自动调整 NR 工作分辨率，尽量达到包含生成帧的目标输出帧率。手动分辨率作为上限，无需额外程序。"},
     {"Target output FPS", "目标输出帧率"},
-    {"The target includes generated frames. If lowering NR brings no FPS benefit, the previous quality is restored.", "目标包含生成帧。降低 NR 分辨率若未明显提高帧率，将恢复此前画质。"},
+    {"The target includes generated frames. Lower one tier while below target; hold at target. Raise only with sustained headroom. GPU timing is diagnostic.", "目标帧率包含生成帧。低于目标时逐档降低分辨率，达到目标时保持当前档位。仅在帧率持续高于目标且余量充足时升档。GPU 计时仅用于诊断。"},
     {"Minimum relative scale", "最低相对比例"},
     {"Minimum width and height relative to each pass's manual upper limit. Existing stage limits still apply.", "相对于各 Pass 手动分辨率上限的最低宽高比例，仍受现有阶段限制。"},
     {"Estimated output FPS: %.1f", "估算输出帧率：%.1f"},

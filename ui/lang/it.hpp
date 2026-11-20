@@ -2320,7 +2320,7 @@ inline constexpr Translation kIt[] = {
     {"Adaptive resolution", "Risoluzione adattiva"},
     {"Adjust NR working resolution toward your target output FPS, including generated frames. Manual resolutions are the upper limits. No extra program is required.", "Regola la risoluzione di lavoro NR verso gli FPS di uscita desiderati, inclusi i fotogrammi generati. Le risoluzioni manuali sono i limiti superiori. Non richiede programmi aggiuntivi."},
     {"Target output FPS", "FPS di uscita desiderati"},
-    {"The target includes generated frames. If lowering NR brings no FPS benefit, the previous quality is restored.", "L'obiettivo include i fotogrammi generati. Se ridurre NR non migliora gli FPS, viene ripristinata la qualità precedente."},
+    {"The target includes generated frames. Lower one tier while below target; hold at target. Raise only with sustained headroom. GPU timing is diagnostic.", "L'obiettivo include i fotogrammi generati. Sotto l'obiettivo, la risoluzione scende di un livello. Quando lo raggiunge, resta invariata. Sale solo se gli FPS restano sufficientemente sopra l'obiettivo. I tempi GPU servono per la diagnostica."},
     {"Minimum relative scale", "Scala relativa minima"},
     {"Minimum width and height relative to each pass's manual upper limit. Existing stage limits still apply.", "Larghezza e altezza minime rispetto al limite manuale di ogni passaggio. Restano validi i limiti della fase."},
     {"Estimated output FPS: %.1f", "FPS di uscita stimati: %.1f"},

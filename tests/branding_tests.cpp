@@ -51,7 +51,7 @@ int main() {
       "Enter the target output frame rate directly (30-360). Press Enter to apply.",
       "Adaptive resolution controls the current size. Turn it off to edit the saved manual upper limit.",
       "Saved manual upper limit: %s",
-      "The target includes generated frames. If lowering NR brings no FPS benefit, the previous quality is restored.",
+      "The target includes generated frames. Lower one tier while below target; hold at target. Raise only with sustained headroom. GPU timing is diagnostic.",
       "Minimum relative scale",
       "Minimum width and height relative to each pass's manual upper limit. Existing stage limits still apply.",
       "Estimated output FPS: %.1f",

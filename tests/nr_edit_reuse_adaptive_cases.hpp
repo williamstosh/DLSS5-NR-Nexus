@@ -146,7 +146,17 @@ struct AdaptiveGpuSubmission {
 
     // Retain the real query coverage, exact queue receipt and delivery test.
     // Scale only the completed timestamp span to make the comparative costs repeatable.
-    if (segment != nullptr && segment->measure) {
+    if (segment != nullptr && segment->measure && cost_us == 0) {
+      const auto sequence = segment->sequence;
+      const auto delivery = segment->adaptive.delivery;
+      // Preserve the independent completion receipt while withholding timestamps.
+      segment->measure = false;
+      timers::Poll(true, false);
+      const auto& completed = timers::completed_stats[1];
+      Check(delivery != nullptr && *delivery == adaptive::DeliveryReceipt::DELIVERED
+                && completed.valid && completed.sequence == sequence && completed.total_us == 0,
+            "proof-only completion preserves delivery and records no timestamp cost");
+    } else if (segment != nullptr && segment->measure) {
       const auto measured_sequence = segment->sequence;
       const auto* actual = timers::internal::mapped;
       Check(actual != nullptr && actual[segment->base + timers::kSlotFrameStart] != timers::kUnwritten,
