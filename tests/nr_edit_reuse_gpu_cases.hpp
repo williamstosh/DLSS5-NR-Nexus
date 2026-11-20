@@ -7,12 +7,14 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <DirectXPackedVector.h>
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <utility>
 #include <vector>
@@ -1958,11 +1960,21 @@ int Run() {
       auto& feature = native::features.at(trial_source);
 
       std::atomic_int fps{80};
+      std::mutex output_cadence_mutex;
+      std::condition_variable output_cadence_changed;
       std::jthread producer([&](std::stop_token stop) {
+        // A delayed provider still has to collect all four real cadence bins.
+        if (!native_off && low_fps == 80) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
         auto deadline = std::chrono::steady_clock::now();
         while (!stop.stop_requested()) {
-          present.Present();
-          unrelated.Present();
+          {
+            std::lock_guard lock(output_cadence_mutex);
+            present.Present();
+            unrelated.Present();
+          }
+          output_cadence_changed.notify_one();
           deadline += std::chrono::nanoseconds(1'000'000'000 / fps.load());
           std::this_thread::sleep_until(deadline);
         }
@@ -2001,13 +2013,52 @@ int Run() {
       const auto wait_until_ns = [](int64_t timestamp_ns) {
         std::this_thread::sleep_until(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(timestamp_ns)));
       };
-      const auto current_output = [&] { return rate::Read(output_identity, rate::NowNs()); };
+      const auto describe_output_window = [&](const char* checkpoint, const rate::Snapshot& sample, int64_t read_ns) {
+        std::cout << "OBS adaptive output checkpoint=" << checkpoint << " source_handle=" << trial_source
+                  << " off=" << native_off << " low_target_fps=" << low_fps
+                  << " available=" << sample.available << " reason=" << static_cast<int>(sample.reason)
+                  << " source=" << static_cast<int>(sample.source) << " fps=" << sample.fps
+                  << " mad=" << sample.fps_mad << " serial=" << sample.window_serial
+                  << " output_generation=" << sample.output.generation << '/' << output_identity.generation
+                  << " source_generation=" << sample.source_generation << " configuration=" << sample.configuration_generation
+                  << " window_begin_ns=" << sample.window_begin_ns << " window_end_ns=" << sample.window_end_ns
+                  << " read_ns=" << read_ns << " applied_ns=" << session->applied_ns
+                  << " stable_after_ns=" << session->stable_after_ns;
+        std::shared_lock lock(rate::internal::state.mutex);
+        const auto found = rate::internal::state.present.find(output_identity.swapchain);
+        if (found != rate::internal::state.present.end()) {
+          const auto& stream = found->second.stream;
+          std::cout << " bins=" << stream.count << '/' << stream.bins.size()
+                    << " previous_ns=" << stream.previous_ns << " pending_begin_ns=" << stream.pending.begin_ns
+                    << " pending_end_ns=" << stream.pending.end_ns << " pending_frames=" << stream.pending.frames;
+          for (size_t index = 0; index < stream.count; ++index) {
+            const auto& bin = stream.bins[index];
+            std::cout << " bin" << index << "_ns=" << bin.end_ns - bin.begin_ns
+                      << " bin" << index << "_frames=" << bin.frames;
+          }
+        }
+        std::cout << '\n';
+      };
 #if defined(NR_NEXUS_DEV_CONTROL)
       funnel_accounting_tests::Restore adaptive_diagnostic;
       adaptive_diagnostic.Atomic(&native::edit_reuse_adaptive_experiment);
 #endif
-      wait_until_ns(session->stable_after_ns + 2 * rate::Stream::BIN_NS + 100'000'000);
-      const auto upper_output = current_output();
+      rate::Snapshot upper_output;
+      int64_t upper_read_ns = 0;
+      const auto upper_deadline = std::chrono::steady_clock::time_point(std::chrono::nanoseconds(
+          session->stable_after_ns + static_cast<int64_t>(rate::Stream{}.bins.size()) * rate::Stream::BIN_NS));
+      {
+        std::unique_lock lock(output_cadence_mutex);
+        output_cadence_changed.wait_until(lock, upper_deadline, [&] {
+          // Stream::Read rejects a caller time older than its latest callback.
+          // Keep the clock read and public Read together between callbacks.
+          upper_read_ns = rate::NowNs();
+          upper_output = rate::Read(output_identity, upper_read_ns);
+          // An available but inaccurate rate must fail the original check.
+          return upper_output.available;
+        });
+      }
+      describe_output_window("upper", upper_output, upper_read_ns);
       Check(upper_output.available && upper_output.source == rate::Source::PRESENT && upper_output.output == output_identity
                 && std::abs(upper_output.fps - 80.) < 3.,
             "real registered Present callbacks produced the main output's complete 80 FPS window");
@@ -2191,7 +2242,14 @@ int Run() {
         }
         if (!session->trial) break;
       }
-      const auto lower_output = current_output();
+      rate::Snapshot lower_output;
+      int64_t lower_read_ns = 0;
+      {
+        std::lock_guard lock(output_cadence_mutex);
+        lower_read_ns = rate::NowNs();
+        lower_output = rate::Read(output_identity, lower_read_ns);
+      }
+      describe_output_window("lower", lower_output, lower_read_ns);
       Check(low_cost_observed && !session->trial && lower_output.available && lower_output.source == rate::Source::PRESENT
                 && lower_output.output == output_identity && lower_output.window_serial > upper_output.window_serial
                 && lower_output.window_begin_ns >= low_applied_ns + adaptive::WARMUP_NS

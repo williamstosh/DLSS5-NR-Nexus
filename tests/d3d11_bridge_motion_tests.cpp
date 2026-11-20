@@ -15,6 +15,7 @@
 #include <fstream>
 #include <initializer_list>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -1456,11 +1457,107 @@ int main(int argc, char** argv) {
         Check(NVSDK_NGX_SUCCEED(created) && native::create_contracts.contains(handle),
             "mock SDK uses the production D3D11 Create hook to capture the source device identity");
       }
+      namespace timers = renodx::addons::dlss5::gpu_timers;
+      struct FrameSnapshot {
+        uint64_t source_sequence = 0, timer_sequence = 0, completed_sequence = 0, cost_sequence = 0;
+        uint64_t submits = 0, copies = 0, reuses = 0, request_generation = 0, applied_generation = 0;
+        int64_t applied_ns = 0, stable_after_ns = 0;
+        size_t cost_count = 0, observations = 0;
+        bool cost_valid = false;
+      };
+      const auto snapshot = [&](const NVSDK_NGX_Handle* source_handle) {
+        FrameSnapshot value{
+            .timer_sequence = timers::internal::next_sequence,
+            .completed_sequence = timers::completed_stats[1].sequence,
+            .submits = native::bridge_submits.load(), .copies = native::bridge_waits11.load(),
+            .reuses = native::edit_reuse_reuses.load(), .observations = model_observations.size()};
+        if (const auto source = native::features.find(source_handle); source != native::features.end()) {
+          value.source_sequence = source->second.sr_sequence;
+          if (source->second.adaptive_session != nullptr) {
+            const auto& session = *source->second.adaptive_session;
+            value.request_generation = session.status.generation;
+            value.applied_generation = session.applied_generation;
+            value.applied_ns = session.applied_ns;
+            value.stable_after_ns = session.stable_after_ns;
+            value.cost_sequence = session.last_sequence;
+            value.cost_count = session.gpu_count;
+            double median = 0., mad = 0.;
+            value.cost_valid = session.GpuStatistics(native::SteadyNowNs(), &median, &mad);
+          }
+        }
+        return value;
+      };
+      FrameSnapshot before_frame;
+      auto trace_consumer = make_texture(adaptive_output_width, adaptive_output_height,
+          DXGI_FORMAT_R16G16B16A16_FLOAT, 0, nullptr, 0);
+      const auto trace_frame = [&](const char* scenario, const rate::OutputIdentity& owner) {
+        const auto after = snapshot(handle);
+        const auto& session = *native::features.at(handle).adaptive_session;
+        const auto sizes = [](const renodx::addons::dlss5::adaptive_resolution::Sizes& values) {
+          std::ostringstream text;
+          for (const auto& size : values) {
+            if (size.width == 0) continue;
+            if (text.tellp() != 0) text << ',';
+            text << size.width << 'x' << size.height;
+          }
+          return text.str();
+        };
+        std::ostringstream actual, models, resets;
+        for (size_t index = before_frame.observations; index < model_observations.size(); ++index) {
+          if (index != before_frame.observations) {
+            actual << ',';
+            models << ',';
+            resets << ',';
+          }
+          const auto& observation = model_observations[index];
+          actual << observation.width << 'x' << observation.height;
+          models << model_presets[index];
+          resets << observation.reset;
+        }
+        if (after.reuses != before_frame.reuses) {
+          const auto& feature = native::features.at(handle);
+          actual << feature.input_width << 'x' << feature.input_height;
+        }
+        context->CopyResource(trace_consumer.Get(), output.Get());
+        const auto rgba = Read11(trace_consumer.Get(), 8);
+        const auto output_window = rate::Read(owner, rate::NowNs());
+        const auto submitted = native::bridge_submitted_value.load();
+        const bool completed = after.submits != before_frame.submits
+            && native::bridge.fence_done12->GetCompletedValue() >= submitted;
+        // Timer sequence values are relative to this SR call. Zero means
+        // that no matching completed group or valid cost entered this call.
+        const auto relative_sequence = [&](uint64_t sequence) {
+          return (sequence > before_frame.timer_sequence && sequence <= after.timer_sequence
+              ? sequence - before_frame.timer_sequence : 0);
+        };
+        std::cout << "NR_RELEASE_PARITY bridge-adaptive " << scenario
+                  << " sr_step=" << after.source_sequence - before_frame.source_sequence
+                  << " requested=" << sizes(session.status.requested) << " confirmed=" << sizes(session.status.applied)
+                  << " actual=" << (actual.str().empty() ? "-" : actual.str())
+                  << " models=" << (models.str().empty() ? "-" : models.str())
+                  << " calls=" << model_observations.size() - before_frame.observations
+                  << " reset=" << (resets.str().empty() ? "-" : resets.str())
+                  << " reused=" << after.reuses - before_frame.reuses
+                  << " submitted=" << after.submits - before_frame.submits << " done=" << completed
+                  << " copied=" << after.copies - before_frame.copies
+                  << " request_step=" << after.request_generation - before_frame.request_generation
+                  << " confirmation_step=" << (after.applied_generation != before_frame.applied_generation)
+                  << " warmup_started=" << (after.applied_ns > before_frame.applied_ns)
+                  << " owner_current=" << rate::IsCurrentOutput(owner)
+                  << " fps_source=" << static_cast<uint32_t>(output_window.source)
+                  << " fps_available=" << output_window.available
+                  << " cost_valid_before=" << before_frame.cost_valid << " cost_valid=" << after.cost_valid
+                  << " cost_count=" << after.cost_count
+                  << " completion_seq=" << relative_sequence(after.completed_sequence)
+                  << " cost_seq=" << (after.cost_valid ? relative_sequence(after.cost_sequence) : 0)
+                  << " rgba_crc32=" << renodx::utils::hash::ComputeCRC32(rgba.data(), rgba.size()) << '\n';
+      };
       const auto frame = [&](bool wait_gpu = true, const char* phase = "preparing",
                              const NVSDK_NGX_Handle* source_handle = nullptr, bool sr_succeeds = true) {
         if (source_handle == nullptr) {
           source_handle = handle;
         }
+        before_frame = snapshot(source_handle);
         ++native::present_generation;
         const auto cpu_before = native::bridge_cpu_timing[0];
         const auto completion_before = native::bridge_completion_wait_ns;
@@ -1588,6 +1685,8 @@ int main(int argc, char** argv) {
         Check(native::features.at(handle).adaptive_session->status.display_output_generation == direct_size.generation
                   && Read11(application.buffers[0].Get(), 8) == Read11(output.Get(), 8),
             "the intermediate Bridge result reaches the exact real Backbuffer and its adaptive output identity");
+        frame();
+        trace_frame("intermediate-delivered", direct_size);
         {
           host::Swapchain secondary(factory.Get(), device.Get(), adaptive_output_width, adaptive_output_height);
           host::Dispatch<reshade::addon_event::init_swapchain>(&secondary, false);
@@ -1613,6 +1712,7 @@ int main(int argc, char** argv) {
         Check(native::bridge_submits.load() == failed_submit && native::bridge_waits11.load() == failed_copy
                   && native::features.at(handle).adaptive_session->applied_ns == failed_applied,
             "failed outer SR cannot submit Bridge work, copy a twin, or confirm an adaptive tier");
+        trace_frame("sr-failed", direct_size);
         auto& ordinary = *native::features.at(handle).adaptive_session;
         const auto ordinary_consumer = make_texture(adaptive_output_width, adaptive_output_height,
             DXGI_FORMAT_R16G16B16A16_FLOAT, 0, nullptr, 0);
@@ -1628,27 +1728,37 @@ int main(int argc, char** argv) {
               nullptr, nullptr, 0u, nullptr);
         };
         const auto clock_start = std::chrono::steady_clock::now();
+        bool ordinary_cost_ready = false;
         bool ordinary_lowered = false;
         bool ordinary_restored = false;
         for (uint32_t tick = 1; tick <= 400 && !ordinary_restored; ++tick) {
           std::this_thread::sleep_until(clock_start + std::chrono::milliseconds(tick * 25));
           ordinary_cadence();
           frame();
+          double median = 0., mad = 0.;
+          if (!ordinary_cost_ready && ordinary.status.applied == ordinary.ladder.sizes[0]
+              && ordinary.GpuStatistics(native::SteadyNowNs(), &median, &mad)) {
+            trace_frame("ordinary-cost-ready", direct_size);
+            ordinary_cost_ready = true;
+          }
           if (!ordinary_lowered && ordinary.status.applied == ordinary.ladder.sizes[1]) {
             Check(ordinary.trial && ordinary.status.output_fps > 0. && ordinary.status.output_fps < 95.
                       && ordinary.status.display_output_generation == direct_size.generation
                       && model_observations.back().width == ordinary.ladder.sizes[1][0].width
                       && model_observations.back().reset == 1 && read_consumer() != original,
                 "registered ordinary Present and completed NR costs request, apply and deliver the lower tier");
+            trace_frame("ordinary-lower", direct_size);
             ordinary_lowered = true;
           } else if (ordinary_lowered && ordinary.status.applied == ordinary.ladder.sizes[0]) {
             Check(!ordinary.trial && model_observations.back().width == ordinary.ladder.sizes[0][0].width
                       && model_observations.back().reset == 1 && read_consumer() != original,
                 "the unchanged output cadence rejects the trial and delivers the original upper tier");
+            trace_frame("ordinary-upper", direct_size);
             ordinary_restored = true;
           }
         }
-        Check(ordinary_lowered && ordinary_restored && rate::Read(direct_size, rate::NowNs()).source == rate::Source::PRESENT,
+        Check(ordinary_cost_ready && ordinary_lowered && ordinary_restored
+                  && rate::Read(direct_size, rate::NowNs()).source == rate::Source::PRESENT,
             "Bridge uses the registered ordinary Present window and completes a two-tier round trip");
 
         const auto while_private_queue_stalled = [&](auto revoke) {
@@ -1677,11 +1787,18 @@ int main(int argc, char** argv) {
         const auto first_copy = native::bridge_waits11.load();
         const auto first_confirmation = ordinary.applied_ns;
         ordinary.Request(1, native::SteadyNowNs());
+        const auto revoked_cost = snapshot(handle);
         while_private_queue_stalled([&] { ObserveOutputDestroy(&application, true); });
+        const auto rejected_cost = snapshot(handle);
+        Check(rejected_cost.cost_count == 0 && !rejected_cost.cost_valid
+                  && rejected_cost.completed_sequence == revoked_cost.completed_sequence
+                  && rejected_cost.cost_sequence == revoked_cost.cost_sequence,
+            "an undelivered Bridge target admits no new cost or completed sample");
         Check(native::bridge_waits11.load() == first_copy && ordinary.applied_ns == first_confirmation
                   && ordinary.status.applied == ordinary.ladder.sizes[0]
                   && model_observations.back().width == ordinary.ladder.sizes[1][0].width && read_consumer() == original,
             "an already executed Bridge tier leaves the old confirmation and SR pixels when the output retires");
+        trace_frame("output-revoked", direct_size);
         host::Dispatch<reshade::addon_event::destroy_swapchain>(&application, true);
         host::Dispatch<reshade::addon_event::init_swapchain>(&application, true);
         const auto recreated_output = rate::MatchPresentOutput(host_owner, application.get_current_back_buffer().handle);
@@ -1693,6 +1810,7 @@ int main(int argc, char** argv) {
         Check(native::bridge_waits11.load() == first_copy + 1 && model_observations.back().reset == 1
                   && read_consumer() != original,
             "the first legal frame on the fresh ordinary output recovers ordered delivery with Reset");
+        trace_frame("output-recovered", recreated_output);
         std::cout << "OBS Bridge Adaptive ordinary roundtrip, failed SR, and output-generation revocation\n";
         namespace adaptive = renodx::addons::dlss5::adaptive_resolution;
         namespace receipt_adapter = xefg::internal;
@@ -1730,7 +1848,6 @@ int main(int argc, char** argv) {
           bool complete = receipt_adapter::modules[0].complete;
           receipt_adapter::ProxySlot proxy = receipt_adapter::proxies[0];
           std::array<void*, 2> source_real = receipt_adapter::source_present_slots[0].real;
-          xefg::BridgeSourceObserver observer = receipt_adapter::bridge_source_observer.load();
           bool native_off = native::native_fg_public_off.load();
           void* handle = reinterpret_cast<void*>(uintptr_t{0xEFAD});
           ~ReceiptCleanup() {
@@ -1746,7 +1863,6 @@ int main(int argc, char** argv) {
             receipt_adapter::modules[0].complete = complete;
             receipt_adapter::proxies[0] = proxy;
             receipt_adapter::source_present_slots[0].real = source_real;
-            xefg::ConfigureBridgeSource(observer);
             native::native_fg_public_off.store(native_off);
             receipt_proxy = nullptr;
             receipt_context_handle = nullptr;
@@ -1773,17 +1889,14 @@ int main(int argc, char** argv) {
         const auto source_present = [&] {
           return receipt_adapter::SourcePresentHooks<0>::Present(application.native.Get(), 0, 0);
         };
-        xefg::ConfigureBridgeSource(&native::ObserveBridgeSourceForXefg);
         native::native_fg_public_off.store(false);
         receipt_sdk_status = 0;
         receipt_source_available = true;
         receipt_proxy = receipt_swapchain.Get();
         receipt_context_handle = receipt_cleanup.handle;
         const auto identity11 = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(device.Get()));
-        receipt_source = native::ObserveBridgeSourceForXefg(identity11).identity;
-        Check(receipt_source.handle == reinterpret_cast<uintptr_t>(handle)
-                  && receipt_source.generation == native::create_contracts.at(handle).source_generation,
-            "the production observer uniquely matches the live D3D11 Create source rather than the private D3D12 device");
+        receipt_source = {.device11 = identity11, .handle = reinterpret_cast<uintptr_t>(handle),
+            .generation = native::create_contracts.at(handle).source_generation};
         const xefg::abi::Init init{.application_swapchain = application.native.Get()};
         Check(Hooks::Init(receipt_cleanup.handle, native::bridge.queue, &init) == 0,
             "mock SDK Init uses the real application-swapchain callback identity capture");
@@ -1831,7 +1944,13 @@ int main(int argc, char** argv) {
         Check(source_present() == S_OK && Hooks::Enable(receipt_cleanup.handle, 0) == 0
                   && xefg::QueryBridgeOff(receipt_source).available && xefg::QueryBridgeOff(receipt_source).uses_source_link,
             "the registered source maps the actual successful nested proxy and a subsequent Disable binds it");
+        const auto registered_off = xefg::QueryBridgeOff(receipt_source);
+        Check(registered_off.before.identity == receipt_source && registered_off.after.identity == receipt_source
+                  && registered_off.source_swapchain == host_owner && registered_off.context_identity != 0,
+            "Attach's registered observer supplies the exact source around the real SDK Disable callback");
         mature();
+        frame();
+        trace_frame("xefg-registered", registered_off.output_identity);
         Check(!native::native_fg_public_off.load() && native::features.at(handle).adaptive_session->prepared,
             "the real Bridge source reaches full two-tier readiness via XeFG receipt without fabricating native SetOptions Off");
         const auto preparation_epoch = native::features.at(handle).adaptive_session->preparation_epoch;
@@ -1871,13 +1990,20 @@ int main(int argc, char** argv) {
         const auto off_confirmation = native::features.at(handle).adaptive_session->applied_ns;
         const auto off_copies = native::bridge_waits11.load();
         native::features.at(handle).adaptive_session->Request(1, native::SteadyNowNs());
+        const auto off_cost = snapshot(handle);
         receipt_sdk_status = -1;
         while_private_queue_stalled([&] { Hooks::Enable(receipt_cleanup.handle, 0); });
+        const auto rejected_off_cost = snapshot(handle);
+        Check(rejected_off_cost.cost_count == 0 && !rejected_off_cost.cost_valid
+                  && rejected_off_cost.completed_sequence == off_cost.completed_sequence
+                  && rejected_off_cost.cost_sequence == off_cost.cost_sequence,
+            "revoked Bridge Off admits no new target cost or completed sample");
         Check(!xefg::QueryBridgeOff(receipt_source).available && framerate::IsCurrentOutput(first_output)
                   && native::bridge_waits11.load() == off_copies && read_consumer() == original
                   && native::features.at(handle).adaptive_session->applied_ns == off_confirmation
                   && model_observations.back().width == native::features.at(handle).adaptive_session->ladder.sizes[1][0].width,
             "done without the still-required Disable receipt cannot copy the result or start tier warmup");
+        trace_frame("xefg-revoked", first_output);
         receipt_sdk_status = 0;
         Check(Hooks::Enable(receipt_cleanup.handle, 0) == 0 && xefg::QueryBridgeOff(receipt_source).available,
             "an actual new Disable can restore permission on the same output");
@@ -1886,6 +2012,7 @@ int main(int argc, char** argv) {
                   && native::features.at(handle).adaptive_session->status.applied[0].width == model_observations.back().width
                   && model_observations.back().reset == 1 && read_consumer() != original,
             "the first matching successful delivery after Off recovery confirms its actual tier once");
+        trace_frame("xefg-recovered", first_output);
         native::features.at(handle).adaptive_session->Request(0, native::SteadyNowNs());
         frame();
 
@@ -1970,6 +2097,7 @@ int main(int argc, char** argv) {
                       && native::features.at(handle).adaptive_session->status.applied
                           == native::features.at(handle).adaptive_session->ladder.sizes[0],
                 "a legal upper-tier x2 reuse makes zero model calls and delivers the complete Bridge result");
+            trace_frame("upper-reuse", rate::MatchPresentOutput(host_owner, application.get_current_back_buffer().handle));
             reused_with_copy = true;
           }
         }
@@ -2057,6 +2185,9 @@ int main(int argc, char** argv) {
                 && feature.input_width == adaptive_output_width && feature.input_height == adaptive_output_height
                 && feature.adaptive_session->status.applied[0].width == adaptive_output_width,
           "Adaptive Off restores the retained legal upper without changing shared Bridge twins");
+      if (!adaptive_hardware) {
+        trace_frame("adaptive-off", rate::MatchPresentOutput(host_owner, application.get_current_back_buffer().handle));
+      }
       uint64_t gpu_samples = 0;
       if (adaptive_hardware) {
         native::enabled.store(false);
@@ -2109,6 +2240,7 @@ int main(int argc, char** argv) {
                   && model_observations[model_observations.size() - 2].width == default_session.ladder.sizes[1][0].width
                   && model_observations.back().width == default_session.ladder.sizes[1][1].width,
             "both elected Passes record their actual lower grids before one Bridge Output copy and confirmation");
+        trace_frame("default-lower", rate::MatchPresentOutput(host_owner, application.get_current_back_buffer().handle));
         const auto group_confirmation = default_session.applied_ns;
         const auto group_copies = native::bridge_waits11.load();
         const auto group_calls = model_calls;
@@ -2118,6 +2250,7 @@ int main(int argc, char** argv) {
         Check(model_calls == group_calls + 2 && native::bridge_waits11.load() == group_copies
                   && default_session.applied_ns == group_confirmation,
             "a failed tail Pass cannot publish the mature prefix as a complete adaptive group");
+        trace_frame("default-tail-failed", rate::MatchPresentOutput(host_owner, application.get_current_back_buffer().handle));
         std::cout << "OBS Bridge Adaptive default-tier two-Pass delivery\n";
 
         native::kSetAdaptiveLevelCount.Commit(2.f);
@@ -2142,6 +2275,10 @@ int main(int argc, char** argv) {
                   && native::bridge_waits11.load() == copy_before_stall
                   && session.applied_ns == applied_before_stall && session.status.applied == session.ladder.sizes[0],
             "watchdog out rescue is not Bridge delivery or GPU completion proof");
+        Check(session.gpu_count == 0 && !snapshot(handle).cost_valid
+                  && timers::completed_stats[1].sequence == before_frame.completed_sequence,
+            "out without done admits no cost or completed target sample");
+        trace_frame("out-only", rate::MatchPresentOutput(host_owner, application.get_current_back_buffer().handle));
         const auto unmodified = Read11(output.Get(), 8);
         Check(std::memcmp(unmodified.data(), output_pixels.data(), unmodified.size()) == 0,
             "unproven Bridge completion preserves the original MOCK SR output");
@@ -2159,8 +2296,10 @@ int main(int argc, char** argv) {
         Check(native::bridge_waits11.load() == copy_before_stall + 1 && recovered_confirmation > applied_before_stall
                   && session.status.applied == session.ladder.sizes[1] && model_observations.back().reset == 1,
             "a new successful SR recovers the lower tier with Reset and starts warmup on its own handoff");
+        trace_frame("done-recovered", rate::MatchPresentOutput(host_owner, application.get_current_back_buffer().handle));
         frame();
         Check(session.applied_ns == recovered_confirmation, "later handoffs of the same tier do not restart warmup");
+        trace_frame("done-repeat", rate::MatchPresentOutput(host_owner, application.get_current_back_buffer().handle));
 
         Check(SUCCEEDED(native::bridge.queue->Wait(stalled.Get(), 2)), "Bridge Adaptive stalls the source-release submission");
         std::jthread release_retirement_stall([stalled] { Sleep(1600); stalled->Signal(2); });

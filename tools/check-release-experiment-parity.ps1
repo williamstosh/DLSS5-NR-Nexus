@@ -156,6 +156,14 @@ function Compare-ReleaseParityCase([string]$Row, $Case, [string]$OffLog, [string
                 $stable = [regex]::Match($matchesForScenario[0], $scenarioPattern).Groups['trace']
                 $traces[$scenario] = if ($stable.Success) { $stable.Value } else { $matchesForScenario[0] }
             }
+            foreach ($line in $lines | Where-Object { $_ -cmatch "^NR_RELEASE_PARITY $escapedRow " }) {
+                $registered = @($Case.scenarios | Where-Object {
+                    $line -cmatch $Case.expect[$_].Replace('{dev}', [string]$dev)
+                })
+                if ($registered.Count -ne 1) {
+                    throw "Unregistered or ambiguous $mode parity trace for ${Row}: $line"
+                }
+            }
         }
         $prefixed = if (-not $Case['existingTrace']) { $lines | Where-Object { $_ -cmatch "^NR_RELEASE_PARITY $escapedRow " } }
         foreach ($line in $prefixed) {

@@ -207,7 +207,13 @@ int RunNativeGuideContractTest();
 int RunPresentGuideModelsTest(bool native_ngx = false, const char* project_id_path = nullptr);
 int RunNativePresentDecisionTest();
 int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_only = false);
-namespace adaptive_resource_strategy_cases { int Run(); }
+// Case bodies follow the Present fixture that supplies their shared Runtime.
+namespace adaptive_resource_strategy_cases {
+int Run();
+#if defined(NR_NEXUS_TEST_NATIVE_NGX)
+int RunNative(const char* project_id_path);
+#endif
+}
 int RunOutputFramerateRegistrationCases();
 
 int RunNativeRequiredMenuTest() {
@@ -835,6 +841,9 @@ int main(int argc, char** argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-fg-service") == 0) return adaptive_fg_service_cases::Run();
 #if defined(NR_NEXUS_TEST_NATIVE_NGX)
+  if (argc == 3 && std::strcmp(argv[1], "--adaptive-resource-strategy-native") == 0) {
+    return adaptive_resource_strategy_cases::RunNative(argv[2]);
+  }
   if (argc == 3 && std::strcmp(argv[1], "--nr-edit-reuse-present-native") == 0) {
     return RunNrEditReusePresentContracts(argv[2]);
   }
