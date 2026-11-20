@@ -3760,7 +3760,9 @@ inline ClaimedPresentFrame IdentifyPresentBaseFrame(ID3D12CommandQueue* native_q
       .sequence = frame.sequence, .output_epoch = frame.swapchain_epoch,
       .pass_count = RequestedStagePlan().At(stage_plan::Stage::PRESENT).count,
       // Missing temporal inputs do not erase the proven SR-to-BB identity.
-      .reuse_edits = WantsPresentBaseFrames()};
+      .reuse_edits = WantsPresentBaseFrames() && contract.has_jitter
+          && std::isfinite(contract.jitter_x) && std::isfinite(contract.jitter_y)
+          && std::abs(contract.jitter_x) <= 0.5f && std::abs(contract.jitter_y) <= 0.5f};
   if (repeated) {
     if (order->entered.load() == frame.queue_entry
         && present_frame_policy::Classify(stream->base_frame_clock, current) == present_frame_policy::Claim::REPEATED) {
