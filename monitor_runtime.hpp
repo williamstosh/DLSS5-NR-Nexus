@@ -214,6 +214,9 @@ inline MonitorEditReuseResult ReadDeliveredEditReuse(
         && now - frame.recorded_ns <= ui::RecentHealthWindow::kStaleNs;
   };
   const auto delivered = [](const EditReuseMonitorFrame& frame) {
+    if (frame.borrowed_delivery != nullptr) {
+      return *frame.borrowed_delivery == adaptive_resolution::DeliveryReceipt::DELIVERED;
+    }
     if (frame.handed_off) return true;
     if (frame.recording == nullptr || !frame.recording->submitted.load()) return false;
     std::lock_guard lock(submission::tracker_mutex);
@@ -231,6 +234,7 @@ inline MonitorEditReuseResult ReadDeliveredEditReuse(
   if (!is_current(latest)) return {};
   if (latest.delivery == EditReuseDelivery::NONE) return {.reason = latest.reason};
   const bool latest_delivered = delivered(latest);
+  if (latest.borrowed_delivery != nullptr && !latest_delivered) return {};
   if (latest_delivered && latest.delivery != EditReuseDelivery::REFRESH) {
     return {.delivery = latest.delivery, .reason = latest.reason};
   }

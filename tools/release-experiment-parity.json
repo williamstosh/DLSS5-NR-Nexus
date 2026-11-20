@@ -118,10 +118,11 @@
         ["adaptive_resolution.hpp", "SetPairedSampling("]
       ],
       "cases": [
-        { "suite": "fg-native", "name": "nr-edit-reuse-contracts", "log": "nr-edit-reuse-contracts", "receipt": "^PASS case=nr-edit-reuse-contracts evidence=WARP\\+MOCK dev={dev}$", "scenarios": ["fixed-active", "paired-low", "unpaired-target", "unpaired-minimum", "xefg-write-permission", "request-history"],
+        { "suite": "fg-native", "name": "nr-edit-reuse-contracts", "log": "nr-edit-reuse-contracts", "receipt": "^PASS case=nr-edit-reuse-contracts evidence=WARP\\+MOCK dev={dev}$", "scenarios": ["fixed-active", "paired-low", "unpaired-target", "unpaired-minimum", "xefg-write-permission", "xefg-replay-delivery", "request-history"],
           "expect": {
             "fixed-active": "^grid=16x16 cadence=1/0 eligibility_keeps_anchor=1 same_grid_source_refresh=1 model_refresh=1 evidence=WARP\\+MOCK$",
             "xefg-write-permission": "^fps-expired=1/0 rgba=edited-alpha-intact revoked-before-copy=original revoked-after-copy=edited pending=unpublished discard=unpublished old-on/late-off=ignored equivalent-settings=1 evidence=WARP\\+MOCK$",
+            "xefg-replay-delivery": "^first-fence=missing replay-fence=completed rgba=identical monitor=waiting/waiting normal-monitor=reused core=unchanged retention=until-teardown evidence=WARP\\+MOCK$",
             "request-history": "^mask_continuous=1 x2_local_reset=1 look_continuous=1 preset_undo=1 explicit_reset_slots=2 evidence=WARP\\+MOCK$",
             "paired-low": "^output=PRESENT grid=12x12 calls=1/0 upper_us=2000 low_us=1500 discarded=1 recovered=1 stale_half_rejected=1 off_revocation_keeps_upper=1 held_100fps=1 output_replacement_rejected=1 evidence=WARP\\+MOCK$",
             "unpaired-target": "^output=PRESENT request=16x16/12x12 delivered=12x12 calls=1 warmup_ns=1000000000 low_fps=100 decision=OBSERVING request_ns=[1-9][0-9]+ delivery_ns=[1-9][0-9]+ decision_window_ns=[1-9][0-9]+/[1-9][0-9]+ decision_ns=[1-9][0-9]+ timestamps=full/half/none costs=2000/1500,missing,missing output_replacement_rejected=1 evidence=WARP\\+MOCK$",

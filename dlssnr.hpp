@@ -483,6 +483,7 @@ struct EditReuseMonitorFrame {
   uint32_t output_height = 0;
   bool handed_off = false;
   std::shared_ptr<submission::RecordingStatus> recording;
+  std::shared_ptr<const adaptive_resolution::DeliveryReceipt> borrowed_delivery;
 };
 
 // A source owns cached FeatureStates, whose active member retains the cache.
@@ -14296,12 +14297,20 @@ inline void StoreEditReuseMonitorFrame(std::array<EditReuseMonitorFrame, 2>* fra
 }
 
 inline void PublishEditReuseMonitorFrame(
-    FeatureState* source, ID3D12GraphicsCommandList* list, EditReuseMonitorFrame frame) noexcept {
+    FeatureState* source, ID3D12GraphicsCommandList* list, EditReuseMonitorFrame frame,
+    std::shared_ptr<adaptive_resolution::DeliveryReceipt>* borrowed_delivery = nullptr) noexcept {
   if (frame.device == nullptr || frame.sequence == 0 || source->source_generation != frame.source_generation
       || source->sr_sequence != frame.sequence
       || (frame.delivery == EditReuseDelivery::NONE && frame.reason == EditReuseBlock::NONE)) return;
   try {
-    if (frame.delivery != EditReuseDelivery::NONE && !frame.handed_off && frame.recording == nullptr && list != nullptr
+    if (borrowed_delivery != nullptr) {
+      // Share the adaptive resolver's outcome even when GPU timing is idle.
+      if (*borrowed_delivery == nullptr) {
+        *borrowed_delivery = std::make_shared<adaptive_resolution::DeliveryReceipt>(
+            adaptive_resolution::DeliveryReceipt::PENDING);
+      }
+      frame.borrowed_delivery = *borrowed_delivery;
+    } else if (frame.delivery != EditReuseDelivery::NONE && !frame.handed_off && frame.recording == nullptr && list != nullptr
         && queue_tracking_active.load(std::memory_order_relaxed)) {
       frame.recording = submission::ObserveRecording(list);
       if (frame.delivery == EditReuseDelivery::ORIGINAL) {
@@ -15300,7 +15309,8 @@ inline bool RecordInline(
     if (edit_monitor.device == nullptr) return;
     edit_monitor.delivery = delivery;
     edit_monitor.reason = reason;
-    PublishEditReuseMonitorFrame(&feature, command_list, std::move(edit_monitor));
+    const bool borrowed_edit = adaptive_recording != nullptr && adaptive_recording->delivery.borrowed_edit_anchor != nullptr;
+    PublishEditReuseMonitorFrame(&feature, command_list, std::move(edit_monitor), borrowed_edit ? &adaptive.delivery : nullptr);
   };
   const bool edit_reuse_fixed_workset = UsesFixedEditReuseWorkset(feature, adaptive);
   const bool edit_reuse_fixed_inline_route = edit_reuse_fixed_workset && fixed_inline_source && no_fg_owner();

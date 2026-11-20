@@ -2077,6 +2077,8 @@ int Run() {
       restore.Value(&receipt_context_handle);
       restore.Value(&receipt_present_status);
       restore.Value(&rate::test_now_ns);
+      restore.Atomic(&native::monitor_requested);
+      native::monitor_requested = true;
       sdk_slot.complete = true;
       sdk_slot.real[0] = reinterpret_cast<void*>(&FakeInit);
       sdk_slot.real[2] = reinterpret_cast<void*>(&FakeReceiptGetSwapchain);
@@ -2121,6 +2123,13 @@ int Run() {
         sdk_present();
       }
       auto& feature = native::features.at(sr);
+      const auto read_edit_delivery = [&](int64_t now) {
+        return native::ReadDeliveredEditReuse(feature.edit_reuse_monitor, feature.source_generation,
+            feature.sr_sequence, addon::stage_plan::Stage::UPSCALED, now).delivery;
+      };
+      const auto waiting = [](native::EditReuseDelivery delivery) {
+        return delivery == native::EditReuseDelivery::NONE || delivery == native::EditReuseDelivery::REFRESH;
+      };
       for (uint32_t i = 0; i < 64 && (!feature.adaptive_session->prepared
                                         || feature.adaptive_session->status.applied[0].width != 16); ++i) {
         source_frame(sr, 0, true, false);
@@ -2154,6 +2163,8 @@ int Run() {
                 && native::edit_reuse_reuses.load() == before + 1 && feature.adaptive_session->status.applied[0].width == 12
                 && feature.adaptive_session->status.reason == adaptive::Reason::OUTPUT_UNAVAILABLE,
             "an expired FPS window keeps the reduced tier and delivers zero-model edit with current alpha");
+      Check(read_edit_delivery(native::SteadyNowNs()) == native::EditReuseDelivery::REUSED,
+            "the monitor reports the reduced reuse after its first valid submission settles");
 
       const auto on = [&] {
         receipt_present_status.enabled = 1;
@@ -2193,9 +2204,11 @@ int Run() {
       Check(source_frame(sr, 0, true, false) == 1, "fresh authority seeds a new reduced anchor");
       before = native::edit_reuse_reuses.load();
       Check(source_frame(sr, 0, false, false) == 0, "record the next reduced reuse while authority holds");
+      const auto unsubmitted = submission::ObserveRecording(gpu.list.Get());
       on();
       native::ResolveAdaptiveBorrowedDeliveries();
-      Check(native::edit_reuse_reuses.load() == before && !native::adaptive_borrowed_deliveries.empty(),
+      Check(!unsubmitted->submitted.load() && waiting(read_edit_delivery(native::SteadyNowNs()))
+                && native::edit_reuse_reuses.load() == before && !native::adaptive_borrowed_deliveries.empty(),
             "ON after copyback leaves the still unsubmitted candidate pending");
       Check(edited(next_finish()) && native::edit_reuse_reuses.load() == before + 1,
             "the ordered, submitted copyback survives the later ON receipt");
@@ -2224,14 +2237,156 @@ int Run() {
       native::ResolveAdaptiveBorrowedDeliveries();
       Check(native::edit_reuse_reuses.load() == before && native::adaptive_borrowed_deliveries.empty(),
             "discard cannot report an edited delivery");
+
+      const auto seed_refreshes = native::edit_reuse_refreshes.load();
+      for (uint32_t attempt = 0; attempt < 4 && native::edit_reuse_refreshes.load() == seed_refreshes; ++attempt) {
+        // Discarded work can require model maturation and standby preparation.
+        source_frame(sr, 1, true, false);
+      }
+      Check(native::edit_reuse_refreshes.load() == seed_refreshes + 1,
+            "seed a confirmed reduced anchor for the missing first submission proof");
+      const auto& session = *feature.adaptive_session;
+      const auto applied_grid = session.status.applied;
+      const auto applied_generation = session.applied_generation;
+      const auto applied_ns = session.applied_ns;
+      const auto confirmed_sequence = session.delivered_edit_sequence;
+      const auto& slot = feature.slots[0];
+      const auto anchor = slot.edit_reuse;
+      Check(applied_grid[0].width == 12 && session.delivered_edit_reuse && confirmed_sequence == feature.sr_sequence
+                && anchor != nullptr && anchor->valid,
+            "the replay probe starts from a delivered low-grid refresh and a valid anchor");
+      const auto anchor_generation = anchor->anchor_generation;
+      const auto anchor_reuses = anchor->reuse_count;
+      const auto calls_before_replay = model_calls;
+      const auto refreshes_before_replay = native::edit_reuse_refreshes.load();
+      const auto reuses_before_replay = native::edit_reuse_reuses.load();
+      const auto evaluations_before_replay = native::successful_evaluations.load();
+      Check(source_frame(sr, 0, false, false) == 0, "record the low-grid reuse that will execute twice");
+      const auto reuse_sequence = feature.sr_sequence;
+      const auto anchor_sequence = anchor->source_sequence;
+      const auto model = slot.handle;
+      const auto look_sequence = slot.look_reuse_sequence;
+      const auto monitor_now = native::SteadyNowNs();
+      const auto recording = submission::ObserveRecording(gpu.list.Get());
+      const auto& deliveries = native::adaptive_borrowed_deliveries;
+      Check(deliveries.size() == 1 && deliveries.front().recording == recording
+                && deliveries.front().delivery.source_sequence == reuse_sequence
+                && deliveries.front().delivery.borrowed_edit_reused,
+            "the actual SR reuse stages one deferred delivery for this recording");
+      const auto delivery = deliveries.front().delivery.frame.delivery;
+      const auto& observation = feature.edit_reuse_monitor[0];
+      Check(observation.sequence == reuse_sequence && observation.source_generation == feature.source_generation
+                && observation.delivery == native::EditReuseDelivery::REUSED && !recording->submitted.load()
+                && waiting(read_edit_delivery(monitor_now)),
+            "the recorded reuse is pending before its first Execute");
+
+      const auto capture = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      gpu.Retain(capture.readback.Get());
+      Check(SUCCEEDED(gpu.list->Close()), "close the exact XeFG low-grid reuse recording");
+      ID3D12CommandList* lists[]{gpu.list.Get()};
+      const auto wait_for_gpu = [&] {
+        gpu.submission_pending = true;
+        Check(SUCCEEDED(gpu.queue->Signal(gpu.fence.Get(), ++gpu.serial)), "signal the independent XeFG fixture fence");
+        HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        Check(event != nullptr, "XeFG fixture completion event");
+        const auto armed = gpu.fence->SetEventOnCompletion(gpu.serial, event);
+        const auto wait = (SUCCEEDED(armed) ? WaitForSingleObject(event, 10000) : WAIT_FAILED);
+        CloseHandle(event);
+        Check(wait == WAIT_OBJECT_0 && SUCCEEDED(gpu.device->GetDeviceRemovedReason()),
+              "complete XeFG fixture GPU work before reusing the recording or its resources");
+        gpu.submission_pending = false;
+      };
+      const auto proofs = [&] {
+        std::lock_guard lock(submission::tracker_mutex);
+        const auto& generation = submission::tracked_lists.at(recording->list).generations.at(recording->generation);
+        Check(generation.unreserved_submissions == 0, "each Execute reserves an exact submission receipt");
+        return generation.submissions;
+      };
+      const auto core_unchanged = [&] {
+        return deliveries.size() == 1 && deliveries.front().recording == recording
+            && (delivery == nullptr || *delivery == adaptive::DeliveryReceipt::PENDING) && feature.sr_sequence == reuse_sequence
+            && session.status.applied == applied_grid && session.applied_generation == applied_generation
+            && session.applied_ns == applied_ns && session.delivered_edit_sequence == confirmed_sequence
+            && session.delivered_edit_reuse && model_calls == calls_before_replay && slot.handle == model
+            && slot.look_reuse_sequence == look_sequence && native::successful_evaluations.load() == evaluations_before_replay
+            && native::edit_reuse_refreshes.load() == refreshes_before_replay
+            && native::edit_reuse_reuses.load() == reuses_before_replay && slot.edit_reuse == anchor
+            && anchor->valid && anchor->reused && anchor->source_sequence == anchor_sequence
+            && anchor->anchor_generation == anchor_generation && anchor->reuse_count == anchor_reuses;
+      };
+
+      ID3D12Fence* queue_fence = nullptr;
+      {
+        std::unique_lock lock(addon::queue_completion_mutex);
+        auto& completion = addon::queue_completions.at(gpu.queue.Get());
+        Check(completion.fence != nullptr && completion.fence != gpu.fence.Get() && !completion.faulted,
+              "the fixture queue has a healthy tracker fence distinct from the GPU wait fence");
+        queue_fence = std::exchange(completion.fence, nullptr);
+      }
+      // Exercise the real hook's missing-fence path for only the first Execute.
+      gpu.queue->ExecuteCommandLists(1, lists);
+      {
+        std::unique_lock lock(addon::queue_completion_mutex);
+        addon::queue_completions.at(gpu.queue.Get()).fence = queue_fence;
+      }
+      wait_for_gpu();
+      const auto first_completion = gpu.serial;
+      const auto first_pixels = capture.Pixels();
+      const auto first_proofs = proofs();
+      Check(recording->submitted.load() && first_proofs.size() == 1 && !first_proofs.front().pending
+                && first_proofs.front().fence.empty() && first_proofs.front().value == 0 && edited(first_pixels),
+            "first Execute writes edited RGB with original alpha but supplies no qualifying fence");
+      native::ResolveAdaptiveBorrowedDeliveries();
+      Check(core_unchanged() && waiting(read_edit_delivery(monitor_now)),
+            "a completed first Execute without its qualifying fence keeps core and monitor pending");
+
+      gpu.queue->ExecuteCommandLists(1, lists);
+      wait_for_gpu();
+      const auto replay_proofs = proofs();
+      Check(replay_proofs.size() == 2 && !replay_proofs.front().pending && replay_proofs.front().fence.empty()
+                && !replay_proofs.back().pending && replay_proofs.back().fence.fence == queue_fence
+                && replay_proofs.back().value != 0 && queue_fence->GetCompletedValue() >= replay_proofs.back().value
+                && std::ranges::all_of(replay_proofs, [&](const auto& proof) {
+                  return proof.list_identity == recording->list && proof.recording_generation == recording->generation;
+                }) && capture.Pixels() == first_pixels,
+            "sequential replay of the same recording reproduces RGBA and earns its own completed fence");
+      native::ResolveAdaptiveBorrowedDeliveries();
+      const auto after_replay = read_edit_delivery(monitor_now);
+      Check(core_unchanged(), "the replay fence cannot advance applied tier, confirmed cadence, counts or history");
+      Check(SUCCEEDED(gpu.allocator->Reset()) && SUCCEEDED(gpu.list->Reset(gpu.allocator.Get(), nullptr)),
+            "reset the replayed list only after both GPU executions have finished");
+      submission::PruneCompletedGenerations();
+      native::ResolveAdaptiveBorrowedDeliveries();
+      Check(recording->closed.load() && core_unchanged() && !submission::ResourceReleasable(anchor.get()),
+            "reset after a missing first fence keeps the unresolved anchor resources pinned");
+
       Check(Hooks::Destroy(context_handle) == 0, "retire the original SDK context");
       xefg::ForgetBridgeSourceSwapchain(source_owner);
       xefg::ConfigureD3D12Source(nullptr);
       native::ForgetSourceHandleLocked(sr);
+      native::ResolveAdaptiveBorrowedDeliveries();
+      Check(deliveries.empty() && (delivery == nullptr || *delivery == adaptive::DeliveryReceipt::REJECTED),
+            "source teardown removes the pending delivery without publishing it");
+      {
+        // Retire only this test's injected hole, using the first Execute's
+        // independently observed completion after the source can no longer publish.
+        std::lock_guard lock(submission::tracker_mutex);
+        auto& generation = submission::tracked_lists.at(recording->list).generations.at(recording->generation);
+        auto& first_proof = generation.submissions.front();
+        first_proof.fence = addon::FenceRef(gpu.fence.Get());
+        first_proof.value = first_completion;
+      }
+      submission::PruneCompletedGenerations();
       native::DrainRetiredResources(true);
+      gpu.uploads.clear();
+      gpu.retained_resources.clear();
+      Check(submission::ResourceReleasable(anchor.get()), "release the isolated replay resources after source teardown");
+      Check(waiting(after_replay), "the replay fence must not publish the first pending XeFG low-grid reuse in the monitor");
       std::cout << "NR_RELEASE_PARITY dx12-upscaled-adaptive-x2 xefg-write-permission fps-expired=1/0 rgba=edited-alpha-intact"
                    " revoked-before-copy=original revoked-after-copy=edited pending=unpublished discard=unpublished"
                    " old-on/late-off=ignored equivalent-settings=1 evidence=WARP+MOCK\n";
+      std::cout << "NR_RELEASE_PARITY dx12-upscaled-adaptive-x2 xefg-replay-delivery first-fence=missing replay-fence=completed"
+                   " rgba=identical monitor=waiting/waiting normal-monitor=reused core=unchanged retention=until-teardown evidence=WARP+MOCK\n";
     }
 
     enum class TimingCoverage { FULL, HALF, NONE };
