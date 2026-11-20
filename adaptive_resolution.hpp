@@ -185,6 +185,8 @@ struct Session {
   uint64_t workload_identity = 0, output_owner = 0;
   // Upper, then supported lower-tier reuse; independent of timing mode.
   std::array<bool, 2> edit_cadence{};
+  bool delivered_edit_reuse = false;
+  uint64_t delivered_edit_sequence = 0;
   uint64_t resource_identity = 0;
   uint64_t configuration_epoch = 0;
   uint64_t preparation_epoch = 0;
@@ -379,6 +381,22 @@ struct Session {
     status.coefficient = ladder.coefficients[level];
     last_switch_ns = now_ns;
     if (settings.enabled) status.reason = Reason::WARMING;
+  }
+
+  void ConfirmEditCadence(uint64_t sequence, bool reuse, bool same_grid, int64_t now_ns) {
+    if (sequence <= delivered_edit_sequence) return;
+    const bool changed = same_grid && delivered_edit_sequence != 0 && delivered_edit_reuse != reuse;
+    delivered_edit_sequence = sequence;
+    delivered_edit_reuse = reuse;
+    const size_t endpoint = (status.applied == status.upper ? 0u : 1u);
+    if (reuse != edit_cadence[endpoint] && trial && raising) raise_comparable = false;
+    if (!changed) return;
+    InvalidateSampling(now_ns);
+    raise_after_ns = now_ns;
+    if (trial && raising) {
+      Request(previous_level, now_ns);
+      trial = false;
+    }
   }
 
   void Fail(uint64_t generation) {
@@ -608,6 +626,9 @@ struct Session {
         .target_fps = settings.target_fps, .upper = status.upper, .multiplier_variable = output.multiplier_variable,
         .edit_cadence = edit_cadence,
         .mask = mask_settings, .normalization = normalization_settings};
+    if (delivered_edit_sequence != 0) {
+      result.edit_cadence[status.applied == status.upper ? 0u : 1u] = delivered_edit_reuse;
+    }
     for (size_t role = 0; role < result.mask.size(); ++role) {
       if ((measurement_roles & (1u << role)) == 0) {
         result.mask[role] = {};
@@ -648,7 +669,7 @@ struct Session {
   void Prepare(const Settings& requested_settings, const Sizes& upper, const Sizes& floor,
                uint64_t source_identity, const Output& output, int64_t now_ns, bool supported, bool frozen,
                uint64_t allocation_identity = 0, uint64_t work_identity = 0, uint32_t model_roles = 3,
-               std::array<bool, 2> cadence = {}) {
+               std::array<bool, 2> cadence = {}, bool confirm_edit_cadence = false) {
     Settings next = requested_settings;
     next.target_fps = (std::isfinite(next.target_fps) ? std::clamp(next.target_fps, 30.f, 360.f) : 60.f);
     next.minimum_scale = (std::isfinite(next.minimum_scale) ? std::clamp(next.minimum_scale, MINIMUM_SCALE, 1.f) : 0.67f);
@@ -679,9 +700,11 @@ struct Session {
     const bool preparation_mode_changed = settings.legacy_preparation != next.legacy_preparation
         || settings.limited_residency != next.limited_residency || settings.resource_strategy != next.resource_strategy;
     const bool work_hash_changed = workload_identity != work_identity;
-    const bool workload_changed = work_hash_changed || edit_cadence != cadence;
     const size_t active_cadence_index = (status.applied == status.upper ? 0u : 1u);
-    const bool active_cadence_changed = edit_cadence[active_cadence_index] != cadence[active_cadence_index];
+    const bool active_cadence_changed = !confirm_edit_cadence
+        && edit_cadence[active_cadence_index] != cadence[active_cadence_index];
+    const bool workload_changed = work_hash_changed || active_cadence_changed
+        || edit_cadence[1u - active_cadence_index] != cadence[1u - active_cadence_index];
     const bool changed = (!frozen && (identity != source_identity
         || measurement_roles != model_roles))
         || settings != next || status.upper != upper || selection_changed;

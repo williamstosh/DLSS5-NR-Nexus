@@ -461,13 +461,13 @@ inline bool Apply(const presets::Document& document, bool compatibility, bool re
   Json writes = Json::object();
   SettingEffect effect = SettingEffect::kNone;
   bool restart = false;
-  bool non_model_change = false;
+  bool restore_configuration_changed = false;
   const auto previous_model_requests = ActiveNrModelRequests();
   for (auto& row : changes) {
     const auto* setting = FindSetting(row.key);
     writes[row.key] = row.after;
     if (setting == nullptr || !setting->IsModelSelection()) {
-      non_model_change = true;
+      restore_configuration_changed |= setting != &kSetEditReuse;
       if (setting != nullptr) effect = (std::max)(effect, setting->effect);
     }
     if (row.key == "NRPresentSdrRestorePolicy") {
@@ -622,7 +622,7 @@ inline bool Apply(const presets::Document& document, bool compatibility, bool re
     }
   }
   const bool model_requests_changed = previous_model_requests != ActiveNrModelRequests();
-  if (non_model_change || model_requests_changed) {
+  if (restore_configuration_changed || model_requests_changed) {
     ++present_restore_configuration.epoch;
   }
   policy_lock.unlock();

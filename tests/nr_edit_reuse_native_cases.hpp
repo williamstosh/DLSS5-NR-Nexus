@@ -439,6 +439,7 @@ int Run() {
       TagChange tag_change = TagChange::NONE;
       bool overwrite_sync_motion = false;
       bool without_backbuffer_tag = false;
+      bool check_pending_mfg = false;
     };
     struct Observation {
       bool replaced = false;
@@ -581,6 +582,23 @@ int Run() {
                   && native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_UI) == nullptr
                   && native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_UIAlpha) == input_alpha,
               "native FG keeps the BB, UI and alpha parameter bindings at consumption");
+          if (request.check_pending_mfg) {
+            const auto pending = read_progress();
+            const auto calls = model_calls;
+            auto duplicate = parameters;
+            duplicate.Set(NVSDK_NGX_DLSSG_Parameter_HUDLess, input_hudless);
+            duplicate.Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, 2u);
+            bool replaced = false;
+            ID3D12Resource* borrowed = nullptr;
+            {
+              const addon::RuntimeLock lock(native::runtime_mutex);
+              borrowed = native::RunNativePreFg(gpu.list.Get(), &duplicate, handle, &replaced);
+            }
+            native::RestoreNativePreFg(gpu.list.Get(), &duplicate, borrowed, true, handle, replaced);
+            Check(observed.replaced && !pending.complete && !replaced && borrowed == nullptr
+                    && model_calls == calls && read_progress() == pending,
+                "a low-tier candidate in the first SDK call cannot be consumed or settled by a second call");
+          }
           consumed_back = Capture(gpu, backbuffer.Get(), NATIVE_INPUT_STATE);
           consumed_hudless = Capture(gpu, bound_hudless, NATIVE_INPUT_STATE);
         };
@@ -735,6 +753,8 @@ int Run() {
             duplicate.Set(NVSDK_NGX_DLSSG_Parameter_MVecs, consumer_motion);
             const auto before = model_calls;
             const auto reuses = native::edit_reuse_reuses.load();
+            const auto producer_result = native::native_fg_result.load();
+            const auto* producer_marker = native::native_fg_marker.load();
             bool replaced = false;
             ID3D12Resource* original = nullptr;
             {
@@ -748,8 +768,10 @@ int Run() {
             native::RestoreNativePreFg(consumer, &duplicate, original, true, handle, replaced);
             Check(native::PreFgResource(&duplicate, NVSDK_NGX_DLSSG_Parameter_HUDLess) == consumer_hudless
                     && model_calls == before && native::edit_reuse_reuses.load() == reuses
+                    && native::native_fg_result.load() == producer_result
+                    && native::native_fg_marker.load() == producer_marker
                     && read_progress() == produced,
-                "Native MFG restores its binding and neither denial nor ordered re-delivery advances history");
+                "Native MFG restores its binding and preserves producer state and history on denial and re-delivery");
           };
           check_mfg(proof_list.Get(), input_hudless, motion.Get(), false);
           check_mfg(gpu.list.Get(), nullptr, motion.Get(), false);
@@ -1347,16 +1369,36 @@ int Run() {
           "a new base token cannot re-deliver the previous fixed slot while Adaptive can acquire residency");
       const auto preparing = record({.token = ++token});
       Check(preparing.reuses == 0 && stream.adaptive_frame.slot == 0
-              && native::features.at(role_handle).adaptive_cache != nullptr
-              && native::features.at(role_handle).slots[0].edit_reuse == nullptr,
-          "actual Adaptive preparation stays on the upper tier and retires the fixed edit anchor");
+              && native::features.at(role_handle).adaptive_cache != nullptr,
+          "actual Adaptive preparation selects the upper tier after the preceding reuse");
       for (uint32_t attempt = 0; attempt < 16 && !stream.adaptive_session->TargetReady(); ++attempt) {
-        Check(record({.token = ++token}).reuses == 0, "preparing Adaptive tiers cannot publish x2 reuse");
+        record({.token = ++token});
       }
       Check(stream.adaptive_session->TargetReady() && stream.adaptive_session->ladder.count == 2,
           "two native Adaptive tiers become ready through normal recording and Fence completion");
+      const auto upper_refresh = record({.token = ++token, .reset = true, .sdk_wrapper = true});
+      const auto& upper_role = native::features.at(role_handle);
+      const auto upper_anchor = upper_role.slots[0].edit_reuse;
+      Check(upper_refresh.replaced && upper_refresh.evaluates == 1 && upper_refresh.reuses == 0
+              && upper_role.adaptive_cache != nullptr && upper_role.adaptive_cache->active == 0
+              && native::adaptive_resident_session.lock() == stream.adaptive_session
+              && upper_role.input_width == width && upper_role.input_height == height
+              && upper_anchor != nullptr && upper_anchor->valid,
+          "the session's actual equivalent upper workset records a native edit anchor");
+      const auto upper_reuse = record({.token = ++token, .sdk_wrapper = true});
+      Check(upper_reuse.replaced && upper_reuse.evaluates == 0 && upper_reuse.reuses == 1
+              && upper_role.slots[0].edit_reuse == upper_anchor,
+          "the session's active equivalent upper workset delivers zero-model reuse");
       stream.adaptive_session->Request(1, native::SteadyNowNs());
-      const auto switched = record({.token = ++token});
+      native::direct_api.evaluate = +[](ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* model,
+                                          const NVSDK_NGX_Parameter* model_parameters, PFN_NVSDK_NGX_ProgressCallback callback) {
+        const auto desc = native::GetD3D12Resource(model_parameters, "DLSSNR.Output")->GetDesc();
+        nr_edit_reuse_xefg_cases::model_pixels.assign(desc.Width * desc.Height * 4,
+            DirectX::PackedVector::XMConvertFloatToHalf(.75f));
+        return nr_edit_reuse_xefg_cases::EditedModel(list, model, model_parameters, callback);
+      };
+      const auto switched = record({.token = ++token, .sdk_wrapper = true, .check_pending_mfg = true});
+      native::direct_api.evaluate = nr_edit_reuse_gpu_cases::NeutralModel;
       const auto& switched_role = native::features.at(role_handle);
       const auto switched_size = stream.adaptive_session->ladder.sizes[1][0];
       Check(switched.replaced && switched.evaluates > 0 && switched.reuses == 0
@@ -1365,23 +1407,59 @@ int Run() {
               && switched_role.input_width == switched_size.width && switched_role.input_height == switched_size.height
               && switched_size.width < width && switched_role.slots[0].edit_reuse == nullptr,
           "native Adaptive switch delivers the actual smaller HUDLess tier without creating an edit anchor");
-      const auto switched_mfg = record({.token = token, .index = 2, .update_source = false});
-      Check(!switched_mfg.replaced && switched_mfg.evaluates == 0 && switched_mfg.reuses == 0,
-          "an Adaptive output without a conventional frame identity cannot use the fixed x2 duplicate path");
+      Check(switched.consumed_back.size() == source_back.size() * sizeof(uint32_t)
+              && switched.consumed_hudless.size() == source_hudless.size() * sizeof(uint32_t),
+          "the low tier supplies both complete color planes at SDK consumption");
+      bool low_rgb_changed = false;
+      constexpr uint32_t alpha_mask = 3u << 30;
+      for (size_t pixel = 0; pixel < source_back.size(); ++pixel) {
+        uint32_t delivered_back = 0, delivered_hudless = 0;
+        std::memcpy(&delivered_back, switched.consumed_back.data() + pixel * sizeof(uint32_t), sizeof(uint32_t));
+        std::memcpy(&delivered_hudless, switched.consumed_hudless.data() + pixel * sizeof(uint32_t), sizeof(uint32_t));
+        Check((delivered_back & alpha_mask) == (source_back[pixel] & alpha_mask)
+                && (delivered_hudless & alpha_mask) == (source_hudless[pixel] & alpha_mask),
+            "the edited low-tier SDK color planes retain the original packed alpha values");
+        low_rgb_changed |= (delivered_hudless & ~alpha_mask) != (source_hudless[pixel] & ~alpha_mask);
+      }
+      Check(low_rgb_changed, "the low-tier SDK output contains a non-neutral RGB edit");
       const auto switched_cache = switched_role.adaptive_cache;
       const auto* switched_slot = stream.cached;
+      const auto switched_progress = read_progress();
+      const auto switched_submissions = native::native_fg_submitted_frames.load();
       std::vector<std::pair<addon::FenceRef, uint64_t>> proofs;
-      Check(stream.native_pair_producer_marker == switched_slot->original_backbuffer
+      Check(stream.source_frame_id == 0 && stream.source_sdk_decision == 0 && switched_progress.complete
+              && switched_slot->base_frame_group.complete && switched_slot->base_frame_group.ready_roles == 3u
+              && stream.native_pair_producer_marker == switched_slot->original_backbuffer
               && submission::UseSubmissionTokens(switched_slot->original_backbuffer, &proofs)
                   == submission::UseSubmission::kComplete
               && !stream.native_pair_completion.empty(),
-          "the pruned Adaptive producer retains its completed Fence receipt");
+          "the SDK accepted the complete low-tier group and its pruned producer retains the completion receipt");
+      native::edit_reuse_enabled = false;
+      const auto switched_mfg = record({.token = token, .index = 2, .update_source = false, .sdk_wrapper = true});
+      for (const auto& denied : {
+               record({.token = token, .index = 2, .source_scope = false, .update_source = false, .sdk_wrapper = true}),
+               record({.token = token + 1, .index = 2, .update_source = false, .sdk_wrapper = true}),
+               record({.token = token, .index = 2, .update_source = false, .with_ui_alpha = false, .sdk_wrapper = true})}) {
+        Check(!denied.replaced && denied.evaluates == 0 && denied.reuses == 0
+                && matches(denied.consumed_hudless, source_hudless),
+            "the completed low tier rejects a missing version, a new token or a changed alpha role");
+      }
+      Check(switched_mfg.replaced && switched_mfg.evaluates == 0 && switched_mfg.reuses == 0
+              && switched_mfg.consumed_back == switched.consumed_back
+              && switched_mfg.consumed_hudless == switched.consumed_hudless && read_progress() == switched_progress
+              && native::native_fg_submitted_frames.load() == switched_submissions,
+          "low-tier per-frame output re-delivers exact RGBA with no new model, history or base-frame count after x2 is disabled");
+      const auto low_overwritten = record({.token = ++token, .sdk_wrapper = true, .overwrite_sync_motion = true});
+      Check(low_overwritten.replaced && low_overwritten.evaluates == 1 && low_overwritten.reuses == 0,
+          "per-frame low-tier MFG serves unchanged inputs and refuses the same-address guide overwrite");
+      native::edit_reuse_enabled = true;
+      const auto* overwritten_slot = stream.cached;
       // Keep the old color slot busy without recording another use of its producer marker.
       native::fg_service::CopyColor(proof_list.Get(), hudless_clone.Get(), D3D12_RESOURCE_STATE_COMMON,
-          switched_slot->color[0], NATIVE_INPUT_STATE);
+          overwritten_slot->color[0], NATIVE_INPUT_STATE);
       const auto no_token = record({.token = ++token, .source_scope = false});
       Check(no_token.replaced && no_token.evaluates > 0 && no_token.reuses == 0
-              && stream.cached != switched_slot && stream.source_frame_id == 0
+              && stream.cached != overwritten_slot && stream.source_frame_id == 0
               && native::features.at(role_handle).adaptive_cache == switched_cache && switched_cache->active == 1,
           "withdrawing the SDK token keeps the completed Adaptive tier and its ordinary per-frame delivery");
       Check(SUCCEEDED(proof_list->Close()) && SUCCEEDED(proof_list->Reset(proof_allocator.Get(), nullptr)),
@@ -1392,6 +1470,9 @@ int Run() {
           "second tokenless Adaptive frame evaluates and delivers after the prior producer was pruned");
       Check(stream.native_pair_producer_marker == nullptr && stream.native_pair_completion.empty(),
           "ordinary tokenless delivery leaves no protected producer receipt");
+      std::cout << "NR_RELEASE_PARITY native-prefg-present-x2 adaptive-worksets active-upper=1/0"
+                   " lower-per-frame=edited-rgba repeated=identical zero-advance=1"
+                   " missing-version/alpha-retag/guide-overwrite=original tokenless=two-deliveries evidence=WARP+MOCK\n";
       native::nr_adaptive_enabled = false;
       native::nr_adaptive_selected_levels = 0;
       recover();
@@ -1493,6 +1574,9 @@ int Run() {
         "missing native SDK scope preserves full-rate fallback without reusing an anchor or claiming a common frame");
     Check(recover(TagCopy::NONE, false).reset == 1,
         "restored SDK source starts Native model history without a caller Reset");
+    const auto refreshed = read_progress();
+    Check(refreshed.anchor != nullptr && refreshed.anchor->valid && stream.native_edit_history,
+        "a fresh Native SDK frame tracks its live anchor before the Off transition");
     native::OnNativeFgOptions(false);
     const auto off = record({.token = ++token});
     Check(!off.replaced && off.evaluates == 0 && off.reuses == 0
@@ -1992,7 +2076,8 @@ int Run() {
                  " unsubmitted_F2_late_F1_failure=PREPARED_to_SUBMITTED_once"
                  " partial_BB_failure=no_output missing_role_and_foreign_unsubmitted=denied"
                  " host_replay=two_GPU_executions_one_CPU_claim replayed_cache=denied recovery=checked"
-                 " adaptive_unacquired=0_evaluate/1_reuse adaptive_preparation_and_switch=no_x2"
+                 " adaptive_unacquired=0_evaluate/1_reuse adaptive_active_upper=refresh/reuse"
+                 " adaptive_low_per_frame=edited_complete/ordered_MFG/reject_pending_missing_version_new_token_alpha_change_guide_overwrite"
                  " adaptive_tokenless_after_prune=two_delivered fixed_recovery=refresh/reuse/MFG"
                  " motion_rejection/reset/gap/off/missing_scope/FG_failure/retirement=checked"
                  " production_Execute_and_Fence=real NR=MOCK FG_consumer=readback"

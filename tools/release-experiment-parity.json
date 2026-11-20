@@ -86,12 +86,13 @@
         ["fg_native_options.hpp", "detour_guard::AttachAll(internal::REFLEX_MARKER_HOOK, &failed)"]
       ],
       "cases": [
-        { "suite": "fg-native", "name": "nr-edit-reuse-native-contracts", "log": "nr-edit-reuse-native-contracts", "receipt": "^PASS case=nr-edit-reuse-native-contracts evidence=WARP\\+MOCK dev={dev}$", "scenarios": ["synchronous", "synchronous-source-refusal", "asynchronous", "mfg-recovery"],
+        { "suite": "fg-native", "name": "nr-edit-reuse-native-contracts", "log": "nr-edit-reuse-native-contracts", "receipt": "^PASS case=nr-edit-reuse-native-contracts evidence=WARP\\+MOCK dev={dev}$", "scenarios": ["synchronous", "synchronous-source-refusal", "asynchronous", "mfg-recovery", "adaptive-worksets"],
           "expect": {
             "synchronous": "^source=successful-present-start\\+sdk-present same-scope=1 ngx-detour=executed pq-evaluates=1/0/1/0 fp16-evaluates=1/0/1 fp16-alpha=preserved$",
             "synchronous-source-refusal": "^missing-present-start=refused failed-present-start=refused wrong-sdk-scope=refused$",
             "asynchronous": "^source=set-tag-for-frame\\+copy\\+fence ngx-detour=executed evaluates=1/0/1 color=complete stale-alpha/expired/role-retag=original$",
-            "mfg-recovery": "^repeated=redelivered missing-role/changed-guide/foreign-list=original sdk-reject=ngx-detour\\+rgba-rollback recovery=reset\\+refresh$"
+            "mfg-recovery": "^repeated=redelivered missing-role/changed-guide/foreign-list=original sdk-reject=ngx-detour\\+rgba-rollback recovery=reset\\+refresh$",
+            "adaptive-worksets": "^active-upper=1/0 lower-per-frame=edited-rgba repeated=identical zero-advance=1 missing-version/alpha-retag/guide-overwrite=original tokenless=two-deliveries evidence=WARP\\+MOCK$"
           } }
       ]
     },
@@ -100,30 +101,38 @@
       "state": "ready",
       "intent": ["NRAdaptiveEnabled", "NRAdaptiveTargetFPS", "NRAdaptiveMinScale", "NRAdaptiveLevelCount", "NRAdaptiveLimitedResidency", "NREditReuse"],
       "commands": ["edit_reuse_adaptive_experiment"],
-      "producer": "Successful D3D12 SR and ordinary Present output, with independent Native/XeFG Off evidence for qualifying low-grid x2",
-      "consumer": "Frozen adaptive measurement -> actual active workset reuse -> complete GPU cycles and adaptive Session trial",
-      "success": "Compatible fixed worksets keep reusing. A real grid change refreshes. Completed output windows control the move to paired or per-frame low-tier delivery and the post-warmup decision.",
-      "refusal": "Incomplete timestamp coverage yields no complete cost. Changed output or source, unconfirmed delivery and old GPU completion cannot confirm a tier or reuse a stale anchor.",
-      "fallback": "Keep valid fixed x2 or use per-frame adaptive NR. Hold the delivered low tier at the exact target or report continued deficit at the minimum.",
+      "producer": "Successful D3D12 SR, selected workset and same-output Native/XeFG Off write permission independent of output FPS",
+      "consumer": "Borrowed SR recording, matching submission, full refresh/reuse GPU cycles and independent adaptive FPS decisions",
+      "success": "Compatible fixed worksets keep reusing. A missing FPS window pauses adjustment while the authorized tier keeps delivering. Actual ordered delivery confirms the active cadence.",
+      "refusal": "Late loss of write permission keeps the successful SR output. A discarded or unproved submission cannot confirm an edited delivery or tier.",
+      "fallback": "Keep valid fixed x2 or use legal per-frame adaptive NR. A skipped model resumes locally, and unrelated histories follow their actual work.",
       "sources": [
         ["dlssnr.hpp", "fg::xefg::ConfigureD3D12Source("],
         ["dlssnr.hpp", "fg::xefg::RegisterD3D12SourceSwapchain("],
         ["dlssnr.hpp", "created->second.source_device12_identity = identity;"],
         ["dlssnr.hpp", "UsesFixedEditReuseWorkset(feature, adaptive)"],
+        ["dlssnr.hpp", "fg::xefg::WithHostWritePermission("],
+        ["dlssnr.hpp", "session.ConfirmEditCadence("],
+        ["preset_runtime.hpp", "kSetEditReuse"],
         ["adaptive_resolution.hpp", "SetPairedSampling("]
       ],
       "cases": [
-        { "suite": "fg-native", "name": "nr-edit-reuse-contracts", "log": "nr-edit-reuse-contracts", "receipt": "^PASS case=nr-edit-reuse-contracts evidence=WARP\\+MOCK dev={dev}$", "scenarios": ["fixed-active", "paired-low", "unpaired-target", "unpaired-minimum"],
+        { "suite": "fg-native", "name": "nr-edit-reuse-contracts", "log": "nr-edit-reuse-contracts", "receipt": "^PASS case=nr-edit-reuse-contracts evidence=WARP\\+MOCK dev={dev}$", "scenarios": ["fixed-active", "paired-low", "unpaired-target", "unpaired-minimum", "xefg-write-permission", "request-history"],
           "expect": {
             "fixed-active": "^grid=16x16 cadence=1/0 eligibility_keeps_anchor=1 same_grid_source_refresh=1 model_refresh=1 evidence=WARP\\+MOCK$",
+            "xefg-write-permission": "^fps-expired=1/0 rgba=edited-alpha-intact revoked-before-copy=original revoked-after-copy=edited pending=unpublished discard=unpublished old-on/late-off=ignored equivalent-settings=1 evidence=WARP\\+MOCK$",
+            "request-history": "^mask_continuous=1 x2_local_reset=1 look_continuous=1 preset_undo=1 explicit_reset_slots=2 evidence=WARP\\+MOCK$",
             "paired-low": "^output=PRESENT grid=12x12 calls=1/0 upper_us=2000 low_us=1500 discarded=1 recovered=1 stale_half_rejected=1 off_revocation_keeps_upper=1 held_100fps=1 output_replacement_rejected=1 evidence=WARP\\+MOCK$",
             "unpaired-target": "^output=PRESENT request=16x16/12x12 delivered=12x12 calls=1 warmup_ns=1000000000 low_fps=100 decision=OBSERVING request_ns=[1-9][0-9]+ delivery_ns=[1-9][0-9]+ decision_window_ns=[1-9][0-9]+/[1-9][0-9]+ decision_ns=[1-9][0-9]+ timestamps=full/half/none costs=2000/1500,missing,missing output_replacement_rejected=1 evidence=WARP\\+MOCK$",
             "unpaired-minimum": "^output=PRESENT request=16x16/12x12 delivered=12x12 calls=1 warmup_ns=1000000000 low_fps=80 decision=AT_MINIMUM request_ns=[1-9][0-9]+ delivery_ns=[1-9][0-9]+ decision_window_ns=[1-9][0-9]+/[1-9][0-9]+ decision_ns=[1-9][0-9]+ timestamps=full/half/none costs=2000/1500,missing,missing output_replacement_rejected=1 evidence=WARP\\+MOCK$"
           } },
         { "suite": "fg-native", "name": "adaptive-inline", "log": "adaptive-inline", "receipt": "^PASS case=adaptive-inline evidence=WARP\\+MOCK dev={dev}$",
           "existingTrace": true,
-          "scenarios": ["completion-scope"],
-          "expect": { "completion-scope": "^ADAPTIVE_COMPLETION_SCOPE evidence=WARP\\+MOCK measured=1 proof_only=1 pending=blocked rejected=blocked superseded=retained$" } },
+          "scenarios": ["completion-scope", "delivered-cadence"],
+          "expect": {
+            "completion-scope": "^ADAPTIVE_COMPLETION_SCOPE evidence=WARP\\+MOCK measured=1 proof_only=1 pending=blocked rejected=blocked superseded=retained$",
+            "delivered-cadence": "^ADAPTIVE_CADENCE_BOUNDARY evidence=WARP\\+MOCK reduced_upper=12x12 declaration_only=unchanged before_submit=unchanged after_delivery=new_window$"
+          } },
         { "suite": "adaptive-resolution", "name": "test", "log": "test", "receipt": "^NR_RELEASE_PARITY dx12-upscaled-adaptive-x2 controller ", "scenarios": ["controller"],
           "expect": { "controller": "^paired_mean_us=2000 lower_us=1500 missing-cost=fps-controlled queue-change=preserved target=exact failed-raise=workload-scoped evidence=CPU$" } }
       ]

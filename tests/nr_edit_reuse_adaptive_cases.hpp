@@ -62,8 +62,10 @@ struct AdaptivePresentOutput final : reshade::api::swapchain {
   AdaptivePresentDevice device;
   AdaptivePresentQueue queue;
   ID3D12Resource* buffer;
+  IDXGISwapChain* native_swapchain = nullptr;
 
-  AdaptivePresentOutput(const Gpu& gpu, ID3D12Resource* buffer) : buffer(buffer) {
+  AdaptivePresentOutput(const Gpu& gpu, ID3D12Resource* buffer, IDXGISwapChain* native_swapchain = nullptr)
+      : buffer(buffer), native_swapchain(native_swapchain) {
     device.native = gpu.device.Get();
     queue.device = &device;
     queue.native = gpu.queue.Get();
@@ -79,7 +81,7 @@ struct AdaptivePresentOutput final : reshade::api::swapchain {
   void Present() {
     Dispatch<reshade::addon_event::present>(&queue, this, nullptr, nullptr, 0u, nullptr);
   }
-  uint64_t get_native() const override { return 0; }
+  uint64_t get_native() const override { return reinterpret_cast<uintptr_t>(native_swapchain); }
   void get_private_data(const uint8_t[16], uint64_t*) const override {}
   void set_private_data(const uint8_t[16], uint64_t) override {}
   reshade::api::device* get_device() override { return &device; }

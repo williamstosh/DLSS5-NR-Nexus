@@ -25,8 +25,6 @@
 #include <utils/hash.hpp>
 #include <unicode_input.hpp>
 
-static std::filesystem::path present_fixture_ini;
-
 extern "C" __declspec(dllexport) bool ReShadeGetConfigValue(
     void*, reshade::api::effect_runtime*, const char* section, const char* key, char* value, size_t* size) {
   if (present_fixture_ini.empty()) return false;

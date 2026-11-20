@@ -2114,7 +2114,7 @@ int Run() {
         set_mode(sl::DLSSGMode::eOff);
         native::edit_reuse_enabled = true;
         native::control_mask_enabled = false;
-        native::look_upsample = addon::look::kUpsampleAuto;
+        native::look_upsample = addon::look::kUpsampleClassic;
         native::nr_resolution_scale = .75f;
         native::nr_adaptive_min_scale = .5f;
         evaluation.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, 0.f);
@@ -2122,7 +2122,7 @@ int Run() {
         native::RegisterCreatedFeatureLocked(source, native::kFeatureDlss, &evaluation);
         auto& feature = native::features.at(source);
         auto next_present = rate::NowNs();
-        const auto frame = [&] {
+        const auto frame = [&](uint64_t expect_comparison_before_submit = 0) {
           const auto now = rate::NowNs() + 250'000'000;
           while (next_present <= now) {
             rate::test_now_ns = next_present;
@@ -2134,6 +2134,10 @@ int Run() {
           ++native::present_generation;
           Check(NVSDK_NGX_SUCCEED(native::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), source, &evaluation, nullptr)),
                 "reduced upper cadence records a successful SR wrapper call");
+          if (expect_comparison_before_submit != 0) {
+            Check(feature.adaptive_session->comparison_generation == expect_comparison_before_submit,
+                "request and recording alone cannot invalidate the delivered tier's comparison window");
+          }
           submit();
           return model_calls - before;
         };
@@ -2161,11 +2165,16 @@ int Run() {
         }
         Check(calls == 0 && frame() == 1, "the reduced upper reuses and refreshes with matching Off");
 
-        const auto change_mode = [&](sl::DLSSGMode mode) {
+        const auto unchanged_comparison = session->comparison_generation;
+        set_mode(sl::DLSSGMode::eOn);
+        Check(frame() == 0 && frame() == 1 && session->comparison_generation == unchanged_comparison,
+            "an owner-free Native declaration leaves the legal manual upper's bilinear edit cadence intact");
+        set_mode(sl::DLSSGMode::eOff);
+        const auto change_cadence = [&](bool reuse) {
           const auto comparison = session->comparison_generation;
           Check(session->last_output_serial != 0, "the current cadence has consumed a stable ordinary FPS window");
-          set_mode(mode);
-          Check(frame() == 1, "changing only Off yields one model evaluation on the same upper grid");
+          native::kSetEditReuse.Store(reuse ? 1.f : 0.f);
+          Check(frame(comparison) == 1, "actual cadence change evaluates on the same upper grid");
           const auto now = rate::NowNs();
           const auto window = rate::Read(owner, now);
           Check(window.available && window.output == owner && window.source == rate::Source::PRESENT
@@ -2174,21 +2183,21 @@ int Run() {
           Check(session->workload_identity == work_identity && session->status.requested[0] == upper
                     && session->status.applied[0] == upper && session->status.generation == generation
                     && session->applied_generation == generation && session->applied_ns == applied_ns
-                    && session->paired_sampling == (mode == sl::DLSSGMode::eOff)
+                    && session->paired_sampling == reuse && session->delivered_edit_reuse == reuse
                     && session->comparison_generation > comparison && session->stable_after_ns == now
                     && session->last_output_serial == 0,
                 "the delivered upper's real cadence cuts FPS comparison independently of work hash and GPU pairing");
         };
-        // The preceding refresh has a valid adjacent anchor. Withdrawing Off
-        // makes this otherwise reusable frame evaluate without a missed-history reset.
-        change_mode(sl::DLSSGMode::eOn);
+        change_cadence(false);
         Check(frame() == 1 && session->last_output_serial == 0,
               "the next adjacent frame stays per-frame and still cannot use the old FPS window");
         reach([&] { return session->last_output_serial != 0; }, "per-frame upper accepts a full new FPS window");
-        change_mode(sl::DLSSGMode::eOff);
+        change_cadence(true);
         Check(frame() == 0 && session->last_output_serial == 0,
-              "restoring Off restores adjacent zero-call reuse and still requires a new FPS window");
+              "the renewed model anchor enables next-frame reuse and still requires a new FPS window");
         reach([&] { return session->last_output_serial != 0; }, "the restored x2 upper accepts a full new FPS window");
+        std::cout << "ADAPTIVE_CADENCE_BOUNDARY evidence=WARP+MOCK reduced_upper=12x12 declaration_only=unchanged"
+                     " before_submit=unchanged after_delivery=new_window\n";
         rate::ReleaseNativeViewport(viewport);
         native::ForgetSourceHandleLocked(source);
         submit();

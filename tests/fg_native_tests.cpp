@@ -752,6 +752,7 @@ int RunNativeRequiredMenuTest() {
 #include "gpu_comparison_cases.hpp"
 #include "gpu_timer_cases.hpp"
 #include "control_mask_gpu_cases.hpp"
+static std::filesystem::path present_fixture_ini;
 #include "nr_edit_reuse_gpu_cases.hpp"
 #include "nr_edit_reuse_render_cases.hpp"
 #if defined(NR_NEXUS_DEV_CONTROL)

@@ -1206,6 +1206,7 @@ int Run() {
       Check(native::features.at(source_handle).sr_sequence == sequence + 1, "nested C/C++ SR mirror advances one source sample");
       if (submit) {
         submit_commands("wrapper frame");
+        native::ResolveAdaptiveBorrowedDeliveries();
         native::DrainRetiredResources(true);
       }
       return model_calls - before;
@@ -1550,6 +1551,120 @@ int Run() {
           "committed parameter change recreates NR without reusing the old edit");
     Check(frame(0) == 1 && model_resets.back() == 1 && native::edit_reuse_reuses.load() == before_settings_reuses,
           "the recreated NR refreshes with Reset after its existing maturation frame");
+    {
+      funnel_accounting_tests::Restore restore;
+      restore.Value(&present_fixture_ini);
+      restore.Value(&model_parameter_observer);
+      restore.Value(&native::direct_api.evaluate);
+      restore.Atomic(&native::detail_stability);
+      restore.Atomic(&native::control_mask_enabled);
+      restore.Atomic(&native::control_mask_red);
+      restore.Atomic(&native::monitor_requested);
+      present_fixture_ini = std::filesystem::current_path() / "x2-request-history.ini";
+      native::detail_stability = 2;
+      native::control_mask_red = 0.5f;
+      native::monitor_requested = true;
+      native::direct_api.evaluate = ConstantModel;
+      native::kSetEditReuse.Commit(0.f);
+
+      const auto* masked = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xED179});
+      native::RegisterCreatedFeatureLocked(masked, native::kFeatureDlss, &parameters);
+      auto& masked_feature = native::features.at(masked);
+      auto& masked_slot = masked_feature.slots[0];
+      auto& editing_feature = native::features.at(owner);
+      auto& editing_slot = editing_feature.slots[0];
+      const ID3D12Resource* model_motion = nullptr;
+      bool model_used_mask = false;
+      model_parameter_observer = [&](const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter* block) {
+        model_used_mask = native::GetD3D12Resource(block, "DLSSNR.ControlMask") != nullptr;
+        model_motion = native::GetD3D12Resource(block, "DLSSNR.MVec");
+      };
+      const auto evaluate = [&](const NVSDK_NGX_Handle* source_handle, bool use_mask) {
+        native::control_mask_enabled = use_mask;
+        const auto calls = source_frame(source_handle, 0, true, false);
+        if (calls != 0) {
+          Check(calls == 1 && model_used_mask == use_mask, "the SR wrapper sends only the current source's actual external Mask");
+        }
+        return calls;
+      };
+      for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8 && !masked_slot.look_history.valid; ++attempt) {
+        evaluate(masked, true);
+      }
+      Check(masked_slot.look_history.valid && evaluate(owner, false) == 1 && editing_slot.look_history.valid
+                && editing_slot.edit_reuse == nullptr,
+            "both sources have continuous Look before requesting x2");
+      const auto reset_epoch = native::history_reset_epoch.load();
+      const auto restore_epoch = native::present_restore_configuration.epoch;
+      const auto look_restarts = native::look_history_restarts.load();
+      const auto check_masked_continuity = [&] {
+        const auto written = masked_slot.look_history.written;
+        Check(evaluate(masked, true) == 1 && model_resets.back() == 0 && masked_slot.edit_reuse == nullptr
+                  && masked_slot.look_history.written != written && native::look_history_restarts.load() == look_restarts,
+              "the actual Mask keeps the source per-frame and Look advances through x2 request changes");
+      };
+      native::kSetEditReuse.Commit(1.f);
+      check_masked_continuity();
+      Check(masked_feature.edit_reuse_monitor[0].sequence == masked_feature.sr_sequence
+                && masked_feature.edit_reuse_monitor[0].delivery == native::EditReuseDelivery::PER_FRAME
+                && masked_feature.edit_reuse_monitor[0].reason == native::EditReuseBlock::MASK,
+            "the production monitor attributes per-frame delivery to the actual Mask");
+      Check(evaluate(owner, false) == 1 && model_resets.back() == 0 && editing_slot.edit_reuse != nullptr
+                && editing_slot.edit_reuse->valid && native::look_history_restarts.load() == look_restarts,
+            "enabling x2 seeds an anchor from a real Evaluate with continuous model and Look history");
+      const auto old_anchor = editing_slot.edit_reuse;
+      native::kSetEditReuse.Commit(0.f);
+      native::kSetEditReuse.Commit(1.f);
+      const auto look_before_reuse = editing_slot.look_history.written;
+      const auto reuse_count = native::edit_reuse_reuses.load();
+      Check(evaluate(owner, false) == 0 && native::edit_reuse_reuses.load() == reuse_count + 1
+                && editing_slot.edit_reuse == old_anchor && editing_slot.edit_reuse->reused
+                && editing_slot.look_history.written != look_before_reuse
+                && editing_feature.edit_reuse_monitor[0].sequence == editing_feature.sr_sequence
+                && editing_feature.edit_reuse_monitor[0].delivery == native::EditReuseDelivery::REUSED,
+            "request round-trip between source frames preserves the anchor and the adjacent reuse advances Look");
+      std::string error;
+      const addon::presets::Document disable{
+          .scope = addon::presets::Scope::QUALITY, .settings = {{"NREditReuse", false}}};
+      Check(native::preset_ui::Apply(disable, false, true, &error) && !native::edit_reuse_enabled.load()
+                && native::history_reset_epoch.load() == reset_epoch
+                && native::present_restore_configuration.epoch == restore_epoch,
+            "the real preset transaction turns off the request without publishing either epoch");
+      check_masked_continuity();
+      const auto look_before_recovery = editing_slot.look_history.written;
+      Check(evaluate(owner, false) == 1 && model_resets.back() == 1 && model_motion == wrapper_motion.Get()
+                && editing_slot.model_reset_reasons == native::kResetEditReuseGap && editing_slot.edit_reuse == nullptr
+                && editing_slot.look_history.written != look_before_recovery
+                && native::look_history_restarts.load() == look_restarts,
+            "without a composed guide the skipped source gives its next real model a local Reset and keeps adjacent Look");
+      Check(evaluate(owner, false) == 1 && model_resets.back() == 0,
+            "the actual local recovery is consumed exactly once");
+      Check(native::preset_ui::Undo(&error) && native::edit_reuse_enabled.load()
+                && native::history_reset_epoch.load() == reset_epoch
+                && native::present_restore_configuration.epoch == restore_epoch,
+            "real preset Undo restores the x2 request without publishing either epoch");
+      check_masked_continuity();
+      Check(evaluate(owner, false) == 1 && model_resets.back() == 0 && editing_slot.edit_reuse != nullptr
+                && editing_slot.edit_reuse != old_anchor && editing_slot.edit_reuse->valid
+                && native::look_history_restarts.load() == look_restarts,
+            "Undo seeds a new x2 anchor without resetting either continuous history");
+
+      native::RequestHistoryReset();
+      const auto explicit_epoch = native::history_reset_epoch.load();
+      Check(explicit_epoch == reset_epoch + 1 && masked_slot.acknowledged_reset_epoch == reset_epoch
+                && editing_slot.acknowledged_reset_epoch == reset_epoch,
+            "explicit global Reset remains pending per actual slot before Evaluate");
+      Check(evaluate(masked, true) == 1 && model_resets.back() == 1 && masked_slot.acknowledged_reset_epoch == explicit_epoch
+                && editing_slot.acknowledged_reset_epoch == reset_epoch,
+            "the masked source acknowledges explicit Reset only on its own real Evaluate");
+      Check(evaluate(owner, false) == 1 && model_resets.back() == 1 && editing_slot.acknowledged_reset_epoch == explicit_epoch
+                && native::look_history_restarts.load() == look_restarts + 2 && evaluate(owner, false) == 0
+                && editing_slot.acknowledged_reset_epoch == explicit_epoch,
+            "explicit Reset forces a refresh and restarts Look while subsequent reuse acknowledges nothing new");
+      native::ForgetSourceHandleLocked(masked);
+      native::DrainRetiredResources(true);
+      std::cout << "NR_RELEASE_PARITY dx12-upscaled-adaptive-x2 request-history mask_continuous=1 x2_local_reset=1"
+                   " look_continuous=1 preset_undo=1 explicit_reset_slots=2 evidence=WARP+MOCK\n";
+    }
     Check(frame(1) == 1, "establish fresh anchor before synthetic SR gap");
     ++native::features.at(owner).sr_sequence;
     const auto before_gap_reuses = native::edit_reuse_reuses.load();
@@ -1609,6 +1724,7 @@ int Run() {
       native::adaptive_resident_session = reservation;
       native::kSetAdaptiveLimitedResidency.Store(1.f);
       native::kSetAdaptiveEnabled.Store(1.f);
+      native::look_upsample = addon::look::kUpsampleClassic;
       Check(frame(0) == 0 && native::edit_reuse_reuses.load() == reuses_before_adaptive + 1
                 && native::edit_reuse_fallbacks.load() == fallbacks_before_adaptive,
             "an adaptive request blocked by another source preserves reuse on the actual fixed workset");
@@ -1932,6 +2048,191 @@ int Run() {
     Check(!native::features.contains(owner) && submission::ResourceReleasable(anchor_state.get()),
           "source release retires submitted and discarded cache references");
     anchor_state.reset();
+
+    {
+      const AdaptivePresentRegistration registration;
+      const auto* sr = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xED190});
+      native::RegisterCreatedFeatureLocked(sr, native::kFeatureDlss, &parameters);
+      native::direct_api.evaluate = ConstantModel;
+      native::look_upsample = addon::look::kUpsampleClassic;
+      native::kSetAdaptiveEnabled.Store(1.f);
+      native::kSetAdaptiveLevelCount.Store(2.f);
+      native::kSetAdaptiveMinScale.Store(.75f);
+      source_frame(sr, 0, true, false);  // Establish the SR device in the real wrapper.
+
+      const auto proxy = gpu.Swapchain();
+      ComPtr<ReceiptSwapchain> source;
+      source.Attach(new ReceiptSwapchain(nullptr));
+      source->reported_device12 = gpu.device;
+      AdaptivePresentOutput present(gpu, output.Get(), source.Get());
+      auto& sdk_slot = adapter::modules[0];
+      auto& proxy_slot = adapter::proxies[0];
+      auto& source_slot = adapter::source_present_slots[0];
+      funnel_accounting_tests::Restore restore;
+      restore.Value(&sdk_slot.real);
+      restore.Value(&sdk_slot.complete);
+      restore.Value(&proxy_slot);
+      restore.Value(&source_slot);
+      restore.Value(&receipt_proxy);
+      restore.Value(&receipt_context_handle);
+      restore.Value(&receipt_present_status);
+      restore.Value(&rate::test_now_ns);
+      sdk_slot.complete = true;
+      sdk_slot.real[0] = reinterpret_cast<void*>(&FakeInit);
+      sdk_slot.real[2] = reinterpret_cast<void*>(&FakeReceiptGetSwapchain);
+      sdk_slot.real[6] = reinterpret_cast<void*>(&FakeReceiptEnable);
+      sdk_slot.real[8] = reinterpret_cast<void*>(&FakeReceiptDestroy);
+      receipt_proxy = proxy.Get();
+      proxy_slot.records[0].target = reinterpret_cast<uint8_t*>((*reinterpret_cast<void***>(proxy.Get()))[8]);
+      proxy_slot.installed = proxy_slot.complete = true;
+      proxy_slot.real[0] = reinterpret_cast<void*>(&FakePresent);
+      source_slot.records[0].target = reinterpret_cast<uint8_t*>((*reinterpret_cast<void***>(source.Get()))[8]);
+      source_slot.installed = source_slot.complete = true;
+      source_slot.real[0] = reinterpret_cast<void*>(&FakeSourcePresent);
+      source->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+        return adapter::ProxyHooks<0>::Present(static_cast<IDXGISwapChain*>(receipt_proxy), interval, flags);
+      };
+      xefg::Configure(nullptr, nullptr, nullptr, nullptr);
+      xefg::ConfigureD3D12Source(native::ObserveD3D12SourceForXefg);
+      const auto source_owner = reinterpret_cast<uintptr_t>(&present);
+      Check(xefg::RegisterD3D12SourceSwapchain(source_owner, source.Get()), "register the linked WARP SR source");
+      const auto context_handle = static_cast<void*>(source.Get());
+      receipt_context_handle = context_handle;
+      const xefg::abi::Init xefg_init{.application_swapchain = source.Get(), .max_interpolated = 1};
+      Check(Hooks::Init(context_handle, gpu.queue.Get(), &xefg_init) == 0, "initialize the substitute through XeFG's Init hook");
+      ComPtr<IDXGISwapChain> hooked_proxy;
+      Check(Hooks::GetSwapchain(context_handle, IID_PPV_ARGS(&hooked_proxy)) == 0, "register the exact returned proxy");
+      const auto context = adapter::state.contexts.at(context_handle);
+      context->get_status = FakeReceiptPresentStatus;
+      const auto sdk_present = [&] {
+        Check(adapter::SourcePresentHooks<0>::Present(source.Get(), 0, 0) == S_OK, "nested source and proxy Present");
+      };
+      rate::test_now_ns = rate::NowNs();
+      receipt_present_status = {.frames_presented = 1, .enabled = 0};
+      sdk_present();
+      Check(Hooks::Enable(context_handle, 0) == 0, "real SDK hook accepts explicit XeFG Disable");
+      const auto output_id = present.Identity();
+      const auto source_id = native::UniqueD3D12SourceLocked(reinterpret_cast<uintptr_t>(
+          renodx::utils::directx::NativeIdentity(gpu.device.Get())));
+      Check(xefg::QueryBridgeOff(source_id, output_id).available && output_id == context->output_identity,
+            "Disable identifies the same successful SR and its XeFG output");
+      for (uint32_t sample = 0; sample < 100; ++sample) {
+        rate::test_now_ns += 25'000'000;
+        sdk_present();
+      }
+      auto& feature = native::features.at(sr);
+      for (uint32_t i = 0; i < 64 && (!feature.adaptive_session->prepared
+                                        || feature.adaptive_session->status.applied[0].width != 16); ++i) {
+        source_frame(sr, 0, true, false);
+      }
+      Check(feature.adaptive_session->prepared && feature.adaptive_session->status.applied[0].width == 16
+                && rate::Read(output_id, rate::NowNs()).available,
+            "two ready tiers and current linked FPS evidence");
+      feature.adaptive_session->Request(1, rate::NowNs());
+      const auto next_finish = [&] {
+        auto capture = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        submit_commands("XeFG low-grid actual SR output");
+        native::ResolveAdaptiveBorrowedDeliveries();
+        return capture.Pixels();
+      };
+      const auto source_pixel = source_values.data() + (6 * 16 + 6) * 4;
+      const auto original = [&](const auto& bytes) {
+        return std::memcmp(source_values.data(), bytes.data(), bytes.size()) == 0;
+      };
+      const auto edited = [&](const auto& bytes) {
+        const auto* pixel = bytes.data() + (6 * 16 + 6) * 8;
+        return std::memcmp(pixel, source_pixel, 6) != 0 && std::memcmp(pixel + 6, source_pixel + 3, 2) == 0;
+      };
+      Check(source_frame(sr, 1, false, false) == 1 && edited(next_finish())
+                && feature.adaptive_session->status.applied[0].width == 12,
+            "first complete reduced frame refreshes and delivers edited RGB with its original alpha");
+      rate::test_now_ns += 3'000'000'000;
+      Check(!rate::Read(output_id, rate::NowNs()).available && xefg::QueryBridgeOff(source_id, output_id).available,
+            "age out only the output FPS window");
+      auto before = native::edit_reuse_reuses.load();
+      Check(source_frame(sr, 0, false, false) == 0 && edited(next_finish())
+                && native::edit_reuse_reuses.load() == before + 1 && feature.adaptive_session->status.applied[0].width == 12
+                && feature.adaptive_session->status.reason == adaptive::Reason::OUTPUT_UNAVAILABLE,
+            "an expired FPS window keeps the reduced tier and delivers zero-model edit with current alpha");
+
+      const auto on = [&] {
+        receipt_present_status.enabled = 1;
+        sdk_present();
+        Check(!xefg::QueryBridgeOff(source_id, output_id).available, "one-output SDK ON withdraws the old Disable");
+      };
+      const auto disable = [&] {
+        receipt_present_status.enabled = 0;
+        Check(Hooks::Enable(context_handle, 0) == 0 && xefg::QueryBridgeOff(source_id, output_id).available,
+              "restore authority only through a new explicit Disable");
+      };
+      Check(source_frame(sr, 0, true, false) == 1, "renew the reduced anchor before the redundant Disable");
+      const auto before_repeat_disable = feature.slots[0].edit_reuse;
+      receipt_present_status.enabled = 1;
+      receipt_during_present_status = +[] {
+        Check(Hooks::Enable(receipt_context_handle, 0) == 0, "explicit newer Disable while ON status returns");
+      };
+      sdk_present();
+      Check(xefg::QueryBridgeOff(source_id, output_id).available,
+            "ON from the prior declaration cannot withdraw the newer successful Disable");
+      receipt_present_status.enabled = 0;
+      Check(source_frame(sr, 0, false, false) == 0 && edited(next_finish())
+                && feature.slots[0].edit_reuse == before_repeat_disable,
+            "a redundant successful Disable keeps the same valid reduced anchor");
+      const auto refreshes_before_revoke = native::edit_reuse_refreshes.load();
+      model_parameter_observer = [&](const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter*) { on(); };
+      Check(source_frame(sr, 0, false, false) == 1, "withdraw authority inside the actual model call before copyback");
+      model_parameter_observer = {};
+      Check(original(next_finish()) && native::edit_reuse_refreshes.load() == refreshes_before_revoke
+                && feature.slots[0].edit_reuse == nullptr,
+            "revoked private refresh returns original RGBA without publishing an anchor or a second Evaluate");
+      receipt_present_status.enabled = 0;
+      sdk_present();
+      Check(!xefg::QueryBridgeOff(source_id, output_id).available,
+            "an SDK OFF status alone cannot renew revoked write permission");
+      disable();
+      Check(source_frame(sr, 0, true, false) == 1, "fresh authority seeds a new reduced anchor");
+      before = native::edit_reuse_reuses.load();
+      Check(source_frame(sr, 0, false, false) == 0, "record the next reduced reuse while authority holds");
+      on();
+      native::ResolveAdaptiveBorrowedDeliveries();
+      Check(native::edit_reuse_reuses.load() == before && !native::adaptive_borrowed_deliveries.empty(),
+            "ON after copyback leaves the still unsubmitted candidate pending");
+      Check(edited(next_finish()) && native::edit_reuse_reuses.load() == before + 1,
+            "the ordered, submitted copyback survives the later ON receipt");
+      native::ResolveAdaptiveBorrowedDeliveries();
+      Check(native::edit_reuse_reuses.load() == before + 1 && source_frame(sr, 0, true, false) == 1,
+            "settle once; the next frame cannot reuse the revoked authority");
+      disable();
+      Check(source_frame(sr, 0, true, false) == 1, "new authority refreshes after actual per-frame delivery");
+      const auto effective_grid = feature.adaptive_session->status.applied;
+      native::kSetFollowInputRes.Store(1.f);
+      native::kSetLookMode.Store(1.f);
+      const auto look_settings = native::LookSettingsSnapshot(true, false, 0, false);
+      Check(addon::look::GainsNeutral(look_settings) && look_settings.stabilize == 0,
+            "the alternate Look setting requests an identity operation");
+      Check(source_frame(sr, 0, false, false) == 0 && edited(next_finish())
+                && feature.adaptive_session->status.applied == effective_grid,
+            "Follow Input and neutral Look keep low-grid reuse on the same effective size");
+      native::kSetFollowInputRes.Store(0.f);
+      native::kSetLookMode.Store(0.f);
+      Check(source_frame(sr, 0, true, false) == 1, "refresh ahead of the discarded reuse");
+      before = native::edit_reuse_reuses.load();
+      Check(source_frame(sr, 0, false, false) == 0, "record a reuse that the host will discard");
+      Check(SUCCEEDED(gpu.list->Close()) && SUCCEEDED(gpu.allocator->Reset())
+                && SUCCEEDED(gpu.list->Reset(gpu.allocator.Get(), nullptr)), "discard exact list generation without Execute");
+      submission::OnCommandListReset(gpu.list.Get());
+      native::ResolveAdaptiveBorrowedDeliveries();
+      Check(native::edit_reuse_reuses.load() == before && native::adaptive_borrowed_deliveries.empty(),
+            "discard cannot report an edited delivery");
+      Check(Hooks::Destroy(context_handle) == 0, "retire the original SDK context");
+      xefg::ForgetBridgeSourceSwapchain(source_owner);
+      xefg::ConfigureD3D12Source(nullptr);
+      native::ForgetSourceHandleLocked(sr);
+      native::DrainRetiredResources(true);
+      std::cout << "NR_RELEASE_PARITY dx12-upscaled-adaptive-x2 xefg-write-permission fps-expired=1/0 rgba=edited-alpha-intact"
+                   " revoked-before-copy=original revoked-after-copy=edited pending=unpublished discard=unpublished"
+                   " old-on/late-off=ignored equivalent-settings=1 evidence=WARP+MOCK\n";
+    }
 
     enum class TimingCoverage { FULL, HALF, NONE };
     const auto automatic_descent = [&](const NVSDK_NGX_Handle* trial_source, bool native_off, int low_fps,

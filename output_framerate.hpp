@@ -15,6 +15,7 @@
 #include <shared_mutex>
 #include <span>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace renodx::addons::dlss5::output_framerate {
@@ -854,6 +855,21 @@ inline std::optional<uint32_t> NativeMode(const OutputIdentity& identity) {
   const auto* output = internal::FindOutput(identity);
   const auto* options = (output != nullptr ? internal::Options(output->native) : nullptr);
   return (options != nullptr ? std::optional(options->mode) : std::nullopt);
+}
+
+// Preserve the output registration (and, when needed, its Native Off
+// declaration) until the caller finishes recording the host write.
+template <typename RecordWrite>
+inline bool WithCurrentOutput(const OutputIdentity& identity, bool require_native_off, RecordWrite&& record_write) {
+  std::shared_lock lock(internal::state.mutex);
+  const auto* output = internal::FindOutput(identity);
+  if (output == nullptr || (identity.view == 0 && internal::ResolvePresentOutput(*output) != identity)) return false;
+  if (require_native_off) {
+    const auto* options = internal::Options(output->native);
+    if (options == nullptr || options->mode != 0) return false;
+  }
+  std::forward<RecordWrite>(record_write)();
+  return true;
 }
 
 inline void WithdrawNativeFixedness(const OutputIdentity& identity) {

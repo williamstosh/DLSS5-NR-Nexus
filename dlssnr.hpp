@@ -355,6 +355,7 @@ enum HistoryResetReason : uint32_t {
   kResetStateless = 1u << 7,
   kResetRecovery = 1u << 8,
   kResetContract = 1u << 9,
+  kResetEditReuseGap = 1u << 10,
 };
 
 // One NR feature instance (handle + parameter block + latches).  Slot 0 is
@@ -385,7 +386,7 @@ struct NrFeatureSlot {
   // global reset epoch (a new slot must never reset older slots or another
   // stream's history).
   bool pending_reset = false;
-  // Diagnostic evidence only; these fields never participate in Reset policy.
+  // Per-cause evidence also distinguishes model-only recovery from a Look reset.
   uint32_t pending_reset_reasons = 0;
   uint32_t model_reset_reasons = 0;
   // The queue tracker was live when this handle was created, so every
@@ -398,8 +399,7 @@ struct NrFeatureSlot {
   // latch, whose stacked short-circuit never reached the consuming
   // exchange() and stuck the latch true (see reset_epoch.hpp).
   uint64_t acknowledged_reset_epoch = 0;
-  // DLSSNR.Reset as this slot's latest evaluate sent it: the look history
-  // restarts exactly when the model's own history does.
+  // DLSSNR.Reset as this slot's latest evaluate sent it.
   bool model_reset = false;
   bool model_ui_sent = false;
   uint32_t create_input_width = 0, create_input_height = 0;
@@ -413,6 +413,8 @@ struct NrFeatureSlot {
   float logged_model[9] = {NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN};
   int64_t model_logged_ns = 0;
   LookHistory look_history;
+  // Base frame on which temporal Look actually consumed a reused edit.
+  uint64_t look_reuse_sequence = 0;
   std::shared_ptr<edit_reuse::State> edit_reuse;
 };
 
@@ -10825,9 +10827,8 @@ struct LookRoute {
 
 // The look history's per-frame decision, shared by D3D12's RunLookStage and
 // the Vulkan path: whether this frame's compose may read the history, and
-// its dt.  The history restarts exactly when the model's own does
-// (DLSSNR.Reset: startup, a cut, a settings change, the game's Reset), when
-// it holds the other filter's values (bands vs the whole edit), and after a
+// its dt.  The history restarts on input resets, when it holds the other
+// filter's values (bands vs the whole edit), and after a
 // stall.  Detail stability blends per frame, so a slow frame is just a frame
 // to it: without the stall rule it keeps working under 4 fps, where the CPU
 // record clock would restart it every frame (TIME-15).
@@ -10906,6 +10907,7 @@ inline LookRoute RunLookStage(
     uint32_t pass,
     const LookChain& chain,
     const EvaluationContract& frame,
+    uint64_t source_sequence,
     uint32_t pass_offset = 0,
     bool reused_edit = false
 #if defined(NR_NEXUS_DEV_CONTROL)
@@ -11009,9 +11011,6 @@ inline LookRoute RunLookStage(
   }
   const bool whole_edit = settings.stabilize_alpha > 0.f;
   if (temporal) {
-    // A reused edit has no model evaluation or its Reset. The Look filter
-    // still advances using the current frame's adjacent motion vectors.
-    PlanLookHistory(history, !reused_edit && slot.model_reset, whole_edit, now_ns, &look_frame);
     bindings.history_in = history.buffers[history.written]->GetGPUVirtualAddress();
     bindings.history_out = history.buffers[history.written ^ 1u]->GetGPUVirtualAddress();
     submission::TrackUse(command_list, history.buffers[0]);
@@ -11055,6 +11054,11 @@ inline LookRoute RunLookStage(
             heap_gpu, kDescriptorMotionRing + ring, res.descriptor_size);
       }
     }
+    // A local model gap can follow a reuse that still advanced this filter.
+    const bool model_only_reset = slot.model_reset_reasons == kResetEditReuseGap && slot.look_reuse_sequence != 0
+        && slot.look_reuse_sequence + 1 == source_sequence
+        && (settings.stabilize != 2u || look_frame.motion);
+    PlanLookHistory(history, !reused_edit && slot.model_reset && !model_only_reset, whole_edit, now_ns, &look_frame);
     // Orders this frame's history read after the previous frame's write.
     look::UavBarrierAll(command_list);
   }
@@ -11123,6 +11127,9 @@ inline LookRoute RunLookStage(
 #endif
   FinishLookPass(&history, temporal, whole_edit, now_ns, constants, res.id, pass,
                  res.input_width, res.input_height);
+  if (reused_edit && temporal && (settings.stabilize != 2u || look_frame.motion)) {
+    slot.look_reuse_sequence = source_sequence;
+  }
   if (!transport) {
     gpu_timers::Mark(command_list, gpu_timers::PassLookEnd(pass));
     return {kDescriptorLookSet + codec_set, res.input_width, res.input_height,
@@ -11724,7 +11731,7 @@ inline std::string HistoryResetReasonsText(uint32_t reasons) {
            {kResetConfiguration, "configuration"}, {kResetDimensions, "dimensions"},
            {kResetSourceChange, "source_change"}, {kResetGame, "game"},
            {kResetEpochUnverified, "epoch_unverified"}, {kResetStateless, "stateless"},
-           {kResetRecovery, "recovery"}, {kResetContract, "contract"}}) {
+           {kResetRecovery, "recovery"}, {kResetContract, "contract"}, {kResetEditReuseGap, "edit_reuse_gap"}}) {
     if ((reasons & flag) == 0) continue;
     if (!text.empty()) {
       text += '+';
@@ -12037,11 +12044,12 @@ inline fg::xefg::BridgeSourceObservation ObserveD3D12SourceForXefg(uintptr_t dev
   return observation;
 }
 
-inline fg::xefg::BridgeOffEvidence EditReuseXefgOffLocked(const NVSDK_NGX_Handle* handle, uint64_t generation = 0) {
+inline fg::xefg::BridgeOffEvidence EditReuseXefgOffLocked(const NVSDK_NGX_Handle* handle, uint64_t generation = 0,
+    const output_framerate::OutputIdentity& output = {}) {
   const auto created = create_contracts.find(handle);
   const auto source = UniqueD3D12SourceLocked(created != create_contracts.end()
       ? reinterpret_cast<uintptr_t>(created->second.source_device12_identity.Get()) : 0);
-  auto evidence = fg::xefg::QueryBridgeOff(source);
+  auto evidence = fg::xefg::QueryBridgeOff(source, output);
   if (evidence.available && (source.handle != reinterpret_cast<uintptr_t>(handle)
       || (generation != 0 && source.generation != generation))) {
     evidence.available = false;
@@ -12137,7 +12145,12 @@ struct AdaptiveEditCadence {
   bool reduced_upper = false;
   bool lower = false;
   uint32_t stack_encoding = 0;
+  bool confirm_on_delivery = false;
 };
+
+inline bool CanReuseBilinearEdit(const look::Settings& settings) {
+  return settings.upsample == look::kUpsampleClassic && !look::Dispatched(settings, false);
+}
 
 inline adaptive_resolution::Frame FreezeAdaptiveFrame(
     std::shared_ptr<adaptive_resolution::Session>* owner, const stage_plan::Plan& plan,
@@ -12246,7 +12259,7 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
   };
   // Identify the cadence contract of both endpoints before choosing a tier.
   const bool upper_full_size = upper[group.begin] == adaptive_resolution::Size{reference_width, reference_height};
-  bool lower_edit_reuse = edit_cadence.lower && selected_levels == 2 && source_outputs == 1
+  bool lower_edit_reuse = edit_cadence.lower && source_outputs == 1
       && effective_strategy == AdaptiveFeatureMode::OFF && !limited_residency;
   // The adaptive route can also reuse a reduced manual upper tier. Its Off
   // evidence can change that tier's cadence even when fixed reuse is unavailable.
@@ -12351,7 +12364,8 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
        .split_fps = output.split_fps, .owner = output_identity.generation, .rate_multiplier = output.rate_multiplier,
        .rate_comparable = output.rate_comparable},
        now_ns, eligible, frozen, layout_identity, work_identity,
-       (observed_model_roles != 0 ? observed_model_roles : required_roles), {upper_edit_reuse, lower_edit_reuse});
+       (observed_model_roles != 0 ? observed_model_roles : required_roles), {upper_edit_reuse, lower_edit_reuse},
+       edit_cadence.confirm_on_delivery);
   auto& session = **owner;
   session.status.display_output_generation = output_identity.generation;
   session.status.display_source_generation = (display_source_generation != 0
@@ -14059,7 +14073,14 @@ struct AdaptiveDelivery {
   uint64_t configuration = 0;
   output_framerate::OutputIdentity output;
   bool complete = false;
+  std::optional<bool> upscaled_edit_cadence;
+  std::shared_ptr<edit_reuse::State> borrowed_edit_anchor;
+  bool borrowed_edit_reused = false;
+  DXGI_FORMAT borrowed_edit_format = DXGI_FORMAT_UNKNOWN;
+  uint32_t borrowed_edit_encoding = 0;
 };
+
+inline void ObserveEditReuse(edit_reuse::State* cache, DXGI_FORMAT color_format, uint8_t hdr_mode, uint32_t encoding);
 
 inline void ResolveAdaptiveDelivery(const AdaptiveDelivery& delivery, bool delivered, bool reset_borrowed_history = false) {
   const auto& frame = delivery.frame;
@@ -14082,13 +14103,21 @@ inline void ResolveAdaptiveDelivery(const AdaptiveDelivery& delivery, bool deliv
       model.pending_reset = true;
       model.pending_reset_reasons |= kResetRecovery;
       model.look_history.valid = false;
+      if (model.edit_reuse != nullptr && model.edit_reuse == delivery.borrowed_edit_anchor) {
+        model.edit_reuse->valid = false;
+      }
     }
   }
   if (delivered && delivery.complete && delivery.actual == frame.sizes) {
     if (frame.delivery != nullptr) {
       *frame.delivery = adaptive_resolution::DeliveryReceipt::DELIVERED;
     }
-    session.Applied(frame.generation, delivery.actual, SteadyNowNs());
+    const int64_t now = SteadyNowNs();
+    const bool same_grid = session.applied_ns != 0 && session.status.applied == delivery.actual;
+    session.Applied(frame.generation, delivery.actual, now);
+    if (delivery.upscaled_edit_cadence.has_value() && session.status.applied == delivery.actual) {
+      session.ConfirmEditCadence(delivery.source_sequence, *delivery.upscaled_edit_cadence, same_grid, now);
+    }
   } else if (frame.comparison_generation == session.comparison_generation) {
     session.InvalidateSampling(SteadyNowNs());
   }
@@ -14106,14 +14135,16 @@ inline std::vector<AdaptiveBorrowedDelivery> adaptive_borrowed_deliveries;
 
 inline void ResolveAdaptiveBorrowedDeliveries() {
   std::erase_if(adaptive_borrowed_deliveries, [](const AdaptiveBorrowedDelivery& pending) {
-    const auto& frame = pending.delivery.frame;
-    const auto source = features.find(pending.delivery.source);
-    if (source == features.end() || source->second.source_generation != pending.delivery.source_generation
-        || frame.generation != frame.session->status.generation
-        || frame.preparation_epoch != frame.session->preparation_epoch
-        || frame.session->status.display_output_generation != pending.delivery.output.generation
-        || pending.delivery.configuration != configuration_generation.load()) {
-      ResolveAdaptiveDelivery(pending.delivery, false);
+    const auto& delivery = pending.delivery;
+    const auto& frame = delivery.frame;
+    const auto source = features.find(delivery.source);
+    const bool edit_copy = delivery.borrowed_edit_anchor != nullptr;
+    if (source == features.end() || source->second.source_generation != delivery.source_generation
+        || (!edit_copy && (frame.generation != frame.session->status.generation
+            || frame.preparation_epoch != frame.session->preparation_epoch
+            || frame.session->status.display_output_generation != delivery.output.generation
+            || delivery.configuration != configuration_generation.load()))) {
+      ResolveAdaptiveDelivery(delivery, false);
       return true;
     }
 
@@ -14128,6 +14159,12 @@ inline void ResolveAdaptiveBorrowedDeliveries() {
           // recording. A later replay cannot repair its missing Signal.
           const auto& proofs = generation->second.submissions;
           if (proofs.empty() && generation->second.unreserved_submissions == 0 && generation->second.open) return false;
+          if (edit_copy
+              && (generation->second.unreserved_submissions != 0 || (!proofs.empty() && proofs.front().fence.empty()))) {
+            // Execute may have run but neither replay nor Reset can prove its
+            // first submission. The tracker retains its referenced resources.
+            return false;
+          }
           if (generation->second.unreserved_submissions == 0 && !proofs.empty()) {
             if (proofs.front().pending) return false;
             submitted = !proofs.front().fence.empty() && proofs.front().fence->GetCompletedValue() != UINT64_MAX;
@@ -14136,7 +14173,17 @@ inline void ResolveAdaptiveBorrowedDeliveries() {
       }
       submitted |= recording.completed_healthy;
     }
-    ResolveAdaptiveDelivery(pending.delivery, submitted, true);
+    // These counts describe the original recording. ResolveAdaptiveDelivery
+    // separately rejects old output or settings cohorts for current sampling.
+    if (submitted && edit_copy) {
+      if (delivery.borrowed_edit_reused) {
+        ObserveEditReuse(delivery.borrowed_edit_anchor.get(), delivery.borrowed_edit_format, 1, delivery.borrowed_edit_encoding);
+      } else {
+        ++edit_reuse_refreshes;
+        ++successful_evaluations;
+      }
+    }
+    ResolveAdaptiveDelivery(delivery, submitted, true);
     return true;
   });
 }
@@ -14313,12 +14360,22 @@ inline bool UsesFixedEditReuseWorkset(const FeatureState& feature, const adaptiv
       && cache->ladder.sizes[cache->active] == cache->upper);
 }
 
+inline bool LookContinuesAfterEditReuse(const NrFeatureSlot& slot, uint64_t sequence) {
+  const auto& cache = slot.edit_reuse;
+  return slot.look_history.valid && cache != nullptr && cache->valid && cache->reused
+      && cache->source_sequence + 1 == sequence && slot.look_reuse_sequence == cache->source_sequence;
+}
+
+inline void ResetAfterEditReuse(NrFeatureSlot* slot, bool look_continues) {
+  slot->pending_reset = true;
+  slot->pending_reset_reasons |= (look_continues ? kResetEditReuseGap : kResetRecovery);
+}
+
 inline void RetireEditReuse(NrFeatureSlot* slot, uint64_t sequence) {
   if (slot->edit_reuse == nullptr) return;
-  if (slot->edit_reuse->reused || slot->edit_reuse->source_sequence + 1 != sequence) {
-    slot->pending_reset = true;
-    slot->pending_reset_reasons |= kResetRecovery;
-    slot->look_history.valid = false;
+  const auto& cache = *slot->edit_reuse;
+  if (cache.reused || (cache.source_sequence != 0 && cache.source_sequence + 1 != sequence)) {
+    ResetAfterEditReuse(slot, LookContinuesAfterEditReuse(*slot, sequence));
   }
   retired_nr_features.push_back(RetiredNrFeature{
       .generation = present_generation, .tracker_proof = true, .edit_reuse = std::move(slot->edit_reuse)});
@@ -14330,12 +14387,11 @@ inline void RetireStackEditReuse(NrFeatureSlot* slots, uint64_t sequence) {
   // the same frame even though only the first slot has a cache to retire.
   const bool skipped = slots[0].edit_reuse != nullptr && slots[0].edit_reuse->reused;
   for (uint32_t pass = 0; pass < kMaxNrPasses; ++pass) {
-    if (skipped && slots[pass].handle != nullptr) {
-      slots[pass].pending_reset = true;
-      slots[pass].pending_reset_reasons |= kResetRecovery;
-      slots[pass].look_history.valid = false;
+    auto& slot = slots[pass];
+    if (skipped && slot.handle != nullptr && (slot.edit_reuse == nullptr || !slot.edit_reuse->reused)) {
+      ResetAfterEditReuse(&slot, false);
     }
-    RetireEditReuse(&slots[pass], sequence);
+    RetireEditReuse(&slot, sequence);
   }
 }
 
@@ -14351,7 +14407,8 @@ inline std::array<uint64_t, 40> PrepareEditReuseHistory(
       (slot->handle != nullptr ? slot->nr_preset : model_request), style.load(), std::bit_cast<uint32_t>(intensity.load()),
       std::bit_cast<uint32_t>(local_tone_strength.load()), std::bit_cast<uint32_t>(local_structure_strength.load()),
       std::bit_cast<uint32_t>(skin_structure_strength.load()), skin_independent.load(), use_auto_mask.load(),
-      ui_correction.load(), codec_mode.load(), source_encoding.load(), FrameDisplayCodec(res),
+      diagnostics::ModelUi(frame.diagnostic_model_ui, frame.ui_correction, ui_correction.load()),
+      codec_mode.load(), source_encoding.load(), FrameDisplayCodec(res),
       std::bit_cast<uint32_t>(color_strength.load()), std::bit_cast<uint32_t>(transfer_strength.load()),
       std::bit_cast<uint32_t>(frame.motion_scale_x), std::bit_cast<uint32_t>(frame.motion_scale_y),
       feed_mode.load(), norm_governor.load(), depth_mode.load(), std::bit_cast<uint32_t>(norm_attack_stops.load()),
@@ -14447,8 +14504,7 @@ inline void RecordEditReuseWork(
       Transition(list, cache->composed_motion.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     } else {
-      slot->pending_reset = true;
-      slot->pending_reset_reasons |= kResetRecovery;
+      ResetAfterEditReuse(slot, LookContinuesAfterEditReuse(*slot, sequence));
       cache->valid = false;
       ++edit_reuse_fallbacks;
     }
@@ -14590,8 +14646,7 @@ inline EditReuseGroup PrepareEditReuseGroup(
   }
   if (skipped && (!compose || pending_reset || frame.frame_reset != 0)) {
     for (auto& slot : slots) {
-      slot.pending_reset = true;
-      slot.pending_reset_reasons |= kResetRecovery;
+      ResetAfterEditReuse(&slot, LookContinuesAfterEditReuse(slot, sequence));
     }
   }
   if (compose && !pending_reset && frame.frame_reset == 0) {
@@ -14600,9 +14655,8 @@ inline EditReuseGroup PrepareEditReuseGroup(
     auto& first = group.layers[0];
     RecordEditReuseWork(device, list, &feature->slots[0], &first, sequence, false, true);
     if (!first.composed_motion) {
-      for (auto& slot : slots) {
-        slot.pending_reset = true;
-        slot.pending_reset_reasons |= kResetRecovery;
+      for (auto& slot : slots.subspan(1)) {
+        ResetAfterEditReuse(&slot, LookContinuesAfterEditReuse(slot, sequence));
       }
     }
   }
@@ -14639,11 +14693,14 @@ inline void RecordTerminalEditReuse(ID3D12Device* device, ID3D12GraphicsCommandL
 inline void FinishEditReuseGroup(EditReuseGroup* group, NrFeatureSlot* slots, uint32_t passes,
                                  bool delivered, bool reuse_failed) {
   if (delivered || !group->valid) return;
+  bool discarded_reuse = reuse_failed;
   for (uint32_t pass = 0; pass < group->anchors; ++pass) {
-    group->layers[pass].cache->valid = false;
-    group->layers[pass].cache->reused = false;
+    auto* cache = group->layers[pass].cache;
+    discarded_reuse |= group->reuse && cache->reused;
+    cache->valid = false;
+    cache->reused = false;
   }
-  if (reuse_failed) {
+  if (discarded_reuse) {
     for (uint32_t pass = 0; pass < passes; ++pass) {
       slots[pass].pending_reset = true;
       slots[pass].pending_reset_reasons |= kResetRecovery;
@@ -15108,31 +15165,32 @@ inline bool RecordInline(
   };
   fg::xefg::BridgeOffEvidence edit_off;
   const auto adaptive_reuse_route = [&] {
-    if (present != nullptr || bridge_source != nullptr || hook_point.load() != kHookUpscaled
-        || successful_sr_device != device || fg::xefg::Enabled() || mixed_present_fg_seen.load()
-        || !nr_adaptive_enabled.load() || !no_fg_owner()) return false;
+    edit_off = {};
+    if (!fixed_inline_source || bridge_source != nullptr || hook_point.load() != kHookUpscaled
+        || successful_sr_device != device || !adaptive_output_owner || mixed_present_fg_seen.load()
+        || !nr_adaptive_enabled.load() || native_fg_owns.load() || auto_fg_fallback_active.load()
+        || fg::xefg::BlocksHostWrite(adaptive_output_owner)) return false;
     if (output_framerate::NativeMode(adaptive_output_owner) == 0u) {
-      edit_off = {};
       return true;
     }
-    edit_off = EditReuseXefgOffLocked(handle, feature.source_generation);
-    return edit_off.available && edit_off.output_identity == adaptive_output_owner
-        && edit_off.MatchesOutput(output_framerate::Read(adaptive_output_owner, SteadyNowNs()));
+    edit_off = EditReuseXefgOffLocked(handle, feature.source_generation, adaptive_output_owner);
+    return edit_off.available && edit_off.output_identity == adaptive_output_owner;
   };
-  const bool lower_reuse_shape = requested_stack == 1 && !look_mode.load() && detail_stability.load() == 1u
-      && !nr_follow_input_res.load() && edit_reuse_model_request == 2u
-      && execution_stage == stage_plan::Stage::UPSCALED && !nr_adaptive_limited_residency.load();
+  const auto inline_look = (fixed_inline_source
+      ? std::optional(LookSettingsSnapshot(true, false, group.begin, false)) : std::nullopt);
+  const bool bilinear_edit = inline_look && CanReuseBilinearEdit(*inline_look);
+  // The reduced adaptive blend currently has a proven footprint for the
+  // bilinear single-model B path. Equivalent Look and size requests share it.
+  const bool lower_reuse_shape = requested_stack == 1 && edit_reuse_model_request == 2u
+      && bilinear_edit && edit_reuse_inputs_eligible(false, false);
   const bool potential_fixed_reuse = nr_adaptive_enabled.load() && fixed_inline_source && no_fg_owner()
       && edit_reuse_inputs_eligible(false, edit_reuse_stack_shape);
   const AdaptiveEditCadence edit_cadence{
       .upper = potential_fixed_reuse,
-      .reduced_upper = potential_fixed_reuse && [&] {
-        const auto settings = LookSettingsSnapshot(true, false, group.begin, false);
-        return settings.upsample == look::kUpsampleClassic && !look::Dispatched(settings, false);
-      }(),
-      .lower = edit_reuse_requested && lower_reuse_shape && edit_reuse_inputs_eligible(false, false)
-          && adaptive_reuse_route(),
-      .stack_encoding = (potential_fixed_reuse && edit_reuse_stack_shape ? V6EncodingConstant(InterpretSourceUnits(hdr_mode)) : 0u)};
+      .reduced_upper = potential_fixed_reuse && bilinear_edit,
+      .lower = edit_reuse_requested && lower_reuse_shape && adaptive_reuse_route(),
+      .stack_encoding = (potential_fixed_reuse && edit_reuse_stack_shape ? V6EncodingConstant(InterpretSourceUnits(hdr_mode)) : 0u),
+      .confirm_on_delivery = present == nullptr && bridge_source == nullptr && execution_stage == stage_plan::Stage::UPSCALED};
   auto adaptive = (preparing_adaptive_frame != nullptr ? *preparing_adaptive_frame
       : present != nullptr && present->adaptive_frame != nullptr ? *present->adaptive_frame
       : FreezeAdaptiveFrame(&feature.adaptive_session, plan, group, width, height,
@@ -15267,7 +15325,7 @@ inline bool RecordInline(
 #endif
   // Tier preparation can yield to a public FG call. Recheck the Off receipt
   // required by adaptive reuse at admission.
-  const bool edit_reuse_adaptive_inline_route = edit_reuse_requested && adaptive_reuse_route();
+  const bool edit_reuse_adaptive_inline_route = lower_reuse_shape && adaptive_reuse_route();
   const bool edit_reuse_prefg_route = present != nullptr && present_frame_policy::Known(present->base_frame)
       && present->base_frame.reuse_edits
       && hook_point.load() == kHookPresent && !present->d3d11_bridge
@@ -15295,29 +15353,30 @@ inline bool RecordInline(
   }
   // SELECT_ORIGINAL matches the four v6 Resolve taps. Transport or Look
   // shaping on a smaller grid can introduce different contributing pixels.
-  const bool edit_reuse_fixed_bilinear = fixed_edit_look.has_value()
-      && (*fixed_edit_look)[0].upsample == look::kUpsampleClassic
-      && !look::Dispatched((*fixed_edit_look)[0], false);
+  const bool edit_reuse_fixed_bilinear = fixed_edit_look.has_value() && CanReuseBilinearEdit((*fixed_edit_look)[0]);
   const auto& edit_tiers = feature.adaptive_cache;
   // Establish the same ordered-history provenance while both tiers prepare.
   // Otherwise the first x2 frame must discard their unguarded ready objects.
-  const bool edit_reuse_adaptive_contract = edit_reuse_contract_eligible && lower_reuse_shape
+  const bool edit_reuse_adaptive_contract = edit_reuse_contract_eligible
       // The existing private low tier has its own resolve and history contract.
       && edit_reuse_adaptive_inline_route && adaptive.enabled
       && adaptive.session != nullptr && adaptive.session == feature.adaptive_session && !adaptive.session->failed
       && !adaptive.session->settings.limited_residency
       && !adaptive.session->settings.legacy_preparation
       && adaptive.session->settings.resource_strategy == AdaptiveFeatureMode::OFF
-      && nr_adaptive_selected_levels.load() == 2 && adaptive.session->settings.selected_levels == 2
-      && adaptive.session->ladder.count == 2 && adaptive.output_count == 1
-      && edit_tiers != nullptr && edit_tiers->count == 2 && edit_tiers->ladder.count == 2
+      && adaptive.output_count == 1
+      && edit_tiers != nullptr && edit_tiers->count == adaptive.session->ladder.count && edit_tiers->count >= 2
       && edit_tiers->output_count == 1 && !edit_tiers->pre_sr
       && !edit_tiers->failed && !edit_tiers->budget_blocked && !edit_tiers->standby_retired
       && edit_tiers->identity == adaptive.layout_identity && edit_tiers->preparation_epoch == adaptive.preparation_epoch
-      && edit_tiers->active == adaptive.slot && nr_input_width <= width && nr_input_height <= height;
-  const bool edit_reuse_adaptive_route = edit_reuse_adaptive_contract && adaptive.session->prepared
-      && edit_tiers->tiers[0].ready && edit_tiers->tiers[1].ready
-      && AdaptiveTierUsable(*edit_tiers, *adaptive.session, 0) && AdaptiveTierUsable(*edit_tiers, *adaptive.session, 1);
+      && edit_tiers->active == adaptive.slot && adaptive.sizes[0] == adaptive_resolution::Size{nr_input_width, nr_input_height}
+      && nr_input_width <= width && nr_input_height <= height;
+  const bool edit_reuse_adaptive_route = edit_reuse_adaptive_contract
+      && AdaptiveTierUsable(*edit_tiers, *adaptive.session, adaptive.slot)
+      && ((adaptive.session->prepared && edit_tiers->tiers[adaptive.slot].ready)
+          || (adaptive.session->applied_ns != 0 && adaptive.session->status.applied == adaptive.sizes
+              && feature.slots[0].edit_reuse != nullptr));
+  const bool edit_reuse_low_grid = edit_reuse_adaptive_route && !edit_reuse_fixed_workset;
   const uint64_t edit_reuse_sequence = (present != nullptr ? present->base_frame.sequence : inline_source.sequence);
   bool edit_reuse_route_eligible = edit_reuse_contract_eligible && !adaptive.preparing && !prepare_models_only
       && ((edit_reuse_fixed_workset
@@ -15644,6 +15703,7 @@ inline bool RecordInline(
           true, present != nullptr && present->diagnostic.bypass_host_look, group.begin)),
       .motion_scale = {current.motion_scale_x, current.motion_scale_y},
   };
+  if (edit_reuse_low_grid) look_chain.settings[0] = *inline_look;
   std::array<uint32_t, kMaxNrPasses> pass_look_wanted{};
   if (codec_ok) {
     for (uint32_t pass = 0; pass < requested_stack; ++pass) {
@@ -16249,9 +16309,21 @@ inline bool RecordInline(
   } else if (edit_reuse_route_eligible) {
     std::array<uint64_t, 3> route_contract{};
     if (present != nullptr) {
-      route_contract = {present->restore_config_epoch, std::bit_cast<uint32_t>(frame_divisor), frame.ui_correction};
-    } else if (edit_reuse_adaptive_route && !edit_reuse_fixed_workset) {
-      route_contract = {edit_off.context_identity, edit_off.epoch, edit_off.source_link_generation};
+      // The transaction epoch still guards Present submission. Anchors depend on what the codec actually uses.
+      const bool hdr = res.hdr_mode != 0;
+      const bool hdr_restore = hdr && present->hdr_pedestal.effective_gate != 0.f;
+      const bool sdr_restore = present_sdr_restore::ShouldRestore(present->sdr_restore_policy, res.hdr_mode,
+                                                                present->diagnostic.bypass_sdr_restore);
+      const uint64_t restore_mode = (hdr ? (hdr_restore ? 1u + (present->hdr_pedestal.effective_mode == 2u) : 0u)
+                                        : (sdr_restore ? 1u + present->sdr_restore_effective_mode : 0u));
+      route_contract = {
+          (static_cast<uint64_t>(present->domain) << 32u) | (restore_mode << 16u)
+              | (static_cast<uint64_t>(hdr ? present->hdr_curve : 0u) << 8u) | static_cast<uint64_t>(frame.feed),
+          std::bit_cast<uint32_t>(hdr ? frame_divisor : frame_paper_white),
+          (hdr_restore ? (uint64_t{std::bit_cast<uint32_t>(v6_pedestal_cap)} << 32u)
+                             | std::bit_cast<uint32_t>(v6_dark_gate) : 0u)};
+    } else if (edit_reuse_low_grid) {
+      route_contract = {edit_off.context_identity, edit_off.write_epoch, edit_off.source_link_generation};
     }
     edit_contract = PrepareEditReuseHistory(&feature.slots[0], frame, res,
         (present != nullptr && present_frame_policy::Known(present->base_frame)
@@ -16268,6 +16340,7 @@ inline bool RecordInline(
   bool model_evaluated = false;
   bool edit_reused = false;
   bool edit_reuse_delivery_failed = false;
+  bool edit_write_revoked = false;
   const auto* previous_edit = feature.slots[0].edit_reuse.get();
   const bool edit_monitor_expected_reuse = (edit_monitor.device != nullptr || monitor_adapter_delivery) && edit_reuse_route_eligible
       && previous_edit != nullptr && previous_edit->valid && !previous_edit->reused;
@@ -16816,7 +16889,7 @@ inline bool RecordInline(
       if (edit.cache != nullptr && !capture_edit_in_look) {
         capture_edit(false);
       }
-      if (single_edit_reuse) {
+      if (single_edit_reuse && !edit_reuse_low_grid) {
         if (edit_reuse_present_route && recording != nullptr) {
           recording->edit_refreshed = true;
         } else {
@@ -16876,7 +16949,7 @@ inline bool RecordInline(
     LookRoute route{srv_table_start, nr_input_width, nr_input_height, nr_input_width, nr_input_height};
     if (!edit.reused || !edit_reuse_adaptive_route) {
       route = RunLookStage(
-          command_list, device, res, feature.slots[pass], pass, look_chain, frame, group.begin, edit.reused
+          command_list, device, res, feature.slots[pass], pass, look_chain, frame, edit_reuse_sequence, group.begin, edit.reused
 #if defined(NR_NEXUS_DEV_CONTROL)
           , bridge_model_serial
 #endif
@@ -17459,20 +17532,38 @@ inline bool RecordInline(
       if (capture_this_eval || capture_service_role) {
         capture_stage("packed_final", res.decoded, D3D12_RESOURCE_STATE_COPY_SOURCE, width, height);
       }
-      Transition(
-          command_list, output,
-          output_rest,
-          D3D12_RESOURCE_STATE_COPY_DEST,
-          0u);
-      CopyMip0(command_list, output, res.decoded, nullptr, output_rect.x, output_rect.y);
-      if (hdr_capture_plan) {
-        screenshot::RecordHdrReceiverCopy(device, command_list, output, output_rect.x, output_rect.y);
+      if (edit_reuse_low_grid) {
+        // Only these commands modify the successful SR result. The copy
+        // shares the list with SR and its consumer. Serialize it against
+        // withdrawal of that output's write permission, after private work.
+        bool copied = false;
+        if (!edit_reuse_delivery_failed && !mixed_present_fg_seen.load()
+            && !native_fg_owns.load() && !auto_fg_fallback_active.load()) {
+          fg::xefg::WithHostWritePermission(adaptive_output_owner, edit_off.available ? &edit_off : nullptr, [&] {
+            copied = output_framerate::WithCurrentOutput(adaptive_output_owner, !edit_off.available, [&] {
+              Transition(command_list, output, output_rest, D3D12_RESOURCE_STATE_COPY_DEST, 0u);
+              CopyMip0(command_list, output, res.decoded, nullptr, output_rect.x, output_rect.y);
+              Transition(command_list, output, D3D12_RESOURCE_STATE_COPY_DEST, output_rest, 0u);
+            });
+          });
+        }
+        if (!copied && !edit_reuse_delivery_failed) {
+          edit_write_revoked = edit_reuse_delivery_failed = true;
+          auto& slot = feature.slots[0];
+          RetireEditReuse(&slot, edit_reuse_sequence);
+          slot.pending_reset = true;
+          slot.pending_reset_reasons |= kResetRecovery;
+          slot.look_history.valid = false;
+          ++edit_reuse_fallbacks;
+        }
+      } else {
+        Transition(command_list, output, output_rest, D3D12_RESOURCE_STATE_COPY_DEST, 0u);
+        CopyMip0(command_list, output, res.decoded, nullptr, output_rect.x, output_rect.y);
+        if (hdr_capture_plan) {
+          screenshot::RecordHdrReceiverCopy(device, command_list, output, output_rect.x, output_rect.y);
+        }
+        Transition(command_list, output, D3D12_RESOURCE_STATE_COPY_DEST, output_rest, 0u);
       }
-      Transition(
-          command_list, output,
-          D3D12_RESOURCE_STATE_COPY_DEST,
-          output_rest,
-          0u);
       if (timers_active) {
         gpu_timers::Mark(command_list, gpu_timers::kSlotCopyBackEnd);
       }
@@ -17558,7 +17649,9 @@ inline bool RecordInline(
     using sr_benchmark::Delivery;
     benchmark_frame->nr_writeback_recorded = executed >= 0 && !NVSDK_NGX_FAILED(stack_failure)
         && !adaptive.preparing && !edit_reuse_delivery_failed;
-    if (edit_reuse_delivery_failed || benchmark_frame->original_selection_failed) {
+    if (edit_write_revoked) {
+      benchmark_frame->fallback_reason = "adaptive_write_permission_lost";
+    } else if (edit_reuse_delivery_failed || benchmark_frame->original_selection_failed) {
       benchmark_frame->fallback_reason = (benchmark_frame->original_selection_failed ? "select_original_failed" : "reuse_apply_failed");
     } else if (NVSDK_NGX_FAILED(stack_failure)) {
       benchmark_frame->fallback_reason = "nr_evaluate_failed";
@@ -17654,7 +17747,7 @@ inline bool RecordInline(
   // image through untouched.
   if (!adaptive.preparing) RecordOutputPass(output, handle);
   if (edit_reuse_delivery_failed) {
-    publish_edit_monitor(EditReuseDelivery::ORIGINAL, EditReuseBlock::SELECT_ORIGINAL);
+    publish_edit_monitor(EditReuseDelivery::ORIGINAL, edit_write_revoked ? EditReuseBlock::ORDER : EditReuseBlock::SELECT_ORIGINAL);
     ++bypassed_evaluations;
     return true;
   }
@@ -17691,13 +17784,25 @@ inline bool RecordInline(
     if (adaptive.session != nullptr) {
       adaptive_recording->delivery.frame.sampling_generation = adaptive.session->sampling_generation;
     }
+    if (edit_cadence.confirm_on_delivery && adaptive.enabled && adaptive_recording->delivery.complete) {
+      const auto& anchor = feature.slots[0].edit_reuse;
+      adaptive_recording->delivery.upscaled_edit_cadence = edit_reused || (edit_reuse_route_eligible
+          && (same_stage_stack ? group_anchor_ready : anchor != nullptr && anchor->valid
+              && anchor->source_sequence == edit_reuse_sequence));
+      if (edit_reuse_low_grid && *adaptive_recording->delivery.upscaled_edit_cadence) {
+        adaptive_recording->delivery.borrowed_edit_anchor = anchor;
+        adaptive_recording->delivery.borrowed_edit_reused = edit_reused;
+        adaptive_recording->delivery.borrowed_edit_format = output_desc.Format;
+        adaptive_recording->delivery.borrowed_edit_encoding = v6_encoding;
+      }
+    }
   }
   if (edit_reused) {
     publish_edit_monitor(EditReuseDelivery::REUSED, EditReuseBlock::NONE);
     if (edit_reuse_present_route && recording != nullptr) {
       recording->reused_edit = edit.cache;
       recording->edit_reuse_encoding = v6_encoding;
-    } else {
+    } else if (!edit_reuse_low_grid) {
       auto* const anchor = (same_stage_stack ? edit_group.layers[0].cache : edit.cache);
       ObserveEditReuse(anchor, output_desc.Format, hdr_mode, v6_encoding);
     }
@@ -17721,7 +17826,7 @@ inline bool RecordInline(
     publish_edit_monitor((refresh ? EditReuseDelivery::REFRESH : EditReuseDelivery::PER_FRAME), reason);
   }
   for (auto& slot : feature.slots) slot.fail_count = 0;
-  if (!adaptive.preparing) {
+  if (!adaptive.preparing && (adaptive_recording == nullptr || adaptive_recording->delivery.borrowed_edit_anchor == nullptr)) {
     ++successful_evaluations;
   }
   if (mixed_stage_terminal.active) {
@@ -19324,7 +19429,7 @@ inline bool RecordInlinePreSR(
     const auto benchmark_detail_before = (benchmark_frame == nullptr ? 0 : look_stability_passes.load());
 #endif
     const LookRoute route = RunLookStage(
-        command_list, device, res, feature.slots[pass], pass, look_chain, frame, group.begin, edit.reused);
+        command_list, device, res, feature.slots[pass], pass, look_chain, frame, edit_sequence, group.begin, edit.reused);
 #if defined(NR_NEXUS_DEV_CONTROL)
     if (benchmark_frame != nullptr) {
       auto& sample = benchmark_frame->passes[pass];
@@ -24927,7 +25032,7 @@ inline sl::Result HookedStreamlineSetTagForFrame(
 #endif
   const bool has_hudless_tag = tags != nullptr && std::any_of(tags, tags + num_tags,
       [](const sl::ResourceTag& tag) { return tag.type == sl::kBufferTypeHUDLessColor; });
-  if (fg_service::Requested() && edit_reuse_enabled.load() && fg::native_options::ObservesPresentDecisions()
+  if (fg_service::Requested() && fg::native_options::ObservesPresentDecisions()
       && has_hudless_tag && !fg::xefg::Enabled()) {
     tag_list.reset(NativeStreamlineTagList(command_buffer));
     bool hooks_ready = false;
@@ -29095,7 +29200,9 @@ struct Setting {
       present_sdr_restore_config_version.store(present_sdr_restore::CONFIG_VERSION, std::memory_order_relaxed);
     }
     StoreLocked(value);
-    ++present_restore_configuration.epoch;
+    if (b != &edit_reuse_enabled) {
+      ++present_restore_configuration.epoch;
+    }
   }
   // Caller owns the configuration lock; preset batches publish one epoch.
   void StoreLocked(float value) const {
@@ -29320,7 +29427,7 @@ inline constexpr Setting kSetAdaptiveLimitedResidency{
 inline constexpr Setting kSetAdaptiveResourceStrategy{
     presets::ADAPTIVE_RESOURCE_STRATEGY_KEY, &adaptive_feature_mode, 0u, SettingEffect::kNone};
 inline constexpr Setting kSetEditReuse{
-    "NREditReuse", &edit_reuse_enabled, defaults::kEditReuse, SettingEffect::kHistory};
+    "NREditReuse", &edit_reuse_enabled, defaults::kEditReuse, SettingEffect::kNone};
 inline constexpr Setting kSetPassResolutionMode[] = {
     {"NRPass2ResolutionMode", &pass_resolution_mode[0], 0u, SettingEffect::kNone},
     {"NRPass3ResolutionMode", &pass_resolution_mode[1], 0u, SettingEffect::kNone},

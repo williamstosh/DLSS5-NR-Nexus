@@ -477,14 +477,18 @@
   {
     const bool previous = runtime::edit_reuse_enabled.load();
     const auto reset_epoch = runtime::history_reset_epoch.load();
+    const auto restore_epoch = runtime::present_restore_configuration.epoch;
     const auto toggle = set("NREditReuse", !previous);
     check(toggle["ok"] && toggle["changes"].size() == 1
             && toggle["state"]["settings"]["NREditReuse"] == !previous
             && runtime::edit_reuse_enabled.load() == !previous
-            && runtime::history_reset_epoch.load() == reset_epoch + 1,
-        "the live x2 toggle commits the existing setting and resets history");
-    check(set("NREditReuse", previous)["ok"] && runtime::edit_reuse_enabled.load() == previous,
-        "the same operation restores the initial x2 setting");
+            && runtime::history_reset_epoch.load() == reset_epoch
+            && runtime::present_restore_configuration.epoch == restore_epoch,
+        "the live x2 toggle commits only the existing request");
+    check(set("NREditReuse", previous)["ok"] && runtime::edit_reuse_enabled.load() == previous
+            && runtime::history_reset_epoch.load() == reset_epoch
+            && runtime::present_restore_configuration.epoch == restore_epoch,
+        "the same operation restores the initial x2 request and preserves both epochs");
   }
   check(set("NRHookPoint", 3)["reason"] == "invalid_value", "invalid hook is rejected before mutation");
   check(set("NeuralUplift", 1)["reason"] == "invalid_value", "booleans require JSON booleans");

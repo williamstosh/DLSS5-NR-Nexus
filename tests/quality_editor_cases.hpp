@@ -60,6 +60,7 @@
   const auto before_reuse = profile::Snapshot();
   const auto reuse_writes = configuration_writes;
   const auto reuse_history = runtime::history_reset_epoch.load();
+  const auto reuse_restore_epoch = runtime::present_restore_configuration.epoch;
   // The ID survives clipping and stacked labels; click scrolls it into view.
   const auto reuse_scope = ImHashStr("NREditReuse", 0, ImHashStr("##quality_columns", 0, settings_window()->ID));
   const auto reuse_id = ImHashStr("##value", 0, reuse_scope);
@@ -80,8 +81,9 @@
   auto requested_reuse = before_reuse;
   requested_reuse["NREditReuse"] = true;
   check(profile::Snapshot() == requested_reuse && configuration_writes == reuse_writes + 1
-            && runtime::history_reset_epoch.load() == reuse_history + 1,
-        "x2 switch saves the request and resets history without changing incompatible settings");
+            && runtime::history_reset_epoch.load() == reuse_history
+            && runtime::present_restore_configuration.epoch == reuse_restore_epoch,
+        "x2 switch saves only its request and preserves both history epochs");
   bool persisted_reuse = false;
   check(reshade::get_config_value(nullptr, runtime::kConfigSection, "NREditReuse", persisted_reuse)
             && persisted_reuse && has_text(ui::text::kEditReuseCompatibility)
@@ -100,6 +102,9 @@
   click(reuse_reset);
   persisted_reuse = true;
   check(profile::Snapshot() == before_reuse
+            && configuration_writes == reuse_writes + 2
+            && runtime::history_reset_epoch.load() == reuse_history
+            && runtime::present_restore_configuration.epoch == reuse_restore_epoch
             && reshade::get_config_value(nullptr, runtime::kConfigSection, "NREditReuse", persisted_reuse)
             && !persisted_reuse && !has_text(ui::text::kEditReuseRequirements),
         "x2 row reset restores and saves Off while keeping the other quality settings");

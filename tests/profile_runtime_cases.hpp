@@ -135,11 +135,37 @@ const auto RunProfileRuntimeCases = [&](const std::filesystem::path& outputdir) 
               && imported.settings["NREditReuse"] == true,
           "Quality capture and share-text round trip retain the x2 boolean request.");
     runtime::kSetEditReuse.Commit(0.f);
-    Check(adapter::Apply(imported, false, true, &error) && runtime::edit_reuse_enabled.load(),
-          "Applying a shared quality preset restores its x2 request.");
-    Check(adapter::Undo(&error) && !runtime::edit_reuse_enabled.load(),
-          "Undo import restores the prior x2 request through the batch transaction.");
-    runtime::kSetEditReuse.Commit(1.f);
+    const auto previous = profile::Snapshot();
+    auto requested = previous;
+    requested["NREditReuse"] = true;
+    const auto reset_epoch = runtime::history_reset_epoch.load();
+    const auto restore_epoch = runtime::present_restore_configuration.epoch;
+    const auto saved_request_is = [](bool expected) {
+      bool value = !expected;
+      return reshade::get_config_value(nullptr, runtime::kConfigSection, "NREditReuse", value) && value == expected;
+    };
+    const presets::Document request{.scope = presets::Scope::QUALITY,
+                                    .settings = {{"NREditReuse", imported.settings.at("NREditReuse")}}};
+    Check(adapter::Apply(request, false, true, &error) && profile::Snapshot() == requested && saved_request_is(true)
+              && runtime::history_reset_epoch.load() == reset_epoch
+              && runtime::present_restore_configuration.epoch == restore_epoch,
+          "Applying a shared x2 request changes only that setting and preserves both history epochs.");
+    Check(adapter::Undo(&error) && profile::Snapshot() == previous && saved_request_is(false)
+              && runtime::history_reset_epoch.load() == reset_epoch
+              && runtime::present_restore_configuration.epoch == restore_epoch,
+          "Undo restores the prior x2 request and preserves both history epochs.");
+    auto mixed = request;
+    mixed.settings["NRIntensity"] = (runtime::intensity.load() == 0.5f ? 0.75f : 0.5f);
+    Check(adapter::Apply(mixed, false, true, &error) && saved_request_is(true)
+              && runtime::intensity.load() == mixed.settings.at("NRIntensity").get<float>()
+              && runtime::history_reset_epoch.load() == reset_epoch + 1
+              && runtime::present_restore_configuration.epoch == restore_epoch + 1,
+          "An x2 change in a batch preserves the other setting's configuration effect.");
+    Check(adapter::Undo(&error) && profile::Snapshot() == previous && saved_request_is(false)
+              && runtime::history_reset_epoch.load() == reset_epoch + 2
+              && runtime::present_restore_configuration.epoch == restore_epoch + 2,
+          "Undo of a mixed batch publishes the other setting's configuration effect once.");
+    Check(adapter::Apply(request, false, false, &error), "Enable the x2 request for the legacy preset check.");
     Check(adapter::Apply({.scope = presets::Scope::QUALITY, .settings = {{"NRIntensity", 0.75f}}}, false, false, &error)
               && runtime::edit_reuse_enabled.load(),
           "An older partial preset without x2 preserves the current request.");

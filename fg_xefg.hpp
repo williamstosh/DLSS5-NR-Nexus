@@ -157,6 +157,7 @@ struct BridgeOffEvidence {
   uintptr_t proxy_device11 = 0;
   uint64_t declaration = 0;
   uint64_t epoch = 0;
+  uint64_t write_epoch = 0;
   BridgeSourceIdentity source;
   BridgeSourceObservation before;
   BridgeSourceObservation after;
@@ -352,9 +353,13 @@ struct Context {
   bool bridge_context_ready = false;
   bool bridge_proxy_ready = false;
   bool bridge_off_observed = false;
+  bool bridge_present_fg_on = false;
+  bool bridge_enable_ambiguous = false;
   uint32_t bridge_enable_inflight = 0;
   uint64_t bridge_declaration = 0;
   uint64_t bridge_off_epoch = 0;
+  uint64_t bridge_write_epoch = 0;
+  output_framerate::OutputIdentity bridge_off_output;
   BridgeSourceIdentity bridge_off_source;
   BridgeSourceObservation bridge_before_observation;
   BridgeSourceObservation bridge_after_observation;
@@ -752,6 +757,7 @@ inline void ReleaseFrames(Context* context) {
   context->last_id_known = false;
   context->last_submission_frame = 0;
   ++context->epoch;
+  ++context->bridge_write_epoch;
 #if defined(NR_NEXUS_DEV_CONTROL)
   edit_fg_observation::StopEnvironment(2, reinterpret_cast<uintptr_t>(context));
   context->fg_environment_generation = ++state.fg_environment_generation;
@@ -943,6 +949,26 @@ struct ProxySlot {
 };
 inline std::array<ProxySlot, 4> proxies;
 
+struct BridgeLinkVersion {
+  uint64_t declaration = 0;
+  uint64_t epoch = 0;
+  uint64_t generation = 0;
+
+  bool operator==(const BridgeLinkVersion&) const = default;
+};
+
+inline BridgeLinkVersion BridgeLinkVersionLocked(const Context& context) {
+  return {.declaration = context.bridge_declaration, .epoch = context.epoch,
+      .generation = context.bridge_link_generation};
+}
+
+inline bool UniqueProxyLocked(uintptr_t proxy) {
+  return proxy != 0 && std::ranges::count_if(state.contexts, [&](const auto& entry) {
+    const auto& [handle, context] = entry;
+    return context->proxy_identity == proxy;
+  }) == 1;
+}
+
 struct BridgeSourcePresentMapping {
   std::shared_ptr<BridgeSourceSwapchain> registration;
   BridgeSourceObservation before;
@@ -951,6 +977,7 @@ struct BridgeSourcePresentMapping {
   uintptr_t proxy = 0;
   uint64_t declaration = 0;
   uint64_t epoch = 0;
+  BridgeLinkVersion previous_link;
   const char* failure = nullptr;
   bool proxy_outer = false;
   bool unregistered_outer = false;
@@ -1013,10 +1040,11 @@ inline void RecordSourcePresentMapping(const BridgeSourcePresentMapping& mapping
     }
   }
   if (reason != nullptr) {
+    const auto old = registration->context.lock();
+    if (old != nullptr && BridgeLinkVersionLocked(*old) != mapping.previous_link) return;
     registration->reason = reason;
     if (std::strcmp(reason, "source_observer_busy") == 0) return;
-    if (const auto old = registration->context.lock(); old != nullptr
-        && old->bridge_source_swapchain == registration->owner
+    if (old != nullptr && old->bridge_source_swapchain == registration->owner
         && old->bridge_source_generation == registration->generation) {
       RevokeBridgeSourceLinkLocked(old.get(), reason
 #if defined(NR_NEXUS_DEV_CONTROL)
@@ -1124,6 +1152,9 @@ struct BridgeSourcePresent : BridgeSourcePresentMapping {
               break;
             }
             registration = candidate;
+            if (const auto mapped = candidate->context.lock(); mapped != nullptr) {
+              previous_link = BridgeLinkVersionLocked(*mapped);
+            }
           }
         }
         if (registration != nullptr) {
@@ -1287,6 +1318,7 @@ struct BridgeProxyPresent {
           if (const auto old = state.bridge_swapchains.find(context->bridge_source_swapchain);
               old != state.bridge_swapchains.end()) {
             reverse.mapping.registration = old->second;
+            reverse.mapping.previous_link = BridgeLinkVersionLocked(*context);
           }
         }
       }
@@ -1464,6 +1496,7 @@ struct PresentFrame {
   FrameInput input;
   uintptr_t proxy_identity = 0;
   uint64_t serial = 0;
+  BridgeLinkVersion bridge_link;
   bool test_present = false;
   bool completed = false;
   bool service_owned = false;
@@ -1518,9 +1551,7 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
   bool repeated = false;
   {
     std::unique_lock lock(state.mutex);
-    if (identity == 0 || std::ranges::count_if(state.contexts, [&](const auto& entry) {
-          return entry.second->proxy_identity == identity;
-        }) != 1) return present;
+    if (!UniqueProxyLocked(identity)) return present;
     for (const auto& [handle, context] : state.contexts) {
       if (context->proxy_identity != identity) continue;
       present.context = context;
@@ -1533,6 +1564,9 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
       }
       if (present.test_present) return present;
       RegisterOutput(context.get());
+      if (context->bridge_enable_inflight == 0) {
+        present.bridge_link = BridgeLinkVersionLocked(*context);
+      }
       present.service_stats_serial = context->service_stats_serial;
       present.service_owned = service_requested && context->enabled;
       const bool has_present_id = context->fresh_id;
@@ -1670,7 +1704,7 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
     const auto it = state.contexts.find(reinterpret_cast<void*>(present->input.context));
     return it != state.contexts.end() && it->second == present->context
         && context.epoch == present->input.epoch && context.proxy_identity == present->proxy_identity
-        && context.output_identity == present->input.output
+        && context.output_identity == present->input.output && UniqueProxyLocked(present->proxy_identity)
         && (!present->input.output || output_framerate::IsCurrentOutput(present->input.output));
   };
   uint64_t value = 0;
@@ -1691,11 +1725,6 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
   const int32_t status_result = (status_queried
       ? context.get_status(reinterpret_cast<void*>(present->input.context), &status) : 0);
   const bool has_status = status_queried && status_result == 0;
-#if defined(NR_NEXUS_DEV_CONTROL)
-  edit_fg_observation::RecordResult(present->edit_fg_ticket, present_result, present->edit_fg_return_ns,
-      {.queried = status_queried, .api_result = status_result, .frames_presented = status.frames_presented,
-          .frame_gen_result = status.frame_gen_result, .enabled = status.enabled});
-#endif
   std::unique_lock lock(state.mutex);
   --context.presents_in_flight;
   if (present->frame != nullptr) {
@@ -1715,12 +1744,25 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
   const bool delivered = same_output && present_result == S_OK;
   const bool failed_delivery = submitted && !delivered;
   if (same_output && present->serial == context.present_serial) {
-    const bool status_valid = has_status && status.frame_gen_result >= 0
+    const bool status_current = has_status && present->input.output
         && present->serial > context.status_ambiguous_through;
+    const bool same_declaration = context.bridge_declaration == present->bridge_link.declaration
+        && context.bridge_enable_inflight == 0;
+    const bool fg_consumed = delivered && submitted && present->serial > context.status_ambiguous_through;
+    if (((status_current && status.enabled != 0) || fg_consumed) && same_declaration && present->bridge_link.declaration != 0
+        && BridgeLinkVersionLocked(context) == present->bridge_link) {
+      // SDK enable state is independent of interpolation success or the FPS window.
+      if (!context.bridge_present_fg_on) ++context.bridge_write_epoch;
+      context.bridge_present_fg_on = true;
+      context.bridge_off_observed = false;
+      context.bridge_off_reason = (fg_consumed ? "sdk_present_consumed" : "sdk_present_enabled");
+    }
     // Intel updates LastPresentStatus on each proxy Present. A separate
     // successful call can therefore report output for a repeated Present ID.
-    output_framerate::ObserveXeFG(present->input.output, present->serial, presented_ns, present_result == S_OK,
-        status_valid, status.frames_presented, !present->repeated, status.enabled == 0);
+    if (same_declaration) {
+      output_framerate::ObserveXeFG(present->input.output, present->serial, presented_ns, present_result == S_OK,
+          status_current && status.frame_gen_result >= 0, status.frames_presented, !present->repeated, status.enabled == 0);
+    }
   }
   ++context.interval_presents;
   context.interval_submitted += submitted;
@@ -1821,6 +1863,11 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
     reshade::log::message(reshade::log::level::info, message);
   }
   if (lock.owns_lock()) lock.unlock();
+#if defined(NR_NEXUS_DEV_CONTROL)
+  edit_fg_observation::RecordResult(present->edit_fg_ticket, present_result, present->edit_fg_return_ns,
+      {.queried = status_queried, .api_result = status_result, .frames_presented = status.frames_presented,
+          .frame_gen_result = status.frame_gen_result, .enabled = status.enabled});
+#endif
   if (submitted) {
     if (failed_delivery && present->on_service_failure != nullptr) {
       present->on_service_failure(present->input);
@@ -2372,6 +2419,7 @@ struct SdkHooks {
     uintptr_t device12 = 0;
     uintptr_t proxy = 0;
     bool uses_source_link = false;
+    bool overlapping_enable = false;
     uint64_t link_generation = 0;
     BridgeSourceIdentity linked_source;
 #if defined(NR_NEXUS_DEV_CONTROL)
@@ -2395,7 +2443,10 @@ struct SdkHooks {
         source_swapchain_generation = attempt->bridge_source_generation;
         initial_link_generation = attempt->bridge_link_generation;
 #endif
-        ++attempt->bridge_enable_inflight;
+        overlapping_enable = ++attempt->bridge_enable_inflight > 1;
+        if (overlapping_enable) {
+          attempt->bridge_enable_ambiguous = true;
+        }
         auto* application_device = attempt->bridge_application_device11.Get();
         auto* proxy_device = attempt->bridge_proxy_device11.Get();
         if (application_device == nullptr || proxy_device == nullptr || application_device == proxy_device) {
@@ -2454,16 +2505,22 @@ struct SdkHooks {
       }
       const auto it = state.contexts.find(handle);
       const bool same_context = it != state.contexts.end() && it->second == attempt;
-      const bool current = same_context && attempt->bridge_context_ready && attempt->bridge_proxy_ready
-          && attempt->bridge_declaration == declaration
-          && attempt->bridge_enable_inflight == 0 && attempt->epoch == epoch && attempt->proxy_identity == proxy
+      const bool same_contract = same_context && attempt->epoch == epoch && attempt->proxy_identity == proxy;
+      const bool ordered = same_contract && attempt->bridge_declaration == declaration
+          && attempt->bridge_enable_inflight == 0 && !overlapping_enable;
+      const bool current = ordered && attempt->bridge_context_ready && attempt->bridge_proxy_ready
           && (!uses_source_link || (BridgeSourceLinkCurrentLocked(*attempt)
               && attempt->bridge_link_generation == link_generation && attempt->bridge_link_source == linked_source));
-      if (status == 0 && same_context && attempt->epoch == epoch) {
-        if (it->second->enabled != (enabled != 0)) {
-          ReleaseFrames(it->second.get());
+      if (status == 0 && same_contract) {
+        if (attempt->enabled != (enabled != 0)) {
+          ReleaseFrames(attempt.get());
         }
-        it->second->enabled = enabled != 0;
+        attempt->enabled = enabled != 0;
+        if (ordered) {
+          attempt->bridge_enable_ambiguous = false;
+          attempt->bridge_present_fg_on = false;
+        }
+        RegisterOutput(attempt.get());
       }
       if (same_context) {
         if (attempt->bridge_declaration == declaration) {
@@ -2474,22 +2531,24 @@ struct SdkHooks {
           const bool source_device_matches = (device12 != 0
               ? before.device11 == 0 && before.device12 == device12
               : before.device12 == 0 && before.device11 == device11);
+          const bool unique_source_route = (state.contexts.size() == 1 || (uses_source_link && device12 != 0));
           attempt->bridge_off_reason = (status != 0 ? "set_enabled_failed"
               : enabled != 0 ? "enabled" : observed_device == 0 ? "device11_identity_missing_or_conflicting"
               : proxy == 0 ? "proxy_identity_missing"
-              : state.contexts.size() != 1 ? "multiple_contexts"
+              : !unique_source_route ? "multiple_contexts"
               : before.handle == 0 || before.generation == 0 || !source_device_matches ? "source_missing_before_disable"
               : uses_source_link && before != linked_source ? "source_changed_since_mapping"
               : before != after ? "source_changed_during_disable" : "observed_disable");
           attempt->bridge_off_observed = status == 0 && enabled == 0 && observed_device != 0 && proxy != 0
               && before.handle != 0 && before.generation != 0
               && source_device_matches && before == after && (!uses_source_link || before == linked_source)
-              && state.contexts.size() == 1 && !stopped.load();
+              && unique_source_route && !stopped.load();
           attempt->bridge_off_uses_source_link = uses_source_link;
           attempt->bridge_off_link_generation = link_generation;
           if (attempt->bridge_off_observed) {
             attempt->bridge_off_source = before;
             attempt->bridge_off_epoch = attempt->epoch;
+            attempt->bridge_off_output = attempt->output_identity;
           }
         } else if (attempt->bridge_declaration == declaration && attempt->bridge_enable_inflight == 0) {
           attempt->bridge_off_reason = (!attempt->bridge_context_ready ? "context_not_initialized"
@@ -2727,7 +2786,10 @@ inline void Configure(Service service, PrepareCapture capture, Retire retire, bo
         "DLSS5 XeFG SDK detours disabled: no SDK/proxy interception; resource/UI contract trace unavailable");
   }
   internal::block_optional_hudless.store(block_optional_hudless, std::memory_order_release);
-  internal::sdk_detours_enabled.store(enable_sdk_detours, std::memory_order_release);
+  {
+    std::unique_lock lock(internal::state.mutex);
+    internal::sdk_detours_enabled.store(enable_sdk_detours, std::memory_order_release);
+  }
   internal::service.store(service, std::memory_order_release);
   internal::prepare_capture.store(capture, std::memory_order_release);
   internal::retire.store(retire, std::memory_order_release);
@@ -2820,21 +2882,28 @@ inline bool RegisterD3D12SourceSwapchain(uintptr_t owner, IDXGISwapChain* swapch
   return internal::RegisterSourceSwapchain(owner, swapchain, true);
 }
 
-// runtime_mutex may already be held. This query reads the captured contract
-// only: it never calls COM, the source observer, or an SDK entrypoint.
-inline BridgeOffEvidence QueryBridgeOff(const BridgeSourceIdentity& source) {
+namespace internal {
+
+inline BridgeOffEvidence QueryBridgeOffLocked(const BridgeSourceIdentity& source,
+                                              const output_framerate::OutputIdentity& output) {
   BridgeOffEvidence evidence;
-  if (internal::stopped.load(std::memory_order_acquire)
-      || !internal::sdk_detours_enabled.load(std::memory_order_acquire)) {
+  if (stopped.load(std::memory_order_acquire) || !sdk_detours_enabled.load(std::memory_order_acquire)) {
     evidence.reason = "sdk_observation_unavailable";
     return evidence;
   }
-  std::shared_lock lock(internal::state.mutex);
-  if (internal::state.contexts.size() != 1) {
-    evidence.reason = internal::state.contexts.empty() ? "context_unobserved" : "multiple_contexts";
+  if (!output && state.contexts.size() != 1) {
+    evidence.reason = (state.contexts.empty() ? "context_unobserved" : "multiple_contexts");
     return evidence;
   }
-  const auto& [handle, context] = *internal::state.contexts.begin();
+  const auto matched = (output ? std::ranges::find_if(state.contexts, [&](const auto& item) {
+    const auto& [handle, context] = item;
+    return context->output_identity == output;
+  }) : state.contexts.begin());
+  if (matched == state.contexts.end()) {
+    evidence.reason = "output_unobserved";
+    return evidence;
+  }
+  const auto& [handle, context] = *matched;
   evidence.context = reinterpret_cast<uintptr_t>(handle);
   evidence.context_identity = reinterpret_cast<uintptr_t>(context.get());
   evidence.output_identity = context->output_identity;
@@ -2843,6 +2912,7 @@ inline BridgeOffEvidence QueryBridgeOff(const BridgeSourceIdentity& source) {
   evidence.proxy_device11 = reinterpret_cast<uintptr_t>(context->bridge_proxy_device11.Get());
   evidence.declaration = context->bridge_declaration;
   evidence.epoch = context->epoch;
+  evidence.write_epoch = context->bridge_write_epoch;
   evidence.source = context->bridge_off_source;
   evidence.before = context->bridge_before_observation;
   evidence.after = context->bridge_after_observation;
@@ -2855,7 +2925,7 @@ inline BridgeOffEvidence QueryBridgeOff(const BridgeSourceIdentity& source) {
   evidence.source_link_generation = context->bridge_link_generation;
   evidence.uses_source_link = context->bridge_off_uses_source_link;
   if (evidence.source_swapchain == 0) {
-    for (const auto& [owner, registered] : internal::state.bridge_swapchains) {
+    for (const auto& [owner, registered] : state.bridge_swapchains) {
       const bool same_device = (source.device12 != 0
           ? source.device11 == 0 && reinterpret_cast<uintptr_t>(registered->device12.Get()) == source.device12
           : source.device11 != 0 && reinterpret_cast<uintptr_t>(registered->device11.Get()) == source.device11);
@@ -2871,8 +2941,8 @@ inline BridgeOffEvidence QueryBridgeOff(const BridgeSourceIdentity& source) {
       evidence.source_swapchain_generation = registered->generation;
     }
   }
-  if (const auto registered = internal::state.bridge_swapchains.find(evidence.source_swapchain);
-      registered != internal::state.bridge_swapchains.end()
+  if (const auto registered = state.bridge_swapchains.find(evidence.source_swapchain);
+      registered != state.bridge_swapchains.end()
       && registered->second->generation == evidence.source_swapchain_generation) {
     evidence.source_present_thread_id = registered->second->source_present_thread_id;
     evidence.source_present_proxy_entry_depth = registered->second->source_present_proxy_entry_depth;
@@ -2880,16 +2950,21 @@ inline BridgeOffEvidence QueryBridgeOff(const BridgeSourceIdentity& source) {
   evidence.reason = context->bridge_off_reason;
   if (!context->bridge_context_ready || !context->bridge_proxy_ready || context->bridge_enable_inflight != 0
       || !context->bridge_off_observed) return evidence;
-  if (context->bridge_off_epoch != context->epoch || context->enabled) {
+  if (context->bridge_off_epoch != context->epoch || context->enabled || context->bridge_present_fg_on) {
     evidence.reason = "context_changed_after_disable";
-  } else if (context->bridge_off_uses_source_link && (!internal::BridgeSourceLinkCurrentLocked(*context)
+  } else if (!UniqueProxyLocked(evidence.proxy)) {
+    evidence.reason = "proxy_identity_ambiguous";
+  } else if (context->bridge_off_output != context->output_identity
+      || (evidence.output_identity && !output_framerate::IsCurrentOutput(evidence.output_identity))) {
+    evidence.reason = "output_changed_after_disable";
+  } else if (context->bridge_off_uses_source_link && (!BridgeSourceLinkCurrentLocked(*context)
       || context->bridge_off_link_generation != context->bridge_link_generation)) {
     evidence.reason = "source_mapping_changed_after_disable";
   } else if ((source.device11 == 0 && source.device12 == 0) || (source.device11 != 0 && source.device12 != 0)
       || source.handle == 0 || source.generation == 0) {
     evidence.reason = "source_unobserved_or_ambiguous";
   } else if (source.device12 != 0 && (!context->bridge_off_uses_source_link
-      || !internal::BridgeSourceLinkCurrentLocked(*context)
+      || !BridgeSourceLinkCurrentLocked(*context)
       || source.device12 != reinterpret_cast<uintptr_t>(context->device_identity.Get()))) {
     evidence.reason = "source_device12_link_unproven";
   } else if (source != context->bridge_off_source) {
@@ -2898,6 +2973,51 @@ inline BridgeOffEvidence QueryBridgeOff(const BridgeSourceIdentity& source) {
     evidence.available = true;
   }
   return evidence;
+}
+
+inline bool BlocksHostWriteLocked(const output_framerate::OutputIdentity& output) {
+  if (!output_framerate::IsCurrentOutput(output)) return true;
+  if (output.view != 0 && !UniqueProxyLocked(output.swapchain)) return true;
+  return std::ranges::any_of(state.contexts, [&](const auto& entry) {
+    const auto& [handle, context] = entry;
+    return context->output_identity == output && (context->enabled || context->bridge_present_fg_on
+        || context->bridge_enable_inflight != 0 || context->bridge_enable_ambiguous);
+  });
+}
+
+}  // namespace internal
+
+// runtime_mutex may already be held. These snapshots never call COM, the source observer, or the SDK.
+inline BridgeOffEvidence QueryBridgeOff(const BridgeSourceIdentity& source,
+                                       const output_framerate::OutputIdentity& output = {}) {
+  std::shared_lock lock(internal::state.mutex);
+  return internal::QueryBridgeOffLocked(source, output);
+}
+
+inline bool BlocksHostWrite(const output_framerate::OutputIdentity& output) {
+  std::shared_lock lock(internal::state.mutex);
+  return internal::BlocksHostWriteLocked(output);
+}
+
+// The caller owns the current SR recording and proves consumer order. The callback only records
+// the host output barriers and copy. It must not reenter this adapter or call the SDK.
+template <typename RecordWrite>
+inline bool WithHostWritePermission(const output_framerate::OutputIdentity& output,
+                                    const BridgeOffEvidence* expected_off, RecordWrite&& record_write) {
+  std::shared_lock lock(internal::state.mutex);
+  if (internal::BlocksHostWriteLocked(output)) return false;
+  if (expected_off != nullptr) {
+    if (!expected_off->available || expected_off->output_identity != output) return false;
+    const auto current = internal::QueryBridgeOffLocked(expected_off->source, output);
+    if (!current.available || current.context != expected_off->context
+        || current.context_identity != expected_off->context_identity || current.proxy != expected_off->proxy
+        || current.write_epoch != expected_off->write_epoch || current.epoch != expected_off->epoch
+        || (current.uses_source_link && current.source_link_generation != expected_off->source_link_generation)) {
+      return false;
+    }
+  }
+  std::forward<RecordWrite>(record_write)();
+  return true;
 }
 
 // Public SDK enable state, independent of whether NR requested ownership.
@@ -2942,10 +3062,10 @@ inline void Stop() noexcept {
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
   fg_output_probe::StopXefg();
 #endif
-  internal::stopped.store(true, std::memory_order_release);
   std::map<uintptr_t, std::shared_ptr<internal::BridgeSourceSwapchain>> removed_sources;
   {
     std::unique_lock lock(internal::state.mutex);
+    internal::stopped.store(true, std::memory_order_release);
     for (const auto& [handle, context] : internal::state.contexts) {
       internal::RevokeBridgeSourceLinkLocked(context.get(), "source_observation_stopped");
       output_framerate::ReleaseXeFGOutput(context->output_identity);

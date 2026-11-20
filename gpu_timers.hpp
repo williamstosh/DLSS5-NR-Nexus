@@ -576,12 +576,16 @@ inline bool Publish(const Segment& s, bool log, const void* queue) {
     PublishCompleted(next, s.pass_begin, s.pass_count);
   }
   if (s.adaptive.session != nullptr) {
+    const bool reused = s.group_edit_reused || (s.pass_count != 0 && s.pass_count <= kTimerMaxPasses
+        && std::ranges::all_of(std::span{s.passes}.first(s.pass_count), [](const auto& pass) { return pass.edit_reused; }));
+    const bool matching_phase = !s.adaptive.paired
+        || (reused == (s.adaptive.application_frame != s.adaptive.pair_first_frame));
     s.adaptive.session->ObserveGpu({.generation = s.adaptive.generation,
         .frame = s.adaptive.application_frame, .sequence = s.sequence,
         .context = reinterpret_cast<uintptr_t>(queue) ^ s.comparison.identity.device_session,
         .recorded_ns = next.recorded_ns, .completed_ns = next.measured_ns,
         .total_us = static_cast<double>(next.total_us), .role = s.adaptive.role,
-        .required_roles = s.adaptive.required_roles, .valid = complete,
+        .required_roles = s.adaptive.required_roles, .valid = complete && matching_phase,
         .stable = s.adaptive_stable, .paired = s.adaptive.paired,
         .pair_first_frame = s.adaptive.pair_first_frame, .sampling_generation = s.adaptive.sampling_generation}, NowNs());
   }
