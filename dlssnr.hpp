@@ -10004,6 +10004,12 @@ inline void BindCodecV6(
   const D3D12_GPU_DESCRIPTOR_HANDLE heap_start =
       heaps[0]->GetGPUDescriptorHandleForHeapStart();
   if (capture == nullptr) {
+    // Switching HDR worksets also replaces the heap for ControlMask's
+    // shared guide tables, even when this codec does not sample them.
+    command_list->SetComputeRootDescriptorTable(
+        3, DescriptorHeapSlot(heap_start, kDescriptorControlMaskDepthNullSrv, resources.descriptor_size));
+    command_list->SetComputeRootDescriptorTable(
+        4, DescriptorHeapSlot(heap_start, kDescriptorControlMaskMotionNullSrv, resources.descriptor_size));
     command_list->SetComputeRootDescriptorTable(
         5, DescriptorHeapSlot(heap_start, kDescriptorControlMaskDepthProofNullCbv, resources.descriptor_size));
   }
