@@ -1727,39 +1727,114 @@ int main(int argc, char** argv) {
           host::Dispatch<reshade::addon_event::present>(&application.queue, &application,
               nullptr, nullptr, 0u, nullptr);
         };
-        const auto clock_start = std::chrono::steady_clock::now();
-        bool ordinary_cost_ready = false;
-        bool ordinary_lowered = false;
-        bool ordinary_restored = false;
-        for (uint32_t tick = 1; tick <= 400 && !ordinary_restored; ++tick) {
-          std::this_thread::sleep_until(clock_start + std::chrono::milliseconds(tick * 25));
-          ordinary_cadence();
-          frame();
-          double median = 0., mad = 0.;
-          if (!ordinary_cost_ready && ordinary.status.applied == ordinary.ladder.sizes[0]
-              && ordinary.GpuStatistics(native::SteadyNowNs(), &median, &mad)) {
-            trace_frame("ordinary-cost-ready", direct_size);
-            ordinary_cost_ready = true;
+        {
+          namespace adaptive = renodx::addons::dlss5::adaptive_resolution;
+          struct RestoreClock {
+            int64_t saved_ns;
+            ~RestoreClock() { rate::test_now_ns = saved_ns; }
+          } restore_clock{rate::test_now_ns};
+          const auto clock_start = std::chrono::steady_clock::now();
+          int64_t present_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clock_start.time_since_epoch()).count();
+          const auto run_cadence = [&](int64_t period_ns, uint32_t presents) {
+            // Keep the Present intervals exact under WARP load. Pace each
+            // batch so the following fault cases can resume the wall clock.
+            const auto end_ns = present_ns + period_ns * presents;
+            std::this_thread::sleep_until(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(end_ns)));
+            for (uint32_t index = 0; index < presents; ++index) {
+              present_ns += period_ns;
+              rate::test_now_ns = present_ns;
+              ordinary_cadence();
+            }
+            frame();
+            return rate::Read(direct_size, present_ns);
+          };
+          const auto ordinary_window = [&](const rate::Snapshot& window) {
+            return window.available && window.output == direct_size && window.source == rate::Source::PRESENT
+                && ordinary.status.display_output_generation == direct_size.generation && window.split_available
+                && window.window_end_ns - window.window_begin_ns >= 4 * rate::Stream::BIN_NS;
+          };
+          const auto delivered_tier = [&](size_t tier) {
+            return ordinary.active_level == tier && ordinary.status.applied == ordinary.ladder.sizes[tier]
+                && ordinary.applied_generation == ordinary.status.generation
+                && ordinary.applied_ns > before_frame.applied_ns
+                && ordinary.stable_after_ns == ordinary.applied_ns + adaptive::WARMUP_NS
+                && native::bridge_submits.load() == before_frame.submits + 1
+                && native::bridge_waits11.load() == before_frame.copies + 1
+                && native::bridge.fence_done12->GetCompletedValue() >= native::bridge_submitted_value.load()
+                && model_observations.size() == before_frame.observations + 1
+                && model_observations.back().width == ordinary.ladder.sizes[tier][0].width
+                && model_observations.back().reset == 1 && read_consumer() != original;
+          };
+          bool ordinary_cost_ready = false;
+          uint64_t lower_generation = 0;
+          bool minimum_observed = false;
+          for (uint32_t tick = 0; tick < 360 && !minimum_observed; ++tick) {
+            const auto window = run_cadence(25'000'000, 1);
+            double median = 0., mad = 0.;
+            if (!ordinary_cost_ready && ordinary.status.applied == ordinary.ladder.sizes[0]
+                && ordinary.GpuStatistics(native::SteadyNowNs(), &median, &mad)) {
+              trace_frame("ordinary-cost-ready", direct_size);
+              ordinary_cost_ready = true;
+            }
+            if (lower_generation == 0 && ordinary.status.applied == ordinary.ladder.sizes[1]) {
+              Check(ordinary.trial && !ordinary.raising && ordinary_window(window) && window.fps == 40.
+                        && window.window_begin_ns >= before_frame.stable_after_ns && delivered_tier(1),
+                  "the registered 40 FPS Present window requests and delivers the adjacent lower grid through Bridge");
+              trace_frame("ordinary-lower", direct_size);
+              lower_generation = ordinary.applied_generation;
+            }
+            if (lower_generation != 0) {
+              Check(ordinary.level == 1 && ordinary.active_level == 1 && ordinary.status.generation == lower_generation
+                        && ordinary.applied_generation == lower_generation,
+                  "continued deficit cannot roll back the delivered Bridge minimum");
+              if (!ordinary.trial && ordinary.status.reason == adaptive::Reason::AT_MINIMUM) {
+                Check(ordinary_window(window) && window.fps == 40. && window.window_end_ns == present_ns
+                          && window.window_begin_ns >= ordinary.stable_after_ns,
+                    "the Bridge minimum is judged below target on a new complete window after warmup");
+                minimum_observed = true;
+              }
+            }
           }
-          if (!ordinary_lowered && ordinary.status.applied == ordinary.ladder.sizes[1]) {
-            Check(ordinary.trial && ordinary.status.output_fps > 0. && ordinary.status.output_fps < 95.
-                      && ordinary.status.display_output_generation == direct_size.generation
-                      && model_observations.back().width == ordinary.ladder.sizes[1][0].width
-                      && model_observations.back().reset == 1 && read_consumer() != original,
-                "registered ordinary Present and completed NR costs request, apply and deliver the lower tier");
-            trace_frame("ordinary-lower", direct_size);
-            ordinary_lowered = true;
-          } else if (ordinary_lowered && ordinary.status.applied == ordinary.ladder.sizes[0]) {
-            Check(!ordinary.trial && model_observations.back().width == ordinary.ladder.sizes[0][0].width
-                      && model_observations.back().reset == 1 && read_consumer() != original,
-                "the unchanged output cadence rejects the trial and delivers the original upper tier");
-            trace_frame("ordinary-upper", direct_size);
-            ordinary_restored = true;
+          Check(ordinary_cost_ready && minimum_observed,
+              "ordinary Bridge supplies complete GPU diagnostics and holds its delivered minimum at 40 FPS");
+
+          const auto faster_since_ns = present_ns;
+          rate::Snapshot first_surplus;
+          uint64_t upper_generation = 0;
+          bool upper_accepted = false;
+          for (uint32_t tick = 0; tick < 240 && !upper_accepted; ++tick) {
+            const auto window = run_cadence(9'000'000, 4);
+            const double target = ordinary.settings.target_fps;
+            const double margin = std::max({1., 0.02 * target, 2. * window.fps_mad});
+            const bool surplus = ordinary_window(window) && window.window_begin_ns >= faster_since_ns
+                && window.fps >= target + margin;
+            if (surplus && !first_surplus.available) {
+              first_surplus = window;
+            }
+            if (upper_generation == 0 && ordinary.status.applied == ordinary.ladder.sizes[0]) {
+              Check(ordinary.trial && ordinary.raising && surplus && first_surplus.available
+                        && window.window_begin_ns == first_surplus.window_end_ns && delivered_tier(0),
+                  "two contiguous non-overlapping surplus windows request and deliver the ready Bridge upper tier");
+              trace_frame("ordinary-upper", direct_size);
+              upper_generation = ordinary.applied_generation;
+            }
+            if (upper_generation == 0) {
+              Check(ordinary.level == 1 && ordinary.active_level == 1 && ordinary.status.generation == lower_generation,
+                  "Bridge keeps its low tier while the registered Present windows have insufficient independent surplus");
+            } else {
+              Check(ordinary.level == 0 && ordinary.active_level == 0 && ordinary.status.generation == upper_generation
+                        && ordinary.applied_generation == upper_generation,
+                  "Bridge keeps the delivered upper tier during post-switch warmup and evaluation");
+              if (!ordinary.trial && ordinary.status.reason == adaptive::Reason::OBSERVING) {
+                Check(ordinary_window(window) && window.window_begin_ns >= ordinary.stable_after_ns
+                          && window.split_fps[0] >= target && window.split_fps[1] >= target,
+                    "the delivered upper tier holds after warmup and meets the target across a complete new window");
+                upper_accepted = true;
+              }
+            }
           }
+          Check(upper_accepted, "Bridge uses the registered ordinary Present window and completes a two-tier round trip");
         }
-        Check(ordinary_cost_ready && ordinary_lowered && ordinary_restored
-                  && rate::Read(direct_size, rate::NowNs()).source == rate::Source::PRESENT,
-            "Bridge uses the registered ordinary Present window and completes a two-tier round trip");
 
         const auto while_private_queue_stalled = [&](auto revoke) {
           ComPtr<ID3D12Fence> gate;

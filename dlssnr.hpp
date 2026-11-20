@@ -12246,9 +12246,12 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
   };
   // Identify the cadence contract of both endpoints before choosing a tier.
   const bool upper_full_size = upper[group.begin] == adaptive_resolution::Size{reference_width, reference_height};
-  bool upper_edit_reuse = edit_cadence.upper && (upper_full_size || edit_cadence.reduced_upper);
   bool lower_edit_reuse = edit_cadence.lower && selected_levels == 2 && source_outputs == 1
       && effective_strategy == AdaptiveFeatureMode::OFF && !limited_residency;
+  // The adaptive route can also reuse a reduced manual upper tier. Its Off
+  // evidence can change that tier's cadence even when fixed reuse is unavailable.
+  bool upper_edit_reuse = lower_edit_reuse
+      || (edit_cadence.upper && (upper_full_size || edit_cadence.reduced_upper));
   for (const uint32_t value : {guide_width, guide_height, required_roles, observed_model_roles}) {
     append_measurement(value);
   }
