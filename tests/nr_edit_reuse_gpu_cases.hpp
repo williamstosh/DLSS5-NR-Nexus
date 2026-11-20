@@ -20,6 +20,7 @@
 #include <edit_reuse.hpp>
 
 #include "inline_execution_trace.hpp"
+#include "nr_edit_reuse_adaptive_cases.hpp"
 
 // Included after the native fixture's model substitutes and real GPU host.
 namespace nr_edit_reuse_gpu_cases {
@@ -1189,24 +1190,27 @@ int Run() {
     const auto* owner = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xED170});
     native::RegisterCreatedFeatureLocked(owner, native::kFeatureDlss, &parameters);
     native::created_feature_ids[owner] = native::kFeatureDlss;
-    const auto frame = [&](int reset, bool submit = true, bool mirror = false) {
+    const auto source_frame = [&](const NVSDK_NGX_Handle* source_handle, int reset, bool submit, bool mirror) {
       parameters.Set(NVSDK_NGX_Parameter_Reset, reset);
       gpu.list->ClearState(nullptr);
       const auto before = model_calls;
-      const auto sequence = native::features.at(owner).sr_sequence;
+      const auto sequence = native::features.at(source_handle).sr_sequence;
       native::ngx_slot_real[0].evaluate = reinterpret_cast<void*>(CopySr);
       native::ngx_slot_real[0].evaluate_c = reinterpret_cast<void*>(MirrorSr);
-      const auto result = (mirror ? native::HookedEvaluateFeatureCSlot<0>(gpu.list.Get(), owner, &parameters, nullptr)
-                                  : native::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), owner, &parameters, nullptr));
+      const auto result = (mirror ? native::HookedEvaluateFeatureCSlot<0>(gpu.list.Get(), source_handle, &parameters, nullptr)
+                                  : native::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), source_handle, &parameters, nullptr));
       native::ngx_slot_real[0].evaluate = nullptr;
       native::ngx_slot_real[0].evaluate_c = nullptr;
       Check(NVSDK_NGX_SUCCEED(result), "copy SR remains successful through cache wrapper");
-      Check(native::features.at(owner).sr_sequence == sequence + 1, "nested C/C++ SR mirror advances one source sample");
+      Check(native::features.at(source_handle).sr_sequence == sequence + 1, "nested C/C++ SR mirror advances one source sample");
       if (submit) {
         submit_commands("wrapper frame");
         native::DrainRetiredResources(true);
       }
       return model_calls - before;
+    };
+    const auto frame = [&](int reset, bool submit = true, bool mirror = false) {
+      return source_frame(owner, reset, submit, mirror);
     };
     for (uint32_t prefix = 0; prefix < native::kContractDebounceFrames + 8; ++prefix) frame(1);
     Check(native::features.at(owner).slots[0].edit_reuse != nullptr, "production wrapper establishes an edit anchor");
@@ -1602,7 +1606,8 @@ int Run() {
       // disables this frame's adaptive route while the user's request stays On.
       auto reservation = std::make_shared<addon::adaptive_resolution::Session>();
       native::adaptive_resident_session = reservation;
-      native::nr_adaptive_enabled = true;
+      native::kSetAdaptiveLimitedResidency.Store(1.f);
+      native::kSetAdaptiveEnabled.Store(1.f);
       Check(frame(0) == 0 && native::edit_reuse_reuses.load() == reuses_before_adaptive + 1
                 && native::edit_reuse_fallbacks.load() == fallbacks_before_adaptive,
             "an adaptive request blocked by another source preserves reuse on the actual fixed workset");
@@ -1611,27 +1616,89 @@ int Run() {
                 && session->status.reason == addon::adaptive_resolution::Reason::PREPARING
                 && native::features.at(owner).slots[0].edit_reuse == old_anchor.lock(),
             "the dormant adaptive request retains its status and the current fixed anchor");
+      Check(frame(0) == 1, "the following fixed frame refreshes before adaptive eligibility changes");
+      const auto compatible_anchor = native::features.at(owner).slots[0].edit_reuse;
+      const auto compatible_model = native::features.at(owner).slots[0].handle;
+      const auto compatible_workset = native::features.at(owner).last_workset_key;
+      const auto compatible_allocations = native::worksets_created;
       reservation.reset();
       native::adaptive_resident_session.reset();
       Check(native::EnsureLookPipeline(gpu.device.Get()), "warm existing Look programs before admitted adaptive recording");
-      Check(frame(0) >= 1 && native::edit_reuse_reuses.load() == reuses_before_adaptive + 1
+      Check(frame(0) == 0 && native::edit_reuse_reuses.load() == reuses_before_adaptive + 2
                 && native::features.at(owner).adaptive_cache != nullptr
-                && native::features.at(owner).slots[0].edit_reuse == nullptr,
-            "an admitted adaptive On frame evaluates the model without edit reuse");
+                && native::features.at(owner).adaptive_cache->active == 0
+                && native::features.at(owner).slots[0].edit_reuse == compatible_anchor
+                && native::features.at(owner).slots[0].handle == compatible_model
+                && native::features.at(owner).last_workset_key == compatible_workset
+                && native::worksets_created == compatible_allocations,
+            "adaptive eligibility alone keeps the same fixed workset, model and adjacent reuse");
       native::PollAdaptiveCache(native::features.at(owner).adaptive_cache.get());
-      native::nr_adaptive_enabled = false;
-      Check(frame(0) == 1
-                && native::features.at(owner).adaptive_session == session
-                && native::features.at(owner).adaptive_cache == nullptr
-                && native::features.at(owner).slots[0].edit_reuse != nullptr
-                && native::features.at(owner).slots[0].edit_reuse->valid,
+      native::kSetAdaptiveEnabled.Store(0.f);
+      auto& feature = native::features.at(owner);
+      bool refreshed = false;
+      for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8; ++attempt) {
+        if (frame(1) == 1 && feature.adaptive_cache == nullptr
+            && feature.slots[0].edit_reuse != nullptr && feature.slots[0].edit_reuse->valid) {
+          refreshed = true;
+          break;
+        }
+      }
+      Check(refreshed && feature.adaptive_session == session,
             "adaptive Off retains its Session, retires standby slots and refreshes a new edit anchor");
       const auto fresh_anchor = native::features.at(owner).slots[0].edit_reuse;
       const auto fresh_generation = fresh_anchor->anchor_generation;
-      Check(frame(0) == 0 && native::edit_reuse_reuses.load() == reuses_before_adaptive + 2
+      Check(frame(0) == 0 && native::edit_reuse_reuses.load() == reuses_before_adaptive + 3
                 && native::features.at(owner).slots[0].edit_reuse == fresh_anchor
                 && fresh_anchor->anchor_generation == fresh_generation,
             "the retained disabled Session permits one reuse with zero model calls and no recursive recapture");
+      native::kSetAdaptiveLimitedResidency.Store(0.f);
+    }
+    {
+      auto& original = native::features.at(owner);
+      Check(frame(1) == 1, "prepare a fresh fixed anchor before changing source or model");
+      const auto original_anchor = original.slots[0].edit_reuse;
+      const auto original_model = original.slots[0].handle;
+      const auto reuses_before = native::edit_reuse_reuses.load();
+      const auto* second = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xED174});
+      native::RegisterCreatedFeatureLocked(second, native::kFeatureDlss, &parameters);
+      for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8; ++attempt) {
+        const auto calls = source_frame(second, 0, true, false);
+        Check(native::edit_reuse_reuses.load() == reuses_before,
+              "the new handle on the same 16x16 output cannot consume the previous source's anchor");
+        const auto& anchor = native::features.at(second).slots[0].edit_reuse;
+        if (anchor != nullptr && anchor->valid) {
+          Check(calls == 1, "the new source's first valid anchor records a model call");
+          break;
+        }
+      }
+      const auto& second_feature = native::features.at(second);
+      Check(second_feature.slots[0].edit_reuse != nullptr && second_feature.slots[0].edit_reuse != original_anchor
+                && second_feature.slots[0].handle != original_model && second_feature.input_width == 16
+                && second_feature.source_generation != original.source_generation && model_resets.back() == 1,
+            "the first delivered edit for a same-size new source refreshes its own model and history");
+      Check(source_frame(second, 0, true, false) == 0, "the new source can reuse only its own refresh");
+      native::ForgetSourceHandleLocked(second);
+      native::DrainRetiredResources(true);
+
+      native::kSetPreset.Commit(1.f);
+      const auto reuses_before_model = native::edit_reuse_reuses.load();
+      for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8; ++attempt) {
+        const auto calls = frame(0);
+        Check(native::edit_reuse_reuses.load() == reuses_before_model,
+              "a changed model request cannot reuse the previous model's edit");
+        const auto& anchor = original.slots[0].edit_reuse;
+        if (anchor != nullptr && anchor->valid) {
+          Check(calls == 1, "the changed model's first valid anchor records a model call");
+          break;
+        }
+      }
+      Check(original.slots[0].nr_preset == 1 && original.slots[0].edit_reuse != nullptr
+                && original.slots[0].edit_reuse != original_anchor && original.input_width == 16
+                && model_resets.back() == 1 && frame(0) == 0,
+            "the real model replacement at unchanged geometry refreshes before resuming x2");
+      native::kSetPreset.Commit(2.f);
+      std::cout << "NR_RELEASE_PARITY dx12-upscaled-adaptive-x2 fixed-active grid=16x16 cadence=1/0"
+                   " eligibility_keeps_anchor=1 same_grid_source_refresh=1 model_refresh=1 evidence=WARP+MOCK\n";
     }
     {
       auto& slot = native::features.at(owner).slots[0];
@@ -1695,13 +1762,14 @@ int Run() {
       refresh_at_size(16);
     }
     {
-      Check(!native::edit_reuse_adaptive_experiment.load(), "two-tier edit reuse experiment defaults to disabled");
-      const auto saved_levels = native::nr_adaptive_selected_levels.load();
-      const auto saved_minimum = native::nr_adaptive_min_scale.load();
-      native::nr_adaptive_selected_levels = 2;
-      native::nr_adaptive_min_scale = .75f;
-      native::edit_reuse_adaptive_experiment = true;
-      native::nr_adaptive_enabled = true;
+      const AdaptivePresentRegistration registration;
+      AdaptivePresentOutput present(gpu, output.Get());
+      SetAdaptiveOutputMode(&present, 70);
+      const auto saved_levels = native::kSetAdaptiveLevelCount.Get();
+      const auto saved_minimum = native::kSetAdaptiveMinScale.Get();
+      native::kSetAdaptiveLevelCount.Store(2.f);
+      native::kSetAdaptiveMinScale.Store(.75f);
+      native::kSetAdaptiveEnabled.Store(1.f);
       native::direct_api.evaluate = ConstantModel;
       native::intensity = 1.f;
       for (size_t pixel = 0; pixel < source_values.size() / 4; ++pixel) {
@@ -1719,13 +1787,14 @@ int Run() {
           ++active_calls;
         }
       };
-      const auto before_preparing_reuses = native::edit_reuse_reuses.load();
       auto& feature = native::features.at(owner);
       for (uint32_t attempt = 0; attempt < 32; ++attempt) {
         const auto successes = native::SourceSuccessfulEvaluations();
         const auto active_before = active_calls;
+        const auto reuses_before = native::edit_reuse_reuses.load();
         frame(0);
-        Check(native::SourceSuccessfulEvaluations() - successes == active_calls - active_before,
+        Check(native::SourceSuccessfulEvaluations() - successes
+                  == active_calls - active_before + native::edit_reuse_reuses.load() - reuses_before,
               "standby preparation contributes no successful source frames");
         if (feature.adaptive_session != nullptr && feature.adaptive_session->prepared) break;
       }
@@ -1736,8 +1805,6 @@ int Run() {
             "the real adaptive path prepares exactly two independent model histories");
       Check(tiers->ladder.sizes[1][0].width == 12 && tiers->ladder.sizes[1][0].height == 12,
             "the prepared low tier uses a noninteger 12-to-16 Resolve ratio");
-      Check(native::edit_reuse_reuses.load() == before_preparing_reuses,
-            "the bounded preparation interval never reuses an edit before both tiers are ready");
       const auto models = native::nr_features_created;
       const auto allocations = native::worksets_created;
       const auto upper_model = feature.slots[0].handle;
@@ -1812,102 +1879,9 @@ int Run() {
       }
       checked_frame(0, 1);
       checked_frame(0, 0);
-      {
-        namespace timers = addon::gpu_timers;
-        const auto session = feature.adaptive_session;
-        const auto saved_stability = session->stable_after_ns;
-        const auto saved_comparison_stability = native::comparison_stable_after_ns[1];
-        const auto saved_measure = session->next_measure_ns;
-        namespace rate = addon::output_framerate;
-        const auto output_fixture = reinterpret_cast<uintptr_t>(session.get());
-        const std::array fixture_buffers{
-            reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(output.Get()))};
-        rate::RegisterPresentOutput(output_fixture,
-            reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(gpu.device.Get())), 0, fixture_buffers);
-        const auto fixture_output = rate::MatchPresentOutput(output_fixture, fixture_buffers[0]);
-        session->output_source = static_cast<uint64_t>(rate::Source::PRESENT);
-        session->output_generation = session->output_configuration = fixture_output.generation;
-        Check(!native::gpu_timers_enabled.load() && !native::cost_meter_enabled.load(),
-              "paired WARP recording is driven by adaptive sampling without profiling");
-        timers::Poll(true, false);
-        session->InvalidateSampling();
-        session->stable_after_ns = native::comparison_stable_after_ns[1] = 0;
-        session->next_measure_ns = 0;
-        const auto timed_source = [&](uint32_t calls) {
-          // With no Present provider, Prepare intentionally clears its samples
-          // every frame. Supply the existing synthetic output-FPS contract.
-          const auto now = native::SteadyNowNs();
-          {
-            std::unique_lock lock(addon::output_framerate::internal::state.mutex);
-            auto& estimate = addon::output_framerate::internal::state.present.at(output_fixture).stream;
-            estimate.previous_ns = now;
-            estimate.snapshot = {.available = true, .source = addon::output_framerate::Source::PRESENT,
-                .source_generation = fixture_output.generation, .configuration_generation = fixture_output.generation,
-                .window_serial = 1, .window_begin_ns = now - 500'000'000, .window_end_ns = now,
-                .fps = 60., .fg_off = true};
-          }
-          const auto sequence = timers::internal::next_sequence;
-          const auto successes = native::SourceSuccessfulEvaluations();
-          Check(frame(0, false) == calls && native::SourceSuccessfulEvaluations() == successes + 1,
-                "paired timer source retains the actual refresh/reuse calls");
-          const auto found = std::find_if(std::begin(timers::internal::segments), std::end(timers::internal::segments),
-              [&](const auto& segment) { return segment.recorded && segment.sequence == sequence + 1; });
-          Check(found != std::end(timers::internal::segments) && found->measure && found->adaptive.paired
-                    && found->adaptive.pair_first_frame != 0
-                    && found->adaptive.application_frame == feature.sr_sequence,
-                "production timer captures the selected true source ID and paired tag");
-          const auto tag = found->adaptive;
-          const auto measured_sequence = found->sequence;
-          // Preserve the real completion receipt before Poll; Gpu::Submit's
-          // unconditional prune intentionally does not preserve timer receipts.
-          Check(SUCCEEDED(gpu.list->Close()), "paired recording close");
-          ID3D12CommandList* lists[]{gpu.list.Get()};
-          gpu.queue->ExecuteCommandLists(1, lists);
-          gpu.submission_pending = true;
-          Check(SUCCEEDED(gpu.queue->Signal(gpu.fence.Get(), ++gpu.serial)), "paired completion signal");
-          HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-          Check(event != nullptr, "paired completion event");
-          const auto armed = gpu.fence->SetEventOnCompletion(gpu.serial, event);
-          const auto wait = (SUCCEEDED(armed) ? WaitForSingleObject(event, 10000) : WAIT_FAILED);
-          CloseHandle(event);
-          Check(wait == WAIT_OBJECT_0 && SUCCEEDED(gpu.device->GetDeviceRemovedReason()), "paired healthy bounded completion");
-          gpu.submission_pending = false;
-          native::ResolveAdaptiveBorrowedDeliveries();
-          Check(SUCCEEDED(gpu.allocator->Reset()) && SUCCEEDED(gpu.list->Reset(gpu.allocator.Get(), nullptr)),
-                "paired completed recording reset");
-          native::DrainRetiredResources(true);
-          timers::Poll(true, false);
-          gpu.uploads.clear();
-          gpu.retained_resources.clear();
-          Check(timers::stage_stats[1].valid && timers::stage_stats[1].sequence == measured_sequence,
-                "both real WARP chains publish complete production timestamps");
-          return std::pair{tag, timers::stage_stats[1].total_us};
-        };
-        const auto first = timed_source(1);
-        Check(session->gpu_count == 0 && session->pending_pair.frame == first.first.application_frame,
-              "one completed production chain does not publish a two-source cost");
-        session->next_measure_ns = native::SteadyNowNs() + 10'000'000'000;
-        const auto second = timed_source(0);
-        Check(second.first.application_frame == first.first.application_frame + 1
-                  && second.first.pair_first_frame == first.first.pair_first_frame
-                  && session->gpu_count == 1
-                  && std::abs(session->gpu_us[0] - (static_cast<double>(first.second) + second.second) / 2.) < .001,
-              "the adjacent reuse is measured before the next 250ms opportunity and publishes the complete chain mean");
-        session->next_measure_ns = 0;
-        const auto unmatched = timed_source(1);
-        Check(session->pending_pair.frame == unmatched.first.application_frame,
-              "a new first source waits for its adjacent completion");
-        session->stable_after_ns = saved_stability;
-        native::comparison_stable_after_ns[1] = saved_comparison_stability;
-        session->next_measure_ns = saved_measure;
-        rate::DestroyPresentOutput(output_fixture);
-      }
       std::weak_ptr<reuse::State> retired_lower = low_anchor;
       low_anchor.reset();
       feature.adaptive_session->Request(0, native::SteadyNowNs());
-      Check(feature.adaptive_session->pending_pair.pair_first_frame == 0
-                && feature.adaptive_session->measure_pair_first_frame == 0,
-            "the real tier request clears the unfinished old measurement pair");
       checked_frame(0, 1);
       Check(tiers->active == 0 && feature.slots[0].handle == upper_model && model_resets.back() == 1
                 && retired_lower.expired() && tiers->tiers[1].state.slots[0].edit_reuse == nullptr,
@@ -1915,86 +1889,16 @@ int Run() {
       checked_frame(0, 0);
       Check(native::nr_features_created == models && native::worksets_created == allocations,
             "upper/lower/upper reuse creates no additional model or adaptive workset");
-      native::native_fg_public_off = false;
-      native::native_fg_declaration = native::NativeFgDeclaration::kUnknown;
-      checked_frame(0, 1);
-      Check(feature.slots[0].edit_reuse == nullptr && !feature.adaptive_session->paired_sampling,
-            "Unknown without a public Off receipt never admits two-tier reuse");
-#if defined(NR_NEXUS_DEV_CONTROL)
-      {
-        namespace xefg = addon::fg::xefg;
-        namespace xi = xefg::internal;
-        // Only the receipt is MOCK here. Public Enable/link acceptance is
-        // exercised by fg_xefg_tests; recording, shaders and retirement use WARP.
-        const bool stopped = xi::stopped.exchange(false);
-        const bool sdk_enabled = xi::sdk_detours_enabled.exchange(true);
-        Check(xi::state.contexts.empty() && xi::state.bridge_swapchains.empty(), "isolated SDK receipt fixture");
-        auto context = std::make_shared<xi::Context>();
-        context->device = gpu.device;
-        context->device_identity = renodx::utils::directx::NativeIdentity(gpu.device.Get());
-        context->proxy_identity = 0xE012;
-        context->bridge_context_ready = context->bridge_proxy_ready = context->bridge_off_observed = true;
-        context->bridge_off_epoch = context->epoch;
-        context->bridge_off_uses_source_link = true;
-        context->bridge_source_swapchain = 0xE011;
-        context->bridge_source_generation = 1;
-        context->bridge_link_generation = context->bridge_off_link_generation = 1;
-        context->bridge_link_source = context->bridge_off_source = {
-            .handle = reinterpret_cast<uintptr_t>(owner), .generation = feature.source_generation,
-            .device12 = reinterpret_cast<uintptr_t>(context->device_identity.Get())};
-        auto source_chain = std::make_shared<xi::BridgeSourceSwapchain>();
-        source_chain->owner = context->bridge_source_swapchain;
-        source_chain->identity = 0xE013;
-        source_chain->device12 = context->device_identity;
-        source_chain->generation = context->bridge_source_generation;
-        source_chain->hook_ready = true;
-        source_chain->context = context;
-        source_chain->proxy = context->proxy_identity;
-        xi::state.contexts.emplace(reinterpret_cast<void*>(uintptr_t{0xE014}), context);
-        xi::state.bridge_swapchains.emplace(source_chain->owner, source_chain);
-        Check(native::EditReuseXefgOffLocked(owner).available,
-              "a source-bound MOCK SDK Disable is available without changing the native declaration");
-        Check(!native::EditReuseXefgOffLocked(owner, feature.source_generation + 1).available,
-              "a current Disable cannot admit a recording from a different source generation");
-        checked_frame(0, 1);
-        Check(feature.adaptive_session->paired_sampling && !native::native_fg_public_off.load()
-                  && native::native_fg_declaration.load() == native::NativeFgDeclaration::kUnknown,
-              "DEV accepts the independent SDK receipt and preserves native Unknown");
-        checked_frame(0, 0);
-        const auto sampling = feature.adaptive_session->sampling_generation;
-        ++context->bridge_link_generation;
-        context->bridge_off_link_generation = context->bridge_link_generation;
-        checked_frame(0, 1);
-        Check(feature.adaptive_session->sampling_generation > sampling && model_resets.back() == 1,
-              "a newly accepted source link invalidates paired measurements and old NR edit history");
-        checked_frame(0, 0);
-        ++context->epoch;
-        checked_frame(0, 1);
-        Check(feature.slots[0].edit_reuse == nullptr && !feature.adaptive_session->paired_sampling,
-              "a stale Disable epoch stops reuse and paired sampling immediately");
-        xefg::ForgetBridgeSourceSwapchain(source_chain->owner);
-        xi::state.contexts.clear();
-        xi::sdk_detours_enabled = sdk_enabled;
-        xi::stopped = stopped;
-      }
-#endif
-      native::native_fg_public_off = true;
-      native::native_fg_declaration = native::NativeFgDeclaration::kOff;
-      native::edit_reuse_adaptive_experiment = false;
-      const auto reuses = native::edit_reuse_reuses.load();
-      checked_frame(0, 1);
-      checked_frame(0, 1);
-      Check(feature.slots[0].edit_reuse == nullptr && native::edit_reuse_reuses.load() == reuses,
-            "disabling the private experiment restores the unchanged per-frame adaptive admission");
-      native::nr_adaptive_enabled = false;
-      native::nr_adaptive_selected_levels = saved_levels;
-      native::nr_adaptive_min_scale = saved_minimum;
+      rate::ReleaseNativeViewport(70);
+      native::kSetAdaptiveEnabled.Store(0.f);
+      native::kSetAdaptiveLevelCount.Store(saved_levels);
+      native::kSetAdaptiveMinScale.Store(saved_minimum);
       native::direct_api.evaluate = NeutralModel;
       parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, 0.f);
       parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, 0.f);
       upload(wrapper_depth.Get(), std::vector<float>(16 * 16, .5f), NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 4);
       submit_commands("restore normal guide input");
-      Check(frame(1) == 1, "leaving the two-tier experiment returns to the existing fixed-size refresh");
+      Check(frame(1) == 1, "disabling adaptive resolution returns to the fixed-size refresh");
       std::cout << "PASS edit reuse two ready tiers: actual low-grid Resolve/Commit/writeback, nonzero jitter, exact occlusion RGBA,"
                    " one reuse, source clock, separate preparation counts and retired anchors; evidence=WARP+MOCK\n";
     }
@@ -2027,13 +1931,319 @@ int Run() {
     Check(!native::features.contains(owner) && submission::ResourceReleasable(anchor_state.get()),
           "source release retires submitted and discarded cache references");
     anchor_state.reset();
+
+    const auto automatic_trial = [&](const NVSDK_NGX_Handle* trial_source, bool native_off, int low_fps) {
+      const AdaptivePresentRegistration registration;
+      AdaptivePresentOutput present(gpu, output.Get());
+      const auto output_identity = present.Identity();
+      auto unrelated_buffer = uav_texture(16, 16, DXGI_FORMAT_R16G16B16A16_FLOAT);
+      AdaptivePresentOutput unrelated(gpu, unrelated_buffer.Get());
+      if (native_off) {
+        SetAdaptiveOutputMode(&present, 71);
+      } else {
+        SetAdaptiveOutputMode(&unrelated, 71);
+      }
+      Check(rate::NativeMode(output_identity) == (native_off ? std::optional{0u} : std::nullopt),
+            "the main PRESENT output has exactly the intended combination Off evidence");
+      native::kSetEditReuse.Store(1.f);
+      native::kSetAdaptiveEnabled.Store(1.f);
+      native::kSetAdaptiveLevelCount.Store(2.f);
+      native::kSetAdaptiveLimitedResidency.Store(0.f);
+      native::kSetAdaptiveMinScale.Store(.75f);
+      native::kSetAdaptiveTargetFps.Store(100.f);
+      Check(!native::gpu_timers_enabled.load() && !native::cost_meter_enabled.load(),
+            "the production adaptive route schedules its own measurements with profiling disabled");
+      native::direct_api.evaluate = ConstantModel;
+      native::RegisterCreatedFeatureLocked(trial_source, native::kFeatureDlss, &parameters);
+      auto& feature = native::features.at(trial_source);
+
+      std::atomic_int fps{80};
+      std::jthread producer([&](std::stop_token stop) {
+        auto deadline = std::chrono::steady_clock::now();
+        while (!stop.stop_requested()) {
+          present.Present();
+          unrelated.Present();
+          deadline += std::chrono::nanoseconds(1'000'000'000 / fps.load());
+          std::this_thread::sleep_until(deadline);
+        }
+      });
+      for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 32; ++attempt) {
+        source_frame(trial_source, 0, true, false);
+        if (feature.adaptive_session != nullptr && feature.adaptive_session->prepared
+            && feature.adaptive_session->status.applied[0].width == 16) break;
+      }
+      const auto session = feature.adaptive_session;
+      const auto tiers = feature.adaptive_cache;
+      Check(session != nullptr && session->prepared && session->status.applied[0].width == 16
+                && tiers != nullptr && tiers->active == 0 && tiers->tiers[0].ready && tiers->tiers[1].ready,
+            "actual SR deliveries confirm the upper working size and prepare both production tiers");
+      const auto upper_model = feature.slots[0].handle;
+      auto lower_model = tiers->tiers[1].state.slots[0].handle;
+      Check(upper_model != nullptr && lower_model != nullptr && upper_model != lower_model,
+            "the two prepared grids have distinct model histories");
+      Check(source_frame(trial_source, 1, true, false) == 1 && source_frame(trial_source, 0, true, false) == 0
+                && session->paired_sampling,
+            "even without combination Off the delivered upper tier runs fixed x2");
+
+      const AdaptiveGpuSubmission queue{.gpu = &gpu};
+      struct Recording {
+        uint32_t calls = 0;
+        timers::Segment* timer = nullptr;
+      };
+      const auto record = [&] {
+        const auto sequence = timers::internal::next_sequence;
+        const auto calls = source_frame(trial_source, 0, false, false);
+        const auto segment = std::ranges::find_if(timers::internal::segments, [&](const auto& candidate) {
+          return candidate.recorded && candidate.sequence > sequence && candidate.adaptive.session == session;
+        });
+        return Recording{.calls = calls, .timer = (segment != std::end(timers::internal::segments) ? &*segment : nullptr)};
+      };
+      const auto wait_until_ns = [](int64_t timestamp_ns) {
+        std::this_thread::sleep_until(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(timestamp_ns)));
+      };
+      const auto current_output = [&] { return rate::Read(output_identity, rate::NowNs()); };
+#if defined(NR_NEXUS_DEV_CONTROL)
+      funnel_accounting_tests::Restore adaptive_diagnostic;
+      adaptive_diagnostic.Atomic(&native::edit_reuse_adaptive_experiment);
+#endif
+      wait_until_ns(session->stable_after_ns + 2 * rate::Stream::BIN_NS + 100'000'000);
+      const auto upper_output = current_output();
+      Check(upper_output.available && upper_output.source == rate::Source::PRESENT && upper_output.output == output_identity
+                && std::abs(upper_output.fps - 80.) < 3.,
+            "real registered Present callbacks produced the main output's complete 80 FPS window");
+      const auto upper_applied_ns = session->applied_ns;
+      const auto upper_generation = session->applied_generation;
+      adaptive::GpuSample old_half;
+      Recording first_lower;
+      bool saw_half = false;
+      for (uint32_t cycle = 0; cycle < 12; ++cycle) {
+        wait_until_ns(session->next_measure_ns + 2'000'000);
+        const auto refresh = record();
+        if (tiers->active == 1) {
+          first_lower = refresh;
+          break;
+        }
+        Check(refresh.calls == 1 && refresh.timer != nullptr && refresh.timer->measure && refresh.timer->adaptive.paired,
+              "an actual upper refresh records the first member of an x2 cost cycle");
+        const auto first_tag = refresh.timer->adaptive;
+        const auto samples_before = session->gpu_count;
+        queue.Complete(refresh.timer, 3000);
+        Check(session->gpu_count == samples_before && session->pending_pair.frame == first_tag.application_frame
+                  && session->status.output_fps > 77. && session->output_source == static_cast<uint64_t>(rate::Source::PRESENT),
+              "an upper half pair leaves cost unchanged while the real PRESENT window remains available");
+        old_half = session->pending_pair;
+        if (samples_before == 0) {
+          Check(session->status.reason == adaptive::Reason::COLLECTING && !session->trial,
+                "a first upper half pair cannot request a lower tier");
+          saw_half = true;
+          if (native_off) {
+            SetAdaptiveOutputMode(&present, 71, sl::DLSSGMode::eOn);
+          }
+        }
+#if defined(NR_NEXUS_DEV_CONTROL)
+        const bool toggle_diagnostic = samples_before == 1 && native_off;
+        if (toggle_diagnostic) {
+          native::edit_reuse_adaptive_experiment = true;
+        }
+#endif
+        const auto reused = record();
+        if (tiers->active == 1) {
+          first_lower = reused;
+          break;
+        }
+        Check(reused.calls == 0 && reused.timer != nullptr && reused.timer->measure
+                  && reused.timer->adaptive.application_frame == first_tag.application_frame + 1
+                  && reused.timer->adaptive.pair_first_frame == first_tag.pair_first_frame,
+              "the adjacent, delivered zero-call upper reuse records the other half of the same cycle");
+        queue.Complete(reused.timer, 1000);
+        Check(session->gpu_count == std::min(samples_before + 1, session->gpu_us.size())
+                  && session->gpu_us[session->gpu_count - 1] == 2000. && session->pending_pair.frame == 0,
+              "delivered WARP refresh and reuse publish exactly one 2 ms base-frame cost");
+        if (samples_before == 0 && native_off) {
+          Check(session->sampling_generation == first_tag.sampling_generation && session->status.output_fps > 77.,
+                "withdrawing Off alone preserves a healthy fixed anchor, cost pair and independent output window");
+          SetAdaptiveOutputMode(&present, 71);
+        }
+#if defined(NR_NEXUS_DEV_CONTROL)
+        if (toggle_diagnostic) {
+          Check(session->sampling_generation == first_tag.sampling_generation && session->status.output_fps > 77.,
+                "enabling diagnostic logging preserves the actual upper x2 pair and independent output window");
+          native::edit_reuse_adaptive_experiment = false;
+        }
+#endif
+      }
+      Check(saw_half && tiers->active == 1, "production output and complete upper cost cycles select the real lower grid");
+      Check(session->trial && session->level == 1 && session->previous_level == 0
+                && session->baseline_gpu_us == 2000. && std::abs(session->baseline_fps - 80.) < 3.
+                && session->status.requested[0].width == 12,
+            "actual low-tier selection preserves the automatic request and its frozen upper trial baseline");
+      const auto trial_generation = session->status.generation;
+      const auto baseline_fps = session->baseline_fps;
+      Check(first_lower.calls == 1 && feature.slots[0].handle == lower_model && feature.input_width == 12
+                && model_resets.back() == 1 && session->paired_sampling == native_off
+                && session->pending_pair.frame == 0 && session->applied_generation == upper_generation
+                && session->applied_ns == upper_applied_ns && session->status.applied[0].width == 16,
+            "the selected low frame changes route and actual grid, keeps the trial, and only records pending delivery");
+      if (native_off) {
+        const auto discarded = submission::ObserveRecording(gpu.list.Get());
+        const auto discarded_model = feature.slots[0].handle;
+        const auto models_before_recovery = native::nr_features_created;
+        const auto worksets_before_recovery = native::worksets_created;
+        Check(SUCCEEDED(gpu.list->Close()), "close the failed first low-tier recording without executing");
+        queue.ResetList();
+        native::ResolveAdaptiveBorrowedDeliveries();
+        timers::Poll(true, false);
+        gpu.uploads.clear();
+        gpu.retained_resources.clear();
+        Check(discarded->closed.load() && !discarded->submitted.load() && session->trial
+                  && session->applied_generation == upper_generation && session->applied_ns == upper_applied_ns
+                  && session->gpu_count == 0 && session->pending_pair.frame == 0,
+              "discarded first low refresh leaves the upper confirmation and warmup unmodified");
+        const auto maturation = record();
+        lower_model = feature.slots[0].handle;
+        Check(maturation.calls == 0 && tiers->active == 1 && feature.input_width == 12
+                  && lower_model != nullptr && lower_model != discarded_model
+                  && native::nr_features_created == models_before_recovery + 1
+                  && native::worksets_created == worksets_before_recovery + 1,
+              "discarded GPU state rebuilds the low workset and defers the new model's first Evaluate by one frame");
+        const auto original = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        queue.Complete(nullptr, 0);
+        const auto original_pixels = original.Pixels();
+        Check(original_pixels.size() == source_values.size() * sizeof(uint16_t)
+                  && std::memcmp(original_pixels.data(), source_values.data(), original_pixels.size()) == 0
+                  && session->trial && session->applied_generation == upper_generation && session->applied_ns == upper_applied_ns
+                  && session->gpu_count == 0,
+              "the maturation frame delivers original SR bits and leaves the old tier confirmation and costs intact");
+        first_lower = record();
+        Check(first_lower.calls == 1 && feature.slots[0].handle == lower_model && model_resets.back() == 1
+                  && session->status.generation == trial_generation,
+              "the first mature replacement refreshes within the original automatic trial");
+      }
+
+      const auto capture = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      queue.Complete(first_lower.timer, native_off ? 2000 : 1500);
+      const auto pixels = capture.Pixels();
+      Check(pixels.size() == source_values.size() * sizeof(uint16_t)
+                && std::memcmp(pixels.data(), source_values.data(), pixels.size()) != 0
+                && std::memcmp(pixels.data() + 6, source_values.data() + 3, sizeof(uint16_t)) == 0,
+            "first confirmed lower work really edits the game's WARP output and preserves its alpha");
+      const auto low_applied_ns = session->applied_ns;
+      Check(session->trial && session->applied_generation == trial_generation && session->status.applied[0].width == 12
+                && low_applied_ns > upper_applied_ns && session->stable_after_ns == low_applied_ns + adaptive::WARMUP_NS
+                && session->gpu_count == 0 && session->baseline_gpu_us == 2000. && session->baseline_fps == baseline_fps,
+            "only complete low delivery starts warmup with the original upper baseline and no inherited cost");
+      if (!native_off) {
+        Check(session->sampling_generation > old_half.sampling_generation && feature.slots[0].edit_reuse == nullptr,
+              "low-tier single timing retires the upper sampling generation and cannot reuse without matching Off");
+      }
+      Check(old_half.frame != 0 && old_half.generation == upper_generation,
+            "the delayed input is a real completed upper half from the old request");
+      session->ObserveGpu(old_half, native::SteadyNowNs());
+      Check(session->pending_pair.frame == 0 && session->gpu_count == 0 && session->applied_ns == low_applied_ns,
+            "the completed old-generation half cannot publish cost or restart the low warmup");
+
+      fps = low_fps;
+      if (native_off) {
+        const auto next = record();
+        Check(next.calls == 0 && feature.slots[0].edit_reuse != nullptr && feature.slots[0].edit_reuse->width == 12,
+              "matching Native Off delivers a real zero-call low-grid reuse after recovery");
+        queue.Complete(next.timer, 1000);
+        Check(session->applied_ns == low_applied_ns && session->gpu_count == 0,
+              "a low reuse during warmup cannot confirm or measure twice");
+      }
+      wait_until_ns(session->stable_after_ns + 2'000'000);
+      bool low_cost_observed = false;
+      for (uint32_t cycle = 0; cycle < 25; ++cycle) {
+        wait_until_ns(session->next_measure_ns + 2'000'000);
+        const auto low = record();
+        if (session->level == 0) {
+          Check(low_fps == 80 && !session->trial && session->blocked && session->status.reason == adaptive::Reason::NO_BENEFIT
+                    && session->status.applied[0].width == 12 && tiers->active == 0 && low.calls == 1 && model_resets.back() == 1,
+                "a full 80 FPS low comparison requests the upper anchor and records a fresh upper model result");
+          queue.Complete(low.timer, 3000);
+          Check(session->status.applied[0].width == 16 && session->blocked_until_ns > session->applied_ns
+                    && session->stable_after_ns == session->applied_ns + adaptive::WARMUP_NS,
+                "upper re-delivery confirms the anchor and keeps the no-benefit cooldown");
+          break;
+        }
+        Check(tiers->active == 1 && feature.slots[0].handle == lower_model && feature.input_width == 12
+                  && session->applied_ns == low_applied_ns && session->paired_sampling == native_off && low.calls == 1
+                  && low.timer != nullptr && low.timer->measure && low.timer->adaptive.paired == native_off,
+              "each measured low refresh uses the new grid, model and sampling route");
+        const auto before_low_sample = session->gpu_count;
+        queue.Complete(low.timer, native_off ? 2000 : 1500);
+        if (native_off) {
+          Check(session->gpu_count == before_low_sample && session->pending_pair.frame == feature.sr_sequence,
+                "a completed low refresh on its own still cannot publish a cycle");
+          const auto reused = record();
+          Check(reused.calls == 0 && reused.timer != nullptr && reused.timer->measure
+                    && reused.timer->adaptive.pair_first_frame == session->pending_pair.frame,
+                "the adjacent low base frame reuses the delivered edit and closes the cost cycle");
+          queue.Complete(reused.timer, 1000);
+          Check(session->gpu_count == std::min(before_low_sample + 1, session->gpu_us.size())
+                    && session->gpu_us[session->gpu_count - 1] == 1500. && session->pending_pair.frame == 0,
+                "the complete low x2 pair publishes the mean of its 2 ms refresh and 1 ms reuse");
+        }
+        if (session->gpu_count == session->gpu_us.size()) {
+          Check(std::ranges::all_of(session->gpu_us, [](double cost) { return cost == 1500.; }),
+                "the lower comparison uses a fresh 1.5 ms cost window in its actual sampling mode");
+          low_cost_observed = true;
+        }
+        if (!session->trial) break;
+      }
+      const auto lower_output = current_output();
+      Check(low_cost_observed && !session->trial && lower_output.available && lower_output.source == rate::Source::PRESENT
+                && lower_output.output == output_identity && lower_output.window_serial > upper_output.window_serial
+                && lower_output.window_begin_ns >= low_applied_ns + adaptive::WARMUP_NS
+                && std::abs(lower_output.fps - low_fps) < 3. && std::abs(session->status.output_fps - low_fps) < 3.
+                && session->level == (low_fps == 100 ? 1u : 0u),
+            "the same trial accepts 100 FPS or returns at 80 FPS using a complete new window on the same output");
+      producer.request_stop();
+      producer.join();
+      Dispatch<reshade::addon_event::destroy_swapchain>(&present, true);
+      Dispatch<reshade::addon_event::init_swapchain>(&present, true);
+      const auto replacement = present.Identity();
+      Check(replacement && replacement != output_identity && !rate::IsCurrentOutput(output_identity)
+                && !rate::Read(replacement, rate::NowNs()).available
+                && rate::Read(unrelated.Identity(), rate::NowNs()).available,
+            "registered output replacement revokes the old window even at the same resource address");
+      source_frame(trial_source, 0, true, false);
+      Check(session->status.display_output_generation == replacement.generation && session->status.output_fps == 0.,
+            "after actual output replacement the source cannot use the previous window or the other live output's window");
+      rate::ReleaseNativeViewport(71);
+      native::ForgetSourceHandleLocked(trial_source);
+      native::DrainRetiredResources(true);
+      std::cout << "OBS Upscaled adaptive production off=" << native_off << " upper_fps=" << baseline_fps
+                << " low_fps=" << lower_output.fps << " upper_gpu_us=2000 low_gpu_us=1500"
+                << " output_serial=" << upper_output.window_serial << '/' << lower_output.window_serial << '\n';
+      std::cout << "PASS Upscaled adaptive production off=" << native_off << " upper=80fps/2ms low=" << low_fps
+                << "fps/1.5ms delivery=" << (low_fps == 100 ? "accepted" : "returned") << " evidence=WARP+MOCK\n";
+      if (native_off) {
+        std::cout << "NR_RELEASE_PARITY dx12-upscaled-adaptive-x2 paired-low output=PRESENT grid=12x12"
+                     " calls=1/0 upper_us=2000 low_us=1500 discarded=1 recovered=1 stale_half_rejected=1 off_revocation_keeps_upper=1"
+                     " accepted_100fps=1 output_replacement_rejected=1 evidence=WARP+MOCK\n";
+      } else {
+        std::cout << "NR_RELEASE_PARITY dx12-upscaled-adaptive-x2 "
+                  << (low_fps == 100 ? "unpaired-accept" : "unpaired-rollback")
+                  << " output=PRESENT grid=12x12 calls=1 upper_us=2000 low_us=1500 trial_preserved=1 warmed_after_delivery=1 "
+                  << (low_fps == 100 ? "accepted_100fps=1" : "returned_80fps=1 cooldown=1")
+                  << " output_replacement_rejected=1 evidence=WARP+MOCK\n";
+      }
+    };
+    automatic_trial(reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xED171}), false, 100);
+    automatic_trial(reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xED172}), false, 80);
+    automatic_trial(reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xED173}), true, 100);
+    native::kSetAdaptiveEnabled.Store(0.f);
+    native::kSetAdaptiveLevelCount.Store(0.f);
+    native::kSetAdaptiveTargetFps.Store(native::kSetAdaptiveTargetFps.fallback);
+    native::kSetAdaptiveMinScale.Store(native::kSetAdaptiveMinScale.fallback);
+    std::cout << "PASS Upscaled adaptive x2 production parity evidence=WARP+MOCK\n";
 #if defined(NR_NEXUS_DEV_CONTROL)
     // The original single-output adaptive/discard/failure source is already released above.
     // Give the rotating-output On scenario a new source lifetime and its own ordinary warmup.
     native::nr_adaptive_enabled = false;
     native::nr_follow_input_res = false;
     native::nr_resolution_scale = 1.f;
-    native::edit_reuse_adaptive_experiment = false;
     native::edit_reuse_fg_experiment = false;
     native::edit_reuse_enabled = true;
     native::native_fg_owns = false;

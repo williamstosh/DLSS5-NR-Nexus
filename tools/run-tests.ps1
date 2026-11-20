@@ -12,7 +12,8 @@ param(
     [string]$DetoursLibrary,
     [string]$PythonExecutable,
     [ValidateSet('Auto','Quick','Full','None')][string]$UiPreview = 'Auto',
-    [ValidateSet('inline-restore-roi','control-mask','control-mask-safety','control-mask-safety-hardware','control-mask-capture','control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','control-mask-native-ngx-fg','gpu-pass-diagnostics','native-required-menu','native-owner-idle','native-options-resume','native-options-delayed','native-guide-contract','present-guide-models','adaptive-fg-service','adaptive-inline','adaptive-status','output-framerate-registration','output-framerate-sdk','vulkan-recorded-use-contract','native-present-decision','trace-metadata','stage-chain','stage-resolution','stage-resolution-hardware','same-stage-resolution','same-stage-resolution-hardware','render-stage-resolution','render-stage-resolution-hardware','present-stage-resolution','present-stage-resolution-hardware','native-prefg-resolution','native-prefg-resolution-hardware','native-frame-identity','same-stage-model-pair','same-stage-mixed-pair','source-lifecycle','feature-switch','feature-switch-hardware','f5-mixed','present-chain','present-chain-hardware','present-chain-scrgb','present-chain-hdr10','native-full','native-full-hardware','nr-edit-reuse-contracts','nr-edit-reuse-contracts-public','nr-edit-reuse-render-contracts','nr-edit-reuse-present-contracts','nr-edit-reuse-present-diagnostic','nr-edit-reuse-present-native','nr-edit-reuse-xefg-contracts','nr-edit-reuse-native-contracts','native-frame-source','nr-fg-output-marker','fg-consumer-capture','xefg-present-probe')]
+    [ValidateSet('Auto','Off','On')][string]$DevControlMode = 'Auto',
+    [ValidateSet('inline-restore-roi','control-mask','control-mask-safety','control-mask-safety-hardware','control-mask-capture','control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','control-mask-native-ngx-fg','gpu-pass-diagnostics','native-required-menu','native-owner-idle','native-options-resume','native-options-delayed','native-guide-contract','present-guide-models','adaptive-fg-service','adaptive-inline','adaptive-resource-strategy','adaptive-status','output-framerate-registration','output-framerate-sdk','vulkan-recorded-use-contract','native-present-decision','trace-metadata','stage-chain','stage-resolution','stage-resolution-hardware','same-stage-resolution','same-stage-resolution-hardware','render-stage-resolution','render-stage-resolution-hardware','present-stage-resolution','present-stage-resolution-hardware','native-prefg-resolution','native-prefg-resolution-hardware','native-frame-identity','same-stage-model-pair','same-stage-mixed-pair','source-lifecycle','feature-switch','feature-switch-hardware','f5-mixed','present-chain','present-chain-hardware','present-chain-scrgb','present-chain-hdr10','native-full','native-full-hardware','nr-edit-reuse-contracts','nr-edit-reuse-contracts-public','nr-edit-reuse-render-contracts','nr-edit-reuse-present-contracts','nr-edit-reuse-present-diagnostic','nr-edit-reuse-present-native','nr-edit-reuse-xefg-contracts','nr-edit-reuse-native-contracts','native-frame-source','nr-fg-output-marker','fg-consumer-capture','xefg-present-probe')]
     [string[]]$NativeCase = @(),
     [switch]$VulkanNativeNgx,
     [string]$NativeNgxProjectIdPath,
@@ -63,7 +64,18 @@ $sources = [ordered]@{
 }
 $executionPolicySuites = @('edit-reuse-policy','present-frame-policy','capability-policy')
 $dependencyCheckedSuites = $executionPolicySuites + @('adaptive-resolution')
+$macroSuites = @('fg-native','bridge-motion','adaptive-resolution','vulkan-control-mask')
 if ($Suite -contains 'all') { $Suite = @($sources.Keys) }
+if ($DevControlMode -ne 'Auto') {
+    if (-not @($Suite | Where-Object { $_ -in $macroSuites }).Count) {
+        throw '-DevControlMode Off/On requires fg-native, bridge-motion, adaptive-resolution or vulkan-control-mask.'
+    }
+    if ($env:CL -match 'NR_NEXUS_DEV_CONTROL\b' -or $env:_CL_ -match 'NR_NEXUS_DEV_CONTROL\b') {
+        throw 'Explicit DEV control mode cannot be combined with NR_NEXUS_DEV_CONTROL in CL or _CL_.'
+    }
+    . (Join-Path $PSScriptRoot 'check-release-experiment-parity.ps1') -SourceRoot $SourceRoot
+    $parityInputs = Get-ReleaseParityBuildContext -SourceRoot $SourceRoot -HostRoot $HostRoot
+}
 if ($BuildOnly -and @($Suite | Where-Object { $_ -in @('config','constants','lifecycle','ui') }).Count) {
     throw '-BuildOnly requires explicitly selecting native/policy/scope/fg-xefg/fg-native/bridge-motion suites.'
 }
@@ -131,6 +143,7 @@ if (-not $DetoursLibrary) { $DetoursLibrary = Join-Path $HostRoot 'external/Deto
 $parameters = @{ SourceRoot=$SourceRoot; HostRoot=$HostRoot; ShaderIncludeDirectory=$ShaderIncludeDirectory
     BuildProject=$BuildProject; VcVars64=$VcVars64 }
 Initialize-TestBuild $VcVars64
+$compiler = (Get-Command cl.exe -CommandType Application).Path
 $common = @('/nologo','/std:c++20','/EHsc','/W4','/O2','/MT','/utf-8','/DNOMINMAX','/DWIN32_LEAN_AND_MEAN')
 $includes = @($SourceRoot, "$HostRoot/src", "$HostRoot/src/addons/dlss5",
     "$HostRoot/external/Detours/src", "$HostRoot/external/reshade", "$HostRoot/external/Streamline/include")
@@ -175,10 +188,12 @@ foreach ($item in $Suite) {
     $name = $sources[$item]
     $exe = Join-Path $directory "$name.exe"
     $arguments = $common + @($includes | ForEach-Object { "/I$_" })
+    $explicitMode = $DevControlMode -ne 'Auto' -and $item -in $macroSuites
     if ($item -in $dependencyCheckedSuites) {
         $msvcInclude = Join-Path $env:VCToolsInstallDir 'include'
         $ucrtInclude = Join-Path $env:WindowsSdkDir "Include/$($env:WindowsSDKVersion.TrimEnd('\'))/ucrt"
-        $arguments = $common + @('/X', '/Y-', '/UNR_NEXUS_DEV_CONTROL', "/I$SourceRoot", "/I$msvcInclude", "/I$ucrtInclude")
+        $arguments = $common + @('/X', '/Y-', "/I$SourceRoot", "/I$msvcInclude", "/I$ucrtInclude")
+        if (-not $explicitMode) { $arguments += '/UNR_NEXUS_DEV_CONTROL' }
     }
     if ($item -in @('control-mask-execution','vulkan-control-mask')) {
         $arguments += "/I$HostRoot/external/reshade/include"
@@ -190,19 +205,16 @@ foreach ($item in $Suite) {
         $arguments += @('/bigobj','/Gy','/Gw','/DNDEBUG','/DRESHADE_ADDON=1',
             "/I$ShaderIncludeDirectory", "/I$HostRoot/external/DLSS/include",
             "/I$HostRoot/external/json/include", "/I$HostRoot/external/frozen/include", "/I$HostRoot/external/gtl/include")
-        if ($item -eq 'fg-native' -and (@($NativeCase | Where-Object { $_ -in @('inline-restore-roi','nr-edit-reuse-contracts','nr-edit-reuse-native-contracts','native-frame-source') }).Count -gt 0)) {
-            $arguments += '/DNR_NEXUS_DEV_CONTROL'
-        }
-        if ($item -eq 'fg-native' -and @($NativeCase | Where-Object { $_ -in @('nr-fg-output-marker','fg-consumer-capture','xefg-present-probe') }).Count -gt 0) {
-            $arguments += '/DNR_NEXUS_DEV_CONTROL'
-        }
+        $automaticNativeDev = $item -eq 'fg-native' -and @($NativeCase | Where-Object {
+            $_ -in @('inline-restore-roi','nr-edit-reuse-contracts','nr-edit-reuse-native-contracts','native-frame-source',
+                'nr-fg-output-marker','fg-consumer-capture','xefg-present-probe')
+        }).Count -gt 0
+        $automaticBridgeDev = $item -eq 'bridge-motion' -and @($BridgeCase | Where-Object {
+            $_ -in @('adaptive','adaptive-hardware','adaptive-native-ngx','adaptive-native-snippet')
+        }).Count -gt 0
+        if (-not $explicitMode -and ($automaticNativeDev -or $automaticBridgeDev)) { $arguments += '/DNR_NEXUS_DEV_CONTROL' }
         if ($item -eq 'fg-native' -and $NativeCase -contains 'xefg-present-probe') {
             $arguments += '/DNR_NEXUS_TEST_XEFG_PRESENT_PROBE'
-        }
-        if ($item -eq 'bridge-motion' -and @($BridgeCase | Where-Object {
-                $_ -in @('adaptive','adaptive-hardware','adaptive-native-ngx','adaptive-native-snippet')
-            }).Count -gt 0) {
-            $arguments += '/DNR_NEXUS_DEV_CONTROL'
         }
         if ($item -eq 'vulkan-control-mask') { $arguments += "/I$VulkanIncludeDirectory" }
         $link += @('user32.lib','gdi32.lib','ole32.lib','psapi.lib')
@@ -212,15 +224,23 @@ foreach ($item in $Suite) {
         }
         if ($item -eq 'bridge-motion') { $link += 'd3dcompiler.lib' }
     }
+    if ($explicitMode -and $DevControlMode -eq 'On') { $arguments += '/DNR_NEXUS_DEV_CONTROL' }
+    if ($explicitMode -and $DevControlMode -eq 'Off') { $arguments += '/UNR_NEXUS_DEV_CONTROL' }
     if ($item -eq 'branding') { $arguments += '/DRENODX_DLSS5_DEBUG' }
     $arguments += @((Join-Path $testRoot "$name.cpp"), "/Fo$directory/$name.obj", "/Fe$exe",
         '/sourceDependencies', "$directory/dependencies.json", '/link', '/OPT:REF', '/OPT:ICF') + $link
     $arguments | ConvertTo-Json | Set-Content -LiteralPath "$directory/arguments.json" -Encoding utf8
     Register-TestCompilerOutput $directory -ObjectPath @(Join-Path $directory "$name.obj") -ExecutablePath $exe
-    & cl.exe @arguments *> "$directory/compile.log"
+    & $compiler @arguments *> "$directory/compile.log"
     if ($LASTEXITCODE -ne 0) { throw "Compile/link failed: $item; see $directory/compile.log" }
+    if ($explicitMode) { $executableHash = (Get-FileHash -LiteralPath $exe).Hash }
     $dependencyFile = Join-Path $directory 'dependencies.json'
     $inputPaths = @((Join-Path $testRoot "$name.cpp"), $PSCommandPath)
+    if ($explicitMode) {
+        $inputPaths += @((Join-Path $repositoryRoot 'host/lock.json'), (Join-Path $repositoryRoot 'host/tools.lock.json'),
+            (Join-Path $PSScriptRoot 'check-release-experiment-parity.ps1'), (Join-Path $testRoot 'test-support.ps1'))
+        if ($item -ne 'adaptive-resolution') { $inputPaths += $DetoursLibrary }
+    }
     if ($item -in $dependencyCheckedSuites) {
         $policyChecker = Join-Path $PSScriptRoot 'check-execution-policy-dependencies.ps1'
         $inputPaths += $policyChecker
@@ -276,8 +296,9 @@ foreach ($item in $Suite) {
                 if ($case -eq 'edit-reuse-production') {
                     $stdout = Join-Path $directory 'warp-edit-reuse-production.stdout.log'
                     Invoke-TestProcess $exe $directory 'warp-edit-reuse-production' @('--warp','--edit-reuse-production')
+                    $dev = [int]($arguments -ccontains '/DNR_NEXUS_DEV_CONTROL')
                     $receipts = @(Get-Content -LiteralPath $stdout | Where-Object {
-                        $_ -ceq 'PASS case=bridge-edit-reuse-production evidence=WARP+MOCK dev=0'
+                        $_ -ceq "PASS case=bridge-edit-reuse-production evidence=WARP+MOCK dev=$dev"
                     })
                     if ($receipts.Count -ne 1) {
                         Complete-TestOutput $directory -Outcome Failed
@@ -380,7 +401,8 @@ foreach ($item in $Suite) {
                         if (-not $consumerPassed) { Complete-TestOutput $directory -Outcome Failed }
                     }
                 } else {
-                    Invoke-TestProcess $exe $directory $case @("--$case")
+                    $timeout = if ($case -eq 'output-framerate-sdk') { 180000 } else { 45000 }
+                    Invoke-TestProcess $exe $directory $case @("--$case") -TimeoutMilliseconds $timeout
                 }
             }
         } else {
@@ -418,9 +440,30 @@ foreach ($item in $Suite) {
         }
     }
     $result = @{suite=$item; build='passed'; run=$(if ($BuildOnly -or $skipVulkanRun) { 'not_run' } else { 'passed' })}
+    if ($explicitMode) {
+        if ((Get-FileHash -LiteralPath $exe).Hash -cne $executableHash) { throw "Test EXE changed: $exe" }
+        $cases = switch ($item) {
+            'fg-native' {
+                if ($NativeCase.Count) { $NativeCase }
+                else { 'test', 'f5-mixed', 'control-mask', 'adaptive-fg-service', 'adaptive-inline', 'present-guide-models' }
+            }
+            'bridge-motion' { $BridgeCase }
+            default { 'test' }
+        }
+        $result['buildIdentity'] = [ordered]@{
+            mode=$DevControlMode; source=$parityInputs; compiler=$compiler
+            compilerSha256=(Get-FileHash -LiteralPath $compiler).Hash
+            compilerEnvironment=@{CL=$env:CL; _CL_=$env:_CL_}
+            argumentsSha256=(Get-FileHash -LiteralPath (Join-Path $directory 'arguments.json')).Hash
+            inputsSha256=(Get-FileHash -LiteralPath (Join-Path $directory 'inputs.json')).Hash
+            dependenciesSha256=(Get-FileHash -LiteralPath $dependencyFile).Hash
+            executableSha256=$executableHash; executable=[IO.Path]::GetFileName($exe)
+            softwareOnly=[bool]$SoftwareOnly; cases=@($cases)
+        }
+    }
     if ($item -in $dependencyCheckedSuites) { $result.dependency_policy = 'passed' }
     if ($skipVulkanRun) { $result.skip_reason = 'software_only_native_gpu_required' }
-    $result | ConvertTo-Json | Set-Content -LiteralPath "$directory/result.json" -Encoding utf8
+    $result | ConvertTo-Json -Depth 9 | Set-Content -LiteralPath "$directory/result.json" -Encoding utf8
     if (-not $BuildOnly) { Complete-TestOutput $directory }
 }
 if (-not $BuildOnly) { Complete-TestOutput $OutputDirectory }
@@ -452,8 +495,8 @@ if ($Suite -contains 'ui' -and -not $BuildOnly -and $UiPreview -ne 'None') {
 } catch {
     if ($OutputDirectory -and (Test-Path -LiteralPath (Join-Path $OutputDirectory 'artifact-lifecycle.json'))) {
         if ($testWorkspaceStarted) {
-            foreach ($policySuite in $dependencyCheckedSuites) {
-                Complete-TestOutput (Join-Path $OutputDirectory $policySuite) -Outcome Failed
+            foreach ($item in $Suite) {
+                Complete-TestOutput (Join-Path $OutputDirectory $item) -Outcome Failed
             }
         }
         Complete-TestOutput $OutputDirectory -Outcome Failed

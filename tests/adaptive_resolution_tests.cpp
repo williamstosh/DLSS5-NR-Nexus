@@ -65,5 +65,8 @@ int main() {
     for (uint32_t step = 55; step <= 68; ++step) tick(step, 60., 3000.);
     check(session.level == 0 && !session.trial, "successful quality recovery returns to the manual upper tier");
   }
+  if (passed) {
+    std::cout << "NR_RELEASE_PARITY native-application-frame-count controller fixed=trial-accepted-80-to-100 dynamic-no-denominator=collecting dynamic-ratio-shift=rollback gap-denominator=unavailable full-tags=recovered evidence=CPU\n";
+  }
   return passed ? 0 : 1;
 }

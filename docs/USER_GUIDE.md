@@ -312,13 +312,26 @@ F6 立即提示开关操作，随后状态更新为正在检查、正常运行�
 
 自适应分辨率面向原生 DX12 的单个处理阶段，包括兼容的 XeFG／原生 FG 同尺寸链。跨阶段链、FG 异尺寸和 DX11 Bridge 继续使用手动分辨率；Vulkan 使用全输出尺寸。缺少可靠帧率来源时暂停自动并保留合法尺寸。动态 FG 还需匹配的游戏帧计数；信息不足时暂停试探并等待采样，估算输出帧率仍可显示。更改设置或 GPU A/B 对比期间暂停自动。建议在游戏中比较转动视角时的细节和切档观感；使用限帧时，也可核对显示的帧率。
 
-**开发版（尚未随安装包发布）**按实际 SR 来源识别能力。DX11 游戏经第三方工具提供 D3D12 SR 输出时，也可沿 D3D12 路径使用自适应。帧率采样对应当前画面：普通路径标为「应用 Present 提交节奏估算」，FG 路径优先使用对应 SDK 的输出计数；无法确认归属时等待采样。有效计数和比较条件不变时，其他画面或无关 FG 请求不会打断调节。新档的完整结果成功送入本次画面后才开始暖机和观察收益；准备或失败期间保留最近确认的档位。修改已绑定遮罩的混合方式会保留兼容的已准备档位，并重新观察收益。Vulkan 开启自动选项时保留选择，并提示当前路径不支持自动尺寸。
+**开发版 v0.7.0-dev.1（尚未发布）**让符合条件的原生 DX11 Bridge 超分后输出直接使用同一个自适应开关；第三方工具提供的 D3D12 SR 输出仍沿 D3D12 路径工作。已经开启自动的旧配置会在取得可靠输出和可用档位后开始调节，关闭自动即可恢复保存的手动上限。Bridge 的渲染介入点和普通 DX11 Present 仍沿手动设置处理。实验功能可在普通构建中使用，无需诊断控制通道。
+
+帧率采样对应当前画面：普通路径标为「应用 Present 提交节奏估算」，FG 路径优先使用对应 SDK 的输出计数；无法确认归属时等待采样。有效计数和比较条件不变时，其他画面或无关 FG 请求不会打断调节。新档完整交付后才开始暖机和观察收益，准备或失败期间保留最近确认的档位。修改已绑定遮罩的混合方式会保留兼容的已准备档位，并重新观察收益。原生 FG 缺可靠游戏帧标签时，固定倍率估算或动态试档会暂停；同画面的 SDK 实测帧率仍可显示。Vulkan 保留自动选项的选择，并提示当前路径不支持自动尺寸。
 
 **档位数量与准备**：可选择「默认」或 2–15 档，数量包含手动上限。「默认」沿用原缓存容量：单颜色、单输出最多 4 档，双颜色通常 2 档，轮换输出会占用相应容量。显式选择档数时按所需颜色和输出准备完整集合，并检查实际显存余量。可用的不同尺寸取决于最低比例和取整：例如最低 67% 的完整范围最多 8 档，最低 33% 最多 15 档；选择更多也不会重复相同尺寸。更多档位带来更细的步距，同时增加首次准备时间和显存使用。
 
 首次准备分步进行，尚不能处理的帧保留游戏原画。开启、修改档数或尺寸范围后，复用兼容档位并准备缺少的尺寸，所选档位全部就绪后再自动调节；单次准备仍可能短暂卡顿。容量不足时保留选择并暂停，可减少档数后重新准备。调整目标 FPS、风格、混合强度或已有遮罩阈值会保留兼容分配。短时暂停不因闲置五秒而丢弃已接纳的档位；真实换源或资源合同变化仍可能需要重新准备。
 
 **预备方式**：「预备方式」可选择默认的「全档预备」或「按需备档（实验）」。全档预备用更多显存换取就绪后的顺畅切换；按需备档只保留当前、请求和回退所需的档位，降低同时驻留的开销，准备新的冷档仍可能卡顿。两种方式保留你选择的档数和最低比例。容量不足而暂停时，改变预备方式会重新检查预算；等待所需档位时继续使用合法的已就绪尺寸。
+
+开发版另提供**资源策略**，随画质设置、共享预设和方案槽保存。默认沿用原预备方式；三个实验选项只在适用时生效，界面显示实际策略和回退原因，保留所选档数和最低比例。
+
+| 资源策略 | 用途与取舍 |
+| --- | --- |
+| 沿用预备方式 | 使用已保存的全档预备或普通按需备档，旧配置默认选此项。 |
+| 保留兼容模型 | 重配备用档时尝试保留容量足够的健康模型，减少模型重建；仍需准备新工作面。 |
+| 上限容量复用 | 用手动上限容量创建备用模型，再按当前档位处理；可能减少重建，也可能占用更多显存。 |
+| 上限容量按需准备 | 需要冷档时才准备上限容量备用模型，减少未用备用分配，首次切换可能停顿。与普通按需备档分别保存。 |
+
+备用策略当前主要用于 Runtime 310.9.16.0 的 FP16 超分后单层模型 B；容量复用还要求单输出和可支持的完整档位集合。超出范围时按该组原预备方式工作。回到默认策略可恢复原资源管理方式。旧版读取新共享预设时忽略策略扩展；退回 v0.6.0 后，方案槽保留原有内容，仅新策略不生效。
 
 自动降档会累计比较连续细档的收益；收益仍不明确时恢复较高画质，并在冷却后重新采样。准备中的资源分配失败会停止新增档位，保留安全可用的画面并回收未使用的备用资源；重新开启须等这次失败遗留的资源可以安全释放后再准备。「关闭 NR 时保留资源」仍控制正常关闭时的行为。
 
@@ -458,11 +471,15 @@ F6 立即提示开关操作，随后状态更新为正在检查、正常运行�
 
 复用需要 NR Runtime 310.9.16.0、可写的当帧 HDR 颜色和匹配的深度、运动矢量及两轴 jitter 偏移。每轴偏移最大半个渲染像素，运动矢量须排除 jitter。多层使用时域滤波时，各层须使用当前介入点的完整分辨率。任一层使用更小的工作尺寸时，整组按原设置逐帧处理。仅空间 Look 的异尺寸组可在满足复用条件时使用 x2。单层 Upscaled 在较低工作尺寸且只需普通双线性缩放时也可复用，需要低格 Look 传输时则逐帧处理。跨介入点或实际绑定区域遮罩时继续逐帧处理，自适应分辨率准备与切档沿用原处理流程。
 
-**开发版（尚未随安装包发布）**也将符合上述条件的 DX11 SR 后输出接入同一复用规则：包括第三方提供的 D3D12 输出，以及原生 DX11 Bridge 的共享输出。原生 Bridge 完成 GPU 处理后才向游戏回拷；缺少 jitter 时按原设置逐帧处理，交付未完成时保留游戏原画，恢复后先刷新。此接线的真实 Runtime、游戏表现与动态画质仍待验证。
+**开发版 v0.7.0-dev.1（尚未发布）**也将符合上述条件的 DX11 SR 后输出接入同一复用规则：包括第三方提供的 D3D12 输出，以及原生 DX11 Bridge 的共享输出。原生 Bridge 完成 GPU 处理后才向游戏回拷；缺少 jitter 时按原设置逐帧处理，交付未完成时保留游戏原画，恢复后先刷新。
+
+同开**自适应分辨率**和 **x2** 即请求组合：兼容的上限工作集继续复用，真实换档后先刷新。原生 DX12 超分后的低档组合目前支持两档全预备、单层模型 B、关闭 Look、Detail Stability=1、不跟随输入，以及有可靠同输出 FG 关闭凭据的全幅 FP16 输入。缺少低档组合凭据时，自动调档仍可运行，合格上限保持 x2，低档改为逐帧处理；缺可靠成本时等待采样。原生 Bridge 的自适应低档按逐帧 NR 处理。
+
+原生 DLSS FG 的 **Pre-FG Present x2** 也使用同一开关：选择 Present 并启用既有 Pre-FG 处理后，具有可靠游戏帧身份及完整颜色输入的路径可刷新／复用，同帧后续 MFG 沿用已有结果。缺少严格复用输入时保留普通 Pre-FG 处理。《巫师 3》的早侧颜色交接及晚侧整组内容版本仍有阻塞，在这些场景继续走原退路；普通 Present 保留默认「每帧」。上述开发版能力的动态画质和主观流畅度留待人工验收。
 
 **普通 D3D12 Present x2**使用单层和固定全幅工作尺寸。FG 关闭时，在**处理与兼容性 → 介入点**选**呈现（Present）**，再在 **FG 高级设置 → FG 帧处理策略**选**游戏帧**（Game frames，`NRPresentFrames=1`）。游戏须把已确认的同帧 SR 图像整幅复制到当前 FP16 scRGB Backbuffer。无法确认同帧来源时保留原画，普通 HDR10/PQ 也保留原画。选择**每帧**（`NRPresentFrames=0`）可恢复按呈现帧处理。
 
-Render／Upscaled 使用 FP16 scRGB。符合上述条件的固定尺寸 Upscaled x2 可与原生 DLSS FG 同时运行，继续使用画质页的同一个开关。NR 在游戏 SR 输出上写回编辑，游戏随后按原流程交给 FG。原生 DLSS FG 的 Present 仍缺同帧来源和交接验证。XeFG 的 Present x2 使用单层和单 Backbuffer，可在既有条件下使用 FP16 scRGB 或 HDR10/PQ。可用默认快捷键 **F11** 打开监视器，查看 x2 请求、生效状态，以及逐帧处理或保留原画的原因。
+Render／Upscaled 使用 FP16 scRGB。符合上述条件的固定尺寸 Upscaled x2 可与原生 DLSS FG 同时运行，继续使用画质页的同一个开关。NR 在游戏 SR 输出上写回编辑，游戏随后按原流程交给 FG。XeFG 的 Present x2 使用单层和单 Backbuffer，可在既有条件下使用 FP16 scRGB 或 HDR10/PQ。可用默认快捷键 **F11** 打开监视器，查看 x2 请求、生效状态，以及逐帧处理或保留原画的原因。
 
 《巫师 3》已实机验证关闭 FG 的 4K 双层 Upscaled。使用 v0.6.0 普通构建候选也验证了原生 DLSS FG 开启时的 4K 单层 Upscaled 刷新与复用。同尺寸多层随 FG 声明变化的验证来自离线测试。开启 FG 的多层实机、异尺寸实机和多层 Render 仍待验。普通 scRGB Present 已用真实 GPU 和 NVIDIA Runtime 离线验证，游戏内表现仍待验收。XeFG 单 Backbuffer 的 HDR10/PQ 已在《巫师 3》静态场景确认隔帧调用。若在自己的场景看到拖影、明暗跳变或感到卡顿，可关闭 x2 比较逐帧效果。
 
@@ -887,13 +904,26 @@ Automatic sizing keeps a lower level when reducing NR resolution helps approach 
 
 Adaptive sizing supports one processing stage on native DX12, including compatible same-size XeFG / native FG chains. Cross-stage chains, FG chains with different sizes and DX11 Bridge retain manual resolution; Vulkan uses full output resolution. Automatic sizing pauses without a reliable output-rate source and keeps a legal size. Dynamic FG also needs matching game-frame counts; while those are unavailable, it pauses quality trials and collects samples, and estimated output FPS can still be shown. Editing settings and GPU A/B comparisons pause it. Compare detail and transitions while moving the camera, and check the displayed FPS when using frame caps.
 
-**Development builds (not yet included in a release package)** identify capabilities from the actual SR source. A DX11 game with a third-party D3D12 SR output can also use adaptive sizing through that D3D12 path. FPS samples belong to the current picture: the ordinary path reports an Application Present submission estimate, while FG paths prefer the matching SDK's output counts. Sampling waits when that relationship is unknown. Other outputs and unrelated FG requests leave adjustment running when valid counts and comparison conditions are unchanged. Warmup and benefit measurement begin after the complete new level reaches the current picture; preparation or failure retains the last confirmed level. Changing a bound mask's blend mode retains compatible prepared levels and starts fresh benefit measurements. Enabling automatic sizing on Vulkan preserves the choice and reports that it is unavailable on this path.
+**Development version v0.7.0-dev.1 (not yet released)** connects eligible native DX11 Bridge post-SR outputs to the same adaptive switch. Third-party D3D12 SR outputs continue through the D3D12 path. Existing configurations with automatic sizing enabled start adjusting once a reliable output and ready levels are available. Turning it off restores the saved manual upper limit. Bridge Render and ordinary DX11 Present retain manual sizing. Experimental features work in ordinary builds without a diagnostic control channel.
+
+FPS samples belong to the current picture: the ordinary path reports an Application Present submission estimate, while FG paths prefer the matching SDK's output counts. Sampling waits if ownership is unknown. Unrelated pictures or FG requests leave unchanged valid comparisons running. Warmup starts after complete delivery of the new level; preparation or failure keeps the last confirmed level. Changing a bound mask's blend mode retains compatible prepared levels and collects fresh benefit samples. Without reliable game-frame tags, native FG pauses fixed-multiplier estimates or dynamic trials; measured SDK output FPS for the same picture remains visible. Vulkan retains the automatic-size selection and reports that its current path does not support it.
 
 **Level count and preparation**: Choose Default or 2–15 levels, including the manual upper limit. Default retains the original cache capacity: up to four levels for one color and one output, usually two for two colors; rotating outputs consume corresponding capacity. An explicit count prepares the complete collection for the required colors and outputs, subject to available video memory. The number of distinct sizes depends on the minimum scale and rounding: a 67% minimum allows up to eight levels, while 33% allows up to fifteen. A higher selection never duplicates identical sizes. More levels give smaller steps and increase initial preparation time and video-memory use.
 
 Initial preparation proceeds in several steps; frames that NR cannot process yet keep the game's image. Enabling automatic sizing or changing the count or size range reuses compatible levels and prepares missing sizes before automatic adjustment begins. Individual preparation steps can still briefly stall. If capacity is insufficient, the selection is kept and adjustment pauses; reduce the count to prepare again. Target FPS, style, blend strength and existing mask thresholds retain compatible allocations. A temporary pause no longer discards admitted levels merely because they have been idle for five seconds. A genuinely replaced source or changed resource contract can still require preparation.
 
 **Preparation mode**: Preparation mode offers Prepare all levels (the default) and On-demand (experimental). Preparing all levels uses more VRAM for smooth switching once ready. On-demand retains the levels needed for current output, the requested target and recovery, reducing simultaneous residency; preparing a cold level can still cause a pause. Both modes retain your selected level count and minimum scale. Changing preparation mode retries the budget check after a capacity pause. While a target is being prepared, a legal ready size remains in use.
+
+Development builds also offer **Resource strategy**, saved with quality settings, shared presets and profile slots. The default follows your preparation mode. The other three experimental choices apply where supported; the UI shows the effective strategy and fallback reason while keeping your level count and minimum scale.
+
+| Resource strategy | Purpose and tradeoff |
+| --- | --- |
+| Follow preparation mode | Use the saved Prepare all levels or ordinary On-demand mode. This is the upgrade default. |
+| Retain compatible model | Try to keep a healthy model with enough capacity when retargeting a standby level, reducing model creation while still preparing new work surfaces. |
+| Upper-capacity reuse | Create standby models at the manual upper capacity and process the actual selected grid. This may reduce recreation and use more VRAM. |
+| Upper-capacity on-demand | Prepare an upper-capacity standby model only for a cold request, reducing unused allocations at the cost of a possible first-switch pause. Saved separately from ordinary On-demand. |
+
+Alternate strategies currently target Runtime 310.9.16.0, FP16 Upscaled and a single model B pass. Capacity reuse also requires one output and a supported complete level set. Other groups fall back to their saved preparation mode. Choosing the default restores ordinary resource management. Older versions ignore the new shared-preset extension; reverting to v0.6.0 keeps existing profile-slot contents and leaves the new strategy inactive.
 
 Downscaling compares the cumulative benefit of successive fine steps. If the benefit remains unclear, it restores higher quality and collects fresh samples after a cooldown. An allocation failure during preparation stops new levels, retains a safe available image and reclaims unused standby resources. Re-enabling waits until resources left by that failed preparation can be safely released before preparing again. The option to retain resources when NR is turned off still controls normal shutdown behavior.
 
@@ -1033,11 +1063,15 @@ Under the working-resolution controls in **Quality → Core quality**, enable **
 
 Reuse requires NR Runtime 310.9.16.0, writable HDR color for the current frame, matching depth and motion vectors, and both jitter offsets. Each offset may be up to half a render pixel. Motion vectors must exclude jitter. Multi-pass x2 with temporal filtering requires every pass to run at the hook point's full resolution. If any pass uses a smaller working resolution, the group runs every frame with its original settings. Eligible groups with mixed working resolutions and spatial-only Look can still reuse. Single-pass Upscaled can also reuse at a lower resolution with standard bilinear upsampling. It runs every frame when it needs lower-resolution Look transport. Mixed hook points and bound Region masks also run every frame. Adaptive resolution keeps its usual preparation and tier changes.
 
-**Development builds (not yet included in a release package)** also apply the same reuse rules to eligible DX11 post-SR outputs: both third-party D3D12 outputs and shared outputs from the native DX11 Bridge. The native Bridge copies back to the game after GPU processing completes. Missing jitter retains regular per-frame NR; incomplete delivery keeps the game image, with a refresh on recovery. Real Runtime behavior, in-game operation and dynamic quality of these connections still need validation.
+**Development version v0.7.0-dev.1 (not yet released)** also applies the same reuse rules to eligible DX11 post-SR outputs: third-party D3D12 outputs and shared native DX11 Bridge outputs. The native Bridge copies back after GPU processing completes. Missing jitter retains regular per-frame NR; incomplete delivery keeps the game image, with a refresh on recovery.
+
+Enable **Adaptive resolution** and **x2** together to request the combination. Compatible upper worksets keep reusing; a real level change refreshes first. The native D3D12 Upscaled lower-tier combination currently supports two fully prepared levels, one model B pass, Look off, Detail Stability=1, Follow Input off, and full-frame FP16 inputs with reliable FG-off evidence for the same output. Without lower-tier reuse evidence, automatic sizing continues: eligible upper levels keep x2 and lower levels run per frame. Missing reliable costs wait for samples. Native Bridge adaptive lower levels use per-frame NR.
+
+Native DLSS FG **Pre-FG Present x2** uses the same switch. Select Present and enable the existing Pre-FG processing option; paths with reliable game-frame identity and complete color inputs can refresh/reuse, while subsequent MFG consumption uses the same result. Missing strict reuse inputs retain ordinary Pre-FG processing. The Witcher 3 still has blocked early color handoff and late complete-content-version paths, which retain their existing fallback. Ordinary Present keeps its default Every present policy. Dynamic quality and subjective smoothness of these development features await manual acceptance.
 
 **Ordinary D3D12 Present x2** uses one NR pass at a fixed full-frame working resolution. With FG off, choose **Present** under **Processing & compatibility → Hook point** and **Game frames** (`NRPresentFrames=1`) under **FG advanced settings → FG frame processing policy**. The game must copy the complete SR image from the verified source for that frame to the current FP16 scRGB backbuffer. If the source cannot be verified, the game image is kept. Ordinary HDR10/PQ also keeps the game image. Select **Every frame** (`NRPresentFrames=0`) to restore processing on each present.
 
-Render and Upscaled use FP16 scRGB. Eligible fixed-resolution Upscaled x2 works with native DLSS Frame Generation and uses the same Quality switch. NR writes back to the game's SR output, and the game feeds FG through its usual path. Native DLSS FG Present still needs verification of frame identity and handoff. XeFG Present x2 uses one pass and a single backbuffer, with FP16 scRGB or HDR10/PQ under its existing conditions. Open the monitor with the default shortcut **F11** to see the x2 request, its effective state, and why NR is running every frame or keeping the original image.
+Render and Upscaled use FP16 scRGB. Eligible fixed-resolution Upscaled x2 works with native DLSS Frame Generation and uses the same Quality switch. NR writes back to the game's SR output, and the game feeds FG through its usual path. XeFG Present x2 uses one pass and a single backbuffer, with FP16 scRGB or HDR10/PQ under its existing conditions. Open the monitor with the default shortcut **F11** to see the x2 request, its effective state, and why NR is running every frame or keeping the original image.
 
 In The Witcher 3, two 4K Upscaled passes with FG off have been tested in game. The standard v0.6.0 candidate also verified 4K single-pass Upscaled refresh and reuse with native DLSS FG on. Offline tests cover same-resolution multi-pass behavior when only the FG declaration changes. Multi-pass with FG on, mixed working resolutions and multi-pass Render still need in-game testing. Ordinary scRGB Present has been tested offline on real hardware with the NVIDIA Runtime and still needs in-game validation. HDR10/PQ with a single XeFG backbuffer has been confirmed to reuse edits in a static Witcher 3 scene. If you notice ghosting, brightness jumps or stutter, turn off x2 to compare per-frame NR.
 

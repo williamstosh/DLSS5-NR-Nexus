@@ -2942,9 +2942,7 @@ inline bool YieldPresentToNativeFg() {
   return true;
 }
 
-#if defined(NR_NEXUS_DEV_CONTROL)
 #include "native_fg_tag_source.hpp"
-#endif
 #include "fg_native.hpp"
 
 // The stopped XeFG pool no longer rotates its owned lists. End replay
@@ -3544,8 +3542,11 @@ inline void STDMETHODCALLTYPE HookedMixedCopyResource(ID3D12GraphicsCommandList*
   }
   if (ui_alpha_only_copy_hooks.load(std::memory_order_relaxed)) return;
   GuardHook([&] { native_tag_source::ObservePremiseCopy(list, source, destination, true); });
-  GuardHook([&] { native_tag_source::ObserveCopy(list, source, destination, true); });
 #endif
+  if (callback) GuardHook([&] {
+    native_tag_source::ObserveCopy(list, source, destination, true);
+    fg_service::ObserveNativeInputCopy(destination);
+  });
   GuardHook([&] { ObserveMixedPresentCopy(list, source, destination); });
 }
 inline void STDMETHODCALLTYPE HookedMixedCopyRegion(ID3D12GraphicsCommandList* list,
@@ -3566,8 +3567,11 @@ inline void STDMETHODCALLTYPE HookedMixedCopyRegion(ID3D12GraphicsCommandList* l
   }
   if (ui_alpha_only_copy_hooks.load(std::memory_order_relaxed)) return;
   GuardHook([&] { native_tag_source::ObservePremiseCopy(list, source->pResource, destination->pResource, false); });
-  GuardHook([&] { native_tag_source::ObserveCopy(list, source->pResource, destination->pResource, full); });
 #endif
+  if (callback) GuardHook([&] {
+    native_tag_source::ObserveCopy(list, source->pResource, destination->pResource, full);
+    fg_service::ObserveNativeInputCopy(destination->pResource);
+  });
   GuardHook([&] { ObserveMixedPresentCopy(list, source->pResource, destination->pResource, full); });
 }
 inline bool InstallMixedPresentCopyHooks(ID3D12GraphicsCommandList* list, [[maybe_unused]] bool ui_alpha_only) {
@@ -5169,6 +5173,9 @@ inline void OnNativePresentObserved(IDXGISwapChain* swapchain, UINT flags,
     return;
   }
   try {
+    if (const auto* present = fg::native_options::internal::PresentDecisionScope::publishing) {
+      native_tag_source::ExpirePresent(*present);
+    }
     const void* const identity = renodx::utils::directx::NativeIdentity(swapchain);
     const auto input = native_sdk_present_input;
     native_sdk_present_input = {};

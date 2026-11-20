@@ -4,10 +4,14 @@
  */
 #pragma once
 
-#if defined(NR_NEXUS_DEV_CONTROL)
 // Composed inside dlss5::internal, after the Present retirement primitives.
 namespace native_tag_source {
 
+struct PremiseHooks {
+  bool legacy = false, list7_acquired = false, enhanced = false;
+};
+
+#if defined(NR_NEXUS_DEV_CONTROL)
 struct PremiseRecording {
   uint64_t list = 0, generation = 0;
   uint32_t receipts = 0;
@@ -60,9 +64,6 @@ struct PremiseEvent {
   D3D12_RESOURCE_BARRIER legacy{};
   D3D12_TEXTURE_BARRIER enhanced{};
   uintptr_t queue = 0;
-};
-struct PremiseHooks {
-  bool legacy = false, list7_acquired = false, enhanced = false;
 };
 struct PremiseSnapshot {
   uint64_t epoch = 0;
@@ -288,6 +289,35 @@ inline void AppendPremiseObservation(std::ostream& line) {
   line << " premise_evidence=recorded_api_order_only gpu_completion=unqueried enhanced_state_mapping=none"
        << " region_full_write=unknown";
 }
+#endif
+
+// The SDK's frame tag publishes one exact input group. The HUDLess producer
+// may substitute its observed clone; the other roles use the SDK's declared
+// lifetime and remain tied to the same frame-bound tag.
+struct FrameRoles {
+  ID3D12Resource* back_buffer = nullptr;
+  ID3D12Resource* depth = nullptr;
+  ID3D12Resource* motion = nullptr;
+  ID3D12Resource* ui = nullptr;
+  ID3D12Resource* alpha = nullptr;
+
+  std::array<const void*, 5> Identities() const {
+    return {renodx::utils::directx::NativeIdentity(back_buffer),
+        renodx::utils::directx::NativeIdentity(depth), renodx::utils::directx::NativeIdentity(motion),
+        renodx::utils::directx::NativeIdentity(ui), renodx::utils::directx::NativeIdentity(alpha)};
+  }
+};
+
+inline size_t FrameRole(sl::BufferType type) {
+  switch (type) {
+    case sl::kBufferTypeBackbuffer: return 0;
+    case sl::kBufferTypeDepth: return 1;
+    case sl::kBufferTypeMotionVectors: return 2;
+    case sl::kBufferTypeUIColorAndAlpha: return 3;
+    case sl::kBufferTypeUIAlpha: return 4;
+    default: return 5;
+  }
+}
 
 struct Version {
   uint32_t frame = 0;
@@ -297,6 +327,10 @@ struct Version {
   // Owned SDK clone, or original direct-tag resource; exact-use retirement.
   ID3D12Resource* clone = nullptr;
   const void* identity = nullptr;
+  const void* tagged_hudless = nullptr;
+  std::array<const void*, 5> frame_roles{};
+  output_framerate::OutputIdentity output;
+  uint64_t output_binding = 0;
   const void* producer = nullptr;
   ID3D12GraphicsCommandList* list = nullptr;  // Identity only; never dereferenced.
   std::pair<uint64_t, uint64_t> recording{};
@@ -308,9 +342,11 @@ struct Version {
   bool valid = true;
   bool direct = false;
   bool claimed = false;
+  bool expired = false;
   const char* reason = "tag_copy_unobserved";
 };
 
+#if defined(NR_NEXUS_DEV_CONTROL)
 struct Observation {
   uint64_t legacy_calls = 0;
   uint64_t for_frame_calls = 0;
@@ -372,6 +408,7 @@ struct Observation {
   const char* claim_reason = "claim_unobserved";
   const char* direct_block_reason = "none";
 };
+#endif
 
 struct State {
   // Protected by the existing runtime_mutex, including the prune callback.
@@ -381,10 +418,23 @@ struct State {
   uint64_t next_generation = 0;
   bool direct_capacity_blocked = false;
   const char* direct_unresolved_reason = nullptr;
+#if defined(NR_NEXUS_DEV_CONTROL)
   Observation observation;
+#endif
 };
 static State state;
+static std::atomic_bool tracking_versions{false};
 
+struct NativeBackbufferWrite {
+  static inline thread_local ID3D12Resource* destination = nullptr;
+  ID3D12Resource* previous;
+
+  explicit NativeBackbufferWrite(ID3D12Resource* backbuffer)
+      : previous(std::exchange(destination, backbuffer)) {}
+  ~NativeBackbufferWrite() { destination = previous; }
+};
+
+#if defined(NR_NEXUS_DEV_CONTROL)
 // Diagnostic callers hold runtime_mutex and enable the existing DEV experiment.
 // Native pointers are values only; this observation acquires no COM references.
 inline void ObserveTags(bool frame_bound, uint32_t frame, uint32_t viewport,
@@ -443,6 +493,7 @@ inline void NoteRemoval(const Version& version, const char* reason) {
   observation.removal_identity = reinterpret_cast<uintptr_t>(version.identity);
   observation.removal_reason = reason;
 }
+#endif
 
 struct Scope {
   static inline thread_local Scope* active = nullptr;
@@ -453,14 +504,17 @@ struct Scope {
   bool finished = false;
   bool has_hudless = false;
   bool direct_lifecycle = false;
+#if defined(NR_NEXUS_DEV_CONTROL)
   uint64_t premise_ticket = 0;
+#endif
 
   Scope(ID3D12GraphicsCommandList* list, uint32_t frame, uint32_t viewport,
-      const sl::ResourceTag* tags, uint32_t count, PremiseHooks premise_hooks = {}) {
+      const sl::ResourceTag* tags, uint32_t count, [[maybe_unused]] PremiseHooks premise_hooks = {}) {
     std::optional<RuntimeLock> lock;
     if (!HoldingRuntimeLock()) {
       lock.emplace(runtime_mutex);
     }
+#if defined(NR_NEXUS_DEV_CONTROL)
     auto& observation = state.observation;
     ++observation.scope_enters;
     observation.scope_sequence = ++observation.sequence;
@@ -472,6 +526,7 @@ struct Scope {
     observation.recording_generation = 0;
     observation.scope_epoch = 0;
     observation.scope_reason = "scope_entered";
+#endif
     direct_lifecycle = std::ranges::any_of(state.versions, &Version::direct);
     previous = active;
     active = this;
@@ -479,13 +534,17 @@ struct Scope {
     // Replacing this frame/role revokes its old tag, while another frame's
     // different clone remains valid for the delayed FG worker.
     std::erase_if(state.versions, [&](Version& version) {
-      if (version.frame != frame || version.viewport != viewport) return false;
+      if (version.viewport != viewport || (!version.expired && version.frame != frame)) return false;
+#if defined(NR_NEXUS_DEV_CONTROL)
       NoteRemoval(version, "same_frame_role_retagged");
+#endif
       RetirePresentResource(&version.clone);
       return true;
     });
     if (previous != nullptr) {
+#if defined(NR_NEXUS_DEV_CONTROL)
       observation.scope_reason = "nested_tag_call";
+#endif
       for (auto& version : state.versions) {
         if (version.epoch == previous->epoch) {
           version.valid = false;
@@ -495,44 +554,83 @@ struct Scope {
       return;
     }
     if (tags == nullptr) {
+#if defined(NR_NEXUS_DEV_CONTROL)
       observation.scope_reason = "tags_missing";
+#endif
       return;
     }
     const sl::ResourceTag* hudless = nullptr;
+    std::array<const void*, 5> frame_roles{};
+    uint32_t seen_roles = 0;
+    bool roles_valid = true;
     for (uint32_t index = 0; index < count; ++index) {
+      const size_t role = FrameRole(tags[index].type);
+      if (role < frame_roles.size()) {
+        const auto bit = 1u << role;
+        const auto& tag = tags[index];
+        if ((seen_roles & bit) != 0 || tag.lifecycle != sl::ResourceLifecycle::eValidUntilPresent
+            || tag.next != nullptr) {
+          roles_valid = false;
+        } else {
+          const auto surface = ToStreamlineResourceRef(tag);
+          if (surface.resource != nullptr) {
+            const auto desc = surface.resource->GetDesc();
+            if (surface.extent.left == 0 && surface.extent.top == 0
+                && surface.extent.width == desc.Width && surface.extent.height == desc.Height) {
+              frame_roles[role] = renodx::utils::directx::NativeIdentity(surface.resource);
+            }
+          }
+          roles_valid &= frame_roles[role] != nullptr;
+        }
+        seen_roles |= bit;
+      }
       if (tags[index].type != sl::kBufferTypeHUDLessColor) continue;
       if (hudless != nullptr) {
+#if defined(NR_NEXUS_DEV_CONTROL)
         observation.scope_reason = "hudless_tags_ambiguous";
+#endif
         return;
       }
       hudless = &tags[index];
       has_hudless = true;
+#if defined(NR_NEXUS_DEV_CONTROL)
       observation.lifecycle = static_cast<uint32_t>(hudless->lifecycle);
       observation.tag_native = (hudless->resource != nullptr
           ? reinterpret_cast<uintptr_t>(hudless->resource->native) : 0);
+#endif
     }
     if (hudless == nullptr
         || (hudless->lifecycle != sl::ResourceLifecycle::eOnlyValidNow
             && hudless->lifecycle != sl::ResourceLifecycle::eValidUntilEvaluate
             && hudless->lifecycle != sl::ResourceLifecycle::eValidUntilPresent)) {
+#if defined(NR_NEXUS_DEV_CONTROL)
       observation.scope_reason = (hudless == nullptr ? "hudless_tag_missing" : "tag_lifecycle_ineligible");
+#endif
       return;
     }
     const bool direct = hudless->lifecycle == sl::ResourceLifecycle::eValidUntilPresent;
     direct_lifecycle = direct_lifecycle || direct;
     if (!direct && list == nullptr) {
+#if defined(NR_NEXUS_DEV_CONTROL)
       observation.scope_reason = "native_list_missing";
+#endif
       return;
     }
     source = ToStreamlineResourceRef(*hudless);
     if (source.resource == nullptr) {
+#if defined(NR_NEXUS_DEV_CONTROL)
       observation.scope_reason = "source_resource_unavailable";
+#endif
       return;
     }
     source_identity = renodx::utils::directx::NativeIdentity(source.resource);
+#if defined(NR_NEXUS_DEV_CONTROL)
     observation.source_identity = reinterpret_cast<uintptr_t>(source_identity);
+#endif
     if (source_identity == nullptr) {
+#if defined(NR_NEXUS_DEV_CONTROL)
       observation.scope_reason = "source_identity_unavailable";
+#endif
       return;
     }
     const auto desc = source.resource->GetDesc();
@@ -540,9 +638,12 @@ struct Scope {
         || desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1
         || source.extent.left != 0 || source.extent.top != 0
         || source.extent.width != desc.Width || source.extent.height != desc.Height) {
+#if defined(NR_NEXUS_DEV_CONTROL)
       observation.scope_reason = "source_shape_or_extent_ineligible";
+#endif
       return;
     }
+#if defined(NR_NEXUS_DEV_CONTROL)
     if (NativePremiseEnabled()) {
       auto* native = source.resource;
       renodx::utils::directx::NativeFromReShadeProxy(&native);
@@ -551,13 +652,18 @@ struct Scope {
           .declared_state = source.state, .list_type = (list != nullptr ? static_cast<uint32_t>(list->GetType()) : UINT32_MAX),
           .hooks = premise_hooks, .tag = {.list = reinterpret_cast<uintptr_t>(list), .recording = ReadPremiseRecording(list)}});
     }
+#endif
     std::pair<uint64_t, uint64_t> recording{};
     if (!direct) {
       recording = submission::RecordingIdentity(list);
+#if defined(NR_NEXUS_DEV_CONTROL)
       observation.recording_list = recording.first;
       observation.recording_generation = recording.second;
+#endif
       if (recording.first == 0 || (recording.first >> 63) != 0 || recording.second == 0) {
+#if defined(NR_NEXUS_DEV_CONTROL)
         observation.scope_reason = "recording_identity_unavailable";
+#endif
         return;
       }
     }
@@ -565,7 +671,9 @@ struct Scope {
     // pair's direct ticket. Unclaimed tokens survive, including ambiguity.
     std::erase_if(state.versions, [&](Version& version) {
       if (!version.direct || !version.claimed || version.identity != source_identity) return false;
+#if defined(NR_NEXUS_DEV_CONTROL)
       NoteRemoval(version, "claimed_direct_resource_retagged");
+#endif
       RetirePresentResource(&version.clone);
       return true;
     });
@@ -576,7 +684,9 @@ struct Scope {
         if (direct) {
           state.direct_capacity_blocked = true;
         }
+#if defined(NR_NEXUS_DEV_CONTROL)
         observation.scope_reason = "viewport_capacity";
+#endif
         return;
       }
       state.viewports.emplace_back(viewport, ++state.next_generation);
@@ -590,7 +700,9 @@ struct Scope {
         });
         if (oldest == state.versions.end()) {
           state.direct_capacity_blocked = true;
+#if defined(NR_NEXUS_DEV_CONTROL)
           observation.scope_reason = "unclaimed_direct_capacity";
+#endif
           return;
         }
       } else if (oldest->direct && !oldest->claimed) {
@@ -598,7 +710,9 @@ struct Scope {
         // look unique. Clone admission retains its existing bounded policy.
         state.direct_capacity_blocked = true;
       }
+#if defined(NR_NEXUS_DEV_CONTROL)
       NoteRemoval(*oldest, "version_capacity_evicted");
+#endif
       RetirePresentResource(&oldest->clone);
       state.versions.erase(oldest);
     }
@@ -608,6 +722,8 @@ struct Scope {
         .viewport = viewport,
         .epoch = epoch,
         .generation = viewport_source->second,
+        .tagged_hudless = source_identity,
+        .frame_roles = (roles_valid ? frame_roles : decltype(frame_roles){}),
         .producer = (direct ? nullptr : reinterpret_cast<const void*>(0xFFFC'0000'0000'0000ull | epoch)),
         .list = list,
         .recording = recording,
@@ -619,35 +735,47 @@ struct Scope {
       state.versions.back().clone = source.resource;
       state.versions.back().identity = source_identity;
     }
+    tracking_versions.store(true, std::memory_order_release);
+#if defined(NR_NEXUS_DEV_CONTROL)
     observation.scope_epoch = epoch;
     observation.scope_reason = (direct ? "direct_tag_pending" : "copy_pending");
+#endif
   }
 
   void Finish(bool success) {
     if (finished) return;
+#if defined(NR_NEXUS_DEV_CONTROL)
     FinishPremiseTag(premise_ticket, success);
+#endif
     std::optional<RuntimeLock> lock;
     if (!HoldingRuntimeLock()) {
       lock.emplace(runtime_mutex);
     }
+#if defined(NR_NEXUS_DEV_CONTROL)
     auto& observation = state.observation;
     observation.finish_sequence = ++observation.sequence;
     observation.finish_success = success;
     observation.finish_reason = (epoch == 0 ? "scope_ineligible" : "version_missing_at_finish");
+#endif
     finished = true;
     bool published = false;
     for (auto version = state.versions.begin(); version != state.versions.end(); ++version) {
       if (version->epoch != epoch) continue;
       const bool content_observed = (version->direct ? version->copies == 0 : version->copies == 1);
       if (success && version->valid && content_observed && version->clone != nullptr) {
+        version->output = output_framerate::NativeViewportOutput(version->viewport);
+        version->output_binding = output_framerate::NativeBindingGeneration(version->output);
         version->published = true;
         published = true;
         version->reason = (version->direct ? "direct_tag_unclaimed" : "tag_copy_producer_unfinished");
+#if defined(NR_NEXUS_DEV_CONTROL)
         ++observation.publish_count;
         observation.publish_sequence = ++observation.sequence;
         observation.publish_epoch = version->epoch;
         observation.finish_reason = (version->direct ? "direct_published" : "published");
+#endif
       } else {
+#if defined(NR_NEXUS_DEV_CONTROL)
         if (!success) {
           observation.finish_reason = "sdk_call_failed";
         } else if (!version->valid) {
@@ -655,7 +783,10 @@ struct Scope {
         } else {
           observation.finish_reason = (version->copies == 0 ? "copy_unobserved" : "copy_not_unique_or_clone_missing");
         }
+#endif
+#if defined(NR_NEXUS_DEV_CONTROL)
         NoteRemoval(*version, "finish_failed");
+#endif
         RetirePresentResource(&version->clone);
         state.versions.erase(version);
       }
@@ -681,11 +812,12 @@ struct Scope {
 
 inline void ObserveCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* source,
     ID3D12Resource* destination, bool full) {
-  if (list == nullptr || destination == nullptr) return;
+  if (list == nullptr || destination == nullptr || !tracking_versions.load(std::memory_order_acquire)) return;
   std::optional<RuntimeLock> lock;
   if (!HoldingRuntimeLock()) {
     lock.emplace(runtime_mutex);
   }
+#if defined(NR_NEXUS_DEV_CONTROL)
   auto& observation = state.observation;
   ++observation.copy_calls;
   observation.copy_sequence = ++observation.sequence;
@@ -694,13 +826,25 @@ inline void ObserveCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* source,
   observation.copy_full = full;
   observation.copy_epoch = 0;
   observation.copy_reason = "destination_identity_unavailable";
+#endif
   const auto destination_identity = renodx::utils::directx::NativeIdentity(destination);
+#if defined(NR_NEXUS_DEV_CONTROL)
   observation.copy_destination_identity = reinterpret_cast<uintptr_t>(destination_identity);
+#endif
   if (destination_identity == nullptr) return;
   // An overwrite is a new content version even when it is not an eligible
   // SDK tag copy. Track that write before retiring our clone reference.
   std::erase_if(state.versions, [&](Version& version) {
-    if (version.identity != destination_identity) return false;
+    if (version.expired) return false;
+    if (version.identity != destination_identity) {
+      if (std::ranges::find(version.frame_roles, destination_identity) != version.frame_roles.end()
+          && (NativeBackbufferWrite::destination == nullptr
+              || renodx::utils::directx::NativeIdentity(NativeBackbufferWrite::destination) != destination_identity)) {
+        version.valid = false;
+        version.reason = "tagged_resource_group_overwritten";
+      }
+      return false;
+    }
     submission::TrackUse(list, version.clone);
     if (version.direct && !version.claimed) {
       // A recorded overwrite may execute after an older SDK consumer on a
@@ -710,28 +854,40 @@ inline void ObserveCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* source,
       version.reason = "direct_tag_unclaimed_overwrite";
       return false;
     }
+#if defined(NR_NEXUS_DEV_CONTROL)
     NoteRemoval(version, "clone_overwritten");
+#endif
     RetirePresentResource(&version.clone);
     return true;
   });
   auto* scope = Scope::active;
+#if defined(NR_NEXUS_DEV_CONTROL)
   observation.copy_reason = "outside_tag_scope";
+#endif
   if (scope == nullptr) return;
+#if defined(NR_NEXUS_DEV_CONTROL)
   ++observation.scoped_copies;
   observation.copy_reason = "scope_or_source_ineligible";
+#endif
   if (scope->epoch == 0 || source == nullptr) return;
+#if defined(NR_NEXUS_DEV_CONTROL)
   observation.copy_reason = "tag_source_identity_mismatch";
+#endif
   if (scope->source_identity != renodx::utils::directx::NativeIdentity(source)) return;
+#if defined(NR_NEXUS_DEV_CONTROL)
   ++observation.source_matches;
   observation.copy_epoch = scope->epoch;
   observation.copy_reason = "scope_version_missing_or_invalid";
+#endif
   const auto version = std::ranges::find(state.versions, scope->epoch, &Version::epoch);
   if (version == state.versions.end() || !version->valid) return;
   ++version->copies;
   if (version->direct) {
     version->valid = false;
     version->reason = "direct_tag_unexpected_source_copy";
+#if defined(NR_NEXUS_DEV_CONTROL)
     observation.copy_reason = version->reason;
+#endif
     return;
   }
   if (!full || version->copies != 1 || list != version->list
@@ -739,6 +895,7 @@ inline void ObserveCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* source,
       || destination_identity == scope->source_identity) {
     version->valid = false;
     version->reason = "tag_copy_ambiguous_or_partial";
+#if defined(NR_NEXUS_DEV_CONTROL)
     if (!full) {
       observation.copy_reason = "partial_copy";
     } else if (version->copies != 1) {
@@ -749,6 +906,7 @@ inline void ObserveCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* source,
       observation.copy_reason = (destination_identity == scope->source_identity
           ? "source_destination_alias" : "recording_mismatch");
     }
+#endif
     return;
   }
   const auto from = source->GetDesc();
@@ -758,7 +916,9 @@ inline void ObserveCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* source,
       || from.Width != to.Width || from.Height != to.Height || from.Format != to.Format) {
     version->valid = false;
     version->reason = "tag_copy_resource_shape";
+#if defined(NR_NEXUS_DEV_CONTROL)
     observation.copy_reason = "clone_shape_ineligible";
+#endif
     return;
   }
   destination->AddRef();
@@ -766,8 +926,56 @@ inline void ObserveCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* source,
   version->identity = destination_identity;
   submission::TrackUse(list, destination);
   submission::TrackUse(list, version->producer);
+#if defined(NR_NEXUS_DEV_CONTROL)
   observation.clone_identity = reinterpret_cast<uintptr_t>(destination_identity);
   observation.copy_reason = "clone_recorded";
+#endif
+}
+
+inline void ObserveSuccessfulRetag(std::optional<uint32_t> frame, uint32_t viewport, const sl::ResourceTag* tags,
+    uint32_t count, uint64_t new_epoch) {
+  if (tags == nullptr || !tracking_versions.load(std::memory_order_acquire)) return;
+  std::optional<RuntimeLock> lock;
+  if (!HoldingRuntimeLock()) {
+    lock.emplace(runtime_mutex);
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    const auto& tag = tags[i];
+    const bool hudless = tag.type == sl::kBufferTypeHUDLessColor;
+    const size_t role = FrameRole(tag.type);
+    if (!hudless && role >= 5) continue;
+    const auto resource = ToStreamlineResourceRef(tag);
+    const auto* identity = renodx::utils::directx::NativeIdentity(resource.resource);
+    for (auto& version : state.versions) {
+      if (version.epoch == new_epoch || version.viewport != viewport) continue;
+      const auto* old = (hudless ? version.identity : version.frame_roles[role]);
+      const bool same_input = identity != nullptr && (identity == old || (hudless && identity == version.tagged_hudless));
+      if ((!frame || version.frame != *frame) && !same_input && (identity != nullptr || old == nullptr)) continue;
+      version.valid = false;
+      version.reason = "tagged_resource_group_retagged";
+    }
+  }
+}
+
+inline void ExpirePresent(const fg::native_options::internal::PresentDecisionScope& present) {
+  if (!present.output_identity || !tracking_versions.load(std::memory_order_acquire)) return;
+  std::optional<RuntimeLock> lock;
+  if (!HoldingRuntimeLock()) {
+    lock.emplace(runtime_mutex);
+  }
+  for (auto& version : state.versions) {
+    if (version.output != present.output_identity || version.output_binding != present.binding_generation) continue;
+    if (present.application_back_buffer != 0
+        && reinterpret_cast<uintptr_t>(version.frame_roles[0]) != present.application_back_buffer) continue;
+    if (present.application_frame && version.frame != present.application_frame->index) continue;
+#if defined(NR_NEXUS_DEV_CONTROL)
+    NoteRemoval(version, "sdk_present_scope_ended");
+#endif
+    version.valid = false;
+    version.expired = true;
+    version.reason = "tagged_resource_group_expired";
+    RetirePresentResource(&version.clone);
+  }
 }
 
 // Called with runtime_mutex while the submission tracker holds its own lock.
@@ -789,40 +997,68 @@ inline void PreserveProof(const void* marker,
 
 // Caller holds runtime_mutex. No waits and no global-latest-frame fallback.
 inline fg::native_options::frame_source::Frame CurrentFrame(
-    ID3D12Resource* hudless, ID3D12GraphicsCommandList* list, uint64_t claimed_epoch = 0) {
+    ID3D12Resource* hudless, ID3D12GraphicsCommandList* list, uint64_t claimed_epoch = 0,
+    const FrameRoles* roles = nullptr) {
+#if defined(NR_NEXUS_DEV_CONTROL)
   auto& observation = state.observation;
   observation.query_sequence = ++observation.sequence;
   observation.query_identity = 0;
   observation.query_pending = 0;
   observation.query_direct = false;
+#endif
   fg::native_options::frame_source::Frame result{.reason = "tag_copy_source_unobserved"};
   if (hudless == nullptr || list == nullptr) return result;
   const auto identity = renodx::utils::directx::NativeIdentity(hudless);
+#if defined(NR_NEXUS_DEV_CONTROL)
   observation.query_identity = reinterpret_cast<uintptr_t>(identity);
+#endif
   if (identity == nullptr) return result;
   auto version = state.versions.end();
   size_t matching = 0;
   for (auto candidate = state.versions.begin(); candidate != state.versions.end(); ++candidate) {
     if (candidate->identity != identity) continue;
     ++matching;
+#if defined(NR_NEXUS_DEV_CONTROL)
     if (candidate->direct && !candidate->claimed) {
       ++observation.query_pending;
     }
+#endif
     if (claimed_epoch == 0 || claimed_epoch == candidate->epoch) {
       version = candidate;
     }
   }
   if (matching > 1) {
     result.reason = "tagged_resource_tokens_ambiguous";
+    result.conflicting = true;
     return result;
   }
   if (version == state.versions.end()) return result;
+#if defined(NR_NEXUS_DEV_CONTROL)
   observation.query_direct = version->direct;
+#endif
   result.frame = version->frame;
+  result.viewport = version->viewport;
   result.epoch = version->epoch;
   result.generation = version->generation;
   result.reason = version->reason;
+  result.conflicting = !version->valid;
   if (!version->valid || !version->published) return result;
+  if (roles != nullptr) {
+    if (roles->back_buffer == nullptr || roles->depth == nullptr || roles->motion == nullptr
+        || roles->Identities() != version->frame_roles) {
+      result.reason = "tagged_resource_group_mismatch";
+      result.conflicting = true;
+      return result;
+    }
+    if (!fg::native_options::ObservesPresentDecisions()
+        || !version->output || version->output_binding == 0
+        || output_framerate::NativeViewportOutput(version->viewport) != version->output
+        || output_framerate::NativeBindingGeneration(version->output) != version->output_binding) {
+      result.reason = "tagged_output_changed";
+      result.conflicting = true;
+      return result;
+    }
+  }
   if (version->direct) {
     if (state.direct_unresolved_reason != nullptr) {
       result.reason = state.direct_unresolved_reason;
@@ -890,44 +1126,56 @@ inline fg::native_options::frame_source::Frame CurrentFrame(
 // Caller holds runtime_mutex. Freeze only the exact ticket just inspected;
 // a second pending token on the same resource cannot be consumed by guessing.
 inline bool ClaimFrame(const fg::native_options::frame_source::Frame& frame,
-    ID3D12Resource* hudless, ID3D12GraphicsCommandList* list) {
+    ID3D12Resource* hudless, ID3D12GraphicsCommandList* list, const FrameRoles& roles) {
+#if defined(NR_NEXUS_DEV_CONTROL)
   auto& observation = state.observation;
   observation.claim_sequence = ++observation.sequence;
   observation.claim_epoch = frame.epoch;
   observation.claim_reason = "frame_ticket_invalid";
+#endif
   if (!frame.available || frame.epoch == 0) return false;
   const auto version = std::ranges::find(state.versions, frame.epoch, &Version::epoch);
   if (version == state.versions.end()) return false;
   const uint64_t preferred = (version->direct && !version->claimed ? 0 : frame.epoch);
-  const auto current = CurrentFrame(hudless, list, preferred);
+  const auto current = CurrentFrame(hudless, list, preferred, &roles);
   if (!current.available || current.epoch != frame.epoch || current.frame != frame.frame
       || current.generation != frame.generation) {
+#if defined(NR_NEXUS_DEV_CONTROL)
     observation.claim_reason = "frame_ticket_changed_or_ambiguous";
+#endif
     return false;
   }
   // This reference can retire only after the actual consuming recording is
   // discarded or all of its genuine submissions complete.
   submission::TrackUse(list, version->clone);
   version->claimed = true;
+#if defined(NR_NEXUS_DEV_CONTROL)
   ++observation.claim_count;
   observation.claim_reason = (version->direct ? "direct_claimed" : "clone_claimed");
+#endif
   return true;
 }
 
 // Caller holds runtime_mutex; an in-flight Scope can no longer publish after
 // its version is erased. Serial identities are never recycled by Reset.
 inline void Reset() {
+#if defined(NR_NEXUS_DEV_CONTROL)
   ResetPremise();
+#endif
+#if defined(NR_NEXUS_DEV_CONTROL)
   ++state.observation.reset_count;
+#endif
   for (auto& version : state.versions) {
+#if defined(NR_NEXUS_DEV_CONTROL)
     NoteRemoval(version, "reset");
+#endif
     RetirePresentResource(&version.clone);
   }
   state.versions.clear();
+  tracking_versions.store(false, std::memory_order_release);
   state.viewports.clear();
   state.direct_capacity_blocked = false;
   state.direct_unresolved_reason = nullptr;
 }
 
 }  // namespace native_tag_source
-#endif

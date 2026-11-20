@@ -75,6 +75,7 @@ struct NativeApplicationTag {
   uintptr_t back_buffer = 0;
   std::optional<uint32_t> index;
   int64_t observed_ns = 0;
+  bool conflicting = false;
 };
 
 struct NativeLegacySourceTag {
@@ -606,6 +607,7 @@ inline void BindNativeOutput(const OutputIdentity& identity, uint32_t viewport,
     if (found->second.index != application_tag.index) {
       // Framed resource tags can run ahead of Present. Two outstanding frame
       // tokens for one BB cannot identify the frame the SDK will consume.
+      found->second.conflicting |= found->second.index.has_value() && application_tag.index.has_value();
       found->second.index.reset();
     }
     found->second.observed_ns = application_tag.observed_ns;
@@ -776,7 +778,10 @@ inline bool HasNativeApplicationTags(const OutputIdentity& identity) {
 }
 
 inline std::optional<NativeApplicationFrame> TakeNativeApplicationFrame(const OutputIdentity& identity,
-    uint64_t binding_generation, uintptr_t back_buffer, int64_t now_ns) {
+    uint64_t binding_generation, uintptr_t back_buffer, int64_t now_ns, bool* conflicting = nullptr) {
+  if (conflicting != nullptr) {
+    *conflicting = false;
+  }
   std::unique_lock lock(internal::state.mutex);
   auto* output = internal::FindOutput(identity);
   if (output == nullptr || output->native.generation != binding_generation) return std::nullopt;
@@ -785,7 +790,11 @@ inline std::optional<NativeApplicationFrame> TakeNativeApplicationFrame(const Ou
   if (found == tags.end()) return std::nullopt;
   const auto tag = found->second;
   tags.erase(found);
-  if (!tag.index || !internal::Fresh(tag.observed_ns, now_ns)) return std::nullopt;
+  if (!internal::Fresh(tag.observed_ns, now_ns)) return std::nullopt;
+  if (conflicting != nullptr) {
+    *conflicting = tag.conflicting;
+  }
+  if (!tag.index) return std::nullopt;
   return NativeApplicationFrame{.generation = binding_generation, .index = *tag.index};
 }
 

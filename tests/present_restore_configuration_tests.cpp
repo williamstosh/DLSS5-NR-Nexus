@@ -316,7 +316,7 @@ int main(int argc, char** argv) {
     if (test_case == "nr-resolution-adaptive") {
       Check(!runtime::nr_adaptive_enabled.load() && runtime::nr_adaptive_target_fps.load() == 60.f
                 && runtime::nr_adaptive_min_scale.load() == .67f && runtime::nr_adaptive_selected_levels.load() == 0
-                && !runtime::nr_adaptive_limited_residency.load(),
+                && !runtime::nr_adaptive_limited_residency.load() && runtime::kSetAdaptiveResourceStrategy.Get() == 0.f,
             "adaptive resolution defaults to Off, 60 output FPS and 67 percent relative minimum");
       const auto original = runtime::profile_ui::Snapshot();
       runtime::kSetAdaptiveEnabled.Commit(1.f);
@@ -361,6 +361,41 @@ int main(int argc, char** argv) {
       auto invalid_mode = saved;
       invalid_mode["NRAdaptiveLimitedResidency"] = 2;
       Check(!runtime::profile_ui::ApplySnapshot(invalid_mode, &error), "preparation mode requires a boolean preset value");
+      namespace presets = renodx::addons::dlss5::presets;
+      const auto* strategy_key = runtime::kSetAdaptiveResourceStrategy.key;
+      for (const uint32_t strategy : {1u, 2u, 3u, 0u}) {
+        const presets::Document preset{.scope = presets::Scope::FULL, .settings = {{strategy_key, strategy}}};
+        Check(runtime::preset_ui::Apply(preset, true, false, &error), "Full preset applies explicit resource strategy");
+        runtime::LoadConfiguration();
+        Check(runtime::preset_ui::ReadSetting(strategy_key) == strategy
+                  && runtime::profile_ui::Snapshot().at(strategy_key) == strategy
+                  && runtime::nr_adaptive_limited_residency.load() && runtime::nr_adaptive_selected_levels.load() == 15,
+              "Strategy persists through INI reload, preserving preparation mode and the chosen level count");
+        const auto captured = runtime::preset_ui::Capture(presets::Scope::QUALITY, {{"name", "Resource strategy"}});
+        Check(captured.settings.at(strategy_key) == strategy, "Quality export includes the exact strategy, including zero");
+        if (strategy == 3) {
+          Check(presets::WriteFile(std::filesystem::absolute(base_directory / "resource-strategy.nrnexus.json"), captured, true, &error),
+              "Export current resource strategy for the v0.6.0 reader");
+        }
+      }
+      runtime::kSetAdaptiveResourceStrategy.Commit(2.f);
+      Check(runtime::profile_ui::ApplySnapshot({{"NRAdaptiveLimitedResidency", true}}, &error)
+                && runtime::kSetAdaptiveResourceStrategy.Get() == 2.f,
+            "A partial legacy preset preserves the current resource strategy");
+      for (const auto* value : {"-1", "4", "1.5", "2junk"}) {
+        Check(WritePrivateProfileStringA(runtime::kConfigSection, strategy_key, value, ini_path.c_str()), "Write an invalid strategy to the real INI fixture");
+        runtime::LoadConfiguration();
+        Check(runtime::kSetAdaptiveResourceStrategy.Get() == 0.f && runtime::nr_adaptive_limited_residency.load(),
+              "Invalid resource strategy falls back to the saved ordinary preparation mode");
+      }
+      for (const presets::Json invalid : {presets::Json(-1), presets::Json(4), presets::Json(1.5), presets::Json(true)}) {
+        const presets::Document preset{.scope = presets::Scope::FULL, .settings = {{strategy_key, invalid}}};
+        const auto preview = runtime::preset_ui::Preview(preset, true);
+        const auto row = std::ranges::find_if(preview, [&](const auto& item) { return item.key == strategy_key; });
+        Check(row != preview.end() && !row->apply && std::string_view(row->status) == "Invalid value"
+                  && !runtime::profile_ui::ApplySnapshot(preset.settings, &error),
+              "Preset preview and profile application reject invalid strategy values");
+      }
       runtime::ResetSettings({runtime::kPerformanceSettings});
       Check(!runtime::nr_adaptive_enabled.load() && runtime::nr_adaptive_target_fps.load() == 60.f
                 && runtime::nr_adaptive_min_scale.load() == .67f && runtime::nr_adaptive_selected_levels.load() == 0

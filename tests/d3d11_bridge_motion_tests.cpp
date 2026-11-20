@@ -74,6 +74,8 @@ int main() { return ProbeFormats(); }
 
 #ifndef MOTION_FORMAT_PROBE_ONLY
 #define DEBUG_LEVEL_0
+#define NR_NEXUS_TEST_NATIVE_SDK_CLOCK
+#pragma include_alias(<reshade_api.hpp>, <include/reshade_api.hpp>)
 #include <d3dcompiler.h>
 #include <DirectXPackedVector.h>
 #include <nlohmann/json.hpp>
@@ -377,6 +379,7 @@ std::vector<unsigned char> Read12(ID3D12Resource* texture, UINT pixel_bytes,
 }
 }
 #include "d3d11_present_stage_resolution_cases.hpp"
+#include "d3d11_bridge_adaptive_cases.hpp"
 int main(int argc, char** argv) {
   try {
 #if defined(NR_NEXUS_DEV_CONTROL)
@@ -454,7 +457,6 @@ int main(int argc, char** argv) {
           "production Bridge x2 uses WARP without other stage variants");
     }
     if (adaptive_case) {
-      Check(dev == 1, "Bridge Adaptive requires the NR_NEXUS_DEV_CONTROL build");
       Check(warp != adaptive_hardware && !stage_resolution && !present_stage_resolution && !dlaa_only && !sr_only,
           "Bridge Adaptive explicitly selects WARP or hardware, without other stage variants or fallback");
     }
@@ -1170,6 +1172,25 @@ int main(int argc, char** argv) {
       return 0;
     }
     if (adaptive_case) {
+      namespace host = bridge_adaptive_cases;
+      namespace rate = renodx::addons::dlss5::output_framerate;
+      const auto module = GetModuleHandleW(nullptr);
+      Check(DllMain(module, DLL_PROCESS_ATTACH, nullptr), "Bridge Adaptive attaches through the production registration");
+      const auto detach = [](HINSTANCE instance) { DllMain(instance, DLL_PROCESS_DETACH, nullptr); };
+      std::unique_ptr<std::remove_pointer_t<HINSTANCE>, decltype(detach)> attached(module, detach);
+      host::Swapchain application(factory.Get(), device.Get(), adaptive_output_width, adaptive_output_height);
+      host::Dispatch<reshade::addon_event::init_swapchain>(&application, false);
+      const auto host_owner = reinterpret_cast<uintptr_t>(&application);
+      {
+        std::shared_lock lock(xefg::internal::state.mutex);
+        const auto registration = xefg::internal::state.bridge_swapchains.find(host_owner);
+        Check(registration != xefg::internal::state.bridge_swapchains.end()
+                  && registration->second->device11.Get() == renodx::utils::directx::NativeIdentity(device.Get()),
+            "the registered D3D11 init callback creates the actual XeFG source registration in both builds");
+      }
+      auto unassociated_output = std::exchange(output, application.buffers[0]);
+      const auto direct_size = rate::MatchPresentOutput(host_owner, application.get_current_back_buffer().handle);
+      Check(direct_size && direct_size.view == 0, "the registered output sampler recognizes the game's direct backbuffer");
       native::d3d11_swapchain_seen.store(true);
       native::dx11_route.store(native::kDx11RouteNative);
       if (!adaptive_native_ngx) {
@@ -1184,18 +1205,16 @@ int main(int argc, char** argv) {
         native::ngx_loader_staging.core_ready = true;
         native::PublishNgxLoaderSymbols();
       }
-      native::OnNativeFgOptions(false);
+      native::enabled.store(true);
       native::adaptive_configuration_settings = native::comparison_ui::CaptureAdaptiveSettings;
       renodx::addons::dlss5::gpu_timers::comparison_settings = native::comparison_ui::CaptureSettings;
       native::hook_point.store(native::kHookUpscaled);
       native::preset.store(adaptive_hardware ? 2u : 1u);
-      native::nr_adaptive_enabled.store(true);
-      native::nr_adaptive_selected_levels.store(2);
-      native::nr_adaptive_min_scale.store(.5f);
-      Check(!native::bridge_adaptive_experiment.load() && !native::nr_adaptive_limited_residency.load()
+      Check(native::nr_adaptive_enabled.load() && native::nr_adaptive_selected_levels.load() == 2
+                && !native::nr_adaptive_limited_residency.load()
                 && !native::async_autoscale_preparation.load()
                 && native::adaptive_feature_mode.load() == native::AdaptiveFeatureMode::OFF,
-          "Bridge Adaptive and private PSO experiments start disabled; this case selects two full-prepared tiers only");
+          "the production INI reader selects adaptive and two full-prepared tiers");
       params::OwnedParameters mock_parameters;
       NVSDK_NGX_Parameter* sdk_sr_parameters = nullptr;
       auto* handle = reinterpret_cast<NVSDK_NGX_Handle*>(uintptr_t{0xD5AD});
@@ -1438,7 +1457,7 @@ int main(int argc, char** argv) {
             "mock SDK uses the production D3D11 Create hook to capture the source device identity");
       }
       const auto frame = [&](bool wait_gpu = true, const char* phase = "preparing",
-                             const NVSDK_NGX_Handle* source_handle = nullptr) {
+                             const NVSDK_NGX_Handle* source_handle = nullptr, bool sr_succeeds = true) {
         if (source_handle == nullptr) {
           source_handle = handle;
         }
@@ -1458,11 +1477,11 @@ int main(int argc, char** argv) {
         {
           result = native::Ngx11Evaluate(0, "adaptive Bridge", context.Get(), source_handle, &parameters, [&] {
             context->UpdateSubresource(output.Get(), 0, nullptr, output_pixels.data(), adaptive_output_width * 8, 0);
-            return NVSDK_NGX_Result_Success;
+            return (sr_succeeds ? NVSDK_NGX_Result_Success : NVSDK_NGX_Result_Fail);
           });
         }
         const auto source_ns = native::SteadyNowNs() - begin;
-        Check(NVSDK_NGX_SUCCEED(result), "Bridge Adaptive preserves the selected SR provider's successful result");
+        Check(NVSDK_NGX_SUCCEED(result) == sr_succeeds, "Bridge Adaptive preserves the selected SR provider's actual result");
 #if defined(NR_NEXUS_TEST_NATIVE_NGX)
         if (adaptive_native_snippet && bridge_snippet_init_calls != 0) {
           Check(NVSDK_NGX_SUCCEED(bridge_snippet_init_result), "production snippet Init_Ext returned failure; no alternate provider is tried");
@@ -1507,11 +1526,12 @@ int main(int argc, char** argv) {
             "Bridge Adaptive restores the game's source parameters");
       };
       if (!adaptive_hardware) {
+        output.Swap(unassociated_output);
+        parameters.Set(NVSDK_NGX_Parameter_Output, static_cast<ID3D11Resource*>(output.Get()));
         for (uint32_t source = 0; source < native::kContractDebounceFrames + 2; ++source) frame();
-        Check(native::features.at(handle).adaptive_cache == nullptr,
-            "the default-off Bridge experiment cannot enter the native Adaptive fallback");
+        Check(native::features.at(handle).adaptive_cache == nullptr && model_calls != 0,
+            "an unrelated same-device SR surface preserves manual NR without using the ordinary output");
       }
-      native::bridge_adaptive_experiment.store(true);
       const auto mature = [&] {
         for (uint32_t source = 0; source < native::kContractDebounceFrames + 32; ++source) {
           frame();
@@ -1541,11 +1561,146 @@ int main(int argc, char** argv) {
       if (adaptive_hardware) {
         mature();
       } else {
+        Check(native::bridge_copy_context.load() == native::bridge.context_native,
+            "the real immediate-context copy observer was installed");
+        const auto intermediate = [&] { return native::bridge_sets.at(handle)[0].present_source; };
+        Check(intermediate().resource_generation != 0 && !rate::FindSourceOutput(intermediate()),
+            "successful SR identifies its intermediate texture without inventing an output association");
+        ComPtr<ID3D11DeviceContext> deferred;
+        ComPtr<ID3D11CommandList> never_submitted;
+        Check(SUCCEEDED(device->CreateDeferredContext(0, &deferred)), "Bridge intermediate deferred-copy fixture");
+        deferred->CopyResource(application.buffers[0].Get(), output.Get());
+        Check(SUCCEEDED(deferred->FinishCommandList(FALSE, &never_submitted)) && !rate::FindSourceOutput(intermediate()),
+            "an unsubmitted deferred copy earns no association");
+        const auto wrong_surface = make_texture(adaptive_output_width, adaptive_output_height,
+            DXGI_FORMAT_R16G16B16A16_FLOAT, 0, output_pixels.data(), adaptive_output_width * 8);
+        context->CopyResource(application.buffers[0].Get(), wrong_surface.Get());
+        Check(!rate::FindSourceOutput(intermediate()),
+            "an actual immediate copy from a different same-size surface earns no SR association");
+        const D3D11_BOX clipped{.right = adaptive_output_width - 1, .bottom = adaptive_output_height, .back = 1};
+        context->CopySubresourceRegion(application.buffers[0].Get(), 0, 0, 0, 0, output.Get(), 0, &clipped);
+        Check(!rate::FindSourceOutput(intermediate()), "a partial copy earns no whole-output association");
+        context->CopyResource(application.buffers[0].Get(), output.Get());
+        Check(rate::FindSourceOutput(intermediate()) == direct_size,
+            "the actual immediate full copy binds the intermediate SR surface to the registered ordinary output");
+        mature();
+        context->CopySubresourceRegion(application.buffers[0].Get(), 0, 0, 0, 0, output.Get(), 0, nullptr);
+        Check(native::features.at(handle).adaptive_session->status.display_output_generation == direct_size.generation
+                  && Read11(application.buffers[0].Get(), 8) == Read11(output.Get(), 8),
+            "the intermediate Bridge result reaches the exact real Backbuffer and its adaptive output identity");
+        {
+          host::Swapchain secondary(factory.Get(), device.Get(), adaptive_output_width, adaptive_output_height);
+          host::Dispatch<reshade::addon_event::init_swapchain>(&secondary, false);
+          context->CopyResource(secondary.buffers[0].Get(), output.Get());
+          Check(!rate::FindSourceOutput(intermediate()), "copying the source to a second live output withdraws unique ownership");
+          frame();
+          Check(native::features.at(handle).adaptive_session->status.display_output_generation == 0,
+              "an ambiguous intermediate source retains manual NR while neither output supplies adaptive evidence");
+          host::Dispatch<reshade::addon_event::destroy_swapchain>(&secondary, true);
+        }
+        context->CopyResource(application.buffers[0].Get(), output.Get());
+        Check(rate::FindSourceOutput(intermediate()) == direct_size, "a fresh exact copy restores the single surviving output");
+        std::cout << "OBS Bridge Adaptive intermediate copy, deferred and wrong surface rejection, ambiguous output recovery\n";
+        output.Swap(unassociated_output);
+        parameters.Set(NVSDK_NGX_Parameter_Output, static_cast<ID3D11Resource*>(output.Get()));
+        mature();
+        Check(native::features.at(handle).adaptive_session->status.display_output_generation == direct_size.generation,
+            "ordinary Bridge prepares both tiers for the registered direct output without vendor Off");
+        const auto failed_submit = native::bridge_submits.load();
+        const auto failed_copy = native::bridge_waits11.load();
+        const auto failed_applied = native::features.at(handle).adaptive_session->applied_ns;
+        frame(false, "failed-sr", handle, false);
+        Check(native::bridge_submits.load() == failed_submit && native::bridge_waits11.load() == failed_copy
+                  && native::features.at(handle).adaptive_session->applied_ns == failed_applied,
+            "failed outer SR cannot submit Bridge work, copy a twin, or confirm an adaptive tier");
+        auto& ordinary = *native::features.at(handle).adaptive_session;
+        const auto ordinary_consumer = make_texture(adaptive_output_width, adaptive_output_height,
+            DXGI_FORMAT_R16G16B16A16_FLOAT, 0, nullptr, 0);
+        const auto read_consumer = [&] {
+          context->CopyResource(ordinary_consumer.Get(), output.Get());
+          return Read11(ordinary_consumer.Get(), 8);
+        };
+        const auto original = std::vector<uint8_t>(
+            reinterpret_cast<const uint8_t*>(output_pixels.data()),
+            reinterpret_cast<const uint8_t*>(output_pixels.data()) + output_pixels.size() * sizeof(unsigned short));
+        const auto ordinary_cadence = [&] {
+          host::Dispatch<reshade::addon_event::present>(&application.queue, &application,
+              nullptr, nullptr, 0u, nullptr);
+        };
+        const auto clock_start = std::chrono::steady_clock::now();
+        bool ordinary_lowered = false;
+        bool ordinary_restored = false;
+        for (uint32_t tick = 1; tick <= 400 && !ordinary_restored; ++tick) {
+          std::this_thread::sleep_until(clock_start + std::chrono::milliseconds(tick * 25));
+          ordinary_cadence();
+          frame();
+          if (!ordinary_lowered && ordinary.status.applied == ordinary.ladder.sizes[1]) {
+            Check(ordinary.trial && ordinary.status.output_fps > 0. && ordinary.status.output_fps < 95.
+                      && ordinary.status.display_output_generation == direct_size.generation
+                      && model_observations.back().width == ordinary.ladder.sizes[1][0].width
+                      && model_observations.back().reset == 1 && read_consumer() != original,
+                "registered ordinary Present and completed NR costs request, apply and deliver the lower tier");
+            ordinary_lowered = true;
+          } else if (ordinary_lowered && ordinary.status.applied == ordinary.ladder.sizes[0]) {
+            Check(!ordinary.trial && model_observations.back().width == ordinary.ladder.sizes[0][0].width
+                      && model_observations.back().reset == 1 && read_consumer() != original,
+                "the unchanged output cadence rejects the trial and delivers the original upper tier");
+            ordinary_restored = true;
+          }
+        }
+        Check(ordinary_lowered && ordinary_restored && rate::Read(direct_size, rate::NowNs()).source == rate::Source::PRESENT,
+            "Bridge uses the registered ordinary Present window and completes a two-tier round trip");
+
+        const auto while_private_queue_stalled = [&](auto revoke) {
+          ComPtr<ID3D12Fence> gate;
+          Check(SUCCEEDED(native::bridge.device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)))
+                    && SUCCEEDED(native::bridge.queue->Wait(gate.Get(), 1)),
+              "stage the fault after recording and before GPU-only done");
+          const auto expected = native::bridge_submitted_value.load() + 1;
+          bool saw_submission = false;
+          std::jthread worker([&] {
+            const auto deadline = GetTickCount64() + 350;
+            while (native::bridge_submitted_value.load(std::memory_order_acquire) < expected
+                   && GetTickCount64() < deadline) {
+              Sleep(1);
+            }
+            saw_submission = native::bridge_submitted_value.load(std::memory_order_acquire) == expected;
+            revoke();
+            gate->Signal(1);
+          });
+          frame(false, "late-revocation");
+          worker.join();
+          Check(saw_submission && native::bridge_submitted_value.load() == expected
+                    && native::bridge.fence_done12->GetCompletedValue() >= expected,
+              "late revocation case observes the intended submission and GPU-only done");
+        };
+        const auto first_copy = native::bridge_waits11.load();
+        const auto first_confirmation = ordinary.applied_ns;
+        ordinary.Request(1, native::SteadyNowNs());
+        while_private_queue_stalled([&] { ObserveOutputDestroy(&application, true); });
+        Check(native::bridge_waits11.load() == first_copy && ordinary.applied_ns == first_confirmation
+                  && ordinary.status.applied == ordinary.ladder.sizes[0]
+                  && model_observations.back().width == ordinary.ladder.sizes[1][0].width && read_consumer() == original,
+            "an already executed Bridge tier leaves the old confirmation and SR pixels when the output retires");
+        host::Dispatch<reshade::addon_event::destroy_swapchain>(&application, true);
+        host::Dispatch<reshade::addon_event::init_swapchain>(&application, true);
+        const auto recreated_output = rate::MatchPresentOutput(host_owner, application.get_current_back_buffer().handle);
+        Check(recreated_output && recreated_output.generation != direct_size.generation
+                  && !rate::IsCurrentOutput(direct_size),
+            "the actual swapchain lifecycle creates a new output identity at the same address");
+        ordinary.Request(0, native::SteadyNowNs());
+        frame();
+        Check(native::bridge_waits11.load() == first_copy + 1 && model_observations.back().reset == 1
+                  && read_consumer() != original,
+            "the first legal frame on the fresh ordinary output recovers ordered delivery with Reset");
+        std::cout << "OBS Bridge Adaptive ordinary roundtrip, failed SR, and output-generation revocation\n";
         namespace adaptive = renodx::addons::dlss5::adaptive_resolution;
         namespace receipt_adapter = xefg::internal;
         namespace framerate = renodx::addons::dlss5::output_framerate;
-        // Real WARP COM identities and production source observer, with only
-        // the XeFG SDK calls/proxy-hook installation boundary mocked.
+        // Keep the SR surface separate from both swapchains. Only the exact
+        // successful outer source and inner proxy call can associate it.
+        output.Swap(unassociated_output);
+        parameters.Set(NVSDK_NGX_Parameter_Output, static_cast<ID3D11Resource*>(output.Get()));
         ComPtr<IDXGISwapChain1> receipt_swapchain;
         const DXGI_SWAP_CHAIN_DESC1 description{.Width = 8, .Height = 8, .Format = DXGI_FORMAT_R8G8B8A8_UNORM,
             .SampleDesc = {1, 0}, .BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT, .BufferCount = 2,
@@ -1563,14 +1718,18 @@ int main(int argc, char** argv) {
                     && device12_observation.device12_interface_identity == device12_observation.returned_device_identity,
               "real D3D12 getter fallback verifies the returned interface without inventing a D3D11 identity");
         }
-        Check(SUCCEEDED(factory->CreateSwapChainForComposition(device.Get(), &description, nullptr, &receipt_swapchain)),
-            "WARP creates the D3D11 application/proxy swapchain used for identity observation");
+        ComPtr<ID3D11Device> proxy_device11;
+        Check(SUCCEEDED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0,
+                  D3D11_SDK_VERSION, &proxy_device11, nullptr, nullptr))
+                  && SUCCEEDED(factory->CreateSwapChainForComposition(proxy_device11.Get(), &description, nullptr, &receipt_swapchain)),
+            "XeFG uses a second real D3D11 device for the proxy identity");
         ComPtr<IDXGISwapChain3> receipt_swapchain3;
         Check(SUCCEEDED(receipt_swapchain.As(&receipt_swapchain3)), "WARP proxy supports the existing SDK boundary");
         struct ReceiptCleanup {
           std::array<void*, receipt_adapter::EXPORTS.size()> real = receipt_adapter::modules[0].real;
           bool complete = receipt_adapter::modules[0].complete;
           receipt_adapter::ProxySlot proxy = receipt_adapter::proxies[0];
+          std::array<void*, 2> source_real = receipt_adapter::source_present_slots[0].real;
           xefg::BridgeSourceObserver observer = receipt_adapter::bridge_source_observer.load();
           bool native_off = native::native_fg_public_off.load();
           void* handle = reinterpret_cast<void*>(uintptr_t{0xEFAD});
@@ -1586,6 +1745,7 @@ int main(int argc, char** argv) {
             receipt_adapter::modules[0].real = real;
             receipt_adapter::modules[0].complete = complete;
             receipt_adapter::proxies[0] = proxy;
+            receipt_adapter::source_present_slots[0].real = source_real;
             xefg::ConfigureBridgeSource(observer);
             native::native_fg_public_off.store(native_off);
             receipt_proxy = nullptr;
@@ -1601,9 +1761,18 @@ int main(int argc, char** argv) {
         receipt_adapter::modules[0].real[6] = reinterpret_cast<void*>(&FakeReceiptEnable);
         receipt_adapter::proxies[0].installed = receipt_adapter::proxies[0].complete = true;
         receipt_adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakePresent);
-        receipt_adapter::proxies[0].real[2] = (*reinterpret_cast<void***>(receipt_swapchain3.Get()))[13];
+        receipt_adapter::proxies[0].real[2] = reinterpret_cast<void*>(+[](IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT) -> HRESULT {
+          return S_OK;
+        });
         receipt_adapter::proxies[0].records[0].target = static_cast<uint8_t*>(
             (*reinterpret_cast<void***>(receipt_swapchain3.Get()))[8]);
+        receipt_adapter::source_present_slots[0].real[0] = reinterpret_cast<void*>(
+            +[](IDXGISwapChain*, UINT interval, UINT flags) -> HRESULT {
+              return receipt_adapter::ProxyHooks<0>::Present(static_cast<IDXGISwapChain*>(receipt_proxy), interval, flags);
+            });
+        const auto source_present = [&] {
+          return receipt_adapter::SourcePresentHooks<0>::Present(application.native.Get(), 0, 0);
+        };
         xefg::ConfigureBridgeSource(&native::ObserveBridgeSourceForXefg);
         native::native_fg_public_off.store(false);
         receipt_sdk_status = 0;
@@ -1615,7 +1784,7 @@ int main(int argc, char** argv) {
         Check(receipt_source.handle == reinterpret_cast<uintptr_t>(handle)
                   && receipt_source.generation == native::create_contracts.at(handle).source_generation,
             "the production observer uniquely matches the live D3D11 Create source rather than the private D3D12 device");
-        const xefg::abi::Init init{.application_swapchain = receipt_swapchain.Get()};
+        const xefg::abi::Init init{.application_swapchain = application.native.Get()};
         Check(Hooks::Init(receipt_cleanup.handle, native::bridge.queue, &init) == 0,
             "mock SDK Init uses the real application-swapchain callback identity capture");
         const auto receipt_context = receipt_adapter::state.contexts.at(receipt_cleanup.handle);
@@ -1650,13 +1819,18 @@ int main(int argc, char** argv) {
             "concurrent Enable cannot discard the successful public proxy registration or accept the stale experiment declaration");
         observed_proxy.Reset();
         Check(Hooks::GetSwapchain(receipt_cleanup.handle, IID_PPV_ARGS(&observed_proxy)) == 0
-                  && receipt_context->bridge_proxy_device11.Get() == receipt_context->bridge_application_device11.Get(),
-            "fresh GetSwapchain captures the matching proxy D3D11 identity within the SDK callback");
+                  && receipt_context->bridge_proxy_device11 != nullptr
+                  && receipt_context->bridge_proxy_device11.Get() != receipt_context->bridge_application_device11.Get(),
+            "fresh GetSwapchain captures the distinct proxy D3D11 identity within the SDK callback");
         frame();
-        Check(native::features.at(handle).adaptive_cache == nullptr && !xefg::QueryBridgeOff(receipt_source).available,
-            "default enabled=false and the stale in-flight Disable cannot activate Bridge Adaptive");
-        Check(Hooks::Enable(receipt_cleanup.handle, 0) == 0 && xefg::QueryBridgeOff(receipt_source).available,
-            "a fresh successful Disable binds the unique source before and after the actual mock SDK call");
+        Check(native::features.at(handle).adaptive_session->status.display_output_generation == 0
+                  && !xefg::QueryBridgeOff(receipt_source).available,
+            "default enabled=false and the stale in-flight Disable cannot authorize the SDK output");
+        Check(Hooks::Enable(receipt_cleanup.handle, 0) == 0 && !xefg::QueryBridgeOff(receipt_source).available,
+            "a successful Disable before the exact source-to-proxy Present cannot establish the other device's output");
+        Check(source_present() == S_OK && Hooks::Enable(receipt_cleanup.handle, 0) == 0
+                  && xefg::QueryBridgeOff(receipt_source).available && xefg::QueryBridgeOff(receipt_source).uses_source_link,
+            "the registered source maps the actual successful nested proxy and a subsequent Disable binds it");
         mature();
         Check(!native::native_fg_public_off.load() && native::features.at(handle).adaptive_session->prepared,
             "the real Bridge source reaches full two-tier readiness via XeFG receipt without fabricating native SetOptions Off");
@@ -1694,6 +1868,26 @@ int main(int argc, char** argv) {
         };
         Check(present() == S_OK, "the first off-state proxy Present opens the SDK window");
         const auto first_output = read_bridge_window();
+        const auto off_confirmation = native::features.at(handle).adaptive_session->applied_ns;
+        const auto off_copies = native::bridge_waits11.load();
+        native::features.at(handle).adaptive_session->Request(1, native::SteadyNowNs());
+        receipt_sdk_status = -1;
+        while_private_queue_stalled([&] { Hooks::Enable(receipt_cleanup.handle, 0); });
+        Check(!xefg::QueryBridgeOff(receipt_source).available && framerate::IsCurrentOutput(first_output)
+                  && native::bridge_waits11.load() == off_copies && read_consumer() == original
+                  && native::features.at(handle).adaptive_session->applied_ns == off_confirmation
+                  && model_observations.back().width == native::features.at(handle).adaptive_session->ladder.sizes[1][0].width,
+            "done without the still-required Disable receipt cannot copy the result or start tier warmup");
+        receipt_sdk_status = 0;
+        Check(Hooks::Enable(receipt_cleanup.handle, 0) == 0 && xefg::QueryBridgeOff(receipt_source).available,
+            "an actual new Disable can restore permission on the same output");
+        frame();
+        Check(native::bridge_waits11.load() == off_copies + 1
+                  && native::features.at(handle).adaptive_session->status.applied[0].width == model_observations.back().width
+                  && model_observations.back().reset == 1 && read_consumer() != original,
+            "the first matching successful delivery after Off recovery confirms its actual tier once");
+        native::features.at(handle).adaptive_session->Request(0, native::SteadyNowNs());
+        frame();
 
         NVSDK_NGX_Handle* other_source = nullptr;
         source_create_result = reinterpret_cast<NVSDK_NGX_Handle*>(uintptr_t{0xD5AE});
@@ -1703,10 +1897,10 @@ int main(int argc, char** argv) {
         sdk_slot.create = old_create;
         Check(NVSDK_NGX_SUCCEED(other_created) && native::create_contracts.contains(other_source),
             "a second live SR source on the same D3D11 device is registered by the real Create wrapper");
-        const auto submitted = native::bridge_submits.load();
         frame(true, "wrong source", other_source);
-        Check(native::bridge_submits.load() == submitted && framerate::Read(first_output, framerate::NowNs()).available,
-            "the wrong Bridge source cannot use the existing SDK window even on the same device");
+        Check(framerate::Read(first_output, framerate::NowNs()).available
+                  && native::features.at(other_source).adaptive_cache == nullptr,
+            "a second Bridge source cannot use the existing SDK window on the same device");
         const auto old_release = std::exchange(sdk_slot.release, reinterpret_cast<void*>(&MotionReleaseSource));
         const auto other_released = native::HookedReleaseFeature11Slot<0>(other_source);
         sdk_slot.release = old_release;
@@ -1716,14 +1910,15 @@ int main(int argc, char** argv) {
         Check(Hooks::Enable(receipt_cleanup.handle, 0) == -1 && !xefg::QueryBridgeOff(receipt_source).available,
             "a failed Disable withdraws the existing Off receipt");
         frame();
-        Check(native::bridge_submits.load() == submitted && framerate::Read(first_output, framerate::NowNs()).available,
-            "a still-fresh SDK window cannot authorize Bridge after a failed Disable");
+        Check(native::features.at(handle).adaptive_session->status.display_output_generation == 0
+                  && framerate::Read(first_output, framerate::NowNs()).available,
+            "a still-fresh SDK window cannot authorize adaptation after a failed Disable");
         receipt_sdk_status = 0;
 
         Check(receipt_adapter::ProxyHooks<0>::Resize(receipt_swapchain.Get(), 0, 9, 8, DXGI_FORMAT_UNKNOWN, 0) == S_OK
                   && !framerate::IsCurrentOutput(first_output),
             "resizing the same proxy retires its old SDK output generation");
-        Check(Hooks::Enable(receipt_cleanup.handle, 0) == 0 && present() == S_OK,
+        Check(source_present() == S_OK && Hooks::Enable(receipt_cleanup.handle, 0) == 0 && present() == S_OK,
             "the resized proxy has a fresh Off receipt and a first SDK sample");
         frame();
         check_unavailable_window(xefg::QueryBridgeOff(receipt_source).output_identity,
@@ -1756,6 +1951,31 @@ int main(int argc, char** argv) {
         check_unavailable_window(resized_output,
             "Bridge keeps the output identity and preparation while rejecting an SDK window reporting FG On");
         std::cout << "PASS Bridge Adaptive XeFG Off output ownership, resize and failure revocation dev=" << dev << '\n';
+        output.Swap(unassociated_output);
+        parameters.Set(NVSDK_NGX_Parameter_Output, static_cast<ID3D11Resource*>(output.Get()));
+      }
+      if (!adaptive_hardware) {
+        mature();
+        parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, 0.f);
+        parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, 0.f);
+        native::kSetEditReuse.Commit(1.f);
+        bool reused_with_copy = false;
+        for (uint32_t source = 0; source < 8 && !reused_with_copy; ++source) {
+          const auto before_eval = model_calls;
+          const auto before_reuse = native::edit_reuse_reuses.load();
+          const auto before_copy = native::bridge_waits11.load();
+          frame();
+          if (native::edit_reuse_reuses.load() != before_reuse) {
+            Check(model_calls == before_eval && native::bridge_waits11.load() == before_copy + 1
+                      && native::features.at(handle).adaptive_session->status.applied
+                          == native::features.at(handle).adaptive_session->ladder.sizes[0],
+                "a legal upper-tier x2 reuse makes zero model calls and delivers the complete Bridge result");
+            reused_with_copy = true;
+          }
+        }
+        Check(reused_with_copy, "adaptive qualification preserves legal fixed upper-tier x2 delivery");
+        native::kSetEditReuse.Commit(0.f);
+        mature();
       }
       auto& feature = native::features.at(handle);
 #if defined(NR_NEXUS_TEST_NATIVE_NGX)
@@ -1830,7 +2050,7 @@ int main(int argc, char** argv) {
         mature();
       }
       const auto retained_upper = feature.slots[0].handle;
-      native::nr_adaptive_enabled.store(false);
+      native::kSetAdaptiveEnabled.Commit(0.f);
       frame(true, "off");
       frame(true, "off");
       Check(feature.adaptive_cache == nullptr && feature.slots[0].handle == retained_upper
@@ -1868,7 +2088,40 @@ int main(int argc, char** argv) {
         }
 #endif
       } else {
-        native::nr_adaptive_enabled.store(true);
+        native::kSetAdaptiveLevelCount.Commit(0.f);
+        native::kSetStackPasses.Commit(2.f);
+        native::kSetAdaptiveEnabled.Commit(1.f);
+        for (uint32_t source = 0; source < native::kContractDebounceFrames + 48; ++source) {
+          frame();
+          if (feature.adaptive_session->prepared && feature.adaptive_session->ladder.count >= 2
+              && feature.adaptive_session->status.applied == feature.adaptive_session->ladder.sizes[0]) break;
+        }
+        auto& default_session = *feature.adaptive_session;
+        Check(default_session.settings.selected_levels == 0 && default_session.prepared
+                  && default_session.ladder.count >= 2 && default_session.ladder.sizes[1][1].width != 0,
+            "the default number of tiers prepares a complete two-Pass ordinary Bridge group");
+        const auto two_pass_copies = native::bridge_waits11.load();
+        const auto two_pass_calls = model_calls;
+        default_session.Request(1, native::SteadyNowNs());
+        frame();
+        Check(native::bridge_waits11.load() == two_pass_copies + 1 && model_calls == two_pass_calls + 2
+                  && default_session.status.applied == default_session.ladder.sizes[1]
+                  && model_observations[model_observations.size() - 2].width == default_session.ladder.sizes[1][0].width
+                  && model_observations.back().width == default_session.ladder.sizes[1][1].width,
+            "both elected Passes record their actual lower grids before one Bridge Output copy and confirmation");
+        const auto group_confirmation = default_session.applied_ns;
+        const auto group_copies = native::bridge_waits11.load();
+        const auto group_calls = model_calls;
+        default_session.Request(0, native::SteadyNowNs());
+        fail_model_call = group_calls + 2;
+        frame();
+        Check(model_calls == group_calls + 2 && native::bridge_waits11.load() == group_copies
+                  && default_session.applied_ns == group_confirmation,
+            "a failed tail Pass cannot publish the mature prefix as a complete adaptive group");
+        std::cout << "OBS Bridge Adaptive default-tier two-Pass delivery\n";
+
+        native::kSetAdaptiveLevelCount.Commit(2.f);
+        native::kSetStackPasses.Commit(1.f);
         mature();
         // Reuse the existing bounded watchdog case: out can advance before done.
         ComPtr<ID3D12Fence> stalled;
@@ -1877,12 +2130,17 @@ int main(int argc, char** argv) {
         Check(SUCCEEDED(native::bridge.queue->Wait(stalled.Get(), 1)), "Bridge Adaptive stalls its private queue");
         std::jthread release_stall([stalled] { Sleep(1600); stalled->Signal(1); });
         const auto signals = native::bridge_signals.load();
+        auto& session = *feature.adaptive_session;
+        session.Request(1, native::SteadyNowNs());
+        const auto applied_before_stall = session.applied_ns;
+        const auto copy_before_stall = native::bridge_waits11.load();
         frame(false);
         const auto pending = native::bridge_submitted_value.load();
-        const auto pending_model = model_observations.back().id;
         Check(native::bridge.fence_done12->GetCompletedValue() < pending
                   && native::bridge_pending_delivery_value == pending
-                  && native::bridge.fence_out12->GetCompletedValue() >= pending,
+                  && native::bridge.fence_out12->GetCompletedValue() >= pending
+                  && native::bridge_waits11.load() == copy_before_stall
+                  && session.applied_ns == applied_before_stall && session.status.applied == session.ladder.sizes[0],
             "watchdog out rescue is not Bridge delivery or GPU completion proof");
         const auto unmodified = Read11(output.Get(), 8);
         Check(std::memcmp(unmodified.data(), output_pixels.data(), unmodified.size()) == 0,
@@ -1891,6 +2149,25 @@ int main(int argc, char** argv) {
         frame(false);
         Check(model_calls == blocked_calls && native::bridge_signals.load() == signals + 1,
             "pending real done blocks repeated NR and shared twin writes");
+        release_stall.join();
+        WaitForGpu(native::bridge.fence_done12, pending);
+        Check(Read11(output.Get(), 8) == unmodified && session.applied_ns == applied_before_stall
+                  && native::bridge_waits11.load() == copy_before_stall,
+            "late done only ends resource isolation and cannot copy or confirm the timed-out frame");
+        frame();
+        const auto recovered_confirmation = session.applied_ns;
+        Check(native::bridge_waits11.load() == copy_before_stall + 1 && recovered_confirmation > applied_before_stall
+                  && session.status.applied == session.ladder.sizes[1] && model_observations.back().reset == 1,
+            "a new successful SR recovers the lower tier with Reset and starts warmup on its own handoff");
+        frame();
+        Check(session.applied_ns == recovered_confirmation, "later handoffs of the same tier do not restart warmup");
+
+        Check(SUCCEEDED(native::bridge.queue->Wait(stalled.Get(), 2)), "Bridge Adaptive stalls the source-release submission");
+        std::jthread release_retirement_stall([stalled] { Sleep(1600); stalled->Signal(2); });
+        frame(false);
+        const auto retiring = native::bridge_submitted_value.load();
+        const auto pending_model = model_observations.back().id;
+        Check(native::bridge.fence_done12->GetCompletedValue() < retiring, "source release happens before the GPU-only done");
         native::ngx11_slot_real[0].release = reinterpret_cast<void*>(MotionReleaseSource);
         Check(NVSDK_NGX_SUCCEED(native::HookedReleaseFeature11Slot<0>(handle)), "real Bridge source-release hook succeeds");
         native::DrainRetiredResources(true);
@@ -1898,15 +2175,14 @@ int main(int argc, char** argv) {
         Check(!native::bridge_retired.empty()
                   && std::find(model_released.begin(), model_released.end(), pending_model) == model_released.end(),
             "source release keeps in-flight private NR and shared twins until done and recording discard");
-        release_stall.join();
-        WaitForGpu(native::bridge.fence_done12, pending);
+        release_retirement_stall.join();
+        WaitForGpu(native::bridge.fence_done12, retiring);
         gpu_samples = renodx::addons::dlss5::gpu_timers::published_segments;
         const bool cleaned = cleanup();
         cleanup_guard.action = nullptr;
         Check(cleaned && std::find(model_released.begin(), model_released.end(), pending_model) != model_released.end(),
             "actual done plus owned-list Reset releases the retired model, worksets and shared twins");
       }
-      native::bridge_adaptive_experiment.store(false);
       native::ReleaseBridge();
       check_debug_messages();
       std::cout << "PASS Bridge Adaptive "
@@ -1916,6 +2192,9 @@ int main(int argc, char** argv) {
           << " two full-prepared tiers, ready roundtrip/Reset/zero creates, Off/source release/retirement"
           << (adaptive_hardware ? "; requested_model=B internal_model=unknown; " : ", standby failure/recovery/watchdog; ")
           << "gpu_segments=" << gpu_samples << " dev=" << dev << '\n';
+      if (!adaptive_hardware) {
+        std::cout << "PASS case=bridge-adaptive evidence=WARP+MOCK dev=" << dev << '\n';
+      }
       return 0;
     }
     if (stage_resolution) {

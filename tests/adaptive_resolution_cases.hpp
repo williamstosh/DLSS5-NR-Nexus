@@ -325,6 +325,95 @@ inline bool Run() {
                       : "an unchanged FPS cap rolls back once and changing pair phase cannot reopen its cooldown");
   }
 
+  for (const bool benefit : {true, false}) {
+    adaptive::Sizes transition_upper{}, transition_floor{};
+    transition_upper[0] = {.width = 3840, .height = 2160};
+    transition_floor[0] = {.width = 2880, .height = 1620};
+    const adaptive::Settings transition_settings{.enabled = true, .target_fps = 100.f, .minimum_scale = .75f,
+        .prepared_levels = 2, .selected_levels = 2};
+    adaptive::Output transition_output{.available = true, .source = 1, .generation = 1, .configuration = 1};
+    adaptive::Session controller;
+    controller.Prepare(transition_settings, transition_upper, transition_floor, 1, transition_output, start, true, false);
+    controller.UpdatePreparation(controller.preparation_epoch, 2, 2, adaptive::Reason::PREPARING, start);
+    controller.Applied(controller.status.generation, controller.status.requested, start);
+    controller.SetPairedSampling(true, 0, start);
+    uint64_t source = 0;
+    int64_t now = start;
+    const auto prepare = [&](double fps) {
+      transition_output.serial++;
+      transition_output.begin_ns = now - adaptive::WARMUP_NS;
+      transition_output.end_ns = now;
+      transition_output.fps = fps;
+      controller.Prepare(transition_settings, transition_upper, transition_floor, 1, transition_output, now, true, false);
+    };
+    for (uint32_t tick = 0; tick < 24 && !controller.trial; ++tick) {
+      now += adaptive::SAMPLE_INTERVAL_NS;
+      const auto first = ++source;
+      controller.ObserveGpu(paired_sample(controller, first, first, now, 3000.), now);
+      now += 8'333'333;
+      controller.ObserveGpu(paired_sample(controller, ++source, first, now, 1000.), now);
+      prepare(80.);
+    }
+    check(controller.trial && controller.level == 1 && controller.previous_level == 0
+              && controller.baseline_fps == 80. && controller.baseline_gpu_us == 2000.
+              && controller.status.applied == transition_upper,
+          "a complete delivered x2 baseline requests the per-frame lower tier without confirming its delivery");
+    const auto generation = controller.status.generation;
+    const auto old_sampling = controller.sampling_generation;
+    const auto late_source = ++source;
+    auto late_pair = paired_sample(controller, late_source, late_source - 1, now + 1, 1000.);
+    controller.SetPairedSampling(false, 0, now);
+    check(controller.trial && controller.level == 1 && controller.previous_level == 0
+              && controller.status.generation == generation && controller.baseline_gpu_us == 2000.
+              && controller.baseline_fps == 80. && controller.sampling_generation > old_sampling,
+          "paired-to-per-frame timing preserves the same trial and its frozen per-base-frame benefit anchor");
+    controller.ObserveGpu(late_pair, late_pair.completed_ns);
+    check(controller.gpu_count == 0 && controller.pending_pair.frame == 0,
+          "a pre-transition completion cannot enter the lower-tier timing window");
+    const auto before_delivery = controller.applied_ns;
+    now += 10'000'000;
+    controller.Applied(generation, transition_floor, now);
+    check(controller.applied_ns == now && controller.applied_ns > before_delivery
+              && controller.stable_after_ns == now + adaptive::WARMUP_NS && controller.trial,
+          "only the lower tier's first actual delivery starts its warmup after the timing transition");
+    {
+      auto missing_cost = controller;
+      auto new_output = transition_output;
+      const auto deadline = missing_cost.stable_after_ns + adaptive::SAMPLE_MAX_AGE_NS;
+      new_output.serial++;
+      new_output.begin_ns = missing_cost.stable_after_ns;
+      new_output.end_ns = deadline;
+      missing_cost.Prepare(transition_settings, transition_upper, transition_floor, 1, new_output,
+          deadline - 1, true, false);
+      check(missing_cost.trial && missing_cost.level == 1,
+          "missing lower-tier completion waits through the bounded cost collection interval");
+      missing_cost.Prepare(transition_settings, transition_upper, transition_floor, 1, new_output,
+          deadline, true, false);
+      const auto rollback_generation = missing_cost.status.generation;
+      check(!missing_cost.trial && missing_cost.level == 0 && missing_cost.status.applied == transition_floor
+                && missing_cost.status.requested == transition_upper,
+          "missing cost at expiry requests the accepted anchor while retaining the last real delivery");
+      missing_cost.Prepare(transition_settings, transition_upper, transition_floor, 1, new_output,
+          deadline + 1, true, false);
+      check(missing_cost.status.generation == rollback_generation && !missing_cost.trial,
+          "a persistent completion gap cannot repeatedly request the same rollback");
+    }
+    for (uint32_t tick = 0; tick < 24 && controller.trial; ++tick) {
+      now += adaptive::SAMPLE_INTERVAL_NS;
+      controller.ObserveGpu({.generation = controller.status.generation, .frame = ++source, .sequence = source,
+          .context = 1, .recorded_ns = now, .completed_ns = now, .total_us = 1500., .valid = true, .stable = true,
+          .sampling_generation = controller.sampling_generation}, now);
+      prepare(benefit ? 100. : 80.);
+    }
+    check(benefit ? controller.level == 1 && !controller.trial && !controller.blocked
+                  : controller.level == 0 && !controller.trial && controller.blocked,
+          benefit ? "fresh lower-tier per-frame cost and output accept the original cross-mode trial"
+                  : "fresh lower-tier cost without output benefit returns the original trial to its anchor once");
+  }
+  if (passed) {
+    std::cout << "NR_RELEASE_PARITY dx12-upscaled-adaptive-x2 controller paired_mean_us=2000 lower_us=1500 preserved_trial=1 accepted=1 rollback=1 bounded_missing_cost=1 evidence=CPU\n";
+  }
+
   adaptive::Session dual;
   dual.prepared = true;
   dual.status.generation = 1;

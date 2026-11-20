@@ -57,14 +57,24 @@ struct Size {
   bool operator==(const Size&) const = default;
 };
 using Sizes = std::array<Size, MAX_PASSES>;
+enum ResourceStrategy : uint32_t {
+  OFF,
+  RETAIN,
+  UPPER_CAPACITY,
+  UPPER_CAPACITY_ON_DEMAND,
+  UPPER_CAPACITY_ADJACENT,
+};
+enum class ResourceFallback { NONE, BINDING, LEVELS };
+
 struct Settings {
   bool enabled = false;
   float target_fps = 60.f, minimum_scale = 0.67f;
   uint32_t prepared_levels = 0;
   uint32_t selected_levels = 0;
-  // The default-off preparation experiments retain their original on-demand ladder.
+  // Alternate strategies use the existing retargetable preparation path.
   bool legacy_preparation = false;
   bool limited_residency = false;
+  ResourceStrategy resource_strategy = ResourceStrategy::OFF;
   bool operator==(const Settings&) const = default;
 };
 struct Output {
@@ -126,6 +136,11 @@ struct Status {
   uint64_t preparation_vram_delta_bytes = 0, peak_process_vram_bytes = 0;
   uint64_t display_output_generation = 0, display_source_generation = 0;
   uint32_t display_stage = 0;
+  ResourceStrategy requested_resource_strategy = ResourceStrategy::OFF;
+  ResourceStrategy effective_resource_strategy = ResourceStrategy::OFF;
+  ResourceFallback resource_fallback = ResourceFallback::NONE;
+  bool resource_strategy_observed = false;
+  bool resource_limited_residency = false;
 };
 struct GpuSample {
   uint64_t generation = 0, frame = 0, sequence = 0, context = 0;
@@ -223,13 +238,17 @@ struct Session {
   void SetPairedSampling(bool enabled, uint64_t sampling_identity = 0, int64_t now_ns = 0) {
     if (!enabled) sampling_identity = 0;
     if (paired_sampling == enabled && paired_identity == sampling_identity) return;
+    const bool context_changed = paired_sampling && enabled && paired_identity != sampling_identity;
     paired_sampling = enabled;
     paired_identity = sampling_identity;
-    if (trial && frozen_resume_level == MAX_LEVELS) {
+    if (context_changed && trial && frozen_resume_level == MAX_LEVELS) {
       Request(previous_level, now_ns);
       trial = false;
     }
-    InvalidateSampling(now_ns);
+    // Both modes measure a complete NR chain per base frame. A new mode
+    // needs fresh GPU samples, while the output window and frozen trial
+    // baseline remain comparable until their own owner or context changes.
+    InvalidateSampling(context_changed ? now_ns : 0);
   }
 
   uint64_t SelectMeasurementPair(uint64_t source_frame, bool first_due) {
@@ -530,7 +549,8 @@ struct Session {
     const auto next_minimum = selected.sizes[selected.count - 1];
     const bool resources_changed = resource_identity != allocation_identity;
     const bool retain_legacy = next.legacy_preparation && settings.legacy_preparation && !resources_changed
-        && status.upper == upper && settings.prepared_levels == next.prepared_levels;
+        && status.upper == upper && settings.prepared_levels == next.prepared_levels
+        && settings.selected_levels == next.selected_levels;
     if (retain_legacy) {
       selected = ladder;
     }
@@ -538,7 +558,7 @@ struct Session {
     const bool selection_edited = settings.selected_levels != next.selected_levels || settings.minimum_scale != next.minimum_scale;
     const bool toggled = settings.enabled != next.enabled;
     const bool preparation_mode_changed = settings.legacy_preparation != next.legacy_preparation
-        || settings.limited_residency != next.limited_residency;
+        || settings.limited_residency != next.limited_residency || settings.resource_strategy != next.resource_strategy;
     const bool changed = (!frozen && identity != source_identity)
         || settings != next || status.upper != upper || selection_changed;
     if (resources_changed) {
@@ -698,8 +718,15 @@ struct Session {
       return;
     }
     double gpu = 0., gpu_mad = 0.;
+    const bool gpu_available = GpuStatistics(now_ns, &gpu, &gpu_mad);
+    if (trial && !gpu_available && now_ns - stable_after_ns >= SAMPLE_MAX_AGE_NS) {
+      Request(previous_level, now_ns);
+      trial = false;
+      status.reason = Reason::COLLECTING;
+      return;
+    }
     if (output.begin_ns < stable_after_ns || output.end_ns > now_ns || now_ns - output.end_ns > SAMPLE_MAX_AGE_NS
-        || !GpuStatistics(now_ns, &gpu, &gpu_mad)) {
+        || !gpu_available) {
       status.reason = Reason::COLLECTING;
       return;
     }

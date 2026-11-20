@@ -24,9 +24,7 @@
 #include "fg_frame.hpp"
 #include "lastgasp.hpp"
 #include "output_framerate.hpp"
-#if defined(NR_NEXUS_DEV_CONTROL)
 #include "native_fg_frame.hpp"
-#endif
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
 #include <cstring>
 
@@ -49,6 +47,16 @@ static std::atomic_bool stopped{false};
 static std::atomic_bool decisions_ready{false};
 static thread_local uint32_t present_depth = 0;
 static thread_local std::optional<output_framerate::OutputIdentity> options_output;
+#if defined(NR_NEXUS_TEST_NATIVE_SDK_CLOCK)
+static thread_local int64_t test_now_ns = 0;
+#endif
+
+inline int64_t NowNs() {
+#if defined(NR_NEXUS_TEST_NATIVE_SDK_CLOCK)
+  if (test_now_ns != 0) return test_now_ns;
+#endif
+  return output_framerate::NowNs();
+}
 
 struct State {
   std::shared_mutex mutex;
@@ -76,6 +84,7 @@ enum FrameHook : uint32_t {
   PRESENT1_ATTACHED = 1u << 5,
 };
 static std::atomic_uint32_t frame_hooks{0};
+#endif
 
 struct ReflexMarkerHook {
   HMODULE module = nullptr;
@@ -86,77 +95,85 @@ struct ReflexMarkerHook {
 static ReflexMarkerHook reflex_marker;
 
 static sl::Result HookedReflexMarker(sl::PCLMarker marker, const sl::FrameToken& frame) {
-  if (!stopped.load(std::memory_order_acquire)) PinRuntimeCallback();
-  return frame_source::ObserveMarker(reflex_marker.real, marker, frame);
+  if (stopped.load(std::memory_order_acquire)) return reflex_marker.real(marker, frame);
+  PinRuntimeCallback();
+  return frame_source::ObserveMarker(reflex_marker.real, marker, frame, NowNs);
 }
-#endif
+
+static const detour_guard::Hook REFLEX_MARKER_HOOK[] = {{
+    .name = "slReflexSetMarker", .real = reinterpret_cast<void**>(&reflex_marker.real),
+    .detour = reinterpret_cast<void*>(&HookedReflexMarker), .record = &reflex_marker.record,
+}};
 
 struct PresentDecisionScope {
+  static inline thread_local const PresentDecisionScope* active = nullptr;
+  static inline thread_local const PresentDecisionScope* publishing = nullptr;
+
   IDXGISwapChain* swapchain;
   UINT flags;
   PresentObserved callback = nullptr;
   output_framerate::OutputIdentity output_identity;
+  uintptr_t native_swapchain = 0;
   uint64_t binding_generation = 0;
+  uintptr_t sdk_back_buffer = 0;
+  uintptr_t application_back_buffer = 0;
+  bool application_tags_conflicting = false;
   std::optional<output_framerate::NativeApplicationFrame> application_frame;
-#if defined(NR_NEXUS_DEV_CONTROL)
-  bool application_frame_from_reflex = false;
-  frame_source::SdkScope frame_scope;
-#endif
+  const PresentDecisionScope* previous = active;
+  std::optional<frame_source::SdkScope> frame_scope;
 
-  PresentDecisionScope(IDXGISwapChain* output, UINT present_flags) : swapchain(output), flags(present_flags)
-#if defined(NR_NEXUS_DEV_CONTROL)
-      , frame_scope((!stopped.load(std::memory_order_acquire) && (present_flags & DXGI_PRESENT_TEST) == 0
-                        ? reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(output)) : 0),
-            !stopped.load(std::memory_order_acquire) && (present_flags & DXGI_PRESENT_TEST) == 0)
-#endif
-  {
-    if (present_depth++ == 0 && !stopped.load(std::memory_order_acquire) && (flags & DXGI_PRESENT_TEST) == 0) {
-      output_identity = output_framerate::MatchNativeSwapchain(
-          reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(swapchain)));
+  PresentDecisionScope(IDXGISwapChain* output, UINT present_flags) : swapchain(output), flags(present_flags) {
+    const bool observing = !stopped.load(std::memory_order_acquire) && (flags & DXGI_PRESENT_TEST) == 0;
+    if (observing) {
+      native_swapchain = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(swapchain));
+    }
+    const bool outermost = present_depth++ == 0;
+    if (outermost && observing) {
+      output_identity = output_framerate::MatchNativeSwapchain(native_swapchain);
       binding_generation = output_framerate::BeginNativeOutputPresent(output_identity);
-      if (output_framerate::HasNativeApplicationTags(output_identity)) {
+    }
+    frame_scope.emplace(native_swapchain, observing && (!outermost || output_identity), NowNs());
+    if (outermost && observing) {
+      const bool has_tags = output_framerate::HasNativeApplicationTags(output_identity);
+      const bool has_marker = output_identity && frame_source::CurrentFrame(native_swapchain, NowNs()).available;
+      if (has_tags || has_marker) {
         Microsoft::WRL::ComPtr<IDXGISwapChain3> swapchain3;
         Microsoft::WRL::ComPtr<IUnknown> back_buffer;
         if (SUCCEEDED(swapchain->QueryInterface(IID_PPV_ARGS(&swapchain3)))
             && SUCCEEDED(swapchain3->GetBuffer(swapchain3->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&back_buffer)))) {
-          application_frame = output_framerate::TakeNativeApplicationFrame(output_identity, binding_generation,
-              reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(back_buffer.Get())),
-              output_framerate::NowNs());
+          sdk_back_buffer = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(back_buffer.Get()));
+          if (has_tags) {
+            application_back_buffer = sdk_back_buffer;
+            application_frame = output_framerate::TakeNativeApplicationFrame(output_identity, binding_generation,
+                application_back_buffer, NowNs(), &application_tags_conflicting);
+          }
         }
       }
-#if defined(NR_NEXUS_DEV_CONTROL)
-      if (!application_frame) {
-        const auto frame = frame_source::CurrentFrame(frame_scope.diagnostic_output);
-        if (frame.available) {
-          application_frame = output_framerate::NativeApplicationFrame{
-              .generation = binding_generation, .index = frame.frame};
-          application_frame_from_reflex = true;
-        }
-      }
-#endif
       callback = present_observed.load(std::memory_order_acquire);
       if (callback != nullptr) {
         callback(swapchain, flags, PresentPhase::SDK_BEGIN);
       }
     }
+    active = (!outermost && observing && previous != nullptr && previous->native_swapchain == native_swapchain
+        ? previous : this);
   }
   void Publish(HRESULT result, bool skip) const {
+    active = previous;
     if (output_identity && !stopped.load(std::memory_order_acquire)) {
-      auto verified_frame = application_frame;
-#if defined(NR_NEXUS_DEV_CONTROL)
-      if (application_frame_from_reflex && !frame_source::CurrentFrame(frame_scope.diagnostic_output).available) {
-        verified_frame.reset();
-      }
-#endif
-      output_framerate::ObserveNativePresent(output_identity, result == S_OK, output_framerate::NowNs(),
-          skip, binding_generation, verified_frame);
+      output_framerate::ObserveNativePresent(output_identity, result == S_OK, NowNs(),
+          skip, binding_generation, application_frame);
     }
     if (callback != nullptr) {
+      const auto* outer = std::exchange(publishing, this);
       callback(swapchain, flags, FAILED(result) ? PresentPhase::SDK_FAILED
           : (skip ? PresentPhase::SDK_HANDLED : PresentPhase::SDK_FORWARD));
+      publishing = outer;
     }
   }
-  ~PresentDecisionScope() { --present_depth; }
+  ~PresentDecisionScope() {
+    active = previous;
+    --present_depth;
+  }
 };
 
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
@@ -238,7 +255,7 @@ static sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGSt
   if (!stopped.load(std::memory_order_acquire)) {
     const bool valid = result == sl::Result::eOk && output.structVersion >= sl::kStructVersion1;
     output_framerate::ObserveNativeState(query, valid && output.status == sl::DLSSGStatus::eOk,
-        valid ? output.numFramesActuallyPresented : 0, output_framerate::NowNs());
+        valid ? output.numFramesActuallyPresented : 0, NowNs());
   }
   return result;
 }
@@ -259,6 +276,13 @@ static HRESULT HookedPresent1(IDXGISwapChain* swapchain, UINT interval, UINT fla
   scope.Publish(result, skip);
   return result;
 }
+
+static const detour_guard::Hook PRESENT_HOOKS[] = {
+    {"slHookPresent", reinterpret_cast<void**>(&state.present),
+        reinterpret_cast<void*>(&HookedPresent), &state.present_record},
+    {"slHookPresent1", reinterpret_cast<void**>(&state.present1),
+        reinterpret_cast<void*>(&HookedPresent1), &state.present1_record},
+};
 }  // namespace internal
 
 inline std::optional<output_framerate::OutputIdentity> ChangedOutput() noexcept {
@@ -274,6 +298,32 @@ inline void Configure(void (*callback)(bool enabled) noexcept,
 inline bool ObservesPresentDecisions() noexcept {
   return internal::decisions_ready.load(std::memory_order_acquire)
       && !internal::stopped.load(std::memory_order_acquire);
+}
+
+inline frame_source::Frame CurrentPresentFrame(const void* output, ID3D12Resource* back_buffer) {
+  const auto* present = internal::PresentDecisionScope::active;
+  if (present == nullptr || !present->output_identity || present->sdk_back_buffer == 0
+      || internal::stopped.load(std::memory_order_acquire)) {
+    return {.reason = "sdk_present_frame_unavailable"};
+  }
+  if (reinterpret_cast<uintptr_t>(output) != present->native_swapchain
+      || reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(back_buffer))
+          != present->sdk_back_buffer
+      || output_framerate::MatchPresentOutput(present->output_identity.swapchain,
+             present->sdk_back_buffer) != present->output_identity
+      || output_framerate::NativeBindingGeneration(present->output_identity) != present->binding_generation) {
+    return {.reason = "sdk_present_frame_changed"};
+  }
+  auto marker = frame_source::CurrentFrame(present->native_swapchain, internal::NowNs());
+  if (!marker.available) return marker;
+  if (present->application_tags_conflicting
+      || (present->application_frame && present->application_frame->index != marker.frame)) {
+    return {.reason = "sdk_present_start_conflicts_with_backbuffer_tag"};
+  }
+  // A game can reach the registered rotating backbuffer without a Streamline
+  // viewport tag. The live output generation then identifies this lifetime.
+  marker.generation = (present->binding_generation != 0 ? present->binding_generation : present->output_identity.generation);
+  return marker;
 }
 
 inline bool InSdkPresent() noexcept { return internal::present_depth != 0; }
@@ -342,7 +392,7 @@ inline void ObserveBackBufferTags(uint32_t viewport, const sl::ResourceTag* tags
     output_framerate::BindNativeOutput(output, viewport, frame && !source_ambiguous ? tagged_source : 0, frame,
         {.back_buffer = (back_buffer_ambiguous ? 0 : tagged_back_buffer),
          .index = (valid_until_present && !back_buffer_has_no_resource ? frame : std::nullopt),
-         .observed_ns = output_framerate::NowNs()}, resource_generation);
+         .observed_ns = internal::NowNs()}, resource_generation);
   }
   if (!frame) {
     std::optional<output_framerate::OutputIdentity> legacy_back_buffer;
@@ -355,7 +405,7 @@ inline void ObserveBackBufferTags(uint32_t viewport, const sl::ResourceTag* tags
 
 #if defined(NR_NEXUS_DEV_CONTROL)
 inline frame_source::Frame CurrentFrame(uintptr_t output_identity) {
-  return frame_source::CurrentFrame(output_identity);
+  return frame_source::CurrentFrame(output_identity, internal::NowNs());
 }
 
 inline uint32_t FrameHookFacts() {
@@ -371,9 +421,7 @@ inline void Stop() noexcept {
 #endif
   internal::stopped.store(true, std::memory_order_release);
   output_framerate::ReleaseNative();
-#if defined(NR_NEXUS_DEV_CONTROL)
   frame_source::Stop();
-#endif
   internal::options_changed.store(nullptr, std::memory_order_release);
   internal::present_observed.store(nullptr, std::memory_order_release);
   internal::decisions_ready.store(false, std::memory_order_release);
@@ -393,12 +441,10 @@ inline void Stop() noexcept {
           reinterpret_cast<void*>(&internal::HookedPresent1), internal::state.present1_record);
     }
   }
-#if defined(NR_NEXUS_DEV_CONTROL)
   if (internal::reflex_marker.installed) {
     detour_guard::Neutralize(reinterpret_cast<void* const*>(&internal::reflex_marker.real),
         reinterpret_cast<void*>(&internal::HookedReflexMarker), internal::reflex_marker.record);
   }
-#endif
 }
 
 // Call outside DllMain and without the host's runtime lock: discovery takes
@@ -407,13 +453,8 @@ inline void Poll() {
   if (internal::stopped.load(std::memory_order_acquire)
       || internal::options_changed.load(std::memory_order_acquire) == nullptr) return;
   std::unique_lock lock(internal::state.mutex, std::try_to_lock);
-#if defined(NR_NEXUS_DEV_CONTROL)
   if (!lock.owns_lock() || (internal::state.installed && internal::reflex_marker.installed)
       || internal::stopped.load(std::memory_order_acquire)) return;
-#else
-  if (!lock.owns_lock() || internal::state.installed
-      || internal::stopped.load(std::memory_order_acquire)) return;
-#endif
 
   HMODULE plugin = nullptr;
   if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"sl.dlss_g.dll", &plugin)) return;
@@ -439,7 +480,6 @@ inline void Poll() {
       --lastgasp::expected_fault_depth;
     }
   };
-#if defined(NR_NEXUS_DEV_CONTROL)
   if (!internal::reflex_marker.installed) {
     HMODULE reflex = nullptr;
     if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"sl.reflex.dll", &reflex)) {
@@ -452,13 +492,12 @@ inline void Poll() {
             && !internal::stopped.load(std::memory_order_acquire)) {
           internal::reflex_marker.module = reflex;
           internal::reflex_marker.real = reinterpret_cast<frame_source::SetMarker>(marker);
-          const detour_guard::Hook hooks[] = {{
-              .name = "slReflexSetMarker", .real = reinterpret_cast<void**>(&internal::reflex_marker.real),
-              .detour = reinterpret_cast<void*>(&internal::HookedReflexMarker), .record = &internal::reflex_marker.record}};
           size_t failed = 0;
-          internal::reflex_marker.installed = detour_guard::AttachAll(hooks, &failed) == 1;
+          internal::reflex_marker.installed = detour_guard::AttachAll(internal::REFLEX_MARKER_HOOK, &failed) == 1;
           if (internal::reflex_marker.installed) {
+#if defined(NR_NEXUS_DEV_CONTROL)
             internal::frame_hooks.fetch_or(internal::REFLEX_ATTACHED, std::memory_order_release);
+#endif
             frame_source::Activate();
             if (internal::stopped.load(std::memory_order_acquire)) {
               detour_guard::Neutralize(reinterpret_cast<void* const*>(&internal::reflex_marker.real),
@@ -470,7 +509,6 @@ inline void Poll() {
     }
   }
   if (internal::state.installed) return;
-#endif
   void* const target = resolve(gateway, "slDLSSGSetOptions");
   if (target == nullptr
       || reinterpret_cast<uintptr_t>(target) - reinterpret_cast<uintptr_t>(plugin) >= image_size) return;
@@ -521,13 +559,7 @@ inline void Poll() {
     detour_guard::AttachAll(state_hooks, &failed);
   }
   if (internal::state.installed && has_decisions) {
-    const detour_guard::Hook present_hooks[] = {
-        {"slHookPresent", reinterpret_cast<void**>(&internal::state.present),
-            reinterpret_cast<void*>(&internal::HookedPresent), &internal::state.present_record},
-        {"slHookPresent1", reinterpret_cast<void**>(&internal::state.present1),
-            reinterpret_cast<void*>(&internal::HookedPresent1), &internal::state.present1_record},
-    };
-    internal::decisions_ready.store(detour_guard::AttachAll(present_hooks, &failed) == 2,
+    internal::decisions_ready.store(detour_guard::AttachAll(internal::PRESENT_HOOKS, &failed) == 2,
                                     std::memory_order_release);
 #if defined(NR_NEXUS_DEV_CONTROL)
     if (internal::state.present != nullptr) {

@@ -101,7 +101,7 @@ inline int Run() {
     std::shared_ptr<adaptive::Session> independent;
     const auto freeze = [&] {
       return runtime::FreezeAdaptiveFrame(&independent, plan, plan.At(Stage::PRESENT), 16, 16, 16, 16,
-          0x501, true, 1, 1, false, 1, 0, false, nullptr, nullptr, main_output, main_source);
+          0x501, true, 1, 1, false, 1, 0, false, nullptr, main_output, main_source);
     };
     const auto explicit_off = freeze();
     Check(explicit_off.enabled && explicit_off.upper[0].width == 16 && explicit_off.upper[1].width == 8,
@@ -117,7 +117,7 @@ inline int Run() {
     const auto unassociated_output = rate::FindPresentOutput(device, unassociated_buffers[0]);
     std::shared_ptr<adaptive::Session> waiting;
     const auto waiting_frame = runtime::FreezeAdaptiveFrame(&waiting, plan, plan.At(Stage::PRESENT), 16, 16, 16, 16,
-        0x502, true, 1, 1, false, 1, 0, false, nullptr, nullptr, unassociated_output, main_source);
+        0x502, true, 1, 1, false, 1, 0, false, nullptr, unassociated_output, main_source);
     auto manual = target;
     manual.adaptive_output = unassociated_output;
     Check(!waiting_frame.enabled && runtime::PresentResolutionPairAllowed(manual),

@@ -667,6 +667,46 @@ const auto RunProfileRuntimeCases = [&](const std::filesystem::path& outputdir) 
   #include "profile_first_install_cases.hpp"
   #include "profile_reset_cases.hpp"
 
+  const auto* strategy_key = runtime::kSetAdaptiveResourceStrategy.key;
+  seed();
+  runtime::kSetAdaptiveResourceStrategy.Commit(0.f);
+  profile::Assign(3, profile::Snapshot(), true);
+  settle();
+  commit(runtime::kSetIntensity, .413f);
+  settle();
+  const auto default_strategy = disk();
+  Check(default_strategy.last_applied.at(strategy_key) == 0 && default_strategy.slots[3].snapshot.at(strategy_key) == 0,
+        "Default strategy stays explicit through production autosave");
+  std::cout << "RESOURCE_STRATEGY_V060_PATH default " << profile::game_id << '\n';
+
+  seed();
+  select(0);
+  commit(runtime::kSetAdaptiveResourceStrategy, 1.f);
+  settle();
+  profile::Assign(3, profile::Snapshot());
+  settle();
+  commit(runtime::kSetAdaptiveResourceStrategy, 2.f);
+  settle();
+  profile::Assign(4, profile::Snapshot());
+  settle();
+  commit(runtime::kSetAdaptiveResourceStrategy, 3.f);
+  settle();
+  profile::Assign(5, profile::Snapshot(), true);
+  settle();
+  const auto explicit_strategy = disk();
+  Check(explicit_strategy.last_applied.at(strategy_key) == 3 && explicit_strategy.slots[0].overrides.at(strategy_key) == 3
+            && explicit_strategy.slots[3].snapshot.at(strategy_key) == 1
+            && explicit_strategy.slots[4].snapshot.at(strategy_key) == 2
+            && explicit_strategy.slots[5].snapshot.at(strategy_key) == 3,
+        "All spare strategies round-trip through saved snapshots and official overrides");
+  const auto explicit_strategy_id = profile::game_id;
+  select(3);
+  Check(runtime::kSetAdaptiveResourceStrategy.Get() == 1.f, "Switching profiles restores the saved resource strategy");
+  profile::Request(profile::Action::UNDO);
+  settle();
+  Check(runtime::kSetAdaptiveResourceStrategy.Get() == 3.f, "Undo restores the previous resource strategy");
+  std::cout << "RESOURCE_STRATEGY_V060_PATH explicit " << explicit_strategy_id << '\n';
+
   // Finish all real writes before restoring fixture configuration/environment.
   profile::active = -1;
   profile::state.selected.clear();

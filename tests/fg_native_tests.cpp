@@ -1,5 +1,6 @@
 #define DEBUG_LEVEL_0
 #define NR_NEXUS_TEST_SUBMISSION_FAILURE
+#define NR_NEXUS_TEST_NATIVE_SDK_CLOCK
 #include <windows.h>
 #include <d3d12sdklayers.h>
 #include <algorithm>
@@ -206,6 +207,7 @@ int RunNativeGuideContractTest();
 int RunPresentGuideModelsTest(bool native_ngx = false, const char* project_id_path = nullptr);
 int RunNativePresentDecisionTest();
 int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_only = false);
+namespace adaptive_resource_strategy_cases { int Run(); }
 int RunOutputFramerateRegistrationCases();
 
 int RunNativeRequiredMenuTest() {
@@ -758,30 +760,18 @@ int RunNativeRequiredMenuTest() {
 #if defined(NR_NEXUS_DEV_CONTROL)
 #include "inline_restore_roi_cases.hpp"
 #include "native_fg_frame_cases.hpp"
-#include "nr_edit_reuse_native_cases.hpp"
 #endif
+#include "nr_edit_reuse_native_cases.hpp"
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
 #include "nr_xefg_present_probe_cases.hpp"
 #endif
 
 int main(int argc, char** argv) {
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-status") == 0) return adaptive_status_cases::Run();
-  if (argc == 2 && std::strcmp(argv[1], "--output-framerate-sdk") == 0) {
-    try {
-      reshade::internal::get_reshade_module_handle(GetModuleHandleW(nullptr));
-      output_framerate_sdk_cases::Run();
-      return 0;
-    } catch (const std::exception& error) {
-      std::cerr << "FAIL output-framerate-sdk: " << error.what() << '\n';
-      return 1;
-    } catch (...) {
-      return 1;
-    }
-  }
-  const auto run_edit_reuse_case = [argv](auto run) {
+  const auto run_edit_reuse_case = [argv](auto run, const char* evidence = "WARP+MOCK") {
     const int result = run();
     if (result == 0) {
-      std::cout << "PASS case=" << (argv[1] + 2) << " evidence=WARP+MOCK dev="
+      std::cout << "PASS case=" << (argv[1] + 2) << " evidence=" << evidence << " dev="
 #if defined(NR_NEXUS_DEV_CONTROL)
                 << "1\n";
 #else
@@ -790,6 +780,20 @@ int main(int argc, char** argv) {
     }
     return result;
   };
+  if (argc == 2 && std::strcmp(argv[1], "--output-framerate-sdk") == 0) {
+    return run_edit_reuse_case([] {
+      try {
+        reshade::internal::get_reshade_module_handle(GetModuleHandleW(nullptr));
+        output_framerate_sdk_cases::Run();
+        return 0;
+      } catch (const std::exception& error) {
+        std::cerr << "FAIL output-framerate-sdk: " << error.what() << '\n';
+        return 1;
+      } catch (...) {
+        return 1;
+      }
+    }, "MOCK");
+  }
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
   if (argc == 2 && std::strcmp(argv[1], "--xefg-present-probe") == 0) return nr_xefg_present_probe_cases::Run();
 #endif
@@ -799,11 +803,11 @@ int main(int argc, char** argv) {
 #endif
 #if defined(NR_NEXUS_DEV_CONTROL)
   if (argc == 2 && std::strcmp(argv[1], "--native-frame-source") == 0) return native_fg_frame_cases::Run();
+  if (argc == 2 && std::strcmp(argv[1], "--inline-restore-roi") == 0) return inline_restore_roi_cases::Run();
+#endif
   if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-native-contracts") == 0) {
     return run_edit_reuse_case(nr_edit_reuse_native_cases::Run);
   }
-  if (argc == 2 && std::strcmp(argv[1], "--inline-restore-roi") == 0) return inline_restore_roi_cases::Run();
-#endif
   if (argc == 2 && std::strcmp(argv[1], "--nr-edit-reuse-xefg-contracts") == 0) {
     return run_edit_reuse_case(nr_edit_reuse_xefg_cases::Run);
   }
@@ -822,6 +826,9 @@ int main(int argc, char** argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-inline") == 0) {
     return run_edit_reuse_case(adaptive_inline_cases::Run);
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--adaptive-resource-strategy") == 0) {
+    return run_edit_reuse_case(adaptive_resource_strategy_cases::Run);
   }
   if (argc == 2 && std::strcmp(argv[1], "--output-framerate-registration") == 0) {
     return run_edit_reuse_case(RunOutputFramerateRegistrationCases);
@@ -1099,6 +1106,11 @@ int main(int argc, char** argv) {
   }
   const bool trace_metadata_only = argc == 2 && std::strcmp(argv[1], "--trace-metadata") == 0;
   const bool hardware = argc == 2 && std::strcmp(argv[1], "--native-full-hardware") == 0;
+  const bool software = argc == 2 && std::strcmp(argv[1], "--native-full") == 0;
+  if (argc != 1 && !trace_metadata_only && !hardware && !software) {
+    std::cerr << "FAIL unavailable or unrecognized FG test case: " << argv[1] << '\n';
+    return 1;
+  }
   try {
     {
       const uint8_t bgra[] = {17, 32, 255, 128};
@@ -4210,6 +4222,7 @@ void ResizeNativeTestOutput(Gpu& gpu, IDXGISwapChain3* output, ID3D12Resource* o
 }
 
 #include "nr_edit_reuse_present_cases.hpp"
+#include "adaptive_resource_strategy_cases.hpp"
 #include "output_framerate_registration_cases.hpp"
 
 int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {

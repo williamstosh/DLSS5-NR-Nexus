@@ -864,6 +864,17 @@ inline void Tick() {
         pending_action = Action::NONE;
       } else if (worker.loading) {
         state = std::move(worker.result);
+        // A v0.6.0 manifest has no strategy extension. Its snapshots used the
+        // saved preparation mode, including any ordinary limited residency.
+        const auto restore_resource_strategy_default = [](Json* snapshot) {
+          if (!snapshot->empty() && !snapshot->contains(presets::ADAPTIVE_RESOURCE_STRATEGY_KEY)) {
+            (*snapshot)[presets::ADAPTIVE_RESOURCE_STRATEGY_KEY] = 0u;
+          }
+        };
+        restore_resource_strategy_default(&state.last_applied);
+        for (auto& slot : state.slots) {
+          restore_resource_strategy_default(&slot.snapshot);
+        }
         game_id = std::move(worker.id);
         storage_path = std::move(worker.path);
         const auto& display_name = state.slots[edit_index].name;

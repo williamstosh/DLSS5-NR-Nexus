@@ -15,7 +15,14 @@ namespace adaptive = renodx::addons::dlss5::adaptive_resolution;
 namespace rate = renodx::addons::dlss5::output_framerate;
 namespace native_adapter = fg::native_options::internal;
 
+struct ReflexFrameToken final : sl::FrameToken {
+  uint32_t index = 0;
+  operator uint32_t() const override { return index; }
+};
+
 inline void Run() {
+  auto& now_ns = native_adapter::test_now_ns;
+  now_ns = 10'000'000'000;
   constexpr uintptr_t owner = 0xAF001;
   ComPtr<ReceiptDeviceIdentity> buffer_face, source_face, device;
   buffer_face.Attach(new ReceiptDeviceIdentity());
@@ -72,7 +79,7 @@ inline void Run() {
   fg::native_options::ObserveBackBufferTags(7, volatile_tags, 2, std::nullopt, resource_generation);
   Check(!rate::CaptureNativeLegacySourceTag(7), "a volatile legacy SR tag supplies no later Evaluate proof");
   fg::native_options::ObserveBackBufferTags(7, tags, 2, std::nullopt, resource_generation);
-  rate::ObservePresent(output, rate::NowNs());
+  rate::ObservePresent(output, now_ns);
   const auto persistent_legacy_tag = rate::CaptureNativeLegacySourceTag(7);
   Check(persistent_legacy_tag && rate::BindNativeLegacySourceOutput(legacy_source, *persistent_legacy_tag),
         "legacy tag evidence survives Present and can prove the next Evaluate");
@@ -93,22 +100,38 @@ inline void Run() {
   options.mode = sl::DLSSGMode::eOn;
   const sl::ViewportHandle viewport(7);
   native_adapter::HookedSetOptions(viewport, options);
-  const auto warm = [](auto operation, std::chrono::milliseconds step) {
+  const auto warm = [&](auto operation, std::chrono::milliseconds step) {
     const auto begin = std::chrono::steady_clock::now();
     for (auto index = 0; index <= 2400 / step.count(); ++index) {
-      std::this_thread::sleep_until(begin + index * step);
+      if (now_ns != 0) {
+        now_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(step).count();
+      } else {
+        std::this_thread::sleep_until(begin + index * step);
+      }
       operation();
     }
   };
+  const auto sdk_marker = reinterpret_cast<fg::native_options::frame_source::SetMarker>(
+      native_adapter::REFLEX_MARKER_HOOK[0].detour);
+  const auto observe_marker = [&](uint32_t index) {
+    ReflexFrameToken token;
+    token.index = index;
+    Check(sdk_marker(sl::PCLMarker::ePresentStart, token) == sl::Result::eOk,
+          "the registered Reflex entry forwards a successful PresentStart");
+  };
+  native_adapter::reflex_marker.real = +[](sl::PCLMarker, const sl::FrameToken&) { return sl::Result::eOk; };
+  uint32_t marker_index = 1'000'000;
   warm([&] {
     bool skip = true;
-    rate::ObserveNativeEvaluation(output, 2, true, rate::NowNs());
+    rate::ObserveNativeEvaluation(output, 2, true, now_ns);
+    observe_marker(++marker_index);
     Check(native_adapter::HookedPresent(proxy.Get(), 0, 0, skip) == S_OK && !skip,
           "outer Native SDK forwarding still returns the original routing decision");
   }, std::chrono::milliseconds(24));
-  auto sample = rate::Read(output, rate::NowNs());
+  auto sample = rate::Read(output, now_ns);
   Check(!sample.available,
-        "successful outer Native SDK wrapper calls without Present frame proof cannot supply the fixed estimate");
+        "successful outer Native SDK wrapper calls with only Reflex diagnostics cannot supply the fixed estimate");
+  std::cout << "NR_RELEASE_PARITY native-application-frame-count marker-only fixed-fps=unavailable\n";
 
   proxy->current_back_buffer = buffer_face.Get();
   uint32_t application_frame = 30;
@@ -116,30 +139,44 @@ inline void Run() {
     // Tag only the current Backbuffer. The earlier paired SR tag is a
     // separate proof and must not be needed for application-frame counts.
     fg::native_options::ObserveBackBufferTags(7, tags, 1, frame);
+    observe_marker(++marker_index);
     bool skip = true;
     Check(native_adapter::HookedPresent(proxy.Get(), 0, 0, skip) == S_OK && !skip,
           "Native SDK forwards the tagged current backbuffer through its outer Present wrapper");
   };
   warm([&] {
-    rate::ObserveNativeEvaluation(output, 2, true, rate::NowNs());
+    rate::ObserveNativeEvaluation(output, 2, true, now_ns);
     send_tagged_present(++application_frame);
     send_tagged_present(application_frame);
-  }, std::chrono::milliseconds(24));
-  sample = rate::Read(output, rate::NowNs());
-  Check(sample.available && sample.source == rate::Source::NATIVE_FIXED && std::abs(sample.fps - 83.33) < 5.,
-        "public Backbuffer FrameTokens produce a deduplicated fixed estimate through the actual SDK wrapper");
+  }, std::chrono::milliseconds(25));
+  sample = rate::Read(output, now_ns);
+  Check(sample.available && sample.source == rate::Source::NATIVE_FIXED && std::abs(sample.fps - 80.) < 0.001,
+        "Backbuffer FrameTokens produce a deduplicated fixed estimate despite a conflicting diagnostic token");
+  fg::native_options::ObserveBackBufferTags(7, tags, 1, ++application_frame);
+  send_tagged_present(++application_frame);
+  Check(!rate::Read(output, now_ns).available,
+        "multiple FrameTokens for the current backbuffer cut coverage without a marker substitute");
+  warm([&] {
+    rate::ObserveNativeEvaluation(output, 2, true, now_ns);
+    send_tagged_present(++application_frame);
+  }, std::chrono::milliseconds(25));
+  Check(rate::Read(output, now_ns).source == rate::Source::NATIVE_FIXED
+            && rate::Read(output, now_ns).available, "unique tags reestablish coverage after ambiguity");
   proxy->current_back_buffer = source_face.Get();
   send_tagged_present(++application_frame);
-  Check(!rate::Read(output, rate::NowNs()).available,
+  Check(!rate::Read(output, now_ns).available,
         "a FrameToken for a different backbuffer cannot extend the fixed estimate");
+  std::cout << "NR_RELEASE_PARITY native-application-frame-count fixed-estimate"
+               " source=NATIVE_FIXED fps=80 denominator-hz=40 multiplier=2"
+               " duplicate=deduplicated conflicting-marker=ignored ambiguous/wrong-bb=unavailable\n";
   proxy->current_back_buffer = buffer_face.Get();
   warm([&] {
     sl::DLSSGState state;
-    rate::ObserveNativeEvaluation(output, 2, true, rate::NowNs());
+    rate::ObserveNativeEvaluation(output, 2, true, now_ns);
     Check(native_adapter::HookedGetState(viewport, state, nullptr) == sl::Result::eOk,
           "passive GetState returns the application result");
   }, std::chrono::milliseconds(550));
-  sample = rate::Read(output, rate::NowNs());
+  sample = rate::Read(output, now_ns);
   Check(sample.available && sample.source == rate::Source::NATIVE_STATE && !sample.multiplier_variable
             && sample.observed_multiplier == 0,
         "passive Native GetState becomes the preferred source and fixed counts need no denominator");
@@ -154,23 +191,23 @@ inline void Run() {
   for (const auto& extent : extent_tags) {
     fg::native_options::ObserveBackBufferTags(7, tags, 1, ++application_frame);
     fg::native_options::ObserveBackBufferTags(7, &extent, 1, application_frame);
-    Check(rate::Read(output, rate::NowNs()).window_serial == native_serial
+    Check(rate::Read(output, now_ns).window_serial == native_serial
               && rate::NativeBindingGeneration(output) == native_generation
-              && !rate::TakeNativeApplicationFrame(output, native_generation, buffer, rate::NowNs()),
+              && !rate::TakeNativeApplicationFrame(output, native_generation, buffer, now_ns),
           "extent-only Backbuffer metadata preserves output and fixed SDK counts, with no application-frame proof");
   }
   Check(rate::CaptureNativeLegacySourceTag(7) && rate::BindNativeLegacySourceOutput(legacy_source, *persistent_legacy_tag),
         "global legacy evidence survives cadence staleness and later Evaluates until explicit replacement or release");
   options.numFramesToGenerate = 3;
   native_adapter::HookedSetOptions(sl::ViewportHandle(8), options);
-  Check(rate::Read(output, rate::NowNs()).window_serial == native_serial,
+  Check(rate::Read(output, now_ns).window_serial == native_serial,
         "another viewport's successful Native Options preserve the bound output");
 
   // Start a new viewport binding with no outer Present history. Only the SDK
   // responses supply FPS. Completed NR costs and delivery are MOCK inputs.
   const sl::ResourceTag remove_back_buffer(nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilPresent);
   fg::native_options::ObserveBackBufferTags(7, &remove_back_buffer, 1);
-  Check(!rate::Read(output, rate::NowNs()).available && !rate::CaptureNativeLegacySourceTag(7)
+  Check(!rate::Read(output, now_ns).available && !rate::CaptureNativeLegacySourceTag(7)
             && !rate::FindSourceOutput(legacy_source),
         "explicit Backbuffer removal revokes the viewport association rather than acting as extent metadata");
   fg::native_options::ObserveBackBufferTags(7, tags, 2, 13, resource_generation);
@@ -206,19 +243,17 @@ inline void Run() {
   uint64_t low_generation = 0;
   int64_t last_read_ns = 0;
   bool accepted = false;
-  const auto begin = std::chrono::steady_clock::now();
   for (int tick = 0; tick <= test_duration / tick_interval && !accepted; ++tick) {
-    std::this_thread::sleep_until(begin + tick * tick_interval);
-    rate::ObserveNativeEvaluation(output, 2, true, rate::NowNs());
+    now_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(tick_interval).count();
+    rate::ObserveNativeEvaluation(output, 2, true, now_ns);
     if (tick % (sdk_interval / tick_interval) == 0) {
       const bool full_low_interval = controller.active_level == 1 && controller.applied_ns <= last_read_ns;
       reported_frames = (full_low_interval ? 150u : 120u);
       sl::DLSSGState state;
       Check(native_adapter::HookedGetState(viewport, state, nullptr) == sl::Result::eOk,
             "fixed control receives each low-frequency count through the passive SDK wrapper");
-      last_read_ns = rate::NowNs();
+      last_read_ns = now_ns;
     }
-    const auto now_ns = rate::NowNs();
     sample = rate::Read(output, now_ns);
     observe_mock_gpu(&controller, static_cast<uint64_t>(tick + 1), now_ns);
     prepare_from_sdk(&controller, sample, now_ns);
@@ -248,12 +283,117 @@ inline void Run() {
         "fixed 100 FPS SDK counts and cheaper MOCK NR accept the delivered lower tier");
   std::cout << "PASS Native fixed low-frequency SDK counts request and accept the lower tier evidence=MOCK"
             << " baseline_fps=" << controller.baseline_fps << " accepted_fps=" << sample.fps << '\n';
+  std::cout << "NR_RELEASE_PARITY native-application-frame-count fixed-state"
+               " source=NATIVE_STATE intervals-ms=1500 denominator=unknown trial-fps=80 accepted-fps=100\n";
+
+  rate::ReleaseNativeViewport(7);
+  options.mode = sl::DLSSGMode::eAuto;
+  fg::native_options::ObserveBackBufferTags(7, tags, 1);
+  Check(native_adapter::HookedSetOptions(viewport, options) == sl::Result::eOk,
+        "dynamic control starts on the same output under a new viewport binding");
+  native_adapter::state.present1 = +[](IDXGISwapChain*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*, bool& skip)
+      -> HRESULT {
+    skip = false;
+    return S_OK;
+  };
+  adaptive::Session dynamic;
+  uint64_t sequence = 0;
+  reported_frames = 120;
+  const auto dynamic_interval = [&](uint32_t first_tag, uint32_t last_tag) {
+    for (uint32_t frame = 0; frame < 60; ++frame) {
+      now_ns += 25'000'000;
+      observe_marker(++marker_index);
+      if (frame >= first_tag && frame <= last_tag) {
+        fg::native_options::ObserveBackBufferTags(7, tags, 1, ++application_frame);
+      }
+      bool skip = true;
+      Check(native_adapter::HookedPresent1(proxy.Get(), 0, 0, nullptr, skip) == S_OK && !skip,
+            "Native Present1 preserves the application's SDK result");
+      if (frame == 59) {
+        sl::DLSSGState state;
+        Check(native_adapter::HookedGetState(viewport, state, nullptr) == sl::Result::eOk,
+              "Native GetState returns the SDK count across the current coverage interval");
+      }
+      sample = rate::Read(output, now_ns);
+      observe_mock_gpu(&dynamic, ++sequence, now_ns);
+      prepare_from_sdk(&dynamic, sample, now_ns);
+      dynamic.UpdatePreparation(dynamic.preparation_epoch, 2, 2, adaptive::Reason::PREPARING, now_ns);
+      if (dynamic.status.generation != dynamic.applied_generation) {
+        dynamic.Applied(dynamic.status.generation, dynamic.status.requested, now_ns);
+      }
+    }
+  };
+  for (int interval = 0; interval < 9; ++interval) {
+    dynamic_interval(60, 0);
+  }
+  Check(sample.available && sample.source == rate::Source::NATIVE_STATE && sample.multiplier_variable
+            && sample.observed_multiplier == 0 && std::abs(sample.fps - 80.) < 0.001
+            && !dynamic.trial && dynamic.active_level == 0 && dynamic.status.reason == adaptive::Reason::COLLECTING,
+        "dynamic SDK output stays at 80 FPS but diagnostic-only Presents cannot drive a trial");
+  for (int interval = 0; interval < 9 && !dynamic.trial; ++interval) {
+    dynamic_interval(0, 59);
+  }
+  Check(sample.available && sample.source == rate::Source::NATIVE_STATE && sample.multiplier_variable
+            && std::abs(sample.observed_multiplier - 2.) < 0.001 && dynamic.trial && dynamic.active_level == 1,
+        "full current-backbuffer token coverage restores dynamic sampling and requests the lower tier");
+  for (int frame = 0; frame < 60; ++frame) {
+    now_ns += 25'000'000;
+    if (frame == 0 || frame == 59) {
+      send_tagged_present(++application_frame);
+    } else {
+      observe_marker(++marker_index);
+      bool skip = true;
+      Check(native_adapter::HookedPresent1(proxy.Get(), 0, 0, nullptr, skip) == S_OK && !skip,
+            "unidentified SDK calls continue through the middle of the sample");
+    }
+  }
+  sl::DLSSGState state;
+  Check(native_adapter::HookedGetState(viewport, state, nullptr) == sl::Result::eOk,
+        "SDK output count survives the middle coverage gap");
+  sample = rate::Read(output, now_ns);
+  prepare_from_sdk(&dynamic, sample, now_ns);
+  Check(sample.available && sample.source == rate::Source::NATIVE_STATE && sample.observed_multiplier == 0
+            && std::abs(sample.fps - 80.) < 0.001 && !dynamic.trial && dynamic.level == 0
+            && dynamic.status.requested == upper,
+        "fresh endpoint tags cannot bridge a middle gap or keep a dynamic trial alive");
+  for (int interval = 0; interval < 9 && !dynamic.trial; ++interval) {
+    dynamic_interval(0, 59);
+  }
+  Check(sample.available && std::abs(sample.observed_multiplier - 2.) < 0.001 && dynamic.trial,
+        "a continuous fresh token window can drive a new trial after the gap");
+  const auto old_binding = rate::NativeBindingGeneration(output);
+  static const sl::ResourceTag* replacement_binding_tag = nullptr;
+  replacement_binding_tag = tags;
+  native_adapter::state.present = +[](IDXGISwapChain*, UINT, UINT, bool& skip) -> HRESULT {
+    rate::ReleaseNativeViewport(7);
+    fg::native_options::ObserveBackBufferTags(9, replacement_binding_tag, 1);
+    skip = false;
+    return S_OK;
+  };
+  fg::native_options::ObserveBackBufferTags(7, tags, 1, ++application_frame);
+  bool skip = true;
+  Check(native_adapter::HookedPresent(proxy.Get(), 0, 0, skip) == S_OK && !skip
+            && rate::NativeBindingGeneration(output) != old_binding,
+        "the real SDK return crosses a newly bound viewport on the same output");
+  {
+    const std::shared_lock lock(rate::internal::state.mutex);
+    Check(rate::internal::FindOutput(output)->native.applications == 0,
+          "the old invocation cannot contribute an application frame to the new binding");
+  }
+  replacement_binding_tag = nullptr;
+  std::cout << "PASS Native dynamic SDK coverage and recovery evidence=MOCK\n";
+  std::cout << "NR_RELEASE_PARITY native-application-frame-count dynamic-state"
+               " source=NATIVE_STATE fps=80 marker-only=collecting full-tags=trial"
+               " middle-gap=rollback full-window=recovered old-binding=discarded\n";
 
   rate::DestroyPresentOutput(owner);
   rate::ReleaseNative();
   native_adapter::state.real = nullptr;
   native_adapter::state.get_state = nullptr;
   native_adapter::state.present = nullptr;
+  native_adapter::state.present1 = nullptr;
+  now_ns = 0;
+  native_adapter::reflex_marker.real = nullptr;
   proxy->current_back_buffer.Reset();
 
   const auto original_sdk = adapter::modules[0].real;

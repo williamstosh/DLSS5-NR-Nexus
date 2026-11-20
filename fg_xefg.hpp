@@ -495,7 +495,10 @@ inline bool BridgeSourceLinkCurrentLocked(const Context& context) {
       || source->second->generation != context.bridge_source_generation
       || source->second->context.lock().get() != &context || source->second->proxy != context.proxy_identity
       || context.bridge_link_source.handle == 0 || context.bridge_link_source.generation == 0) return false;
-  if (context.bridge_link_source.device12 == 0) return source->second->device12 == nullptr;
+  if (context.bridge_link_source.device12 == 0) {
+    return source->second->device12 == nullptr && source->second->device11 != nullptr
+        && reinterpret_cast<uintptr_t>(source->second->device11.Get()) == context.bridge_link_source.device11;
+  }
   if (context.bridge_link_source.device11 != 0 || source->second->device11 != nullptr
       || source->second->device12 == nullptr || source->second->device12.Get() != context.device_identity.Get()
       || reinterpret_cast<uintptr_t>(source->second->device12.Get()) != context.bridge_link_source.device12) return false;
@@ -2808,8 +2811,7 @@ inline bool RegisterSourceSwapchain(uintptr_t owner, IDXGISwapChain* swapchain, 
 }
 }  // namespace internal
 
-// DEV callers register the real API swapchain during init and revoke its
-// owner token before every resize/destroy early return.
+// The swapchain owner token is revoked before every resize/destroy early return.
 inline bool RegisterBridgeSourceSwapchain(uintptr_t owner, IDXGISwapChain* swapchain) noexcept {
   return internal::RegisterSourceSwapchain(owner, swapchain, false);
 }

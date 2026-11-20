@@ -35,6 +35,7 @@ void Check(bool condition, std::string_view message) {
 }
 
 bool Validate(std::string_view key, const Json& value) {
+  if (key == presets::ADAPTIVE_RESOURCE_STRATEGY_KEY) return value.is_number_integer() && value >= 0 && value <= 3;
   for (unsigned pass = 2; pass <= 4; ++pass) {
     const auto prefix = "NRPass" + std::to_string(pass);
     if (key == prefix + "ResolutionMode") return value.is_number_integer() && value >= 0 && value <= 2;
@@ -438,6 +439,38 @@ int wmain(int argc, wchar_t** argv) {
     Check(presets::WriteFile(preset_path, preset, true, &error), "Legacy atomic overwrite");
     preset.metadata["unknown"] = "invalid";
     Check(!presets::WriteFile(preset_path, preset, true, &error), "Legacy schema validation retained");
+
+    auto strategy_state = profiles::EmptyState("strategy-owner");
+    const auto strategy_path = root / L"strategy-slots.json";
+    const auto* strategy_key = presets::ADAPTIVE_RESOURCE_STRATEGY_KEY;
+    strategy_state.slots[0].overrides[strategy_key] = 1;
+    strategy_state.slots[0].snapshot = {{strategy_key, 0}, {"NRIntensity", .5}};
+    strategy_state.last_applied = strategy_state.slots[0].snapshot;
+    Check(profiles::Write(strategy_path, &strategy_state, 0, Validate, &error), error);
+    Check(Bytes(strategy_path).find(strategy_key) == std::string::npos,
+        "The profile manifest contains only legacy settings even with explicit zero and a spare strategy");
+    auto attempted = strategy_state;
+    attempted.slots[0].overrides[strategy_key] = 2;
+    {
+      presets::internal::Handle held(CreateFileW(strategy_path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+          nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+      Check(held.value != INVALID_HANDLE_VALUE, "Hold the old base manifest through extension staging");
+      Check(!profiles::Write(strategy_path, &attempted, 1, Validate, &error) && attempted.revision == 1,
+          "A locked base manifest prevents committing a new strategy revision");
+    }
+    profiles::State loaded_strategy;
+    Check(profiles::Read(strategy_path, Validate, &loaded_strategy, &error)
+              && loaded_strategy.slots[0].overrides.at(strategy_key) == 1
+              && loaded_strategy.last_applied.at(strategy_key) == 0,
+          "Interrupted publication preserves both the old manifest and its matching extension");
+    Json legacy_write = Json::parse(Bytes(strategy_path));
+    legacy_write["revision"] = 2;
+    Put(strategy_path, legacy_write.dump(2) + "\n");
+    Check(profiles::Read(strategy_path, Validate, &loaded_strategy, &error)
+              && loaded_strategy.revision == 2
+              && !loaded_strategy.slots[0].overrides.contains(strategy_key)
+              && loaded_strategy.last_applied.at("NRIntensity") == .5,
+          "Even an unchanged legacy save cannot attach an interrupted extension at the same revision");
     std::cout << checks << " profile store checks passed\n";
     return 0;
   } catch (const std::exception& exception) {

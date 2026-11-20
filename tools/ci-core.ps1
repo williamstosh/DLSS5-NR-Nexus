@@ -5,6 +5,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $repo = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repo 'tests/test-support.ps1')
+. (Join-Path $PSScriptRoot 'check-release-experiment-parity.ps1')
 $OutputDirectory = Initialize-TestOutput $OutputDirectory
 $previousCl = $env:CL
 $outcome = 'Failed'
@@ -32,7 +33,6 @@ $adaptiveContractReceipts = @{
     )
     'nr-edit-reuse-xefg-contracts'='^ADAPTIVE_DELIVERY_XEFG evidence=WARP\+MOCK rejected_proxy=1 restored_anchor=1 late_receipt=ignored$'
 }
-$devCases = @('nr-edit-reuse-native-contracts','native-present-decision')
 $summary = [ordered]@{ schema='nr-nexus-ci-core/1'; status='Running'
     sourceCommit=(& git --no-optional-locks -C $repo rev-parse HEAD)
     sourceTree=(& git --no-optional-locks -C $repo rev-parse 'HEAD^{tree}')
@@ -46,11 +46,27 @@ function Get-CoreCaseReceipt([string]$Case, [string]$Stdout, [string]$Pattern) {
 }
 
 try {
+    $registration = Get-ReleaseParityRegistration -SourceRoot $repo -AllowPending
+    $summary['releaseParity'] = [ordered]@{ status='Running'; pending=$registration.pending; rows=@(); builds=@{} }
+    if ($registration.pending.Count) {
+        $summary.releaseParity.status = 'Pending'
+        throw "Release parity migration pending: $($registration.pending -join ', ')."
+    }
+    $hostRoot = Join-Path $repo '.local/renodx'
+    $buildContext = Get-ReleaseParityBuildContext $repo $hostRoot
+    $parityCases = @($registration.rows | ForEach-Object { $_.cases })
+    $pairedFgCases = @($parityCases | Where-Object suite -CEQ 'fg-native' | ForEach-Object name | Select-Object -Unique)
+    $pairedBridgeCases = @($parityCases | Where-Object suite -CEQ 'bridge-motion' | ForEach-Object name | Select-Object -Unique)
+    foreach ($case in $parityCases | Where-Object { $_.suite -ceq 'fg-native' -and $_.log -cne 'adaptive-inline' }) {
+        $independentCases[$case.name] = $case.receipt.Replace('{dev}', '0')
+    }
+    $devCases = @($pairedFgCases + 'native-present-decision' | Select-Object -Unique)
     # -SoftwareOnly controls runner selection; the compile guard also rejects
     # any accidental native adapter path inside the existing FG fixtures.
     $env:CL = ($previousCl + ' /DNR_NEXUS_TEST_WARP_ONLY').Trim()
     $suiteOutput = Join-Path $OutputDirectory 'suites'
-    & (Join-Path $PSScriptRoot 'run-tests.ps1') -Suite $suites -SoftwareOnly -UiPreview None -OutputDirectory $suiteOutput -RetentionMode Standard
+    & (Join-Path $PSScriptRoot 'run-tests.ps1') -Suite $suites -DevControlMode Off `
+        -SoftwareOnly -UiPreview None -OutputDirectory $suiteOutput -RetentionMode Standard
     foreach ($policySuite in $policySuites) {
         $policy = Get-Content -LiteralPath (Join-Path $suiteOutput "$policySuite/result.json") -Raw | ConvertFrom-Json
         if ($policy.suite -cne $policySuite -or $policy.build -cne 'passed' -or $policy.run -cne 'passed' -or
@@ -92,7 +108,7 @@ try {
     }
 
     $bridgeOutput = Join-Path $OutputDirectory 'bridge-suites'
-    & (Join-Path $PSScriptRoot 'run-tests.ps1') -Suite bridge-motion -BridgeCase edit-reuse-production `
+    & (Join-Path $PSScriptRoot 'run-tests.ps1') -Suite bridge-motion -BridgeCase $pairedBridgeCases -DevControlMode Off `
         -SoftwareOnly -UiPreview None -OutputDirectory $bridgeOutput -RetentionMode Standard
     $bridge = Join-Path $bridgeOutput 'bridge-motion'
     $bridgeResult = Get-Content -LiteralPath (Join-Path $bridge 'result.json') -Raw | ConvertFrom-Json
@@ -107,35 +123,56 @@ try {
     $summary['inlineFrameTrace'] = & (Join-Path $PSScriptRoot 'check-inline-frame-traces.ps1') `
         -PublicLog (Join-Path $OutputDirectory 'nr-edit-reuse-contracts-public/test.stdout.log') -BridgeLog $bridgeStdout
 
-    # The Native x2 contract selects the DEV macro for this separate FG binary.
     $devOutput = Join-Path $OutputDirectory 'dev-suites'
-    & (Join-Path $PSScriptRoot 'run-tests.ps1') -Suite fg-native,bridge-motion -NativeCase $devCases -BridgeCase adaptive `
+    & (Join-Path $PSScriptRoot 'run-tests.ps1') -Suite fg-native,bridge-motion,adaptive-resolution `
+        -NativeCase $devCases -BridgeCase $pairedBridgeCases -DevControlMode On `
         -SoftwareOnly -UiPreview None -OutputDirectory $devOutput -RetentionMode Standard
+    $after = Get-ReleaseParityBuildContext $repo $hostRoot
+    if (($after | ConvertTo-Json -Depth 5 -Compress) -cne ($buildContext | ConvertTo-Json -Depth 5 -Compress)) {
+        throw 'Core source or locked dependencies changed between the two modes.'
+    }
+    $ordinaryBuilds = @{ 'fg-native'=$fg; 'bridge-motion'=$bridge; 'adaptive-resolution'=(Join-Path $suiteOutput 'adaptive-resolution') }
+    foreach ($suite in $ordinaryBuilds.Keys) {
+        $summary.releaseParity.builds[$suite] = Assert-ReleaseParityBuildPair $suite $ordinaryBuilds[$suite] `
+            (Join-Path $devOutput $suite) $buildContext
+    }
+    $devController = Get-Content -LiteralPath (Join-Path $devOutput 'adaptive-resolution/result.json') -Raw | ConvertFrom-Json
+    if ($devController.dependency_policy -cne 'passed') { throw 'DEV controller requires STATIC dependency isolation.' }
     $devFg = Join-Path $devOutput 'fg-native'
-    $devResult = Get-Content -LiteralPath (Join-Path $devFg 'result.json') -Raw | ConvertFrom-Json
-    if ($devResult.suite -cne 'fg-native' -or $devResult.build -cne 'passed' -or $devResult.run -cne 'passed') {
-        throw 'Native DEV contracts require a passing FG build and run.'
+    $summary.independent += @{name='native-present-decision';status='Passed';evidence='WARP+MOCK'
+        receipt=(Get-CoreCaseReceipt 'native-present-decision' (Join-Path $devFg 'native-present-decision.stdout.log') `
+            '^PASS case=native-present-decision evidence=WARP\+MOCK dev=1$')
+        executableSha256=$summary.releaseParity.builds['fg-native'].On.executableSha256}
+    foreach ($row in $registration.rows) {
+        $cases = @(foreach ($case in $row.cases) {
+            $pair = $summary.releaseParity.builds[$case.suite]
+            if ($pair.On.cases -cnotcontains $case.name) { throw "Missing DEV invocation: $($case.suite)/$($case.name)" }
+            $offDirectory = $ordinaryBuilds[$case.suite]
+            $offLogName = "$($case.log).stdout.log"
+            if ($case.suite -ceq 'fg-native' -and $independentCases.Contains($case.name)) {
+                $offDirectory = Join-Path $OutputDirectory $case.name
+                $offLogName = 'test.stdout.log'
+            } elseif ($pair.Off.cases -cnotcontains $case.name) {
+                throw "Missing ordinary invocation: $($case.suite)/$($case.name)"
+            }
+            $receipt = Compare-ReleaseParityCase $row.id $case (Join-Path $offDirectory $offLogName) `
+                (Join-Path $devOutput "$($case.suite)/$($case.log).stdout.log")
+            $receipt['suite'] = $case.suite
+            $receipt['ordinaryExeSha256'] = $pair.Off.executableSha256
+            $receipt['devExeSha256'] = $pair.On.executableSha256
+            $receipt
+        })
+        $summary.releaseParity.rows += @{ id=$row.id; status='Passed'; cases=$cases }
     }
-    $devExecutableHash = (Get-FileHash -LiteralPath (Join-Path $devFg 'fg_native_tests.exe')).Hash
-    foreach ($case in $devCases) {
-        $receipt = Get-CoreCaseReceipt $case (Join-Path $devFg "$case.stdout.log") "^PASS case=$case evidence=WARP\+MOCK dev=1$"
-        $summary.independent += @{name=$case;status='Passed';evidence='WARP+MOCK';receipt=$receipt
-            executableSha256=$devExecutableHash}
-    }
-    $devBridge = Join-Path $devOutput 'bridge-motion'
-    $devBridgeResult = Get-Content -LiteralPath (Join-Path $devBridge 'result.json') -Raw | ConvertFrom-Json
-    if ($devBridgeResult.suite -cne 'bridge-motion' -or $devBridgeResult.build -cne 'passed' -or $devBridgeResult.run -cne 'passed') {
-        throw 'Bridge adaptive XeFG Off requires a passing DEV Bridge build and run.'
-    }
-    $devBridgeReceipt = Get-CoreCaseReceipt 'bridge-adaptive-xefg-off' (Join-Path $devBridge 'warp-adaptive.stdout.log') `
-        '^PASS Bridge Adaptive XeFG Off output ownership, resize and failure revocation dev=1$'
-    $summary.independent += @{name='bridge-adaptive-xefg-off';status='Passed';evidence='WARP+MOCK';receipt=$devBridgeReceipt
-        executableSha256=(Get-FileHash -LiteralPath (Join-Path $devBridge 'd3d11_bridge_motion_tests.exe')).Hash}
+    $summary.releaseParity.status = 'Passed'
     $outcome = 'Passed'
 } finally {
     $env:CL = $previousCl
     $summary.status = $outcome
-    $summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'result.json') -Encoding utf8
+    if ($summary.Contains('releaseParity') -and $summary.releaseParity.status -eq 'Running') {
+        $summary.releaseParity.status = 'Failed'
+    }
+    $summary | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'result.json') -Encoding utf8
     foreach ($directory in @($global:NexusTestOutputs.Keys | Where-Object {
         $_ -eq $OutputDirectory -or $_.StartsWith($OutputDirectory + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
     } | Sort-Object Length -Descending)) { Complete-TestOutput $directory -Outcome $outcome }

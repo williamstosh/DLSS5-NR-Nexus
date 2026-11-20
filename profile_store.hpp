@@ -5,6 +5,9 @@
 
 #pragma once
 
+#include <Windows.h>
+#include <bcrypt.h>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -19,7 +22,10 @@
 #include <utility>
 #include <vector>
 
+#include "preset_fields.hpp"
 #include "preset_store.hpp"
+
+#pragma comment(lib, "bcrypt.lib")
 
 namespace renodx::addons::dlss5::profiles {
 
@@ -139,6 +145,37 @@ inline Json Encode(const State& state) {
           {"slots", std::move(slots)}};
 }
 
+inline auto ResourceStrategyFields(Json* manifest) {
+  std::array<Json*, 1 + 2 * SLOT_IDS.size()> fields{&(*manifest)["last_applied"]};
+  for (std::size_t index = 0; index < SLOT_IDS.size(); ++index) {
+    auto& slot = (*manifest)["slots"][SLOT_IDS[index]];
+    fields[1 + 2 * index] = &slot["snapshot"];
+    fields[2 + 2 * index] = &slot["overrides"];
+  }
+  return fields;
+}
+
+inline std::filesystem::path ResourceStrategyPath(const std::filesystem::path& manifest_path) {
+  auto path = manifest_path;
+  path += L".resource-strategy.json";
+  return path;
+}
+
+inline std::string ManifestDigest(std::string_view manifest) {
+  std::array<unsigned char, 32> hash{};
+  if (BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0,
+          reinterpret_cast<unsigned char*>(const_cast<char*>(manifest.data())), static_cast<ULONG>(manifest.size()), hash.data(),
+          static_cast<ULONG>(hash.size())) < 0) return {};
+  constexpr std::string_view digits = "0123456789abcdef";
+  std::string digest;
+  digest.reserve(hash.size() * 2);
+  for (const auto value : hash) {
+    digest += digits[value >> 4];
+    digest += digits[value & 15];
+  }
+  return digest;
+}
+
 }  // namespace internal
 
 inline bool StoragePath(std::string_view game_id, std::filesystem::path* output, std::string* error = nullptr) {
@@ -175,9 +212,33 @@ inline bool StoragePath(std::string_view game_id, std::filesystem::path* output,
 inline bool Read(const std::filesystem::path& path, const Validator& validator, State* output, std::string* error = nullptr) {
   if (output == nullptr) return internal::Fail(error, "Missing profiles output.");
   try {
+    std::string manifest;
     Json root;
-    if (!presets::ReadJsonFile(path, &root, error)) return false;
-    return internal::Decode(root, validator, output, error);
+    if (!presets::internal::ReadTextFile(path, &manifest, error) || !presets::ParseJson(manifest, &root, error)) return false;
+    State decoded;
+    if (!internal::Decode(root, validator, &decoded, error)) return false;
+    Json extension;
+    if (presets::ReadJsonFile(internal::ResourceStrategyPath(path), &extension) && extension.is_object()) {
+      const auto entry = extension.find(internal::ManifestDigest(manifest));
+      if (entry != extension.end() && entry->is_array()) {
+        const auto fields = internal::ResourceStrategyFields(&root);
+        if (entry->size() == fields.size() && std::all_of(entry->begin(), entry->end(), [&](const Json& value) {
+              return value.is_null() || validator(presets::ADAPTIVE_RESOURCE_STRATEGY_KEY, value);
+            })) {
+          for (std::size_t index = 0; index < fields.size(); ++index) {
+            if (!(*entry)[index].is_null()) {
+              (*fields[index])[presets::ADAPTIVE_RESOURCE_STRATEGY_KEY] = (*entry)[index];
+            }
+          }
+          State extended;
+          if (internal::Decode(root, validator, &extended, nullptr)) {
+            decoded = std::move(extended);
+          }
+        }
+      }
+    }
+    *output = std::move(decoded);
+    return true;
   } catch (const std::exception&) {
     return internal::Fail(error, "Cannot read profiles or validate settings.");
   }
@@ -209,9 +270,13 @@ inline bool Write(const std::filesystem::path& path, State* state, std::uint64_t
     }
     const DWORD attributes = GetFileAttributesW(path.c_str());
     const bool exists = attributes != INVALID_FILE_ATTRIBUTES;
+    std::string existing_manifest;
     if (exists) {
+      Json current_manifest;
       State current;
-      if (!Read(path, validator, &current, error)) return false;
+      if (!presets::internal::ReadTextFile(path, &existing_manifest, error)
+          || !presets::ParseJson(existing_manifest, &current_manifest, error)
+          || !internal::Decode(current_manifest, validator, &current, error)) return false;
       if (current.revision != expected_revision) return internal::Fail(error, "Profiles revision conflict; reload before saving.");
       if (current.owner != state->owner) return internal::Fail(error, "Profiles owner mismatch.");
     } else {
@@ -219,7 +284,40 @@ inline bool Write(const std::filesystem::path& path, State* state, std::uint64_t
       if (expected_revision != 0) return internal::Fail(error, "Profiles revision conflict; destination is missing.");
     }
     checked.revision = expected_revision + 1;
-    const auto text = internal::Encode(checked).dump(2) + "\n";
+    auto manifest = internal::Encode(checked);
+    Json values = Json::array();
+    bool has_resource_strategy = false;
+    for (auto* fields : internal::ResourceStrategyFields(&manifest)) {
+      const auto strategy = fields->find(presets::ADAPTIVE_RESOURCE_STRATEGY_KEY);
+      if (strategy == fields->end()) {
+        values.push_back(nullptr);
+      } else {
+        values.push_back(*strategy);
+        fields->erase(strategy);
+        has_resource_strategy = true;
+      }
+    }
+    // v0.6.0 emits LF. Use Windows line endings so its save cannot match an
+    // extension from an interrupted write for the same revision and fields.
+    const auto text = manifest.dump(2) + "\r\n";
+    if (has_resource_strategy) {
+      const auto digest = internal::ManifestDigest(text);
+      if (digest.empty()) return internal::Fail(error, "Cannot identify profiles for the resource strategy extension.");
+      const auto extension_path = internal::ResourceStrategyPath(path);
+      Json extension = Json::object();
+      Json previous;
+      if (exists && presets::ReadJsonFile(extension_path, &previous) && previous.is_object()) {
+        const auto current_digest = internal::ManifestDigest(existing_manifest);
+        if (const auto current = previous.find(current_digest); current != previous.end()) {
+          extension[current_digest] = *current;
+        }
+      }
+      extension[digest] = std::move(values);
+      // Publish both revisions before replacing slots.json. An interrupted save
+      // still opens the old manifest and its matching extension.
+      if (!presets::WriteJsonFile(extension_path, extension.dump() + "\n", true,
+              [&](const Json& root, std::string*) { return root == extension; }, error)) return false;
+    }
     if (!presets::WriteJsonFile(path, text, exists,
                                [&](const Json& root, std::string* message) {
                                  State parsed;

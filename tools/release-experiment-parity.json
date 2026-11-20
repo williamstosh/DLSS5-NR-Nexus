@@ -1,0 +1,258 @@
+{
+  "rows": [
+    {
+      "id": "bridge-adaptive",
+      "state": "ready",
+      "intent": ["NRAdaptiveEnabled", "NRAdaptiveTargetFPS", "NRAdaptiveMinScale", "NRAdaptiveLevelCount", "NRAdaptiveLimitedResidency"],
+      "commands": ["bridge_adaptive_experiment"],
+      "producer": "Successful native Ngx11Evaluate -> RunBridge, ordinary Present ownership and XeFG source registration",
+      "consumer": "FreezeAdaptiveFrame -> SelectAdaptiveTier -> GPU done and D3D11 Output copy -> ResolveAdaptiveDelivery",
+      "success": "The same source, settings and timing request and deliver both actual grids, with first confirmation after the Output copy.",
+      "refusal": "Failed SR, stale output, revoked required Off or out without done blocks confirmation and copying. A valid frame recovers.",
+      "fallback": "Retain manual NR or fixed x2 when valid, and original SR when the shared result cannot be delivered.",
+      "sources": [
+        ["dlssnr.hpp", "fg::xefg::ConfigureBridgeSource("],
+        ["dlssnr.hpp", "fg::xefg::RegisterBridgeSourceSwapchain("],
+        ["dlssnr.hpp", "fg::xefg::ForgetBridgeSourceSwapchain("],
+        ["dlssnr.hpp", "reshade::register_event<reshade::addon_event::init_swapchain>(internal::OnInitSwapchain)"],
+        ["dlssnr.hpp", "reshade::unregister_event<reshade::addon_event::destroy_swapchain>(internal::OnDestroySwapchain)"],
+        ["dlssnr.hpp", "BridgeAdaptiveEligible(*bridge_source"],
+        ["d3d11_bridge.hpp", "ResolveAdaptiveDelivery("]
+      ],
+      "cases": [
+        { "suite": "bridge-motion", "name": "adaptive", "log": "warp-adaptive", "receipt": "^PASS case=bridge-adaptive evidence=WARP\\+MOCK dev={dev}$",
+          "existingTrace": true,
+          "scenarios": ["ordinary", "intermediate-source", "xefg", "default-ladder", "delivery-recovery"],
+          "expect": {
+            "ordinary": "^OBS Bridge Adaptive ordinary roundtrip, failed SR, and output-generation revocation$",
+            "intermediate-source": "^OBS Bridge Adaptive intermediate copy, deferred and wrong surface rejection, ambiguous output recovery$",
+            "xefg": "^(?<trace>PASS Bridge Adaptive XeFG Off output ownership, resize and failure revocation) dev={dev}$",
+            "default-ladder": "^OBS Bridge Adaptive default-tier two-Pass delivery$",
+            "delivery-recovery": "^(?<trace>PASS Bridge Adaptive WARP\\+MOCK two full-prepared tiers, ready roundtrip/Reset/zero creates, Off/source release/retirement, standby failure/recovery/watchdog); gpu_segments=[1-9][0-9]* dev={dev}$"
+          } },
+        { "suite": "bridge-motion", "name": "edit-reuse-production", "log": "warp-edit-reuse-production", "receipt": "^PASS case=bridge-edit-reuse-production evidence=WARP\\+MOCK dev={dev}$",
+          "existingTrace": true,
+          "scenarios": ["fixed-frame-1", "fixed-frame-2", "fixed-frame-3", "fixed-frame-4"],
+          "expect": {
+            "fixed-frame-1": "^INLINE_POLICY_BASE route=bridge base=1 plan_stage=Upscaled pass_begin=0 pass_count=1 model=2 calls=1 reset=1 history=1 anchor_base=1 anchor_generation=1 anchor_age=0 complete=1 rgba_crc32=[0-9]+$",
+            "fixed-frame-2": "^INLINE_POLICY_BASE route=bridge base=2 plan_stage=Upscaled pass_begin=0 pass_count=1 model=2 calls=0 reset=- history=2 anchor_base=1 anchor_generation=1 anchor_age=1 complete=1 rgba_crc32=[0-9]+$",
+            "fixed-frame-3": "^INLINE_POLICY_BASE route=bridge base=3 plan_stage=Upscaled pass_begin=0 pass_count=1 model=2 calls=1 reset=0 history=3 anchor_base=3 anchor_generation=2 anchor_age=0 complete=1 rgba_crc32=[0-9]+$",
+            "fixed-frame-4": "^INLINE_POLICY_BASE route=bridge base=4 plan_stage=Upscaled pass_begin=0 pass_count=1 model=2 calls=0 reset=- history=4 anchor_base=3 anchor_generation=2 anchor_age=1 complete=1 rgba_crc32=[0-9]+$"
+          } }
+      ]
+    },
+    {
+      "id": "native-prefg-present-x2",
+      "state": "ready",
+      "intent": ["NREditReuse", "NRPresentPreFg", "NRPresentPreFgContract", "NRPresentFrames"],
+      "commands": ["edit_reuse_fg_experiment"],
+      "producer": "Successful PresentStart in the matching Native SDK Present scope, and actual asynchronous slSetTagForFrame registration",
+      "consumer": "NGX FG Evaluate -> RunNativePreFg -> fg_service::Record -> required colors, SDK input restoration and MFG cache",
+      "success": "Synchronous claims require a successful PresentStart in the same SDK scope and verified resource handoff. Eligible synchronous and asynchronous base frames refresh, reuse, and refresh across the required roles with stable same-frame MFG consumption.",
+      "refusal": "Reject synchronous claims without a successful PresentStart in the matching scope. Reject conflicting tags, missing roles, stale ordering or late SDK failure and recover on a valid frame.",
+      "fallback": "Use legal per-frame Pre-FG or the original SDK inputs. Publish only complete color groups.",
+      "sources": [
+        ["dlssnr.hpp", "reinterpret_cast<void*>(&HookedStreamlineSetTagForFrame)"],
+        ["dlssnr.hpp", "native_tag_source::Scope> tag_source"],
+        ["dlssnr.hpp", "hooks_ready = InstallCommandListStateHooks(tag_list.get()) && InstallMixedPresentCopyHooks(tag_list.get())"],
+        ["dlssnr.hpp", "tag_source.emplace(tag_list.get()"],
+        ["dlssnr.hpp", "detour_guard::AttachAll(kStreamlineHooks,"],
+        ["dlssnr.hpp", "prefg_hudless = RunNativePreFg("],
+        ["fg_native.hpp", "native_tag_source::CurrentFrame(hudless, list"],
+        ["fg_native.hpp", "fg::native_options::CurrentPresentFrame(owner->native_output_identity, backbuffer)"],
+        ["fg_native_options.hpp", "frame_scope.emplace("],
+        ["fg_native_options.hpp", "frame_source::ObserveMarker(reflex_marker.real, marker, frame, NowNs)"],
+        ["fg_native_options.hpp", "detour_guard::AttachAll(internal::REFLEX_MARKER_HOOK, &failed)"]
+      ],
+      "cases": [
+        { "suite": "fg-native", "name": "nr-edit-reuse-native-contracts", "log": "nr-edit-reuse-native-contracts", "receipt": "^PASS case=nr-edit-reuse-native-contracts evidence=WARP\\+MOCK dev={dev}$", "scenarios": ["synchronous", "synchronous-source-refusal", "asynchronous", "mfg-recovery"],
+          "expect": {
+            "synchronous": "^source=successful-present-start\\+sdk-present same-scope=1 ngx-detour=executed pq-evaluates=1/0/1/0 fp16-evaluates=1/0/1 fp16-alpha=preserved$",
+            "synchronous-source-refusal": "^missing-present-start=refused failed-present-start=refused wrong-sdk-scope=refused$",
+            "asynchronous": "^source=set-tag-for-frame\\+copy\\+fence ngx-detour=executed evaluates=1/0/1 color=complete stale-alpha/expired/role-retag=original$",
+            "mfg-recovery": "^repeated=redelivered missing-role/changed-guide/foreign-list=original sdk-reject=ngx-detour\\+rgba-rollback recovery=reset\\+refresh$"
+          } }
+      ]
+    },
+    {
+      "id": "dx12-upscaled-adaptive-x2",
+      "state": "ready",
+      "intent": ["NRAdaptiveEnabled", "NRAdaptiveTargetFPS", "NRAdaptiveMinScale", "NRAdaptiveLevelCount", "NRAdaptiveLimitedResidency", "NREditReuse"],
+      "commands": ["edit_reuse_adaptive_experiment"],
+      "producer": "Successful D3D12 SR and ordinary Present output, with independent Native/XeFG Off evidence for qualifying low-grid x2",
+      "consumer": "Frozen adaptive measurement -> actual active workset reuse -> complete GPU cycles and adaptive Session trial",
+      "success": "Compatible fixed worksets keep reusing. A real grid change refreshes. Qualifying low-tier x2 and no-Off per-frame trials each deliver and evaluate within the original trial.",
+      "refusal": "Missing half-pair, changed output or source, unconfirmed delivery and old GPU completion cannot advance the trial or reuse the anchor.",
+      "fallback": "Keep valid fixed x2 or use per-frame adaptive NR. Return to the accepted anchor after a confirmed no-gain trial.",
+      "sources": [
+        ["dlssnr.hpp", "fg::xefg::ConfigureD3D12Source("],
+        ["dlssnr.hpp", "fg::xefg::RegisterD3D12SourceSwapchain("],
+        ["dlssnr.hpp", "created->second.source_device12_identity = identity;"],
+        ["dlssnr.hpp", "UsesFixedEditReuseWorkset(feature, adaptive)"],
+        ["adaptive_resolution.hpp", "SetPairedSampling("]
+      ],
+      "cases": [
+        { "suite": "fg-native", "name": "nr-edit-reuse-contracts", "log": "nr-edit-reuse-contracts", "receipt": "^PASS case=nr-edit-reuse-contracts evidence=WARP\\+MOCK dev={dev}$", "scenarios": ["fixed-active", "paired-low", "unpaired-accept", "unpaired-rollback"],
+          "expect": {
+            "fixed-active": "^grid=16x16 cadence=1/0 eligibility_keeps_anchor=1 same_grid_source_refresh=1 model_refresh=1 evidence=WARP\\+MOCK$",
+            "paired-low": "^output=PRESENT grid=12x12 calls=1/0 upper_us=2000 low_us=1500 discarded=1 recovered=1 stale_half_rejected=1 off_revocation_keeps_upper=1 accepted_100fps=1 output_replacement_rejected=1 evidence=WARP\\+MOCK$",
+            "unpaired-accept": "^output=PRESENT grid=12x12 calls=1 upper_us=2000 low_us=1500 trial_preserved=1 warmed_after_delivery=1 accepted_100fps=1 output_replacement_rejected=1 evidence=WARP\\+MOCK$",
+            "unpaired-rollback": "^output=PRESENT grid=12x12 calls=1 upper_us=2000 low_us=1500 trial_preserved=1 warmed_after_delivery=1 returned_80fps=1 cooldown=1 output_replacement_rejected=1 evidence=WARP\\+MOCK$"
+          } },
+        { "suite": "fg-native", "name": "adaptive-inline", "log": "adaptive-inline", "receipt": "^PASS case=adaptive-inline evidence=WARP\\+MOCK dev={dev}$",
+          "existingTrace": true,
+          "scenarios": ["completion-scope"],
+          "expect": { "completion-scope": "^ADAPTIVE_COMPLETION_SCOPE evidence=WARP\\+MOCK measured=1 proof_only=1 pending=blocked rejected=blocked superseded=retained$" } },
+        { "suite": "adaptive-resolution", "name": "test", "log": "test", "receipt": "^NR_RELEASE_PARITY dx12-upscaled-adaptive-x2 controller ", "scenarios": ["controller"],
+          "expect": { "controller": "^paired_mean_us=2000 lower_us=1500 preserved_trial=1 accepted=1 rollback=1 bounded_missing_cost=1 evidence=CPU$" } }
+      ]
+    },
+    {
+      "id": "adaptive-resource-strategies",
+      "state": "ready",
+      "intent": ["NRAdaptiveResourceStrategy", "NRAdaptiveLimitedResidency", "NRAdaptiveMinScale", "NRAdaptiveLevelCount"],
+      "commands": ["adaptive_feature_experiment"],
+      "producer": "INI/preset setting NRAdaptiveResourceStrategy (0 through 3) and legacy slot compatibility",
+      "consumer": "Adaptive effective strategy and preparation policy -> actual Feature capacity, worksets and retirement",
+      "success": "Explicit 0 preserves ordinary preparation. Mode 1 retains a compatible model, mode 2 prepares upper-capacity work, and mode 3 prepares a cold target on demand.",
+      "refusal": "Bad values, incompatible Create contracts, budget refusal, stale completions and live references cannot misreport a successful strategy.",
+      "fallback": "Keep configured legal tiers and ordinary preparation per group. Preserve v0.6.0 slot read/write.",
+      "sources": [
+        ["dlssnr.hpp", "resource_strategy = effective_strategy"],
+        ["dlssnr.hpp", "ReadPresentRestoreRaw(kSetAdaptiveResourceStrategy.key)"],
+        ["preset_fields.hpp", ".key = ADAPTIVE_RESOURCE_STRATEGY_KEY"]
+      ],
+      "cases": [
+        { "suite": "fg-native", "name": "adaptive-resource-strategy", "log": "adaptive-resource-strategy", "receipt": "^PASS case=adaptive-resource-strategy evidence=WARP\\+MOCK dev={dev}$",
+          "existingTrace": true,
+          "scenarios": ["configuration", "ordinary-on-demand", "retain", "retain-rebind", "upper-capacity", "upper-capacity-output", "upper-capacity-rebind", "upper-capacity-on-demand", "cold-failure", "level-fallback", "on-demand-fallback", "binding-fallback"],
+          "expect": {
+            "configuration": "^RESOURCE_STRATEGY requested=0 effective=0 levels=2 startup=eager create_width=8 evaluate_width=8 delivered=1$",
+            "ordinary-on-demand": "^RESOURCE_STRATEGY requested=0 effective=0 levels=2 startup=cold create_width=8 evaluate_width=8 delivered=1$",
+            "retain": "^RESOURCE_STRATEGY requested=1 effective=1 levels=2 startup=eager create_width=8 evaluate_width=8 delivered=1$",
+            "retain-rebind": "^RESOURCE_STRATEGY_REBIND strategy=1 in_flight=blocked stale_receipt=rejected create_delta=0 retained=1 delivered_width=5$",
+            "upper-capacity": "^RESOURCE_STRATEGY requested=2 effective=2 levels=2 startup=eager create_width=16 evaluate_width=8 delivered=1$",
+            "upper-capacity-output": "^RESOURCE_STRATEGY_OUTPUT strategy=2 readback=fp16_16x16 alpha_preserved=1 color_written=1$",
+            "upper-capacity-rebind": "^RESOURCE_STRATEGY_REBIND strategy=2 in_flight=blocked stale_receipt=rejected create_delta=0 retained=1 delivered_width=5$",
+            "upper-capacity-on-demand": "^RESOURCE_STRATEGY requested=3 effective=3 levels=2 startup=cold create_width=16 evaluate_width=8 delivered=1$",
+            "cold-failure": "^RESOURCE_STRATEGY_FAILURE strategy=3 cold_evaluate=rejected confirmed_width=16 retained_upper=1$",
+            "level-fallback": "^RESOURCE_STRATEGY requested=2 effective=0 levels=4 startup=cold create_width=14 evaluate_width=14 delivered=1$",
+            "on-demand-fallback": "^RESOURCE_STRATEGY requested=3 effective=0 levels=4 startup=cold create_width=14 evaluate_width=14 delivered=1$",
+            "binding-fallback": "^RESOURCE_STRATEGY requested=1 effective=0 levels=2 startup=cold create_width=8 evaluate_width=8 delivered=1$"
+          } }
+      ]
+    },
+    {
+      "id": "native-application-frame-count",
+      "state": "ready",
+      "intent": [],
+      "commands": [],
+      "producer": "Registered successful slSetTagForFrame, outer SDK Present/Present1 and matched passive SDK GetState. Reflex observes diagnostics.",
+      "consumer": "ObserveNativePresent -> deduplicated output window -> NATIVE_STATE or NATIVE_FIXED -> adaptive Session",
+      "success": "Valid tags count once. Fixed SDK output can control without a denominator. Valid 40 application FPS and fixed 2x estimate 80 FPS.",
+      "refusal": "Wrong, duplicate, ambiguous, marker-only or stale frame evidence cannot create a usable denominator. Incomplete dynamic windows pause control.",
+      "fallback": "Display valid SDK counts, suspend affected trials, and resume after a full new attributed window.",
+      "sources": [
+        ["dlssnr.hpp", "fg::native_options::ObserveBackBufferTags(static_cast<uint32_t>(viewport)"],
+        ["fg_native_options.hpp", "output_framerate::TakeNativeApplicationFrame("],
+        ["fg_native_options.hpp", "output_framerate::ObserveNativePresent("],
+        ["fg_native_options.hpp", "output_framerate::ObserveNativeState("],
+        ["fg_native_options.hpp", "detour_guard::AttachAll(internal::PRESENT_HOOKS,"],
+        ["addon.cpp", "reshade::register_event<reshade::addon_event::present>(ObserveOutputPresent)"],
+        ["addon.cpp", "reshade::unregister_event<reshade::addon_event::present>(ObserveOutputPresent)"]
+      ],
+      "cases": [
+        { "suite": "fg-native", "name": "output-framerate-registration", "log": "output-framerate-registration", "receipt": "^PASS case=output-framerate-registration evidence=WARP\\+MOCK dev={dev}$",
+          "existingTrace": true,
+          "scenarios": ["registration"],
+          "expect": { "registration": "^PASS production registered sampling to ordinary adaptive NR evidence=WARP\\+MOCK$" } },
+        { "suite": "fg-native", "name": "output-framerate-sdk", "log": "output-framerate-sdk", "receipt": "^PASS case=output-framerate-sdk evidence=MOCK dev={dev}$", "scenarios": ["marker-only", "fixed-state", "dynamic-state", "fixed-estimate"],
+          "expect": {
+            "marker-only": "^fixed-fps=unavailable$",
+            "fixed-state": "^source=NATIVE_STATE intervals-ms=1500 denominator=unknown trial-fps=80 accepted-fps=100$",
+            "dynamic-state": "^source=NATIVE_STATE fps=80 marker-only=collecting full-tags=trial middle-gap=rollback full-window=recovered old-binding=discarded$",
+            "fixed-estimate": "^source=NATIVE_FIXED fps=80 denominator-hz=40 multiplier=2 duplicate=deduplicated conflicting-marker=ignored ambiguous/wrong-bb=unavailable$"
+          } },
+        { "suite": "adaptive-resolution", "name": "test", "log": "test", "receipt": "^NR_RELEASE_PARITY native-application-frame-count controller ", "scenarios": ["controller"],
+          "expect": { "controller": "^fixed=trial-accepted-80-to-100 dynamic-no-denominator=collecting dynamic-ratio-shift=rollback gap-denominator=unavailable full-tags=recovered evidence=CPU$" } }
+      ]
+    }
+  ],
+  "legacySettings": {
+    "settings": { "count": 259, "sha256": "2188F4D3F239D9C3BDF2ECB47C59A3D3900133445F831DB34215AF24E10E7C03" },
+    "presets": { "count": 283, "sha256": "4ACC3F4E7FAB3CB35E2122C66668C9AFB293C0A6DD52E0B8183422A7FF206FA1" },
+    "ini": { "count": 170, "sha256": "B334112E310AE66299BE73D5E8C34CC01B9987B043F3C9ECF10ED7F90EE39DC3" }
+  },
+  "nonGameplaySettings": {},
+  "diagnosticCommands": {
+    "status": "Snapshot readout.",
+    "sr_benchmark": "Bounded SR benchmark capture.",
+    "inline_restore_roi": "Instrumentation readback.",
+    "fg_consumer_capture": "FG consumer capture.",
+    "native_ui_alpha_preflight": "UI alpha observation."
+  },
+  "testCommands": {
+    "fg_output_marker": "Explicit diagnostic marker injection.",
+    "xefg_present_probe": "Test-only XeFG output/controller probe and calibration."
+  },
+  "sharedOperationAdapters": {
+    "reset_nr": {
+      "file": "dev_control.hpp",
+      "start": "response[\"reason\"] = \"invalid_reset_request\";",
+      "end": "#if defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)",
+      "anchors": ["RecreateFeatures();"]
+    },
+    "set": {
+      "file": "dev_control.hpp",
+      "start": "const bool resource_strategy_command =",
+      "end": "response[\"ok\"] = applied;",
+      "anchors": ["preset_ui::FindSetting(key)", "stage_edit::Confirm()", "resolution_edit::Confirm()", "preset_ui::Apply(", "presets::ADAPTIVE_RESOURCE_STRATEGY_KEY"]
+    }
+  },
+  "diagnosticWrites": {
+    "Native tag inventory": {
+      "file": "native_fg_tag_source.hpp",
+      "start": "inline void ObserveTags(",
+      "end": "inline void NoteGate(",
+      "anchors": ["auto& observation = state.observation;"],
+      "forbidden": "\\bstate\\.(?!observation\\b)|\\btracking_versions\\b"
+    },
+    "Native premise resource removal": {
+      "file": "native_fg_tag_source.hpp",
+      "start": "inline void ForgetPremiseResource(",
+      "end": "inline void AppendPremiseObservation(",
+      "anchors": ["premise.snapshot = {};", "premise.live = {};", "++premise.epoch;"],
+      "forbidden": "\\bstate\\b|\\btracking_versions\\b|\\b(?:Forget|Remove|Publish)Version\\b"
+    }
+  },
+  "macroSites": {
+    "dlssnr.hpp edit_fg_observation::ObserveRecording": "diagnostic",
+    "dlssnr.hpp edit_fg_observation::ObserveResource": "diagnostic",
+    "dlssnr.hpp edit_fg_observation::ObserveSourceFrame": "diagnostic",
+    "dlssnr.hpp InstallCommandListStateHooks": "diagnostic",
+    "dlssnr.hpp InstallMixedPresentCopyHooks": "diagnostic",
+    "dlssnr.hpp InstallNativePremiseBarrierHooks": "diagnostic",
+    "dlssnr.hpp native_tag_source::ForgetPremiseResource": "diagnostic",
+    "dlssnr.hpp native_tag_source::ObservePremiseEvent": "diagnostic",
+    "dlssnr.hpp native_tag_source::ObserveTags": "diagnostic",
+    "dlssnr.hpp native_ui_alpha_observation::ObserveExecute": "diagnostic",
+    "dlssnr.hpp ObserveEditNativeFg": "diagnostic",
+    "dlssnr.hpp ObserveNativeUiAlphaInput": "diagnostic",
+    "dlssnr.hpp ObserveSrBenchmarkRenderInput": "diagnostic",
+    "dlssnr.hpp ObserveSrBenchmarkResult": "diagnostic",
+    "dlssnr.hpp reshade::register_event<reshade::addon_event::destroy_resource>(internal::OnPremiseResourceDestroyed)": "diagnostic",
+    "dlssnr.hpp reshade::unregister_event<reshade::addon_event::destroy_resource>(internal::OnPremiseResourceDestroyed)": "diagnostic",
+    "fg_native.hpp fg::native_options::ObservesPresentDecisions": "diagnostic",
+    "fg_xefg.hpp edit_fg_observation::ObserveRecording": "diagnostic",
+    "fg_xefg.hpp edit_fg_observation::ObserveResource": "diagnostic",
+    "fg_xefg.hpp ObserveEditPresent": "diagnostic",
+    "nr_xefg_present_probe.hpp AttachPinned": "test",
+    "nr_xefg_present_probe.hpp ConfigureCapture": "test",
+    "nr_xefg_present_probe.hpp detour_guard::AttachAll": "test",
+    "nr_xefg_present_probe.hpp InstallOutput": "test",
+    "present_path.hpp InstallNativePremiseBarrierHooks": "diagnostic",
+    "present_path.hpp native_tag_source::ObservePremiseBarrierCall": "diagnostic",
+    "present_path.hpp native_tag_source::ObservePremiseCopy": "diagnostic",
+    "present_path.hpp native_tag_source::ObservePremiseEvent": "diagnostic"
+  }
+}

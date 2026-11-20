@@ -6733,7 +6733,14 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       Check(!reuse_feature || expect_requested || demand_prepare,
             "Feature capacity experiment requires either the existing settings assertions or the demand fixture");
       Check(addon::adaptive_feature_mode.load() == addon::AdaptiveFeatureMode::OFF, "Feature capacity reuse is disabled by default");
-      addon::adaptive_feature_mode = feature_mode;
+      const auto original_levels = addon::nr_adaptive_selected_levels.load();
+      if (upper_capacity) addon::kSetAdaptiveLevelCount.Store(3.f);
+      if (adjacent_ready) {
+        // The test-only adjacent prototype has no registered player value.
+        addon::adaptive_feature_mode = feature_mode;
+      } else {
+        addon::kSetAdaptiveResourceStrategy.Store(static_cast<float>(feature_mode));
+      }
       native_resize_demand_prepare = demand_prepare;
       native_resize_create_gpu = demand_adjacent;
       const uint32_t frame_count = (automatic_limited ? selected_source_limit : (demand_prepare ? 900u : (settings_reuse ? 360u : 180u)));
@@ -8195,7 +8202,8 @@ int RunNativeNgx(const char* project_id_path, bool hot_toggle = false,
       }
       addon::core_create_feature = native_resize_create;
       addon::core_release_feature = native_resize_release;
-      addon::adaptive_feature_mode = addon::AdaptiveFeatureMode::OFF;
+      addon::kSetAdaptiveResourceStrategy.Store(0.f);
+      addon::kSetAdaptiveLevelCount.Store(static_cast<float>(original_levels));
       native_resize_demand_prepare = false;
       native_resize_selected_sequence = false;
       native_resize_create_gpu = false;

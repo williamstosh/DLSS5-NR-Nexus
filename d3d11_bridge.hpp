@@ -294,6 +294,8 @@ struct BridgeSurfaceSet {
   uint64_t bytes = 0;
   uint64_t last_value = 0;
   uint64_t layout_generation = 0;
+  output_framerate::SourceIdentity present_source;
+  uint64_t present_source_sequence = 0;
 };
 inline std::unordered_map<const NVSDK_NGX_Handle*, std::array<BridgeSurfaceSet, 2>> bridge_sets;
 
@@ -399,6 +401,9 @@ inline void MarkBridgeLost(const char* why) {
 // defers destruction until its GPU work is done); D3D12 resources wait for
 // the done fence to pass the last value that used them.
 inline void RetireBridgeSet(BridgeSurfaceSet&& set) {
+  if (set.present_source.handle != 0) {
+    output_framerate::ForgetSourceOutput(set.present_source.handle, &set.present_source);
+  }
   ReleaseCom(set.color11);
   ReleaseCom(set.output11);
   ReleaseCom(set.motion11);
@@ -1071,6 +1076,74 @@ inline void ReleaseBridgeObjects() {
 // Returned by EnsureBridgeUp when the bridge is ready.
 inline constexpr NrDeclineReason kBridgeReady = NrDeclineReason::kCount;
 
+using BridgeCopyResourceFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, ID3D11Resource*);
+using BridgeCopyRegionFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT, UINT, UINT, UINT,
+    ID3D11Resource*, UINT, const D3D11_BOX*);
+inline void* bridge_copy_resource = nullptr;
+inline void* bridge_copy_region = nullptr;
+inline std::atomic<ID3D11DeviceContext*> bridge_copy_context{nullptr};
+
+inline void ObserveBridgeOutputCopy(ID3D11DeviceContext* context, ID3D11Resource* destination,
+    ID3D11Resource* source, const D3D11_BOX* source_box) noexcept {
+  if (context != bridge_copy_context.load(std::memory_order_acquire) || !nr_adaptive_enabled.load()
+      || source == nullptr || destination == nullptr || destination == source) return;
+  GuardHook([&] {
+    RuntimeTryLock lock(runtime_mutex);
+    if (!lock.owns_lock() || context != bridge_copy_context.load(std::memory_order_acquire)
+        || shutting_down.load()) return;
+    const auto source_resource = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(source));
+    const output_framerate::SourceIdentity* matched = nullptr;
+    for (const auto& [handle, sets] : bridge_sets) {
+      const auto& set = sets[0];
+      if (set.present_source.resource != source_resource || set.present_source.resource_generation == 0) continue;
+      const auto feature = features.find(handle);
+      if (feature == features.end() || feature->second.source_generation != set.present_source.generation
+          || feature->second.sr_sequence != set.present_source_sequence) continue;
+      if (matched != nullptr) return;
+      matched = &set.present_source;
+    }
+    if (matched == nullptr) return;
+    UINT generation_size = sizeof(uint64_t);
+    uint64_t generation = 0;
+    if (FAILED(source->GetPrivateData(kAdaptiveOutputIdentityGuid, &generation_size, &generation))
+        || generation_size != sizeof(generation) || generation != matched->resource_generation) return;
+
+    const auto destination_resource = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(destination));
+    const auto output = output_framerate::FindPresentOutput(matched->device, destination_resource);
+    if (!output || output.view != 0) return;
+    D3D11_RESOURCE_DIMENSION source_kind = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+    D3D11_RESOURCE_DIMENSION destination_kind = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+    source->GetType(&source_kind);
+    destination->GetType(&destination_kind);
+    if (source_kind != D3D11_RESOURCE_DIMENSION_TEXTURE2D || destination_kind != source_kind) return;
+    D3D11_TEXTURE2D_DESC src, dst;
+    static_cast<ID3D11Texture2D*>(source)->GetDesc(&src);
+    static_cast<ID3D11Texture2D*>(destination)->GetDesc(&dst);
+    if (src.Width != dst.Width || src.Height != dst.Height || src.Format != dst.Format
+        || src.ArraySize != 1 || dst.ArraySize != 1 || src.MipLevels != 1 || dst.MipLevels != 1
+        || src.SampleDesc.Count != 1 || dst.SampleDesc.Count != 1) return;
+    if (source_box != nullptr && (source_box->left != 0 || source_box->top != 0 || source_box->front != 0
+        || source_box->right != src.Width || source_box->bottom != src.Height || source_box->back != 1)) return;
+    output_framerate::BindSourceOutput(*matched, output);
+  });
+}
+
+inline void STDMETHODCALLTYPE HookedBridgeCopyResource(ID3D11DeviceContext* context,
+    ID3D11Resource* destination, ID3D11Resource* source) {
+  reinterpret_cast<BridgeCopyResourceFn>(bridge_copy_resource)(context, destination, source);
+  ObserveBridgeOutputCopy(context, destination, source, nullptr);
+}
+
+inline void STDMETHODCALLTYPE HookedBridgeCopyRegion(ID3D11DeviceContext* context, ID3D11Resource* destination,
+    UINT destination_subresource, UINT x, UINT y, UINT z, ID3D11Resource* source, UINT source_subresource,
+    const D3D11_BOX* source_box) {
+  reinterpret_cast<BridgeCopyRegionFn>(bridge_copy_region)(
+      context, destination, destination_subresource, x, y, z, source, source_subresource, source_box);
+  if (destination_subresource == 0 && x == 0 && y == 0 && z == 0 && source_subresource == 0) {
+    ObserveBridgeOutputCopy(context, destination, source, source_box);
+  }
+}
+
 // Called from the game's D3D11 evaluate, outside every lock: the bring-up
 // loads DLLs (d3d12.dll, the NR runtime) and takes the Detours transaction.
 // One thread brings the bridge up; any other evaluate meanwhile declines.
@@ -1254,6 +1327,33 @@ inline NrDeclineReason EnsureBridgeUp(ID3D11DeviceContext* context) {
   // Retirement proofs for the bridge's own submissions; outside every lock
   // (queue_hook_mutex, then the Detours transaction).
   InstallQueueCompletionHooks(bridge.queue);
+  // Observe after the real immediate-context call. Deferred recording and
+  // a ReShade add-on that consumes a pre-copy callback cannot create a link.
+  {
+    auto** context_vtable = *reinterpret_cast<void***>(bridge.context_native);
+    constexpr size_t COPY_RESOURCE = 47;
+    constexpr size_t COPY_SUBRESOURCE_REGION = 46;
+    const std::array targets{context_vtable[COPY_RESOURCE], context_vtable[COPY_SUBRESOURCE_REGION]};
+    static std::array<void*, 2> hooked_targets{};
+    static std::array<detour_guard::Record, 2> records{};
+    if (fg::PinRuntimeCallback()) {
+      const auto attach = [&](size_t index, void** real, void* replacement, const char* name) {
+        if (*real != nullptr || targets[index] == nullptr) return;
+        *real = targets[index];
+        const detour_guard::Hook hook{.name = name, .real = real, .detour = replacement, .record = &records[index]};
+        size_t failed = 0;
+        if (detour_guard::AttachAll(std::span{&hook, 1}, &failed) == 1) {
+          hooked_targets[index] = targets[index];
+        }
+      };
+      attach(0, &bridge_copy_resource, reinterpret_cast<void*>(&HookedBridgeCopyResource), "Bridge CopyResource");
+      attach(1, &bridge_copy_region, reinterpret_cast<void*>(&HookedBridgeCopyRegion), "Bridge CopySubresourceRegion");
+      if ((hooked_targets[0] != nullptr && hooked_targets[0] == targets[0])
+          || (hooked_targets[1] != nullptr && hooked_targets[1] == targets[1])) {
+        bridge_copy_context.store(bridge.context_native, std::memory_order_release);
+      }
+    }
+  }
   const bool depth_conversion = SUCCEEDED(bridge.device11->CreateComputeShader(
       __bridge_depth.data(), __bridge_depth.size(), nullptr, &bridge.depth_cs));
   // BridgeDeviceLock's critical section.  Every D3D11.4 runtime exposes it;
@@ -1357,6 +1457,7 @@ inline bool DrainBridgeQueue() {
 // D3D11 evaluate brings a new device up, unless the bridge was lost.
 inline void ReleaseBridge() {
   if (!bridge_device_live.load(std::memory_order_acquire)) return;
+  bridge_copy_context.store(nullptr, std::memory_order_release);
   if (bridge.watchdog != nullptr) {
     bridge_watchdog_stop.store(true, std::memory_order_release);
     WaitForSingleObject(bridge.watchdog, 2000);
@@ -1420,6 +1521,10 @@ inline void ReleaseBridge() {
 struct BridgeSrAttempt {
   uint64_t generation = 0;
   uint64_t sequence = 0;
+  ID3D11Resource* output = nullptr;
+  ID3D11Resource* motion = nullptr;
+  ID3D11Resource* depth = nullptr;
+  ID3D11Resource* exposure = nullptr;
 };
 
 inline bool RunBridge(ID3D11DeviceContext* context,
@@ -1643,7 +1748,11 @@ inline bool RunBridge(ID3D11DeviceContext* context,
           && created->second.source_device11_identity.Get() == device11_identity
           && created->second.source_generation == ordered_sr->generation
           && source->second.source_generation == ordered_sr->generation
-          && source->second.sr_sequence == ordered_sr->sequence) {
+          && source->second.sr_sequence == ordered_sr->sequence
+          && resources[at(ResourceKey::kOutput)] == ordered_sr->output
+          && resources[at(ResourceKey::kMotionVectors)] == ordered_sr->motion
+          && resources[at(ResourceKey::kDepth)] == ordered_sr->depth
+          && resources[at(ResourceKey::kExposureTexture)] == ordered_sr->exposure) {
         // A cached layout can be reused by different texture objects. Prove
         // that the actual copies in this evaluate belong to the immediate device.
         for (const auto key : {ResourceKey::kOutput, ResourceKey::kMotionVectors, ResourceKey::kDepth,
@@ -1670,6 +1779,28 @@ inline bool RunBridge(ID3D11DeviceContext* context,
       }
       PruneCompletedSubmissionUses();
     }
+    const auto game_output = (trusted_sr ? reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(output)) : 0);
+    if (game_output != 0 && nr_adaptive_enabled.load()) {
+      uint64_t generation = 0;
+      UINT size = sizeof(generation);
+      if (FAILED(output->GetPrivateData(kAdaptiveOutputIdentityGuid, &size, &generation))
+          || size != sizeof(generation) || generation == 0) {
+        generation = next_adaptive_output_identity++;
+        if (FAILED(output->SetPrivateData(kAdaptiveOutputIdentityGuid, sizeof(generation), &generation))) {
+          generation = 0;
+        }
+      }
+      const output_framerate::SourceIdentity present_source{
+          .handle = reinterpret_cast<uintptr_t>(handle), .generation = ordered_sr->generation,
+          .device = reinterpret_cast<uintptr_t>(device11_identity), .resource = game_output, .resource_generation = generation};
+      if (set->present_source != present_source) {
+        if (set->present_source.handle != 0) {
+          output_framerate::ForgetSourceOutput(set->present_source.handle, &set->present_source);
+        }
+        set->present_source = present_source;
+      }
+      set->present_source_sequence = ordered_sr->sequence;
+    }
     const BridgeAdaptiveSource bridge_source{
         .api = capability::Api::DX11, .backend = capability::Backend::DX11_BRIDGE,
         .handle = handle, .device = bridge.device12, .list = slot.list,
@@ -1678,20 +1809,24 @@ inline bool RunBridge(ID3D11DeviceContext* context,
         .source_generation = (created != create_contracts.end() ? created->second.source_generation : 0),
         .shared_layout = set->layout_generation, .stage = stage_plan::Stage::UPSCALED,
         .sr_sequence = (trusted_sr ? ordered_sr->sequence : 0),
-        .output_twin = (trusted_sr ? set->output12 : nullptr)};
-    adaptive_bridge = !pre && present == nullptr
-        && BridgeAdaptiveEligible(bridge_source, slot.list, bridge.device12, handle, plan);
+        .output_twin = (trusted_sr ? set->output12 : nullptr),
+        .game_output = game_output,
+        .game_output_generation = (set->present_source.resource == game_output ? set->present_source.resource_generation : 0)};
+    output_framerate::OutputIdentity selected_output;
+    fg::xefg::BridgeOffEvidence selected_off;
+    adaptive_bridge = trusted_sr && nr_adaptive_enabled.load()
+        && BridgeAdaptiveEligible(bridge_source, slot.list, bridge.device12, handle, plan, &selected_output, &selected_off);
     bool poll_adaptive_timers = false;
     const auto settle_adaptive = [&](NrRecording* recording) {
-      if (adaptive_bridge) ResolveAdaptiveDelivery(recording->adaptive_delivery, delivered);
-      if (poll_adaptive_timers) gpu_timers::Poll(true, false);
+      const auto& receipt = recording->adaptive_delivery;
+      if (receipt.frame.session != nullptr) {
+        ResolveAdaptiveDelivery(receipt, delivered && (receipt.frame.enabled || !receipt.frame.session->settings.enabled));
+      }
+      if (poll_adaptive_timers) {
+        gpu_timers::Poll(true, false);
+      }
     };
     const std::unique_ptr<NrRecording, decltype(settle_adaptive)> adaptive_delivery(&bridge_recording, settle_adaptive);
-    if (bridge_adaptive_experiment.load() && nr_adaptive_enabled.load() && !adaptive_bridge) {
-      decline(NrDeclineReason::kBridgeDown,
-          "Bridge Adaptive experiment requires an identified Upscaled source, one Pass, two full-prepared tiers, FG Off and x2 Off; native SR retained");
-      return;
-    }
     strict_delivery |= adaptive_bridge;
     if (!strict_delivery && !pre && present == nullptr) {
       // Let the original SR run while the CPU records NR. The input fence
@@ -2033,12 +2168,32 @@ inline bool RunBridge(ID3D11DeviceContext* context,
         CountNrDecline(NrDeclineReason::kStagePredecessorIncomplete);
         return;
       }
-      // Options callbacks can revoke public FG Off during the completion
-      // wait. The finished private image must not acquire a new output route.
       if (independent_present_pair && !PresentResolutionPairAllowed(*present)) return;
-      if (adaptive_bridge && (!BridgeAdaptiveEligible(bridge_source, slot.list, bridge.device12, handle, plan)
-              || !bridge_recording.output_ready || !bridge_recording.group_complete
-              || bridge_recording.model_evaluate_mask != 1 || bridge_recording.model_pass_mask != 1)) return;
+      if (adaptive_bridge) {
+        // Options and swapchain callbacks can revoke the selected route while
+        // the private queue is executing. Reacquiring a different receipt
+        // does not grant this recording permission to write the game's Output.
+        output_framerate::OutputIdentity current_output;
+        fg::xefg::BridgeOffEvidence current_off;
+        const auto& receipt = bridge_recording.adaptive_delivery;
+        if (!nr_adaptive_enabled.load()
+            || !BridgeAdaptiveEligible(bridge_source, slot.list, bridge.device12, handle, plan, &current_output, &current_off)
+            || current_output != selected_output || receipt.output != selected_output
+            || receipt.source != handle || receipt.source_sequence != bridge_source.sr_sequence
+            || receipt.source_generation != bridge_source.source_generation
+            || receipt.configuration != evaluate_chain.configuration_generation
+            || current_off.available != selected_off.available
+            || current_off.context_identity != selected_off.context_identity || current_off.proxy != selected_off.proxy
+            || current_off.epoch != selected_off.epoch || current_off.declaration != selected_off.declaration
+            || current_off.source_link_generation != selected_off.source_link_generation
+            || set->layout_generation != bridge_source.shared_layout || set->output12 != bridge_source.output_twin
+            || !PresentGroupResult(std::span{&bridge_recording, 1}, 1, true).complete
+            || (receipt.frame.enabled && (!receipt.complete || receipt.actual != receipt.frame.sizes))) return;
+        if (current_off.available) {
+          const auto sample = output_framerate::Read(current_output, SteadyNowNs());
+          if (sample.available && !current_off.MatchesOutput(sample)) return;
+        }
+      }
     }
     if (measure_cpu) {
       cpu_start = SteadyNowNs();
@@ -2174,6 +2329,12 @@ inline NVSDK_NGX_Result Ngx11Evaluate(int slot, const char* entry,
       }
     }
     const NVSDK_NGX_Result result = real();
+    if (NVSDK_NGX_SUCCEED(result) && ordered_sr) {
+      sr_attempt.output = bridge::GetD3D11Resource(parameters, NVSDK_NGX_Parameter_Output);
+      sr_attempt.motion = bridge::GetD3D11Resource(parameters, NVSDK_NGX_Parameter_MotionVectors);
+      sr_attempt.depth = bridge::GetD3D11Resource(parameters, NVSDK_NGX_Parameter_Depth);
+      sr_attempt.exposure = bridge::GetD3D11Resource(parameters, NVSDK_NGX_Parameter_ExposureTexture);
+    }
     if (NVSDK_NGX_FAILED(result) && ordered_sr && sr_attempt.sequence != 0
         && edit_reuse_enabled.load() && monitor_requested.load()) {
       RuntimeLock lock(runtime_mutex);
@@ -2208,9 +2369,13 @@ inline NVSDK_NGX_Result Ngx11Evaluate(int slot, const char* entry,
   // e2e11_native control asserts it).  Outside the runtime lock, as the
   // prime requires.
   stage_plan::Plan plan;
+  bool has_adaptive_session = false;
   {
     RuntimeLock lock(runtime_mutex);
     plan = EvaluationStagePlan(handle);
+    if (const auto source = features.find(handle); source != features.end()) {
+      has_adaptive_session = source->second.adaptive_session != nullptr;
+    }
   }
   if (plan.valid && plan.At(stage_plan::Stage::RENDER).count != 0
       && enabled.load() && !NrYieldsToForeign()
@@ -2247,7 +2412,7 @@ inline NVSDK_NGX_Result Ngx11Evaluate(int slot, const char* entry,
     return result;
   }
   const bool ordered_upscaled = plan.valid && !plan.mixed && plan.At(stage_plan::Stage::UPSCALED).count == plan.pass_count
-      && enabled.load() && edit_reuse_enabled.load()
+      && enabled.load() && (edit_reuse_enabled.load() || nr_adaptive_enabled.load() || has_adaptive_session)
       && bridge_state.load(std::memory_order_acquire) == BridgeState::kUp && NgxLoaderView().nr_ready;
   const NVSDK_NGX_Result result = call_real(ordered_upscaled);
   if (NVSDK_NGX_FAILED(result)) {

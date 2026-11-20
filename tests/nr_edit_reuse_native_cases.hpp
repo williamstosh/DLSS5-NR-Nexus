@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -28,8 +29,10 @@
 namespace nr_edit_reuse_native_cases {
 namespace addon = renodx::addons::dlss5;
 namespace frame_policy = native::present_frame_policy;
-namespace frame_source = addon::fg::native_options::frame_source;
 namespace tag_source = native::native_tag_source;
+namespace native_adapter = addon::fg::native_options::internal;
+namespace frame_source = addon::fg::native_options::frame_source;
+namespace rate = addon::output_framerate;
 using stage_execution_cases::Capture;
 using stage_execution_cases::Snapshot;
 
@@ -71,7 +74,9 @@ int Run() {
     model_evaluated_handles.clear();
     model_released_handles.clear();
     fail_call = 0;
-    Check(!native::edit_reuse_fg_experiment.load(), "native Pre-FG edit experiment defaults off");
+#if defined(NR_NEXUS_DEV_CONTROL)
+    Check(!native::edit_reuse_fg_experiment.load(), "native FG diagnostics default off");
+#endif
     native::enabled = true;
     native::hooks_enabled = true;
     native::shutdown_quiesce_enabled = false;
@@ -103,7 +108,6 @@ int Run() {
     native::intensity = 1.f;
     native::preset = 2;
     native::edit_reuse_enabled = true;
-    native::edit_reuse_fg_experiment = true;
     native::direct_api.private_instance = true;
     native::direct_api.module = GetModuleHandleW(nullptr);
     native::direct_api.create = CreateModel;
@@ -128,6 +132,13 @@ int Run() {
     Check(native::InstallQueueCompletionHooks(gpu.queue.Get()), "native edit production Execute hook");
     Check(native::InstallCommandListStateHooks(gpu.list.Get()), "native edit production command-list hooks");
     Check(native::InstallMixedPresentCopyHooks(gpu.list.Get()), "native tag-copy production CopyResource observer");
+    const auto* registered_tag = std::ranges::find_if(native::kStreamlineHooks, [](const auto& hook) {
+      return std::string_view(hook.name) == "slSetTagForFrame";
+    });
+    Check(registered_tag != std::end(native::kStreamlineHooks) && registered_tag->detour != nullptr,
+        "production Streamline hook inventory registers the per-frame tag entry");
+    const auto set_tag_for_frame = reinterpret_cast<decltype(native::real_streamline_set_tag_for_frame)>(
+        registered_tag->detour);
     const auto execute_recording = [&] {
       // Let production Execute hooks attach the proof; Gpu::Submit also
       // reserves a synthetic host proof and is deliberately not used here.
@@ -182,7 +193,10 @@ int Run() {
     auto ui = gpu.Texture(width, height, DXGI_FORMAT_R8G8B8A8_UNORM);
     auto depth = gpu.Texture(width, height, DXGI_FORMAT_R32G8X24_TYPELESS);
     auto motion = gpu.Texture(width, height, DXGI_FORMAT_R16G16_FLOAT);
-    auto output = gpu.Swapchain(DXGI_FORMAT_R10G10B10A2_UNORM);
+    auto other_motion = gpu.Texture(width, height, DXGI_FORMAT_R16G16_FLOAT, NATIVE_INPUT_STATE);
+    ComPtr<ReceiptSwapchain> output;
+    output.Attach(new ReceiptSwapchain(nullptr));
+    output->current_back_buffer = backbuffer.Get();
     auto& owner = native::present_streams[nullptr];
     owner.device_identity = renodx::utils::directx::NativeIdentity(gpu.device.Get());
     owner.native_output_identity = renodx::utils::directx::NativeIdentity(output.Get());
@@ -231,6 +245,170 @@ int Run() {
     native::native_fg_owns = true;
     const auto context = reinterpret_cast<uintptr_t>(&owner);
     const auto output_identity = reinterpret_cast<uintptr_t>(owner.native_output_identity);
+    const uintptr_t registered_buffers[]{reinterpret_cast<uintptr_t>(
+        renodx::utils::directx::NativeIdentity(backbuffer.Get()))};
+    rate::RegisterPresentOutput(context, reinterpret_cast<uintptr_t>(owner.device_identity),
+        output_identity, registered_buffers);
+    struct SdkConsumer {
+      const void* context = nullptr;
+      void (*evaluate)(const void*) = nullptr;
+      HRESULT result = S_OK;
+    };
+    static SdkConsumer sdk_consumer;
+    native_adapter::state.present = +[](IDXGISwapChain*, UINT, UINT, bool& skip) {
+      skip = true;
+      sdk_consumer.evaluate(sdk_consumer.context);
+      return sdk_consumer.result;
+    };
+    native_adapter::decisions_ready = true;
+    const auto* registered_present = std::ranges::find_if(native_adapter::PRESENT_HOOKS, [](const auto& hook) {
+      return std::string_view(hook.name) == "slHookPresent";
+    });
+    Check(registered_present != std::end(native_adapter::PRESENT_HOOKS) && registered_present->detour != nullptr,
+        "Native SDK installation registers the outer Present entry");
+    const auto sdk_present = reinterpret_cast<native_adapter::Present>(registered_present->detour);
+    const auto& registered_marker = native_adapter::REFLEX_MARKER_HOOK[0];
+    Check(std::string_view(registered_marker.name) == "slReflexSetMarker" && registered_marker.detour != nullptr,
+        "Native installation registers the Reflex PresentStart producer in this build");
+    const auto sdk_marker = reinterpret_cast<frame_source::SetMarker>(registered_marker.detour);
+    static thread_local sl::Result original_marker_result = sl::Result::eOk;
+    const auto mock_marker = +[](sl::PCLMarker, const sl::FrameToken&) { return original_marker_result; };
+    funnel_accounting_tests::Restore marker_substitutions;
+    marker_substitutions.Value(&native_adapter::reflex_marker.real);
+    marker_substitutions.Value(&native_adapter::test_now_ns);
+    native_adapter::reflex_marker.real = mock_marker;
+    frame_source::Activate();
+    const auto mark_start = [&](uint32_t token, sl::Result result = sl::Result::eOk) {
+      FakeFrameToken frame;
+      frame.frame = token;
+      original_marker_result = result;
+      Check(sdk_marker(sl::PCLMarker::ePresentStart, frame) == result,
+          "the registered Reflex wrapper returns the actual PresentStart outcome");
+    };
+    const auto tag_sdk = [&](uint32_t token) {
+      FakeFrameToken frame;
+      frame.frame = token;
+      sl::Resource resource(sl::ResourceType::eTex2d, backbuffer.Get(), NATIVE_INPUT_STATE);
+      const sl::ResourceTag tag(&resource, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilPresent);
+      const auto original = std::exchange(native::real_streamline_set_tag_for_frame,
+          +[](const sl::FrameToken&, const sl::ViewportHandle&, const sl::ResourceTag*, uint32_t, sl::CommandBuffer*) {
+            return sl::Result::eOk;
+          });
+      const auto tagged = set_tag_for_frame(frame, sl::ViewportHandle(0u), &tag, 1, gpu.list.Get());
+      native::real_streamline_set_tag_for_frame = original;
+      Check(tagged == sl::Result::eOk, "the registered Streamline wrapper returns the actual Backbuffer tag result");
+    };
+    const auto run_sdk = [&](uint32_t token, auto&& evaluate, bool success = true, bool tag_backbuffer = true,
+                             bool issue_start = true, UINT flags = 0, IDXGISwapChain* sdk_output = nullptr) {
+      if (tag_backbuffer) {
+        tag_sdk(token);
+      }
+      if (issue_start) {
+        mark_start(token);
+      }
+      using Evaluate = std::remove_reference_t<decltype(evaluate)>;
+      const auto previous = std::exchange(sdk_consumer, SdkConsumer{
+          .context = &evaluate, .evaluate = +[](const void* context) { (*static_cast<const Evaluate*>(context))(); },
+          .result = (success ? S_OK : E_FAIL)});
+      bool skip = false;
+      Check(sdk_present(sdk_output != nullptr ? sdk_output : output.Get(), 0, flags, skip) == sdk_consumer.result && skip,
+          "the registered outer SDK wrapper forwards the consumer and its routing result");
+      sdk_consumer = previous;
+      if (previous.context == nullptr) {
+        Check(!addon::fg::native_options::CurrentPresentFrame(reinterpret_cast<const void*>(output_identity),
+                  backbuffer.Get()).available,
+            "the real SDK Present scope cannot supply a deferred token after its return");
+      }
+    };
+    constexpr uint32_t scope_token = 0x8aa;
+    const auto read_sync_frame = [&] {
+      return addon::fg::native_options::CurrentPresentFrame(owner.native_output_identity, backbuffer.Get());
+    };
+    run_sdk(scope_token + 1, [&] {
+      const auto frame = read_sync_frame();
+      Check(frame.available && frame.frame == scope_token + 1,
+          "the current registered SDK entry binds a successful PresentStart without a Backbuffer frame tag");
+      Check(!addon::fg::native_options::CurrentPresentFrame(other_motion.Get(), backbuffer.Get()).available
+                && !addon::fg::native_options::CurrentPresentFrame(owner.native_output_identity, other_motion.Get()).available,
+          "the live SDK entry refuses a different output or Backbuffer");
+      bool worker_claimed = true;
+      std::jthread worker([&] { worker_claimed = read_sync_frame().available; });
+      worker.join();
+      Check(!worker_claimed, "another thread cannot borrow the current SDK PresentStart");
+      run_sdk(scope_token + 1, [&] {
+        const auto nested = read_sync_frame();
+        Check(nested.available && nested.epoch == frame.epoch,
+            "a genuine nested SDK callback for the same output keeps the outer PresentStart");
+      }, true, false, false);
+    }, true, false);
+    run_sdk(scope_token, [&] {
+      Check(!read_sync_frame().available, "a successful Backbuffer tag and SDK entry cannot replace PresentStart");
+    }, true, true, false);
+    run_sdk(scope_token + 1, [&] {
+      Check(!read_sync_frame().available, "the next SDK call cannot redeem a previously bound PresentStart");
+    }, true, false, false);
+    ComPtr<ReceiptSwapchain> other_output;
+    other_output.Attach(new ReceiptSwapchain(nullptr));
+    run_sdk(scope_token + 20, [&] {
+      Check(read_sync_frame().available, "the original output owns its live SDK scope before foreign nesting");
+      run_sdk(scope_token + 20, [&] {
+        Check(!read_sync_frame().available, "a real nested SDK callback for another output cannot borrow the outer frame");
+      }, true, false, false, 0, other_output.Get());
+      Check(!read_sync_frame().available, "the conflicting output revokes the outer PresentStart before later consumption");
+    }, true, false);
+    mark_start(scope_token + 2, sl::Result::eErrorInvalidState);
+    run_sdk(scope_token + 2, [&] {
+      Check(!read_sync_frame().available, "a failed PresentStart cannot use an otherwise valid Backbuffer frame tag");
+    }, true, true, false);
+    mark_start(scope_token + 3);
+    run_sdk(scope_token + 4, [&] {
+      Check(!read_sync_frame().available, "a conflicting valid frame tag and PresentStart cannot identify the NGX input");
+    }, true, true, false);
+    tag_sdk(scope_token + 5);
+    tag_sdk(scope_token + 6);
+    run_sdk(scope_token + 6, [&] {
+      Check(!read_sync_frame().available, "PresentStart cannot resolve competing successful tags for the current Backbuffer");
+    }, true, false);
+    mark_start(scope_token + 7);
+    mark_start(scope_token + 8);
+    run_sdk(scope_token + 8, [&] {
+      Check(!read_sync_frame().available, "two competing starts before the real SDK entry cannot select the latest token");
+    }, true, false, false);
+    static const frame_source::SetMarker reenter_marker = sdk_marker;
+    native_adapter::reflex_marker.real = +[](sl::PCLMarker marker, const sl::FrameToken& frame) {
+      if (static_cast<uint32_t>(frame) == scope_token + 9) {
+        FakeFrameToken overlap;
+        overlap.frame = scope_token + 10;
+        return reenter_marker(marker, overlap);
+      }
+      return sl::Result::eOk;
+    };
+    mark_start(scope_token + 9);
+    native_adapter::reflex_marker.real = mock_marker;
+    run_sdk(scope_token + 9, [&] {
+      Check(!read_sync_frame().available, "overlapping successful registered marker writes cannot authorize the SDK entry");
+    }, true, false, false);
+    native_adapter::test_now_ns = native_adapter::NowNs();
+    mark_start(scope_token + 11);
+    native_adapter::test_now_ns += frame_source::PRESENT_START_TTL_NS + 1;
+    run_sdk(scope_token + 11, [&] {
+      Check(!read_sync_frame().available, "an expired successful PresentStart cannot enter a new SDK scope");
+    }, true, false, false);
+    run_sdk(scope_token + 12, [&] {
+      Check(read_sync_frame().available, "the registered SDK entry binds a fresh PresentStart");
+      native_adapter::test_now_ns += frame_source::PRESENT_START_TTL_NS + 1;
+      Check(!read_sync_frame().available, "an expired PresentStart cannot authorize later consumption inside a slow SDK scope");
+    }, true, false);
+    native_adapter::test_now_ns = 0;
+    run_sdk(scope_token + 13, [&] {
+      Check(!read_sync_frame().available, "TEST Present cannot bind the successful PresentStart");
+    }, true, true, true, DXGI_PRESENT_TEST);
+    run_sdk(scope_token + 13, [&] {
+      const auto frame = read_sync_frame();
+      Check(frame.available && frame.frame == scope_token + 13, "the real SDK entry binds the unconsumed matching start and tag");
+    }, true, false, false);
+    std::cout << "PASS synchronous SDK frame evidence successful-PresentStart+real-entry;"
+                 " failed/conflicting/overlapped/expired/cross-thread/test/wrong-output/wrong-bb denied\n";
     ComPtr<ID3D12CommandAllocator> proof_allocator;
     ComPtr<ID3D12GraphicsCommandList> proof_list;
     Check(SUCCEEDED(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&proof_allocator)))
@@ -238,12 +416,12 @@ int Run() {
                 nullptr, IID_PPV_ARGS(&proof_list)))
             && native::InstallCommandListStateHooks(proof_list.Get()),
         "tag-copy proof query uses a separate real recording");
-    frame_source::Activate();
     std::vector<uint32_t> source_back(width * height), source_hudless(width * height);
     std::vector<uint8_t> source_ui(width * height * 4);
     bool initialized = false;
     bool clone_initialized = false;
     enum class TagCopy { NONE, SUCCESS, FAILED, OVERWRITTEN, DIRECT, DIRECT_AMBIGUOUS };
+    enum class TagChange { NONE, WRITE_ALPHA, PRESENT_END, RETAG_HUDLESS, RETAG_ALPHA };
     struct Request {
       uint32_t token = 0;
       bool reset = false;
@@ -256,6 +434,11 @@ int Run() {
       bool owner_ready = true;
       bool with_ui_alpha = true;
       bool retain_recording = false;
+      bool omit_alpha_tag = false;
+      bool sdk_wrapper = false;
+      TagChange tag_change = TagChange::NONE;
+      bool overwrite_sync_motion = false;
+      bool without_backbuffer_tag = false;
     };
     struct Observation {
       bool replaced = false;
@@ -377,7 +560,55 @@ int Run() {
       Snapshot consumed_back, consumed_hudless, restored_back, original_hudless, unchanged_ui;
       const auto consume = [&] {
         ID3D12Resource* original = nullptr;
-        {
+        ID3D12Resource* bound_hudless = nullptr;
+        const auto read_sdk_inputs = [&] {
+          bound_hudless = native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_HUDLess);
+          if (observed.replaced) {
+            const auto& stream = native::fg_service::streams.at({true, context});
+            const auto* cached = stream.cached;
+            Check(cached != nullptr && cached->color[0] != nullptr && stream.source_backbuffer == backbuffer.Get()
+                    && stream.source_hudless == input_hudless,
+                "native FG publishes both output colors for the actual borrowed input pair");
+            auto* delivered_hudless = (cached->color_inputs_prepared ? cached->coupled_hudless : cached->color[1]);
+            Check(original == input_hudless && bound_hudless == delivered_hudless
+                    && bound_hudless != input_hudless && bound_hudless != backbuffer.Get(),
+                "native FG consumes the group's private HUDLess result and returns the borrowed original binding");
+          } else {
+            Check(original == nullptr && bound_hudless == input_hudless,
+                "unprepared native input keeps its original HUDLess binding");
+          }
+          Check(native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_Backbuffer) == backbuffer.Get()
+                  && native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_UI) == nullptr
+                  && native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_UIAlpha) == input_alpha,
+              "native FG keeps the BB, UI and alpha parameter bindings at consumption");
+          consumed_back = Capture(gpu, backbuffer.Get(), NATIVE_INPUT_STATE);
+          consumed_hudless = Capture(gpu, bound_hudless, NATIVE_INPUT_STATE);
+        };
+        if (request.sdk_wrapper) {
+          const auto result = (request.fg_success ? NVSDK_NGX_Result_Success : NVSDK_NGX_Result_Fail);
+          uint32_t original_calls = 0;
+          const auto original_evaluate = [&](ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* feature,
+                                             const NVSDK_NGX_Parameter* block) {
+            Check(list == gpu.list.Get() && feature == handle && block == &parameters,
+                "the actual NGX detour forwards the real command list, FG handle and parameter block");
+            ++original_calls;
+            observed.replaced = native::PreFgResource(block, NVSDK_NGX_DLSSG_Parameter_HUDLess) != input_hudless;
+            if (observed.replaced) {
+              original = input_hudless;
+            }
+            read_sdk_inputs();
+            return result;
+          };
+          static thread_local const decltype(original_evaluate)* handler = nullptr;
+          handler = &original_evaluate;
+          auto* previous = std::exchange(native::ngx_slot_real[0].evaluate, reinterpret_cast<void*>(+[](
+              ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* feature, const NVSDK_NGX_Parameter* block,
+              PFN_NVSDK_NGX_ProgressCallback) { return (*handler)(list, feature, block); }));
+          const auto forwarded = native::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), handle, &parameters, nullptr);
+          native::ngx_slot_real[0].evaluate = previous;
+          handler = nullptr;
+          Check(forwarded == result && original_calls == 1, "the detour returns exactly one original SDK outcome");
+        } else {
           const addon::RuntimeLock lock(native::runtime_mutex);
           if (request.owner_ready) {
             original = native::RunNativePreFg(gpu.list.Get(), &parameters, handle, &observed.replaced);
@@ -386,7 +617,7 @@ int Run() {
             const auto features_before = native::features.size();
             const auto creates_before = native::nr_features_created;
             const auto evaluates_before = model_calls;
-            const auto claims_before = tag_source::Snapshot().claim_count;
+            const auto unclaimed = tag_source::CurrentFrame(input_hudless, gpu.list.Get());
             const auto& existing = native::fg_service::streams.at({true, context});
             auto* cached_before = existing.cached;
             const auto serial_before = existing.native_serial;
@@ -413,11 +644,10 @@ int Run() {
                     && unchanged.base_frame_clock.claims == common_claims_before
                     && unchanged.base_frame_clock.outputs == common_outputs_before,
                 "owner-unavailable consumption cannot create or advance the previous output cache");
-            const auto claimed = tag_source::Snapshot();
-            const auto exact = tag_source::CurrentFrame(input_hudless, gpu.list.Get(), claimed.claim_epoch);
-            Check(claimed.claim_count == claims_before + 1 && claimed.claim_epoch != 0
-                    && std::strcmp(claimed.claim_reason, "direct_claimed") == 0
-                    && exact.available && exact.frame == request.token && exact.epoch == claimed.claim_epoch
+            const auto exact = tag_source::CurrentFrame(input_hudless, gpu.list.Get(), unclaimed.epoch);
+            Check(unclaimed.available && unclaimed.epoch != 0
+                    && std::strcmp(exact.reason, "direct_tag_claimed") == 0
+                    && exact.available && exact.frame == request.token && exact.epoch == unclaimed.epoch
                     && !tag_source::CurrentFrame(input_hudless, gpu.list.Get()).available,
                 "real index-one consumption claims its unique direct tag even before an NR owner is ready");
             Check(!submission::ResourceReleasable(input_hudless)
@@ -425,28 +655,10 @@ int Run() {
                 "owner-unavailable direct claim tracks the actual original resource in its consuming recording");
           }
         }
-        auto* bound_hudless = native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_HUDLess);
-        if (observed.replaced) {
-          const auto& stream = native::fg_service::streams.at({true, context});
-          const auto* cached = stream.cached;
-          Check(cached != nullptr && cached->color[0] != nullptr && stream.source_backbuffer == backbuffer.Get()
-                  && stream.source_hudless == input_hudless,
-              "native FG publishes both output colors for the actual borrowed input pair");
-          auto* delivered_hudless = (cached->color_inputs_prepared ? cached->coupled_hudless : cached->color[1]);
-          Check(original == input_hudless && bound_hudless == delivered_hudless
-                  && bound_hudless != input_hudless && bound_hudless != backbuffer.Get(),
-              "native FG consumes the group's private HUDLess result and returns the borrowed original binding");
-        } else {
-          Check(original == nullptr && bound_hudless == input_hudless,
-              "unprepared native input keeps its original HUDLess binding");
+        if (!request.sdk_wrapper) {
+          read_sdk_inputs();
+          native::RestoreNativePreFg(gpu.list.Get(), &parameters, original, request.fg_success, handle, observed.replaced);
         }
-        Check(native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_Backbuffer) == backbuffer.Get()
-                && native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_UI) == nullptr
-                && native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_UIAlpha) == input_alpha,
-            "native FG keeps the BB, UI and alpha parameter bindings at consumption");
-        consumed_back = Capture(gpu, backbuffer.Get(), NATIVE_INPUT_STATE);
-        consumed_hudless = Capture(gpu, bound_hudless, NATIVE_INPUT_STATE);
-        native::RestoreNativePreFg(gpu.list.Get(), &parameters, original, request.fg_success, handle, observed.replaced);
         Check(native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_Backbuffer) == backbuffer.Get()
                 && native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_HUDLess) == input_hudless
                 && native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_UI) == nullptr
@@ -459,6 +671,50 @@ int Run() {
         restored_back = Capture(gpu, backbuffer.Get(), NATIVE_INPUT_STATE);
         original_hudless = Capture(gpu, input_hudless, NATIVE_INPUT_STATE);
         unchanged_ui = Capture(gpu, ui.Get(), NATIVE_INPUT_STATE);
+        if (request.overwrite_sync_motion) {
+          Check(observed.replaced && bound_hudless != input_hudless,
+              "synchronous MFG overwrite test starts with an accepted index-one replacement");
+          auto duplicate = parameters;
+          duplicate.Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, 2u);
+          ID3D12Resource* sdk_hudless = nullptr;
+          const auto original_evaluate = [&](ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* feature,
+                                             const NVSDK_NGX_Parameter* block) {
+            Check(list == gpu.list.Get() && feature == handle && block == &duplicate
+                      && native::PreFgResource(block, NVSDK_NGX_DLSSG_Parameter_MVecs) == motion.Get(),
+                "the SDK receives the same FG call and motion binding after a same-address overwrite");
+            sdk_hudless = native::PreFgResource(block, NVSDK_NGX_DLSSG_Parameter_HUDLess);
+            return NVSDK_NGX_Result_Success;
+          };
+          static thread_local const decltype(original_evaluate)* handler = nullptr;
+          funnel_accounting_tests::Restore operation;
+          operation.Value(&handler);
+          operation.Value(&native::ngx_slot_real[0].evaluate);
+          handler = &original_evaluate;
+          native::ngx_slot_real[0].evaluate = reinterpret_cast<void*>(+[](
+              ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* feature, const NVSDK_NGX_Parameter* block,
+              PFN_NVSDK_NGX_ProgressCallback) { return (*handler)(list, feature, block); });
+          const auto before = read_progress();
+          const auto calls = model_calls;
+          const auto reuses = native::edit_reuse_reuses.load();
+          const auto evaluate_mfg = [&](ID3D12Resource* expected, const char* message) {
+            sdk_hudless = nullptr;
+            Check(native::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), handle, &duplicate, nullptr)
+                          == NVSDK_NGX_Result_Success && sdk_hudless == expected,
+                message);
+            Check(native::PreFgResource(&duplicate, NVSDK_NGX_DLSSG_Parameter_HUDLess) == input_hudless
+                      && model_calls == calls && native::edit_reuse_reuses.load() == reuses
+                      && read_progress() == before,
+                "MFG preserves the first delivery, history and original parameter bindings");
+          };
+          evaluate_mfg(bound_hudless, "the actual NGX wrapper re-delivers an unchanged synchronous input group");
+          upload(other_motion.Get(), std::vector<uint16_t>(width * height * 2, 0x3c00), NATIVE_INPUT_STATE);
+          gpu.Transition(other_motion.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+          gpu.Transition(motion.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_DEST);
+          gpu.list->CopyResource(motion.Get(), other_motion.Get());
+          gpu.Transition(motion.Get(), D3D12_RESOURCE_STATE_COPY_DEST, NATIVE_INPUT_STATE);
+          gpu.Transition(other_motion.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, NATIVE_INPUT_STATE);
+          evaluate_mfg(input_hudless, "the actual NGX wrapper rejects synchronous cache reuse after same-address motion overwrite");
+        }
         if (request.retain_recording) {
           for (const auto* snapshot : {&consumed_back, &consumed_hudless, &restored_back, &original_hudless, &unchanged_ui}) {
             gpu.retained_resources.emplace_back(snapshot->readback.Get());
@@ -472,10 +728,11 @@ int Run() {
                       == submission::UseSubmission::kUnsubmitted,
               "complete Native color recording has no cross-list order before Execute");
           const auto check_mfg = [&](ID3D12GraphicsCommandList* consumer, ID3D12Resource* consumer_hudless,
-                                     bool deliver) {
+                                     ID3D12Resource* consumer_motion, bool deliver) {
             auto duplicate = parameters;
             duplicate.Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, 2u);
             duplicate.Set(NVSDK_NGX_DLSSG_Parameter_HUDLess, consumer_hudless);
+            duplicate.Set(NVSDK_NGX_DLSSG_Parameter_MVecs, consumer_motion);
             const auto before = model_calls;
             const auto reuses = native::edit_reuse_reuses.load();
             bool replaced = false;
@@ -494,9 +751,10 @@ int Run() {
                     && read_progress() == produced,
                 "Native MFG restores its binding and neither denial nor ordered re-delivery advances history");
           };
-          check_mfg(proof_list.Get(), input_hudless, false);
-          check_mfg(gpu.list.Get(), nullptr, false);
-          check_mfg(gpu.list.Get(), input_hudless, true);
+          check_mfg(proof_list.Get(), input_hudless, motion.Get(), false);
+          check_mfg(gpu.list.Get(), nullptr, motion.Get(), false);
+          check_mfg(gpu.list.Get(), input_hudless, other_motion.Get(), false);
+          check_mfg(gpu.list.Get(), input_hudless, motion.Get(), true);
         }
       };
       if (request.tag_copy != TagCopy::NONE) {
@@ -511,33 +769,51 @@ int Run() {
           for (uint32_t pending = 0; pending < pending_tags; ++pending) {
             FakeFrameToken frame;
             frame.frame = request.token + pending;
-            Check(frame_source::ObserveMarker(+[](sl::PCLMarker, const sl::FrameToken&) { return sl::Result::eOk; },
-                      sl::PCLMarker::ePresentStart, frame) == sl::Result::eOk,
-                "tag producer enters the actual successful Reflex marker observer");
             {
-              const frame_source::SdkScope sdk_scope(output_identity);
-              sl::Resource resource(sl::ResourceType::eTex2d, hudless.Get(), NATIVE_INPUT_STATE);
-              const sl::ResourceTag tag(&resource, sl::kBufferTypeHUDLessColor,
-                  direct_tag ? sl::ResourceLifecycle::eValidUntilPresent : sl::ResourceLifecycle::eOnlyValidNow);
+              sl::Resource backbuffer_tag(sl::ResourceType::eTex2d, backbuffer.Get(), NATIVE_INPUT_STATE);
+              sl::Resource hudless_tag(sl::ResourceType::eTex2d, hudless.Get(), NATIVE_INPUT_STATE);
+              sl::Resource depth_tag(sl::ResourceType::eTex2d, depth.Get(), NATIVE_INPUT_STATE);
+              sl::Resource motion_tag(sl::ResourceType::eTex2d, motion.Get(), NATIVE_INPUT_STATE);
+              sl::Resource alpha_tag(sl::ResourceType::eTex2d, input_alpha, NATIVE_INPUT_STATE);
+              constexpr auto until_present = sl::ResourceLifecycle::eValidUntilPresent;
+              const sl::ResourceTag tags[] = {
+                  {&backbuffer_tag, sl::kBufferTypeBackbuffer, until_present},
+                  {&hudless_tag, sl::kBufferTypeHUDLessColor,
+                      direct_tag ? until_present : sl::ResourceLifecycle::eOnlyValidNow},
+                  {&depth_tag, sl::kBufferTypeDepth, until_present},
+                  {&motion_tag, sl::kBufferTypeMotionVectors, until_present},
+                  {&alpha_tag, sl::kBufferTypeUIAlpha, until_present},
+              };
+              const uint32_t tag_count = (input_alpha != nullptr && !request.omit_alpha_tag ? 5u : 4u);
               const sl::ViewportHandle viewport(0u);
-              tag_source::Scope tag_scope(gpu.list.Get(), static_cast<uint32_t>(frame),
-                  static_cast<uint32_t>(viewport), &tag, 1);
-              if (!direct_tag) {
-                gpu.Transition(hudless.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                gpu.Transition(hudless_clone.Get(), clone_initialized ? NATIVE_INPUT_STATE : D3D12_RESOURCE_STATE_COMMON,
-                    D3D12_RESOURCE_STATE_COPY_DEST);
-                // Only the installed production CopyResource observer may bind
-                // this destination to the tag. Do not call ObserveCopy directly.
-                gpu.list->CopyResource(hudless_clone.Get(), hudless.Get());
-                gpu.Transition(hudless_clone.Get(), D3D12_RESOURCE_STATE_COPY_DEST, NATIVE_INPUT_STATE);
-                gpu.Transition(hudless.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, NATIVE_INPUT_STATE);
-                clone_initialized = true;
-              }
-              tag_scope.Finish(request.tag_copy != TagCopy::FAILED);
+              const auto original_tag = [&](const sl::FrameToken& original_frame, const sl::ViewportHandle& original_viewport,
+                                            const sl::ResourceTag* original_tags, uint32_t count, sl::CommandBuffer* list) {
+                Check(&original_frame == &frame && &original_viewport == &viewport && original_tags == tags
+                          && count == tag_count && list == gpu.list.Get(),
+                    "the registered wrapper passes the exact frame, viewport, tag and recording to Streamline");
+                if (!direct_tag) {
+                  gpu.Transition(hudless.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                  gpu.Transition(hudless_clone.Get(), clone_initialized ? NATIVE_INPUT_STATE : D3D12_RESOURCE_STATE_COMMON,
+                      D3D12_RESOURCE_STATE_COPY_DEST);
+                  gpu.list->CopyResource(hudless_clone.Get(), hudless.Get());
+                  gpu.Transition(hudless_clone.Get(), D3D12_RESOURCE_STATE_COPY_DEST, NATIVE_INPUT_STATE);
+                  gpu.Transition(hudless.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, NATIVE_INPUT_STATE);
+                  clone_initialized = true;
+                }
+                return (request.tag_copy != TagCopy::FAILED ? sl::Result::eOk : sl::Result::eErrorInvalidParameter);
+              };
+              static const decltype(original_tag)* handler = nullptr;
+              handler = &original_tag;
+              native::real_streamline_set_tag_for_frame = +[](const sl::FrameToken& frame, const sl::ViewportHandle& viewport,
+                                                             const sl::ResourceTag* tags, uint32_t count, sl::CommandBuffer* list) {
+                return (*handler)(frame, viewport, tags, count, list);
+              };
+              const auto result = set_tag_for_frame(frame, viewport, tags, tag_count, gpu.list.Get());
+              handler = nullptr;
+              native::real_streamline_set_tag_for_frame = nullptr;
+              Check((result == sl::Result::eOk) == (request.tag_copy != TagCopy::FAILED),
+                  "the registered frame-tag wrapper returns the SDK outcome");
             }
-            Check(frame_source::ObserveMarker(+[](sl::PCLMarker, const sl::FrameToken&) { return sl::Result::eOk; },
-                      sl::PCLMarker::ePresentEnd, frame) == sl::Result::eOk,
-                "producer Present and Reflex scopes finish before deferred NGX consumption");
             if (request.tag_copy == TagCopy::DIRECT_AMBIGUOUS && pending == 0) {
               uint64_t unclaimed_epoch = 0;
               {
@@ -574,6 +850,46 @@ int Run() {
             }
             submit();
           }
+          if (request.tag_change == TagChange::PRESENT_END) {
+            {
+              const addon::RuntimeLock lock(native::runtime_mutex);
+              Check(tag_source::CurrentFrame(input_hudless, gpu.list.Get()).available,
+                  "the fresh completed role group is eligible before the SDK Present boundary");
+            }
+            addon::fg::native_options::Configure(nullptr, native::OnNativePresentObserved);
+            run_sdk(request.token, [] {}, true, false, false);
+            addon::fg::native_options::Configure(nullptr);
+            {
+              const addon::RuntimeLock lock(native::runtime_mutex);
+              Check(!tag_source::CurrentFrame(input_hudless, gpu.list.Get()).available,
+                  "the SDK Present boundary expires the role group before any subsequent texture overwrite");
+            }
+          }
+          if (request.tag_change == TagChange::WRITE_ALPHA || request.tag_change == TagChange::PRESENT_END) {
+            for (size_t alpha = 3; alpha < source_ui.size(); alpha += 4) {
+              source_ui[alpha] ^= 0xff;
+            }
+            upload(ui.Get(), source_ui, NATIVE_INPUT_STATE);
+            submit();
+          }
+          if (request.tag_change == TagChange::RETAG_HUDLESS || request.tag_change == TagChange::RETAG_ALPHA) {
+            const bool tag_hudless = request.tag_change == TagChange::RETAG_HUDLESS;
+            FakeFrameToken newer;
+            newer.frame = request.token + 1;
+            sl::Resource resource(sl::ResourceType::eTex2d,
+                tag_hudless ? static_cast<void*>(hudless.Get()) : static_cast<void*>(ui.Get()), NATIVE_INPUT_STATE);
+            const sl::ResourceTag replacement(&resource,
+                tag_hudless ? sl::kBufferTypeHUDLessColor : sl::kBufferTypeUIAlpha,
+                sl::ResourceLifecycle::eValidUntilPresent);
+            const auto original = std::exchange(native::real_streamline_set_tag_for_frame,
+                +[](const sl::FrameToken&, const sl::ViewportHandle&, const sl::ResourceTag*, uint32_t, sl::CommandBuffer* list) {
+                  Check(list == nullptr, "role-only retag forwards the SDK's null list");
+                  return sl::Result::eOk;
+                });
+            const auto result = set_tag_for_frame(newer, sl::ViewportHandle(0u), &replacement, 1, nullptr);
+            native::real_streamline_set_tag_for_frame = original;
+            Check(result == sl::Result::eOk, "the registered role-only tag wrapper returns SDK success");
+          }
           if (request.tag_copy == TagCopy::OVERWRITTEN) {
             gpu.Transition(backbuffer.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
             gpu.Transition(hudless_clone.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -587,7 +903,7 @@ int Run() {
         std::thread consumer([&] {
           try {
             Check(GetCurrentThreadId() != producer_thread
-                    && !addon::fg::native_options::CurrentFrame(output_identity).available,
+                    && !addon::fg::native_options::CurrentPresentFrame(owner.native_output_identity, backbuffer.Get()).available,
                 "deferred NGX consumes on another thread with no producer TLS ticket");
             {
               const addon::RuntimeLock lock(native::runtime_mutex);
@@ -598,14 +914,29 @@ int Run() {
                 claimed_epoch = source->second.native_edit_source_epoch;
                 Check(claimed_epoch != 0, "repeated MFG queries the production pair's claimed source epoch");
               }
-              const auto tagged = tag_source::CurrentFrame(input_hudless, gpu.list.Get(), claimed_epoch);
+              const native::native_tag_source::FrameRoles roles{
+                  .back_buffer = backbuffer.Get(), .depth = depth.Get(), .motion = motion.Get(), .alpha = input_alpha};
+              const auto tagged = tag_source::CurrentFrame(input_hudless, gpu.list.Get(), claimed_epoch, &roles);
               observed.source_generation = tagged.generation;
-              const bool expected = request.tag_copy == TagCopy::SUCCESS || request.tag_copy == TagCopy::DIRECT;
+              const bool expected = !request.omit_alpha_tag && request.tag_change == TagChange::NONE
+                  && (request.tag_copy == TagCopy::SUCCESS || request.tag_copy == TagCopy::DIRECT);
               Check(tagged.available == expected && (!expected || tagged.frame == request.token),
                   "only a successful unique direct tag or unchanged completed clone retains its actual FrameToken");
               if (request.tag_copy == TagCopy::DIRECT_AMBIGUOUS) {
                 Check(std::strcmp(tagged.reason, "tagged_resource_tokens_ambiguous") == 0,
                     "two direct tokens are refused specifically for ambiguity rather than a missing source");
+              }
+              if (request.omit_alpha_tag) {
+                Check(std::strcmp(tagged.reason, "tagged_resource_group_mismatch") == 0,
+                    "a tagged HUDLess version cannot substitute for an untagged required alpha version");
+              }
+              if (request.tag_change == TagChange::WRITE_ALPHA) {
+                Check(std::strcmp(tagged.reason, "tagged_resource_group_overwritten") == 0,
+                    "a same-address Alpha overwrite withdraws the complete async color group");
+              }
+              if (request.tag_change == TagChange::RETAG_HUDLESS || request.tag_change == TagChange::RETAG_ALPHA) {
+                Check(std::strcmp(tagged.reason, "tagged_resource_group_retagged") == 0,
+                    "a successful role-only tag revokes the older group without a new list-backed tag ticket");
               }
             }
             consume();
@@ -615,19 +946,18 @@ int Run() {
         });
         consumer.join();
         if (consumer_failure != nullptr) std::rethrow_exception(consumer_failure);
+        if (request.update_source && request.tag_change != TagChange::PRESENT_END) {
+          run_sdk(request.token, [] {}, true, false, false);
+        }
       } else if (request.source_scope) {
-        FakeFrameToken token;
-        token.frame = request.token;
-        Check(frame_source::ObserveMarker(+[](sl::PCLMarker, const sl::FrameToken&) { return sl::Result::eOk; },
-                  sl::PCLMarker::ePresentStart, token) == sl::Result::eOk,
-            "real Reflex observer sees successful PresentStart");
-        const frame_source::SdkScope scope(output_identity);
-        const auto ticket = addon::fg::native_options::CurrentFrame(output_identity);
-        Check(ticket.available && ticket.frame == request.token, "SDK scope exposes this producer token");
-        observed.source_generation = ticket.generation;
-        consume();
+        run_sdk(request.token, [&] {
+          const auto ticket = addon::fg::native_options::CurrentPresentFrame(owner.native_output_identity, backbuffer.Get());
+          Check(ticket.available && ticket.frame == request.token, "SDK scope exposes this output's proven PresentStart");
+          observed.source_generation = ticket.generation;
+          consume();
+        }, true, !request.without_backbuffer_tag);
       } else {
-        Check(!addon::fg::native_options::CurrentFrame(output_identity).available,
+        Check(!addon::fg::native_options::CurrentPresentFrame(owner.native_output_identity, backbuffer.Get()).available,
             "missing SDK source scope cannot expose an old token");
         consume();
       }
@@ -645,15 +975,9 @@ int Run() {
                 && marker == prepared.cached->color[0] && serial == prepared.delivery_serial
                 && submission::UseSubmissionTokens(marker, &receipts) == submission::UseSubmission::kUnsubmitted,
             "SDK-accepted F2 remains PREPARED on the actual unsubmitted host recording");
-        FakeFrameToken late_token;
-        late_token.frame = request.token - 1;
-        Check(frame_source::ObserveMarker(+[](sl::PCLMarker, const sl::FrameToken&) { return sl::Result::eOk; },
-                  sl::PCLMarker::ePresentStart, late_token) == sl::Result::eOk,
-            "late F1 reaches the real Reflex observer before the F2 host list is submitted");
-        {
-          const frame_source::SdkScope scope(output_identity);
-          const auto ticket = addon::fg::native_options::CurrentFrame(output_identity);
-          Check(ticket.available && ticket.frame == late_token.frame && ticket.generation == prepared.source_generation,
+        run_sdk(request.token - 1, [&] {
+          const auto ticket = addon::fg::native_options::CurrentPresentFrame(owner.native_output_identity, backbuffer.Get());
+          Check(ticket.available && ticket.frame == request.token - 1 && ticket.generation == prepared.source_generation,
               "the late F1 consumer acquires its own trusted SDK scope in F2's source generation");
           auto late_parameters = parameters;
           late_parameters.Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, 1u);
@@ -665,7 +989,7 @@ int Run() {
           }
           Check(original == nullptr && !replaced, "unsubmitted F2 declines late F1 without another NR output replacement");
           native::RestoreNativePreFg(gpu.list.Get(), &late_parameters, original, false, handle, replaced);
-        }
+        }, false);
         Check(native::native_fg_result.load() == addon::fg::Result::PREPARED
                 && native::native_fg_marker.load() == marker && native::native_fg_recording_serial.load() == serial
                 && native::native_fg_submitted_frames.load() == submitted
@@ -695,7 +1019,7 @@ int Run() {
     bool direct_warmup_mfg_checked = false;
     const auto recover = [&](TagCopy tag_copy = TagCopy::NONE, bool reset = true) {
       for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 12; ++attempt) {
-        auto observed = record({.token = ++token, .reset = reset, .tag_copy = tag_copy});
+        auto observed = record({.token = ++token, .reset = reset, .tag_copy = tag_copy, .sdk_wrapper = tag_copy == TagCopy::NONE});
         Check(observed.reuses == 0, "native recovery cannot reuse an invalidated edit anchor");
         if (tag_copy == TagCopy::DIRECT && !direct_warmup_mfg_checked && !observed.replaced) {
           uint64_t claimed_epoch = 0, native_frame = 0;
@@ -791,12 +1115,16 @@ int Run() {
         const bool refresh = frame % 2 == 0;
         const auto before = read_progress();
         const auto submissions_before = native::native_fg_submitted_frames.load();
-        auto observed = record({.token = ++token, .reset = frame == 0});
+        auto observed = record({.token = ++token, .reset = frame == 0, .sdk_wrapper = extra == ExtraConsumption::NONE,
+            .without_backbuffer_tag = extra == ExtraConsumption::NONE});
         const auto after = read_progress();
-        Check(observed.replaced && observed.evaluates == (refresh ? 1u : 0u)
-                && observed.reuses == (refresh ? 0u : 1u)
-                && observed.reset == (refresh ? (frame == 0 ? 1 : 0) : -1),
-            "native real-frame model calls follow refresh/reuse/refresh/reuse with only the initial Reset");
+        if (!observed.replaced || observed.evaluates != (refresh ? 1u : 0u)
+            || observed.reuses != (refresh ? 0u : 1u)
+            || observed.reset != (refresh ? (frame == 0 ? 1 : 0) : -1)) {
+          throw std::runtime_error("Native refresh/reuse phase mismatch at token " + std::to_string(token)
+              + ", replaced " + std::to_string(observed.replaced) + ", evaluates " + std::to_string(observed.evaluates)
+              + ", reuses " + std::to_string(observed.reuses) + ", Reset " + std::to_string(observed.reset));
+        }
         const auto& base = stream.base_frame_clock.frame;
         Check(stream.native_edit_source && after.source == output_identity && after.source_generation != 0
                 && after.source_generation == observed.source_generation
@@ -870,15 +1198,9 @@ int Run() {
             late_parameters.Set(NVSDK_NGX_DLSSG_Parameter_UIAlpha, late_alpha);
             late_parameters.Set(NVSDK_NGX_DLSSG_Parameter_Reset, 1u);
             late_parameters.Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, 1u);
-            FakeFrameToken late_token;
-            late_token.frame = token - 1;
-            Check(frame_source::ObserveMarker(+[](sl::PCLMarker, const sl::FrameToken&) { return sl::Result::eOk; },
-                      sl::PCLMarker::ePresentStart, late_token) == sl::Result::eOk,
-                "the real Reflex observer accepts the delayed F1 PresentStart after F2");
-            {
-              const frame_source::SdkScope scope(output_identity);
-              const auto ticket = addon::fg::native_options::CurrentFrame(output_identity);
-              Check(ticket.available && ticket.frame == late_token.frame && ticket.generation == after.source_generation,
+            run_sdk(token - 1, [&] {
+              const auto ticket = addon::fg::native_options::CurrentPresentFrame(owner.native_output_identity, backbuffer.Get());
+              Check(ticket.available && ticket.frame == token - 1 && ticket.generation == after.source_generation,
                   "the late Native wrapper receives a trusted older token in F2's actual source generation");
               bool replaced = false;
               ID3D12Resource* original = nullptr;
@@ -893,7 +1215,7 @@ int Run() {
                       && native::PreFgResource(&late_parameters, NVSDK_NGX_DLSSG_Parameter_UIAlpha) == late_alpha
                       && native::GetUInt(&late_parameters, NVSDK_NGX_DLSSG_Parameter_Reset) == 1u,
                   "declining late F1 preserves its borrowed SDK parameters");
-            }
+            }, sdk_succeeded);
             const auto late_back = Capture(gpu, backbuffer.Get(), NATIVE_INPUT_STATE);
             const auto late_original_hudless = Capture(gpu, hudless.Get(), NATIVE_INPUT_STATE);
             submit();
@@ -922,6 +1244,17 @@ int Run() {
     const auto reset = record({.token = ++token, .reset = true});
     Check(reset.replaced && reset.evaluates == 1 && reset.reuses == 0 && reset.reset == 1,
         "explicit native Reset interrupts the x2 reuse phase");
+
+    const auto overwritten_refresh = record({.token = ++token, .reset = true,
+        .sdk_wrapper = true, .overwrite_sync_motion = true});
+    const auto overwritten_reuse = record({.token = ++token, .sdk_wrapper = true, .overwrite_sync_motion = true});
+    const auto after_overwrite = record({.token = ++token, .sdk_wrapper = true});
+    Check(overwritten_refresh.replaced && overwritten_refresh.evaluates == 1 && overwritten_refresh.reuses == 0
+            && overwritten_reuse.replaced && overwritten_reuse.evaluates == 0 && overwritten_reuse.reuses == 1
+            && after_overwrite.replaced && after_overwrite.evaluates == 1 && after_overwrite.reuses == 0,
+        "same-address MFG rejection preserves the next legitimate refresh and reuse phase");
+    std::cout << "PASS synchronous MFG input versions refresh/reuse redelivered before same-address motion copy;"
+                 " both rejected after copy; next frame refreshed evidence=WARP+MOCK\n";
 
     {
       Check(SUCCEEDED(proof_list->Close()) && SUCCEEDED(proof_list->Reset(proof_allocator.Get(), nullptr)),
@@ -1104,7 +1437,7 @@ int Run() {
       }
     }
     Check(edited_valid_region, "native rejection check also exercises accepted non-neutral edit pixels");
-    const auto failed = record({.token = ++token, .reset = true, .fg_success = false});
+    const auto failed = record({.token = ++token, .reset = true, .fg_success = false, .sdk_wrapper = true});
     Check(failed.replaced && failed.evaluates == 1 && failed.reuses == 0
             && !matches(failed.consumed_back, source_back) && matches(failed.restored_back, source_back)
             && native::fg_service::streams.at({true, context}).cached == nullptr,
@@ -1172,14 +1505,14 @@ int Run() {
       tag_source::Reset();
     }
     recover(TagCopy::SUCCESS);
-    const auto tagged_refresh = record({.token = ++token, .reset = true, .tag_copy = TagCopy::SUCCESS});
+    const auto tagged_refresh = record({.token = ++token, .reset = true, .tag_copy = TagCopy::SUCCESS, .sdk_wrapper = true});
     Check(tagged_refresh.replaced && tagged_refresh.evaluates == 1 && tagged_refresh.reuses == 0
             && tagged_refresh.reset == 1,
         "deferred native tag-copy produces one actual-model refresh after producer scopes end");
     auto tagged_anchor = native::features.at(role_handle).slots[0].edit_reuse;
     Check(tagged_anchor != nullptr && tagged_anchor->valid, "deferred native tag-copy establishes a private edit anchor");
     const auto tagged_anchor_generation = tagged_anchor->anchor_generation;
-    const auto tagged_reuse = record({.token = ++token, .tag_copy = TagCopy::SUCCESS});
+    const auto tagged_reuse = record({.token = ++token, .tag_copy = TagCopy::SUCCESS, .sdk_wrapper = true});
     Check(tagged_reuse.replaced && tagged_reuse.evaluates == 0 && tagged_reuse.reuses == 1
             && matches(tagged_reuse.consumed_back, source_back)
             && matches(tagged_reuse.consumed_hudless, source_hudless),
@@ -1198,7 +1531,7 @@ int Run() {
             && tagged_mfg.consumed_back == tagged_reuse.consumed_back
             && tagged_mfg.consumed_hudless == tagged_reuse.consumed_hudless,
         "deferred MFG reconsumes the same tagged clone without advancing NR or cache cadence");
-    const auto tagged_next = record({.token = ++token, .tag_copy = TagCopy::SUCCESS});
+    const auto tagged_next = record({.token = ++token, .tag_copy = TagCopy::SUCCESS, .sdk_wrapper = true});
     Check(tagged_next.replaced && tagged_next.evaluates == 1 && tagged_next.reuses == 0 && tagged_next.reset == 0,
         "next real tagged token refreshes after deferred reuse without a false history Reset");
     tagged_anchor.reset();
@@ -1212,15 +1545,22 @@ int Run() {
           "failed or overwritten tag-copy rejects the old edit cache and preserves the current original BB");
       recover(TagCopy::SUCCESS);
     }
-    {
-      const addon::RuntimeLock lock(native::runtime_mutex);
-      tag_source::Reset();
+    const auto sdk_generation = rate::NativeBindingGeneration(rate::MatchNativeSwapchain(output_identity));
+    uint64_t direct_generation = 0;
+    for (uint32_t attempt = 0; attempt < 8 && direct_generation < sdk_generation; ++attempt) {
+      {
+        const addon::RuntimeLock lock(native::runtime_mutex);
+        tag_source::Reset();
+      }
+      const auto owner_unavailable = record({.token = ++token, .tag_copy = TagCopy::DIRECT, .owner_ready = false});
+      Check(!owner_unavailable.replaced && owner_unavailable.evaluates == 0 && owner_unavailable.reuses == 0
+              && matches(owner_unavailable.consumed_back, source_back)
+              && matches(owner_unavailable.restored_back, source_back),
+          "direct FG consumption before owner readiness leaves current color intact without NR or cache output");
+      direct_generation = owner_unavailable.source_generation;
     }
-    const auto owner_unavailable = record({.token = ++token, .tag_copy = TagCopy::DIRECT, .owner_ready = false});
-    Check(!owner_unavailable.replaced && owner_unavailable.evaluates == 0 && owner_unavailable.reuses == 0
-            && matches(owner_unavailable.consumed_back, source_back)
-            && matches(owner_unavailable.restored_back, source_back),
-        "direct FG consumption before owner readiness leaves current color intact without NR or cache output");
+    Check(direct_generation != 0 && direct_generation == sdk_generation,
+        "real tag retirement and reacquisition exercise a collision between the independent generation counters");
     recover(TagCopy::DIRECT);
     Check(direct_warmup_mfg_checked, "direct source completes preparation after an observed warmup MFG turn");
     const auto direct_refresh = record({.token = ++token, .reset = true, .tag_copy = TagCopy::DIRECT});
@@ -1256,10 +1596,8 @@ int Run() {
     direct_anchor.reset();
     {
       const auto tagged = read_progress();
-      // SDK activation and the existing viewport lifetimes reach equal
-      // generation values independently; only the production APIs advance them.
       Check(tagged.kind == frame_policy::SourceKind::TAGGED_RESOURCE
-              && tagged.source_generation == frame_source::Snapshot().generation,
+              && tagged.source_generation == rate::NativeBindingGeneration(rate::MatchNativeSwapchain(output_identity)),
           "the direct-tag and SDK producers naturally have the same numeric generation");
       const auto sdk_first = record({.token = token, .update_source = false});
       const auto sdk_claim = read_progress();
@@ -1301,6 +1639,28 @@ int Run() {
             && matches(ambiguous_direct.restored_back, source_back),
         "a recorded overwrite cannot make a later direct token unique; ambiguity preserves the current BB");
     ++token;
+    {
+      const addon::RuntimeLock lock(native::runtime_mutex);
+      tag_source::Reset();
+    }
+    const auto before_missing_role = read_progress();
+    const auto missing_role = record({.token = ++token, .tag_copy = TagCopy::DIRECT, .omit_alpha_tag = true});
+    Check(!missing_role.replaced && missing_role.evaluates == 0 && missing_role.reuses == 0
+            && read_progress().claims == before_missing_role.claims && matches(missing_role.restored_back, source_back),
+        "an incomplete async color group cannot claim, infer or replace a basic frame");
+    for (const auto change : {TagChange::WRITE_ALPHA, TagChange::PRESENT_END, TagChange::RETAG_HUDLESS, TagChange::RETAG_ALPHA}) {
+      {
+        const addon::RuntimeLock lock(native::runtime_mutex);
+        tag_source::Reset();
+      }
+      const auto before = read_progress();
+      const auto stale = record({.token = ++token, .tag_copy = TagCopy::SUCCESS, .sdk_wrapper = true, .tag_change = change});
+      Check(!stale.replaced && stale.evaluates == 0 && stale.reuses == 0
+              && read_progress().claims == before.claims && read_progress().outputs == before.outputs
+              && matches(stale.restored_back, source_back),
+          "the actual asynchronous NGX detour keeps original inputs when a tagged role changes or expires");
+      ++token;
+    }
     {
       const addon::RuntimeLock lock(native::runtime_mutex);
       tag_source::Reset();
@@ -1489,7 +1849,6 @@ int Run() {
     Check(final_anchor != nullptr, "recovered native output owns its final private cache");
     std::weak_ptr<addon::edit_reuse::State> retired_anchor = final_anchor;
     final_anchor.reset();
-    frame_source::Stop();
     {
       const addon::RuntimeLock lock(native::runtime_mutex);
       tag_source::Reset();
@@ -1505,14 +1864,123 @@ int Run() {
             && retired_anchor.expired() && native::retired_nr_features.empty()
             && native::retired_final_resources.empty(),
         "native source retirement releases all edit caches, models and worksets after actual Fence completion");
-    native::edit_reuse_fg_experiment = false;
+    rate::DestroyPresentOutput(context);
+    backbuffer = gpu.Texture(width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    output->current_back_buffer = backbuffer.Get();
+    auto& fp16_owner = native::present_streams[nullptr];
+    fp16_owner.device_identity = renodx::utils::directx::NativeIdentity(gpu.device.Get());
+    fp16_owner.native_output_identity = reinterpret_cast<const void*>(output_identity);
+    fp16_owner.backbuffer_width = width;
+    fp16_owner.backbuffer_height = height;
+    fp16_owner.backbuffer_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    fp16_owner.prefg_target_valid = true;
+    auto& fp16_target = fp16_owner.prefg_target;
+    native::SnapshotPresentRestoreConfiguration(&fp16_target);
+    fp16_target.private_signed_runtime = true;
+    fp16_target.hdr_mode = 1;
+    fp16_target.units = {renodx::dlss5::codec::Encoding::Linear, true, 80.f, false};
+    fp16_target.hdr_codec_mode = 3;
+    fp16_target.hdr_white_nits = 80.f;
+    fp16_target.hdr_encoding = native::V6EncodingConstant(fp16_target.units);
+    fp16_target.diagnostic.bypass_host_look = true;
+    fp16_target.ui_correction = false;
+    const auto fp16_context = reinterpret_cast<uintptr_t>(&fp16_owner);
+    const uintptr_t fp16_buffers[]{reinterpret_cast<uintptr_t>(
+        renodx::utils::directx::NativeIdentity(backbuffer.Get()))};
+    rate::RegisterPresentOutput(fp16_context, reinterpret_cast<uintptr_t>(fp16_owner.device_identity),
+        output_identity, fp16_buffers);
+    addon::bridge::OwnedParameters fp16_parameters = parameters;
+    fp16_parameters.Set(NVSDK_NGX_DLSSG_Parameter_Backbuffer, backbuffer.Get());
+    fp16_parameters.Set(NVSDK_NGX_DLSSG_Parameter_HUDLess, static_cast<ID3D12Resource*>(nullptr));
+    fp16_parameters.Set(NVSDK_NGX_DLSSG_Parameter_UIAlpha, static_cast<ID3D12Resource*>(nullptr));
+    fp16_parameters.Set(NVSDK_NGX_DLSSG_Parameter_UserInterfaceRecompositionEnabled, 0u);
+    fp16_parameters.Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, 1u);
+    const auto* fp16_handle = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xF045});
+    native::RegisterCreatedFeatureLocked(fp16_handle, NVSDK_NGX_Feature_FrameGeneration, &fp16_parameters);
+    static Snapshot* sdk_color = nullptr;
+    funnel_accounting_tests::Restore fp16_substitutions;
+    fp16_substitutions.Value(&native::ngx_slot_real[0].evaluate);
+    native::ngx_slot_real[0].evaluate = reinterpret_cast<void*>(+[](ID3D12GraphicsCommandList* list,
+        const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter* block, PFN_NVSDK_NGX_ProgressCallback) {
+      Check(list == model_gpu->list.Get(), "the FG wrapper forwards the real WARP command list");
+      *sdk_color = Capture(*model_gpu, native::PreFgResource(block, NVSDK_NGX_DLSSG_Parameter_Backbuffer),
+          NATIVE_INPUT_STATE);
+      return NVSDK_NGX_Result_Success;
+    });
+    bool fp16_initialized = false;
+    const auto fp16_record = [&](bool reset) {
+      std::vector<uint16_t> input(width * height * 4);
+      for (size_t value = 0; value < input.size(); value += 4) {
+        input[value] = DirectX::PackedVector::XMConvertFloatToHalf(0.5f);
+        input[value + 1] = DirectX::PackedVector::XMConvertFloatToHalf(0.625f);
+        input[value + 2] = DirectX::PackedVector::XMConvertFloatToHalf(0.75f);
+        input[value + 3] = DirectX::PackedVector::XMConvertFloatToHalf((token % 4 + 1) * 0.25f);
+      }
+      upload(backbuffer.Get(), input, fp16_initialized ? NATIVE_INPUT_STATE : D3D12_RESOURCE_STATE_COMMON);
+      fp16_initialized = true;
+      fp16_parameters.Set(NVSDK_NGX_DLSSG_Parameter_Reset, reset ? 1u : 0u);
+      const auto before_evaluates = model_calls;
+      const auto before_reuses = native::edit_reuse_reuses.load();
+      Snapshot consumed;
+      sdk_color = &consumed;
+      run_sdk(++token, [&] {
+        Check(NVSDK_NGX_SUCCEED(native::HookedEvaluateFeatureSlot<0>(
+                  gpu.list.Get(), fp16_handle, &fp16_parameters, nullptr)),
+            "the real NGX wrapper preserves the software SDK result");
+      });
+      sdk_color = nullptr;
+      const auto restored = Capture(gpu, backbuffer.Get(), NATIVE_INPUT_STATE);
+      submit();
+      const auto pixels = consumed.Pixels();
+      Check(pixels == restored.Pixels() && pixels.size() == input.size() * sizeof(uint16_t),
+          "accepted FP16 SDK input remains on its real Backbuffer after the wrapper");
+      for (size_t alpha = 3; alpha < input.size(); alpha += 4) {
+        uint16_t actual;
+        std::memcpy(&actual, pixels.data() + alpha * sizeof(actual), sizeof(actual));
+        Check(actual == input[alpha], "FP16 writeback keeps the current alpha");
+      }
+      return std::pair{model_calls - before_evaluates, native::edit_reuse_reuses.load() - before_reuses};
+    };
+    bool fp16_ready = false;
+    for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 12; ++attempt) {
+      const auto phase = fp16_record(true);
+      if (phase.first == 1 && native::fg_service::streams.at({true, fp16_context}).base_frame_clock.complete) {
+        fp16_ready = true;
+        break;
+      }
+    }
+    Check(fp16_ready && fp16_record(false) == std::pair{0u, uint64_t{1}}
+            && fp16_record(false) == std::pair{1u, uint64_t{0}},
+        "the registered SDK and actual NGX wrappers deliver FP16 refresh, reuse and refresh");
+    native::present_pre_fg = 0;
+    Check(fp16_record(false) == std::pair{0u, uint64_t{0}},
+        "NRPresentPreFg=0 leaves the FP16 SDK path untouched");
+    {
+      const addon::RuntimeLock lock(native::runtime_mutex);
+      native::RetirePresentStream(nullptr);
+      native::ForgetSourceHandleLocked(fp16_handle);
+    }
+    submit();
+    rate::DestroyPresentOutput(fp16_context);
+    native_adapter::state.present = nullptr;
+    native_adapter::decisions_ready = false;
     Check(SUCCEEDED(proof_list->Close()), "close the unsubmitted foreign proof-query list");
     nr_edit_reuse_xefg_cases::model_pixels.clear();
     model_gpu = nullptr;
     check_debug();
-    std::cout << "PASS native Pre-FG x2 evidence=WARP+MOCK format=HDR10-PQ roles=BB+HUDLess+UIAlpha"
-                 " frame_source=Reflex_PresentStart_and_SDK_scope numeric_NGX_FrameID=absent"
-                 " deferred_frame_source=tag_scope_MOCK_CopyResource_real cross_thread_after_PresentEnd=checked"
+    std::cout << "NR_RELEASE_PARITY native-prefg-present-x2 synchronous source=successful-present-start+sdk-present"
+                 " same-scope=1 ngx-detour=executed pq-evaluates=1/0/1/0 fp16-evaluates=1/0/1 fp16-alpha=preserved\n"
+                 "NR_RELEASE_PARITY native-prefg-present-x2 synchronous-source-refusal"
+                 " missing-present-start=refused failed-present-start=refused wrong-sdk-scope=refused\n"
+                 "NR_RELEASE_PARITY native-prefg-present-x2 asynchronous source=set-tag-for-frame+copy+fence"
+                 " ngx-detour=executed evaluates=1/0/1 color=complete stale-alpha/expired/role-retag=original\n"
+                 "NR_RELEASE_PARITY native-prefg-present-x2 mfg-recovery"
+                 " repeated=redelivered missing-role/changed-guide/foreign-list=original"
+                 " sdk-reject=ngx-detour+rgba-rollback recovery=reset+refresh\n";
+    std::cout << "PASS native Pre-FG x2 evidence=WARP+MOCK format=HDR10-PQ,FP16"
+                 " roles=BB+HUDLess+UIAlpha,FP16_BB"
+                 " frame_source=registered_PresentStart_and_SDK_scope numeric_NGX_FrameID=absent"
+                 " deferred_frame_source=registered_tag_wrapper_MOCK_CopyResource_real cross_thread_outside_SDK_scope=checked"
                  " deferred_refresh_reuse_refresh=1/0/1 tag_unsubmitted/failed/overwritten=denied"
                  " direct_UntilPresent_no_clone=checked direct_refresh_reuse_refresh=1/0/1 direct_pending_ambiguity=denied"
                  " direct_warmup_MFG_claim=stable"
@@ -1532,12 +2000,12 @@ int Run() {
     return 0;
   } catch (const std::exception& error) {
     fail_call = 0;
-    frame_source::Stop();
     {
       const addon::RuntimeLock lock(native::runtime_mutex);
       tag_source::Reset();
     }
-    native::edit_reuse_fg_experiment = false;
+    native_adapter::state.present = nullptr;
+    native_adapter::decisions_ready = false;
     std::cerr << "nr-edit-reuse-native-contracts: " << error.what() << '\n';
     return 1;
   }

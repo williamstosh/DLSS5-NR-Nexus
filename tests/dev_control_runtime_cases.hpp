@@ -700,12 +700,7 @@
       "experimental mode accepts only the integer values zero through three");
   const bool released_before = runtime::disabled_resources_released.load();
   runtime::disabled_resources_released = false;
-  check(experiment(2)["reason"] == "resources_not_released", "NR OFF alone does not prove its old resources are released");
-  // This fixture has no GPU resources; the release proof is explicitly mocked.
-  runtime::disabled_resources_released = true;
   runtime::enabled = true;
-  check(experiment(2)["reason"] == "nr_running", "a running NR chain cannot change the experimental mode");
-  runtime::enabled = false;
   runtime::slider_pending = &runtime::kSetAdaptiveTargetFps;
   check(experiment(2)["reason"] == "configuration_busy", "another configuration edit owns the experiment admission boundary");
   runtime::slider_pending = nullptr;
@@ -715,8 +710,9 @@
   const auto experimental = control::Execute(experiment_request);
   check(experimental["ok"] && experimental["state"]["available"]
           && experimental["state"]["experiments"]["adaptive_feature_mode"] == 2
+          && experimental["state"]["settings"][runtime::kSetAdaptiveResourceStrategy.key] == 2
           && runtime::adaptive_feature_mode.load() == runtime::AdaptiveFeatureMode::UPPER_CAPACITY,
-      "an admitted experiment request reads back after releasing the nonrecursive runtime lock");
+      "the legacy experiment command commits the registered setting while NR is running and resources remain allocated");
   check(control::Execute(experiment_request) == experimental,
       "same-id experimental replay returns its original receipt without another mutation");
   status = control::Execute({{"id", "query-experiment"}, {"op", "status"}, {"query_id", "experiment-idempotent"}});
@@ -729,9 +725,10 @@
           && experiment(0)["ok"] && runtime::adaptive_feature_mode.load() == runtime::AdaptiveFeatureMode::OFF
           && experiment(0)["status"] == "unchanged",
       "the dedicated operation supports RETAIN and ON_DEMAND and returns to OFF without activation claims");
-  check(configuration_writes == experiment_writes && runtime::configuration_generation == experiment_generation
+  check(configuration_writes > experiment_writes && runtime::configuration_generation == experiment_generation
           && runtime::nr_features_created == experiment_features,
-      "experiment requests write no INI settings, recreate no features and leave ordinary configuration generation unchanged");
+      "legacy experiment requests persist the official setting without immediately recreating features");
+  runtime::enabled = false;
   runtime::disabled_resources_released = released_before;
   for (const auto* operation : {"bridge_adaptive_experiment", "edit_reuse_adaptive_experiment", "edit_reuse_fg_experiment"}) {
     const bool bridge = std::string_view(operation) == "bridge_adaptive_experiment";
@@ -746,6 +743,7 @@
     };
     const auto boolean_identity = control::Identity();
     const auto boolean_settings = runtime::profile_ui::Snapshot(true);
+    const auto boolean_writes = configuration_writes;
     const auto boolean_adaptive = runtime::CopyAdaptiveStatus();
     const auto boolean_sources = runtime::features.size();
     const auto boolean_evaluates = runtime::SourceSuccessfulEvaluations();
@@ -838,7 +836,7 @@
         "Boolean requested state can turn off, reopen and return to its default without changing ordinary settings");
     const auto after_boolean = runtime::CopyAdaptiveStatus();
     check(control::Identity() == boolean_identity && runtime::profile_ui::Snapshot(true) == boolean_settings
-            && configuration_writes == experiment_writes && runtime::configuration_generation == experiment_generation
+            && configuration_writes == boolean_writes && runtime::configuration_generation == experiment_generation
             && runtime::nr_features_created == experiment_features && runtime::features.size() == boolean_sources
             && runtime::SourceSuccessfulEvaluations() == boolean_evaluates
             && boolean_counters == std::tuple{runtime::edit_reuse_enabled.load(), runtime::edit_reuse_refreshes.load(),
