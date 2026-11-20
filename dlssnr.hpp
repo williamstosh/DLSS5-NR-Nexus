@@ -12303,7 +12303,6 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
       const auto decision = edit_reuse_policy::DecideGroup(std::span{edit_layers}.first(group.count), edit_cadence.stack_encoding);
       upper_edit_reuse = decision.anchors != edit_reuse_policy::Anchors::NONE;
     }
-    append_measurement(static_cast<uint32_t>(upper_edit_reuse) | (static_cast<uint32_t>(lower_edit_reuse) << 1));
     for (const uint32_t value : {codec_mode.load(), source_encoding.load(), transfer_mode.load(),
              display_pedestal.load(), sdr_black_restore.load(), depth_mode.load(),
              static_cast<uint32_t>(neural_floor_guard.load()),
@@ -12349,7 +12348,7 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
        .split_fps = output.split_fps, .owner = output_identity.generation, .rate_multiplier = output.rate_multiplier,
        .rate_comparable = output.rate_comparable},
        now_ns, eligible, frozen, layout_identity, work_identity,
-       (observed_model_roles != 0 ? observed_model_roles : required_roles));
+       (observed_model_roles != 0 ? observed_model_roles : required_roles), {upper_edit_reuse, lower_edit_reuse});
   auto& session = **owner;
   session.status.display_output_generation = output_identity.generation;
   session.status.display_source_generation = (display_source_generation != 0

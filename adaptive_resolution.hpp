@@ -164,6 +164,7 @@ struct Session {
     float target_fps = 0.;
     Sizes upper{};
     bool multiplier_variable = false;
+    std::array<bool, 2> edit_cadence{};
     std::array<std::array<uint64_t, MAX_PASSES>, 2> mask{};
     std::array<uint64_t, 2> normalization{};
     bool operator==(const Conditions&) const = default;
@@ -182,6 +183,8 @@ struct Session {
   Ladder ladder;
   uint64_t identity = 0, output_source = 0, output_generation = 0, output_configuration = 0;
   uint64_t workload_identity = 0, output_owner = 0;
+  // Upper, then supported lower-tier reuse; independent of timing mode.
+  std::array<bool, 2> edit_cadence{};
   uint64_t resource_identity = 0;
   uint64_t configuration_epoch = 0;
   uint64_t preparation_epoch = 0;
@@ -194,8 +197,10 @@ struct Session {
   size_t level = 0, previous_level = 0, active_level = 0;
   size_t frozen_resume_level = MAX_LEVELS;
   int64_t applied_ns = 0, stable_after_ns = 0, last_switch_ns = 0;
+  int64_t raise_after_ns = 0;
   int64_t next_measure_ns = 0;
   bool trial = false, raising = false, failed = false;
+  bool raise_comparable = true;
   bool defer_preparation = false;
   bool minimum_pending = false;
   double baseline_fps = 0., baseline_fps_mad = 0., baseline_gpu_us = 0., baseline_gpu_mad = 0.;
@@ -250,7 +255,9 @@ struct Session {
     InvalidateSampling(now_ns);
     if (frozen_resume_level == MAX_LEVELS) {
       if (trial) {
-        if (raising || applied_generation != status.generation) Request(previous_level, now_ns);
+        if (raising || applied_generation != status.generation) {
+          Request(previous_level, now_ns);
+        }
         trial = false;
       }
       status.reason = Reason::COLLECTING;
@@ -599,6 +606,7 @@ struct Session {
   Conditions CurrentConditions(const Output& output) const {
     Conditions result{.workload = workload_identity, .owner = output.owner, .source = output.source,
         .target_fps = settings.target_fps, .upper = status.upper, .multiplier_variable = output.multiplier_variable,
+        .edit_cadence = edit_cadence,
         .mask = mask_settings, .normalization = normalization_settings};
     for (size_t role = 0; role < result.mask.size(); ++role) {
       if ((measurement_roles & (1u << role)) == 0) {
@@ -606,7 +614,9 @@ struct Session {
         result.normalization[role] = 0;
       } else {
         for (size_t pass = 0; pass < MAX_PASSES; ++pass) {
-          if (status.upper[pass].width == 0) result.mask[role][pass] = 0;
+          if (status.upper[pass].width == 0) {
+            result.mask[role][pass] = 0;
+          }
         }
       }
     }
@@ -637,7 +647,8 @@ struct Session {
 
   void Prepare(const Settings& requested_settings, const Sizes& upper, const Sizes& floor,
                uint64_t source_identity, const Output& output, int64_t now_ns, bool supported, bool frozen,
-               uint64_t allocation_identity = 0, uint64_t work_identity = 0, uint32_t model_roles = 3) {
+               uint64_t allocation_identity = 0, uint64_t work_identity = 0, uint32_t model_roles = 3,
+               std::array<bool, 2> cadence = {}) {
     Settings next = requested_settings;
     next.target_fps = (std::isfinite(next.target_fps) ? std::clamp(next.target_fps, 30.f, 360.f) : 60.f);
     next.minimum_scale = (std::isfinite(next.minimum_scale) ? std::clamp(next.minimum_scale, MINIMUM_SCALE, 1.f) : 0.67f);
@@ -648,7 +659,9 @@ struct Session {
     if (allocation_identity == 0) {
       allocation_identity = source_identity;
     }
-    if (work_identity == 0) work_identity = source_identity;
+    if (work_identity == 0) {
+      work_identity = source_identity;
+    }
     const uint32_t selected_levels = (next.selected_levels != 0 ? next.selected_levels
         : (next.legacy_preparation ? next.prepared_levels : std::max(2u, next.prepared_levels)));
     auto selected = BuildLadder(upper, floor, next.minimum_scale, selected_levels);
@@ -665,7 +678,11 @@ struct Session {
     const bool toggled = settings.enabled != next.enabled;
     const bool preparation_mode_changed = settings.legacy_preparation != next.legacy_preparation
         || settings.limited_residency != next.limited_residency || settings.resource_strategy != next.resource_strategy;
-    const bool changed = (!frozen && (identity != source_identity || workload_identity != work_identity
+    const bool work_hash_changed = workload_identity != work_identity;
+    const bool workload_changed = work_hash_changed || edit_cadence != cadence;
+    const size_t active_cadence_index = (status.applied == status.upper ? 0u : 1u);
+    const bool active_cadence_changed = edit_cadence[active_cadence_index] != cadence[active_cadence_index];
+    const bool changed = (!frozen && (identity != source_identity
         || measurement_roles != model_roles))
         || settings != next || status.upper != upper || selection_changed;
     if (resources_changed) {
@@ -678,7 +695,6 @@ struct Session {
       preparation_epoch = epoch;
       settings = next;
       identity = source_identity;
-      workload_identity = work_identity;
       resource_identity = allocation_identity;
       status.upper = upper;
       ladder = selected;
@@ -705,7 +721,6 @@ struct Session {
       }
       settings = next;
       identity = source_identity;
-      workload_identity = work_identity;
       status.upper = upper;
       ladder = selected;
       minimum = next_minimum;
@@ -732,6 +747,29 @@ struct Session {
       } else {
         Request(candidate, now_ns);
       }
+    }
+    if (!frozen && workload_changed) {
+      // A change at the other endpoint only rebuilds raise evidence. The
+      // delivered tier needs a clean FPS window only if its own cadence changes.
+      surplus_window = {};
+      raise_after_ns = now_ns;
+      if (active_cadence_changed) {
+        InvalidateSampling(now_ns);
+      }
+      if (trial && raising) {
+        if (active_cadence_changed || work_hash_changed) {
+          Request(previous_level, now_ns);
+          trial = false;
+        } else if (applied_generation != status.generation && edit_cadence[0] != cadence[0]) {
+          // An older recording may still deliver the pending upper tier.
+          // Its cadence is unproven, so it cannot establish a failed edge.
+          raise_comparable = false;
+        }
+      }
+    }
+    if (!frozen) {
+      workload_identity = work_identity;
+      edit_cadence = cadence;
     }
     measurement_roles = model_roles;
     if (!settings.enabled || !supported) {
@@ -797,7 +835,9 @@ struct Session {
     if (output_changed || rate_changed || !reliable_output) {
       // Missing comparison evidence cancels a pending request or an unjudged
       // quality increase. A successfully delivered lower tier remains in use.
-      if (trial && (raising || applied_generation != status.generation)) Request(previous_level, now_ns);
+      if (trial && (raising || applied_generation != status.generation)) {
+        Request(previous_level, now_ns);
+      }
       trial = false;
       InvalidateSampling(now_ns);
       output_source = output.source;
@@ -845,7 +885,9 @@ struct Session {
     }
     if (trial && raising) {
       if (deficit) {
-        RememberFailedRaise();
+        if (raise_comparable) {
+          RememberFailedRaise();
+        }
         Request(previous_level, now_ns);
         trial = false;
         status.reason = Reason::NO_BENEFIT;
@@ -857,7 +899,9 @@ struct Session {
       }
       return;
     }
-    if (deficit || on_target) trial = false;
+    if (deficit || on_target) {
+      trial = false;
+    }
     if (deficit) {
       const size_t candidate = (settings.legacy_preparation && minimum_pending ? level : Adjacent(false));
       if (candidate == level && ladder.sizes[level] == minimum) {
@@ -873,7 +917,9 @@ struct Session {
       raising = false;
       trial = true;
       if (candidate == level) {
-        if (!settings.legacy_preparation || !RequestMinimum(now_ns)) trial = false;
+        if (!settings.legacy_preparation || !RequestMinimum(now_ns)) {
+          trial = false;
+        }
       } else {
         Request(candidate, now_ns);
       }
@@ -884,13 +930,15 @@ struct Session {
     const auto conditions = CurrentConditions(output);
     const auto* failed_raise = FindFailedRaise(ladder.sizes[level], ladder.sizes[candidate], conditions, multiplier);
     const double margin = std::max({1., static_cast<double>(settings.target_fps) * 0.02, 2. * output.mad});
-    bool headroom = output.fps >= settings.target_fps + margin;
+    bool headroom = output.begin_ns >= raise_after_ns && output.fps >= settings.target_fps + margin;
     if (failed_raise != nullptr) {
       const double recovery_margin = std::max({1., static_cast<double>(settings.target_fps) * 0.02,
           2. * std::max(failed_raise->mad, output.mad)});
       headroom &= output.fps >= failed_raise->fps + recovery_margin;
     }
-    if (!headroom) surplus_window = {};
+    if (!headroom) {
+      surplus_window = {};
+    }
     if (candidate != level && headroom && AccumulateWindow(&surplus_window, output)) {
       previous_level = level;
       baseline_fps = surplus_window.fps;
@@ -899,6 +947,7 @@ struct Session {
       baseline_gpu_mad = gpu_mad;
       baseline_multiplier = multiplier;
       trial_conditions = conditions;
+      raise_comparable = true;
       trial = raising = true;
       Request(candidate, now_ns);
       status.reason = Reason::RAISING;

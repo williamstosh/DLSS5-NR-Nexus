@@ -2073,6 +2073,7 @@ int Run() {
         reach(80, [&] { return session->status.applied[0].width == 12 && session->failed_raises.size() == 1; },
             "upper deficit remembers a failed edge and delivers its low anchor");
         const auto old_work = session->workload_identity;
+        const auto old_cadence = session->edit_cadence;
         for (uint32_t frame = 0; frame < 36; ++frame) {
           frame_at_fps(125);
           Check(session->level == 1, "unchanged low-tier FPS cannot retry the failed edge");
@@ -2081,7 +2082,8 @@ int Run() {
         native::ApplySettingEffect(native::kSetEditReuse.effect);
         frame_at_fps(125);
         const bool eligible = inputs == Inputs::QUALIFIED;
-        Check((session->workload_identity != old_work) == eligible && !session->paired_sampling,
+        Check((session->edit_cadence != old_cadence) == eligible && session->workload_identity == old_work
+                  && !session->paired_sampling,
             "only actual upper x2 changes the edge workload while its current low tier remains per-frame");
         if (eligible) {
           reach(125, [&] { return session->status.applied[0].width == 16 && session->paired_sampling; },

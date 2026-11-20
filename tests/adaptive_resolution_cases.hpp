@@ -27,11 +27,12 @@ struct FpsTrace {
   adaptive::Session controller;
   int64_t now = 1'000'000'000;
   uint64_t workload = 1;
+  std::array<bool, 2> edit_cadence{};
   uint32_t model_roles = 3;
   uint64_t frame = 0;
 
   void Prepare(bool supported = true, bool frozen = false) {
-    controller.Prepare(settings, upper, floor, 1, output, now, supported, frozen, 1, workload, model_roles);
+    controller.Prepare(settings, upper, floor, 1, output, now, supported, frozen, 1, workload, model_roles, edit_cadence);
   }
 
   void Ready() {
@@ -561,6 +562,112 @@ void RunFpsCases(const Check& check) {
       check(changed.controller.status.requested == trace.upper && changed.controller.status.applied == trace.floor,
             "changing role 2 mask or normalization permits a retrial at the unchanged low-tier FPS");
     }
+  }
+  {
+    FpsTrace trace;
+    trace.edit_cadence = {true, true};
+    trace.Start();
+    trace.controller.SetPairedSampling(true, 1, trace.now);
+    trace.WarmUp();
+    trace.Window(60.);
+    const auto first = ++trace.frame;
+    trace.controller.ObserveGpu({.generation = trace.controller.applied_generation, .frame = first,
+        .sequence = first, .context = 1, .recorded_ns = trace.now, .completed_ns = trace.now,
+        .total_us = 3000., .valid = true, .stable = true, .paired = true, .pair_first_frame = first,
+        .sampling_generation = trace.controller.sampling_generation}, trace.now);
+    const auto sampling_generation = trace.controller.sampling_generation;
+    const auto comparison_generation = trace.controller.comparison_generation;
+    const auto stable_after_ns = trace.controller.stable_after_ns;
+    const auto generation = trace.controller.status.generation;
+    trace.edit_cadence[1] = false;
+    ++trace.now;
+    trace.Prepare();
+    check(trace.controller.edit_cadence == trace.edit_cadence && trace.controller.pending_pair.frame == first
+              && trace.controller.sampling_generation == sampling_generation
+              && trace.controller.comparison_generation == comparison_generation
+              && trace.controller.stable_after_ns == stable_after_ns && trace.controller.status.generation == generation,
+          "a candidate-only workload change preserves the delivered tier's FPS evidence and pending GPU half");
+    trace.controller.ObserveGpu({.generation = trace.controller.applied_generation, .frame = ++trace.frame,
+        .sequence = trace.frame, .context = 1, .recorded_ns = trace.now, .completed_ns = trace.now,
+        .total_us = 1000., .valid = true, .stable = true, .paired = true, .pair_first_frame = first,
+        .sampling_generation = sampling_generation}, trace.now);
+    check(trace.controller.gpu_count == 1 && trace.controller.gpu_us[0] == 2000.,
+          "a changed candidate still lets the delivered upper tier finish its original cost pair");
+  }
+  {
+    FpsTrace trace;
+    trace.edit_cadence = {true, true};
+    trace.Start();
+    trace.WarmUp();
+    trace.Window(56.);
+    trace.Ready();
+    trace.Deliver();
+    trace.WarmUp();
+    trace.Window(60.);
+    trace.controller.SetPairedSampling(true, 1, trace.now);
+    const auto first = ++trace.frame;
+    trace.controller.ObserveGpu({.generation = trace.controller.applied_generation, .frame = first,
+        .sequence = first, .context = 1, .recorded_ns = trace.now, .completed_ns = trace.now,
+        .total_us = 3000., .valid = true, .stable = true, .paired = true, .pair_first_frame = first,
+        .sampling_generation = trace.controller.sampling_generation}, trace.now);
+    const auto comparison_generation = trace.controller.comparison_generation;
+    const auto generation = trace.controller.status.generation;
+    const auto applied_ns = trace.controller.applied_ns;
+    trace.edit_cadence[1] = false;
+    ++trace.now;
+    trace.Prepare();
+    check(trace.controller.status.applied == trace.floor && trace.controller.status.requested == trace.floor
+              && trace.controller.applied_ns == applied_ns && trace.controller.status.generation == generation
+              && trace.controller.comparison_generation > comparison_generation
+              && trace.controller.stable_after_ns == trace.now && trace.controller.pending_pair.frame == 0,
+          "a delivered lower tier's real cadence change cuts old FPS and GPU samples without raising the tier");
+  }
+  {
+    FpsTrace trace;
+    trace.edit_cadence = {true, true};
+    trace.Start();
+    trace.WarmUp();
+    trace.Window(56.);
+    trace.Ready();
+    trace.Deliver();
+    trace.WarmUp();
+    trace.Window(70.);
+    trace.Window(70.);
+    check(trace.controller.trial && trace.controller.raising && trace.controller.status.requested == trace.upper,
+          "cadence comparison starts from a real lower-tier surplus");
+    auto pending = trace;
+    const auto pending_generation = pending.controller.status.generation;
+    pending.edit_cadence[0] = false;
+    ++pending.now;
+    pending.Prepare();
+    check(pending.controller.trial && pending.controller.raising && !pending.controller.raise_comparable
+              && pending.controller.status.generation == pending_generation,
+          "a still-legal pending raise survives a candidate-only change without assuming its delivered cadence");
+    pending.Ready();
+    pending.Deliver();
+    pending.WarmUp();
+    pending.Window(59.);
+    check(pending.controller.status.requested == trace.floor && pending.controller.failed_raises.empty(),
+          "an unproven pending cadence cannot create a performance failure boundary");
+    trace.Ready();
+    trace.Deliver();
+    const auto delivered_generation = trace.controller.status.generation;
+    trace.edit_cadence[1] = false;
+    ++trace.now;
+    trace.Prepare();
+    check(trace.controller.trial && trace.controller.raising && trace.controller.raise_comparable
+              && trace.controller.status.generation == delivered_generation,
+          "changing only the lower candidate preserves the delivered upper tier's FPS trial");
+    trace.WarmUp();
+    auto below_target = trace;
+    trace.Window(60.);
+    check(!trace.controller.trial && trace.controller.status.requested == trace.upper
+              && trace.controller.status.applied == trace.upper,
+          "the unchanged delivered upper tier stays when its new window meets the exact target");
+    below_target.Window(59.);
+    check(below_target.controller.status.requested == trace.floor && below_target.controller.failed_raises.size() == 1
+              && below_target.controller.failed_raises[0].conditions.edit_cadence[1],
+          "a failed upper tier retains the lower cadence under which its baseline was actually measured");
   }
   for (const bool upper_costs_available : {false, true}) {
     FpsTrace trace;
