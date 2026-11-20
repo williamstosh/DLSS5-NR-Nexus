@@ -379,6 +379,11 @@ std::vector<unsigned char> Read12(ID3D12Resource* texture, UINT pixel_bytes,
 #include "d3d11_present_stage_resolution_cases.hpp"
 int main(int argc, char** argv) {
   try {
+#if defined(NR_NEXUS_DEV_CONTROL)
+    constexpr int dev = 1;
+#else
+    constexpr int dev = 0;
+#endif
     bool warp = false;
     bool dlaa_only = false;
     bool sr_only = false;
@@ -449,6 +454,7 @@ int main(int argc, char** argv) {
           "production Bridge x2 uses WARP without other stage variants");
     }
     if (adaptive_case) {
+      Check(dev == 1, "Bridge Adaptive requires the NR_NEXUS_DEV_CONTROL build");
       Check(warp != adaptive_hardware && !stage_resolution && !present_stage_resolution && !dlaa_only && !sr_only,
           "Bridge Adaptive explicitly selects WARP or hardware, without other stage variants or fallback");
     }
@@ -1156,11 +1162,6 @@ int main(int argc, char** argv) {
       native::ReleaseBridge();
       check_debug_messages();
       if (edit_reuse_production) {
-#if defined(NR_NEXUS_DEV_CONTROL)
-        constexpr int dev = 1;
-#else
-        constexpr int dev = 0;
-#endif
         std::cout << "PASS case=bridge-edit-reuse-production evidence=WARP+MOCK dev=" << dev << '\n';
       } else {
         std::cout << "PASS ordinary Upscaled watchdog " << (warp ? "WARP" : "NATIVE_GPU")
@@ -1754,7 +1755,7 @@ int main(int argc, char** argv) {
         frame();
         check_unavailable_window(resized_output,
             "Bridge keeps the output identity and preparation while rejecting an SDK window reporting FG On");
-        std::cout << "PASS Bridge Adaptive XeFG Off output ownership, resize and failure revocation\n";
+        std::cout << "PASS Bridge Adaptive XeFG Off output ownership, resize and failure revocation dev=" << dev << '\n';
       }
       auto& feature = native::features.at(handle);
 #if defined(NR_NEXUS_TEST_NATIVE_NGX)
@@ -1914,7 +1915,7 @@ int main(int argc, char** argv) {
                   : (adaptive_hardware ? "NATIVE_GPU+MOCK" : "WARP+MOCK")))
           << " two full-prepared tiers, ready roundtrip/Reset/zero creates, Off/source release/retirement"
           << (adaptive_hardware ? "; requested_model=B internal_model=unknown; " : ", standby failure/recovery/watchdog; ")
-          << "gpu_segments=" << gpu_samples << '\n';
+          << "gpu_segments=" << gpu_samples << " dev=" << dev << '\n';
       return 0;
     }
     if (stage_resolution) {

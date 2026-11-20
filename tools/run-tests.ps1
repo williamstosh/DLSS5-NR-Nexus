@@ -199,6 +199,11 @@ foreach ($item in $Suite) {
         if ($item -eq 'fg-native' -and $NativeCase -contains 'xefg-present-probe') {
             $arguments += '/DNR_NEXUS_TEST_XEFG_PRESENT_PROBE'
         }
+        if ($item -eq 'bridge-motion' -and @($BridgeCase | Where-Object {
+                $_ -in @('adaptive','adaptive-hardware','adaptive-native-ngx','adaptive-native-snippet')
+            }).Count -gt 0) {
+            $arguments += '/DNR_NEXUS_DEV_CONTROL'
+        }
         if ($item -eq 'vulkan-control-mask') { $arguments += "/I$VulkanIncludeDirectory" }
         $link += @('user32.lib','gdi32.lib','ole32.lib','psapi.lib')
         if (($item -in @('fg-native','vulkan-control-mask') -or ($item -eq 'bridge-motion' -and $bridgeNativeNgx)) -and $NativeNgxSdkLibraryDirectory) {

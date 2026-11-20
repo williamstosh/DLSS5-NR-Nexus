@@ -128,7 +128,7 @@ try {
         throw 'Bridge adaptive XeFG Off requires a passing DEV Bridge build and run.'
     }
     $devBridgeReceipt = Get-CoreCaseReceipt 'bridge-adaptive-xefg-off' (Join-Path $devBridge 'warp-adaptive.stdout.log') `
-        '^PASS Bridge Adaptive XeFG Off output ownership, resize and failure revocation$'
+        '^PASS Bridge Adaptive XeFG Off output ownership, resize and failure revocation dev=1$'
     $summary.independent += @{name='bridge-adaptive-xefg-off';status='Passed';evidence='WARP+MOCK';receipt=$devBridgeReceipt
         executableSha256=(Get-FileHash -LiteralPath (Join-Path $devBridge 'd3d11_bridge_motion_tests.exe')).Hash}
     $outcome = 'Passed'
