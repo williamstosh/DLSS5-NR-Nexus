@@ -1498,7 +1498,42 @@ int Run() {
       }
       nr_edit_reuse_xefg_cases::model_pixels[pixel * 4 + 3] = DirectX::PackedVector::XMConvertFloatToHalf(1.f);
     }
-    Check(record({.token = ++token, .reset = true}).evaluates == 1, "refresh a non-neutral native edit anchor");
+    {
+      const auto submitted_before = native::native_fg_submitted_frames.load();
+      const auto accepted = record({.token = ++token, .reset = true, .sdk_wrapper = true});
+      const auto accepted_progress = read_progress();
+      const auto accepted_submissions = native::native_fg_submitted_frames.load();
+      const auto& stream = native::fg_service::streams.at({true, context});
+      Check(accepted.replaced && accepted.evaluates == 1 && accepted.reuses == 0
+              && accepted_progress.complete && accepted_progress.cached != nullptr
+              && stream.native_pair_producer_marker == accepted_progress.cached->original_backbuffer
+              && !stream.native_pair_completion.empty()
+              && stream.native_pair_completion.fence->GetCompletedValue() >= stream.native_pair_completion_value
+              && accepted_submissions == submitted_before + 1,
+          "the SDK accepts and submits a complete non-neutral native refresh");
+      Check(accepted.restored_back == accepted.consumed_back && !matches(accepted.restored_back, source_back),
+          "the accepted native refresh leaves edited BB RGBA in the game resource");
+
+      // Record the entry readback on the same list as the re-delivery, with no new input writes.
+      const auto before_sdk = Capture(gpu, backbuffer.Get(), NATIVE_INPUT_STATE);
+      const auto refused = record({.token = token, .index = 2, .fg_success = false, .update_source = false,
+          .sdk_wrapper = true});
+      Check(refused.replaced && refused.evaluates == 0 && refused.reuses == 0
+              && refused.consumed_back == accepted.consumed_back && refused.consumed_hudless == accepted.consumed_hudless,
+          "the rejecting SDK call consumes the already delivered BB and HUDLess RGBA without new NR work");
+      const auto entry_back = before_sdk.Pixels();
+      Check(entry_back == accepted.restored_back, "the failing re-delivery starts with the committed edited BB RGBA");
+      Check(refused.restored_back == entry_back, "failed SDK re-delivery preserves the pre-call BB RGBA exactly");
+      Check(read_progress() == accepted_progress && native::native_fg_submitted_frames.load() == accepted_submissions,
+          "failed SDK re-delivery preserves the accepted cache, model history and base-frame counts");
+
+      const auto retried = record({.token = token, .index = 2, .update_source = false, .sdk_wrapper = true});
+      Check(retried.replaced && retried.evaluates == 0 && retried.reuses == 0
+              && retried.consumed_back == entry_back && retried.restored_back == entry_back
+              && retried.consumed_hudless == accepted.consumed_hudless
+              && read_progress() == accepted_progress && native::native_fg_submitted_frames.load() == accepted_submissions,
+          "the same input version re-delivers successfully after SDK rejection without advancing the accepted frame");
+    }
     const auto rejected = record({.token = ++token, .reject_motion = true});
     Check(rejected.replaced && rejected.evaluates == 0 && rejected.reuses == 1,
         "non-neutral native reuse executes without another model evaluation");
@@ -2060,7 +2095,10 @@ int Run() {
                  " ngx-detour=executed evaluates=1/0/1 color=complete stale-alpha/expired/role-retag=original\n"
                  "NR_RELEASE_PARITY native-prefg-present-x2 mfg-recovery"
                  " repeated=redelivered missing-role/changed-guide/foreign-list=original"
-                 " sdk-reject=ngx-detour+rgba-rollback recovery=reset+refresh\n";
+                 " sdk-reject=ngx-detour+rgba-rollback recovery=reset+refresh\n"
+                 "NR_RELEASE_PARITY native-prefg-present-x2 rejected-redelivery"
+                 " sdk-reject=ngx-detour sdk-input=edited-rgba backbuffer=exact-rgba bindings=restored"
+                 " cache-history-base=unchanged retry=redelivered\n";
     std::cout << "PASS native Pre-FG x2 evidence=WARP+MOCK format=HDR10-PQ,FP16"
                  " roles=BB+HUDLess+UIAlpha,FP16_BB"
                  " frame_source=registered_PresentStart_and_SDK_scope numeric_NGX_FrameID=absent"

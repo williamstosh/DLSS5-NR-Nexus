@@ -2608,9 +2608,9 @@ inline void RestoreNativePreFg(ID3D12GraphicsCommandList* list,
     stream.native_pending_parameters = nullptr;
     redelivery = std::exchange(stream.native_pending_redelivery, false);
   }
-  // Evaluate returning does not end the SDK's real-frame consumption of B.
-  // Keep successful NR pixels; rollback only this invocation's failed work.
-  if (!succeeded && backbuffer_replaced && list != nullptr && stream.cached != nullptr
+  // A proved re-delivery writes the already accepted edited BB. Restoring
+  // the first replacement's raw snapshot would undo that earlier delivery.
+  if (!succeeded && !redelivery && backbuffer_replaced && list != nullptr && stream.cached != nullptr
       && stream.cached->original_backbuffer != nullptr && stream.source_backbuffer != nullptr) {
     constexpr auto input_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     const native_tag_source::NativeBackbufferWrite write(stream.source_backbuffer);

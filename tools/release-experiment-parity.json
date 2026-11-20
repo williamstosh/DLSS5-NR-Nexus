@@ -86,13 +86,14 @@
         ["fg_native_options.hpp", "detour_guard::AttachAll(internal::REFLEX_MARKER_HOOK, &failed)"]
       ],
       "cases": [
-        { "suite": "fg-native", "name": "nr-edit-reuse-native-contracts", "log": "nr-edit-reuse-native-contracts", "receipt": "^PASS case=nr-edit-reuse-native-contracts evidence=WARP\\+MOCK dev={dev}$", "scenarios": ["synchronous", "synchronous-source-refusal", "asynchronous", "mfg-recovery", "adaptive-worksets"],
+        { "suite": "fg-native", "name": "nr-edit-reuse-native-contracts", "log": "nr-edit-reuse-native-contracts", "receipt": "^PASS case=nr-edit-reuse-native-contracts evidence=WARP\\+MOCK dev={dev}$", "scenarios": ["synchronous", "synchronous-source-refusal", "asynchronous", "mfg-recovery", "adaptive-worksets", "rejected-redelivery"],
           "expect": {
             "synchronous": "^source=successful-present-start\\+sdk-present same-scope=1 ngx-detour=executed pq-evaluates=1/0/1/0 fp16-evaluates=1/0/1 fp16-alpha=preserved$",
             "synchronous-source-refusal": "^missing-present-start=refused failed-present-start=refused wrong-sdk-scope=refused$",
             "asynchronous": "^source=set-tag-for-frame\\+copy\\+fence ngx-detour=executed evaluates=1/0/1 color=complete stale-alpha/expired/role-retag=original$",
             "mfg-recovery": "^repeated=redelivered missing-role/changed-guide/foreign-list=original sdk-reject=ngx-detour\\+rgba-rollback recovery=reset\\+refresh$",
-            "adaptive-worksets": "^active-upper=1/0 lower-per-frame=edited-rgba repeated=identical zero-advance=1 missing-version/alpha-retag/guide-overwrite=original tokenless=two-deliveries evidence=WARP\\+MOCK$"
+            "adaptive-worksets": "^active-upper=1/0 lower-per-frame=edited-rgba repeated=identical zero-advance=1 missing-version/alpha-retag/guide-overwrite=original tokenless=two-deliveries evidence=WARP\\+MOCK$",
+            "rejected-redelivery": "^sdk-reject=ngx-detour sdk-input=edited-rgba backbuffer=exact-rgba bindings=restored cache-history-base=unchanged retry=redelivered$"
           } }
       ]
     },
