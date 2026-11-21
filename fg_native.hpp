@@ -358,6 +358,11 @@ inline void Retire() noexcept {
     if (!HoldingRuntimeLock()) {
       lock.emplace(runtime_mutex);
     }
+    if (!enabled.load(std::memory_order_relaxed) || shutting_down.load(std::memory_order_acquire)
+        || !hooks_enabled.load(std::memory_order_acquire) || NrYieldsToForeign()
+        || (!PresentHookServes() && !experimental_present_chain.load(std::memory_order_relaxed))) {
+      InvalidateOrdinaryPresentAttemptsLocked();
+    }
     if (!HasResources() && present_retired.empty()) return;
     RetireServiceStreamsLocked();
     if (workset_free_policy.load(std::memory_order_relaxed) == 0u
@@ -1417,6 +1422,15 @@ inline void OnXeFGPresentDelivery(const fg::FrameInput& input, bool succeeded) n
     }
     Retire();
   });
+}
+
+// Caller owns runtime_mutex. An adopted ordinary color has already observed
+// its application frame; receive only any still-unobserved raw Reset event.
+inline void ObserveOrdinaryHandoffInput(const fg::FrameInput& input, bool reset_observed) {
+  const auto existing = streams.find({false, input.context});
+  const bool pending = existing != streams.end() && existing->second.pending_xefg_game_reset;
+  if (!reset_observed && (pending || (input.has_constants && input.reset))) ObserveGameReset();
+  if (existing != streams.end()) existing->second.pending_xefg_game_reset = false;
 }
 
 inline fg::Result Service(const fg::FrameInput& input) noexcept {

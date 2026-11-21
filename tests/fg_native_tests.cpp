@@ -204,7 +204,8 @@ int RunNativeOwnerIdleTest();
 int RunNativeOptionsResumeTest(bool delayed_options = false);
 void ResizeNativeTestOutput(Gpu& gpu, IDXGISwapChain3* output, ID3D12Resource* old_input);
 int RunNativeGuideContractTest();
-int RunPresentGuideModelsTest(bool native_ngx = false, const char* project_id_path = nullptr, bool handoff_only = false);
+int RunPresentGuideModelsTest(bool native_ngx = false, const char* project_id_path = nullptr, bool handoff_only = false,
+                              bool ordinary_signal_loss_only = false);
 int RunNativePresentDecisionTest();
 int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_only = false);
 // Case bodies follow the Present fixture that supplies their shared Runtime.
@@ -1114,6 +1115,9 @@ int main(int argc, char** argv) {
   if (argc == 2 && std::strcmp(argv[1], "--present-guide-models") == 0) return RunPresentGuideModelsTest();
   if (argc == 2 && std::strcmp(argv[1], "--xefg-present-handoff") == 0) {
     return run_edit_reuse_case([] { return RunPresentGuideModelsTest(false, nullptr, true); });
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--xefg-ordinary-receipt-first-signal") == 0) {
+    return run_edit_reuse_case([] { return RunPresentGuideModelsTest(false, nullptr, true, true); });
   }
   if (argc == 2 && std::strcmp(argv[1], "--native-present-decision") == 0) {
     return run_edit_reuse_case(RunNativePresentDecisionTest);
@@ -4248,7 +4252,7 @@ void ResizeNativeTestOutput(Gpu& gpu, IDXGISwapChain3* output, ID3D12Resource* o
 #include "xefg_inline_handoff_cases.hpp"
 #include "xefg_present_handoff_cases.hpp"
 
-int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool handoff_only) {
+int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool handoff_only, bool ordinary_signal_loss_only) {
   try {
     const HMODULE test_module = GetModuleHandleW(nullptr);
     reshade::internal::get_reshade_module_handle(test_module);
@@ -4568,7 +4572,7 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool
       native::codec_pipeline.incremental_preparation = false;
       native::edit_reuse_enabled = false;
       native::control_mask_enabled = false;
-      xefg_present_handoff_cases::Run(gpu, submit, wait_present_fence);
+      xefg_present_handoff_cases::Run(gpu, submit, wait_present_fence, ordinary_signal_loss_only);
       return 0;
     }
     // Session::Tag declares COMMON. Finish these transitions before its

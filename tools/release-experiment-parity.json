@@ -222,7 +222,7 @@
       "sources": [
         ["preset_runtime.hpp", "fg::xefg::ReconcileNrService();"],
         ["dlssnr.hpp", "fg::xefg::ReconcileNrService();"],
-        ["fg_xefg.hpp", "inline void ReconcileNrService() noexcept"],
+        ["fg_xefg.hpp", "inline void ReconcileNrService(ID3D12Device* prepare_device = nullptr) noexcept"],
         ["fg_xefg.hpp", "internal::retire.store(retire, std::memory_order_release);"],
         ["fg_xefg.hpp", "ReconcileNrService();"],
         ["fg_native.hpp", "inline void RetireServiceStreamsLocked()"],
@@ -242,7 +242,7 @@
         { "suite": "fg-native", "name": "present-guide-models", "log": "present-guide-models",
           "receipt": "^PASS XeFG Present handoff providers=ordinary-image\\+Core real_guides\\+Optional-no-ID passes=2 Service_owned_pending\\+external_replayable public_disable_restore evidence=WARP\\+MOCK real_NGX=NOT_RUN$",
           "existingTrace": true,
-          "scenarios": ["upscaled", "render", "upscaled-empty-pool", "render-empty-pool", "upscaled-off-hold", "render-off-hold", "upscaled-reclaim", "render-reclaim", "upscaled-owner-exit", "render-owner-exit", "owner-isolation", "owner-pending", "nested-delivery", "nested-failed-sr", "nested-source-first", "nested-source-next", "nested-recovery", "present-handoff"],
+          "scenarios": ["upscaled", "render", "upscaled-empty-pool", "render-empty-pool", "upscaled-off-hold", "render-off-hold", "upscaled-reclaim", "render-reclaim", "upscaled-owner-exit", "render-owner-exit", "owner-isolation", "owner-pending", "nested-delivery", "nested-failed-sr", "nested-source-first", "nested-source-next", "nested-recovery", "present-handoff", "ordinary-present-receipt", "ordinary-receipt-game-reset"],
           "expect": {
             "upscaled": "^XEFG_INLINE_HANDOFF stage=Upscaled fg=held_on sr=MOCK sr_wrapper=actual inline_nr_evals=2 inline_delivery_readback=2 xefg_nr_evals=2 xefg_delivery_readback=2 game_pending_and_replayable=1 evidence=WARP\\+MOCK$",
             "render": "^XEFG_INLINE_HANDOFF stage=Render fg=held_on sr=MOCK sr_wrapper=actual inline_nr_evals=2 inline_delivery_readback=2 xefg_nr_evals=2 xefg_delivery_readback=2 game_pending_and_replayable=0 evidence=WARP\\+MOCK$",
@@ -261,7 +261,16 @@
             "nested-source-first": "^XEFG_INLINE_NESTED_SOURCE_OUTPUT frame=1 outer_enhanced=matched same_list_copy=1 output_registered=1 source_bound=1$",
             "nested-source-next": "^XEFG_INLINE_NESTED_SOURCE_OUTPUT frame=2 outer_enhanced=matched same_list_copy=1 output_registered=1 source_bound=1$",
             "nested-recovery": "^XEFG_INLINE_NESTED_RECOVERY stage=Upscaled failed_inner_sr=1 recovered_own_sequence=1$",
-            "present-handoff": "^PASS xefg-present-handoff evidence=WARP\\+MOCK passes=1 same_backbuffer=1 full_rgba=1$"
+            "present-handoff": "^PASS xefg-present-handoff evidence=WARP\\+MOCK passes=1 same_backbuffer=1 full_rgba=1$",
+            "ordinary-present-receipt": "^PASS xefg-ordinary-present-receipt evidence=WARP\\+MOCK same_version=1 next_version=1 sdk_failure=1 late_end=1 distinct_output=1 hudless_conflict=1 no_sdk_finish=1$",
+            "ordinary-receipt-game-reset": "^PASS xefg-ordinary-receipt-game-reset evidence=WARP\\+MOCK game_reset_delta=1 same_version_write=1 sdk_writes=0 next_version_reset=1$"
+          } },
+        { "suite": "fg-native", "name": "xefg-ordinary-receipt-first-signal", "log": "xefg-ordinary-receipt-first-signal",
+          "receipt": "^PASS xefg-ordinary-receipt-first-signal evidence=WARP\\+MOCK first_proof=failed owner_fence=complete claim=conflict single_write=1$",
+          "existingTrace": true,
+          "scenarios": ["first-signal-conflict"],
+          "expect": {
+            "first-signal-conflict": "^PASS xefg-ordinary-receipt-first-signal evidence=WARP\\+MOCK first_proof=failed owner_fence=complete claim=conflict single_write=1$"
           } }
       ]
     }

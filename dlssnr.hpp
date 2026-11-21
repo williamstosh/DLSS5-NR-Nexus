@@ -1192,6 +1192,7 @@ struct PresentTarget {
   NVSDK_NGX_Feature diagnostic_source_feature = NVSDK_NGX_Feature_Reserved_Unknown;
   uint32_t guide_mode = 0;
   uintptr_t swapchain_identity = 0;
+  fg::xefg::OrdinaryPresentAttempt ordinary_attempt;
   DXGI_FORMAT swapchain_format = DXGI_FORMAT_UNKNOWN;
   bool d3d11_bridge = false;
   // Granted only by the ordinary Present caller, never by pre-FG/B1.
@@ -8043,18 +8044,8 @@ inline constexpr uint32_t kGameResetBurstLines = 32;
 // later gate would otherwise lose the reset entirely, while the NR slots
 // still get DLSSNR.Reset=1 on their next evaluated frame via the un-acked
 // epoch.
-inline void ObserveGameFrame(const FeatureState& current) {
-  const float pe = current.pre_exposure > 0.f ? current.pre_exposure : 1.f;
-  const float es = current.exposure.scale > 0.f ? current.exposure.scale : 1.f;
+inline void ObserveGameReset() {
   GameWindow& w = game_window;
-  w.pe_min = w.frames == 0 ? pe : (std::min)(w.pe_min, pe);
-  w.pe_max = w.frames == 0 ? pe : (std::max)(w.pe_max, pe);
-  w.es_min = w.frames == 0 ? es : (std::min)(w.es_min, es);
-  w.es_max = w.frames == 0 ? es : (std::max)(w.es_max, es);
-  w.pe_last = pe;
-  w.es_last = es;
-  ++w.frames;
-  if (current.frame_reset == 0) return;
   RequestHistoryReset(HistoryResetSource::kGameReset);
   ++w.resets;
   const int64_t now = SteadyNowNs();
@@ -8071,6 +8062,20 @@ inline void ObserveGameFrame(const FeatureState& current) {
     }
   }
   last_game_reset_ns = now;
+}
+
+inline void ObserveGameFrame(const FeatureState& current) {
+  const float pe = current.pre_exposure > 0.f ? current.pre_exposure : 1.f;
+  const float es = current.exposure.scale > 0.f ? current.exposure.scale : 1.f;
+  GameWindow& w = game_window;
+  w.pe_min = w.frames == 0 ? pe : (std::min)(w.pe_min, pe);
+  w.pe_max = w.frames == 0 ? pe : (std::max)(w.pe_max, pe);
+  w.es_min = w.frames == 0 ? es : (std::min)(w.es_min, es);
+  w.es_max = w.frames == 0 ? es : (std::max)(w.es_max, es);
+  w.pe_last = pe;
+  w.es_last = es;
+  ++w.frames;
+  if (current.frame_reset != 0) ObserveGameReset();
 }
 
 // Returns the workset for `key` (the game resource the pass owns), creating
@@ -25941,6 +25946,7 @@ inline void OnInitDevice(reshade::api::device* device) {
 // foreign tool's present callback can evaluate.  Under DX11Source=off the
 // first D3D12 swapchain also runs the device half held back at init_device.
 inline void OnInitSwapchain(reshade::api::swapchain* swapchain, bool /*resize*/) {
+  ConfigureOrdinaryPresentOwner();
   fg::native_options::Configure(OnNativeFgOptions, OnNativePresentObserved);
   fg::native_options::Poll();
   fg::xefg::Configure(fg_service::Service, fg_service::PrepareCapture, fg_service::Retire,
@@ -26486,12 +26492,12 @@ inline FunnelInputs CollectFunnelInputs() {
     in.dx11_source_off = false;
     in.seen = 1;
     in.eligible = 1;
-    in.injected = current == fg::Result::SUBMITTED ? 1 : 0;
+    in.injected = fg::Submitted(current) ? 1 : 0;
     in.submitted_ok = in.injected;
     in.unaccounted = 0;
     in.top_decline_tag = (current == fg::Result::PREPARED ? "fg_preparing"
         : current == fg::Result::FAILED ? "fg_handoff_failed"
-        : current == fg::Result::SUBMITTED ? nullptr : "fg_unserved");
+        : fg::Submitted(current) ? nullptr : "fg_unserved");
     in.top_decline_count = in.injected == 0 ? 1 : 0;
   }
   return in;
@@ -27145,7 +27151,7 @@ inline ui::CardInputs CollectCardInputs(const NrVerdict& verdict,
   // The funnel's 0/1 values describe the current handoff, not session totals.
   if (fg::xefg::OwnsStream()) {
     in.fg_submitted_frames = fg::xefg::SubmittedFrames();
-    in.fg_continuing_submission = fg::xefg::DisplayResult() == fg::Result::SUBMITTED;
+    in.fg_continuing_submission = fg::Submitted(fg::xefg::DisplayResult());
   } else if (native_fg_owns.load(std::memory_order_acquire)
              && hook_point.load(std::memory_order_relaxed) == kHookPresent) {
     in.fg_submitted_frames = native_fg_submitted_frames.load(std::memory_order_relaxed);
@@ -29031,6 +29037,15 @@ inline void ServiceDisabledNr() {
   ngx_serial::retirement_armed.store(false, std::memory_order_release);
 }
 
+inline void OnFinishPresent(reshade::api::command_queue*, reshade::api::swapchain* swapchain) {
+  const auto found = std::find_if(ordinary_present_event_attempts.rbegin(), ordinary_present_event_attempts.rend(),
+      [&](const auto& attempt) { return attempt.owner == reinterpret_cast<uintptr_t>(swapchain); });
+  if (found == ordinary_present_event_attempts.rend()) return;
+  const auto attempt = *found;
+  ordinary_present_event_attempts.erase(std::next(found).base());
+  EndOrdinaryPresentAttempt(attempt);
+}
+
 inline void OnPresent(
     reshade::api::command_queue* queue,
     reshade::api::swapchain* swapchain,
@@ -29039,6 +29054,9 @@ inline void OnPresent(
     uint32_t,
     const reshade::api::rect*) {
   if (shutting_down.load(std::memory_order_acquire)) return;
+  GuardHook([&] {
+    BeginOrdinaryPresentAttempt(queue, swapchain);
+  });
   StartAsyncAutoscalePreparation();
   // Bind to the selected runtime's device and first backbuffer, rather than
   // interleaving different swapchains or treating lifecycle ticks as presents.
@@ -36421,6 +36439,7 @@ inline void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) 
   fg::xefg::ForgetBridgeSourceSwapchain(reinterpret_cast<uintptr_t>(swapchain));
   if (swapchain != nullptr) {
     RuntimeLock lock(runtime_mutex);
+    InvalidateOrdinaryPresentAttemptsLocked(reinterpret_cast<uintptr_t>(swapchain));
     if (auto stream = present_streams.find(swapchain); stream != present_streams.end()) {
       stream->second.mixed_buffers.clear();
       stream->second.mixed_source_resource.reset();
@@ -36970,6 +36989,7 @@ inline void Use(DWORD reason, HMODULE module, LPVOID reserved) {
       reshade::register_event<reshade::addon_event::init_swapchain>(internal::OnInitSwapchain);
       reshade::register_event<reshade::addon_event::destroy_swapchain>(internal::OnDestroySwapchain);
       reshade::register_event<reshade::addon_event::present>(internal::OnPresent);
+      reshade::register_event<reshade::addon_event::finish_present>(internal::OnFinishPresent);
       reshade::register_event<reshade::addon_event::init_effect_runtime>(
           internal::OnInitEffectRuntime);
       reshade::register_event<reshade::addon_event::destroy_effect_runtime>(
@@ -37022,6 +37042,7 @@ inline void Use(DWORD reason, HMODULE module, LPVOID reserved) {
       reshade::unregister_event<reshade::addon_event::init_swapchain>(internal::OnInitSwapchain);
       reshade::unregister_event<reshade::addon_event::destroy_swapchain>(internal::OnDestroySwapchain);
       reshade::unregister_event<reshade::addon_event::present>(internal::OnPresent);
+      reshade::unregister_event<reshade::addon_event::finish_present>(internal::OnFinishPresent);
       reshade::unregister_event<reshade::addon_event::init_effect_runtime>(
           internal::OnInitEffectRuntime);
       reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(

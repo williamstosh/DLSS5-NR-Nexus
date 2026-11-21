@@ -11,6 +11,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <thread>
 #include <tuple>
 #include <utility>
@@ -28,7 +29,7 @@ struct ExternalList {
   std::shared_ptr<submission::RecordingStatus> recording;
 };
 
-inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence) {
+inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordinary_signal_loss_only = false) {
   using stage_execution_cases::Capture;
   using Pixel = std::array<uint8_t, 4>;
   constexpr Pixel scene_a{62, 111, 190, 77};
@@ -42,12 +43,14 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence) {
   restore.Value(&adapter::proxies[0].real[0]);
   restore.Value(&model_parameter_observer);
   restore.Value(&nr_edit_reuse_xefg_cases::consume_sdk_present);
+  restore.Value(&nr_edit_reuse_xefg_cases::sdk_present_result);
   restore.Atomic(&native::present_frames);
   restore.Atomic(&native::stack_passes);
   restore.Atomic(&native::present_guides);
   restore.Atomic(&native::present_pre_fg);
   native::stack_passes = 1;
   native::present_frames = 0;
+  nr_edit_reuse_xefg_cases::sdk_present_result = S_OK;
   native::ngx_slot_real[0].create = reinterpret_cast<void*>(nr_edit_reuse_render_cases::CreateSr);
   native::ngx_slot_real[0].evaluate = reinterpret_cast<void*>(nr_edit_reuse_gpu_cases::CopySr);
   native::ngx_slot_real[0].release = reinterpret_cast<void*>(+[](NVSDK_NGX_Handle*) -> NVSDK_NGX_Result {
@@ -71,7 +74,11 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence) {
   native::present_guides = native::kPresentGuidesOptional;
   native::present_pre_fg = 1;
   for (auto* output : {&route, &other_route}) {
-    const std::array buffers{static_cast<uintptr_t>(output->get_current_back_buffer().handle)};
+    const auto buffer = static_cast<uintptr_t>(output->get_current_back_buffer().handle);
+    const auto canonical = reinterpret_cast<uintptr_t>(
+        renodx::utils::directx::NativeIdentity(reinterpret_cast<IUnknown*>(buffer)));
+    std::vector buffers{buffer};
+    if (canonical != 0 && canonical != buffer) buffers.push_back(canonical);
     rate::RegisterPresentOutput(reinterpret_cast<uintptr_t>(output),
         reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(gpu.device.Get())),
         reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(output->swapchain)), buffers);
@@ -137,6 +144,7 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence) {
   };
   rebuild_source();
 
+  uint32_t produced_colors = 0;
   const auto produce = [&](ID3D12Resource* target, Pixel pixel, int scene, bool reset) {
     ++native::present_generation;
     if (scene < 0) {
@@ -161,6 +169,7 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence) {
       }
     }
     submit();
+    ++produced_colors;
   };
 
   std::vector<uint8_t> consumed;
@@ -190,10 +199,18 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence) {
     return (it == native::present_streams.end() ? uint64_t{0} : it->second.nr_presents);
   };
   const auto call_ordinary = [&](PresentRingFaceProbe* output) {
+    const auto attempt = native::BeginOrdinaryPresentAttempt(&output->queue, output);
+    Check(static_cast<bool>(attempt), "ordinary Present begins a real output attempt");
     native::present_sdr_white_polled_ns = native::SteadyNowNs();
     native::RunPresentPath(&output->queue, output);
+    return attempt;
   };
-  const auto sdk_present = [&](Session* sdk_session, int scene, bool reset) {
+  const auto find_attempt = [](PresentRingFaceProbe* output) {
+    return native::FindOrdinaryPresentAttempt(reinterpret_cast<uintptr_t>(
+        renodx::utils::directx::NativeIdentity(output->swapchain)), reinterpret_cast<uintptr_t>(
+        renodx::utils::directx::NativeIdentity(output->back)));
+  };
+  const auto sdk_present = [&](Session* sdk_session, int scene, bool reset, HRESULT expected = S_OK) {
     if (scene >= 0) {
       ++present_id;
       sdk_session->Tag(present_id, DEPTH, depths[scene].Get());
@@ -204,11 +221,31 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence) {
       sdk_session->Present(present_id);
     } else {
       Check(!sdk_session->context->fresh_id, "unlabeled application Present starts without a fresh ID");
-      Check(SUCCEEDED(adapter::ProxyHooks<0>::Present(sdk_session->proxy.Get(), 0, 0)), "SDK forwards the untagged application Present");
+      Check(adapter::ProxyHooks<0>::Present(sdk_session->proxy.Get(), 0, 0) == expected,
+            "Proxy Present returns the original untagged SDK result");
+    }
+  };
+  const auto next_execute = [] {
+    const std::lock_guard lock(submission::tracker_mutex);
+    return submission::next_execute;
+  };
+  const auto observe_color_submissions = [](submission::RecordingOwner owner, const void* backbuffer,
+                                            uint64_t first_execute, const auto& observe) {
+    const std::lock_guard lock(submission::tracker_mutex);
+    for (const auto& [list_id, list] : submission::tracked_lists) {
+      for (const auto& [generation, recorded] : list.generations) {
+        if (recorded.owner != owner || recorded.first_execute < first_execute
+            || std::ranges::none_of(recorded.classified_uses, [&](const auto& use) {
+                 return use.kind == submission::UseKind::kOutputColor && use.output.resource == backbuffer
+                     && use.output.subresource == 0;
+               })) continue;
+        observe(list_id, generation, recorded);
+      }
     }
   };
   const auto frame = [&](const char* stage, PresentRingFaceProbe* output, Pixel pixel, int scene, bool reset,
-                         bool sdk, bool edited, int expected_reset, bool check = true) {
+                         bool sdk, bool edited, int expected_reset, bool check = true,
+                         xefg::OrdinaryPresentAttempt* open_attempt = nullptr) {
     produce(output->back, pixel, scene, reset);
     const auto calls = model_calls;
     const auto creations = next_handle;
@@ -218,13 +255,9 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence) {
     const auto application_frame = session.context->application_frame;
     const auto reads = sdk_reads;
     model_depth = model_motion = nullptr;
-    uint64_t first_execute = 0;
-    {
-      const std::lock_guard lock(submission::tracker_mutex);
-      first_execute = submission::next_execute;
-    }
+    const auto first_execute = next_execute();
     const auto ordinary_real_guides = native::present_guides_real.load();
-    call_ordinary(output);
+    const auto attempt = call_ordinary(output);
     const auto ordinary_delta = ordinary_submissions(output) - ordinary;
     std::pair<uint64_t, uint64_t> submitted_recording;
     if (ordinary_delta != 0) {
@@ -240,22 +273,13 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence) {
     bool ordinary_color_matches_slot = false;
     nlohmann::json color_recordings = nlohmann::json::array();
     const auto color_identity = renodx::utils::directx::NativeIdentity(output->back);
-    {
-      const std::lock_guard lock(submission::tracker_mutex);
-      for (const auto& [list_id, list] : submission::tracked_lists) {
-        for (const auto& [generation, recorded] : list.generations) {
-          if (recorded.owner != submission::RecordingOwner::kOrdinaryPresent || recorded.first_execute < first_execute
-              || std::ranges::none_of(recorded.classified_uses, [&](const auto& use) {
-                   return use.kind == submission::UseKind::kOutputColor && use.output.resource == color_identity
-                       && use.output.subresource == 0;
-                 })) continue;
+    observe_color_submissions(submission::RecordingOwner::kOrdinaryPresent, color_identity, first_execute,
+        [&](uint64_t list_id, uint64_t generation, const auto& recorded) {
           ordinary_color_writes += recorded.submissions.size();
           ordinary_color_matches_slot |= submitted_recording == std::pair{list_id, generation};
           color_recordings.push_back({{"list", list_id}, {"generation", generation}, {"execute", recorded.first_execute},
                                      {"submissions", recorded.submissions.size()}});
-        }
-      }
-    }
+        });
     if (sdk) {
       sdk_present(&session, scene, reset);
     } else {
@@ -263,6 +287,13 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence) {
       const auto pixels = Capture(gpu, output->back, present_state);
       submit();
       consumed = pixels.Pixels();
+    }
+    if (open_attempt != nullptr) {
+      Check(find_attempt(output) == attempt, "the current ordinary attempt is available before the consumer begins");
+      *open_attempt = attempt;
+    } else {
+      if (!sdk) native::EndOrdinaryPresentAttempt(attempt, S_OK);
+      Check(!find_attempt(output), "consumer completion closes this ordinary Present attempt");
     }
     const auto evaluations = model_calls - calls;
     const int observed_reset = (evaluations == 0 ? -1 : model_resets.back());
@@ -314,6 +345,75 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence) {
     }
     Check(false, "establish the fixture's initial output before checking first-frame handoffs");
   };
+  const auto fail_first_tracker_signal = [&](const auto& operation) {
+    using namespace control_mask_gpu_cases;
+    namespace vtable = renodx::utils::vtable;
+    vtable::Slot<SignalFn> signal_probe{.object = gpu.queue.Get(), .index = 14,
+        .original = &real_signal, .replacement = Signal};
+    vtable::Install(&signal_probe);
+    const auto restore_signal = [](vtable::Slot<SignalFn>* slot) {
+      signal_fault_fence = nullptr;
+      vtable::Uninstall(slot);
+    };
+    const std::unique_ptr<vtable::Slot<SignalFn>, decltype(restore_signal)> signal_owner(&signal_probe, restore_signal);
+    {
+      std::lock_guard lock(addon::queue_completion_mutex);
+      signal_fault_fence = addon::queue_completions.at(gpu.queue.Get()).fence;
+    }
+    Check(signal_fault_fence != nullptr, "the real tracker has a scoped first Signal target");
+    const auto failures = injected_failures;
+    operation();
+    Check(injected_failures == failures + 1, "fail exactly the first post-Execute tracker Signal");
+  };
+  const auto release_fixture = [&] {
+    Check(NVSDK_NGX_SUCCEED(native::HookedReleaseFeatureSlot<0>(source)), "release the rebuilt SR source");
+    const addon::ngx_serial::PresentTurn turn;
+    Check(turn.owns(), "handoff cleanup owns the runtime turn");
+    const addon::RuntimeLock lock(native::runtime_mutex);
+    Check(native::ReleasePresentRing(), "handoff cleanup retires the completed ordinary ring");
+    for (auto* output : {&route, &other_route}) {
+      native::RetirePresentStream(output);
+      rate::DestroyPresentOutput(reinterpret_cast<uintptr_t>(output));
+    }
+    native::DrainRetiredResources(true);
+  };
+  if (ordinary_signal_loss_only) {
+    Check(Hooks::Enable(session.handle, 0) == 0 && !session.context->enabled, "Signal fixture starts with ordinary ownership");
+    warm("ordinary-receipt-signal-prefix", &route, false);
+    produce(back.Get(), menu, -1, false);
+    const auto calls = model_calls;
+    const auto deliveries = xefg::SubmittedFrames();
+    const auto reads = sdk_reads;
+    xefg::OrdinaryPresentAttempt attempt;
+    fail_first_tracker_signal([&] { attempt = call_ordinary(&route); });
+    wait_fence(native::present_ring.fence, native::present_ring.submitted);
+    xefg::OrdinaryPresentReceipt receipt;
+    {
+      const addon::RuntimeLock lock(native::runtime_mutex);
+      receipt = native::ordinary_present_attempts.at(&route).receipt;
+    }
+    Check(receipt.attempt == attempt && receipt.executed && receipt.output_ready && receipt.group_complete
+              && receipt.submission.signaled && receipt.submission.fence_value == native::present_ring.submitted
+              && receipt.first_state == submission::SubmissionProofState::kSignalFailed && !receipt.proofs_healthy
+              && model_calls == calls + 1, "ordinary color executed once and its own fence completed without a first tracker proof");
+    Check(Hooks::Enable(session.handle, 1) == 0 && find_attempt(&route) == attempt,
+          "the SDK takes the same output and sees the actual unproven ordinary receipt");
+    auto sdk = adapter::BeginPresent(session.proxy.Get(), 0);
+    Check(sdk.ordinary_claim == xefg::OrdinaryPresentClaim::CONFLICT && sdk.ordinary_receipt.attempt == attempt
+              && sdk.ordinary_receipt.first_state == submission::SubmissionProofState::kSignalFailed
+              && !sdk.color_executed && sdk.service_result == fg::Result::NOT_SERVED,
+          "missing first tracker proof forbids claiming the ordinary result or writing it again");
+    const auto status = nr_edit_reuse_xefg_cases::ConsumeSdkPresent(session.proxy.Get(), 0, 0);
+    adapter::EndPresent(&sdk, status);
+    Check(status == S_OK && xefg::CurrentResult() == fg::Result::NOT_SERVED && !find_attempt(&route)
+              && sdk_reads == reads + 1 && model_calls == calls + 1 && xefg::SubmittedFrames() == deliveries
+              && consumed == expected_pixels(menu, true) && !submission::ResourceReleasable(back.Get()),
+          "SDK consumes the actual RGBA without a second enhancement or a manufactured lifetime proof");
+    release_fixture();
+    std::cout << "PASS xefg-ordinary-receipt-first-signal evidence=WARP+MOCK first_proof=failed owner_fence=complete"
+                 " claim=conflict single_write=1" << std::endl;
+    return;
+  }
   warm("initial-sdk", &route, true);
   frame("on-last-scene-a", &route, scene_a, 0, false, true, true, 0);
   frame("on-menu-no-id", &route, menu, -1, false, true, true, 1);
@@ -334,18 +434,168 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence) {
             << " single_write=" << duplicate_ok << std::endl;
 
   frame("off-last-scene-a", &route, scene_a, 0, true, true, true, 1);
-  Check(Hooks::Enable(session.handle, 0) == 0 && !session.context->enabled, "SDK actually relinquishes this output");
-  frame("off-first-menu-ordinary", &route, menu, -1, false, false, true, 1);
+  {
+    uint64_t first_sdk_execute = 0;
+    const auto color_identity = renodx::utils::directx::NativeIdentity(back.Get());
+    const auto consume_original = nr_edit_reuse_xefg_cases::consume_sdk_present;
+    std::vector<submission::GenerationSubmission> sdk_writes;
+    nlohmann::json sdk_recordings = nlohmann::json::array();
+    funnel_accounting_tests::Restore consumer_restore;
+    consumer_restore.Value(&nr_edit_reuse_xefg_cases::consume_sdk_present);
+    nr_edit_reuse_xefg_cases::consume_sdk_present = [&](IDXGISwapChain* output) {
+      // The consumer's GPU readback retires completed tracker generations.
+      observe_color_submissions(submission::RecordingOwner::kXeFg, color_identity, first_sdk_execute,
+          [&](uint64_t list_id, uint64_t generation, const auto& recorded) {
+            sdk_writes.insert(sdk_writes.end(), recorded.submissions.begin(), recorded.submissions.end());
+            sdk_recordings.push_back({{"list", list_id}, {"generation", generation}, {"execute", recorded.first_execute}});
+          });
+      consume_original(output);
+    };
+    struct ReceiptCase {
+      const char* ordinary_phase;
+      const char* next_phase;
+      HRESULT sdk_status;
+      int ordinary_reset;
+      bool raw_sdk_reset;
+    };
+    constexpr ReceiptCase receipt_cases[]{
+        {"off-first-menu-ordinary", "after-enable-next-produced-menu", S_OK, 1, false},
+        {"off-menu-before-sdk-failure", "after-failed-end-next-produced-menu", E_FAIL, -1, false},
+        {"off-menu-before-sdk-reset", "after-sdk-reset-next-produced-menu", S_OK, -1, true},
+    };
+    const auto& game_resets = native::history_reset_counts[static_cast<size_t>(native::HistoryResetSource::kGameReset)];
+    for (const auto& scenario : receipt_cases) {
+      const bool sdk_success = scenario.sdk_status == S_OK;
+      Check(Hooks::Enable(session.handle, 0) == 0 && !session.context->enabled, "SDK actually relinquishes this output");
+      const auto before_ordinary = model_calls;
+      const auto resets_before_ordinary = game_resets.load();
+      xefg::OrdinaryPresentAttempt ordinary_attempt;
+      Check(frame(scenario.ordinary_phase, &route, menu, -1, false, false, true,
+                  scenario.ordinary_reset, true, &ordinary_attempt)
+                && model_calls == before_ordinary + 1,
+            "ordinary Present writes the complete menu version once before SDK BeginPresent");
+      const auto ordinary_pixels = consumed;
+      const auto menu_production = produced_colors;
+      const auto reads = sdk_reads;
+      const auto submissions = xefg::SubmittedFrames();
+      first_sdk_execute = next_execute();
+      sdk_writes.clear();
+      sdk_recordings.clear();
+      Check(native::present_guides == native::kPresentGuidesOptional && !session.context->ui_composition,
+            "the SDK accepts the untagged menu with Optional guides");
+      Check(Hooks::Enable(session.handle, 1) == 0 && session.context->enabled
+                && find_attempt(&route) == ordinary_attempt, "SDK Enable retains the in-progress ordinary attempt");
+      const auto resets_at_sdk_begin = game_resets.load();
+      nr_edit_reuse_xefg_cases::sdk_present_result = scenario.sdk_status;
+      sdk_present(&session, scenario.raw_sdk_reset ? 0 : -1, scenario.raw_sdk_reset, scenario.sdk_status);
+      nr_edit_reuse_xefg_cases::sdk_present_result = S_OK;
+      const auto resets_after_sdk = game_resets.load();
+      const auto result = xefg::CurrentResult();
+      const auto model_evaluates = model_calls - before_ordinary;
+      const auto sdk_deliveries = xefg::SubmittedFrames() - submissions;
+      const bool same_version = produced_colors == menu_production && route.back == back.Get();
+      const bool preserved_rgba = consumed == ordinary_pixels;
+      const bool finished = !find_attempt(&route);
+      const bool single_write = same_version && model_evaluates == 1 && sdk_deliveries == 0 && sdk_writes.empty()
+          && sdk_reads == reads + 1 && preserved_rgba && finished
+          && result == (sdk_success ? fg::Result::ORDINARY_SUBMITTED : fg::Result::FAILED)
+          && (!scenario.raw_sdk_reset || (resets_at_sdk_begin == resets_before_ordinary
+              && resets_after_sdk == resets_at_sdk_begin + 1));
+      accepted &= single_write;
+      std::cout << "XEFG_HANDOFF_SAME_VERSION " << nlohmann::json{{"version", version}, {"same_version", same_version},
+          {"model_evaluates", model_evaluates}, {"ordinary_bb_writes", 1}, {"sdk_bb_writes", sdk_writes.size()},
+          {"sdk_deliveries", sdk_deliveries}, {"sdk_recordings", sdk_recordings}, {"same_rgba", preserved_rgba},
+          {"sdk_success", sdk_success}, {"result", static_cast<unsigned>(result)}, {"finished", finished},
+          {"raw_sdk_reset", scenario.raw_sdk_reset}, {"game_reset_delta", resets_after_sdk - resets_at_sdk_begin},
+          {"passed", single_write}}.dump() << std::endl;
+
+      sdk_writes.clear();
+      sdk_recordings.clear();
+      first_sdk_execute = next_execute();
+      const bool next_delivered = frame(scenario.next_phase, &route, scene_a, -1, false, true, true,
+                                        scenario.raw_sdk_reset ? 1 : -1);
+      const bool next_completed = sdk_writes.size() == 1
+          && submission::ReadSubmission(sdk_writes.front()).state == submission::SubmissionProofState::kComplete;
+      const auto& evaluate = native::stage_telemetry[static_cast<size_t>(addon::stage_plan::Stage::PRESENT)].last_evaluate;
+      const bool game_reset_applied = evaluate.reset_sent && (evaluate.reset_reasons & native::kResetGame) != 0
+          && game_resets.load() == resets_after_sdk;
+      const bool next_passed = next_delivered && next_completed && produced_colors == menu_production + 1
+          && xefg::CurrentResult() == fg::Result::SUBMITTED && (!scenario.raw_sdk_reset || game_reset_applied);
+      accepted &= next_passed;
+      std::cout << "XEFG_HANDOFF_NEXT_VERSION " << nlohmann::json{{"version", version},
+          {"new_color_produced", produced_colors == menu_production + 1}, {"sdk_bb_writes", sdk_writes.size()},
+          {"sdk_recordings", sdk_recordings}, {"completed", next_completed}, {"after_sdk_success", sdk_success},
+          {"raw_sdk_reset", scenario.raw_sdk_reset}, {"game_reset_applied", game_reset_applied},
+          {"passed", next_passed}}.dump() << std::endl;
+      if (scenario.raw_sdk_reset && single_write && next_passed) {
+        std::cout << "PASS xefg-ordinary-receipt-game-reset evidence=WARP+MOCK game_reset_delta=1"
+                     " same_version_write=1 sdk_writes=0 next_version_reset=1" << std::endl;
+      }
+    }
+  }
   warm("other-ordinary-prefix", &other_route, false);
-  Check(Hooks::Enable(session.handle, 1) == 0 && session.context->enabled, "SDK actually takes this output back");
-  frame("another-output-ordinary-while-sdk-on", &other_route, scene_b, -1, false, false, true, 0);
+  xefg::OrdinaryPresentAttempt other_attempt;
+  frame("another-output-ordinary-while-sdk-on", &other_route, scene_b, -1, false, false, true, 0, true, &other_attempt);
   rebuild_source();
   frame("reenabled-first-scene-b-rebuilt", &route, scene_b, 1, true, true, true, 1);
+  Check(find_attempt(&other_route) == other_attempt,
+        "SDK consumes its own BB without adopting or closing the ordinary receipt of another output");
   frame("reenabled-scene-b-steady", &route, scene_b, 1, false, true, true, 0);
+  xefg::OrdinaryPresentAttempt next_other_attempt;
+  frame("ordinary-no-sdk-next-begin", &other_route, menu, -1, false, false, true, -1, true, &next_other_attempt);
+  Check(other_attempt.owner == next_other_attempt.owner && other_attempt.serial < next_other_attempt.serial,
+        "a new real Begin supersedes the previous attempt when no finish callback arrived");
+  native::EndOrdinaryPresentAttempt(other_attempt, E_FAIL);
+  Check(find_attempt(&other_route) == next_other_attempt, "late ordinary Finish leaves the newer output attempt active");
+  native::EndOrdinaryPresentAttempt(next_other_attempt, S_OK);
+  Check(!find_attempt(&other_route), "successful finish without SDK closes only the current attempt");
 
   session.context->ui_composition = true;
   frame("required-hudless-missing", &route, menu, -1, false, true, false, -1);
   session.context->ui_composition = false;
+
+  {
+    const auto hudless = gpu.Texture(size, size, DXGI_FORMAT_R8G8B8A8_UNORM, present_state);
+    upload(hudless.Get(), scene_b, present_state);
+    submit();
+    Check(Hooks::Enable(session.handle, 0) == 0, "SDK relinquishes the BB before the ordinary-only color");
+    xefg::OrdinaryPresentAttempt ordinary_attempt;
+    Check(frame("ordinary-before-new-hudless", &route, menu, -1, false, false, true, -1, true, &ordinary_attempt),
+          "ordinary attempt completes its BB color before the SDK receives a distinct HUDLess");
+    const auto ordinary_pixels = consumed;
+    const auto calls = model_calls;
+    const auto deliveries = xefg::SubmittedFrames();
+    Check(Hooks::Enable(session.handle, 1) == 0, "SDK takes the same output with a necessary HUDLess");
+    session.context->ui_composition = true;
+    session.Tag(++present_id, HUDLESS, hudless.Get());
+    submit();
+    Check(Hooks::PresentId(session.handle, present_id) == 0, "the SDK receives the actual new HUDLess tag");
+    auto sdk = adapter::BeginPresent(session.proxy.Get(), 0);
+    Check(sdk.input.hudless == hudless.Get() && sdk.input.hudless != sdk.input.backbuffer
+              && sdk.ordinary_claim == xefg::OrdinaryPresentClaim::CONFLICT && sdk.ordinary_receipt.attempt == ordinary_attempt
+              && std::string_view(sdk.handoff_reason) == "ordinary_hudless_uncovered"
+              && !sdk.color_executed && sdk.service_result == fg::Result::NOT_SERVED && model_calls == calls,
+          "a complete BB receipt cannot stand in for the newly required HUDLess or allow a second BB enhancement");
+    const auto status = nr_edit_reuse_xefg_cases::ConsumeSdkPresent(session.proxy.Get(), 0, 0);
+    Check(status == S_OK && consumed == ordinary_pixels, "the actual SDK consumer reads only the ordinary enhanced BB");
+    const auto hudless_capture = Capture(gpu, hudless.Get(), present_state);
+    submit();
+    Check(hudless_capture.Pixels() == expected_pixels(scene_b, false), "the rejected group keeps every HUDLess RGBA channel");
+    session.context->ui_composition = false;
+
+    produce(back.Get(), scene_a, -1, false);
+    const auto next_attempt = call_ordinary(&route);
+    Check(next_attempt.owner == ordinary_attempt.owner && next_attempt.serial > ordinary_attempt.serial,
+          "a new ordinary attempt exists before the old SDK End returns");
+    adapter::EndPresent(&sdk, status);
+    Check(find_attempt(&route) == next_attempt && xefg::SubmittedFrames() == deliveries && model_calls == calls,
+          "the delayed SDK End settles only its old receipt and leaves the newer attempt active");
+    sdk_present(&session, -1, false);
+    Check(!find_attempt(&route) && xefg::CurrentResult() == fg::Result::SUBMITTED
+              && xefg::SubmittedFrames() == deliveries + 1 && model_calls == calls + 1
+              && consumed == expected_pixels(scene_a, true),
+          "the next actual BB version delivers after the late SDK End");
+  }
 
   const auto create_list = [&] {
     ExternalList external;
@@ -569,26 +819,6 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence) {
   Check(last_evaluate.reset_sent && (last_evaluate.reset_reasons & native::kResetGame) != 0,
         "the first legal application frame applies the actual Game Reset retained across both pending Presents");
 
-  const auto fail_first_tracker_signal = [&](const auto& operation) {
-    using namespace control_mask_gpu_cases;
-    namespace vtable = renodx::utils::vtable;
-    vtable::Slot<SignalFn> signal_probe{.object = gpu.queue.Get(), .index = 14,
-        .original = &real_signal, .replacement = Signal};
-    vtable::Install(&signal_probe);
-    const auto restore_signal = [](vtable::Slot<SignalFn>* slot) {
-      signal_fault_fence = nullptr;
-      vtable::Uninstall(slot);
-    };
-    const std::unique_ptr<vtable::Slot<SignalFn>, decltype(restore_signal)> signal_owner(&signal_probe, restore_signal);
-    {
-      std::lock_guard lock(addon::queue_completion_mutex);
-      signal_fault_fence = addon::queue_completions.at(gpu.queue.Get()).fence;
-    }
-    Check(signal_fault_fence != nullptr, "the real tracker has a scoped first Signal target");
-    const auto failures = injected_failures;
-    operation();
-    Check(injected_failures == failures + 1, "fail exactly the first post-Execute tracker Signal");
-  };
   auto unsignaled = record_writer(stale_a.Get(), 3);
   fail_first_tracker_signal([&] { execute_and_wait(gpu.queue.Get(), unsignaled); });
   // DXGI writes stay on the swapchain's queue. Reset only the test's queue
@@ -654,19 +884,10 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence) {
         {"owner_completed", fence->GetCompletedValue()}, {"first_signal", "failed"}}.dump() << std::endl;
     Check(Hooks::Enable(cold.handle, 0) == 0, "close the preparation-fault SDK owner");
   }
-  Check(NVSDK_NGX_SUCCEED(native::HookedReleaseFeatureSlot<0>(source)), "release the rebuilt SR source");
-  {
-    const addon::ngx_serial::PresentTurn turn;
-    Check(turn.owns(), "handoff cleanup owns the runtime turn");
-    const addon::RuntimeLock lock(native::runtime_mutex);
-    Check(native::ReleasePresentRing(), "handoff cleanup retires the completed ordinary ring");
-    for (auto* output : {&route, &other_route}) {
-      native::RetirePresentStream(output);
-      rate::DestroyPresentOutput(reinterpret_cast<uintptr_t>(output));
-    }
-    native::DrainRetiredResources(true);
-  }
+  release_fixture();
   Check(accepted, "same-backbuffer Present handoff must deliver the first legal version exactly once");
+  std::cout << "PASS xefg-ordinary-present-receipt evidence=WARP+MOCK same_version=1 next_version=1"
+               " sdk_failure=1 late_end=1 distinct_output=1 hudless_conflict=1 no_sdk_finish=1" << std::endl;
   std::cout << "PASS xefg-present-handoff evidence=WARP+MOCK passes=1 same_backbuffer=1 full_rgba=1" << std::endl;
 }
 }  // namespace xefg_present_handoff_cases

@@ -63,6 +63,50 @@ struct PresentSubmissionFact {
 using OrdinarySubmissionFact = PresentSubmissionFact;
 using PrepareRuntime = void (*)(ID3D12Device*) noexcept;
 
+struct OrdinaryPresentAttempt {
+  uintptr_t owner = 0;
+  uint64_t serial = 0;
+  explicit operator bool() const { return owner != 0 && serial != 0; }
+  bool operator==(const OrdinaryPresentAttempt&) const = default;
+};
+
+enum class OrdinaryPresentClaim : uint8_t { NO_MATCH, COVERED, CONFLICT };
+
+// Values only: the ordinary owner retains and retires its own GPU operands.
+// SDK epochs describe the original recording, never a new color version.
+struct OrdinaryPresentReceipt {
+  OrdinaryPresentAttempt attempt;
+  output_framerate::OutputIdentity output;
+  uintptr_t swapchain = 0;
+  uintptr_t backbuffer = 0;
+  uint32_t subresource = 0;
+  uint32_t x = 0;
+  uint32_t y = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uintptr_t context = 0;
+  uint64_t epoch = 0;
+  uint64_t call = 0;
+  uint64_t first_execute = 0;
+  submission::SubmissionProofState first_state = submission::SubmissionProofState::kUnsubmitted;
+  uintptr_t first_fence = 0;
+  uint64_t first_value = 0;
+  uint64_t first_completed_value = 0;
+  bool executed = false;
+  bool output_ready = false;
+  bool group_complete = false;
+  bool proofs_healthy = false;
+  bool proofs_complete = false;
+  bool game_reset_observed = false;
+  OrdinarySubmissionFact submission;
+};
+
+using ClaimOrdinaryPresent = OrdinaryPresentClaim (*)(const FrameInput&) noexcept;
+using FinishOrdinaryPresent = void (*)(const OrdinaryPresentReceipt&, const FrameInput&, uint64_t, HRESULT) noexcept;
+using InvalidateOrdinaryPresent = void (*)(uintptr_t) noexcept;
+using FindOrdinaryPresentAttempt = OrdinaryPresentAttempt (*)(uintptr_t, uintptr_t) noexcept;
+using EndOrdinaryPresent = void (*)(OrdinaryPresentAttempt, HRESULT) noexcept;
+
 struct BridgeSourceIdentity {
   uintptr_t device11 = 0;
   uintptr_t handle = 0;
@@ -261,6 +305,11 @@ namespace internal {
 using Microsoft::WRL::ComPtr;
 inline constexpr int32_t kUiModeAuto = 0;
 inline std::atomic<Service> service{nullptr};
+inline std::atomic<ClaimOrdinaryPresent> claim_ordinary_present{nullptr};
+inline std::atomic<FinishOrdinaryPresent> finish_ordinary_present{nullptr};
+inline std::atomic<InvalidateOrdinaryPresent> invalidate_ordinary_present{nullptr};
+inline std::atomic<FindOrdinaryPresentAttempt> find_ordinary_present_attempt{nullptr};
+inline std::atomic<EndOrdinaryPresent> end_ordinary_present{nullptr};
 inline std::atomic<PrepareCapture> prepare_capture{nullptr};
 inline std::atomic<bool (*)() noexcept> requested{nullptr};
 inline std::atomic_bool block_optional_hudless{false};
@@ -381,6 +430,8 @@ struct PresentHandoff {
   bool sdk_result_available = false;
   PresentSubmissionFact service_submission;
   OrdinarySubmissionFact ordinary_submission;
+  OrdinaryPresentClaim ordinary_claim = OrdinaryPresentClaim::NO_MATCH;
+  OrdinaryPresentReceipt ordinary_receipt;
 };
 
 struct Context {
@@ -617,7 +668,7 @@ inline void LogDiagnostic(const char* message) noexcept {
 }
 
 inline void LogHandoff(const char* event, const PresentHandoff& fact) noexcept {
-  char message[1536];
+  char message[2560];
   std::snprintf(message, sizeof(message),
       "DLSS5 XeFG present_handoff event=%s context=%llx context_identity=%llx output=%llx output_view=%llx output_generation=%llu "
       "epoch=%llu call=%llu declaration=%llu application_frame=%llu bb=%llx hudless=%llx subresource=0 "
@@ -625,7 +676,10 @@ inline void LogHandoff(const char* event, const PresentHandoff& fact) noexcept {
       "xefg_execute=%u ordinary_execute=%u fence_value=%llu sdk_return_ns=%lld sdk_hresult=0x%08x "
       "sdk_result_available=%u owner_current_at_return=%u status_queried=%u status_current=%u status_result=%d status_enabled=%u "
       "xefg[list=%llu generation=%llu queue=%llx fence=%llx completed=%llu signaled=%u] "
-      "ordinary[reason=%s list=%llu generation=%llu queue=%llx fence=%llx value=%llu completed=%llu signaled=%u]",
+      "ordinary[reason=%s list=%llu generation=%llu queue=%llx fence=%llx value=%llu completed=%llu signaled=%u] "
+      "ordinary_receipt[claim=%u owner=%llx attempt=%llu output=%llx output_view=%llx output_generation=%llu "
+      "context=%llx epoch=%llu call=%llu subresource=%u region=%u,%u,%u,%u ready=%u group=%u "
+      "first_execute=%llu first_state=%u first_fence=%llx first_value=%llu first_completed=%llu healthy=%u complete=%u]",
       event, static_cast<unsigned long long>(fact.context), static_cast<unsigned long long>(fact.context_identity),
       static_cast<unsigned long long>(fact.output.swapchain),
       static_cast<unsigned long long>(fact.output.view), static_cast<unsigned long long>(fact.output.generation),
@@ -650,7 +704,22 @@ inline void LogHandoff(const char* event, const PresentHandoff& fact) noexcept {
       static_cast<unsigned long long>(fact.ordinary_submission.queue), static_cast<unsigned long long>(fact.ordinary_submission.fence),
       static_cast<unsigned long long>(fact.ordinary_submission.fence_value),
       static_cast<unsigned long long>(fact.ordinary_submission.completed_value),
-      static_cast<unsigned>(fact.ordinary_submission.signaled));
+      static_cast<unsigned>(fact.ordinary_submission.signaled), static_cast<unsigned>(fact.ordinary_claim),
+      static_cast<unsigned long long>(fact.ordinary_receipt.attempt.owner),
+      static_cast<unsigned long long>(fact.ordinary_receipt.attempt.serial),
+      static_cast<unsigned long long>(fact.ordinary_receipt.output.swapchain),
+      static_cast<unsigned long long>(fact.ordinary_receipt.output.view),
+      static_cast<unsigned long long>(fact.ordinary_receipt.output.generation),
+      static_cast<unsigned long long>(fact.ordinary_receipt.context),
+      static_cast<unsigned long long>(fact.ordinary_receipt.epoch),
+      static_cast<unsigned long long>(fact.ordinary_receipt.call), fact.ordinary_receipt.subresource,
+      fact.ordinary_receipt.x, fact.ordinary_receipt.y, fact.ordinary_receipt.width, fact.ordinary_receipt.height,
+      static_cast<unsigned>(fact.ordinary_receipt.output_ready), static_cast<unsigned>(fact.ordinary_receipt.group_complete),
+      static_cast<unsigned long long>(fact.ordinary_receipt.first_execute), static_cast<unsigned>(fact.ordinary_receipt.first_state),
+      static_cast<unsigned long long>(fact.ordinary_receipt.first_fence),
+      static_cast<unsigned long long>(fact.ordinary_receipt.first_value),
+      static_cast<unsigned long long>(fact.ordinary_receipt.first_completed_value),
+      static_cast<unsigned>(fact.ordinary_receipt.proofs_healthy), static_cast<unsigned>(fact.ordinary_receipt.proofs_complete));
   LogDiagnostic(message);
 }
 
@@ -1529,6 +1598,12 @@ inline std::array<SourcePresentSlot, 4> source_present_slots;
 template <size_t Index>
 struct SourcePresentHooks {
   static HRESULT STDMETHODCALLTYPE Present(IDXGISwapChain* swapchain, UINT interval, UINT flags) {
+    OrdinaryPresentAttempt attempt;
+    if ((flags & DXGI_PRESENT_TEST) == 0) {
+      if (const auto find = find_ordinary_present_attempt.load(std::memory_order_acquire); find != nullptr) {
+        attempt = find(Identity(swapchain), 0);
+      }
+    }
     BridgeSourcePresent present(swapchain, flags
 #if defined(NR_NEXUS_DEV_CONTROL)
         , {.method = BridgePresentMethod::PRESENT,
@@ -1538,10 +1613,19 @@ struct SourcePresentHooks {
     );
     const auto status = reinterpret_cast<PresentFn>(source_present_slots[Index].real[0])(swapchain, interval, flags);
     present.Finish(status);
+    if (status != S_OK && attempt) {
+      if (const auto finish = end_ordinary_present.load(std::memory_order_acquire); finish != nullptr) finish(attempt, status);
+    }
     return status;
   }
   static HRESULT STDMETHODCALLTYPE Present1(IDXGISwapChain1* swapchain, UINT interval, UINT flags,
                                             const DXGI_PRESENT_PARAMETERS* parameters) {
+    OrdinaryPresentAttempt attempt;
+    if ((flags & DXGI_PRESENT_TEST) == 0) {
+      if (const auto find = find_ordinary_present_attempt.load(std::memory_order_acquire); find != nullptr) {
+        attempt = find(Identity(swapchain), 0);
+      }
+    }
     BridgeSourcePresent present(swapchain, flags
 #if defined(NR_NEXUS_DEV_CONTROL)
         , {.method = BridgePresentMethod::PRESENT1,
@@ -1551,6 +1635,9 @@ struct SourcePresentHooks {
     );
     const auto status = reinterpret_cast<Present1Fn>(source_present_slots[Index].real[1])(swapchain, interval, flags, parameters);
     present.Finish(status);
+    if (status != S_OK && attempt) {
+      if (const auto finish = end_ordinary_present.load(std::memory_order_acquire); finish != nullptr) finish(attempt, status);
+    }
     return status;
   }
 };
@@ -1612,6 +1699,9 @@ struct PresentFrame {
   uint64_t declaration = 0;
   bool color_executed = false;
   PresentSubmissionFact service_submission;
+  OrdinaryPresentClaim ordinary_claim = OrdinaryPresentClaim::NO_MATCH;
+  OrdinaryPresentReceipt ordinary_receipt;
+  OrdinaryPresentAttempt ordinary_attempt;
   const char* handoff_reason = "fg_off";
   bool trace_handoff = false;
   BridgeLinkVersion bridge_link;
@@ -1782,6 +1872,9 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
       renodx::utils::directx::NativeIdentity(present.backbuffer.Get()));
   const auto hudless_identity = reinterpret_cast<uintptr_t>(
       renodx::utils::directx::NativeIdentity(present.input.hudless));
+  if (const auto find = find_ordinary_present_attempt.load(std::memory_order_acquire); find != nullptr) {
+    present.ordinary_attempt = find(present.input.output.swapchain, backbuffer_identity);
+  }
   {
     std::unique_lock lock(state.mutex);
     auto& context = *present.context;
@@ -1817,7 +1910,7 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
     {
       std::shared_lock lock(state.mutex);
       if (PresentWriteCurrentLocked(present)) {
-        PublishResult(present.service_result);
+        PublishResult(present.service_result == Result::ORDINARY_SUBMITTED ? Result::PREPARED : present.service_result);
       }
     }
     return std::move(present);
@@ -1871,14 +1964,26 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
     present.input.frame_time_ms = frame.constants.frame_time_ms;
     present.input.reset = frame.constants.reset != 0;
   }
+  struct ServiceScope {
+    PresentFrame* previous;
+    ~ServiceScope() { recording_service = previous; }
+  };
+  const ServiceScope entered{std::exchange(recording_service, &present)};
+  // The ordinary owner enters runtime_mutex, then atomically accepts this
+  // receipt against the still-current SDK call. No adapter lock spans it.
+  if (const auto claim = claim_ordinary_present.load(std::memory_order_acquire); claim != nullptr) {
+    const auto ordinary_claim = claim(present.input);
+    if (ordinary_claim != OrdinaryPresentClaim::NO_MATCH) {
+      if (present.ordinary_claim == OrdinaryPresentClaim::NO_MATCH) {
+        present.ordinary_claim = OrdinaryPresentClaim::CONFLICT;
+        present.handoff_reason = "ordinary_claim_unavailable_or_revoked";
+      }
+      return finish_service();
+    }
+  }
   const auto callback = service.load(std::memory_order_acquire);
   present.handoff_reason = (copies_ordered ? "service_unavailable" : "tag_copy_unordered");
   if (callback != nullptr && copies_ordered) {
-    struct ServiceScope {
-      PresentFrame* previous;
-      ~ServiceScope() { recording_service = previous; }
-    };
-    const ServiceScope entered{std::exchange(recording_service, &present)};
     present.handoff_reason = "service_return";
     present.service_result = callback(present.input);
   }
@@ -1931,14 +2036,15 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
   }
   const bool same_output = PresentOwnerCurrentLocked(*present) && context.bridge_declaration == present->declaration;
   const bool submitted = present->service_result == Result::SUBMITTED;
+  const bool ordinary_submitted = present->service_result == Result::ORDINARY_SUBMITTED;
   const bool delivered = present_result == S_OK;
-  const bool failed_delivery = submitted && !delivered;
+  const bool failed_delivery = (submitted || ordinary_submitted) && !delivered;
   const bool status_current = has_status && same_output && present->input.output
       && present->serial == context.present_serial && present->serial > context.status_ambiguous_through;
   if (same_output && present->serial == context.present_serial) {
     const bool same_declaration = context.bridge_declaration == present->bridge_link.declaration
         && context.bridge_enable_inflight == 0;
-    const bool fg_consumed = delivered && submitted && present->serial > context.status_ambiguous_through;
+    const bool fg_consumed = delivered && (submitted || ordinary_submitted) && present->serial > context.status_ambiguous_through;
     if (((status_current && status.enabled != 0) || fg_consumed) && same_declaration && present->bridge_link.declaration != 0
         && BridgeLinkVersionLocked(context) == present->bridge_link) {
       // SDK enable state is independent of interpolation success or the FPS window.
@@ -1966,6 +2072,9 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
       }
     }
   }
+  if (ordinary_submitted && same_output && present->serial == context.color_serial) {
+    PublishResult(delivered ? Result::ORDINARY_SUBMITTED : Result::FAILED);
+  }
   if (has_status) {
     context.interval_displayed += status.frames_presented;
     ++context.interval_status_samples;
@@ -1982,7 +2091,8 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
       .color_executed = present->color_executed, .ordinary_executed = colors.ordinary_committed,
       .owner_current_at_return = same_output, .status_queried = status_queried, .status_current = status_current,
       .sdk_result_available = true, .service_submission = present->service_submission,
-      .ordinary_submission = colors.ordinary_submission};
+      .ordinary_submission = colors.ordinary_submission,
+      .ordinary_claim = present->ordinary_claim, .ordinary_receipt = present->ordinary_receipt};
   if (same_output && present->serial >= context.last_handoff_write.call
       && (handoff.color_executed || handoff.ordinary_executed)) {
     context.last_handoff_write = handoff;
@@ -2014,6 +2124,9 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
       last_nr_route_reason = "sdk_present_failed";
     } else if (present->service_result == Result::FAILED) {
       last_nr_route_reason = "failed";
+    } else if (ordinary_submitted) {
+      last_nr_route = "single_backbuffer";
+      last_nr_route_reason = "ordinary_owner_receipt";
     } else if (present->service_result == Result::SUBMITTED) {
       last_nr_route_reason = "service_stats_unavailable";
       // Multiple overlapping recordings cannot be attributed to this Present.
@@ -2071,8 +2184,18 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
     reshade::log::message(reshade::log::level::info, message);
   }
   if (lock.owns_lock()) lock.unlock();
-  if (present->trace_handoff || (!same_output && (present->service_owned || present->color_executed))) {
+  if (present->trace_handoff || present->ordinary_claim != OrdinaryPresentClaim::NO_MATCH
+      || (!same_output && (present->service_owned || present->color_executed))) {
     LogHandoff("sdk_present_return", handoff);
+  }
+  if (present->ordinary_receipt.attempt) {
+    if (const auto finish = finish_ordinary_present.load(std::memory_order_acquire); finish != nullptr) {
+      finish(present->ordinary_receipt, present->input, present->serial, present_result);
+    }
+  } else if (present->ordinary_attempt) {
+    if (const auto finish = finish_ordinary_present.load(std::memory_order_acquire); finish != nullptr) {
+      finish({.attempt = present->ordinary_attempt}, present->input, present->serial, present_result);
+    }
   }
 #if defined(NR_NEXUS_DEV_CONTROL)
   edit_fg_observation::RecordResult(present->edit_fg_ticket, present_result, present->edit_fg_return_ns,
@@ -2091,9 +2214,11 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
 
 inline void BeforeResize(IDXGISwapChain* swapchain) {
   const auto identity = Identity(swapchain);
+  std::vector<uintptr_t> affected{identity};
   std::unique_lock lock(state.mutex);
   for (const auto& [handle, context] : state.contexts) {
     if (context->proxy_identity == identity) {
+      affected.push_back(context->application_swapchain_identity);
       context->backbuffers = {};
       ClearBridgeSourceObservationsLocked(context.get(), "proxy_resizing");
       ReleaseFrames(context.get());
@@ -2101,6 +2226,11 @@ inline void BeforeResize(IDXGISwapChain* swapchain) {
   }
   PublishResult(Result::NOT_SERVED);
   lock.unlock();
+  if (const auto invalidate = invalidate_ordinary_present.load(std::memory_order_acquire); invalidate != nullptr) {
+    for (const auto output : affected) {
+      if (output != 0) invalidate(output);
+    }
+  }
   ReconcileNrService();
 }
 
@@ -2882,8 +3012,10 @@ struct SdkHooks {
     fg_output_probe::DestroyXefg(static_cast<uint32_t>(Index), reinterpret_cast<uintptr_t>(handle), status);
 #endif
     if (status == 0) {
+      std::array<uintptr_t, 2> affected{};
       std::unique_lock lock(state.mutex);
       if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
+        affected = {it->second->proxy_identity, it->second->application_swapchain_identity};
         ReleaseFrames(it->second.get());
         // Keep recordings that can still replay alive; submission owns only
         // tokens, never COM references to their operands.
@@ -2894,6 +3026,11 @@ struct SdkHooks {
         state.contexts.erase(it);
       }
       lock.unlock();
+      if (const auto invalidate = invalidate_ordinary_present.load(std::memory_order_acquire); invalidate != nullptr) {
+        for (const auto output : affected) {
+          if (output != 0) invalidate(output);
+        }
+      }
       RefreshOwnership();
       ReconcileNrService();
     }
@@ -2983,6 +3120,31 @@ inline bool ServiceContextCurrent(std::uintptr_t context, std::uint64_t epoch) n
   }
 }
 
+// Called by the ordinary owner under runtime_mutex. The original SDK call
+// runs later, after both locks have been released.
+inline bool AcceptOrdinaryPresentReceipt(const FrameInput& input, const OrdinaryPresentReceipt& receipt,
+                                         OrdinaryPresentClaim claim, const char* reason = "ordinary_owner_conflict") {
+  auto* const present = internal::recording_service;
+  if (present == nullptr || &present->input != &input || !receipt.attempt
+      || !receipt.executed || claim == OrdinaryPresentClaim::NO_MATCH) return false;
+  std::unique_lock lock(internal::state.mutex);
+  if (!internal::Requested() || !internal::PresentWriteCurrentLocked(*present)) return false;
+  auto& context = *present->context;
+  auto& colors = context.present_colors.at(present->serial);
+  if (colors.backbuffer != receipt.backbuffer || colors.ordinary_committed || present->color_executed
+      || (context.color_submitted_epoch == input.epoch
+          && context.color_submitted_frame == input.application_frame)) return false;
+  colors.ordinary_committed = true;
+  colors.ordinary_submission = receipt.submission;
+  present->ordinary_claim = claim;
+  present->ordinary_receipt = receipt;
+  present->ordinary_attempt = receipt.attempt;
+  present->handoff_reason = reason;
+  present->service_result = (claim == OrdinaryPresentClaim::COVERED
+      ? Result::ORDINARY_SUBMITTED : Result::NOT_SERVED);
+  return true;
+}
+
 // Runtime/NGX serialization precedes state.mutex. Publish only the already
 // recorded private list here. The original Present and owner notification
 // run after this lock is released.
@@ -3032,12 +3194,10 @@ inline bool ObservesServiceHandoff(const FrameInput& input) noexcept {
   return present != nullptr && &present->input == &input && present->trace_handoff;
 }
 
-#if defined(NR_NEXUS_DEV_CONTROL)
 inline uint64_t ServiceCall(const FrameInput& input) noexcept {
   const auto* present = internal::recording_service;
   return (present != nullptr && &present->input == &input ? present->serial : 0);
 }
-#endif
 
 inline void ObserveServiceHandoff(const FrameInput& input, const PresentSubmissionFact& fact) noexcept {
   if (auto* present = internal::recording_service; present != nullptr && &present->input == &input) {
@@ -3130,6 +3290,15 @@ inline void Configure(Service service, PrepareCapture capture, Retire retire, bo
 
 inline void ConfigureBridgeSource(BridgeSourceObserver observer) noexcept {
   internal::bridge_source_observer.store(observer, std::memory_order_release);
+}
+
+inline void ConfigureOrdinaryPresentOwner(ClaimOrdinaryPresent claim, FinishOrdinaryPresent finish,
+    InvalidateOrdinaryPresent invalidate, FindOrdinaryPresentAttempt find, EndOrdinaryPresent end) noexcept {
+  internal::claim_ordinary_present.store(claim, std::memory_order_release);
+  internal::finish_ordinary_present.store(finish, std::memory_order_release);
+  internal::invalidate_ordinary_present.store(invalidate, std::memory_order_release);
+  internal::find_ordinary_present_attempt.store(find, std::memory_order_release);
+  internal::end_ordinary_present.store(end, std::memory_order_release);
 }
 
 inline void ConfigureD3D12Source(BridgeSourceObserver observer) noexcept {
@@ -3532,6 +3701,9 @@ inline void Stop() noexcept {
       context->output_identity = {};
     }
     removed_sources.swap(internal::state.bridge_swapchains);
+  }
+  if (const auto invalidate = internal::invalidate_ordinary_present.load(std::memory_order_acquire); invalidate != nullptr) {
+    invalidate(0);
   }
   ReconcileNrService();
   for (size_t index = 0; index < internal::modules.size(); ++index) {
