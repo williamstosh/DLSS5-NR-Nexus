@@ -23,6 +23,7 @@ CloseFn real_close = nullptr;
 ResetFn real_reset = nullptr;
 struct ListCall {
   ID3D12GraphicsCommandList* list;
+  uint64_t identity;
   bool reset;
   HRESULT result;
 };
@@ -58,15 +59,17 @@ NVSDK_NGX_Result NVSDK_CONV ObserveCreateModel(ID3D12GraphicsCommandList* list, 
 }
 
 HRESULT STDMETHODCALLTYPE ObserveClose(ID3D12GraphicsCommandList* list) {
+  const auto identity = addon::submission::RecordingIdentity(list).first;
   const auto result = real_close(list);
-  list_calls.push_back({.list = list, .reset = false, .result = result});
+  list_calls.push_back({.list = list, .identity = identity, .reset = false, .result = result});
   return result;
 }
 
 HRESULT STDMETHODCALLTYPE ObserveReset(ID3D12GraphicsCommandList* list,
                                       ID3D12CommandAllocator* allocator, ID3D12PipelineState* state) {
+  const auto identity = addon::submission::RecordingIdentity(list).first;
   const auto result = real_reset(list, allocator, state);
-  list_calls.push_back({.list = list, .reset = true, .result = result});
+  list_calls.push_back({.list = list, .identity = identity, .reset = true, .result = result});
   return result;
 }
 
@@ -301,11 +304,14 @@ int Run() {
       }
       for (size_t index = before_list_calls; index < list_calls.size(); ++index) {
         const auto& call = list_calls[index];
+        Check(call.identity != 0 && (call.identity & (uint64_t{1} << 63)) == 0,
+              "the lifecycle observer requires a COM object identity, not a pointer fallback");
         bool closed_twice = false;
         if (!call.reset) {
           for (size_t previous = index; previous > 0; --previous) {
             const auto& prior = list_calls[previous - 1];
-            if (prior.list != call.list) continue;
+            // Destroyed SDK pools can recycle addresses; compare live COM object identities.
+            if (prior.identity != call.identity) continue;
             closed_twice = !prior.reset && SUCCEEDED(prior.result);
             break;
           }
@@ -315,6 +321,7 @@ int Run() {
             const auto& event = list_calls[trace];
             std::cerr << "ADAPTIVE_LIST frame=" << input.application_frame
                 << " method=" << (event.reset ? "Reset" : "Close") << " list=" << event.list
+                << " identity=" << event.identity
                 << " hresult=0x" << std::hex << static_cast<uint32_t>(event.result) << std::dec << '\n';
           }
           Check(false, "Service closes each recording once, after its successful Reset");
