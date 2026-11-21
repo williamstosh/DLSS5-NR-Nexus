@@ -4,7 +4,7 @@
 
 ## 简体中文
 
-本指南对应 **v0.6.0**：从安装、选方案和比较画面开始，再按需组合最多四层 NR、独立尺寸和结果编辑。**实验性**表示有特殊条件且默认关闭的试用路径，**暂不支持**表示不可用组合。下载及版本说明见 [v0.6.0](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.6.0)。
+本指南对应 **v0.6.1**：从安装、选方案和比较画面开始，再按需组合最多四层 NR、独立尺寸和结果编辑。**实验性**表示有特殊条件且默认关闭的试用路径，**暂不支持**表示不可用组合。下载及版本说明见 [v0.6.1](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.6.1)。
 
 配图来自已审核的开发界面离屏预览，状态和数字为界面示例；各功能的安装包支持范围见正文。
 
@@ -25,7 +25,7 @@
 
 #### 用 RHI 准备 ReShade 和 Runtime
 
-1. 关闭游戏，备份现有插件、ReShade 配置和将替换的 DLL。在 [v0.6.0 版本页面](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.6.0)下载 Windows x64 ZIP 与对应的 `.zip.sha256` 并校验；从 [RHI 最新版](https://github.com/RankFTW/RHI/releases/latest) 下载 RHI。
+1. 关闭游戏，备份现有插件、ReShade 配置和将替换的 DLL。在 [v0.6.1 版本页面](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.6.1)下载 Windows x64 ZIP 与对应的 `.zip.sha256` 并校验；从 [RHI 最新版](https://github.com/RankFTW/RHI/releases/latest) 下载 RHI。
 2. 在 RHI 选中游戏；未找到时点 **+（Manually add a game）**，选择实际游戏 `.exe` 后点 **Add Game**，或把 `.exe` 拖入窗口。选游戏进程使用的程序，不选启动器；例如实际程序可能在 `Binaries/Win64`。
 3. 在 **Game Overrides → ReShade Channel → Stable** 选择支持完整 Add-on 的渠道，在 **Components → ReShade** 安装；**No Addons 不能加载本插件**。已有 ReShade 时先核对其 Add-on 支持及 API 版本，避免重复安装。
 4. 在 **DLSS / Streamline → Neural Rendering** 列选 **310.9.16 (20/30/40/50)**，点 **Deploy DLL** 单独部署 NR Runtime，无需其他 NR Add-on。**RHI 2.8.8 还会尝试在游戏安装根目录部署最新 `nvngx_dlss.dll`（SR），已有文件先备份为 `.original`；希望保持 SR 版本时使用手动安装。**如果游戏原有 DLSS 但缺此栏，先用 **Settings → Tools & Maintenance → Full refresh**；无 DLSS 或刷新后仍无此栏，使用下方手动安装。
@@ -281,7 +281,7 @@ F6 立即提示开关操作，随后状态更新为正在检查、正常运行�
 
 兼容的 Pre-FG 先增强游戏帧再交给 FG，成功时优先于普通 Present 的帧处理策略。
 
-开发版按实际入口提示可用位置：独立 Streamline 回退在 DLSS 输出后运行，Render 需要原生 SR 前置入口；Ray Reconstruction 继续采用兼容的 Upscaled 处理。
+插件按实际入口提示可用位置：独立 Streamline 回退在 DLSS 输出后运行，Render 需要原生 SR 前置入口；Ray Reconstruction 继续采用兼容的 Upscaled 处理。
 
 | 控件 | 默认／选项或范围 | 用途 |
 | --- | --- | --- |
@@ -314,11 +314,11 @@ F6 立即提示开关操作，随后状态更新为正在检查、正常运行�
 
 自适应分辨率面向原生 DX12 的单个处理阶段，包括兼容的 XeFG／原生 FG 同尺寸链。跨阶段链、FG 异尺寸和 DX11 Bridge 继续使用手动分辨率；Vulkan 使用全输出尺寸。缺少可靠帧率来源时暂停自动并保留合法尺寸。动态 FG 还需匹配的游戏帧计数；信息不足时暂停试探并等待采样，估算输出帧率仍可显示。更改设置或 GPU A/B 对比期间暂停自动。建议在游戏中比较转动视角时的细节和切档观感；使用限帧时，也可核对显示的帧率。
 
-**开发版 v0.7.0-dev.1（尚未发布）**让符合条件的原生 DX11 Bridge 超分后输出直接使用同一个自适应开关；第三方工具提供的 D3D12 SR 输出仍沿 D3D12 路径工作。已经开启自动的旧配置会在取得可靠输出和可用档位后开始调节，关闭自动即可恢复保存的手动上限。Bridge 的渲染介入点和普通 DX11 Present 仍沿手动设置处理。实验功能可在普通构建中使用，无需诊断控制通道。
+符合条件的原生 DX11 Bridge 超分后输出可使用同一个自适应开关；第三方工具提供的 D3D12 SR 输出仍沿 D3D12 路径工作。已经开启自动的旧配置会在取得可靠输出和可用档位后开始调节，关闭自动即可恢复保存的手动上限。Bridge 的渲染介入点和普通 DX11 Present 仍沿手动设置处理。实验功能可在普通构建中使用，无需诊断控制通道。
 
-**开发版如何升降档。** 当前画面的可靠输出 FPS 持续低于目标时，NR 每次只降到相邻的可用档位。新档完整交付并暖机后，按新的帧率样本判断。达到目标就停止降档，恰好等于目标时保持当前档。仍然欠帧就继续逐档降低，最低档仍欠帧时保持最低档并显示未达目标。
+**如何升降档。** 当前画面的可靠输出 FPS 持续低于目标时，NR 每次只降到相邻的可用档位。新档完整交付并暖机后，按新的帧率样本判断。达到目标就停止降档，恰好等于目标时保持当前档。仍然欠帧就继续逐档降低，最低档仍欠帧时保持最低档并显示未达目标。
 
-只有输出 FPS 持续高出目标且有足够余量时，才试升一档。高档暖机后能稳定守住目标就保留，持续欠帧则回到原低档。同样条件下，重试还要求低档的稳定帧率明显高于上次试升前的水平。目标、实际负载或输出统计方式变化后，先重新收集稳定样本，再评估是否试升。NR GPU 耗时只用于诊断，升降档依据输出 FPS。开发版的动态画质和切档流畅度仍待实机人工验收。
+只有输出 FPS 持续高出目标且有足够余量时，才试升一档。高档暖机后能稳定守住目标就保留，持续欠帧则回到原低档。同样条件下，重试还要求低档的稳定帧率明显高于上次试升前的水平。目标、实际负载或输出统计方式变化后，先重新收集稳定样本，再评估是否试升。NR GPU 耗时只用于诊断，升降档依据输出 FPS。动态画质和切档流畅度仍待实机人工验收。
 
 帧率采样对应当前画面。普通路径标为「应用 Present 提交节奏估算」，FG 路径优先使用对应 SDK 的输出计数。无法确认归属时等待采样。有效计数和比较条件不变时，其他画面或无关 FG 请求不会打断调节。等待新档准备或交付时，继续使用上一次确认的健康档位。修改已绑定遮罩的混合方式会保留兼容的已准备档位，并重新采样。原生 FG 缺可靠游戏帧标签时，固定倍率估算或动态试档会暂停，同画面的 SDK 实测帧率仍可显示。Vulkan 保留自动选项的选择，并提示当前路径不支持自动尺寸。
 
@@ -328,7 +328,7 @@ F6 立即提示开关操作，随后状态更新为正在检查、正常运行�
 
 **预备方式**：「预备方式」可选择默认的「全档预备」或「按需备档（实验）」。全档预备用更多显存换取就绪后的顺畅切换；按需备档只保留当前、请求和回退所需的档位，降低同时驻留的开销，准备新的冷档仍可能卡顿。两种方式保留你选择的档数和最低比例。容量不足而暂停时，改变预备方式会重新检查预算；等待所需档位时继续使用合法的已就绪尺寸。
 
-开发版另提供**资源策略**，随画质设置、共享预设和方案槽保存。默认沿用原预备方式；三个实验选项只在适用时生效，界面显示实际策略和回退原因，保留所选档数和最低比例。
+**资源策略**，随画质设置、共享预设和方案槽保存。默认沿用原预备方式；三个实验选项只在适用时生效，界面显示实际策略和回退原因，保留所选档数和最低比例。
 
 | 资源策略 | 用途与取舍 |
 | --- | --- |
@@ -473,21 +473,21 @@ F6 立即提示开关操作，随后状态更新为正在检查、正常运行�
 
 在**画质 → 核心画质**的工作分辨率设置下方，打开**隔帧编辑复用 x2（实验）**，无需重启。关闭后恢复常规 NR，Present 按所选帧处理策略运行。开关随画质方案和共享预设保存。已有 `[RenoDX.DLSS5]` 配置键 `NREditReuse` 继续有效。
 
-**v0.6.0 安装包**沿用同一个开关。在**处理与兼容性 → 介入点**选择**超分后（Upscaled）**或**渲染（Render）**，可对符合条件的单层及同介入点多层组合启用 x2。模型按实际请求判断，可用 A、B 或解析为受支持模型的 Auto。Render 仍在每个基础帧运行原有 SR，Ray Reconstruction 走兼容的 Upscaled 路径。
+**v0.6.1 安装包**沿用同一个开关。在**处理与兼容性 → 介入点**选择**超分后（Upscaled）**或**渲染（Render）**，可对符合条件的单层及同介入点多层组合启用 x2。模型按实际请求判断，可用 A、B 或解析为受支持模型的 Auto。Render 仍在每个基础帧运行原有 SR，Ray Reconstruction 走兼容的 Upscaled 路径。
 
 复用需要 NR Runtime 310.9.16.0、可写的当帧 HDR 颜色和匹配的深度、运动矢量及两轴 jitter 偏移。每轴偏移最大半个渲染像素，运动矢量须排除 jitter。多层使用时域滤波时，各层须使用当前介入点的完整分辨率。任一层使用更小的工作尺寸时，整组按原设置逐帧处理。仅空间 Look 的异尺寸组可在满足复用条件时使用 x2。单层 Upscaled 在较低工作尺寸且只需普通双线性缩放时也可复用，需要低格 Look 传输时则逐帧处理。跨介入点或实际绑定区域遮罩时继续逐帧处理，自适应分辨率准备与切档沿用原处理流程。
 
-**开发版 v0.7.0-dev.1（尚未发布）**也将符合上述条件的 DX11 SR 后输出接入同一复用规则：包括第三方提供的 D3D12 输出，以及原生 DX11 Bridge 的共享输出。原生 Bridge 完成 GPU 处理后才向游戏回拷；缺少 jitter 时按原设置逐帧处理，交付未完成时保留游戏原画，恢复后先刷新。
+符合上述条件的 DX11 SR 后输出也适用同一复用规则，包括第三方提供的 D3D12 输出，以及原生 DX11 Bridge 的共享输出。原生 Bridge 完成 GPU 处理后才向游戏回拷；缺少 jitter 时按原设置逐帧处理，交付未完成时保留游戏原画，恢复后先刷新。
 
 同开**自适应分辨率**和 **x2** 即请求组合。合格的上限尺寸可继续复用，实际换档后先刷新。原生 DX12 超分后的低档复用需要可用的已备档、单层模型 B、全幅 FP16、双线性缩放、无实际 Look 滤波以及同一输出的 FG 关闭凭据。FPS 暂时缺测时，已合法生效的低档保留尺寸和复用节奏，自动调档等待新样本。组合条件不齐时，低档可按原路径逐帧处理。原生 Bridge 的自适应低档按逐帧处理。
 
-原生 DLSS FG 的 **Pre-FG Present x2** 也使用同一开关。选择 Present 并启用 Pre-FG 处理后，可在帧身份可靠、游戏提供完整输入、实际使用兼容上限尺寸的路径刷新／复用。同帧后续 MFG 可以沿用仍有效的完整结果，包括逐帧生成的结果。缺少可靠输入时沿用普通 Pre-FG 退路。《巫师 3》的早侧颜色交接及晚侧整组内容版本仍有阻塞。普通 Present 保留默认「每帧」。上述开发版能力的动态画质和主观流畅度留待人工验收。
+原生 DLSS FG 的 **Pre-FG Present x2** 也使用同一开关。选择 Present 并启用 Pre-FG 处理后，可在帧身份可靠、游戏提供完整输入、实际使用兼容上限尺寸的路径刷新／复用。同帧后续 MFG 可以沿用仍有效的完整结果，包括逐帧生成的结果。缺少可靠输入时沿用普通 Pre-FG 退路。《巫师 3》的早侧颜色交接及晚侧整组内容版本仍有阻塞。普通 Present 保留默认「每帧」。这些组合的动态画质和主观流畅度留待人工验收。
 
 **普通 D3D12 Present x2**使用单层和固定全幅工作尺寸。FG 关闭时，在**处理与兼容性 → 介入点**选**呈现（Present）**，再在 **FG 高级设置 → FG 帧处理策略**选**游戏帧**（Game frames，`NRPresentFrames=1`）。游戏须把已确认的同帧 SR 图像整幅复制到当前 FP16 scRGB Backbuffer。无法确认同帧来源时保留原画，普通 HDR10/PQ 也保留原画。选择**每帧**（`NRPresentFrames=0`）可恢复按呈现帧处理。
 
 Render／Upscaled 使用 FP16 scRGB。符合上述条件的固定尺寸 Upscaled x2 可与原生 DLSS FG 同时运行，继续使用画质页的同一个开关。NR 在游戏 SR 输出上写回编辑，游戏随后按原流程交给 FG。XeFG 的 Present x2 使用单层和单 Backbuffer，可在既有条件下使用 FP16 scRGB 或 HDR10/PQ。可用默认快捷键 **F11** 打开监视器，查看 x2 请求、生效状态，以及逐帧处理或保留原画的原因。
 
-《巫师 3》已实机验证关闭 FG 的 4K 双层 Upscaled。使用 v0.6.0 普通构建候选也验证了原生 DLSS FG 开启时的 4K 单层 Upscaled 刷新与复用。同尺寸多层随 FG 声明变化的验证来自离线测试。开启 FG 的多层实机、异尺寸实机和多层 Render 仍待验。普通 scRGB Present 已用真实 GPU 和 NVIDIA Runtime 离线验证，游戏内表现仍待验收。XeFG 单 Backbuffer 的 HDR10/PQ 已在《巫师 3》静态场景确认隔帧调用。若在自己的场景看到拖影、明暗跳变或感到卡顿，可关闭 x2 比较逐帧效果。
+《巫师 3》已实机验证关闭 FG 的 4K 双层 Upscaled。使用 v0.6.0 普通构建候选也验证了原生 DLSS FG 开启时的 4K 单层 Upscaled 刷新与复用。同尺寸多层随 FG 声明变化的验证来自离线测试。开启 FG 的多层实机、异尺寸实机和多层 Render 仍待验。普通 scRGB Present 已用真实 GPU 和 NVIDIA Runtime 离线验证，游戏内表现仍待验收。XeFG 单 Backbuffer 的 HDR10/PQ 已在《巫师 3》静态场景确认隔帧调用，其帧率收益仍待验证。若在自己的场景看到拖影、明暗跳变或感到卡顿，可关闭 x2 比较逐帧效果。
 
 <a id="zh-paths"></a>
 #### 可用组合
@@ -602,7 +602,7 @@ ROI、单次 HDR、120 次 HDR Present 和 P0 捕获生成额外数据，可能�
 
 ## English
 
-This guide covers **v0.6.0**. Start with installation, profiles and picture comparisons, then combine up to four NR passes, independent sizes and result edits as needed. **Experimental** marks trial paths with special conditions that are off by default; **Not supported yet** marks unavailable combinations. Downloads and release details: [v0.6.0](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.6.0).
+This guide covers **v0.6.1**. Start with installation, profiles and picture comparisons, then combine up to four NR passes, independent sizes and result edits as needed. **Experimental** marks trial paths with special conditions that are off by default; **Not supported yet** marks unavailable combinations. Downloads and release details: [v0.6.1](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.6.1).
 
 Images are reviewed offscreen previews with example states and numbers. See each feature's text for supported paths and usage.
 
@@ -623,7 +623,7 @@ You need Windows x64, a [compatible NVIDIA RTX GPU/driver](../README.md#en-gpu),
 
 #### Prepare ReShade and the runtime with RHI
 
-1. Close the game and back up existing add-ons, ReShade configuration and DLLs you will replace. Download the Windows x64 ZIP and matching `.zip.sha256` from the [v0.6.0 release page](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.6.0), then verify the archive. Download [the latest RHI](https://github.com/RankFTW/RHI/releases/latest).
+1. Close the game and back up existing add-ons, ReShade configuration and DLLs you will replace. Download the Windows x64 ZIP and matching `.zip.sha256` from the [v0.6.1 release page](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.6.1), then verify the archive. Download [the latest RHI](https://github.com/RankFTW/RHI/releases/latest).
 2. Select the game in RHI. If missing, click **+ (Manually add a game)**, select the actual game `.exe` and click **Add Game**, or drag the `.exe` onto the window. Select the executable used by the game process rather than its launcher; it may be under `Binaries/Win64`.
 3. Select **Game Overrides → ReShade Channel → Stable** for full Add-on support, then install under **Components → ReShade**. **No Addons cannot load NR Nexus.** For existing ReShade installations, check Add-on support and the API version before installing again.
 4. In the **DLSS / Streamline → Neural Rendering** column, choose **310.9.16 (20/30/40/50)** and click **Deploy DLL** to deploy the NR runtime separately, without another NR Add-on. **RHI 2.8.8 also attempts to deploy the newest `nvngx_dlss.dll` (SR) in the game installation root, backing up an existing file as `.original`. Use manual installation to keep your SR version.** If the game already has DLSS but this column is missing, use **Settings → Tools & Maintenance → Full refresh**. Without game DLSS, or if the column remains missing, follow manual installation below.
@@ -879,7 +879,7 @@ New defaults initialize missing values and migrate the exact old `0.7 / 0.9` def
 
 Compatible Pre-FG enhances game frames before FG. When it succeeds, it takes precedence over the ordinary Present frame policy.
 
-Development builds report locations available through the actual input path. Standalone Streamline fallback runs after DLSS; Render requires a native pre-SR entry. Ray Reconstruction retains compatible Upscaled processing.
+The add-on reports locations available through the actual input path. Standalone Streamline fallback runs after DLSS; Render requires a native pre-SR entry. Ray Reconstruction retains compatible Upscaled processing.
 
 | Control | Default / options or range | Use |
 | --- | --- | --- |
@@ -912,11 +912,11 @@ The top summary shows FPS / NR GPU / FG / NR resolution, with labels above value
 
 Adaptive sizing supports one processing stage on native DX12, including compatible same-size XeFG / native FG chains. Cross-stage chains, FG chains with different sizes and DX11 Bridge retain manual resolution; Vulkan uses full output resolution. Automatic sizing pauses without a reliable output-rate source and keeps a legal size. Dynamic FG also needs matching game-frame counts; while those are unavailable, it pauses quality trials and collects samples, and estimated output FPS can still be shown. Editing settings and GPU A/B comparisons pause it. Compare detail and transitions while moving the camera, and check the displayed FPS when using frame caps.
 
-**Development version v0.7.0-dev.1 (not yet released)** connects eligible native DX11 Bridge post-SR outputs to the same adaptive switch. Third-party D3D12 SR outputs continue through the D3D12 path. Existing configurations with automatic sizing enabled start adjusting once a reliable output and ready levels are available. Turning it off restores the saved manual upper limit. Bridge Render and ordinary DX11 Present retain manual sizing. Experimental features work in ordinary builds without a diagnostic control channel.
+Eligible native DX11 Bridge post-SR outputs use the same adaptive switch. Third-party D3D12 SR outputs continue through the D3D12 path. Existing configurations with automatic sizing enabled start adjusting once a reliable output and ready levels are available. Turning it off restores the saved manual upper limit. Bridge Render and ordinary DX11 Present retain manual sizing. Experimental features work in ordinary builds without a diagnostic control channel.
 
-**How the development version changes levels.** When reliable FPS for the current output stays below target, NR lowers its resolution by one available level at a time. After the new level delivers a complete result and warms up, fresh FPS samples guide the next decision. Reaching the target stops the descent. At exactly the target, NR holds its current level. If FPS stays below target at the minimum, NR holds that level and reports that FPS is below target.
+**How adaptive resolution changes levels.** When reliable FPS for the current output stays below target, NR lowers its resolution by one available level at a time. After the new level delivers a complete result and warms up, fresh FPS samples guide the next decision. Reaching the target stops the descent. At exactly the target, NR holds its current level. If FPS stays below target at the minimum, NR holds that level and reports that FPS is below target.
 
-NR tries one level higher only when output FPS stays far enough above target. It keeps the higher level if FPS consistently meets the target after warmup and returns to the previous lower level if FPS stays below target. Under the same conditions, retrying that step also requires the lower level's stable FPS to be clearly higher than before the failed raise. If the target, actual workload or output measurement changes, NR collects fresh stable samples before deciding whether to raise. Output FPS drives level changes. NR GPU timing is diagnostic. Dynamic image quality and smoothness during level changes still await manual in-game review in the development version.
+NR tries one level higher only when output FPS stays far enough above target. It keeps the higher level if FPS consistently meets the target after warmup and returns to the previous lower level if FPS stays below target. Under the same conditions, retrying that step also requires the lower level's stable FPS to be clearly higher than before the failed raise. If the target, actual workload or output measurement changes, NR collects fresh stable samples before deciding whether to raise. Output FPS drives level changes. NR GPU timing is diagnostic. Dynamic image quality and smoothness during level changes still await manual in-game review.
 
 FPS samples belong to the current output. The ordinary path reports an Application Present submission estimate, while FG paths prefer the matching SDK's output counts. Sampling waits if output ownership is unknown. Unrelated outputs or FG requests leave valid comparisons running when the measurement and its conditions stay the same. The last confirmed healthy level stays in use while a new level is being prepared or awaiting delivery. Changing a bound mask's blend mode retains compatible prepared levels and starts fresh sampling. Without reliable game-frame tags, native FG pauses fixed-multiplier estimates or dynamic trials. Measured SDK output FPS for the same output remains visible. Vulkan retains the automatic-size selection and reports that its current path does not support it.
 
@@ -926,7 +926,7 @@ Initial preparation proceeds in several steps; frames that NR cannot process yet
 
 **Preparation mode**: Preparation mode offers Prepare all levels (the default) and On-demand (experimental). Preparing all levels uses more VRAM for smooth switching once ready. On-demand retains the levels needed for current output, the requested target and recovery, reducing simultaneous residency; preparing a cold level can still cause a pause. Both modes retain your selected level count and minimum scale. Changing preparation mode retries the budget check after a capacity pause. While a target is being prepared, a legal ready size remains in use.
 
-Development builds also offer **Resource strategy**, saved with quality settings, shared presets and profile slots. The default follows your preparation mode. The other three experimental choices apply where supported; the UI shows the effective strategy and fallback reason while keeping your level count and minimum scale.
+**Resource strategy** is saved with quality settings, shared presets and profile slots. The default follows your preparation mode. The other three experimental choices apply where supported; the UI shows the effective strategy and fallback reason while keeping your level count and minimum scale.
 
 | Resource strategy | Purpose and tradeoff |
 | --- | --- |
@@ -1071,21 +1071,21 @@ When reuse is available, NR generates a new edit every two base frames and repro
 
 Under the working-resolution controls in **Quality → Core quality**, enable **x2 edit reuse (experimental)** without restarting. Turn it off to restore regular NR. Present follows the selected frame policy. The toggle is saved with quality profiles and shared presets. The existing `NREditReuse` key under `[RenoDX.DLSS5]` remains supported.
 
-**The v0.6.0 package** uses the same switch. Under **Processing & compatibility → Hook point**, choose Upscaled (after SR) or Render (before SR) for eligible single-pass and same-hook multi-pass D3D12 configurations. Reuse follows the actual model request, which may be A, B or Auto resolving to a supported model. With Render, the game's SR still runs on every base frame. Ray Reconstruction uses the compatible Upscaled path.
+**The v0.6.1 package** uses the same switch. Under **Processing & compatibility → Hook point**, choose Upscaled (after SR) or Render (before SR) for eligible single-pass and same-hook multi-pass D3D12 configurations. Reuse follows the actual model request, which may be A, B or Auto resolving to a supported model. With Render, the game's SR still runs on every base frame. Ray Reconstruction uses the compatible Upscaled path.
 
 Reuse requires NR Runtime 310.9.16.0, writable HDR color for the current frame, matching depth and motion vectors, and both jitter offsets. Each offset may be up to half a render pixel. Motion vectors must exclude jitter. Multi-pass x2 with temporal filtering requires every pass to run at the hook point's full resolution. If any pass uses a smaller working resolution, the group runs every frame with its original settings. Eligible groups with mixed working resolutions and spatial-only Look can still reuse. Single-pass Upscaled can also reuse at a lower resolution with standard bilinear upsampling. It runs every frame when it needs lower-resolution Look transport. Mixed hook points and bound Region masks also run every frame. Adaptive resolution keeps its usual preparation and tier changes.
 
-**Development version v0.7.0-dev.1 (not yet released)** also applies the same reuse rules to eligible DX11 post-SR outputs: third-party D3D12 outputs and shared native DX11 Bridge outputs. The native Bridge copies back after GPU processing completes. Missing jitter retains regular per-frame NR; incomplete delivery keeps the game image, with a refresh on recovery.
+The same reuse rules cover eligible DX11 post-SR outputs, including third-party D3D12 outputs and shared native DX11 Bridge outputs. The native Bridge copies back after GPU processing completes. Missing jitter retains regular per-frame NR; incomplete delivery keeps the game image, with a refresh on recovery.
 
 Enable **Adaptive resolution** and **x2** together to request the combination. Compatible upper sizes can keep reusing, and a real level change starts with a refresh. Lower-tier reuse in native D3D12 Upscaled requires a ready working size, one model B pass, full-frame FP16, bilinear upsampling, no active Look filtering, and FG-off evidence for the same output. If FPS data goes stale, a valid active lower size keeps its size and reuse cadence while automatic sizing waits for fresh samples. Lower tiers can fall back to per-frame processing when reuse conditions are missing. Native Bridge adaptive lower tiers use per-frame NR.
 
-Native DLSS FG **Pre-FG Present x2** uses the same switch. Select Present and enable Pre-FG processing. Paths that identify the game frame, receive all required inputs, and use a compatible upper working size can refresh and reuse edits. Later MFG outputs for that frame can use a complete, still-valid result, including one produced by per-frame NR. Missing input evidence keeps the existing Pre-FG fallback. The Witcher 3 still has blocked early color handoff and late content-version paths. Ordinary Present keeps its default Every present policy. Dynamic quality and subjective smoothness of these development features await manual acceptance.
+Native DLSS FG **Pre-FG Present x2** uses the same switch. Select Present and enable Pre-FG processing. Paths that identify the game frame, receive all required inputs, and use a compatible upper working size can refresh and reuse edits. Later MFG outputs for that frame can use a complete, still-valid result, including one produced by per-frame NR. Missing input evidence keeps the existing Pre-FG fallback. The Witcher 3 still has blocked early color handoff and late content-version paths. Ordinary Present keeps its default Every present policy. Dynamic quality and subjective smoothness in these combinations still need in-game review.
 
 **Ordinary D3D12 Present x2** uses one NR pass at a fixed full-frame working resolution. With FG off, choose **Present** under **Processing & compatibility → Hook point** and **Game frames** (`NRPresentFrames=1`) under **FG advanced settings → FG frame processing policy**. The game must copy the complete SR image from the verified source for that frame to the current FP16 scRGB backbuffer. If the source cannot be verified, the game image is kept. Ordinary HDR10/PQ also keeps the game image. Select **Every frame** (`NRPresentFrames=0`) to restore processing on each present.
 
 Render and Upscaled use FP16 scRGB. Eligible fixed-resolution Upscaled x2 works with native DLSS Frame Generation and uses the same Quality switch. NR writes back to the game's SR output, and the game feeds FG through its usual path. XeFG Present x2 uses one pass and a single backbuffer, with FP16 scRGB or HDR10/PQ under its existing conditions. Open the monitor with the default shortcut **F11** to see the x2 request, its effective state, and why NR is running every frame or keeping the original image.
 
-In The Witcher 3, two 4K Upscaled passes with FG off have been tested in game. The standard v0.6.0 candidate also verified 4K single-pass Upscaled refresh and reuse with native DLSS FG on. Offline tests cover same-resolution multi-pass behavior when only the FG declaration changes. Multi-pass with FG on, mixed working resolutions and multi-pass Render still need in-game testing. Ordinary scRGB Present has been tested offline on real hardware with the NVIDIA Runtime and still needs in-game validation. HDR10/PQ with a single XeFG backbuffer has been confirmed to reuse edits in a static Witcher 3 scene. If you notice ghosting, brightness jumps or stutter, turn off x2 to compare per-frame NR.
+In The Witcher 3, two 4K Upscaled passes with FG off have been tested in game. The standard v0.6.0 candidate also verified 4K single-pass Upscaled refresh and reuse with native DLSS FG on. Offline tests cover same-resolution multi-pass behavior when only the FG declaration changes. Multi-pass with FG on, mixed working resolutions and multi-pass Render still need in-game testing. Ordinary scRGB Present has been tested offline on real hardware with the NVIDIA Runtime and still needs in-game validation. Edit reuse was observed with a single HDR10/PQ XeFG backbuffer in a static Witcher 3 scene. The frame-rate benefit still needs validation. If you notice ghosting, brightness jumps or stutter, turn off x2 to compare per-frame NR.
 
 <a id="en-paths"></a>
 #### Compatible combinations
