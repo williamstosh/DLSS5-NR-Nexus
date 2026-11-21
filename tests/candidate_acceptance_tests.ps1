@@ -48,6 +48,92 @@ function Write-CandidateFixtureAttempt {
     Write-CandidateFixtureJson $ReceiptPath $Attempt.receipt
 }
 
+function Set-CandidateAssemblyFixtureArguments($Build, [string[]]$Arguments) {
+    Write-CandidateFixtureJson $Build.argumentsPath $Arguments
+    $Build.result.buildIdentity.argumentsSha256 = (Get-FileHash -LiteralPath $Build.argumentsPath).Hash
+    Write-CandidateFixtureJson $Build.resultPath $Build.result
+}
+
+function New-CandidateAssemblyFixture($Directory, $ExeBytes, $Source, $Header, $Compiler) {
+    [void][IO.Directory]::CreateDirectory((Join-Path $Directory 'inputs'))
+    $exe = Join-Path $Directory 'fg_native_tests.exe'
+    $dependencies = Join-Path $Directory 'dependencies.json'
+    $inputs = Join-Path $Directory 'inputs.json'
+    Write-CandidateFixtureJson $dependencies @{Data=@{Source=$Source; Includes=@($Header)}}
+    Write-CandidateFixtureJson $inputs @((New-CandidateFixtureReference $Source), (New-CandidateFixtureReference $Header))
+    $build = @{
+        argumentsPath=(Join-Path $Directory 'arguments.json'); resultPath=(Join-Path $Directory 'result.json')
+        original=$exe; archive=(Join-Path $Directory 'inputs/fg_native_tests.exe')
+        result=@{suite='fg-native'; build='passed'; run='passed'; buildIdentity=@{
+            mode='Off'; softwareOnly=$false; executable='fg_native_tests.exe'; executableSha256=(Get-FileHash -LiteralPath $ExeBytes).Hash
+            compiler=$Compiler.path; compilerSha256=$Compiler.sha256; compilerEnvironment=@{CL=$null; _CL_=$null}
+            inputsSha256=(Get-FileHash -LiteralPath $inputs).Hash; dependenciesSha256=(Get-FileHash -LiteralPath $dependencies).Hash
+        }}
+    }
+    $build.arguments = @('/O2', '/DNR_NEXUS_TEST_NATIVE_NGX', '/UNR_NEXUS_DEV_CONTROL', $Source,
+        ('/Fo' + (Join-Path $Directory 'fg_native_tests.obj')), "/Fe$exe", '/sourceDependencies', $dependencies)
+    Set-CandidateAssemblyFixtureArguments $build $build.arguments
+    return $build
+}
+
+function Assert-CandidateAssemblyRejected([scriptblock]$Check, [string]$Reason) {
+    try { $null = & $Check }
+    catch {
+        if ($_.Exception.Message -notmatch $Reason) { throw }
+        return
+    }
+    throw "Candidate assembly accepted a fixture that should fail with $Reason."
+}
+
+function Test-CandidateAssemblyContracts($Fixture, $ExeBytes, $DifferentBytes, $Source, $Header) {
+    $tokens = $null
+    $parseErrors = $null
+    $assembler = [Management.Automation.Language.Parser]::ParseFile(
+        (Join-Path $repo 'tools/new-candidate-acceptance-receipt.ps1'), [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count) { throw $parseErrors[0] }
+    foreach ($name in @('Read-AssemblyJson', 'Get-AssemblyFile', 'Read-AssemblyBuild')) {
+        $definition = $assembler.Find({param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
+        }, $false)
+        if (-not $definition) { throw "Missing candidate assembler function: $name" }
+        . ([scriptblock]::Create($definition.Extent.Text))
+    }
+    $comparison = @($assembler.EndBlock.Statements | Where-Object {
+        $_ -is [Management.Automation.Language.IfStatementAst] -and
+            $_.Extent.Text.Contains('must share the compiler, normalized commands and actual dependency closure')
+    })
+    if ($comparison.Count -ne 1) { throw 'Cannot locate the production assembly compiler equivalence check.' }
+    $compare = [scriptblock]::Create($comparison[0].Extent.Text)
+
+    $compiler = New-CandidateFixtureReference $Header
+    $nativeDirectory = Join-Path $Fixture 'assembly-native'
+    $costDirectory = Join-Path $Fixture 'assembly-cost'
+    $nativeFixture = New-CandidateAssemblyFixture $nativeDirectory $ExeBytes $Source $Header $compiler
+    $costFixture = New-CandidateAssemblyFixture $costDirectory $DifferentBytes $Source $Header $compiler
+    Assert-CandidateAssemblyRejected { Read-AssemblyBuild $nativeDirectory } 'inputs[\\/]fg_native_tests\.exe'
+    Copy-Item -LiteralPath $DifferentBytes -Destination $nativeFixture.archive
+    Assert-CandidateAssemblyRejected { Read-AssemblyBuild $nativeDirectory } 'executable SHA-256 mismatch'
+    Copy-Item -LiteralPath $ExeBytes -Destination $nativeFixture.archive -Force
+    $native = Read-AssemblyBuild $nativeDirectory
+    if ($native.files.executable.path -ine $nativeFixture.archive -or
+        $native.files.originalExecutablePath -ine $nativeFixture.original) {
+        throw 'Candidate assembly must keep the verified archive and original /Fe path separately.'
+    }
+    $archiveArguments = $nativeFixture.arguments.Replace("/Fe$($nativeFixture.original)", "/Fe$($nativeFixture.archive)")
+    Set-CandidateAssemblyFixtureArguments $nativeFixture $archiveArguments
+    Assert-CandidateAssemblyRejected { Read-AssemblyBuild $nativeDirectory } 'ordinary NGX build'
+
+    Copy-Item -LiteralPath $DifferentBytes -Destination $costFixture.original
+    $costBuild = Read-AssemblyBuild $costDirectory
+    if ($native.files.executable.sha256 -ieq $costBuild.files.executable.sha256) { throw 'Expected distinct synthetic EXEs.' }
+    & $compare
+    Set-CandidateAssemblyFixtureArguments $costFixture ($costFixture.arguments + '/DNR_NEXUS_DEV_CONTROL=0')
+    Assert-CandidateAssemblyRejected { Read-AssemblyBuild $costDirectory } 'ordinary NGX build'
+    Set-CandidateAssemblyFixtureArguments $costFixture ($costFixture.arguments.Replace('/O2', '/Od'))
+    $costBuild = Read-AssemblyBuild $costDirectory
+    Assert-CandidateAssemblyRejected { & $compare } 'normalized commands'
+}
+
 $output = Initialize-TestOutput (Join-Path $repo ('tmp/candidate-acceptance-tests/' + [guid]::NewGuid().ToString('N')))
 $fixture = Join-Path $output 'fixture'
 $outcome = 'Failed'
@@ -243,7 +329,9 @@ try {
     if (-not $rejected -or $preflightResult.status -cne 'PendingHost' -or $preflightResult.candidateAcceptance.candidateComplete) {
         throw 'Candidate mode must report PendingHost and fail when host evidence is absent.'
     }
+    Test-CandidateAssemblyContracts $fixture $nativeExe $wrongDll $addon $inputFile
     $outcome = 'Passed'
+    Write-Output 'PASS candidate assembly CPU_SYNTHETIC: archive SHA, original /Fe identity and equivalent compiler conditions.'
     Write-Output "PASS candidate acceptance: $($cases.Count) receipt negatives, input drift and preflight integration."
 } finally {
     Complete-TestOutput $output -Outcome $outcome

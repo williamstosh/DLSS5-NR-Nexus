@@ -262,6 +262,7 @@ try {
                 throw $reason
             }
             $arguments.NativeNgxSrRuntimePath = $NativeNgxSrRuntimePath
+            $arguments.DevControlMode = 'Off'
             $previousCost = $env:NR_NEXUS_TEST_RESIZE_PREPARATION_COST
             $fullInput = $null
             foreach ($record in $checks) {
@@ -323,6 +324,22 @@ try {
                         $record.stages = @($handoff.phases | ForEach-Object stage)
                     }
                     $record.reportSha256 = (Get-FileHash -LiteralPath $record.report).Hash
+                    $caseDirectory = Join-Path $record.output 'fg-native'
+                    $result = Get-Content -LiteralPath (Join-Path $caseDirectory 'result.json') -Raw | ConvertFrom-Json -AsHashtable
+                    $identity = $result['buildIdentity']
+                    if ($result['build'] -cne 'passed' -or $result['run'] -cne 'passed' -or
+                        $identity['mode'] -cne 'Off' -or $identity['executable'] -cne 'fg_native_tests.exe') {
+                        throw 'Native NGX run has no completed ordinary EXE identity.'
+                    }
+                    $executable = Join-Path $caseDirectory $identity.executable
+                    if ((Get-FileHash -LiteralPath $executable).Hash -ine $identity.executableSha256) {
+                        throw 'Native NGX EXE SHA-256 differs from its run result.'
+                    }
+                    $archive = Join-Path $caseDirectory 'inputs/fg_native_tests.exe'
+                    Assert-TestArtifactPath $archive
+                    [void][IO.Directory]::CreateDirectory((Split-Path $archive -Parent))
+                    [IO.File]::Move($executable, $archive)
+                    $record.executable = @{path=$archive; sha256=$identity.executableSha256}
                     $record.status = 'Passed'
                     [void]$record.Remove('reason')
                 } catch {

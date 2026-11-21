@@ -3,9 +3,9 @@
 Assemble a candidate receipt from a retained ordinary Release build and native execution evidence.
 .DESCRIPTION
 NativeRunDirectory and CostBuildDirectory point at fg-native build results.
-CostReport may live in a separate run directory. The native run uses result.json
-and the cost run uses build-ref.json for EXE identity and invocation details.
-Both retain the original artifact-lifecycle.json, case stdout and raw report.
+Each run uses its result.json, artifact lifecycle, case stdout and raw report.
+A cost run in a separate working directory uses its original build-ref.json.
+An EXE archived under inputs keeps the original compiler output path identity.
 FrozenInputsManifest can supply an archived native link input with path,
 sha256, frozenPath and frozenSha256. Both hashes must match the native inputs.
 HostTrace, when supplied, is a candidate-trace/1 report. A DEV trace is kept as
@@ -27,8 +27,8 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $repo = Split-Path $PSScriptRoot -Parent
-. (Join-Path $PSScriptRoot 'check-candidate-acceptance.ps1')
-. (Join-Path $PSScriptRoot 'check-publishing.ps1') -BuildDirectory $BuildDirectory
+. (Join-Path $PSScriptRoot 'check-candidate-acceptance.ps1') -RunId $RunId
+. (Join-Path $PSScriptRoot 'check-publishing.ps1') -BuildDirectory $BuildDirectory -OutputDirectory $OutputDirectory
 . (Join-Path $PSScriptRoot 'check-release-experiment-parity.ps1') -SourceRoot $repo
 
 function Read-AssemblyJson([string]$Path) {
@@ -42,6 +42,7 @@ function Get-AssemblyFile([string]$Path) {
 }
 
 function Read-AssemblyBuild([string]$Directory) {
+    $Directory = (Get-Item -LiteralPath $Directory).FullName
     $result = Get-AssemblyFile (Join-Path $Directory 'result.json')
     $state = Read-AssemblyJson $result.path
     $identity = $state['buildIdentity']
@@ -51,10 +52,13 @@ function Read-AssemblyBuild([string]$Directory) {
         $identity['executable'] -cne 'fg_native_tests.exe') {
         throw "Expected a completed ordinary native FG build: $Directory"
     }
-    $files = @{result=$result}
+    $originalExe = Join-Path $Directory $identity.executable
+    $retainedExe = if (Test-Path -LiteralPath $originalExe -PathType Leaf) { $originalExe }
+        else { Join-Path $Directory "inputs/$($identity.executable)" }
+    $files = @{result=$result; originalExecutablePath=$originalExe}
     foreach ($part in @('arguments','inputs','dependencies','executable')) {
-        $file = if ($part -eq 'executable') { $identity.executable } else { "$part.json" }
-        $files[$part] = Get-AssemblyFile (Join-Path $Directory $file)
+        $path = if ($part -eq 'executable') { $retainedExe } else { Join-Path $Directory "$part.json" }
+        $files[$part] = Get-AssemblyFile $path
         if ($files[$part].sha256 -ine $identity["${part}Sha256"]) {
             throw "Native build $part SHA-256 mismatch in $Directory."
         }
@@ -62,13 +66,37 @@ function Read-AssemblyBuild([string]$Directory) {
     $cmd = Read-AssemblyJson $files.arguments.path
     $exeFlags = @($cmd | Where-Object { $_ -clike '/Fe*' })
     if ($cmd -isnot [array] -or '/DNR_NEXUS_TEST_NATIVE_NGX' -cnotin $cmd -or
-        $exeFlags.Count -ne 1 -or [IO.Path]::GetFullPath($exeFlags[0].Substring(3)) -ine $files.executable.path -or
+        $exeFlags.Count -ne 1 -or [IO.Path]::GetFullPath($exeFlags[0].Substring(3)) -ine $originalExe -or
         (Get-AssemblyFile $identity.compiler).sha256 -ine $identity.compilerSha256 -or
         @($cmd + @($identity.compilerEnvironment.CL, $identity.compilerEnvironment._CL_) |
             Where-Object { $_ -match '(?:^|\s)["]?[/-]D\s*["]?(?:NR_NEXUS_DEV_CONTROL|NR_NEXUS_TEST_WARP_ONLY)\b' }).Count) {
         throw "Native compile arguments do not describe an ordinary NGX build: $Directory"
     }
-    return @{files=$files; identity=$identity}
+    $dependencyIndex = [Array]::IndexOf($cmd, '/sourceDependencies')
+    if ($dependencyIndex -lt 0 -or $dependencyIndex + 1 -ge $cmd.Count -or
+        [IO.Path]::GetFullPath($cmd[$dependencyIndex + 1]) -ine $files.dependencies.path) {
+        throw "Native compile arguments do not identify the actual dependency output: $Directory"
+    }
+    # Match the parity comparison by excluding just the per-build output paths.
+    $commonArguments = @($cmd | Where-Object { $_ -cnotmatch '^/F[eo]' -and $_ -cne $cmd[$dependencyIndex + 1] })
+    $inputHashes = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $records = Read-AssemblyJson $files.inputs.path
+    if ($records -isnot [array] -or -not $records.Count) { throw "Native build input manifest is empty: $Directory" }
+    foreach ($record in $records) {
+        if ($record['path'] -isnot [string] -or $record['sha256'] -notmatch '\A[0-9a-f]{64}\z') {
+            throw "Invalid native build input record: $Directory"
+        }
+        $inputHashes.Add([IO.Path]::GetFullPath($record.path, $Directory), $record.sha256)
+    }
+    $closure = (Read-AssemblyJson $files.dependencies.path).Data
+    $closurePaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in @($closure.Source) + @($closure.Includes)) {
+        $path = [IO.Path]::GetFullPath($file, $Directory)
+        if (-not $inputHashes.ContainsKey($path)) { throw "Native input manifest omits compiler dependency: $file" }
+        [void]$closurePaths.Add($path)
+    }
+    return @{files=$files; identity=$identity; directory=$Directory; commonArguments=$commonArguments;
+        inputHashes=$inputHashes; closureSource=[IO.Path]::GetFullPath($closure.Source, $Directory); closurePaths=$closurePaths}
 }
 
 function Read-AssemblyRun($Report, $Build, [string]$Case, [string]$PassLine, [string]$Condition, $RuntimeInputs) {
@@ -85,33 +113,45 @@ function Read-AssemblyRun($Report, $Build, [string]$Case, [string]$PassLine, [st
     $finished = ([DateTimeOffset]$state.finishedUtc).UtcDateTime
     $execution = @{lifecycle=$lifecycle; stdout=$stdout}
     $runFiles = @($Report, $stdout)
-    if ($Condition) {
+    $recordedRuntimes = $null
+    if ($directory -ieq $Build.directory) {
+        if ($state['sourceCommit'] -cne $Build.identity.source.commit -or
+            @($Build.identity['cases']).Count -ne 1 -or $Build.identity.cases[0] -cne $Case) {
+            throw 'Artifact lifecycle and result.json must identify this source and exact native case.'
+        }
+        $runFiles += $Build.files.result
+        $execution['result'] = $Build.files.result
+        if ($Condition) {
+            $runtimeFile = Get-AssemblyFile (Join-Path $directory 'native-ngx-runtime-inputs.json')
+            $recordedRuntimes = Read-AssemblyJson $runtimeFile.path
+            $execution['runtimeInputs'] = $runtimeFile
+            $runFiles += $runtimeFile
+        }
+    } elseif ($Condition) {
         $buildRef = Get-AssemblyFile (Join-Path $directory 'build-ref.json')
         $reference = Read-AssemblyJson $buildRef.path
         $arguments = $reference['arguments']
-        $buildDirectory = Split-Path $Build.files.executable.path -Parent
         if ($reference['buildDirectory'] -isnot [string] -or
-            [IO.Path]::GetFullPath($reference.buildDirectory, $directory) -ine $buildDirectory -or
+            [IO.Path]::GetFullPath($reference.buildDirectory, $directory) -ine $Build.directory -or
             $reference['executableSha256'] -ine $Build.files.executable.sha256 -or $reference['condition'] -cne $Condition -or
             $arguments -isnot [array] -or $arguments.Count -ne 2 -or $arguments[0] -cne "--$Case" -or
             $arguments[1] -isnot [string] -or -not [IO.Path]::IsPathFullyQualified($arguments[1])) {
             throw "Cost build-ref does not identify the actual $Condition run with the selected native EXE."
         }
-        foreach ($runtime in $RuntimeInputs) {
-            $expectedPath = [IO.Path]::GetFullPath($runtime.path)
-            $matchingInputs = @($reference['runtimeInputs'] | Where-Object {
-                [IO.Path]::GetFullPath($_.path) -ieq $expectedPath -and $_.sha256 -ieq $runtime.sha256
-            })
-            if ($matchingInputs.Count -ne 1) { throw 'Cost build-ref has different recorded Runtime inputs.' }
-        }
+        $recordedRuntimes = $reference['runtimeInputs']
         $runFiles += $buildRef
         $execution['buildReference'] = $buildRef
     } else {
-        if ($state['sourceCommit'] -cne $Build.identity.source.commit) {
-            throw 'Native artifact lifecycle and result.json describe different source commits.'
+        throw 'Native handoff report must come from the recorded test run directory.'
+    }
+    if ($Condition) {
+        foreach ($runtime in $RuntimeInputs) {
+            $expectedPath = [IO.Path]::GetFullPath($runtime.path)
+            $matchingInputs = @($recordedRuntimes | Where-Object {
+                [IO.Path]::GetFullPath($_.path) -ieq $expectedPath -and $_.sha256 -ieq $runtime.sha256
+            })
+            if ($matchingInputs.Count -ne 1) { throw 'Cost run has different recorded Runtime inputs.' }
         }
-        $runFiles += $Build.files.result
-        $execution['result'] = $Build.files.result
     }
     foreach ($runFile in $runFiles) {
         $written = (Get-Item -LiteralPath $runFile.path).LastWriteTimeUtc
@@ -132,7 +172,7 @@ function Get-AssemblyTrackedPaths([string]$Path) {
     }
 }
 
-function Read-AssemblyShaderGroups([string]$Path) {
+function Read-AssemblyTrackedGroups([string]$Path) {
     $groups = @{}
     $rule = $null
     foreach ($line in Get-Content -LiteralPath $Path) {
@@ -140,7 +180,7 @@ function Read-AssemblyShaderGroups([string]$Path) {
             $rule = $line
             $groups[$rule] = [Collections.Generic.List[string]]::new()
         } elseif ($line) {
-            if (-not $rule) { throw "Shader tracking starts without a rule in $Path." }
+            if (-not $rule) { throw "Dependency tracking starts without a rule in $Path." }
             $groups[$rule].Add($line)
         }
     }
@@ -176,9 +216,19 @@ $costBuild = Read-AssemblyBuild $CostBuildDirectory
 if (@($native.identity['cases']).Count -ne 1 -or $native.identity.cases[0] -cne 'control-mask-native-ngx-fg') {
     throw 'NativeRunDirectory must name the actual control-mask-native-ngx-fg run.'
 }
-foreach ($part in @('arguments','inputs','dependencies','executable')) {
-    if ($native.files[$part].sha256 -ine $costBuild.files[$part].sha256) {
-        throw "Cost and handoff runs must share the same native build $part."
+if ($native.identity.compilerSha256 -ine $costBuild.identity.compilerSha256 -or
+    $native.identity.compiler -ine $costBuild.identity.compiler -or
+    $native.identity.compilerEnvironment.CL -cne $costBuild.identity.compilerEnvironment.CL -or
+    $native.identity.compilerEnvironment._CL_ -cne $costBuild.identity.compilerEnvironment._CL_ -or
+    ($native.commonArguments -join "`n") -cne ($costBuild.commonArguments -join "`n") -or
+    $native.closureSource -ine $costBuild.closureSource -or -not $native.closurePaths.SetEquals($costBuild.closurePaths)) {
+    throw 'Cost and handoff builds must share the compiler, normalized commands and actual dependency closure.'
+}
+$nativeHashes = $native.inputHashes
+if ($nativeHashes.Count -ne $costBuild.inputHashes.Count) { throw 'Cost and handoff build input sets differ.' }
+foreach ($path in $nativeHashes.Keys) {
+    if (-not $costBuild.inputHashes.ContainsKey($path) -or $costBuild.inputHashes[$path] -ine $nativeHashes[$path]) {
+        throw "Cost and handoff build input bytes differ: $path"
     }
 }
 foreach ($key in @('hostCommit','hostLockSha256','hostPatchSha256','toolsLockSha256')) {
@@ -193,9 +243,6 @@ foreach ($key in $context.dependencies.Keys) {
     }
 }
 
-$nativeHashes = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
-$nativeInputRecords = Read-AssemblyJson $native.files.inputs.path
-if ($nativeInputRecords -isnot [array] -or -not $nativeInputRecords.Count) { throw 'Native build input manifest is empty.' }
 $frozenInput = $null
 $usedFrozenInput = $false
 if ($FrozenInputsManifest) {
@@ -210,28 +257,19 @@ if ($FrozenInputsManifest) {
     $frozenInput = @{originalPath=[IO.Path]::GetFullPath($frozenRecord.path); sha256=$frozenRecord.sha256
         archive=@{path=$frozenPath; sha256=$frozenRecord.sha256}; manifest=$frozenManifest}
 }
-$nativeBase = Split-Path $native.files.inputs.path -Parent
-foreach ($inputRecord in $nativeInputRecords) {
-    if ($inputRecord['path'] -isnot [string] -or $inputRecord['sha256'] -notmatch '\A[0-9a-f]{64}\z') {
-        throw 'Invalid record in native build inputs.'
-    }
-    $file = [IO.Path]::GetFullPath($inputRecord.path, $nativeBase)
+foreach ($file in $nativeHashes.Keys) {
+    $expectedHash = $nativeHashes[$file]
     if (-not (Test-Path -LiteralPath $file -PathType Leaf) -or
-        (Get-FileHash -LiteralPath $file).Hash -ine $inputRecord.sha256) {
-        if ($null -eq $frozenInput -or $frozenInput.originalPath -ine $file -or $frozenInput.sha256 -ine $inputRecord.sha256) {
+        (Get-FileHash -LiteralPath $file).Hash -ine $expectedHash) {
+        if ($null -eq $frozenInput -or $frozenInput.originalPath -ine $file -or $frozenInput.sha256 -ine $expectedHash) {
             throw "Native build input SHA-256 mismatch: $file"
         }
         $usedFrozenInput = $true
     }
-    $nativeHashes.Add($file, $inputRecord.sha256)
 }
 if ($frozenInput -and (-not $nativeHashes.ContainsKey($frozenInput.originalPath) -or
     $nativeHashes[$frozenInput.originalPath] -ine $frozenInput.sha256)) {
     throw 'Frozen input does not match any recorded native build input.'
-}
-$includes = Read-AssemblyJson $native.files.dependencies.path
-foreach ($file in @($includes.Data.Source) + @($includes.Data.Includes)) {
-    if (-not $nativeHashes.ContainsKey([IO.Path]::GetFullPath($file))) { throw "Native input manifest omits compiler dependency: $file" }
 }
 $trackedChanges = @(& git --no-optional-locks -C $repo -c core.quotePath=false diff --name-only HEAD --)
 if ($LASTEXITCODE -ne 0) { throw 'Cannot check current tracked inputs.' }
@@ -245,17 +283,30 @@ foreach ($relative in $trackedChanges) {
 
 $tlogs = Join-Path $BuildDirectory 'dlss5.dir/Release/dlss5.tlog'
 $shaderTlogs = Join-Path $BuildDirectory 'x64/Release/dlss5-shaders/dlss5-shaders.tlog'
+$linkRead = Join-Path $tlogs 'link.read.1.tlog'
+$rcRead = Join-Path $tlogs 'rc.read.1.tlog'
+$rcWrite = Get-AssemblyFile (Join-Path $tlogs 'rc.write.1.tlog')
+$linkedResources = @(Get-AssemblyTrackedPaths $linkRead | Where-Object { [IO.Path]::GetExtension($_) -ieq '.res' } | Sort-Object -Unique)
+$rcReads = Read-AssemblyTrackedGroups $rcRead
+$rcWrites = Read-AssemblyTrackedGroups $rcWrite.path
+# Incremental MSBuild keeps rules for resource sources removed from the target.
+$rcSource = [IO.Path]::GetFullPath((Join-Path $repo 'cmake/nexus-version.rc'))
+$rcRule = "^$rcSource"
+if ($linkedResources.Count -ne 1 -or -not $rcReads.ContainsKey($rcRule) -or
+    $linkedResources[0] -notin $rcWrites[$rcRule]) {
+    throw 'The linked Release resource must come from the tracked cmake/nexus-version.rc rule.'
+}
 $groups = @(
     @{log=(Join-Path $tlogs 'CL.read.1.tlog'); output=(Join-Path $BuildDirectory 'dlss5.dir/Release/addon.obj')},
-    @{log=(Join-Path $tlogs 'rc.read.1.tlog'); output=(Join-Path $BuildDirectory 'dlss5.dir/Release/nexus-version.res')},
-    @{log=(Join-Path $tlogs 'link.read.1.tlog'); output=$builtDll.path},
-    @{log=(Join-Path $tlogs 'CustomBuild.read.1.tlog'); output=$null},
+    @{log=$rcRead; output=$linkedResources[0]; inputs=@($rcSource) + @($rcReads[$rcRule])},
+    @{log=$linkRead; output=$builtDll.path},
+    @{log=(Join-Path $tlogs 'CustomBuild.read.1.tlog'); output=(Join-Path $BuildDirectory 'CMakeFiles/generate.stamp')},
     @{log=(Join-Path $shaderTlogs 'CustomBuild.read.1.tlog'); output=$null}
 )
 $actualInputs = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 $buildLogs = foreach ($group in $groups) {
     $log = Get-AssemblyFile $group.log
-    $paths = @(Get-AssemblyTrackedPaths $log.path)
+    $paths = if ($group.ContainsKey('inputs')) { $group.inputs } else { @(Get-AssemblyTrackedPaths $log.path) }
     if (-not $paths.Count) { throw "Empty candidate dependency log: $($log.path)" }
     $latest = if ($group.output) { (Get-Item -LiteralPath $group.output).LastWriteTimeUtc }
         else { (Get-Item -LiteralPath $log.path).LastWriteTimeUtc }
@@ -268,8 +319,8 @@ $buildLogs = foreach ($group in $groups) {
     $log
 }
 $shaderWriteLog = Get-AssemblyFile (Join-Path $shaderTlogs 'CustomBuild.write.1.tlog')
-$shaderReads = Read-AssemblyShaderGroups $buildLogs[-1].path
-$shaderWrites = Read-AssemblyShaderGroups $shaderWriteLog.path
+$shaderReads = Read-AssemblyTrackedGroups $buildLogs[-1].path
+$shaderWrites = Read-AssemblyTrackedGroups $shaderWriteLog.path
 foreach ($rule in $shaderReads.Keys) {
     $shaderOutputs = @($shaderWrites[$rule] | Where-Object { $_ -match '[\\/]dlss5\.include[\\/]embed[\\/]' })
     foreach ($output in $shaderOutputs) {
@@ -281,7 +332,7 @@ foreach ($rule in $shaderReads.Keys) {
         }
     }
 }
-$buildLogs += $shaderWriteLog
+$buildLogs += @($shaderWriteLog, $rcWrite)
 foreach ($key in @('CMAKE_PROJECT_renodx_INCLUDE','FXC_BIN','DXC_BIN','SLANGC_BIN')) {
     [void]$actualInputs.Add($settings[$key])
 }
