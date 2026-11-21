@@ -23589,10 +23589,13 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
 #if defined(NR_NEXUS_DEV_CONTROL)
         , false
 #endif
-        , nullptr, source_scope.owner);
+        , nullptr, NVSDK_NGX_SUCCEED(result));
   }
   RecordInjectionCpu(started_ns);
-  if (source_scope.owner && command_list_touched) {
+  // A nested mirror can write NR first; the source owner still publishes its
+  // output association after the same successful SR call returns.
+  if (source_scope.owner && (command_list_touched
+      || evaluate_chain.Injected(GetD3D12Resource(parameters, NVSDK_NGX_Parameter_Output)))) {
     CaptureAdaptivePresentSource(command_list, handle, parameters);
   }
   if (command_list_touched) state_envelope.MarkInjectionCommandsRecorded();
@@ -23891,10 +23894,11 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
 #if defined(NR_NEXUS_DEV_CONTROL)
         , false
 #endif
-        , nullptr, source_scope.owner);
+        , nullptr, NVSDK_NGX_SUCCEED(result));
   }
   RecordInjectionCpu(started_ns);
-  if (source_scope.owner && command_list_touched) {
+  if (source_scope.owner && (command_list_touched
+      || evaluate_chain.Injected(GetD3D12Resource(parameters, NVSDK_NGX_Parameter_Output)))) {
     CaptureAdaptivePresentSource(command_list, handle, parameters);
   }
   if (command_list_touched) state_envelope.MarkInjectionCommandsRecorded();

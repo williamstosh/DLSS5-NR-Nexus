@@ -134,6 +134,69 @@ function Test-CandidateAssemblyContracts($Fixture, $ExeBytes, $DifferentBytes, $
     Assert-CandidateAssemblyRejected { & $compare } 'normalized commands'
 }
 
+function Test-CandidateNestedSrContracts {
+    $baseline = @{
+        nested_sr_deliveries=@(
+            @{delivery='DELIVERED'; accepted_evaluate_sequence=101; completed_group_sequence=51
+                readback_pixels=64; readback_fence_value=11; readback_fence_completed=11
+                gpu_fence_healthy=$true; sdk_fg_enabled=$true; outer_enhanced_output_matches=$true},
+            @{delivery='DELIVERED'; accepted_evaluate_sequence=103; completed_group_sequence=52
+                readback_pixels=64; readback_fence_value=12; readback_fence_completed=12
+                gpu_fence_healthy=$true; sdk_fg_enabled=$true; outer_enhanced_output_matches=$true}
+        )
+        nested_sr_failure=@{evidence='NATIVE_GPU+MOCK_SR_FAILURE'; nr_evaluate_count=0; new_completed_groups=0; output_unchanged=$true}
+        nested_source_output=@{status='NotRun'; reason='SR RGBA16F and SDK RGBA8 backbuffer formats differ'}
+    } | ConvertTo-Json -Depth 8
+    $cases = @(
+        @{reason='two actual delivered frames'; edit={param($h) $h.Remove('nested_sr_deliveries')}},
+        @{reason='two actual delivered frames'; edit={param($h) $h.nested_sr_deliveries=@($h.nested_sr_deliveries[0])}},
+        @{reason='distinct accepted and completed'; edit={param($h) $h.nested_sr_deliveries[1].delivery='PENDING'}},
+        @{reason='distinct accepted and completed'; edit={param($h) $h.nested_sr_deliveries[1].accepted_evaluate_sequence=101}},
+        @{reason='distinct accepted and completed'; edit={param($h) $h.nested_sr_deliveries[1].completed_group_sequence=51}},
+        @{reason='distinct accepted and completed'; edit={param($h) $h.nested_sr_deliveries[1].readback_fence_completed=11}},
+        @{reason='distinct accepted and completed'; edit={param($h) $h.nested_sr_deliveries[1].gpu_fence_healthy=$false}},
+        @{reason='distinct accepted and completed'; edit={param($h) $h.nested_sr_deliveries[1].sdk_fg_enabled=$false}},
+        @{reason='distinct accepted and completed'; edit={param($h) $h.nested_sr_deliveries[1].outer_enhanced_output_matches=$false}},
+        @{reason='zero NR Evaluate'; edit={param($h) $h.nested_sr_failure.evidence='WARP+MOCK'}},
+        @{reason='zero NR Evaluate'; edit={param($h) $h.nested_sr_failure.nr_evaluate_count=1}},
+        @{reason='zero NR Evaluate'; edit={param($h) $h.nested_sr_failure.new_completed_groups=1}},
+        @{reason='zero NR Evaluate'; edit={param($h) $h.nested_sr_failure.output_unchanged=$false}},
+        @{reason='SourceOutput must remain NotRun'; edit={param($h) $h.nested_source_output.status='Passed'}}
+    )
+    foreach ($path in @('tools/run-release-preflight.ps1', 'tools/new-candidate-acceptance-receipt.ps1')) {
+        $tokens = $null
+        $parseErrors = $null
+        $parser = [Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $repo $path), [ref]$tokens, [ref]$parseErrors)
+        if ($parseErrors.Count) { throw $parseErrors[0] }
+        $first = $parser.Find({param($node)
+            $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $node.Extent.Text.StartsWith('$nestedDeliveries =')
+        }, $true)
+        if (-not $first) { throw "Missing native nested SR receipt checks: $path" }
+        $statements = @($first.Parent.Statements)
+        $start = [Array]::IndexOf($statements, $first)
+        $end = $start
+        while ($end -lt $statements.Count -and
+            -not $statements[$end].Extent.Text.Contains('Native nested SourceOutput must remain NotRun')) { $end++ }
+        if ($start -lt 0 -or $end -eq $statements.Count) { throw "Incomplete native nested SR receipt checks: $path" }
+        $nestedChecks = [scriptblock]::Create(($statements[$start..$end].Extent.Text -join "`n"))
+        $handoff = $baseline | ConvertFrom-Json -AsHashtable
+        . $nestedChecks
+        if ($nestedDeliveries.Count -ne 2 -or $nestedFailure.nr_evaluate_count -ne 0 -or
+            $nestedSourceOutput.status -cne 'NotRun' -or
+            $nestedSourceOutput.reason -cne 'SR RGBA16F and SDK RGBA8 backbuffer formats differ') {
+            throw "Native nested SR checks failed to retain the report facts: $path"
+        }
+        foreach ($case in $cases) {
+            $handoff = $baseline | ConvertFrom-Json -AsHashtable
+            & $case.edit $handoff | Out-Null
+            Assert-CandidateAssemblyRejected { & $nestedChecks } $case.reason
+        }
+    }
+    Write-Output "PASS nested SR CPU_SYNTHETIC: both native receipt consumers reject $($cases.Count) missing or invalid evidence variants."
+}
+
 $output = Initialize-TestOutput (Join-Path $repo ('tmp/candidate-acceptance-tests/' + [guid]::NewGuid().ToString('N')))
 $fixture = Join-Path $output 'fixture'
 $outcome = 'Failed'
@@ -330,6 +393,7 @@ try {
         throw 'Candidate mode must report PendingHost and fail when host evidence is absent.'
     }
     Test-CandidateAssemblyContracts $fixture $nativeExe $wrongDll $addon $inputFile
+    Test-CandidateNestedSrContracts
     $outcome = 'Passed'
     Write-Output 'PASS candidate assembly CPU_SYNTHETIC: archive SHA, original /Fe identity and equivalent compiler conditions.'
     Write-Output "PASS candidate acceptance: $($cases.Count) receipt negatives, input drift and preflight integration."

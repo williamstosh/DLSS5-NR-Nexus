@@ -162,10 +162,13 @@ inline void Run(Gpu& gpu, Session& session, ID3D12Resource* back,
     bool native_ngx;
     bool real_sr;
     uint32_t calls = 0;
+    uint32_t source_wrappers = 0;
     size_t nr_calls_at_entry = 0;
+    bool fail_sr = false;
     bool consumed_replacement = false;
     Snapshot consumed_color;
     Snapshot sr_output;
+    Snapshot outer_output;
   };
   SrObservation observation{.gpu = &gpu, .color = color.Get(), .native_ngx = native_ngx, .real_sr = real_sr};
   static SrObservation* active_sr = nullptr;
@@ -186,7 +189,9 @@ inline void Run(Gpu& gpu, Session& session, ID3D12Resource* back,
       PFN_NVSDK_NGX_ProgressCallback progress) -> NVSDK_NGX_Result {
     auto& observed = *active_sr;
     ++observed.calls;
+    observed.source_wrappers = addon::evaluate_chain.game_wrappers;
     observed.nr_calls_at_entry = (observed.native_ngx ? native_runtime_evaluation_results.size() : model_calls);
+    if (observed.fail_sr) return NVSDK_NGX_Result_FAIL_InvalidParameter;
     auto* input = native::GetD3D12Resource(block, NVSDK_NGX_Parameter_Color);
     auto* output = native::GetD3D12Resource(block, NVSDK_NGX_Parameter_Output);
     observed.consumed_replacement = input != observed.color;
@@ -225,6 +230,8 @@ inline void Run(Gpu& gpu, Session& session, ID3D12Resource* back,
   uint64_t fg_off_samples = 0;
   nlohmann::json phases = nlohmann::json::array();
   nlohmann::json external_blocks = nlohmann::json::array();
+  nlohmann::json nested_deliveries = nlohmann::json::array();
+  nlohmann::json nested_sr_failure;
   const auto present = [&] {
     const auto app_frame = session.context->application_frame;
     native::RunPresentPath(&route.queue, &route);
@@ -238,7 +245,7 @@ inline void Run(Gpu& gpu, Session& session, ID3D12Resource* back,
     Check(fg_held() && session.context->application_frame == app_frame + 1,
           "outer Present and SDK Proxy advance the same enabled XeFG context");
   };
-  const auto source_eval = [&](uint8_t value) {
+  const auto source_eval = [&](uint8_t value, NVSDK_NGX_Result expected = NVSDK_NGX_Result_Success) {
     if (native_ngx) {
       for (uint32_t y = 0; y < render_height; ++y) {
         for (uint32_t x = 0; x < render_width; ++x) {
@@ -262,12 +269,13 @@ inline void Run(Gpu& gpu, Session& session, ID3D12Resource* back,
     }
     observation.consumed_color = {};
     observation.sr_output = {};
+    observation.outer_output = {};
     gpu.list->ClearState(nullptr);
     const auto calls_before = observation.calls;
-    Check(NVSDK_NGX_SUCCEED(native::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), sr, &parameters, nullptr))
+    Check(native::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), sr, &parameters, nullptr) == expected
               && observation.calls == calls_before + 1 && native::create_contracts.at(sr).source_generation == source_generation
               && native::GetD3D12Resource(&parameters, NVSDK_NGX_Parameter_Color) == color.Get(),
-          "successful SR Evaluate keeps its source generation and restores the original Color binding");
+          "SR Evaluate forwards its result, keeps its source generation and restores the original Color binding");
     gpu.Transition(color.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
   };
   const auto check_mock_pixels = [&](const Snapshot& snapshot, uint8_t alpha) {
@@ -555,6 +563,243 @@ inline void Run(Gpu& gpu, Session& session, ID3D12Resource* back,
     if (native_ngx) {
       phases.push_back({{"stage", stage_name}, {"provider", "Core"}, {"frames", std::move(frames)}});
     }
+    if (!render) {
+      namespace timers = addon::gpu_timers;
+      using Delivery = addon::adaptive_resolution::DeliveryReceipt;
+      funnel_accounting_tests::Restore nested_restore;
+      nested_restore.Value(&native::ngx_slot_real[0]);
+      nested_restore.Value(&native::ngx_slot_real[1]);
+      nested_restore.Value(&native::adaptive_configuration_settings);
+      nested_restore.Value(&native::direct_runtime_requirements);
+      nested_restore.Value(&native::ngx_loader_staging.nr_requirements);
+      nested_restore.Atomic(&native::ngx_loader_published);
+      nested_restore.Value(&timers::comparison_settings);
+      nested_restore.Atomic(&native::nr_adaptive_enabled);
+      nested_restore.Atomic(&native::nr_adaptive_min_scale);
+      nested_restore.Atomic(&native::nr_adaptive_selected_levels);
+      nested_restore.Atomic(&native::nr_adaptive_editing);
+      nested_restore.Atomic(&native::nr_adaptive_limited_residency);
+      nested_restore.Atomic(&native::adaptive_feature_mode);
+      nested_restore.Atomic(&native::gpu_timers_enabled);
+      nested_restore.Atomic(&native::cost_meter_enabled);
+      nested_restore.Atomic(&native::preset);
+      native::hook_point = native::kHookUpscaled;
+      native::nr_adaptive_enabled = true;
+      native::nr_adaptive_min_scale = 1.f;
+      native::nr_adaptive_selected_levels = 0;
+      native::nr_adaptive_editing = false;
+      native::nr_adaptive_limited_residency = false;
+      native::adaptive_feature_mode = native::AdaptiveFeatureMode::OFF;
+      native::gpu_timers_enabled = true;
+      native::cost_meter_enabled = false;
+      native::preset = 2;
+      if (!native_ngx) {
+        native::direct_runtime_requirements.dual_models = true;
+        native::ngx_loader_staging.nr_requirements.dual_models = true;
+        native::PublishNgxLoaderSymbols();
+      }
+      // Earlier handoff frames used runtime-default slots. Apply the new
+      // model contract before warming this independently selected B case.
+      native::RecreateFeatures();
+      native::adaptive_configuration_settings = native::comparison_ui::CaptureAdaptiveSettings;
+      timers::comparison_settings = native::comparison_ui::CaptureSettings;
+      namespace rate = addon::output_framerate;
+      const auto release_output = [](reshade::api::swapchain* output) {
+        const addon::RuntimeLock lock(native::runtime_mutex);
+        native::RetirePresentStream(output);
+        ObserveOutputDestroy(output, false);
+      };
+      std::unique_ptr<reshade::api::swapchain, decltype(release_output)> registered_route(nullptr, release_output);
+      rate::OutputIdentity output_owner;
+      d3d12_test::TextureTransfer delivery_readback;
+      if (!native_ngx) {
+        ObserveOutputInit(&route, false);
+        registered_route.reset(&route);
+        output_owner = rate::MatchPresentOutput(reinterpret_cast<uintptr_t>(&route), reinterpret_cast<uintptr_t>(back));
+        Check(static_cast<bool>(output_owner), "production swapchain registration identifies the actual nested SR delivery backbuffer");
+        delivery_readback = gpu.CreateTextureTransfer(output.Get());
+      }
+      const auto source_output = [&] {
+        return rate::FindSourceOutput({.handle = reinterpret_cast<uintptr_t>(sr), .generation = source_generation,
+            .device = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(gpu.device.Get())),
+            .resource = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(output.Get())),
+            .resource_generation = native::AdaptiveResourceGeneration(output.Get())});
+      };
+      if (!native_ngx) {
+        Check(!source_output(), "source ownership starts unbound before the first real backbuffer delivery");
+      }
+      const auto finish_delivery = [&] {
+        submit();
+        const addon::RuntimeLock lock(native::runtime_mutex);
+        native::ResolveAdaptiveBorrowedDeliveries();
+        native::DrainRetiredResources(true);
+        timers::Poll(true, false);
+      };
+      // Mature the single full-size adaptive level through the ordinary owner
+      // before introducing the nested wrapper whose delivery is under test.
+      bool warm = false;
+      for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8 && !warm; ++attempt) {
+        present();
+        const auto calls_before = nr_calls();
+        const auto accepted_before = telemetry.accepted;
+        const auto skipped_before = telemetry.skipped;
+        source_eval(static_cast<uint8_t>(176 + attempt));
+        Check(nr_calls() <= calls_before + 1, "one adaptive level records no standby model evaluations");
+        warm = nr_calls() == calls_before + 1 && previous_nr_succeeded()
+            && telemetry.accepted == accepted_before + 1 && telemetry.skipped == skipped_before;
+        finish_delivery();
+      }
+      const auto& feature = native::features.at(sr);
+      Check(warm && feature.adaptive_session != nullptr && feature.adaptive_session->settings.enabled
+                && feature.adaptive_session->ladder.count == 1 && feature.adaptive_cache != nullptr
+                && feature.adaptive_cache->count == 1 && !native::direct_api.private_instance,
+            "nested SR starts with one warmed adaptive level on the ordinary provider");
+      native::ngx_slot_real[1].evaluate = native::ngx_slot_real[0].evaluate;
+      native::ngx_slot_real[0].evaluate = reinterpret_cast<void*>(+[](ID3D12GraphicsCommandList* list,
+          const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* block,
+          PFN_NVSDK_NGX_ProgressCallback progress) -> NVSDK_NGX_Result {
+        const auto result = native::HookedEvaluateFeatureSlot<1>(list, handle, block, progress);
+        if (NVSDK_NGX_SUCCEED(result)) {
+          active_sr->outer_output = Capture(*active_sr->gpu,
+              native::GetD3D12Resource(block, NVSDK_NGX_Parameter_Output), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        return result;
+      });
+      uint32_t completed_groups = 0;
+      for (uint32_t frame = 0; frame < 2; ++frame) {
+        if (frame == 1) {
+          present();
+          const auto calls_before = nr_calls();
+          const auto accepted_before = telemetry.accepted;
+          const auto source_sequence = native::features.at(sr).sr_sequence;
+          const auto timer_before = timers::internal::next_sequence;
+          const auto completed_before = timers::completed_stats[static_cast<size_t>(Stage::UPSCALED)].sequence;
+          const auto before = Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+          observation.fail_sr = true;
+          source_eval(239, NVSDK_NGX_Result_FAIL_InvalidParameter);
+          observation.fail_sr = false;
+          Check(observation.source_wrappers == 2 && native::features.at(sr).sr_sequence == source_sequence + 1
+                    && nr_calls() == calls_before && telemetry.accepted == accepted_before
+                    && timers::internal::next_sequence == timer_before && observation.outer_output.readback == nullptr,
+                "an actual inner SR failure propagates through both wrappers with no NR or new completion recording");
+          const auto after = Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+          const auto recording = submission::ObserveRecording(gpu.list.Get());
+          finish_delivery();
+          Check(before.Pixels() == after.Pixels()
+                    && timers::completed_stats[static_cast<size_t>(Stage::UPSCALED)].sequence == completed_before,
+                "the failed inner SR frame preserves full output pixels and cannot publish a new completed group");
+          std::cout << "XEFG_INLINE_NESTED_SR_FAILURE stage=Upscaled sr_calls=1 nr_evals=0 source_owners=1"
+                       " new_completed=0 full_readback=unchanged evidence="
+                    << (native_ngx ? "NATIVE_GPU+MOCK_SR_FAILURE" : "WARP+MOCK") << '\n';
+          if (native_ngx) {
+            nested_sr_failure = {{"evidence", "NATIVE_GPU+MOCK_SR_FAILURE"},
+                {"source_sequence", native::features.at(sr).sr_sequence}, {"sr_evaluate_sequence", observation.calls},
+                {"nr_evaluate_count", nr_calls() - calls_before}, {"new_completed_groups", 0},
+                {"retained_completed_sequence", completed_before}, {"output_unchanged", true},
+                {"recording_closed", recording->closed.load()}};
+          }
+        }
+        present();
+        const auto source_sequence = native::features.at(sr).sr_sequence;
+        const auto calls_before = nr_calls();
+        const auto accepted_before = telemetry.accepted;
+        const auto timer_before = timers::internal::next_sequence;
+        const auto value = static_cast<uint8_t>(224 + frame);
+        source_eval(value);
+        Check(observation.source_wrappers == 2 && native::features.at(sr).sr_sequence == source_sequence + 1
+                  && nr_calls() == calls_before + 1 && previous_nr_succeeded()
+                  && telemetry.accepted == accepted_before + 1,
+              "nested Cpp0 to Cpp1 wrappers count one source owner, one successful SR and one actual NR per base frame");
+        const auto segment = std::ranges::find_if(timers::internal::segments, [&](const auto& candidate) {
+          return candidate.recorded && candidate.sequence > timer_before && std::strcmp(candidate.path, "after") == 0;
+        });
+        const bool segment_found = segment != std::end(timers::internal::segments);
+        std::cout << "XEFG_INLINE_NESTED_PREDICATES found=" << segment_found
+                  << " sequence_delta=" << timers::internal::next_sequence - timer_before
+                  << " measure=" << (segment_found && segment->measure)
+                  << " pass_begin=" << (segment_found ? static_cast<int>(segment->pass_begin) : -1)
+                  << " pass_count=" << (segment_found ? static_cast<int>(segment->pass_count) : -1)
+                  << " model=" << (segment_found ? static_cast<int>(segment->passes[0].model) : -1)
+                  << " dual_models=" << native::direct_runtime_requirements.dual_models
+                  << " adaptive_enabled=" << (segment_found && segment->adaptive.enabled)
+                  << " adaptive_preparing=" << (segment_found && segment->adaptive.preparing)
+                  << " delivery_present=" << (segment_found && segment->adaptive.delivery != nullptr)
+                  << " delivery_state=" << (segment_found && segment->adaptive.delivery != nullptr
+                          ? static_cast<int>(*segment->adaptive.delivery) : -1) << std::endl;
+        Check(segment != std::end(timers::internal::segments)
+                  && timers::internal::next_sequence == timer_before + 1 && segment->measure
+                  && segment->pass_begin == 0 && segment->pass_count == 1 && segment->passes[0].model == 2
+                  && segment->adaptive.enabled && !segment->adaptive.preparing && segment->adaptive.delivery != nullptr,
+              "the actual nested NR call records one timed model B group and its production delivery receipt");
+        const auto receipt = segment->adaptive.delivery;
+        const auto timer_sequence = segment->sequence;
+        const auto group = native::EvaluationStagePlan(sr).At(Stage::UPSCALED);
+        Snapshot readback;
+        if (native_ngx) {
+          readback = Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        } else {
+          // Keep the full-copy observer's sealed producer intact until the
+          // real outer Present consumes its exact submission receipt.
+          gpu.Transition(output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+          gpu.Transition(back, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+          gpu.list->CopyResource(back, output.Get());
+          gpu.RecordTextureReadback(output.Get(), delivery_readback);
+          gpu.Transition(back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+          gpu.Transition(output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+          readback = {.readback = delivery_readback.readback, .footprint = delivery_readback.footprint,
+              .width = width, .height = height, .pixel_bytes = 4, .format = back_desc.Format};
+        }
+        const auto recording = submission::ObserveRecording(gpu.list.Get());
+        finish_delivery();
+        const auto completed_fence = gpu.fence->GetCompletedValue();
+        Check(recording->submitted.load() && recording->closed.load() && recording->completed_healthy
+                  && completed_fence != UINT64_MAX && completed_fence >= gpu.serial,
+              "the nested NR list completes and naturally resets with an exact healthy submission proof");
+        if (native_ngx) {
+          const auto rgba = readback.Pixels();
+          Check(rgba.size() == static_cast<size_t>(width) * height * 8
+                    && check_fp16(rgba, observation.sr_output.Pixels()),
+                "nested native NR rewrites the entire SR output with finite RGBA and exact SR alpha");
+        } else {
+          check_mock_pixels(readback, value);
+        }
+        Check(observation.outer_output.readback != nullptr && observation.outer_output.Pixels() == readback.Pixels(),
+              "the outer source owner receives the exact enhanced output produced by the inner NR wrapper");
+        const auto& completed = timers::completed_stats[static_cast<size_t>(Stage::UPSCALED)];
+        const bool published = completed.sequence == timer_sequence
+            && native::CurrentCompletedGroup(completed, group, timers::NowNs());
+        std::cout << "XEFG_INLINE_NESTED_OBS frame=" << frame + 1 << " sr_calls=1 nr_evals=1 source_owners=1"
+                  << " pixel_readback=passed gpu_fence=healthy delivery="
+                  << (*receipt == Delivery::DELIVERED ? "DELIVERED" : *receipt == Delivery::REJECTED ? "REJECTED" : "PENDING")
+                  << " completed_group=" << published << std::endl;
+        Check(*receipt == Delivery::DELIVERED,
+              "successful nested SR must deliver inner non-owner NR after its single real GPU submission");
+        Check(published && completed.passes[0].model == 2 && fg_held(),
+              "nested SR publishes the current completed model B group while XeFG stays enabled");
+        if (!native_ngx) {
+          native::RunPresentPath(&route.queue, &route);
+          Check(source_output() == output_owner,
+                "successful nested SR and its actual same-list backbuffer copy establish production SourceOutput ownership");
+          std::cout << "XEFG_INLINE_NESTED_SOURCE_OUTPUT frame=" << frame + 1
+                    << " outer_enhanced=matched same_list_copy=1 output_registered=1 source_bound=1\n";
+        }
+        ++completed_groups;
+        if (native_ngx) {
+          nested_deliveries.push_back({{"sr_evaluate_sequence", observation.calls},
+              {"source_sequence", native::features.at(sr).sr_sequence}, {"source_owner_count", 1},
+              {"accepted_evaluate_sequence", telemetry.last_evaluate.sequence}, {"completed_group_sequence", completed.sequence},
+              {"delivery", "DELIVERED"}, {"readback_pixels", static_cast<size_t>(width) * height},
+              {"readback_fence_value", gpu.serial}, {"readback_fence_completed", completed_fence},
+              {"gpu_fence_healthy", recording->completed_healthy}, {"sdk_fg_enabled", session.context->enabled},
+              {"outer_enhanced_output_matches", true}});
+        }
+      }
+      std::cout << "XEFG_INLINE_NESTED stage=Upscaled wrappers=Cpp0>Cpp1 frames=" << completed_groups
+                << " sr_calls=2 nr_evals=2 source_owners=2 adaptive_levels=1 gpu_timers=1"
+                   " delivery=DELIVERED completed_groups=2 full_readbacks=2 fg=held_on evidence="
+                << (native_ngx ? "NATIVE_GPU+NATIVE_NGX+MOCK_XeFG" : "WARP+MOCK") << '\n';
+      std::cout << "XEFG_INLINE_NESTED_RECOVERY stage=Upscaled failed_inner_sr=1 recovered_own_sequence=1\n";
+    }
     run_xefg();
     if (native_ngx) {
       std::cout << "CASE path=XeFG-inline-handoff stage=" << stage_name
@@ -578,7 +823,9 @@ inline void Run(Gpu& gpu, Session& session, ID3D12Resource* back,
         {"sr_evidence", real_sr ? "NATIVE_NGX" : "MOCK"}, {"runtime", native::direct_runtime_requirements.file_version},
         {"driver_x100", native::direct_runtime_requirements.driver_x100}, {"runtime_sha256", native::direct_runtime_sha256},
         {"sdk_fg", {{"evidence", "MOCK_XeFG"}, {"on_samples", fg_on_samples}, {"off_samples", fg_off_samples}}},
-        {"phases", std::move(phases)}, {"external_game_recording_blocks", std::move(external_blocks)}};
+        {"phases", std::move(phases)}, {"external_game_recording_blocks", std::move(external_blocks)},
+        {"nested_sr_deliveries", std::move(nested_deliveries)}, {"nested_sr_failure", std::move(nested_sr_failure)},
+        {"nested_source_output", {{"status", "NotRun"}, {"reason", "SR RGBA16F and SDK RGBA8 backbuffer formats differ"}}}};
   }
 }
 }  // namespace xefg_inline_handoff_cases

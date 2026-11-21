@@ -221,13 +221,15 @@
       "fallback": "A genuinely pending handoff preserves the current game output and resumes on a later legal frame.",
       "sources": [
         ["present_path.hpp", "fg_service::Retire();"],
-        ["fg_native.hpp", "inline void RetireServiceStreamsLocked()"]
+        ["fg_native.hpp", "inline void RetireServiceStreamsLocked()"],
+        ["dlssnr.hpp", ", nullptr, NVSDK_NGX_SUCCEED(result));"],
+        ["dlssnr.hpp", "evaluate_chain.Injected(GetD3D12Resource(parameters, NVSDK_NGX_Parameter_Output))"]
       ],
       "cases": [
         { "suite": "fg-native", "name": "present-guide-models", "log": "present-guide-models",
           "receipt": "^PASS XeFG Present handoff providers=ordinary-image\\+Core real_guides\\+Optional-no-ID passes=2 Service_owned_pending\\+external_replayable public_disable_restore evidence=WARP\\+MOCK real_NGX=NOT_RUN$",
           "existingTrace": true,
-          "scenarios": ["upscaled", "render", "upscaled-empty-pool", "render-empty-pool", "upscaled-off-hold", "render-off-hold", "upscaled-reclaim", "render-reclaim"],
+          "scenarios": ["upscaled", "render", "upscaled-empty-pool", "render-empty-pool", "upscaled-off-hold", "render-off-hold", "upscaled-reclaim", "render-reclaim", "nested-delivery", "nested-failed-sr", "nested-source-first", "nested-source-next", "nested-recovery"],
           "expect": {
             "upscaled": "^XEFG_INLINE_HANDOFF stage=Upscaled fg=held_on sr=MOCK sr_wrapper=actual inline_nr_evals=2 inline_delivery_readback=2 xefg_nr_evals=2 xefg_delivery_readback=2 game_pending_and_replayable=1 evidence=WARP\\+MOCK$",
             "render": "^XEFG_INLINE_HANDOFF stage=Render fg=held_on sr=MOCK sr_wrapper=actual inline_nr_evals=2 inline_delivery_readback=2 xefg_nr_evals=2 xefg_delivery_readback=2 game_pending_and_replayable=0 evidence=WARP\\+MOCK$",
@@ -236,7 +238,12 @@
             "upscaled-off-hold": "^XEFG_INLINE_OFF_HOLD stage=Upscaled policy=0 replayable=retained$",
             "render-off-hold": "^XEFG_INLINE_OFF_HOLD stage=Render policy=0 replayable=retained$",
             "upscaled-reclaim": "^XEFG_INLINE_RECLAIM stage=Upscaled completed_owned=drained$",
-            "render-reclaim": "^XEFG_INLINE_RECLAIM stage=Render completed_owned=drained$"
+            "render-reclaim": "^XEFG_INLINE_RECLAIM stage=Render completed_owned=drained$",
+            "nested-delivery": "^XEFG_INLINE_NESTED stage=Upscaled wrappers=Cpp0>Cpp1 frames=2 sr_calls=2 nr_evals=2 source_owners=2 adaptive_levels=1 gpu_timers=1 delivery=DELIVERED completed_groups=2 full_readbacks=2 fg=held_on evidence=WARP\\+MOCK$",
+            "nested-failed-sr": "^XEFG_INLINE_NESTED_SR_FAILURE stage=Upscaled sr_calls=1 nr_evals=0 source_owners=1 new_completed=0 full_readback=unchanged evidence=WARP\\+MOCK$",
+            "nested-source-first": "^XEFG_INLINE_NESTED_SOURCE_OUTPUT frame=1 outer_enhanced=matched same_list_copy=1 output_registered=1 source_bound=1$",
+            "nested-source-next": "^XEFG_INLINE_NESTED_SOURCE_OUTPUT frame=2 outer_enhanced=matched same_list_copy=1 output_registered=1 source_bound=1$",
+            "nested-recovery": "^XEFG_INLINE_NESTED_RECOVERY stage=Upscaled failed_inner_sr=1 recovered_own_sequence=1$"
           } }
       ]
     }

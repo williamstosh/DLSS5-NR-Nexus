@@ -389,6 +389,41 @@ $phases = for ($i = 0; $i -lt $stages.Count; $i++) {
 }
 if ($handoff.sdk_fg.on_samples -lt $samples) { throw 'Native FG sample count does not cover the accepted phase frames.' }
 
+$nestedDeliveries = $handoff['nested_sr_deliveries']
+if ($nestedDeliveries -isnot [array] -or $nestedDeliveries.Count -ne 2) {
+    throw 'Native nested SR requires two actual delivered frames.'
+}
+$nestedAccepted = 0L
+$nestedCompleted = 0L
+foreach ($frame in $nestedDeliveries) {
+    if ($frame -isnot [Collections.IDictionary] -or $frame['delivery'] -cne 'DELIVERED' -or
+        $frame['accepted_evaluate_sequence'] -isnot [long] -or $frame.accepted_evaluate_sequence -le $nestedAccepted -or
+        $frame['completed_group_sequence'] -isnot [long] -or $frame.completed_group_sequence -le $nestedCompleted -or
+        $frame['readback_pixels'] -isnot [long] -or $frame.readback_pixels -le 0 -or
+        $frame['readback_fence_value'] -isnot [long] -or $frame.readback_fence_value -le 0 -or
+        $frame['readback_fence_completed'] -isnot [long] -or $frame.readback_fence_completed -lt $frame.readback_fence_value -or
+        $frame['gpu_fence_healthy'] -isnot [bool] -or -not $frame.gpu_fence_healthy -or
+        $frame['sdk_fg_enabled'] -isnot [bool] -or -not $frame.sdk_fg_enabled -or
+        $frame['outer_enhanced_output_matches'] -isnot [bool] -or -not $frame.outer_enhanced_output_matches) {
+        throw 'Native nested SR requires distinct accepted and completed sequences with healthy delivered readback and matching outer output.'
+    }
+    $nestedAccepted = $frame.accepted_evaluate_sequence
+    $nestedCompleted = $frame.completed_group_sequence
+}
+$nestedFailure = $handoff['nested_sr_failure']
+if ($nestedFailure -isnot [Collections.IDictionary] -or
+    $nestedFailure['evidence'] -cne 'NATIVE_GPU+MOCK_SR_FAILURE' -or
+    $nestedFailure['nr_evaluate_count'] -isnot [long] -or $nestedFailure.nr_evaluate_count -ne 0 -or
+    $nestedFailure['new_completed_groups'] -isnot [long] -or $nestedFailure.new_completed_groups -ne 0 -or
+    $nestedFailure['output_unchanged'] -isnot [bool] -or -not $nestedFailure.output_unchanged) {
+    throw 'Native nested SR failure must preserve output with zero NR Evaluate and zero new completed groups.'
+}
+$nestedSourceOutput = $handoff['nested_source_output']
+if ($nestedSourceOutput -isnot [Collections.IDictionary] -or $nestedSourceOutput['status'] -cne 'NotRun' -or
+    $nestedSourceOutput['reason'] -isnot [string] -or [string]::IsNullOrWhiteSpace($nestedSourceOutput.reason)) {
+    throw 'Native nested SourceOutput must remain NotRun with its reported format limitation.'
+}
+
 $costSource = Get-AssemblyFile $CostReport
 $cost = Read-AssemblyJson $costSource.path
 if ($cost['nr_sha256'] -ine $handoff['runtime_sha256'] -or $cost['host_sr'] -cne 'NATIVE_NGX') {
@@ -430,6 +465,7 @@ $offline = @{
     fgProvider='MockXeFG'; fgOnSamples=$handoff.sdk_fg.on_samples; fgOffSamples=$handoff.sdk_fg.off_samples
     phases=@($phases); executable=$native.files.executable; rawReport=$nativeReport; execution=$nativeExecution
     nativeBuild=$native.files; runtimeInputs=$runtimeManifest
+    nested_sr_deliveries=$nestedDeliveries; nested_sr_failure=$nestedFailure; nested_source_output=$nestedSourceOutput
 } + $binding
 if ($usedFrozenInput) { $offline['frozenNativeInput'] = $frozenInput }
 foreach ($key in $binding.Keys) {
