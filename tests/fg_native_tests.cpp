@@ -2183,10 +2183,16 @@ int main(int argc, char** argv) {
       gpu.Transition(composition_slot.color[i], D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
     }
     gpu.Submit();
+    const auto pair_funnel_before = native::CollectSessionFunnelInputs();
     native::fg_service::Record(&stream, &composition_slot, gpu.list.Get(), composition_input,
         owner.prefg_target, &composition_ready, &composition_recordings);
     Check(composition_ready && composition_recordings[0].model_invoked && composition_recordings[1].model_invoked,
           "direct input must actually prepare both NR outputs");
+    const auto pair_funnel_after = native::CollectSessionFunnelInputs();
+    Check(pair_funnel_after.eligible == pair_funnel_before.eligible + 2
+              && pair_funnel_after.injected == pair_funnel_before.injected + 2
+              && pair_funnel_after.unaccounted == pair_funnel_before.unaccounted,
+          "two private FG color roles account for two opportunities and two successes");
     Check(hudless_snapshot_copies == before_null_consumer, "XeFG null composition parameters skip snapshot with UI present");
     Check(staged_input_copies == before_direct_input, "full-frame XeFG still copies host input through output staging");
     for (uint32_t i = 0; i < 2; ++i) {
@@ -2229,6 +2235,7 @@ int main(int argc, char** argv) {
     composition_input.hudless = nullptr;
     const auto before_single_color = model_calls;
     const auto single_color_handle_begin = model_evaluated_handles.size();
+    const auto single_funnel_before = native::CollectSessionFunnelInputs();
     native::fg_service::Record(&stream, &composition_slot, gpu.list.Get(), composition_input,
         owner.prefg_target, &composition_ready, &composition_recordings);
     Check(composition_ready && composition_input.ui_mode == 0 && !composition_input.ui_composition
@@ -2240,6 +2247,11 @@ int main(int argc, char** argv) {
               && composition_recordings[1].model_evaluate_mask == 0u
               && composition_recordings[1].model_pass_mask == 0u && model_resets.back() == 0,
           "XeFG AUTO without UI composition and HUDLess runs one Backbuffer Evaluate at one Pass");
+    const auto single_funnel_after = native::CollectSessionFunnelInputs();
+    Check(single_funnel_after.eligible == single_funnel_before.eligible + 1
+              && single_funnel_after.injected == single_funnel_before.injected + 1
+              && single_funnel_after.unaccounted == single_funnel_before.unaccounted,
+          "single private FG color accounts for its own opportunity without hiding an earlier leak");
     gpu.Submit();
 
     {
@@ -5107,6 +5119,11 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool
       ordinary_target.workset_key = reinterpret_cast<const ID3D12Resource*>(&ordinary);
       ordinary_target.domain = addon::present_restore_scope::Domain::FINAL_PRESENT;
       native::SnapshotPresentRestoreConfiguration(&ordinary_target);
+      const auto named_terminals = [] {
+        auto count = native::SourceSuccessfulEvaluations();
+        for (const auto& decline : addon::nr_decline_counts) count += decline.load();
+        return count;
+      };
       const auto run_ordinary = [&](bool complete = true) {
         const auto calls_before = model_calls;
         const auto presents_before = ordinary.nr_presents;
@@ -5121,8 +5138,11 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool
                 contracts[1], width, height, 1.f, 0, false);
             auto& ring = native::present_ring;
             auto* slot = &ring.slots[(ring.submitted + 1) % native::kPresentRing];
+            const auto named_before = named_terminals();
             native::SubmitPresentGroup(gpu.queue.Get(), nullptr, slot, ordinary, block,
                 nullptr, ordinary_target, false, {});
+            Check(named_terminals() == named_before + 1,
+                "ordinary preparation, pending work and color execution each name exactly one terminal");
           }
           if (complete) {
             wait_present_fence(native::present_ring.fence, native::present_ring.submitted);

@@ -14432,6 +14432,7 @@ enum class NrModelPreparationState { READY, RECORDED, PENDING, FAILED };
 
 struct NrModelPreparationResult {
   NrModelPreparationState state = NrModelPreparationState::FAILED;
+  NrDeclineReason decline = NrDeclineReason::kCount;
   std::shared_ptr<submission::RecordingStatus> recording;
   std::vector<std::shared_ptr<submission::RecordingStatus>> recordings;
   uint32_t required_mask = 0;
@@ -18215,6 +18216,7 @@ inline bool PrepareNrModels(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Han
                             NrModelPreparationResult* result) {
   if (result == nullptr) return false;
   *result = {};
+  const NrPreparationDeclineScope decline_scope(&result->decline);
   const auto started_ns = SteadyNowNs();
   const PipelinePreparationScope pipeline_scope;
   const bool accepted = RecordInline(list, handle, parameters, nullptr, &target, nullptr, true, nullptr
@@ -23897,7 +23899,10 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
   // at the present (present_path.hpp).  When the present path cannot serve
   // (starved presents, an unusable swapchain) the after path below runs.
   if (fg::xefg::OwnsStream() || PresentTakesEvaluate()) {
-    if (!source_scope.owner && ObservesPresentBaseFrames()) return result;
+    if (!source_scope.owner && ObservesPresentBaseFrames()) {
+      CountNrDecline(NrDeclineReason::kNestedMirror);
+      return result;
+    }
     CapturePresentGuides(
         command_list, handle, parameters,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -24209,7 +24214,10 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
   // at the present (present_path.hpp).  When the present path cannot serve
   // (starved presents, an unusable swapchain) the after path below runs.
   if (fg::xefg::OwnsStream() || PresentTakesEvaluate()) {
-    if (!source_scope.owner && ObservesPresentBaseFrames()) return result;
+    if (!source_scope.owner && ObservesPresentBaseFrames()) {
+      CountNrDecline(NrDeclineReason::kNestedMirror);
+      return result;
+    }
     CapturePresentGuides(
         command_list, handle, parameters,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -26375,7 +26383,7 @@ static_assert(
     }(),
     "kSkipReasonText: a phrase for every eligible decline, none for an ineligible one");
 
-inline FunnelInputs CollectFunnelInputs() {
+inline FunnelInputs CollectSessionFunnelInputs() {
   FunnelInputs in;
   in.hooks_enabled = hooks_enabled.load(std::memory_order_relaxed);
   in.nr_enabled = enabled.load(std::memory_order_relaxed);
@@ -26481,6 +26489,11 @@ inline FunnelInputs CollectFunnelInputs() {
   // `present_starved` report a funnel leak of exactly one.
   named += evaluations_in_flight.load(std::memory_order_relaxed);
   in.unaccounted = in.eligible > named ? in.eligible - named : 0;
+  return in;
+}
+
+inline FunnelInputs CollectFunnelInputs() {
+  auto in = CollectSessionFunnelInputs();
   // FG mode reports this application's current handoff. A model evaluation
   // from an earlier frame, or a create-only recording, is not engagement.
   const bool xefg_active = fg::xefg::OwnsStream();
@@ -26887,15 +26900,18 @@ inline int64_t health_notice_shown_ns = 0;  // lifecycle tick only
 inline constexpr int64_t kHealthNoticeNs = 6'000'000'000LL;
 inline constexpr int64_t kHealthNoticeRepeatNs = 300'000'000'000LL;
 
-inline health::Sample CollectHealthSample(const NrVerdict& verdict) {
+inline health::Sample CollectHealthSample() {
   using health::Signal;
   const auto count = [](const std::atomic_uint64_t& counter) {
     return static_cast<double>(counter.load(std::memory_order_relaxed));
   };
+  // The ledger differences session counters. The card's current FG handoff
+  // is a one-frame result and cannot share that cumulative baseline.
+  const auto session = CollectSessionFunnelInputs();
   health::Sample sample;
-  sample[Signal::kNrFrames] = static_cast<double>(verdict.injected);
-  sample[Signal::kEligible] = static_cast<double>(verdict.eligible);
-  sample[Signal::kUnaccounted] = static_cast<double>(verdict.unaccounted);
+  sample[Signal::kNrFrames] = static_cast<double>(session.injected);
+  sample[Signal::kEligible] = static_cast<double>(session.eligible);
+  sample[Signal::kUnaccounted] = static_cast<double>(session.unaccounted);
   sample[Signal::kMotionChecked] = count(motion_checked_evaluates);
   sample[Signal::kMotionMissing] = count(motion_missing_evaluates);
   sample[Signal::kMotionMisfit] = count(motion_misfit_evaluates);
@@ -26950,7 +26966,7 @@ inline void EmitHealthSummary() {
 
 // Lifecycle tick (runtime_mutex).  `frame`: a real present; synthetic ticks
 // advance time only, so a starved stretch closes windows at 4 s, not per tick.
-inline void TickHealth(const NrVerdict& verdict, int64_t now_ns, bool frame) {
+inline void TickHealth(int64_t now_ns, bool frame) {
   static int64_t peers_read_ns = 0;
   if (now_ns - peers_read_ns >= 2'000'000'000LL) {
     peers_read_ns = now_ns;
@@ -26966,7 +26982,7 @@ inline void TickHealth(const NrVerdict& verdict, int64_t now_ns, bool frame) {
   const bool rates = on_since != 0 && now_ns - on_since >= kHealthWarmupNs;
   health::Event events[health::kRowCount];
   const size_t count =
-      health_ledger.Tick(CollectHealthSample(verdict), now_ns / 1e9, frame, rates, events,
+      health_ledger.Tick(CollectHealthSample(), now_ns / 1e9, frame, rates, events,
                          std::size(events));
   bool warned = false;
   for (size_t i = 0; i < count; ++i) {
@@ -28865,7 +28881,7 @@ inline void RunLifecycleTick(int64_t present_ns, bool from_present) {
       nr_on_since_ns.store(tick_ns, std::memory_order_relaxed);
     }
     // Before the card, which counts the issues it publishes.
-    TickHealth(verdict, tick_ns, present_ns != 0);
+    TickHealth(tick_ns, present_ns != 0);
     MaybeEmitStatusCard(verdict, tick_ns);
   }
   retirement_turn.reset();

@@ -171,7 +171,7 @@ inline constexpr int64_t kPresentGuideMaxAgeNs = 250'000'000;
 inline constexpr uint32_t kPresentLogCap = 16;
 
 inline std::atomic_uint64_t present_frames_seen{0};
-// v8.5.0-rc4: pre-FG's NR passes (RunPresentPreFg), each a unit of the
+// Pre-FG NR passes (RunPresentPreFg and fg_service::Record), each a unit of the
 // verdict's `seen` like an evaluate, ending in exactly one terminal
 // (ProcessInline's success or decline).  Every other unit of a pre-FG
 // session is ineligible - the presents (kPresentPreFg), the DLSS-G
@@ -3293,6 +3293,7 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     bridge::OwnedParameters& block, PresentGuideSet* guides, PresentTarget& target,
     bool neutral_model, const std::vector<std::pair<FenceRef, uint64_t>>& waits,
     PresentQueueOrder* base_order = nullptr) {
+  bool terminal_named = false;
   auto* const backbuffer = GetD3D12Resource(&block, NVSDK_NGX_Parameter_Output);
   const auto write_access = fg::xefg::QueryOrdinaryPresent(target.swapchain_identity,
       reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(backbuffer)), target.adaptive_output);
@@ -3317,6 +3318,7 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     fg::xefg::ObserveOrdinaryPresentSubmission(write_access,
         {.reason = "conflicting_output_recording", .recording = recording});
     CountNrDecline(NrDeclineReason::kPresentBusy);
+    terminal_named = true;
     return false;
   };
   if (!output_write_ordered(submission::RecordingIdentity(slot->list))) return false;
@@ -3344,6 +3346,7 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
   bool submitted = false;
   bool adaptive_delivered = false;
   NrRecording recording;
+  NrModelPreparationResult preparation;
   const auto execute_owned = [&](ID3D12CommandList* list) {
     struct CommitScope {
       PresentQueueOrder* previous;
@@ -3353,6 +3356,11 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     native_queue->ExecuteCommandLists(1, &list);
   };
   const auto cancel = [&](int*) {
+    if (!terminal_named) {
+      CountNrDecline(preparation.decline != NrDeclineReason::kCount ? preparation.decline
+          : preparation.state == NrModelPreparationState::PENDING || preparation.state == NrModelPreparationState::RECORDED
+              ? NrDeclineReason::kSlotWarmupMaturation : NrDeclineReason::kPresentBusy);
+    }
     if (target.adaptive_output && !adaptive_delivered && recording.adaptive_delivery.frame.session != nullptr) {
       ResolveAdaptiveDelivery(recording.adaptive_delivery, false);
     }
@@ -3380,13 +3388,13 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
   if (FAILED(slot->allocator->Reset())
       || FAILED(slot->list->Reset(slot->allocator, nullptr))) {
     CountNrDecline(NrDeclineReason::kPresentBusy);
+    terminal_named = true;
     LogPresent(reshade::log::level::error, "a present command list could not be reset");
     return false;
   }
   recording_started = true;
   submission::OnCommandListReset(slot->list);
   submission::SetRecordingOwner(slot->list, submission::RecordingOwner::kOrdinaryPresent);
-  NrModelPreparationResult preparation;
   const auto pending_preparation = [&] {
     // This attempt has no new creation or color work. The earlier preparation
     // owns its own submission proofs; a later output's ring value is unrelated.
@@ -3498,6 +3506,7 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     const int64_t started_ns = SteadyNowNs();
     const auto previous_capture_serial = screenshot::PendingModelCaptureSerial(slot->list);
     // From here ProcessInline names the terminal.
+    terminal_named = true;
     const bool accepted = ProcessInline(slot->list, handle, &block, &touched, &target, &recording);
     if (!mixed && !base_frame && !identified_frame && recording.output_ready) {
       PublishPresentRestoreOwner(target.domain, target.restore_decision.reason, target.restore_contract_compatible,

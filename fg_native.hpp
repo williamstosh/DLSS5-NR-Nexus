@@ -582,6 +582,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     // before this CPU-only gate, while no FeatureState references are held.
     auto decline = NrDeclineReason::kNrRuntimeUnavailable;
     if (!EnsureDirectRuntime(list, &decline, base.private_signed_runtime)) {
+      present_prefg_attempts.fetch_add(1, std::memory_order_relaxed);
       CountNrDecline(decline);
       return fg::Result::NOT_SERVED;
     }
@@ -789,6 +790,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     }
   }
   const auto pipeline_wait = [&](PipelinePreparationResult result) {
+    present_prefg_attempts.fetch_add(1, std::memory_order_relaxed);
     CountNrDecline(result == PipelinePreparationResult::PENDING
         ? NrDeclineReason::kSlotWarmupMaturation : NrDeclineReason::kFailureBackoff);
     slot->pipeline_pending = true;
@@ -1004,6 +1006,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
       };
       if (!unchanged()) {
         fg::xefg::PresentSubmissionFact preparation_fact{.reason = "model_preparation_slot_busy"};
+        NrDeclineReason preparation_decline = NrDeclineReason::kCount;
         const auto prepare = [&]() -> NrModelPreparationState {
           auto candidate = std::ranges::find_if(stream->slots, [&](const auto& available) {
             return &available != slot && !available.quarantined && available.fence_value == 0;
@@ -1023,8 +1026,9 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
           };
           std::unique_ptr<Slot, decltype(retire_recording)> retirement(&*candidate, retire_recording);
           NrModelPreparationResult preparation;
-          if (!PrepareNrModels(candidate->list, role.Handle(), &role.parameters, target, &preparation)
-              || preparation.state != NrModelPreparationState::RECORDED) {
+          const bool prepared = PrepareNrModels(candidate->list, role.Handle(), &role.parameters, target, &preparation);
+          preparation_decline = preparation.decline;
+          if (!prepared || preparation.state != NrModelPreparationState::RECORDED) {
             preparation_fact.reason = (preparation.state == NrModelPreparationState::FAILED
                 ? "model_preparation_failed" : "model_preparation_pending");
             if (preparation.recording != nullptr) {
@@ -1092,6 +1096,10 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
         };
         const auto preparation_state = prepare();
         if (preparation_state != NrModelPreparationState::READY) {
+          present_prefg_attempts.fetch_add(1, std::memory_order_relaxed);
+          CountNrDecline(preparation_decline != NrDeclineReason::kCount ? preparation_decline
+              : preparation_state == NrModelPreparationState::FAILED ? NrDeclineReason::kFailureBackoff
+                                                                     : NrDeclineReason::kSlotWarmupMaturation);
           slot->model_preparation_pending = true;
           fg::xefg::ObserveServiceHandoff(*service_scope, preparation_fact);
           restore_guides();
@@ -1113,6 +1121,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     role.real_guides = real_guides;
     bool touched = false;
     const EvaluateInFlightScope attempt(true);
+    present_prefg_attempts.fetch_add(1, std::memory_order_relaxed);
     const uint64_t previous_capture_serial = screenshot::PendingModelCaptureSerial(list);
     const bool accepted = ProcessInline(list, role.Handle(), &role.parameters, &touched, &target, &recording);
     if (recording.adaptive_delivery.frame.delivery != nullptr) {
@@ -1668,6 +1677,7 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     // private runtime before this frame adds uses to its open recording.
     auto decline = NrDeclineReason::kNrRuntimeUnavailable;
     if (!EnsureDirectRuntime(slot->list, &decline, true)) {
+      present_prefg_attempts.fetch_add(1, std::memory_order_relaxed);
       CountNrDecline(decline);
       observe(decline == NrDeclineReason::kRuntimeSwitchPending ? "runtime_switch_pending" : "runtime_unavailable");
       return stream.result;
