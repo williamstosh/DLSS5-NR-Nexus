@@ -1,4 +1,5 @@
 #define RESHADE_ADDON 1
+#define NR_NEXUS_TEST_NATIVE_SDK_CLOCK
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -423,7 +424,7 @@ void TestRouteDiagnostics(Gpu* gpu) {
     }
     session.context->interval_start = std::chrono::steady_clock::now() - std::chrono::seconds(6);
     interval_diagnostic.clear();
-    adapter::EndPresent(&present);
+    adapter::EndPresent(&present, S_OK);
     Check(interval_diagnostic.find(std::string("last_nr_route=") + route + " ") != std::string::npos,
           "last route must match successful role counts, not available inputs or earlier frames");
     Check(interval_diagnostic.find(std::string("last_nr_route_reason=") + reason + ";") != std::string::npos,
@@ -1154,9 +1155,10 @@ int main(int argc, char** argv) {
         Check(run_source() == S_OK, "SDK Present returns an On status from before the newer Disable");
         const auto fresh_off = xefg::QueryBridgeOff(receipt_source, output);
         Check(fresh_off.available && fresh_off.declaration != linked.declaration && !xefg::BlocksHostWrite(output)
-                  && !xefg::WithHostWritePermission(output, &linked, record_write)
-                  && xefg::WithHostWritePermission(output, &fresh_off, record_write) && host_writes == 3,
-            "an older On cannot revoke a newer Disable or authorize through the older proof");
+                  && fresh_off.write_epoch == linked.write_epoch
+                  && xefg::WithHostWritePermission(output, &linked, record_write)
+                  && xefg::WithHostWritePermission(output, &fresh_off, record_write) && host_writes == 4,
+            "an older On cannot revoke a newer Disable, and equivalent Off receipts preserve write permission");
 
         receipt_during_present_status = +[] {
           std::thread overlapping([] {
@@ -1177,14 +1179,15 @@ int main(int argc, char** argv) {
                   && !rate::Read(output, rate::NowNs()).available
                   && !xefg::QueryBridgeOff(receipt_source, output).available && xefg::BlocksHostWrite(output)
                   && !xefg::WithHostWritePermission(output, &fresh_off, record_write)
-                  && !xefg::WithHostWritePermission(output, nullptr, record_write) && host_writes == 3,
+                  && !xefg::WithHostWritePermission(output, nullptr, record_write) && host_writes == 4,
             "one current SDK On on a repeated ID immediately blocks both XeFG and same-output Native Off writes");
         receipt_present_status.enabled = 0;
         Check(run_source() == S_OK && xefg::BlocksHostWrite(output)
                   && !xefg::QueryBridgeOff(receipt_source, output).available,
             "a subsequent Off status cannot restore either write route");
         Check(Hooks::Enable(context_handle, 0) == 0 && !xefg::BlocksHostWrite(output)
-                  && xefg::QueryBridgeOff(receipt_source, output).available,
+                  && xefg::QueryBridgeOff(receipt_source, output).available
+                  && !xefg::WithHostWritePermission(output, &fresh_off, record_write) && host_writes == 4,
             "a new successful Disable restores the current source/output permission");
         source_swapchain->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
           Check(adapter::ProxyHooks<0>::Present(static_cast<IDXGISwapChain*>(receipt_proxy), interval, flags) == S_OK

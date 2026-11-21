@@ -378,6 +378,12 @@ void RunBorrowedWrapperClassification(Gpu& gpu) {
 }
 
 void RunBorrowedCore(Gpu& gpu, bool hardware, bool second_adapter) {
+  const auto discard_failed_create_recording = [&gpu] {
+    Check(SUCCEEDED(gpu.list->Close()) && SUCCEEDED(gpu.allocator->Reset())
+              && SUCCEEDED(gpu.list->Reset(gpu.allocator.Get(), nullptr)), "discard failed Create recording");
+    renodx::addons::dlss5::submission::OnCommandListReset(gpu.list.Get());
+    renodx::addons::dlss5::submission::PruneCompletedGenerations();
+  };
   Check(!addon::control_mask_use_core_context.load(), "Core diagnostic defaults off");
   const auto* published = addon::ngx_loader_published.load();
   addon::NgxLoaderSymbols symbols;
@@ -500,6 +506,12 @@ void RunBorrowedCore(Gpu& gpu, bool hardware, bool second_adapter) {
           "borrowed Core Create failure releases parameters without fallback/identity/Init");
   }
   Check(!addon::EnsureDirectRuntime(gpu.list.Get()), "ready Core cannot serve unscoped fallback");
+  Check(addon::TeardownProof() == renodx::addons::dlss5::submission::RecordedWork::kPending
+            && !addon::Shutdown(false) && addon::direct_device == gpu.device.Get()
+            && runtime_initializations == 0 && runtime_shutdowns == 0
+            && addon::get_module_filename_iat == nullptr,
+        "failed borrowed Create leaves an unsubmitted provider recording and prevents teardown");
+  discard_failed_create_recording();
   Check(addon::Shutdown(false) && addon::direct_device == nullptr
             && runtime_initializations == 0 && runtime_shutdowns == 0
             && addon::get_module_filename_iat == nullptr,
@@ -689,6 +701,7 @@ void RunBorrowedCore(Gpu& gpu, bool hardware, bool second_adapter) {
       fail_private_create = !fail_init;
       const auto core_creates = provider_core.creates;
       const auto creates = provider_signed.creates;
+      const auto shutdowns_before_failure = runtime_shutdowns;
       const bool initialized = addon::EnsureDirectRuntime(gpu.list.Get(), nullptr, true);
       if (fail_init) {
         Check(!initialized && !addon::EnsureDirectRuntime(gpu.list.Get())
@@ -710,9 +723,16 @@ void RunBorrowedCore(Gpu& gpu, bool hardware, bool second_adapter) {
             && rejected.slots[0].handle == nullptr && provider_signed.creates == creates + 1
             && provider_core.creates == core_creates && provider_signed.handles.empty(),
             "private signed Create failure destroys its OwnedParameters and does not call Core");
+        Check(addon::TeardownProof() == renodx::addons::dlss5::submission::RecordedWork::kPending
+                  && !addon::Shutdown(false) && provider_private_contexts.contains(device_id)
+                  && runtime_shutdowns == shutdowns_before_failure,
+              "failed private Create retains its initialized provider until its recording is discarded");
+        discard_failed_create_recording();
       }
       addon::direct_api.module = nullptr;
-      Check(addon::Shutdown(false), "failed private provider test cleanup");
+      Check(addon::Shutdown(false) && runtime_shutdowns == shutdowns_before_failure + (fail_init ? 0 : 1)
+                && !provider_private_contexts.contains(device_id) && provider_shared_shutdowns == 0,
+            "failed private provider test cleanup shuts down only the initialized private context");
     }
     configure_runtime();
     symbols.native_ready = false;
