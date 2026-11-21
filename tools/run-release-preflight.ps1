@@ -36,6 +36,50 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $repo = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repo 'tests/test-support.ps1')
+
+function Archive-NativeExecutable([string]$Directory) {
+    $Directory = [IO.Path]::GetFullPath($Directory)
+    $result = Get-Content -LiteralPath (Join-Path $Directory 'result.json') -Raw | ConvertFrom-Json -AsHashtable
+    $identity = $result['buildIdentity']
+    if ($result['build'] -cne 'passed' -or $result['run'] -cne 'passed' -or
+        $identity['mode'] -cne 'Off' -or $identity['executable'] -cne 'fg_native_tests.exe') {
+        throw 'Native NGX run has no completed ordinary EXE identity.'
+    }
+    $executable = Join-Path $Directory $identity.executable
+    if ((Get-FileHash -LiteralPath $executable).Hash -ine $identity.executableSha256) {
+        throw 'Native NGX EXE SHA-256 differs from its run result.'
+    }
+    $inputPath = Join-Path $Directory 'inputs.json'
+    if ((Get-FileHash -LiteralPath $inputPath).Hash -ine $identity['inputsSha256']) {
+        throw 'Native NGX input manifest SHA-256 differs from its build identity.'
+    }
+    $inputs = Get-Content -LiteralPath $inputPath -Raw | ConvertFrom-Json -AsHashtable -NoEnumerate
+    $detours = @($inputs | Where-Object { $_['path'] -is [string] -and $_.path -match '[\\/]Detours[\\/]lib\.X64[\\/]detours\.lib$' })
+    if ($detours.Count -ne 1 -or -not [IO.Path]::IsPathFullyQualified($detours[0].path) -or
+        $detours[0]['sha256'] -isnot [string] -or $detours[0].sha256 -notmatch '\A[0-9a-f]{64}\z') {
+        throw 'Native NGX inputs must identify one actual Detours link library.'
+    }
+    $linkInput = $detours[0]
+    if ((Get-FileHash -LiteralPath $linkInput.path).Hash -ine $linkInput.sha256) {
+        throw 'Native NGX Detours SHA-256 differs from its actual build input.'
+    }
+    $archive = Join-Path $Directory 'inputs/fg_native_tests.exe'
+    $frozenLibrary = Join-Path $Directory 'inputs/detours.lib'
+    $manifestPath = Join-Path $Directory 'inputs/detours-manifest.json'
+    Assert-TestArtifactPath $archive
+    [void][IO.Directory]::CreateDirectory((Split-Path $archive -Parent))
+    [IO.File]::Copy($linkInput.path, $frozenLibrary)
+    $frozenHash = (Get-FileHash -LiteralPath $frozenLibrary).Hash
+    if ($frozenHash -ine $linkInput.sha256) { throw 'Archived native Detours SHA-256 differs from its actual build input.' }
+    [IO.File]::Move($executable, $archive)
+    @{path=$linkInput.path; sha256=$linkInput.sha256; frozenPath=$frozenLibrary; frozenSha256=$frozenHash} |
+        ConvertTo-Json | Set-Content -LiteralPath $manifestPath -Encoding utf8
+    return @{
+        executable=@{path=$archive; sha256=$identity.executableSha256}
+        frozenInputsManifest=@{path=$manifestPath; sha256=(Get-FileHash -LiteralPath $manifestPath).Hash}
+    }
+}
+
 $OutputDirectory = Initialize-TestOutput $OutputDirectory
 $source = (& git --no-optional-locks -C $repo rev-parse HEAD).Trim()
 $previousCl = $env:CL
@@ -362,21 +406,9 @@ try {
                     }
                     $record.reportSha256 = (Get-FileHash -LiteralPath $record.report).Hash
                     $caseDirectory = Join-Path $record.output 'fg-native'
-                    $result = Get-Content -LiteralPath (Join-Path $caseDirectory 'result.json') -Raw | ConvertFrom-Json -AsHashtable
-                    $identity = $result['buildIdentity']
-                    if ($result['build'] -cne 'passed' -or $result['run'] -cne 'passed' -or
-                        $identity['mode'] -cne 'Off' -or $identity['executable'] -cne 'fg_native_tests.exe') {
-                        throw 'Native NGX run has no completed ordinary EXE identity.'
-                    }
-                    $executable = Join-Path $caseDirectory $identity.executable
-                    if ((Get-FileHash -LiteralPath $executable).Hash -ine $identity.executableSha256) {
-                        throw 'Native NGX EXE SHA-256 differs from its run result.'
-                    }
-                    $archive = Join-Path $caseDirectory 'inputs/fg_native_tests.exe'
-                    Assert-TestArtifactPath $archive
-                    [void][IO.Directory]::CreateDirectory((Split-Path $archive -Parent))
-                    [IO.File]::Move($executable, $archive)
-                    $record.executable = @{path=$archive; sha256=$identity.executableSha256}
+                    $archive = Archive-NativeExecutable $caseDirectory
+                    $record.executable = $archive.executable
+                    $record.frozenInputsManifest = $archive.frozenInputsManifest
                     $record.status = 'Passed'
                     [void]$record.Remove('reason')
                 } catch {

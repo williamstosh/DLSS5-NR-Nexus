@@ -132,6 +132,55 @@ function Test-CandidateAssemblyContracts($Fixture, $ExeBytes, $DifferentBytes, $
     Set-CandidateAssemblyFixtureArguments $costFixture ($costFixture.arguments.Replace('/O2', '/Od'))
     $costBuild = Read-AssemblyBuild $costDirectory
     Assert-CandidateAssemblyRejected { & $compare } 'normalized commands'
+
+    $preflight = [Management.Automation.Language.Parser]::ParseFile(
+        (Join-Path $repo 'tools/run-release-preflight.ps1'), [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count) { throw $parseErrors[0] }
+    $archiveFunction = $preflight.Find({param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Archive-NativeExecutable'
+    }, $false)
+    if (-not $archiveFunction) { throw 'Missing native input archive entry.' }
+    . ([scriptblock]::Create($archiveFunction.Extent.Text))
+    $library = Join-Path $Fixture 'Detours/lib.X64/detours.lib'
+    [void][IO.Directory]::CreateDirectory((Split-Path $library -Parent))
+    Set-Content -LiteralPath $library -Value 'synthetic original Detours bytes' -Encoding utf8
+    $linkInput = New-CandidateFixtureReference $library
+    $inputPath = Join-Path $costDirectory 'inputs.json'
+    $recordedInputs = Read-AssemblyJson $inputPath
+    Write-CandidateFixtureJson $inputPath (@($recordedInputs) + @($linkInput))
+    $costFixture.result.buildIdentity.inputsSha256 = (Get-FileHash -LiteralPath $inputPath).Hash
+    Write-CandidateFixtureJson $costFixture.resultPath $costFixture.result
+    Set-Content -LiteralPath $library -Value 'overwritten before archival' -Encoding utf8
+    Assert-CandidateAssemblyRejected { Archive-NativeExecutable $costDirectory } 'Detours SHA-256 differs'
+    Set-Content -LiteralPath $library -Value 'synthetic original Detours bytes' -Encoding utf8
+    $archived = Archive-NativeExecutable $costDirectory
+    $FrozenInputsManifest = Get-CandidateEvidencePath $archived.frozenInputsManifest $costDirectory 'Native archive manifest'
+    $manifest = Read-AssemblyJson $FrozenInputsManifest
+    if ($manifest.path -ine $library -or $manifest.sha256 -ine $linkInput.sha256 -or
+        $manifest.frozenSha256 -ine $linkInput.sha256 -or
+        (Get-FileHash -LiteralPath $manifest.frozenPath).Hash -ine $linkInput.sha256) {
+        throw 'Archived Detours bytes must match the actual compiler input SHA-256.'
+    }
+    $archivedBuild = Read-AssemblyBuild $costDirectory
+    if ($archivedBuild.files.executable.sha256 -ine $archived.executable.sha256) {
+        throw 'Detours archival must retain the original EXE identity.'
+    }
+    $statements = @($assembler.EndBlock.Statements)
+    $start = 0
+    while ($start -lt $statements.Count -and $statements[$start].Extent.Text -cne '$frozenInput = $null') { $start++ }
+    $end = $start
+    while ($end -lt $statements.Count -and -not $statements[$end].Extent.Text.StartsWith('$trackedChanges =')) { $end++ }
+    if ($start -eq $statements.Count -or $end -eq $statements.Count) { throw 'Missing frozen native input validation.' }
+    $frozenChecks = [scriptblock]::Create(($statements[$start..($end - 1)].Extent.Text -join "`n"))
+    Set-Content -LiteralPath $library -Value 'overwritten by a later build' -Encoding utf8
+    $nativeHashes = $archivedBuild.inputHashes
+    . $frozenChecks
+    if (-not $usedFrozenInput -or $frozenInput.sha256 -ine $linkInput.sha256) {
+        throw 'The exact Detours archive must remain usable after the shared source is overwritten.'
+    }
+    Set-Content -LiteralPath $manifest.frozenPath -Value 'incorrect archived bytes' -Encoding utf8
+    Assert-CandidateAssemblyRejected { & $frozenChecks } 'Frozen native input SHA-256 mismatch'
+    Write-Output 'PASS native link input CPU_SYNTHETIC: exact Detours archive survives source overwrite and rejects wrong bytes.'
 }
 
 function Test-CandidateNestedSrContracts {
