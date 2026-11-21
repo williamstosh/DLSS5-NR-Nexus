@@ -2145,13 +2145,20 @@ int main(int argc, char** argv) {
           return 0;
         };
         Check(present() == S_OK, "the proxy reports its first SDK sample with FG enabled");
+        const auto revoked_off = xefg::QueryBridgeOff(receipt_source, resized_output);
+        Check(!revoked_off.available && revoked_off.output_identity == resized_output
+                  && std::strcmp(revoked_off.reason, "sdk_present_enabled") == 0
+                  && xefg::BlocksHostWrite(resized_output),
+            "the first current SDK On sample revokes Disable and blocks writes to the same output");
         const auto enabled_window = warm_sdk_window();
         Check(enabled_window.available && !enabled_window.fg_off && enabled_window.output == resized_output
-                  && xefg::QueryBridgeOff(receipt_source).available,
-            "the complete FG On SDK window conflicts with the matching Disable receipt");
+                  && !xefg::QueryBridgeOff(receipt_source, resized_output).available,
+            "the complete FG On SDK window cannot restore the revoked Disable receipt");
         frame();
-        check_unavailable_window(resized_output,
-            "Bridge keeps the output identity and preparation while rejecting an SDK window reporting FG On");
+        const auto& enabled_status = native::features.at(handle).adaptive_session->status;
+        Check(framerate::IsCurrentOutput(resized_output) && enabled_status.display_output_generation == 0
+                  && enabled_status.output_fps == 0.,
+            "Bridge cannot use the SDK window for adaptation after the matching Disable is revoked");
         std::cout << "PASS Bridge Adaptive XeFG Off output ownership, resize and failure revocation dev=" << dev << '\n';
         output.Swap(unassociated_output);
         parameters.Set(NVSDK_NGX_Parameter_Output, static_cast<ID3D11Resource*>(output.Get()));
