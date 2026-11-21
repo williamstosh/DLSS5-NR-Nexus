@@ -749,14 +749,16 @@ int Run() {
       const auto recover = [&](bool next_base = false) {
         const auto limit = (next_base ? 1u : native::kContractDebounceFrames + 12);
         for (uint32_t attempt = 0; attempt < limit; ++attempt) {
-          const auto before_products = stream.base_frame_clock.outputs;
-          const auto before_epoch = stream.epoch;
+          const auto before = native::fg_service::streams.find({false, context});
+          const auto before_products = (before != native::fg_service::streams.end() ? before->second.base_frame_clock.outputs : 0);
+          const auto before_epoch = (before != native::fg_service::streams.end() ? before->second.epoch : 0);
           const auto observed = frame(false);
           Check(observed.reuses == 0, "interrupted XeFG source cannot reuse before a fresh model output");
           if (observed.result == fg::Result::SUBMITTED && observed.evaluates == 1) {
-            const auto expected_outputs = (stream.epoch == before_epoch ? before_products + 1 : 1);
-            Check(observed.reset == 1
-                      && (pq || (stream.base_frame_clock.complete && stream.base_frame_clock.outputs == expected_outputs)),
+            const auto& recovered = native::fg_service::streams.at({false, context});
+            const auto expected_outputs = (recovered.epoch == before_epoch ? before_products + 1 : 1);
+            Check(observed.reset == 1 && recovered.epoch == session.context->epoch
+                      && (pq || (recovered.base_frame_clock.complete && recovered.base_frame_clock.outputs == expected_outputs)),
                   "XeFG recovery sends Reset on its first actual model refresh and publishes a complete product");
             return;
           }
@@ -985,13 +987,16 @@ int Run() {
 
         native::direct_api.evaluate = nr_edit_reuse_gpu_cases::NeutralModel;
 
-        const auto single_role = stream.base_frame_clock.frame;
-        const auto before_missing_role = stream.base_frame_clock.outputs;
+        const auto single_role = native::fg_service::streams.at({false, context}).base_frame_clock.frame;
         Check(Hooks::UiState(session.handle, 1) == 0 && session.context->epoch != single_role.generation,
               "real XeFG UI composition state changes the required color-role contract and its source epoch");
         const auto missing_role = frame(false);
+        const auto missing_stream = native::fg_service::streams.find({false, context});
+        const bool no_new_product = missing_stream == native::fg_service::streams.end()
+            || (missing_stream->second.epoch == session.context->epoch && !missing_stream->second.base_frame_clock.complete
+                && missing_stream->second.base_frame_clock.outputs == 0);
         Check(missing_role.result != fg::Result::SUBMITTED && missing_role.evaluates == 0 && missing_role.reuses == 0
-                  && stream.base_frame_clock.outputs == before_missing_role && source_matches(missing_role.pixels),
+                  && no_new_product && source_matches(missing_role.pixels),
               "a submitted BB from the previous single-color contract cannot serve the missing required HUDLess role");
 
         auto hudless = gpu.Texture(width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
@@ -1000,28 +1005,33 @@ int Run() {
         bool dual_ready = false;
         for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 12; ++attempt) {
           const auto dual = frame(false, true, Change::NONE, hudless.Get());
+          const auto& current_stream = native::fg_service::streams.at({false, context});
+          Check(current_stream.epoch == session.context->epoch, "dual-role observations belong to the current SDK epoch");
           if (dual.result == fg::Result::SUBMITTED) {
-            const auto& clock = stream.base_frame_clock;
+            const auto& clock = current_stream.base_frame_clock;
             Check(dual.evaluates == 2 && model_resets[model_resets.size() - 2] == 1 && dual.reset == 1
                       && dual.reuses == 0 && clock.complete && clock.frame.roles == 3
                       && clock.frame.generation == session.context->epoch && clock.frame.generation != single_role.generation
-                      && stream.last_output_frame[0] == clock.frame.sequence && stream.last_output_frame[1] == clock.frame.sequence,
+                      && current_stream.last_output_frame[0] == clock.frame.sequence && current_stream.last_output_frame[1] == clock.frame.sequence,
                   "supplying the required HUDLess causes real execution and complete ordered delivery of both roles");
             dual_ready = true;
             break;
           }
-          Check(!stream.base_frame_clock.complete && source_matches(dual.pixels),
+          Check(!current_stream.base_frame_clock.complete && source_matches(dual.pixels),
                 "preparing the new color plan cannot publish a partial group or change the original BB");
         }
         Check(dual_ready, "dual-role XeFG finishes preparing its real model slots");
-        const auto dual_products = stream.base_frame_clock.outputs;
+        // UiState retired the old node. This epoch's reference is used only
+        // until the next UiState below; recovery queries the map again.
+        auto& dual_stream = native::fg_service::streams.at({false, context});
+        const auto dual_products = dual_stream.base_frame_clock.outputs;
         const auto dual_gap = frame(false);
         Check(dual_gap.result != fg::Result::SUBMITTED && dual_gap.evaluates == 0
-                  && stream.base_frame_clock.outputs == dual_products && source_matches(dual_gap.pixels),
+                  && dual_stream.base_frame_clock.outputs == dual_products && source_matches(dual_gap.pixels),
               "missing a required role on an already mature dual-color chain cannot produce a partial group");
         const auto repaired = frame(false, true, Change::NONE, hudless.Get());
         Check(repaired.result == fg::Result::SUBMITTED && repaired.evaluates == 2 && repaired.reset == 1
-                  && stream.base_frame_clock.complete && stream.base_frame_clock.outputs == dual_products + 1,
+                  && dual_stream.base_frame_clock.complete && dual_stream.base_frame_clock.outputs == dual_products + 1,
               "restoring the required HUDLess on the next legal frame refreshes and submits both roles");
 
         auto ui = gpu.Texture(width, height, DXGI_FORMAT_R8G8B8A8_UNORM);
@@ -1029,15 +1039,15 @@ int Run() {
                D3D12_RESOURCE_STATE_COMMON, width * 4);
         gpu.Submit();
         const auto hudless_before = read_output(hudless.Get());
-        const auto before_composition = stream.base_frame_clock.outputs;
-        const auto before_compose_submit = stream.submitted;
+        const auto before_composition = dual_stream.base_frame_clock.outputs;
+        const auto before_compose_submit = dual_stream.submitted;
         const auto before_compose_history = native::game_window.frames;
         const auto before_composed_frames = session.context->interval_nr_composed_frames.load();
         native::direct_api.evaluate = EvaluatePresentEdit;
         std::vector<uint8_t> sdk_bb, sdk_hudless;
         consume_sdk_present = [&](IDXGISwapChain*) {
           ComPtr<ID3D12Resource> backbuffer;
-          Check(stream.submitted == before_compose_submit + 1
+          Check(dual_stream.submitted == before_compose_submit + 1
                     && SUCCEEDED(session.proxy->GetBuffer(session.proxy->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&backbuffer))),
                 "original SDK Present receives the composed group after private submission");
           sdk_bb = read_output(backbuffer.Get());
@@ -1049,13 +1059,13 @@ int Run() {
                   && native::game_window.frames == before_compose_history + 1
                   && sdk_bb == composed.pixels && !source_matches(sdk_bb) && sdk_hudless != hudless_before,
               "mode 3 uses one HUDLess model and hands the real SDK both ordered edited colors");
-        const auto composed_clock = PresentClockState(stream.base_frame_clock);
+        const auto composed_clock = PresentClockState(dual_stream.base_frame_clock);
         const auto composed_calls = model_calls;
         const auto composed_hudless = sdk_hudless;
         session.Present(present_id);
         consume_sdk_present = {};
-        composed_group_published = stream.base_frame_clock.complete && stream.base_frame_clock.frame.roles == 3
-            && stream.base_frame_clock.outputs == before_composition + 1 && PresentClockState(stream.base_frame_clock) == composed_clock
+        composed_group_published = dual_stream.base_frame_clock.complete && dual_stream.base_frame_clock.frame.roles == 3
+            && dual_stream.base_frame_clock.outputs == before_composition + 1 && PresentClockState(dual_stream.base_frame_clock) == composed_clock
             && model_calls == composed_calls && native::game_window.frames == before_compose_history + 1
             && sdk_bb == composed.pixels && sdk_hudless == composed_hudless;
         std::cout << "XEFG_COMPOSED_GROUP complete=" << composed_group_published << " calls=" << composed.evaluates
@@ -1065,7 +1075,8 @@ int Run() {
         Check(Hooks::UiState(session.handle, 0) == 0, "return to the original XeFG single BB role");
         recover();
       }
-      auto final_anchor = native::features.at(owner).slots[0].edit_reuse;
+      const auto final_owner = native::fg_service::streams.at({false, context}).roles[0].Handle();
+      auto final_anchor = native::features.at(final_owner).slots[0].edit_reuse;
       Check(final_anchor != nullptr, "recovered XeFG source owns a new edit cache");
       std::weak_ptr<addon::edit_reuse::State> retired_anchor = final_anchor;
       final_anchor.reset();
@@ -1074,7 +1085,7 @@ int Run() {
       gpu.Submit();
       native::PruneCompletedSubmissionUses();
       native::DrainRetiredResources(true);
-      Check(!native::fg_service::streams.contains({false, context}) && !native::features.contains(owner)
+      Check(!native::fg_service::streams.contains({false, context}) && !native::features.contains(final_owner)
                 && retired_anchor.expired(), "XeFG source retirement releases the cache after owned recordings and Fence completion");
     }
     Check(sdk_failure_recovered && composed_group_published,
