@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
+#include <exception>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -49,6 +50,18 @@
 #endif
 
 namespace renodx::addons::dlss5::fg::xefg {
+
+struct PresentSubmissionFact {
+  const char* reason = "unobserved";
+  std::pair<uint64_t, uint64_t> recording;
+  uintptr_t queue = 0;
+  uintptr_t fence = 0;
+  uint64_t fence_value = 0;
+  uint64_t completed_value = 0;
+  bool signaled = false;
+};
+using OrdinarySubmissionFact = PresentSubmissionFact;
+using PrepareRuntime = void (*)(ID3D12Device*) noexcept;
 
 struct BridgeSourceIdentity {
   uintptr_t device11 = 0;
@@ -228,13 +241,19 @@ static_assert(sizeof(Init) == 72 && offsetof(Init, ui_mode) == 64);
 
 namespace internal {
 inline std::atomic<Retire> retire{nullptr};
+inline std::atomic<PrepareRuntime> prepare_runtime{nullptr};
 }  // namespace internal
 
 // Call only after SDK/configuration locks are released. The owner may already
 // hold runtime_mutex; maintenance neither enters NGX nor waits for its turn.
-inline void ReconcileNrService() noexcept {
+inline void ReconcileNrService(ID3D12Device* prepare_device = nullptr) noexcept {
   if (const auto callback = internal::retire.load(std::memory_order_acquire); callback != nullptr) {
     callback();
+  }
+  if (prepare_device != nullptr) {
+    if (const auto prepare = internal::prepare_runtime.load(std::memory_order_acquire); prepare != nullptr) {
+      prepare(prepare_device);
+    }
   }
 }
 
@@ -334,6 +353,36 @@ struct ContractTrace {
     return emit;
   }
 };
+struct PresentHandoff {
+  output_framerate::OutputIdentity output;
+  uintptr_t context = 0;
+  uintptr_t context_identity = 0;
+  uint64_t epoch = 0;
+  uint64_t application_frame = 0;
+  uint64_t call = 0;
+  uint64_t declaration = 0;
+  uintptr_t backbuffer = 0;
+  uintptr_t hudless = 0;
+  int64_t sdk_return_ns = 0;
+  uint32_t present_id = 0;
+  const char* reason = "unobserved";
+  Result service_result = Result::NOT_SERVED;
+  HRESULT sdk_result = E_FAIL;
+  int32_t status_result = 0;
+  uint32_t status_enabled = 0;
+  bool sdk_enabled_at_entry = false;
+  bool has_present_id = false;
+  bool has_guides = false;
+  bool color_executed = false;
+  bool ordinary_executed = false;
+  bool owner_current_at_return = false;
+  bool status_queried = false;
+  bool status_current = false;
+  bool sdk_result_available = false;
+  PresentSubmissionFact service_submission;
+  OrdinarySubmissionFact ordinary_submission;
+};
+
 struct Context {
   ComPtr<ID3D12CommandQueue> queue;
   ComPtr<ID3D12Device> device;
@@ -387,6 +436,20 @@ struct Context {
   output_framerate::OutputIdentity output_identity;
   uintptr_t application_swapchain_identity = 0;
   uint64_t present_serial = 0;
+  uint64_t color_serial = 0;
+  uint64_t color_submitted_frame = 0;
+  uint64_t color_submitted_epoch = 0;
+  struct PresentColors {
+    uintptr_t backbuffer = 0;
+    uintptr_t hudless = 0;
+    bool xefg_owned = false;
+    bool ordinary_committed = false;
+    OrdinarySubmissionFact ordinary_submission;
+  };
+  std::map<uint64_t, PresentColors> present_colors;
+  std::array<uintptr_t, 16> backbuffers{};
+  uint32_t handoff_frames_left = 0;
+  PresentHandoff last_handoff_write;
   uint64_t status_ambiguous_through = 0;
   uint32_t presents_in_flight = 0;
   bool omit_optional_hudless = false;
@@ -551,6 +614,44 @@ inline void LogDiagnostic(const char* message) noexcept {
   if (function == nullptr) return;
   function(reshade::internal::get_current_module_handle(), static_cast<int>(reshade::log::level::info), message);
 #endif
+}
+
+inline void LogHandoff(const char* event, const PresentHandoff& fact) noexcept {
+  char message[1536];
+  std::snprintf(message, sizeof(message),
+      "DLSS5 XeFG present_handoff event=%s context=%llx context_identity=%llx output=%llx output_view=%llx output_generation=%llu "
+      "epoch=%llu call=%llu declaration=%llu application_frame=%llu bb=%llx hudless=%llx subresource=0 "
+      "sdk_enabled_at_entry=%u present_id=%u fresh_id=%u guides=%u reason=%s service_result=%u "
+      "xefg_execute=%u ordinary_execute=%u fence_value=%llu sdk_return_ns=%lld sdk_hresult=0x%08x "
+      "sdk_result_available=%u owner_current_at_return=%u status_queried=%u status_current=%u status_result=%d status_enabled=%u "
+      "xefg[list=%llu generation=%llu queue=%llx fence=%llx completed=%llu signaled=%u] "
+      "ordinary[reason=%s list=%llu generation=%llu queue=%llx fence=%llx value=%llu completed=%llu signaled=%u]",
+      event, static_cast<unsigned long long>(fact.context), static_cast<unsigned long long>(fact.context_identity),
+      static_cast<unsigned long long>(fact.output.swapchain),
+      static_cast<unsigned long long>(fact.output.view), static_cast<unsigned long long>(fact.output.generation),
+      static_cast<unsigned long long>(fact.epoch), static_cast<unsigned long long>(fact.call),
+      static_cast<unsigned long long>(fact.declaration), static_cast<unsigned long long>(fact.application_frame),
+      static_cast<unsigned long long>(fact.backbuffer), static_cast<unsigned long long>(fact.hudless),
+      static_cast<unsigned>(fact.sdk_enabled_at_entry), fact.present_id, static_cast<unsigned>(fact.has_present_id),
+      static_cast<unsigned>(fact.has_guides), fact.reason, static_cast<unsigned>(fact.service_result),
+      static_cast<unsigned>(fact.color_executed), static_cast<unsigned>(fact.ordinary_executed),
+      static_cast<unsigned long long>(fact.service_submission.fence_value), static_cast<long long>(fact.sdk_return_ns),
+      static_cast<unsigned>(fact.sdk_result), static_cast<unsigned>(fact.sdk_result_available),
+      static_cast<unsigned>(fact.owner_current_at_return),
+      static_cast<unsigned>(fact.status_queried), static_cast<unsigned>(fact.status_current),
+      fact.status_result, fact.status_enabled,
+      static_cast<unsigned long long>(fact.service_submission.recording.first),
+      static_cast<unsigned long long>(fact.service_submission.recording.second),
+      static_cast<unsigned long long>(fact.service_submission.queue), static_cast<unsigned long long>(fact.service_submission.fence),
+      static_cast<unsigned long long>(fact.service_submission.completed_value),
+      static_cast<unsigned>(fact.service_submission.signaled), fact.ordinary_submission.reason,
+      static_cast<unsigned long long>(fact.ordinary_submission.recording.first),
+      static_cast<unsigned long long>(fact.ordinary_submission.recording.second),
+      static_cast<unsigned long long>(fact.ordinary_submission.queue), static_cast<unsigned long long>(fact.ordinary_submission.fence),
+      static_cast<unsigned long long>(fact.ordinary_submission.fence_value),
+      static_cast<unsigned long long>(fact.ordinary_submission.completed_value),
+      static_cast<unsigned>(fact.ordinary_submission.signaled));
+  LogDiagnostic(message);
 }
 
 inline void TraceResourceContract(void* handle, ID3D12CommandList* list, uint32_t id,
@@ -927,7 +1028,7 @@ inline void Initialize(void* handle, ID3D12CommandQueue* queue, const abi::Init*
     output_framerate::ReleaseXeFGOutput(it->second->output_identity);
     state.retired_contexts.push_back(it->second);
   }
-  state.contexts[handle] = std::move(context);
+  state.contexts[handle] = context;
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
   xefg_present_probe::Observe([&] {
     const auto& registered = state.contexts.at(handle);
@@ -936,7 +1037,7 @@ inline void Initialize(void* handle, ID3D12CommandQueue* queue, const abi::Init*
   });
 #endif
   lock.unlock();
-  ReconcileNrService();
+  ReconcileNrService(context->device.Get());
 #if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
   if (probe_sdk_slot < 2) {
     // The actual Init hook owns the opaque-handle lifecycle turn. This export
@@ -1508,6 +1609,11 @@ struct PresentFrame {
   FrameInput input;
   uintptr_t proxy_identity = 0;
   uint64_t serial = 0;
+  uint64_t declaration = 0;
+  bool color_executed = false;
+  PresentSubmissionFact service_submission;
+  const char* handoff_reason = "fg_off";
+  bool trace_handoff = false;
   BridgeLinkVersion bridge_link;
   bool test_present = false;
   bool completed = false;
@@ -1527,6 +1633,23 @@ struct PresentFrame {
 
 inline thread_local PresentFrame* recording_service = nullptr;
 
+inline bool PresentOwnerCurrentLocked(const PresentFrame& present) {
+  const auto it = state.contexts.find(reinterpret_cast<void*>(present.input.context));
+  return it != state.contexts.end() && it->second == present.context
+      && present.context->epoch == present.input.epoch && present.context->proxy_identity == present.proxy_identity
+      && present.context->output_identity == present.input.output && UniqueProxyLocked(present.proxy_identity)
+      && (!present.input.output || output_framerate::IsCurrentOutput(present.input.output));
+}
+
+inline bool PresentWriteCurrentLocked(const PresentFrame& present) {
+  const auto& context = *present.context;
+  return present.service_eligible && PresentOwnerCurrentLocked(present)
+      && context.enabled && context.bridge_enable_inflight == 0 && !context.bridge_enable_ambiguous
+      && context.bridge_declaration == present.declaration && context.color_serial == present.serial
+      && context.application_frame == present.input.application_frame
+      && !stopped.load(std::memory_order_acquire) && sdk_detours_enabled.load(std::memory_order_acquire);
+}
+
 #if defined(NR_NEXUS_DEV_CONTROL)
 inline void ObserveEditPresent(PresentFrame* present, IDXGISwapChain* swapchain,
                                uint32_t method, UINT interval, UINT flags) {
@@ -1542,13 +1665,9 @@ inline void ObserveEditPresent(PresentFrame* present, IDXGISwapChain* swapchain,
     std::shared_lock lock(state.mutex);
     observation.generation = present->context->fg_environment_generation;
   }
-  // BackbufferRegion carries coordinates, not a resource. Observe the actual
-  // current proxy buffer separately, without recording any GPU commands.
-  ComPtr<IDXGISwapChain3> swapchain3;
-  ComPtr<ID3D12Resource> backbuffer;
-  if (SUCCEEDED(swapchain->QueryInterface(IID_PPV_ARGS(&swapchain3)))
-      && SUCCEEDED(swapchain3->GetBuffer(swapchain3->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&backbuffer)))) {
-    observation.backbuffer = edit_fg_observation::ObserveResource(backbuffer.Get());
+  // BackbufferRegion carries coordinates. Use the resource selected by this call.
+  if (present->backbuffer != nullptr) {
+    observation.backbuffer = edit_fg_observation::ObserveResource(present->backbuffer.Get());
   }
   present->edit_fg_ticket = edit_fg_observation::Record(generation,
       {.kind = edit_fg_observation::Kind::XEFG_PRESENT_ENTRY, .xefg_present = observation});
@@ -1558,6 +1677,17 @@ inline void ObserveEditPresent(PresentFrame* present, IDXGISwapChain* swapchain,
 inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
   PresentFrame present;
   if (proxy_depth != 0 || stopped.load(std::memory_order_acquire)) return present;
+  const auto exception_count = std::uncaught_exceptions();
+  const auto abandon_call = [&](PresentFrame*) {
+    if (std::uncaught_exceptions() == exception_count || present.context == nullptr) return;
+    std::unique_lock lock(state.mutex);
+    --present.context->presents_in_flight;
+    present.context->present_colors.erase(present.serial);
+    if (present.pending_frame != nullptr) {
+      present.pending_frame->presenting = false;
+    }
+  };
+  const std::unique_ptr<PresentFrame, decltype(abandon_call)> entered_call(&present, abandon_call);
   const bool service_requested = Requested();
   const auto identity = Identity(swapchain);
   bool repeated = false;
@@ -1575,12 +1705,21 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
         output_framerate::Invalidate(context->output_identity, output_framerate::Reason::kAMBIGUOUS);
       }
       if (present.test_present) return present;
+      context->color_serial = present.serial;
+      if (context->handoff_frames_left != 0) {
+        --context->handoff_frames_left;
+        present.trace_handoff = true;
+      }
       RegisterOutput(context.get());
       if (context->bridge_enable_inflight == 0) {
         present.bridge_link = BridgeLinkVersionLocked(*context);
       }
       present.service_stats_serial = context->service_stats_serial;
-      present.service_owned = service_requested && context->enabled;
+      present.declaration = context->bridge_declaration;
+      present.service_owned = service_requested && context->enabled && context->bridge_enable_inflight == 0
+          && !context->bridge_enable_ambiguous;
+      present.handoff_reason = (context->bridge_enable_inflight != 0 || context->bridge_enable_ambiguous
+          ? "sdk_enable_unresolved" : context->enabled ? "nr_off" : "fg_off");
       const bool has_present_id = context->fresh_id;
       repeated = has_present_id && context->last_id_known && context->last_id == context->present_id;
       present.repeated = repeated;
@@ -1606,6 +1745,7 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
           .diagnostic_context = reinterpret_cast<uintptr_t>(context.get())};
       present.input.output = context->output_identity;
       present.service_eligible = present.service_owned && !repeated;
+      context->present_colors.emplace(present.serial, Context::PresentColors{.xefg_owned = present.service_owned});
       present.continuing_submission = context->last_submission_frame != 0
           && context->last_submission_frame + 1 == present.input.application_frame;
       if (const auto it = context->frames.find(context->present_id); has_present_id && it != context->frames.end()) {
@@ -1623,48 +1763,85 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
   // A previously substituted HUDLess remains an SDK input even if NR was
   // switched off or another input declined after its tag.
   const bool copies_ordered = OrderCopies(present.frame, present.context->queue.Get());
+  // Only explicitly active NONE/BACKBUFFER_UITEXTURE modes exclude HUDLess.
+  // Keep optional HUDLess consistent when composition itself is disabled.
+  if (present.frame != nullptr && !present.frame->rejected
+      && !(present.input.ui_composition && (present.input.ui_mode == 1 || present.input.ui_mode == 2))) {
+    const auto& hudless = present.frame->resources[0];
+    present.input.hudless = hudless.resource.Get();
+    present.input.hudless_state = hudless.data.state;
+  }
+  uint32_t backbuffer_index = UINT32_MAX;
+  if (SUCCEEDED(swapchain->QueryInterface(IID_PPV_ARGS(&present.swapchain)))) {
+    backbuffer_index = present.swapchain->GetCurrentBackBufferIndex();
+    present.swapchain->GetBuffer(backbuffer_index, IID_PPV_ARGS(&present.backbuffer));
+  }
+  present.input.swapchain = present.swapchain.Get();
+  present.input.backbuffer = present.backbuffer.Get();
+  const auto backbuffer_identity = reinterpret_cast<uintptr_t>(
+      renodx::utils::directx::NativeIdentity(present.backbuffer.Get()));
+  const auto hudless_identity = reinterpret_cast<uintptr_t>(
+      renodx::utils::directx::NativeIdentity(present.input.hudless));
+  {
+    std::unique_lock lock(state.mutex);
+    auto& context = *present.context;
+    auto& colors = context.present_colors.at(present.serial);
+    colors.backbuffer = backbuffer_identity;
+    colors.hudless = hudless_identity;
+    if (context.epoch == present.input.epoch && backbuffer_index < context.backbuffers.size()) {
+      context.backbuffers[backbuffer_index] = backbuffer_identity;
+    }
+  }
   if (!present.service_owned) return present;
   // A repeated tagged ID is not a new application frame. Untagged outer
   // Presents still use the current backbuffer with empty guide fields; the
   // Present service can apply its Optional-guide fallback without borrowing
   // resources or constants from an earlier XeFG frame.
-  if (!present.service_eligible) return present;
+  if (!present.service_eligible) {
+    present.handoff_reason = "repeated_present_id";
+    return present;
+  }
   // A frame phase is not a service outage. Keep an adjacent proven service
   // active only while its next frame records, never after a declined return.
-  display_result.store(present.continuing_submission ? Result::SUBMITTED : Result::PREPARED,
-                       std::memory_order_release);
-  result.store(Result::PREPARED, std::memory_order_release);
-  const auto publish_result = [&](PresentFrame*) noexcept {
-    PublishResult(present.service_result);
+  {
+    std::shared_lock lock(state.mutex);
+    if (!Requested() || !PresentWriteCurrentLocked(present)) {
+      present.handoff_reason = "write_permission_revoked";
+      return present;
+    }
+    display_result.store(present.continuing_submission ? Result::SUBMITTED : Result::PREPARED,
+                         std::memory_order_release);
+    result.store(Result::PREPARED, std::memory_order_release);
+  }
+  const auto finish_service = [&] {
+    {
+      std::shared_lock lock(state.mutex);
+      if (PresentWriteCurrentLocked(present)) {
+        PublishResult(present.service_result);
+      }
+    }
+    return std::move(present);
   };
-  const std::unique_ptr<PresentFrame, decltype(publish_result)> completion(&present, publish_result);
-  if (FAILED(swapchain->QueryInterface(IID_PPV_ARGS(&present.swapchain)))
-      || FAILED(present.swapchain->GetBuffer(present.swapchain->GetCurrentBackBufferIndex(),
-                                            IID_PPV_ARGS(&present.backbuffer)))) return present;
-  present.input.swapchain = present.swapchain.Get();
-  present.input.backbuffer = present.backbuffer.Get();
+  present.handoff_reason = "backbuffer_unavailable";
+  if (present.backbuffer == nullptr) return finish_service();
   const auto description = present.backbuffer->GetDesc();
   present.input.color_width = static_cast<uint32_t>(description.Width);
   present.input.color_height = description.Height;
   if (present.frame != nullptr) {
     const auto& frame = *present.frame;
-    if (frame.rejected) return present;
+    if (frame.rejected) {
+      present.handoff_reason = "sdk_tag_rejected";
+      return finish_service();
+    }
     if (frame.has_region) {
       present.input.color_x = frame.region.base.x;
       present.input.color_y = frame.region.base.y;
       present.input.color_width = frame.region.size.x;
       present.input.color_height = frame.region.size.y;
     }
-    const auto& hudless = frame.resources[0];
     const auto& depth = frame.resources[1];
     const auto& motion = frame.resources[2];
     const auto& ui = frame.resources[3];
-    // Only explicitly active NONE/BACKBUFFER_UITEXTURE modes document that
-    // HUDLess is not used. With composition disabled, optional HUDLess tags
-    // can still affect interpolation; preserve consistent NR inputs there.
-    present.input.hudless = (present.input.ui_composition
-        && (present.input.ui_mode == 1 || present.input.ui_mode == 2) ? nullptr : hudless.resource.Get());
-    present.input.hudless_state = hudless.data.state;
     present.input.ui = ui.resource.Get();
     present.input.ui_state = ui.data.state;
     if (present.input.hudless != nullptr) {
@@ -1695,12 +1872,17 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
     present.input.reset = frame.constants.reset != 0;
   }
   const auto callback = service.load(std::memory_order_acquire);
+  present.handoff_reason = (copies_ordered ? "service_unavailable" : "tag_copy_unordered");
   if (callback != nullptr && copies_ordered) {
-    auto* const previous = std::exchange(recording_service, &present);
+    struct ServiceScope {
+      PresentFrame* previous;
+      ~ServiceScope() { recording_service = previous; }
+    };
+    const ServiceScope entered{std::exchange(recording_service, &present)};
+    present.handoff_reason = "service_return";
     present.service_result = callback(present.input);
-    recording_service = previous;
   }
-  return present;
+  return finish_service();
 }
 
 inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
@@ -1712,21 +1894,17 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
     --context.presents_in_flight;
     return;
   }
-  const auto current = [&] {
-    const auto it = state.contexts.find(reinterpret_cast<void*>(present->input.context));
-    return it != state.contexts.end() && it->second == present->context
-        && context.epoch == present->input.epoch && context.proxy_identity == present->proxy_identity
-        && context.output_identity == present->input.output && UniqueProxyLocked(present->proxy_identity)
-        && (!present->input.output || output_framerate::IsCurrentOutput(present->input.output));
-  };
   uint64_t value = 0;
   bool needs_consumer_fence = false;
   bool status_queried = false;
+  Context::PresentColors colors;
   {
     std::unique_lock lock(state.mutex);
     needs_consumer_fence = present->frame != nullptr && !present->frame->captures.empty();
     if (needs_consumer_fence) value = ++context.next_fence;
-    status_queried = present_result == S_OK && current() && context.get_status != nullptr
+    colors = context.present_colors.at(present->serial);
+    context.present_colors.erase(present->serial);
+    status_queried = present_result == S_OK && PresentOwnerCurrentLocked(*present) && context.get_status != nullptr
         && present->serial == context.present_serial && present->serial > context.status_ambiguous_through;
   }
   // Intel permits tagged input reuse after matching proxy Present. This
@@ -1751,13 +1929,13 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
       present->context->frames.erase(it);
     }
   }
-  const bool same_output = current();
+  const bool same_output = PresentOwnerCurrentLocked(*present) && context.bridge_declaration == present->declaration;
   const bool submitted = present->service_result == Result::SUBMITTED;
-  const bool delivered = same_output && present_result == S_OK;
+  const bool delivered = present_result == S_OK;
   const bool failed_delivery = submitted && !delivered;
+  const bool status_current = has_status && same_output && present->input.output
+      && present->serial == context.present_serial && present->serial > context.status_ambiguous_through;
   if (same_output && present->serial == context.present_serial) {
-    const bool status_current = has_status && present->input.output
-        && present->serial > context.status_ambiguous_through;
     const bool same_declaration = context.bridge_declaration == present->bridge_link.declaration
         && context.bridge_enable_inflight == 0;
     const bool fg_consumed = delivered && submitted && present->serial > context.status_ambiguous_through;
@@ -1780,7 +1958,8 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
   context.interval_submitted += submitted;
   if (submitted) {
     submitted_frames.fetch_add(1, std::memory_order_relaxed);
-    if (same_output && context.application_frame == present->input.application_frame) {
+    if (same_output && present->serial == context.color_serial
+        && context.application_frame == present->input.application_frame) {
       context.last_submission_frame = (delivered ? present->input.application_frame : 0);
       if (!delivered) {
         PublishResult(Result::FAILED);
@@ -1790,6 +1969,23 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
   if (has_status) {
     context.interval_displayed += status.frames_presented;
     ++context.interval_status_samples;
+  }
+  const PresentHandoff handoff{
+      .output = present->input.output, .context = present->input.context,
+      .context_identity = present->input.diagnostic_context, .epoch = present->input.epoch,
+      .application_frame = present->input.application_frame, .call = present->serial,
+      .declaration = present->declaration, .backbuffer = colors.backbuffer, .hudless = colors.hudless,
+      .sdk_return_ns = presented_ns, .present_id = present->input.present_id,
+      .reason = present->handoff_reason, .service_result = present->service_result, .sdk_result = present_result,
+      .status_result = status_result, .status_enabled = status.enabled, .sdk_enabled_at_entry = present->input.fg_enabled,
+      .has_present_id = present->input.has_present_id, .has_guides = present->input.depth != nullptr && present->input.motion != nullptr,
+      .color_executed = present->color_executed, .ordinary_executed = colors.ordinary_committed,
+      .owner_current_at_return = same_output, .status_queried = status_queried, .status_current = status_current,
+      .sdk_result_available = true, .service_submission = present->service_submission,
+      .ordinary_submission = colors.ordinary_submission};
+  if (same_output && present->serial >= context.last_handoff_write.call
+      && (handoff.color_executed || handoff.ordinary_executed)) {
+    context.last_handoff_write = handoff;
   }
   const auto now = std::chrono::steady_clock::now();
   const double seconds = std::chrono::duration<double>(now - context.interval_start).count();
@@ -1875,12 +2071,15 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
     reshade::log::message(reshade::log::level::info, message);
   }
   if (lock.owns_lock()) lock.unlock();
+  if (present->trace_handoff || (!same_output && (present->service_owned || present->color_executed))) {
+    LogHandoff("sdk_present_return", handoff);
+  }
 #if defined(NR_NEXUS_DEV_CONTROL)
   edit_fg_observation::RecordResult(present->edit_fg_ticket, present_result, present->edit_fg_return_ns,
       {.queried = status_queried, .api_result = status_result, .frames_presented = status.frames_presented,
           .frame_gen_result = status.frame_gen_result, .enabled = status.enabled});
 #endif
-  if (submitted) {
+  if (submitted || present->color_executed) {
     if (failed_delivery && present->on_service_failure != nullptr) {
       present->on_service_failure(present->input);
     }
@@ -1895,6 +2094,7 @@ inline void BeforeResize(IDXGISwapChain* swapchain) {
   std::unique_lock lock(state.mutex);
   for (const auto& [handle, context] : state.contexts) {
     if (context->proxy_identity == identity) {
+      context->backbuffers = {};
       ClearBridgeSourceObservationsLocked(context.get(), "proxy_resizing");
       ReleaseFrames(context.get());
     }
@@ -2175,6 +2375,15 @@ struct SdkHooks {
           return status;
         }
         const auto identity = Identity(static_cast<IUnknown*>(*output));
+        ComPtr<IDXGISwapChain3> swapchain;
+        ComPtr<ID3D12Resource> backbuffer;
+        uint32_t backbuffer_index = UINT32_MAX;
+        if (SUCCEEDED(static_cast<IUnknown*>(*output)->QueryInterface(IID_PPV_ARGS(&swapchain)))) {
+          backbuffer_index = swapchain->GetCurrentBackBufferIndex();
+          swapchain->GetBuffer(backbuffer_index, IID_PPV_ARGS(&backbuffer));
+        }
+        const auto backbuffer_identity = reinterpret_cast<uintptr_t>(
+            renodx::utils::directx::NativeIdentity(backbuffer.Get()));
         BridgeDeviceObservation device_observation;
         auto device11 = BridgeDeviceIdentity(static_cast<IUnknown*>(*output), &device_observation);
         const bool proxy_ready = BridgeDeviceCaptureReady(device_observation, device11.Get(), false);
@@ -2184,9 +2393,13 @@ struct SdkHooks {
           if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
             if (it->second->bridge_declaration == declaration) {
               if (it->second->proxy_identity != 0 && it->second->proxy_identity != identity) {
+                it->second->backbuffers = {};
                 ReleaseFrames(it->second.get());
               }
               it->second->proxy_identity = identity;
+              if (backbuffer_identity != 0 && backbuffer_index < it->second->backbuffers.size()) {
+                it->second->backbuffers[backbuffer_index] = backbuffer_identity;
+              }
               RegisterOutput(it->second.get());
               retired_device11 = std::move(it->second->bridge_proxy_device11);
               it->second->bridge_proxy_device11 = std::move(device11);
@@ -2507,9 +2720,11 @@ struct SdkHooks {
     }
 #endif
     const auto status = reinterpret_cast<int32_t (*)(void*, uint32_t)>(modules[Index].real[6])(handle, enabled);
-#if defined(NR_NEXUS_DEV_CONTROL)
     const auto sdk_return_ns = output_framerate::NowNs();
-#endif
+    const bool service_requested = Requested();
+    PresentHandoff transition;
+    PresentHandoff last_write;
+    bool prepare_enabled = false;
     const auto after_observation = (status == 0 && enabled == 0 && observer != nullptr && observed_device != 0 && !stopped.load()
         ? observer(observed_device) : BridgeSourceObservation{});
     const auto after = after_observation.identity;
@@ -2527,6 +2742,8 @@ struct SdkHooks {
           && (!uses_source_link || (BridgeSourceLinkCurrentLocked(*attempt)
               && attempt->bridge_link_generation == link_generation && attempt->bridge_link_source == linked_source));
       if (status == 0 && same_contract) {
+        const bool changed = attempt->enabled != (enabled != 0)
+            || (ordered && attempt->bridge_present_fg_on && enabled == 0);
         if (attempt->enabled != (enabled != 0)) {
           ReleaseFrames(attempt.get());
         }
@@ -2536,6 +2753,16 @@ struct SdkHooks {
           attempt->bridge_present_fg_on = false;
         }
         RegisterOutput(attempt.get());
+        if (ordered && changed && service_requested) {
+          attempt->handoff_frames_left = 32;
+          last_write = std::exchange(attempt->last_handoff_write, {});
+          transition = {.output = attempt->output_identity, .context = reinterpret_cast<uintptr_t>(handle),
+              .context_identity = reinterpret_cast<uintptr_t>(attempt.get()),
+              .epoch = attempt->epoch, .declaration = declaration, .sdk_return_ns = sdk_return_ns,
+              .reason = (enabled != 0 ? "sdk_enabled" : "sdk_disabled"), .sdk_result = S_OK,
+              .status_result = status, .sdk_enabled_at_entry = enabled != 0, .sdk_result_available = true};
+        }
+        prepare_enabled = ordered && enabled != 0;
       }
       if (same_context) {
         if (attempt->bridge_declaration == declaration) {
@@ -2589,9 +2816,15 @@ struct SdkHooks {
           .off_observed = current && attempt->bridge_off_observed});
 #endif
     }
+    if (last_write.color_executed || last_write.ordinary_executed) {
+      LogHandoff("last_old_write", last_write);
+    }
+    if (transition.context != 0) {
+      LogHandoff("set_enabled_return", transition);
+    }
     if (status == 0) {
       RefreshOwnership();
-      ReconcileNrService();
+      ReconcileNrService(prepare_enabled ? attempt->device.Get() : nullptr);
     }
     return status;
   }
@@ -2750,6 +2983,69 @@ inline bool ServiceContextCurrent(std::uintptr_t context, std::uint64_t epoch) n
   }
 }
 
+// Runtime/NGX serialization precedes state.mutex. Publish only the already
+// recorded private list here. The original Present and owner notification
+// run after this lock is released.
+template <typename Publish>
+inline bool WithServiceWritePermission(const FrameInput& input, bool publishes_color, Publish&& publish) {
+  auto* const present = internal::recording_service;
+  if (present == nullptr || &present->input != &input) return false;
+  std::unique_lock lock(internal::state.mutex);
+  if (!internal::Requested() || !internal::PresentWriteCurrentLocked(*present)) return false;
+  auto& context = *present->context;
+  const auto& colors = context.present_colors.at(present->serial);
+  if (colors.backbuffer == 0 || (input.hudless != nullptr && colors.hudless == 0)
+      || colors.ordinary_committed || (context.color_submitted_epoch == input.epoch
+          && context.color_submitted_frame == input.application_frame)) return false;
+  if (publishes_color) {
+    const auto intersects = [&](const internal::Context::PresentColors& other) {
+      return other.backbuffer == colors.backbuffer
+          || (other.hudless != 0 && (other.hudless == colors.backbuffer || other.hudless == colors.hudless))
+          || (colors.hudless != 0 && colors.hudless == other.backbuffer);
+    };
+    for (const auto& [serial, older] : context.present_colors) {
+      if (serial >= present->serial) break;
+      if (older.backbuffer == 0 || intersects(older)) return false;
+    }
+    const auto conflicts = [&](const internal::Context& other) {
+      return std::ranges::any_of(other.present_colors, [&](const auto& entry) {
+        const auto& [serial, active_colors] = entry;
+        return intersects(active_colors);
+      });
+    };
+    if (std::ranges::any_of(internal::state.contexts, [&](const auto& entry) {
+          const auto& [handle, other] = entry;
+          return other.get() != &context && conflicts(*other);
+        }) || std::ranges::any_of(internal::state.retired_contexts, [&](const auto& other) {
+          return conflicts(*other);
+        })) return false;
+    context.color_submitted_epoch = input.epoch;
+    context.color_submitted_frame = input.application_frame;
+    present->color_executed = true;
+  }
+  std::forward<Publish>(publish)();
+  return true;
+}
+
+inline bool ObservesServiceHandoff(const FrameInput& input) noexcept {
+  const auto* present = internal::recording_service;
+  return present != nullptr && &present->input == &input && present->trace_handoff;
+}
+
+#if defined(NR_NEXUS_DEV_CONTROL)
+inline uint64_t ServiceCall(const FrameInput& input) noexcept {
+  const auto* present = internal::recording_service;
+  return (present != nullptr && &present->input == &input ? present->serial : 0);
+}
+#endif
+
+inline void ObserveServiceHandoff(const FrameInput& input, const PresentSubmissionFact& fact) noexcept {
+  if (auto* present = internal::recording_service; present != nullptr && &present->input == &input) {
+    present->handoff_reason = fact.reason;
+    present->service_submission = fact;
+  }
+}
+
 inline void SetPresentFailureHandler(const FrameInput& input, void (*callback)(const FrameInput&) noexcept) {
   // Register on this borrow only, so direct service calls and other contexts
   // cannot attach their recovery to an unrelated SDK Present.
@@ -2812,7 +3108,8 @@ inline EnabledContextMetadata QueryEnabledContext() {
 #endif
 
 inline void Configure(Service service, PrepareCapture capture, Retire retire, bool (*requested)() noexcept,
-                      bool block_optional_hudless = false, bool enable_sdk_detours = true) {
+                      bool block_optional_hudless = false, bool enable_sdk_detours = true,
+                      PrepareRuntime prepare_runtime = nullptr) {
   static std::atomic_bool disabled_logged{false};
   if (!enable_sdk_detours && !disabled_logged.exchange(true, std::memory_order_relaxed)) {
     internal::LogDiagnostic(
@@ -2826,6 +3123,7 @@ inline void Configure(Service service, PrepareCapture capture, Retire retire, bo
   internal::service.store(service, std::memory_order_release);
   internal::prepare_capture.store(capture, std::memory_order_release);
   internal::retire.store(retire, std::memory_order_release);
+  internal::prepare_runtime.store(prepare_runtime, std::memory_order_release);
   internal::requested.store(requested, std::memory_order_release);
   ReconcileNrService();
 }
@@ -3021,6 +3319,134 @@ inline bool BlocksHostWriteLocked(const output_framerate::OutputIdentity& output
 
 }  // namespace internal
 
+// The output may name the ordinary view or its associated XeFG context.
+// Swapchain/backbuffer are the borrowed native identities of this callback.
+struct OrdinaryPresentAccess {
+  uintptr_t swapchain = 0;
+  uintptr_t backbuffer = 0;
+  output_framerate::OutputIdentity output;
+  uintptr_t context = 0;
+  uintptr_t owner = 0;
+  uint64_t epoch = 0;
+  uint64_t declaration = 0;
+  uint64_t call = 0;
+  bool allowed = false;
+  bool operator==(const OrdinaryPresentAccess&) const = default;
+};
+
+namespace internal {
+
+inline OrdinaryPresentAccess QueryOrdinaryPresentLocked(uintptr_t swapchain, uintptr_t backbuffer,
+                                                         const output_framerate::OutputIdentity& output) {
+  OrdinaryPresentAccess access{.swapchain = swapchain, .backbuffer = backbuffer, .output = output};
+  if (backbuffer == 0 || (output && !output_framerate::IsCurrentOutput(output))) return access;
+  const bool service_requested = Requested();
+  const auto conflicts = [&](const Context& context, const Context::PresentColors& colors) {
+    return colors.backbuffer == backbuffer || colors.hudless == backbuffer
+        || (colors.backbuffer == 0 && swapchain != 0 && (swapchain == context.proxy_identity
+            || swapchain == context.application_swapchain_identity));
+  };
+  for (const auto& context : state.retired_contexts) {
+    for (const auto& [serial, colors] : context->present_colors) {
+      if (colors.xefg_owned && conflicts(*context, colors)) return access;
+    }
+  }
+  bool blocked = false;
+  for (const auto& [handle, context] : state.contexts) {
+    const bool same_swapchain = swapchain != 0 && (context->proxy_identity == swapchain
+        || context->application_swapchain_identity == swapchain || context->bridge_source_swapchain == swapchain);
+    const bool same_backbuffer = std::ranges::find(context->backbuffers, backbuffer) != context->backbuffers.end();
+    const bool same_output = output && (context->output_identity == output
+        || output.view == reinterpret_cast<uintptr_t>(context.get()));
+    uint64_t active_call = 0;
+    bool blocked_call = false;
+    for (const auto& [serial, colors] : context->present_colors) {
+      if (!conflicts(*context, colors)
+          && !(colors.backbuffer == 0 && (same_swapchain || same_output || same_backbuffer))) continue;
+      blocked_call |= colors.xefg_owned || (service_requested && (colors.ordinary_committed || active_call != 0));
+      active_call = serial;
+    }
+    if (!same_swapchain && !same_output && !same_backbuffer && active_call == 0) continue;
+    if (access.context != 0) return access;
+    blocked = blocked_call || (service_requested && (context->enabled || context->bridge_present_fg_on
+        || context->bridge_enable_inflight != 0 || context->bridge_enable_ambiguous));
+    access.context = reinterpret_cast<uintptr_t>(handle);
+    access.owner = reinterpret_cast<uintptr_t>(context.get());
+    access.epoch = context->epoch;
+    access.declaration = context->bridge_declaration;
+    // Explicit post-FG compatibility can deliver several actual Presents
+    // within one SDK call. The ordinary path tracks those versions itself.
+    access.call = (service_requested ? active_call : 0);
+  }
+  access.allowed = !blocked;
+  return access;
+}
+
+}  // namespace internal
+
+inline OrdinaryPresentAccess QueryOrdinaryPresent(uintptr_t swapchain, uintptr_t backbuffer,
+                                                   const output_framerate::OutputIdentity& output) {
+  std::shared_lock lock(internal::state.mutex);
+  return internal::QueryOrdinaryPresentLocked(swapchain, backbuffer, output);
+}
+
+// Same order as XeFG's final commit. The callback issues only the owned
+// queue submission and cannot reenter the adapter or call the SDK.
+template <typename Publish>
+inline bool WithOrdinaryPresentCommit(const OrdinaryPresentAccess& access, Publish&& publish) {
+  if (!access.allowed) return false;
+  std::unique_lock lock(internal::state.mutex);
+  if (internal::QueryOrdinaryPresentLocked(access.swapchain, access.backbuffer, access.output) != access) return false;
+  if (access.call != 0) {
+    auto& context = *internal::state.contexts.at(reinterpret_cast<void*>(access.context));
+    context.present_colors.at(access.call).ordinary_committed = true;
+  }
+  std::forward<Publish>(publish)();
+  return true;
+}
+
+// Diagnostics only. The reason must have static lifetime, including when a
+// different thread returns the matching SDK call.
+inline void ObserveOrdinaryPresentSubmission(const OrdinaryPresentAccess& access, const OrdinarySubmissionFact& fact) {
+  if (access.owner == 0) return;
+  internal::PresentHandoff handoff;
+  bool trace = false;
+  {
+    std::unique_lock lock(internal::state.mutex);
+    const auto current = internal::state.contexts.find(reinterpret_cast<void*>(access.context));
+    auto* context = (current != internal::state.contexts.end()
+        && reinterpret_cast<uintptr_t>(current->second.get()) == access.owner ? current->second.get() : nullptr);
+    if (context == nullptr) {
+      for (const auto& retired : internal::state.retired_contexts) {
+        if (reinterpret_cast<uintptr_t>(retired.get()) == access.owner) {
+          context = retired.get();
+          break;
+        }
+      }
+    }
+    if (context == nullptr) return;
+    if (const auto call = context->present_colors.find(access.call); call != context->present_colors.end()) {
+      if (!call->second.ordinary_committed || fact.recording.first != 0) {
+        call->second.ordinary_submission = fact;
+      }
+      return;
+    }
+    const bool current_owner = context->epoch == access.epoch && context->bridge_declaration == access.declaration;
+    handoff = {.output = access.output, .context = access.context, .context_identity = access.owner,
+        .epoch = access.epoch, .call = access.call,
+        .declaration = access.declaration, .backbuffer = access.backbuffer,
+        .reason = fact.reason, .ordinary_executed = fact.recording.first != 0,
+        .owner_current_at_return = current_owner, .ordinary_submission = fact};
+    if (current_owner && handoff.ordinary_executed) {
+      context->last_handoff_write = handoff;
+    }
+    trace = context->handoff_frames_left != 0;
+  }
+  if (trace) {
+    internal::LogHandoff("ordinary_present_submission", handoff);
+  }
+}
+
 // runtime_mutex may already be held. These snapshots never call COM, the source observer, or the SDK.
 inline BridgeOffEvidence QueryBridgeOff(const BridgeSourceIdentity& source,
                                        const output_framerate::OutputIdentity& output = {}) {
@@ -3138,6 +3564,7 @@ inline void Poll(bool force_discovery = true) {
   {
     std::unique_lock lock(internal::state.mutex);
     std::erase_if(internal::state.retired_contexts, [](const auto& context) {
+      if (!context->present_colors.empty()) return false;
       for (const auto& surface : context->surfaces) {
         if (!submission::ResourceReleasable(surface->texture.Get())) return false;
         if (surface->consumer_fence != nullptr

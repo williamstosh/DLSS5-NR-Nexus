@@ -22,6 +22,7 @@ struct Slot {
   ID3D12DescriptorHeap* color_heap = nullptr;
   bool color_inputs_prepared = false;
   bool pipeline_pending = false;
+  bool model_preparation_pending = false;
   uint64_t fence_value = 0;
   bool quarantined = false;
 };
@@ -44,6 +45,7 @@ struct Stream {
   AdaptiveDelivery pending_xefg_delivery;
   output_framerate::OutputIdentity xefg_delivery_output;
   bool awaiting_xefg_delivery = false;
+  bool pending_xefg_game_reset = false;
   bool service_recording = false;
   bool service_exit_pending = false;
   bool service_stopped = false;
@@ -172,6 +174,14 @@ inline bool Requested() noexcept {
   return OwnerRequested() && !shutting_down.load(std::memory_order_acquire);
 }
 
+inline void PrepareRuntime(ID3D12Device* device) noexcept {
+  if (device == nullptr || HoldingRuntimeLock() || !Requested()) return;
+  GuardHook([&] {
+    renodx::utils::directx::NativeFromReShadeProxy(&device);
+    PrimeNgxLoaderSymbols(device, true);
+  });
+}
+
 inline bool PrepareCapture(ID3D12GraphicsCommandList* list) noexcept {
   try {
     if (list == nullptr || !IsSupportedInjectionCommandList(list)) return false;
@@ -230,10 +240,14 @@ inline void Release(Stream* stream) {
     owner_resident_nr_handles.erase(role.Handle());
   }
   for (auto& slot : stream->slots) {
-    if (!stream->service_stopped && slot.list != nullptr && !slot.quarantined) {
+    if (!stream->service_stopped && slot.list != nullptr) {
       // This closes replay eligibility only. Exact submission proofs still
       // retain the objects until the GPU finishes their last submission.
-      submission::OnCommandListReset(slot.list);
+      if (!stream->native) {
+        submission::DiscardOwnedRecording(slot.list, submission::RecordingOwner::kXeFg);
+      } else if (!slot.quarantined) {
+        submission::OnCommandListReset(slot.list);
+      }
     }
     for (auto& color : slot.color) RetirePresentResource(&color);
     RetirePresentResource(&slot.original_backbuffer);
@@ -265,8 +279,8 @@ inline void CloseServiceRecordings(Stream* stream) {
   stream->service_exit_pending = true;
   if (stream->service_stopped) return;
   for (auto& slot : stream->slots) {
-    if (slot.list != nullptr && !slot.quarantined) {
-      submission::OnCommandListReset(slot.list);
+    if (slot.list != nullptr) {
+      submission::DiscardOwnedRecording(slot.list, submission::RecordingOwner::kXeFg);
     }
   }
   stream->service_stopped = true;
@@ -527,17 +541,34 @@ inline bool PrepareSurfaces(Stream* stream, Slot* slot, const fg::FrameInput& in
   return true;
 }
 
+inline bool BeginServiceRecording(Stream* stream, Slot* slot) {
+  const auto type = stream->queue->GetDesc().Type;
+  if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE) return false;
+  if (slot->allocator == nullptr && FAILED(stream->device->CreateCommandAllocator(type, IID_PPV_ARGS(&slot->allocator)))) {
+    return false;
+  }
+  if (slot->list == nullptr) {
+    if (FAILED(stream->device->CreateCommandList(0, type, slot->allocator, nullptr, IID_PPV_ARGS(&slot->list)))
+        || FAILED(slot->list->Close())) return false;
+  }
+  if (FAILED(slot->allocator->Reset()) || FAILED(slot->list->Reset(slot->allocator, nullptr))) return false;
+  submission::OnCommandListReset(slot->list);
+  submission::SetRecordingOwner(slot->list, submission::RecordingOwner::kXeFg);
+  return true;
+}
+
 inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* list,
                          const fg::FrameInput& input, const PresentTarget& base,
                          bool* output_ready, std::array<NrRecording, 2>* recordings,
                          const NVSDK_NGX_Parameter* native_parameters = nullptr,
-                         bool ui_recomposition = true) {
+                         bool ui_recomposition = true, const fg::FrameInput* service_scope = nullptr) {
   *output_ready = false;
   *recordings = {};
   slot->adaptive_delivery = {};
   slot->adaptive_recording = {};
   slot->color_inputs_prepared = false;
   slot->pipeline_pending = false;
+  slot->model_preparation_pending = false;
   const PipelinePreparationScope pipeline_scope;
   ResolveAdaptiveBorrowedDeliveries();
   if (!enabled.load(std::memory_order_relaxed)) return fg::Result::NOT_SERVED;
@@ -571,7 +602,9 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
         .roles = (has_hudless && !coupled_ui ? 3u : 1u)};
   }
   const auto previous_base = stream->base_frame_clock.frame;
-  const auto base_claim = present_frame_policy::Observe(&stream->base_frame_clock, base_frame);
+  const auto base_claim = (service_scope == nullptr
+      ? present_frame_policy::Observe(&stream->base_frame_clock, base_frame)
+      : present_frame_policy::Classify(stream->base_frame_clock, base_frame));
   if (base_claim == present_frame_policy::Claim::REPEATED || base_claim == present_frame_policy::Claim::STALE) {
     return fg::Result::NOT_SERVED;
   }
@@ -588,7 +621,8 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
   contract.motion_scale_x = (real_guides ? input.motion_scale_x : static_cast<float>(input.color_width));
   contract.motion_scale_y = (real_guides ? input.motion_scale_y : static_cast<float>(input.color_height));
   contract.create_flags = (real_guides ? input.init_flags : NVSDK_NGX_DLSS_Feature_Flags_DepthInverted);
-  contract.frame_reset = (input.reset ? 1 : 0);
+  const bool game_reset = input.reset || (service_scope != nullptr && stream->pending_xefg_game_reset);
+  contract.frame_reset = (game_reset ? 1 : 0);
   const uint64_t previous_adaptive_layout = stream->adaptive_frame.layout_identity;
   uint32_t required_model_roles = (may_compose && stream->adaptive_model_roles == 2
       ? 2u : (has_hudless && !coupled_ui ? 3u : 1u));
@@ -872,7 +906,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
   const bool edit_reuse_frame = xefg_edit_reuse_frame || native_edit_reuse_frame;
   const bool observes_output = (stream->native ? present_frame_policy::Known(base_frame) : edit_reuse_frame);
   base_frame.reuse_edits = edit_reuse_frame;
-  if (base_claim == present_frame_policy::Claim::NEW_FRAME) {
+  if (service_scope == nullptr && base_claim == present_frame_policy::Claim::NEW_FRAME) {
     stream->base_frame_clock.frame.reuse_edits = edit_reuse_frame;
   }
   // Cache descriptors retain their sources. Stage the current original in
@@ -909,7 +943,8 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
   // after HUDLess evaluated would advance the global epoch behind its history
   // and reset that role again on the following frame. Model-only preparation
   // below also carries a local Reset which must not become a game scene cut.
-  if (!base.game_frame_observed) ObserveGameFrame(contract);
+  if (service_scope == nullptr && !base.game_frame_observed) ObserveGameFrame(contract);
+  bool service_frame_observed = false;
   for (const uint32_t i : {1u, 0u}) {
     if (i == 1 && (!has_hudless || coupled_ui)) continue;
     auto& role = stream->roles[i];
@@ -917,15 +952,12 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     // for which a busy service could obtain a recording slot or NGX turn.
     // A cache output is a completed base frame without a new model call.
     const uint64_t previous_frame = (observes_output ? stream->last_output_frame[i] : stream->last_model_frame[i]);
-    if (present_frame_policy::NeedsReset(previous_base, base_frame, previous_frame,
-            input.reset || stream->epoch != input.epoch, role.real_guides != real_guides)
+    const bool reset_model_history = present_frame_policy::NeedsReset(previous_base, base_frame, previous_frame,
+            game_reset || stream->epoch != input.epoch, role.real_guides != real_guides)
         || (!present_frame_policy::Known(base_frame) && input.application_frame != 0
-            && previous_frame != 0 && input.application_frame != previous_frame + 1)) {
-      ResetPresentStreamHistory(&role);
-    }
-    role.real_guides = real_guides;
+            && previous_frame != 0 && input.application_frame != previous_frame + 1);
     FillPresentBlock(&role, slot->color[i], motion, depth, contract,
-                     input.color_width, input.color_height, 1.f, input.reset ? 1 : 0);
+                     input.color_width, input.color_height, 1.f, contract.frame_reset);
     role.parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, input.jitter_x);
     role.parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, input.jitter_y);
     PresentTarget target = base;
@@ -947,6 +979,133 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
                             : present_restore_scope::Domain::PRE_FG_HUDLESS);
     target.original_identity = reinterpret_cast<uintptr_t>(i == 0 ? input.backbuffer : input.hudless);
     auto& recording = (*recordings)[i];
+    const auto present_group = adaptive_plan.At(stage_plan::Stage::PRESENT);
+    if (service_scope != nullptr && !has_hudless && !stream->adaptive_frame.enabled && present_group.count == 1) {
+      const auto feature = features.find(role.Handle());
+      const auto flags = NrCreateFlags(contract.create_flags, target.hdr_mode != 0);
+      const auto configuration = configuration_generation.load(std::memory_order_relaxed);
+      const auto unchanged = [&] {
+        if (feature == features.end()) return false;
+        uint32_t work_width = 0, work_height = 0;
+        ComputeNrWorkingResolution(input.color_width, input.color_height, contract.input_width, contract.input_height,
+                                   work_width, work_height, present_group.begin);
+        const auto& state = feature->second;
+        const auto& model = state.slots[0];
+        return state.input_width == work_width && state.input_height == work_height
+            && state.output_width == input.color_width && state.output_height == input.color_height
+            && model.handle != nullptr && model.preparation_recording == nullptr
+            && model.configuration_generation == configuration && model.nr_hdr_mode == target.hdr_mode
+            && model.nr_create_flags == flags;
+      };
+      if (!unchanged()) {
+        fg::xefg::PresentSubmissionFact preparation_fact{.reason = "model_preparation_slot_busy"};
+        const auto prepare = [&]() -> NrModelPreparationState {
+          auto candidate = std::ranges::find_if(stream->slots, [&](const auto& available) {
+            return &available != slot && !available.quarantined && available.fence_value == 0;
+          });
+          if (candidate == stream->slots.end()) return NrModelPreparationState::PENDING;
+          if (!BeginServiceRecording(stream, &*candidate)) {
+            candidate->quarantined = true;
+            preparation_fact.reason = "model_preparation_recording_failed";
+            return NrModelPreparationState::FAILED;
+          }
+          bool close_attempted = false;
+          const auto retire_recording = [&](Slot* prepared) {
+            if (!close_attempted && FAILED(prepared->list->Close())) {
+              prepared->quarantined = true;
+            }
+            submission::DiscardOwnedRecording(prepared->list, submission::RecordingOwner::kXeFg);
+          };
+          std::unique_ptr<Slot, decltype(retire_recording)> retirement(&*candidate, retire_recording);
+          NrModelPreparationResult preparation;
+          if (!PrepareNrModels(candidate->list, role.Handle(), &role.parameters, target, &preparation)
+              || preparation.state != NrModelPreparationState::RECORDED) {
+            preparation_fact.reason = (preparation.state == NrModelPreparationState::FAILED
+                ? "model_preparation_failed" : "model_preparation_pending");
+            if (preparation.recording != nullptr) {
+              preparation_fact.recording = {preparation.recording->list, preparation.recording->generation};
+            }
+            return preparation.state;
+          }
+          close_attempted = true;
+          if (FAILED(candidate->list->Close())) {
+            candidate->quarantined = true;
+            preparation_fact.reason = "model_preparation_close_failed";
+            return NrModelPreparationState::FAILED;
+          }
+          submission::TrackUse(candidate->list, candidate->allocator);
+          submission::TrackUse(candidate->list, candidate->list);
+          ID3D12CommandList* creation_list = candidate->list;
+          renodx::utils::directx::NativeFromReShadeProxy(&creation_list);
+          if (!fg::xefg::WithServiceWritePermission(*service_scope, false, [&] {
+                stream->queue->ExecuteCommandLists(1, &creation_list);
+              })) {
+            preparation_fact.reason = "write_permission_revoked";
+            return NrModelPreparationState::PENDING;
+          }
+          candidate->fence_value = ++stream->submitted;
+          const bool signaled = SUCCEEDED(stream->queue->Signal(stream->fence, candidate->fence_value));
+          preparation_fact = {.reason = (signaled ? "model_preparation_gpu_pending" : "model_preparation_signal_failed"),
+              .recording = submission::RecordingIdentity(candidate->list),
+              .queue = reinterpret_cast<uintptr_t>(stream->queue), .fence = reinterpret_cast<uintptr_t>(stream->fence),
+              .fence_value = candidate->fence_value, .signaled = signaled};
+          retirement.reset();
+          if (!signaled) {
+            candidate->quarantined = true;
+            return NrModelPreparationState::FAILED;
+          }
+          uint64_t completed = stream->fence->GetCompletedValue();
+          if (completed < candidate->fence_value) {
+            if (HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr)) {
+              if (SUCCEEDED(stream->fence->SetEventOnCompletion(candidate->fence_value, event))) {
+                WaitForSingleObject(event, kPresentSlotWaitMs);
+              }
+              CloseHandle(event);
+            }
+            completed = stream->fence->GetCompletedValue();
+          }
+          preparation_fact.completed_value = completed;
+          if (completed == UINT64_MAX) {
+            preparation_fact.reason = "model_preparation_device_removed";
+            return NrModelPreparationState::FAILED;
+          }
+          if (completed < candidate->fence_value) return NrModelPreparationState::PENDING;
+          // The slot fence proves queue completion. The original tracked
+          // creation must also prove every required model on the color list.
+          preparation_fact.reason = "model_preparation_proof_pending";
+          const auto prepared_feature = features.find(role.Handle());
+          if (prepared_feature == features.end() || preparation.required_mask == 0) {
+            return NrModelPreparationState::PENDING;
+          }
+          for (uint32_t pass = 0; pass < kMaxNrPasses; ++pass) {
+            if ((preparation.required_mask & (1u << pass)) == 0) continue;
+            auto& model = prepared_feature->second.slots[pass];
+            if (model.handle == nullptr || (!model.creation_completed && model.preparation_recording == nullptr)
+                || !NrModelPreparationReady(&model, list)) return NrModelPreparationState::PENDING;
+          }
+          return NrModelPreparationState::READY;
+        };
+        const auto preparation_state = prepare();
+        if (preparation_state != NrModelPreparationState::READY) {
+          slot->model_preparation_pending = true;
+          fg::xefg::ObserveServiceHandoff(*service_scope, preparation_fact);
+          restore_guides();
+          return (preparation_state == NrModelPreparationState::FAILED ? fg::Result::FAILED : fg::Result::PREPARED);
+        }
+      }
+    }
+    // Independent creation cannot claim the application version or consume
+    // its reset. Those facts belong to the actual color-recording attempt.
+    if (service_scope != nullptr && !service_frame_observed) {
+      present_frame_policy::Observe(&stream->base_frame_clock, base_frame);
+      stream->pending_xefg_game_reset = false;
+      if (!base.game_frame_observed) ObserveGameFrame(contract);
+      service_frame_observed = true;
+    }
+    if (reset_model_history) {
+      ResetPresentStreamHistory(&role);
+    }
+    role.real_guides = real_guides;
     bool touched = false;
     const EvaluateInFlightScope attempt(true);
     const uint64_t previous_capture_serial = screenshot::PendingModelCaptureSerial(list);
@@ -1149,7 +1308,11 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
       target.ui_correction = false;
       target.domain = present_restore_scope::Domain::PRE_FG_HUDLESS;
       target.original_identity = reinterpret_cast<uintptr_t>(input.hudless);
-      ProcessInline(list, role.Handle(), &role.parameters, nullptr, &target, nullptr, true);
+      AdaptiveRecording future_role;
+      RecordInline(list, role.Handle(), &role.parameters, nullptr, &target, nullptr, true, &future_role);
+      if (future_role.delivery.frame.delivery != nullptr) {
+        ResolveAdaptiveDelivery(future_role.delivery, false);
+      }
     }
   }
   restore_guides();
@@ -1215,7 +1378,7 @@ inline void OnXeFGPresentDelivery(const fg::FrameInput& input, bool succeeded) n
     RuntimeLock lock(runtime_mutex);
     const auto matches = [&](const Stream& stream) {
       return stream.awaiting_xefg_delivery && stream.epoch == input.epoch
-          && stream.application_frame == input.application_frame && stream.result == fg::Result::SUBMITTED
+          && stream.application_frame == input.application_frame
           && stream.xefg_delivery_output == input.output;
     };
     Stream* pending = nullptr;
@@ -1258,46 +1421,99 @@ inline void OnXeFGPresentDelivery(const fg::FrameInput& input, bool succeeded) n
 
 inline fg::Result Service(const fg::FrameInput& input) noexcept {
   try {
+    const auto observe = [&](const char* reason) noexcept {
+      fg::xefg::ObserveServiceHandoff(input, {.reason = reason});
+    };
     const int64_t service_entry_ns = (xefg_gpu_capture_enabled.load(std::memory_order_relaxed) ? SteadyNowNs() : 0);
+    observe("service_input_unavailable");
     if (!Requested() || input.queue == nullptr || input.backbuffer == nullptr
         || input.color_width == 0 || input.color_height == 0 || !input.fg_enabled) return fg::Result::NOT_SERVED;
     // AUTO composition may consume HUDLess too. If a mode change happened
     // after an omitted tag, retain the original frame instead of enhancing
     // only one of the SDK's color inputs.
     if (input.ui_composition && (input.ui_mode == 0 || input.ui_mode >= 3) && input.hudless == nullptr) {
+      observe("required_hudless_missing");
       return fg::Result::NOT_SERVED;
     }
+    const auto* backbuffer_identity = renodx::utils::directx::NativeIdentity(input.backbuffer);
+    const auto* hudless_identity = renodx::utils::directx::NativeIdentity(input.hudless);
+    if (backbuffer_identity == nullptr || (input.hudless != nullptr && hudless_identity == nullptr)) {
+      return fg::Result::NOT_SERVED;
+    }
+    const bool distinct_hudless = hudless_identity != nullptr && hudless_identity != backbuffer_identity;
+    observe("queue_unavailable");
     ID3D12CommandQueue* queue = input.queue;
     renodx::utils::directx::NativeFromReShadeProxy(&queue);
     if (!InstallQueueCompletionHooks(queue)) return fg::Result::NOT_SERVED;
     ID3D12Device* device = nullptr;
     if (FAILED(queue->GetDevice(IID_PPV_ARGS(&device)))) return fg::Result::FAILED;
-    PrimeNgxLoaderSymbols(device, true);
+    PrepareRuntime(device);
     auto device_release = std::unique_ptr<ID3D12Device, void (*)(ID3D12Device*)>(device,
         [](ID3D12Device* value) { value->Release(); });
     const BridgeDeviceLock device_lock;
     const ngx_serial::PresentTurn turn(true);
+    observe("ngx_turn_unavailable");
     if (!turn.owns()) return fg::Result::NOT_SERVED;
     RuntimeLock lock(runtime_mutex);
     if (!Requested() || !fg::xefg::ServiceContextCurrent(input.context, input.epoch)) {
+      observe("write_permission_revoked");
       Retire();
       return fg::Result::NOT_SERVED;
     }
-    // The previous Present route no longer rotates these owned recordings.
-    if ((present_ring.device != nullptr && !ReleasePresentRing()) || !RetireBridgeRecordings()) {
+    // The ordinary pool is shared by outputs. Close it only when the
+    // current Provider or device face must be replaced.
+    const bool replacing_provider = direct_device != nullptr && (direct_device != device || !direct_api.private_instance
+        || !parameter_runtime_ready || parameter_runtime_via_core.load(std::memory_order_relaxed));
+    if (replacing_provider && present_ring.device != nullptr && !ReleasePresentRing(true)) {
+      observe("ordinary_recordings_in_flight");
       return fg::Result::NOT_SERVED;
     }
+    if (!RetireBridgeRecordings()) {
+      observe("bridge_recordings_in_flight");
+      return fg::Result::NOT_SERVED;
+    }
+    const std::array<submission::OutputUse, 2> colors{{
+        {.resource = backbuffer_identity, .subresource = 0, .version = input.application_frame},
+        {.resource = hudless_identity, .subresource = 0, .version = input.application_frame}}};
+    const auto targets = std::span{colors}.first(distinct_hudless ? 2 : 1);
+    const auto color_ordered = [&](const std::pair<uint64_t, uint64_t>& recording) {
+      FenceRef queue_fence;
+      {
+        std::shared_lock queue_lock(queue_completion_mutex);
+        if (const auto tracked = queue_completions.find(queue); tracked != queue_completions.end()) {
+          queue_fence = FenceRef(tracked->second.fence);
+        }
+      }
+      if (submission::OutputWriteOrdered(targets, recording, queue_fence.fence)) return true;
+      observe("conflicting_output_recording");
+      if (fg::xefg::ObservesServiceHandoff(input)) {
+        GuardHook([&] {
+          std::vector<submission::RecordingBlocker> blockers;
+          submission::OutputWriteOrdered(targets, recording, queue_fence.fence, &blockers);
+          char reason[176];
+          std::snprintf(reason, sizeof(reason), "XeFG output color context=%llx epoch=%llu application_frame=%llu",
+              static_cast<unsigned long long>(input.context), static_cast<unsigned long long>(input.epoch),
+              static_cast<unsigned long long>(input.application_frame));
+          LogRecordedWorkBlockers(reason, blockers);
+        });
+      }
+      return false;
+    };
+    // Known conflicts should leave the current history intact. Recheck at
+    // publication for changes while the private candidate was recorded.
+    if (!color_ordered({})) return fg::Result::NOT_SERVED;
+    observe("previous_sdk_present_pending");
     if (const auto it = streams.find({false, input.context}); it != streams.end()) {
       auto& previous = it->second;
       if (previous.service_recording) return fg::Result::NOT_SERVED;
       if (previous.awaiting_xefg_delivery) {
         if (previous.epoch == input.epoch && previous.xefg_delivery_output == input.output) {
-          return (!previous.service_exit_pending && !previous.service_stopped
-              && previous.application_frame == input.application_frame ? previous.result : fg::Result::NOT_SERVED);
+          return fg::Result::NOT_SERVED;
         }
         PreservePendingServiceStream(it);
       }
     }
+    observe("private_recording_unavailable");
     auto& stream = streams[{false, input.context}];
     if (stream.device != nullptr && (stream.device != device || stream.queue != queue || stream.epoch != input.epoch)) {
       Release(&stream);
@@ -1336,12 +1552,20 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
         .kind = present_frame_policy::SourceKind::APPLICATION,
         .source = input.context, .generation = input.epoch, .sequence = input.application_frame,
         .pass_count = EvaluationStagePlan(stream.roles[0].Handle(), false).pass_count,
-        .roles = (input.hudless != nullptr && input.hudless != input.backbuffer ? 3u : 1u)};
+        .roles = (distinct_hudless ? 3u : 1u)};
     const auto application_claim = present_frame_policy::Classify(stream.base_frame_clock, application_base);
-    if (application_claim == present_frame_policy::Claim::STALE) return fg::Result::NOT_SERVED;
+    if (application_claim == present_frame_policy::Claim::STALE) {
+      observe("stale_application_frame");
+      return fg::Result::NOT_SERVED;
+    }
     if (application_claim == present_frame_policy::Claim::REPEATED
         || (!present_frame_policy::Known(application_base) && stream.has_frame
-            && stream.application_frame == input.application_frame)) return stream.result;
+            && stream.application_frame == input.application_frame)) {
+      observe("repeated_application_frame");
+      return fg::Result::NOT_SERVED;
+    }
+    // A reset tagged only on a preparation frame still belongs to this owner.
+    stream.pending_xefg_game_reset |= input.reset;
     const bool service_interval_available = service_entry_ns > stream.gpu_capture_entry_ns
         && stream.gpu_capture_entry_ns != 0 && stream.has_frame
         && input.application_frame == stream.application_frame + 1;
@@ -1387,34 +1611,25 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
       }
     }
     if (slot == nullptr) return stream.result;
-    const auto type = queue->GetDesc().Type;
-    if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE) return stream.result;
-    if (slot->allocator == nullptr
-        && FAILED(device->CreateCommandAllocator(type, IID_PPV_ARGS(&slot->allocator)))) {
+    if (!BeginServiceRecording(&stream, slot)) {
       stream.result = fg::Result::FAILED;
       return stream.result;
     }
-    if (slot->list == nullptr) {
-      if (FAILED(device->CreateCommandList(0, type, slot->allocator, nullptr, IID_PPV_ARGS(&slot->list)))) {
-        stream.result = fg::Result::FAILED;
-        return stream.result;
-      }
-      slot->list->Close();
-    }
-    if (FAILED(slot->allocator->Reset()) || FAILED(slot->list->Reset(slot->allocator, nullptr))) {
-      stream.result = fg::Result::FAILED;
-      return stream.result;
-    }
-    submission::OnCommandListReset(slot->list);
+    slot->model_preparation_pending = false;
     bool submitted = false;
     bool close_attempted = false;
     const auto close_recording = [&] {
       close_attempted = true;
       return slot->list->Close();
     };
+#if defined(NR_NEXUS_DEV_CONTROL)
+    present_handoff_capture::Capture handoff_capture;
+#endif
     const auto cancel_recording = [&](Slot*) noexcept {
       if (submitted) return;
       try {
+        ResolveAdaptiveDelivery(slot->adaptive_delivery, false);
+        slot->adaptive_delivery = {};
         if (!close_attempted) {
           if (gpu_timers::internal::current.active) {
             const auto& timing = gpu_timers::internal::segments[gpu_timers::internal::current.idx];
@@ -1424,8 +1639,13 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
           }
           close_recording();
         }
-        submission::OnCommandListReset(slot->list);
-        Invalidate(&stream);
+        submission::DiscardOwnedRecording(slot->list, submission::RecordingOwner::kXeFg);
+        if (slot->model_preparation_pending) {
+          // The separate creation slot still owns its submitted model work.
+          stream.base_frame_clock.complete = false;
+        } else {
+          Invalidate(&stream);
+        }
       } catch (...) {
       }
     };
@@ -1435,14 +1655,19 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     auto decline = NrDeclineReason::kNrRuntimeUnavailable;
     if (!EnsureDirectRuntime(slot->list, &decline, true)) {
       CountNrDecline(decline);
+      observe(decline == NrDeclineReason::kRuntimeSwitchPending ? "runtime_switch_pending" : "runtime_unavailable");
       return stream.result;
     }
     fg::FrameInput nr_input = input;
+    if (!distinct_hudless) {
+      nr_input.hudless = nullptr;
+    }
     const bool exact_ui = nr_input.hudless != nullptr && input.ui_composition && input.ui_mode == 3
         && input.ui != nullptr
         && input.color_x == 0 && input.color_y == 0
         && input.ui->GetDesc().Width == input.color_width && input.ui->GetDesc().Height == input.color_height;
     if (!PrepareSurfaces(&stream, slot, nr_input, false, exact_ui)) {
+      observe("private_surfaces_unavailable");
       close_recording();
       stream.result = fg::Result::FAILED;
       return stream.result;
@@ -1537,7 +1762,7 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
       }
     };
     const auto recorded = Record(&stream, slot, slot->list, nr_input, target,
-                                 &output_ready, &recordings, exact_ui ? &composition : nullptr);
+                                 &output_ready, &recordings, exact_ui ? &composition : nullptr, true, &input);
     uint32_t process_calls = 0;
     uint32_t evaluates = 0;
     uint32_t hudless_processes = 0;
@@ -1564,7 +1789,13 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
         hudless_processes, backbuffer_processes,
         hudless_processes != 0 && backbuffer_processes != 0,
         exact_ui && hudless_processes != 0 && backbuffer_processes == 0 && output_ready);
+    if (slot->model_preparation_pending) {
+      finish_capture();
+      stream.result = recorded;
+      return stream.result;
+    }
     if (!output_ready) {
+      observe(recorded == fg::Result::PREPARED ? "model_prepared_without_color" : "model_color_unavailable");
       for (const auto& recording : recordings) {
         ResolveAdaptiveDelivery(recording.adaptive_delivery, false);
       }
@@ -1580,20 +1811,52 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
         renodx::utils::directx::NativeFromReShadeProxy(&list);
         submission::TrackUse(slot->list, slot->allocator);
         submission::TrackUse(slot->list, slot->list);
-        queue->ExecuteCommandLists(1, &list);
+        if (!fg::xefg::WithServiceWritePermission(input, false, [&] { queue->ExecuteCommandLists(1, &list); })) {
+          observe("write_permission_revoked");
+          return fg::Result::NOT_SERVED;
+        }
         submitted = true;
         slot->fence_value = ++stream.submitted;
         if (FAILED(queue->Signal(stream.fence, slot->fence_value))) slot->quarantined = true;
-      } else {
-        submission::OnCommandListReset(slot->list);
-        Invalidate(&stream);
+        submission::DiscardOwnedRecording(slot->list, submission::RecordingOwner::kXeFg);
       }
       stream.result = (slot->quarantined ? fg::Result::FAILED : recorded);
       return stream.result;
     }
+    const auto recording_id = submission::RecordingIdentity(slot->list);
+    for (const auto& color : targets) {
+      submission::TrackUse(slot->list, color.resource, submission::UseKind::kOutputColor, color);
+    }
+#if defined(NR_NEXUS_DEV_CONTROL)
+    {
+      const InjectedCommandScope injected;
+      handoff_capture.Begin(slot->list, input.backbuffer, 0, input.backbuffer_state,
+          {.producer = present_handoff_capture::Producer::XEFG, .output = input.output.swapchain,
+           .context = input.context, .epoch = input.epoch, .app_frame = input.application_frame,
+           .real_guides = stream.roles[backbuffer_processes != 0 ? 0 : 1].real_guides,
+           .source_confirmed = present_frame_policy::Known(slot->base_frame), .output_generation = input.output.generation,
+           .call = fg::xefg::ServiceCall(input), .source_sequence = slot->base_frame.sequence},
+          RECT{static_cast<LONG>(input.color_x), static_cast<LONG>(input.color_y),
+               static_cast<LONG>(input.color_x + input.color_width), static_cast<LONG>(input.color_y + input.color_height)});
+    }
+#endif
     CopyColor(slot->list, input.backbuffer, input.backbuffer_state, slot->color[0],
               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, 0, 0, input.color_x, input.color_y,
               input.color_width, input.color_height);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    {
+      const InjectedCommandScope injected;
+      const auto& delivered_source = slot->adaptive_delivery;
+      handoff_capture.RecordFinal(input.backbuffer_state,
+          {.source = (delivered_source.source != nullptr ? reinterpret_cast<uintptr_t>(delivered_source.source)
+                                                        : slot->base_frame.source),
+           .reset = (recordings[0].model_reset_mask | recordings[1].model_reset_mask) != 0,
+           .model_calls = evaluates, .reset_epoch = history_reset_epoch.load(std::memory_order_relaxed),
+           .source_generation = (delivered_source.source != nullptr ? delivered_source.source_generation
+                                                                   : slot->base_frame.generation),
+           .output_ready = output_ready, .group_complete = slot->base_frame_group.complete, .delivery_recorded = true});
+    }
+#endif
     if (nr_input.hudless != nullptr && nr_input.hudless != input.backbuffer) {
       CopyColor(slot->list, input.hudless, input.hudless_state, slot->color[1],
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, 0, 0, input.color_x, input.color_y,
@@ -1601,9 +1864,8 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     }
     finish_capture();
     if (FAILED(close_recording())) {
+      observe("private_close_failed");
       ResolveAdaptiveDelivery(slot->adaptive_delivery, false);
-      submission::OnCommandListReset(slot->list);
-      Invalidate(&stream);
       stream.result = fg::Result::FAILED;
       return stream.result;
     }
@@ -1611,10 +1873,27 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     submission::TrackUse(slot->list, slot->list);
     ID3D12CommandList* list = slot->list;
     renodx::utils::directx::NativeFromReShadeProxy(&list);
-    queue->ExecuteCommandLists(1, &list);
+    if (!color_ordered(recording_id)) return fg::Result::NOT_SERVED;
+    if (!fg::xefg::WithServiceWritePermission(input, true, [&] { queue->ExecuteCommandLists(1, &list); })) {
+      observe("write_permission_revoked");
+      return fg::Result::NOT_SERVED;
+    }
     submitted = true;
     slot->fence_value = ++stream.submitted;
-    if (FAILED(queue->Signal(stream.fence, slot->fence_value))) {
+    const bool signaled = SUCCEEDED(queue->Signal(stream.fence, slot->fence_value));
+    fg::xefg::ObserveServiceHandoff(input,
+        {.reason = (signaled ? "color_submitted" : "color_signal_failed"),
+         .recording = recording_id, .queue = reinterpret_cast<uintptr_t>(queue),
+         .fence = reinterpret_cast<uintptr_t>(stream.fence), .fence_value = slot->fence_value,
+         .completed_value = stream.fence->GetCompletedValue(), .signaled = signaled});
+    submission::DiscardOwnedRecording(slot->list, submission::RecordingOwner::kXeFg);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    handoff_capture.Submitted(queue, stream.fence, slot->fence_value, signaled);
+#endif
+    stream.xefg_delivery_output = input.output;
+    stream.awaiting_xefg_delivery = true;
+    fg::xefg::RegisterDeliveryCallback(OnXeFGPresentDelivery);
+    if (!signaled) {
       ResolveAdaptiveDelivery(slot->adaptive_delivery, false);
       slot->quarantined = true;
       if (slot->adaptive_delivery.frame.enabled) {
@@ -1630,10 +1909,7 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     }
     stream.result = fg::Result::SUBMITTED;
     stream.pending_xefg_delivery = std::exchange(slot->adaptive_delivery, {});
-    stream.xefg_delivery_output = input.output;
-    stream.awaiting_xefg_delivery = true;
     present_frame_policy::Publish(&stream.base_frame_clock, slot->base_frame, true, slot->base_frame_group.complete);
-    fg::xefg::RegisterDeliveryCallback(OnXeFGPresentDelivery);
     if (recordings[0].edit_monitor_delivery != EditReuseDelivery::NONE && nr_input.hudless == nullptr) {
       const auto surface = renodx::utils::directx::NativeIdentity(input.backbuffer);
       StoreEditReuseMonitorFrame(&stream.edit_reuse_monitor, {

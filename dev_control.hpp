@@ -621,7 +621,8 @@ inline Json Execute(const Json& request) {
   const bool marker_operation = *operation == "fg_output_marker";
   const bool consumer_operation = *operation == "fg_consumer_capture";
   const bool benchmark_operation = *operation == "sr_benchmark";
-  const bool compact_operation = marker_operation || consumer_operation || benchmark_operation
+  const bool handoff_capture_operation = *operation == "present_handoff_capture";
+  const bool compact_operation = marker_operation || consumer_operation || benchmark_operation || handoff_capture_operation
 #if defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
       || xefg_operation
 #endif
@@ -660,6 +661,10 @@ inline Json Execute(const Json& request) {
   }
   if (benchmark_operation && request.value("action", Json(nullptr)) == "status") {
     return {{"id", *id}, {"ok", true}, {"status", "observed"}, {"capture", control_mask_capture::benchmark::Status()},
+        {"state", ProcessIdentityState()}};
+  }
+  if (handoff_capture_operation && request.value("action", Json(nullptr)) == "status") {
+    return {{"id", *id}, {"ok", true}, {"status", "observed"}, {"capture", present_handoff_capture::Status()},
         {"state", ProcessIdentityState()}};
   }
   if (*operation == "status") {
@@ -718,6 +723,39 @@ inline Json Execute(const Json& request) {
   const bool configuration_busy = shutting_down.load() || slider_pending != nullptr || stage_edit::pending || resolution_edit::pending
       || stage_edit_request.setting != nullptr || !resolution_edit_request.empty() || profile_ui::Busy()
       || profile_ui::pending_action != profile_ui::Action::NONE || preset_ui::manager_geometry.was_open;
+  if (handoff_capture_operation) {
+    const auto action = request.value("action", Json(nullptr));
+    const auto capture_id = request.find("capture_id");
+    response["reason"] = "invalid_capture_request";
+    if (capture_id == request.end() || !capture_id->is_string()) return finish();
+    const auto& name = capture_id->get_ref<const std::string&>();
+    if (action == "stop") {
+      const bool stopped = present_handoff_capture::Stop(name);
+      response["ok"] = stopped;
+      response["status"] = (stopped ? "stopping" : "rejected");
+      response["reason"] = (stopped ? "explicit_stop" : "capture_not_active");
+    } else if (action == "arm") {
+      const auto directory = request.find("run_directory");
+      const auto start_on_real_guides = request.value("start_on_real_guides", Json(false));
+      if (directory == request.end() || !directory->is_string() || !start_on_real_guides.is_boolean()) return finish();
+      if (shutting_down.load()) {
+        response["reason"] = "shutting_down";
+      } else {
+        const auto& path = directory->get_ref<const std::string&>();
+        try {
+          const std::string_view reason = present_handoff_capture::Arm(
+              std::filesystem::path(std::u8string(path.begin(), path.end())), name, start_on_real_guides.get<bool>());
+          response["ok"] = (reason == "queued");
+          response["status"] = (reason == "queued" ? "queued" : "rejected");
+          response["reason"] = reason;
+        } catch (...) {
+          response["reason"] = "capture_arm_failed";
+        }
+      }
+    }
+    response["capture"] = present_handoff_capture::Status();
+    return finish();
+  }
   if (benchmark_operation) {
     namespace benchmark = control_mask_capture::benchmark;
     const auto action = request.value("action", Json(nullptr));

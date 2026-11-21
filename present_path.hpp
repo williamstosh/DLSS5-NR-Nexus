@@ -422,6 +422,7 @@ struct PresentGuideSet {
   ID3D12Resource* depth = nullptr;
   const void* device_identity = nullptr;
   const NVSDK_NGX_Handle* source_handle = nullptr;  // compared only
+  output_framerate::OutputIdentity output;
   // 0 = never captured.
   uint64_t serial = 0;
   uint64_t comparison_request = 0;  // F5 request whose inline pass was bypassed
@@ -466,6 +467,7 @@ struct PresentRing {
   ID3D12CommandQueue* queue = nullptr;
   ID3D12Fence* fence = nullptr;
   uint64_t submitted = 0;
+  bool handoff_wait_timed_out = false;
   PresentSlot slots[kPresentRing];
 };
 
@@ -474,6 +476,7 @@ struct PresentRing {
 // Streamline path keys its synthetic streams the same way; never
 // dereferenced).
 struct PresentStream {
+  output_framerate::OutputIdentity output;
   present_frame_policy::Clock base_frame_clock;
   bool base_history_unbound = false;
   PresentEditReuseMonitor edit_reuse_monitor;
@@ -688,12 +691,42 @@ inline bool PresentRingComplete() {
       : present_ring.fence->GetCompletedValue() >= present_ring.submitted;
 }
 
-// Poll only: a device-face switch may run here while another queue is busy.
-// The former bounded wait released list allocators after timeout, beneath
-// their GPU work. Keep the ring AND guide read values intact until complete;
-// EnsurePresentRing retries then, so captures cannot overwrite guides still
-// read by the old ring. Caller holds runtime_mutex.
-inline bool ReleasePresentRing() {
+// Default retirement polls. An explicit Provider handoff may wait once for
+// this owner's submitted work. A timeout keeps the entire ring and guide
+// read values intact, and later attempts poll until GPU completion.
+// Caller holds runtime_mutex.
+inline bool ReleasePresentRing(bool wait_for_handoff = false) {
+  // This pool always resets a slot before recording its next submission.
+  // Retiring it ends future replay now; the fence still owns every in-flight
+  // reference and must complete before any list or allocator is released.
+  for (PresentSlot& slot : present_ring.slots) {
+    submission::DiscardOwnedRecording(slot.list, submission::RecordingOwner::kOrdinaryPresent);
+  }
+  if (!PresentRingComplete() && wait_for_handoff && !present_ring.handoff_wait_timed_out) {
+    const auto started_ns = SteadyNowNs();
+    const auto before = present_ring.fence != nullptr ? present_ring.fence->GetCompletedValue() : 0;
+    std::vector<submission::RecordingBlocker> blockers;
+    submission::InspectRecordedWork([](uint64_t, uint64_t, const auto& generation) {
+      return generation.owner == submission::RecordingOwner::kOrdinaryPresent;
+    }, &blockers);
+    LogRecordedWorkBlockers("ordinary Present handoff before wait", blockers);
+    if (present_ring.fence != nullptr) {
+      if (HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr)) {
+        if (SUCCEEDED(present_ring.fence->SetEventOnCompletion(present_ring.submitted, event))) {
+          WaitForSingleObject(event, kPresentSlotWaitMs);
+        }
+        CloseHandle(event);
+      }
+    }
+    present_ring.handoff_wait_timed_out = !PresentRingComplete();
+    std::ostringstream message;
+    message << "ordinary Present handoff wait: queue=" << present_ring.queue << ", fence=" << present_ring.fence
+            << ", required=" << present_ring.submitted << ", completed_before=" << before
+            << ", completed_after=" << (present_ring.fence != nullptr ? present_ring.fence->GetCompletedValue() : 0)
+            << ", duration_ms=" << (SteadyNowNs() - started_ns) / 1e6
+            << ", timed_out=" << present_ring.handoff_wait_timed_out;
+    Log(reshade::log::level::info, message.str());
+  }
   if (!PresentRingComplete()) return false;
   for (PresentSlot& slot : present_ring.slots) {
     if (slot.list != nullptr) submission::OnCommandListDestroyed(slot.list);
@@ -1098,8 +1131,7 @@ inline PresentGuideSet* NextPresentCaptureSet() {
   PresentGuideSet* target = nullptr;
   for (PresentGuideSet& set : present_guide_sets) {
     if (&set == last_read || (done != UINT64_MAX && set.read_value > done)
-        || ((ObservesPresentBaseFrames() || ObservesAdaptiveSourceDelivery()) && !set.d3d11
-            && !submission::ResourceReleasable(set.marker))) continue;
+        || (!set.d3d11 && !submission::ResourceReleasable(set.marker))) continue;
     if (target == nullptr || set.serial < target->serial) target = &set;
   }
   if (target == nullptr) present_capture_busy.fetch_add(1, std::memory_order_relaxed);
@@ -1119,6 +1151,7 @@ inline void StampPresentCapture(PresentGuideSet* set, const FeatureState& contra
                                 bool d3d11) {
   set->serial = ++present_capture_serial;
   set->mixed_predecessor = false;
+  set->output = {};
   set->captured_at = present_generation;
   set->captured_ns = SteadyNowNs();
   set->contract = contract;
@@ -1229,6 +1262,16 @@ inline void CapturePresentGuides(
     D3D12_RESOURCE_STATES motion_state,
     D3D12_RESOURCE_STATES depth_state, bool mixed_predecessor, bool successful_dlss_sr) {
   ID3D12Resource* const output = GetD3D12Resource(parameters, NVSDK_NGX_Parameter_Output);
+  if (successful_dlss_sr && output != nullptr) {
+    const auto resource = renodx::utils::directx::NativeIdentity(output);
+    if (output_framerate::FindPresentOutput(0, reinterpret_cast<uintptr_t>(resource))) {
+      submission::SetRecordingOwner(command_list, submission::RecordingOwner::kBorrowedGame, true);
+      const auto source = features.find(handle);
+      submission::TrackUse(command_list, output, submission::UseKind::kOutputColor,
+          {.resource = resource, .subresource = 0,
+           .version = source != features.end() ? source->second.sr_sequence : 0});
+    }
+  }
   // One capture per evaluate chain, admitted like an after-path pass: a real
   // NGX entry owns the stream, so the same slEvaluateFeature's Streamline
   // fallback stays out, and the outer entry of a plugin->core chain is the
@@ -1250,9 +1293,23 @@ inline void CapturePresentGuides(
     }
   }
   if (!mixed_predecessor) CountNrDecline(NrDeclineReason::kPresentHook);
-  // XeFG consumes its SDK tags. Pause ordinary source-list copies through
-  // both provider handoffs so they cannot keep the recorded-work gate busy.
-  if (!mixed_predecessor && (fg::xefg::OwnsStream() || direct_api.private_instance)) return;
+  output_framerate::OutputIdentity capture_output;
+  if (output != nullptr) {
+    const auto resource = renodx::utils::directx::NativeIdentity(output);
+    capture_output = output_framerate::FindPresentOutput(0, reinterpret_cast<uintptr_t>(resource));
+    if (!capture_output) {
+      if (const auto source = features.find(handle); source != features.end()) {
+        capture_output = output_framerate::FindSourceOutput({.handle = reinterpret_cast<uintptr_t>(handle),
+            .generation = source->second.source_generation,
+            .device = reinterpret_cast<uintptr_t>(source->second.source_device12_identity.Get()),
+            .resource = reinterpret_cast<uintptr_t>(resource), .resource_generation = AdaptiveResourceGeneration(output)});
+      }
+    }
+  }
+  // SDK tags supply this output's guides while it is owned by XeFG. Copies
+  // for an independent output have their own lifetime and remain useful.
+  if (!mixed_predecessor && capture_output && !fg::xefg::QueryOrdinaryPresent(0,
+          reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(output)), capture_output).allowed) return;
   if (diagnostics::GuideMode(debug_guide_mode.load(std::memory_order_relaxed),
                             present_guides.load(std::memory_order_relaxed)) == kPresentGuidesNever
       && !screenshot::WantsFinalPresent() && !mixed_predecessor) return;
@@ -1306,7 +1363,7 @@ inline void CapturePresentGuides(
           .recording = submission::RecordingIdentity(command_list),
           .native_list = native_list,
           .sequence = source->second.sr_sequence, .source_generation = source->second.source_generation,
-          .source_resource_generation = (nr_adaptive_enabled.load() ? AdaptiveResourceGeneration(output) : 0),
+          .source_resource_generation = AdaptiveResourceGeneration(output),
           .configuration = configuration_generation.load(std::memory_order_relaxed)};
     }
   }
@@ -1387,11 +1444,13 @@ inline void CapturePresentGuides(
   StampPresentCapture(target, contract, static_cast<uint32_t>(output_desc.Width),
                       output_desc.Height, false);
   target->mixed_predecessor = mixed_predecessor;
+  target->output = capture_output;
   target->base_frame = base_frame;
   target->marker = reinterpret_cast<const void*>(kPresentGuideMarkerPrefix | target->serial);
-  submission::TrackUse(command_list, target->motion);
-  submission::TrackUse(command_list, target->depth);
-  submission::TrackUse(command_list, target->marker);
+  submission::SetRecordingOwner(command_list, submission::RecordingOwner::kBorrowedGame);
+  submission::TrackUse(command_list, target->motion, submission::UseKind::kIndependentGuide);
+  submission::TrackUse(command_list, target->depth, submission::UseKind::kIndependentGuide);
+  submission::TrackUse(command_list, target->marker, submission::UseKind::kIndependentGuide);
   if (target->base_frame.source != nullptr) {
     present_source_lists[target - present_guide_sets].store(base_frame.native_list, std::memory_order_release);
     present_base_capture_active.store(true, std::memory_order_relaxed);
@@ -1440,7 +1499,8 @@ inline void CaptureAdaptivePresentSource(ID3D12GraphicsCommandList* list,
       .source_generation = source->second.source_generation, .source_resource_generation = generation,
       .configuration = configuration_generation.load(std::memory_order_relaxed)};
   capture->marker = reinterpret_cast<const void*>(kPresentGuideMarkerPrefix | ++present_capture_serial);
-  submission::TrackUse(list, capture->marker);
+  submission::SetRecordingOwner(list, submission::RecordingOwner::kBorrowedGame);
+  submission::TrackUse(list, capture->marker, submission::UseKind::kIndependentGuide);
   present_source_lists[capture - present_guide_sets].store(native_list, std::memory_order_release);
 }
 
@@ -2945,9 +3005,11 @@ inline bool YieldPresentToNativeFg() {
 #include "native_fg_tag_source.hpp"
 #include "fg_native.hpp"
 
-inline bool ResumeOrdinaryPresentLocked(ID3D12GraphicsCommandList* command_list = nullptr) {
+inline bool ResumeOrdinaryPresentLocked(ID3D12GraphicsCommandList* command_list = nullptr,
+    const output_framerate::OutputIdentity& output = {}, ID3D12Resource* backbuffer = nullptr) {
+  if (backbuffer != nullptr && !fg::xefg::QueryOrdinaryPresent(0,
+          reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(backbuffer)), output).allowed) return false;
   if (!direct_api.private_instance) return true;
-  if (fg::xefg::OwnsStream()) return false;
   if (command_list != nullptr) {
     auto decline = NrDeclineReason::kNrRuntimeUnavailable;
     if (!EnsureDirectRuntime(command_list, &decline, false)) {
@@ -2966,7 +3028,37 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     bridge::OwnedParameters& block, PresentGuideSet* guides, PresentTarget& target,
     bool neutral_model, const std::vector<std::pair<FenceRef, uint64_t>>& waits,
     PresentQueueOrder* base_order = nullptr) {
-  if (!ResumeOrdinaryPresentLocked(slot->list)) return false;
+  auto* const backbuffer = GetD3D12Resource(&block, NVSDK_NGX_Parameter_Output);
+  const auto write_access = fg::xefg::QueryOrdinaryPresent(target.swapchain_identity,
+      reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(backbuffer)), target.adaptive_output);
+  if (!write_access.allowed) {
+    fg::xefg::ObserveOrdinaryPresentSubmission(write_access, {.reason = "output_write_permission_unavailable"});
+    return false;
+  }
+  const auto output_write_ordered = [&](const std::pair<uint64_t, uint64_t>& recording) {
+    FenceRef ordered_fence;
+    {
+      std::shared_lock completion_lock(queue_completion_mutex);
+      if (const auto completion = queue_completions.find(native_queue); completion != queue_completions.end()) {
+        ordered_fence = FenceRef(completion->second.fence);
+      }
+    }
+    const submission::OutputUse color{.resource = renodx::utils::directx::NativeIdentity(backbuffer),
+        .subresource = 0, .version = target.base_frame.sequence};
+    if (submission::OutputWriteOrdered(color, recording, ordered_fence.fence)) return true;
+    std::vector<submission::RecordingBlocker> blockers;
+    submission::OutputWriteOrdered(color, recording, ordered_fence.fence, &blockers);
+    LogRecordedWorkBlockers("ordinary Present output conflict", blockers);
+    fg::xefg::ObserveOrdinaryPresentSubmission(write_access,
+        {.reason = "conflicting_output_recording", .recording = recording});
+    CountNrDecline(NrDeclineReason::kPresentBusy);
+    return false;
+  };
+  if (!output_write_ordered(submission::RecordingIdentity(slot->list))) return false;
+  if (!ResumeOrdinaryPresentLocked(slot->list, target.adaptive_output, backbuffer)) {
+    fg::xefg::ObserveOrdinaryPresentSubmission(write_access, {.reason = "runtime_unavailable"});
+    return false;
+  }
   if (present_ring.queue != native_queue) {
     if (!PresentRingComplete()) return false;
     native_queue->AddRef();
@@ -2982,13 +3074,19 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
       && stream.fg_multiplier == 1;
   const bool independent_pair = PresentResolutionPairAllowed(target);
   const auto* const handle = stream.Handle(neutral_model);
-  const auto existing_feature = features.find(handle);
-  const bool report_adaptive = target.adaptive_output
-      && (nr_adaptive_enabled.load() || (existing_feature != features.end() && existing_feature->second.adaptive_session));
   bool recording_started = false;
+  bool recording_closed = false;
   bool submitted = false;
   bool adaptive_delivered = false;
   NrRecording recording;
+  const auto execute_owned = [&](ID3D12CommandList* list) {
+    struct CommitScope {
+      PresentQueueOrder* previous;
+      ~CommitScope() { committing_present_queue = previous; }
+    };
+    const CommitScope commit{std::exchange(committing_present_queue, base_order)};
+    native_queue->ExecuteCommandLists(1, &list);
+  };
   const auto cancel = [&](int*) {
     if (target.adaptive_output && !adaptive_delivered && recording.adaptive_delivery.frame.session != nullptr) {
       ResolveAdaptiveDelivery(recording.adaptive_delivery, false);
@@ -2997,10 +3095,11 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
       stream.base_frame_clock.complete = false;
       stream.base_history_unbound = true;
     }
-    if ((!mixed && !independent_pair && !base_frame && !identified_frame) || !recording_started || submitted) return;
+    if (!recording_started || submitted) return;
     // CPU-side NGX/state ledgers may have advanced even if Close failed.
     // Discard the recording and retire its private state before another try.
-    submission::OnCommandListReset(slot->list);
+    if (!recording_closed) slot->list->Close();
+    submission::DiscardOwnedRecording(slot->list, submission::RecordingOwner::kOrdinaryPresent);
     if (auto feature = features.find(handle); feature != features.end()) {
       ReleaseAllNrSlots(feature->second, true);
       if (base_frame || identified_frame) {
@@ -3021,6 +3120,65 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
   }
   recording_started = true;
   submission::OnCommandListReset(slot->list);
+  submission::SetRecordingOwner(slot->list, submission::RecordingOwner::kOrdinaryPresent);
+  NrModelPreparationResult preparation;
+  const auto pending_preparation = [&] {
+    // This attempt has no new creation or color work. The earlier preparation
+    // owns its own submission proofs; a later output's ring value is unrelated.
+    const bool closed = SUCCEEDED(slot->list->Close());
+    submission::DiscardOwnedRecording(slot->list, submission::RecordingOwner::kOrdinaryPresent);
+    recording_started = false;
+    fg::xefg::ObserveOrdinaryPresentSubmission(write_access,
+        {.reason = closed ? "model_preparation_pending" : "model_preparation_close_failed",
+         .recording = preparation.recording != nullptr
+             ? std::pair{preparation.recording->list, preparation.recording->generation} : std::pair<uint64_t, uint64_t>{}});
+    return false;
+  };
+  if (!PrepareNrModels(slot->list, handle, &block, target, &preparation)) return false;
+  if (preparation.state == NrModelPreparationState::PENDING) return pending_preparation();
+  if (preparation.state == NrModelPreparationState::RECORDED) {
+    if (FAILED(slot->list->Close())) return false;
+    recording_closed = true;
+    ID3D12CommandList* prepared_list = slot->list;
+    renodx::utils::directx::NativeFromReShadeProxy(&prepared_list);
+    execute_owned(prepared_list);
+    slot->value = ++present_ring.submitted;
+    const bool signaled = SUCCEEDED(native_queue->Signal(present_ring.fence, slot->value));
+    submission::DiscardOwnedRecording(slot->list, submission::RecordingOwner::kOrdinaryPresent);
+    // This is initialization, with no color publication to cancel. Its
+    // model and allocator stay owned until the actual preparation completes.
+    recording_started = false;
+    if (!signaled) return false;
+  }
+  if (preparation.state != NrModelPreparationState::READY) {
+    if (preparation.state == NrModelPreparationState::FAILED || preparation.recording == nullptr) return false;
+    const auto waiting_started_ns = SteadyNowNs();
+    const uint64_t value = present_ring.submitted;
+    if (present_ring.fence->GetCompletedValue() < value) {
+      HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+      if (event == nullptr) return false;
+      const bool completed = SUCCEEDED(present_ring.fence->SetEventOnCompletion(value, event))
+          && WaitForSingleObject(event, kPresentSlotWaitMs) == WAIT_OBJECT_0;
+      CloseHandle(event);
+      if (!completed) return false;
+    }
+    if (present_ring.fence->GetCompletedValue() == UINT64_MAX) return false;
+    if (!recording_started) {
+      if (FAILED(slot->allocator->Reset()) || FAILED(slot->list->Reset(slot->allocator, nullptr))) return false;
+      submission::OnCommandListReset(slot->list);
+      submission::SetRecordingOwner(slot->list, submission::RecordingOwner::kOrdinaryPresent);
+      recording_started = true;
+      recording_closed = false;
+    }
+    const bool prepared = PrepareNrModels(slot->list, handle, &block, target, &preparation);
+    if (preparation.state == NrModelPreparationState::PENDING) return pending_preparation();
+    if (!prepared || preparation.state != NrModelPreparationState::READY) return false;
+    std::ostringstream message;
+    message << "ordinary Present preparation completed before color: output=" << target.adaptive_output.swapchain
+            << ", generation=" << target.adaptive_output.generation << ", fence=" << present_ring.fence
+            << ", value=" << value << ", wait_ms=" << (SteadyNowNs() - waiting_started_ns) / 1e6;
+    Log(reshade::log::level::info, message.str());
+  }
   target.control_mask_depth_proof = nullptr;
   bool depth_rule_requested = false;
   if (!base_frame && identified_frame && target.depth_matches_color.value_or(false)
@@ -3057,19 +3215,30 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
   // Our own list has no host state for the restore-target gate to wait on.
   gate_ever_opened.store(true, std::memory_order_relaxed);
   bool touched = false;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  present_handoff_capture::Capture handoff_capture;
+  const auto& handoff_stats = stage_telemetry[static_cast<size_t>(stage_plan::Stage::PRESENT)];
+  const uint64_t handoff_evaluates = handoff_stats.evaluates;
+  const uint64_t handoff_resets = handoff_stats.resets;
+  handoff_capture.Begin(slot->list, backbuffer, 0, target.output_state,
+      {.producer = present_handoff_capture::Producer::ORDINARY, .output = target.adaptive_output.swapchain,
+       .context = write_access.context, .epoch = write_access.epoch,
+       .real_guides = guides != nullptr, .source_confirmed = identified_frame,
+       .output_generation = target.adaptive_output.generation,
+       .call = write_access.call, .source_sequence = target.base_frame.sequence});
+#endif
   {
     const EvaluateChainScope chain_scope;
     const int64_t started_ns = SteadyNowNs();
     const auto previous_capture_serial = screenshot::PendingModelCaptureSerial(slot->list);
     // From here ProcessInline names the terminal.
-    const bool accepted = ProcessInline(slot->list, handle, &block, &touched, &target,
-        (mixed || base_frame || identified_frame || report_adaptive) ? &recording : nullptr);
-    if (report_adaptive && !mixed && !base_frame && !identified_frame && recording.output_ready) {
+    const bool accepted = ProcessInline(slot->list, handle, &block, &touched, &target, &recording);
+    if (!mixed && !base_frame && !identified_frame && recording.output_ready) {
       PublishPresentRestoreOwner(target.domain, target.restore_decision.reason, target.restore_contract_compatible,
           target.service_serial, target.restore_config_epoch, "nr_recorded");
     }
     if (base_frame && !accepted) {
-      slot->list->Close();
+      recording_closed = SUCCEEDED(slot->list->Close());
       return false;
     }
     const auto capture_serial = screenshot::PendingModelCaptureSerial(slot->list);
@@ -3097,9 +3266,24 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     }
     RecordInjectionCpu(started_ns);
   }
+#if defined(NR_NEXUS_DEV_CONTROL)
+  handoff_capture.RecordFinal(target.output_state,
+      {.source = target.base_frame.source, .reset = handoff_stats.resets != handoff_resets,
+       .model_calls = static_cast<uint32_t>(handoff_stats.evaluates - handoff_evaluates),
+       .reset_epoch = history_reset_epoch.load(std::memory_order_relaxed),
+       .source_generation = target.diagnostic_source_generation,
+       .output_ready = recording.output_ready, .group_complete = recording.group_complete,
+       .delivery_recorded = recording.output_ready});
+#endif
   submission::TrackUse(slot->list, motion);
   submission::TrackUse(slot->list, depth);
+  if (recording.output_ready) {
+    submission::TrackUse(slot->list, backbuffer, submission::UseKind::kOutputColor,
+        {.resource = renodx::utils::directx::NativeIdentity(backbuffer), .subresource = 0,
+         .version = target.base_frame.sequence});
+  }
   const bool closed = SUCCEEDED(slot->list->Close());
+  recording_closed = closed;
   if (!touched) return false;
   if (!closed) {
     LogPresent(reshade::log::level::error,
@@ -3139,20 +3323,31 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
   if (target.control_mask_depth_proof != nullptr) {
     std::memcpy(slot->control_mask_depth_proof_value, &depth_current, sizeof(depth_current));
   }
-  {
+  if (!output_write_ordered(submission::RecordingIdentity(slot->list))) return false;
+  const bool write_permitted = fg::xefg::WithOrdinaryPresentCommit(write_access, [&] {
     // Our own Execute joins the existing tracker without reopening the
     // application's handoff or being counted as a later game submission.
-    struct CommitScope {
-      PresentQueueOrder* previous;
-      ~CommitScope() { committing_present_queue = previous; }
-    };
-    const CommitScope commit{std::exchange(committing_present_queue, base_order)};
-    native_queue->ExecuteCommandLists(1, &list);
+    execute_owned(list);
+  });
+  if (!write_permitted) {
+    fg::xefg::ObserveOrdinaryPresentSubmission(write_access,
+        {.reason = "write_permission_revoked", .recording = submission::RecordingIdentity(slot->list)});
+    CountNrDecline(NrDeclineReason::kPresentPreFg);
+    return false;
   }
   if (present_order.owns_lock()) present_order.unlock();
   submitted = true;
   slot->value = ++present_ring.submitted;
   const bool signaled = SUCCEEDED(native_queue->Signal(present_ring.fence, slot->value));
+  submission::DiscardOwnedRecording(slot->list, submission::RecordingOwner::kOrdinaryPresent);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  handoff_capture.Submitted(native_queue, present_ring.fence, slot->value, signaled);
+#endif
+  fg::xefg::ObserveOrdinaryPresentSubmission(write_access,
+      {.reason = (signaled ? "submitted" : "signal_failed"), .recording = submission::RecordingIdentity(slot->list),
+       .queue = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(native_queue)),
+       .fence = reinterpret_cast<uintptr_t>(present_ring.fence), .fence_value = slot->value,
+       .completed_value = present_ring.fence->GetCompletedValue(), .signaled = signaled});
   if (target.adaptive_output && signaled && (!identified_frame || frame_ordered)
       && recording.adaptive_delivery.complete && recording.output_ready && recording.group_complete) {
     ResolveAdaptiveDelivery(recording.adaptive_delivery, true);
@@ -3388,6 +3583,9 @@ inline void ObservePresentSourceCopy(ID3D12GraphicsCommandList* list, ID3D12Reso
     }
     frame.backbuffer = output;
     frame.swapchain_epoch = target->base_frame_epoch;
+    set.output = target->output;
+    submission::TrackUse(list, destination, submission::UseKind::kOutputColor,
+        {.resource = output, .subresource = 0, .version = frame.sequence});
   }
 }
 
@@ -4066,6 +4264,12 @@ inline bool RunPresentBaseFrame(ID3D12CommandQueue* native_queue, reshade::api::
 inline void RunPresentPath(
     reshade::api::command_queue* queue, reshade::api::swapchain* swapchain,
     bool auto_fallback = false, bool deferred = false) {
+  const auto backbuffer = (swapchain != nullptr ? swapchain->get_current_back_buffer() : reshade::api::resource{});
+  const auto output = (swapchain != nullptr
+      ? output_framerate::MatchPresentOutput(reinterpret_cast<uintptr_t>(swapchain), backbuffer.handle)
+      : output_framerate::OutputIdentity{});
+  const auto ordinary_access = fg::xefg::QueryOrdinaryPresent(
+      (swapchain != nullptr ? static_cast<uintptr_t>(swapchain->get_native()) : 0), backbuffer.handle, output);
   // An armed request can reach Present without another source Evaluate.
   if (screenshot::WantsFinalPresent()) {
     RejectMixedFinalPresent(RequestedStagePlan());
@@ -4075,9 +4279,9 @@ inline void RunPresentPath(
       && swapchain != nullptr && swapchain->get_device() != nullptr
       && swapchain->get_device()->get_api() == reshade::api::device_api::d3d12;
   const bool ordinary_base_frames = !auto_fallback && ObservesPresentBaseFrames()
-      && !screenshot::WantsFinalPresent() && !fg::xefg::OwnsStream();
+      && !screenshot::WantsFinalPresent() && ordinary_access.allowed;
   const bool adaptive_source_delivery = !auto_fallback && ObservesAdaptiveSourceDelivery()
-      && !screenshot::WantsFinalPresent() && !fg::xefg::OwnsStream();
+      && !screenshot::WantsFinalPresent() && ordinary_access.allowed;
   const bool observes_source_delivery = ordinary_base_frames || adaptive_source_delivery;
   // Resolve unsupported requests before the route's early return: Vulkan
   // and the D3D11 foreign/off routes never satisfy PresentHookServes().
@@ -4124,14 +4328,34 @@ inline void RunPresentPath(
       }
     }
   }
-  if (fg::xefg::OwnsStream()) {
-    if (observed_present_queue.load(std::memory_order_acquire) != nullptr) {
-      RuntimeLock lock(runtime_mutex);
-      for (auto& [_, stream] : present_streams) {
-        InvalidatePresentBaseFrames(&stream);
+  if (!ordinary_access.allowed) {
+    fg::xefg::ObserveOrdinaryPresentSubmission(ordinary_access, {.reason = "xefg_color_owned_or_pending"});
+    RuntimeLock lock(runtime_mutex);
+    const auto stream = present_streams.find(swapchain);
+    for (auto& set : present_guide_sets) {
+      const bool same_output = output && set.output.swapchain == output.swapchain && set.output.device == output.device;
+      const bool unknown_output = !set.output && (output.device == 0
+          || reinterpret_cast<uintptr_t>(set.device_identity) == output.device);
+      const bool same_source_epoch = stream != present_streams.end() && stream->second.base_frame_epoch != 0
+          && set.base_frame.swapchain_epoch == stream->second.base_frame_epoch;
+      // A stream may have belonged to XeFG from its first Present. Unknown
+      // captures cannot survive that ownership interval as this output's
+      // fallback guides. Proven independent outputs keep their own captures.
+      if (same_output || unknown_output || same_source_epoch) {
+        set.serial = 0;
+        ClearPresentSource(&set);
       }
-      ReleasePresentQueueOrder();
-      present_base_capture_active.store(false, std::memory_order_relaxed);
+    }
+    if (stream != present_streams.end()) {
+      InvalidatePresentBaseFrames(&stream->second);
+    }
+    if (observed_present_queue.load(std::memory_order_acquire) != nullptr) {
+      if (std::ranges::none_of(present_streams, [](const auto& entry) {
+            return entry.second.base_frame_epoch != 0;
+          })) {
+        ReleasePresentQueueOrder();
+        present_base_capture_active.store(false, std::memory_order_relaxed);
+      }
     }
     return;
   }
@@ -4139,6 +4363,7 @@ inline void RunPresentPath(
       && swapchain->get_device()->get_api() == reshade::api::device_api::d3d12) {
     RuntimeLock lock(runtime_mutex);
     auto& stream = present_streams[swapchain];
+    stream.output = output;
     std::vector<const void*> buffers;
     const uint32_t count = swapchain->get_back_buffer_count();
     if (count <= 16) {
@@ -4313,8 +4538,7 @@ inline void RunPresentPath(
     CountNrDecline(NrDeclineReason::kTeardownPending);
     return;
   }
-  const uintptr_t back_handle =
-      static_cast<uintptr_t>(swapchain->get_current_back_buffer().handle);
+  const uintptr_t back_handle = static_cast<uintptr_t>(backbuffer.handle);
   ID3D12Resource* back = nullptr;
   ID3D11Texture2D* back11 = nullptr;
   uint32_t back_width = 0;
@@ -4381,7 +4605,7 @@ inline void RunPresentPath(
   target.domain = present_restore_scope::Domain::FINAL_PRESENT;
   SnapshotPresentRestoreConfiguration(&target);
   target.swapchain_identity = reinterpret_cast<uintptr_t>(swapchain);
-  target.adaptive_output = output_framerate::MatchPresentOutput(target.swapchain_identity, back_handle);
+  target.adaptive_output = output;
   target.swapchain_format = back_format;
   target.hdr_color_space = color_space;
   target.d3d11_bridge = d3d11;
@@ -4559,6 +4783,7 @@ inline void RunPresentPath(
     LogPresent(reshade::log::level::info, "the swapchain can be served again");
   }
   PresentStream& stream = present_streams[swapchain];
+  stream.output = target.adaptive_output;
   // A matching DLSS-G declaration is authoritative. When absent, timing
   // needs two complete, consistent windows; hitches do not change NR's
   // motion contract. Count before ring readiness so busy NR does not lower
@@ -4566,6 +4791,7 @@ inline void RunPresentPath(
   const int64_t now_ns = SteadyNowNs();
   const auto fresh = [&](const PresentGuideSet& set) {
     return set.serial != 0 && set.d3d11 == d3d11
+           && (!set.output || set.output == target.adaptive_output)
            && set.device_identity == stream.device_identity
            && PresentAspectMatches(set.output_width, set.output_height, back_width, back_height)
            && (present_generation - set.captured_at <= kPresentGuideMaxAge * stream.fg_multiplier
@@ -4783,7 +5009,10 @@ inline void RunPresentPath(
   }
   // Required guides resume on the next source evaluate after adoption.
   // Waiting for them first would leave the private provider selected forever.
-  if (!d3d11 && !ResumeOrdinaryPresentLocked(present_ring.slots[0].list)) return;
+  if (!d3d11 && !ResumeOrdinaryPresentLocked(present_ring.slots[0].list, target.adaptive_output, back)) {
+    fg::xefg::ObserveOrdinaryPresentSubmission(ordinary_access, {.reason = "runtime_unavailable"});
+    return;
+  }
 
   // Direct3D 12 records on the path's own ring; Direct3D 11 on the bridge's.
   // A busy slot is waited for, bounded (kPresentSlotWaitMs), outside
@@ -4850,7 +5079,7 @@ inline void RunPresentPath(
   // fence, so every token is another queue's.
   auto* native_queue = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
   if (!d3d11 && ordinary_base_frames && WantsPresentBaseFrames()
-      && !fg::xefg::OwnsStream() && !screenshot::WantsFinalPresent()) {
+      && !screenshot::WantsFinalPresent()) {
     if (native_passthrough || deferred) {
       InvalidatePresentBaseFrames(&stream);
       ++edit_reuse_fallbacks;
@@ -4977,6 +5206,7 @@ inline void RunPresentPath(
       CountNrDecline(NrDeclineReason::kScreenshotWait);
       return;
     }
+    fg::xefg::ObserveOrdinaryPresentSubmission(ordinary_access, {.reason = "required_guides_unavailable"});
     CountNrDecline(NrDeclineReason::kPresentNoGuides);
     return;
   }

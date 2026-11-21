@@ -16,6 +16,7 @@
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -556,16 +557,22 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
         upload(target, OVERWRITE_PIXEL, PRESENT);
       }
     };
+    const auto retire_game_producer = [&] {
+      reopen();
+      Check(SUCCEEDED(gpu.list->Close()), "retire the completed producer before Present");
+    };
     const auto present_frame = [&](bool reset = false, bool recycle_recording = false) {
       record(reset);
       const uint64_t queue_entries = native::queue_submit_entries.load();
       submit();
       Check(native::queue_submit_entries.load() == queue_entries + 1, "one hooked native producer Execute precedes Present");
       if (recycle_recording) {
-        reopen();
-        Check(SUCCEEDED(gpu.list->Close()), "retire the completed producer before Present");
+        retire_game_producer();
       }
       event();
+    };
+    const auto present_closed_frame = [&](bool reset = false) {
+      present_frame(reset, true);
     };
     const auto alpha_preserved = [&](const std::vector<Pixel>& pixels) {
       for (const auto& pixel : pixels) {
@@ -575,20 +582,56 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     const auto unchanged_pixels = [&](const std::vector<Pixel>& pixels, Pixel expected) {
       Check(pixels == std::vector(size * size, expected), "Present x2 untouched backbuffer has exact game pixels");
     };
+    const auto next_execute = [] {
+      const std::lock_guard lock(submission::tracker_mutex);
+      return submission::next_execute;
+    };
+    const auto present_submissions = [&](uint64_t first_execute) {
+      size_t preparation = 0;
+      size_t color = 0;
+      const auto backbuffer = renodx::utils::directx::NativeIdentity(back());
+      const std::lock_guard lock(submission::tracker_mutex);
+      for (const auto& [list_id, list] : submission::tracked_lists) {
+        for (const auto& [generation, recording] : list.generations) {
+          if (recording.owner != submission::RecordingOwner::kOrdinaryPresent
+              || recording.first_execute < first_execute) continue;
+          const bool writes_backbuffer = std::ranges::any_of(recording.classified_uses, [&](const auto& use) {
+            return use.kind == submission::UseKind::kOutputColor && use.output.resource == backbuffer
+                && use.output.subresource == 0;
+          });
+          Check(std::ranges::all_of(recording.submissions, [](const auto& receipt) {
+            if (receipt.pending || receipt.fence.empty()) return false;
+            const auto completed = receipt.fence->GetCompletedValue();
+            return completed != UINT64_MAX && completed >= receipt.value;
+          }), "the new actual recording generations have completed submission proof");
+          if (writes_backbuffer) {
+            color += recording.submissions.size();
+          } else {
+            preparation += recording.submissions.size();
+          }
+        }
+      }
+      return std::pair{preparation, color};
+    };
     const auto warm = [&](bool require_prepared, uint32_t resize_from = 0) {
       bool prepared = false;
       bool delivered_while_settling = false;
       for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8; ++attempt) {
         const auto before = stats();
-        present_frame();
+        const auto first_execute = next_execute();
+        present_closed_frame();
         const auto after = stats();
+        const auto [preparation_submissions, color_submissions] = present_submissions(first_execute);
+        Check(after.ring_submissions == before.ring_submissions + preparation_submissions + color_submissions,
+              "the Present ring counts both independent preparation and color Execute calls");
         const auto pixels = read_back();
         swap();
-        if (after.outputs != before.outputs) {
+        if (color_submissions != 0) {
           const auto& work = native::stage_telemetry[static_cast<size_t>(addon::stage_plan::Stage::PRESENT)];
-          Check(after.outputs == before.outputs + 1 && after.calls == before.calls + 1
+          Check(color_submissions == 1 && after.outputs == before.outputs + 1
+                    && after.base_outputs == before.base_outputs + 1 && after.calls == before.calls + 1
                     && after.consumed_serial > before.consumed_serial,
-                "first accepted Present records one model call and consumes its own guide serial");
+                "first accepted Present records one model call and one BB color write using its own guides");
           if (resize_from != 0 && work.work_width == resize_from && work.work_height == resize_from) {
             Check(after.refreshes == before.refreshes && after.reuses == before.reuses && after.anchor_generation == 0,
                   "resize settle delivers per-frame NR without a low-grid x2 anchor");
@@ -599,7 +642,10 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
                     && after.refreshes == before.refreshes + 1 && after.reuses == before.reuses,
                 "first accepted full-grid Present after a cold start or handoff refreshes");
           Check(resize_from == 0 || delivered_while_settling, "resize exercises the old committed grid before refreshing");
-          Check(!require_prepared || prepared, "cold start observes a real prepared-only submission");
+          if (require_prepared && !prepared) {
+            Check(after.creates > before.creates && preparation_submissions != 0,
+                  "cold start submits independent model preparation and color on separate recording generations");
+          }
           Check(native::present_streams.at(&output).edit_reuse_monitor.reason == addon::PresentEditReuseRejection::NONE,
                 "the verified delivery replaces the stream's early rejection");
           return;
@@ -607,7 +653,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
         no_output(before, after, "prepared-only Present leaves actual output and consumed serial unchanged");
         unchanged_pixels(pixels, GAME_PIXEL);
         if (after.creates > before.creates) {
-          Check(after.ring_submissions == before.ring_submissions + 1, "prepared model executes once on the Present ring");
+          Check(preparation_submissions != 0, "created models have actual independent preparation submissions");
           prepared = true;
         }
       }
@@ -623,7 +669,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
         Check(SUCCEEDED(gpu.list->Close()), "close empty recording before native backbuffer readback");
         return pixels;
       };
-      nr_edit_reuse_present_native_cases::Run(*runtime, gpu, stats, present_frame, read_back, read_sr, swap);
+      nr_edit_reuse_present_native_cases::Run(*runtime, gpu, stats, present_closed_frame, read_back, read_sr, swap);
       Check(SUCCEEDED(gpu.list->Close()), "close empty fixture list before NGX teardown");
       Check(NVSDK_NGX_SUCCEED(native::HookedReleaseFeatureSlot<Runtime::SR_SLOT>(sr_handle)),
             "ordinary Present x2 releases the real SR handle");
@@ -650,6 +696,30 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
             "Present x2 model receives actual captured guides, source jitter and full motion scale");
     };
     warm(true);
+    {
+      const auto before = stats();
+      present_frame();
+      const auto producer = submission::ObserveRecording(gpu.list.Get());
+      const submission::OutputUse current_color{.resource = renodx::utils::directx::NativeIdentity(back()), .subresource = 0};
+      Check(producer != nullptr && producer->submitted.load() && !producer->closed.load()
+                && submission::OutputWorkState(current_color) == submission::RecordedWork::kReplayable,
+            "the exact current SR-to-BB producer completed but remains replayable until the game resets it");
+      no_output(before, stats(), "a still replayable current producer cannot write ordinary NR color");
+      unchanged_pixels(read_back(), GAME_PIXEL);
+      Check(producer->closed.load(), "real Reset ends replay before attempting the next application version");
+      swap();
+      const auto recovery = stats();
+      present_closed_frame();
+      const auto after = stats();
+      Check(after.calls == recovery.calls + 1 && after.outputs == recovery.outputs + 1
+                && after.base_outputs == recovery.base_outputs + 1 && model_resets.back() == 1,
+            "the first legal frame after Reset delivers ordinary Present x2 with fresh History");
+      const auto rgba = read_back();
+      alpha_preserved(rgba);
+      Check(rgba != std::vector(size * size, GAME_PIXEL), "the next legal frame writes the complete enhanced BB");
+      swap();
+      std::cout << "PRESENT_CURRENT_PRODUCER replayable_raw=1 evaluates=0 reset_next_delivery=1\n";
+    }
     if (diagnostic_only) {
       nr_edit_reuse_present_diagnostic_cases::Run(std::filesystem::current_path(), &gpu, &output, size,
           record, submit, finish, swap, reopen, motion.Get(), depth.Get());
@@ -682,8 +752,13 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
         const bool refresh = index % 2 == 0;
         game_pixel = trace::PRESENT_SOURCE_PIXELS[index];
         const auto before = stats();
-        present_frame(index == 0, index == 2);
+        const auto first_execute = next_execute();
+        present_closed_frame(index == 0);
         const auto after = stats();
+        const auto [preparation_submissions, color_submissions] = present_submissions(first_execute);
+        Check(color_submissions == 1
+                  && after.ring_submissions == before.ring_submissions + preparation_submissions + color_submissions,
+              "one BB write accounts for the actual color submission separately from model preparation");
         const auto calls = after.calls - before.calls;
         const auto& delivery = source.edit_reuse_monitor[0];
         const auto& slot = native::features.at(stream.Handle()).slots[0];
@@ -768,7 +843,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     }
     game_pixel = GAME_PIXEL;
 
-    present_frame(true);
+    present_closed_frame(true);
     const auto original_source = native::present_streams.at(&output).base_frame_clock.frame;
     const auto original_handle = sr_handle;
     auto original_sr_output = sr_output;
@@ -779,7 +854,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     create_source();
     const auto replacement_prefix = stats();
     game_pixel = OVERWRITE_PIXEL;
-    present_frame();
+    present_closed_frame();
     const auto& replacement = native::present_streams.at(&output).base_frame_clock;
     Check(sr_handle != original_handle && replacement.frame.source == reinterpret_cast<uintptr_t>(sr_handle)
               && replacement.frame.source != original_source.source && sr_output.Get() != original_sr_output.Get()
@@ -823,7 +898,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     unchanged_pixels(read_back(), GAME_PIXEL);
     swap();
     const auto before_discard_recovery = stats();
-    present_frame();
+    present_closed_frame();
     Check(stats().base_outputs == before_discard_recovery.base_outputs + 1 && model_calls == before_discard_recovery.calls + 1
               && model_resets.back() == 1,
           "the next ordered SR producer recovers from discarded base delivery with Reset");
@@ -841,7 +916,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     unchanged_pixels(read_back(), GAME_PIXEL);
     swap();
     const auto before_order_recovery = stats();
-    present_frame();
+    present_closed_frame();
     Check(stats().base_outputs == before_order_recovery.base_outputs + 1 && model_calls == before_order_recovery.calls + 1
               && model_resets.back() == 1,
           "the next ordered SR producer recovers from an unsubmitted base with Reset");
@@ -852,6 +927,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
       before = stats();
       record(false, !jitter_x_present, false, nullptr, jitter_x_present);
       submit();
+      retire_game_producer();
       event();
       const auto after = stats();
       no_output(before, after, "an incomplete jitter pair cannot borrow Present x2 history");
@@ -868,7 +944,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
                 << " jitter_y=" << !jitter_x_present << " source_retained=1 claims=0 calls=0 outputs=0\n";
     }
     const auto before_jitter_recovery = stats();
-    present_frame();
+    present_closed_frame();
     const auto jitter_recovery = stats();
     Check(jitter_recovery.calls == before_jitter_recovery.calls + 1 && model_resets.back() == 1
               && jitter_recovery.base_claims == before_jitter_recovery.base_claims + 1
@@ -906,7 +982,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     warm(false);
     before = stats();
     fail_call = model_calls + 1;
-    present_frame(true);
+    present_closed_frame(true);
     const auto failed = stats();
     Check(failed.calls == before.calls + 1 && failed.outputs == before.outputs
               && failed.consumed_serial == before.consumed_serial && failed.reuses == before.reuses
@@ -925,18 +1001,32 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     adapter::modules[0].complete = true;
     adapter::modules[0].real[0] = reinterpret_cast<void*>(FakeInit);
     adapter::modules[0].real[6] = reinterpret_cast<void*>(FakeReceiptEnable);
+    adapter::modules[0].real[8] = reinterpret_cast<void*>(FakeReceiptDestroy);
     {
-      Session owner(&gpu, 0, 17, FORMAT);
-      Check(Hooks::Enable(owner.handle, 0) == 0 && !xefg::OwnsStream(), "mock XeFG is initially disabled");
+      int owner = 0;
+      const xefg::abi::Init init{.application_swapchain = output.swapchain.Get(), .flags = 17, .max_interpolated = 1};
+      const auto ordinary_access = [&] {
+        const auto buffer = output.get_current_back_buffer().handle;
+        return xefg::QueryOrdinaryPresent(static_cast<uintptr_t>(output.get_native()), buffer,
+            addon::output_framerate::MatchPresentOutput(reinterpret_cast<uintptr_t>(&output), buffer));
+      };
+      Check(Hooks::Init(&owner, gpu.queue.Get(), &init) == 0 && Hooks::Enable(&owner, 0) == 0
+                && ordinary_access().allowed,
+            "mock XeFG starts disabled on this actual ordinary output");
       before = stats();
       record();
       submit();
-      Check(Hooks::Enable(owner.handle, 1) == 0 && xefg::OwnsStream(), "public mock XeFG Enable acquires ownership");
+      retire_game_producer();
+      Check(Hooks::Enable(&owner, 1) == 0, "public mock XeFG Enable succeeds");
+      const auto owned = ordinary_access();
+      Check(!owned.allowed && owned.context == reinterpret_cast<uintptr_t>(&owner),
+            "the enabled XeFG context owns this actual ordinary backbuffer");
       event();
       no_output(before, stats(), "ordinary Present stands down for an active XeFG owner");
-      Check(Hooks::Enable(owner.handle, 0) == 0 && !xefg::OwnsStream(), "public mock XeFG Disable returns ownership");
+      Check(Hooks::Enable(&owner, 0) == 0 && ordinary_access().allowed, "public mock XeFG Disable returns this output");
       event();
       no_output(before, stats(), "ordinary Present cannot consume the base across the owner handoff");
+      Check(Hooks::Destroy(&owner) == 0, "destroy the mock SDK owner of this output");
     }
     unchanged_pixels(read_back(), GAME_PIXEL);
     swap();
@@ -1018,6 +1108,8 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
         submit();
         gpu.list = game_list;
       }
+      finish();
+      retire_game_producer();
       event();
       const auto after_foreign = stats();
       const auto pixels = read_back();
@@ -1207,6 +1299,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     before = stats();
     record(false, false);
     submit();
+    retire_game_producer();
     event();
     const auto every_first = stats();
     event();
@@ -1259,7 +1352,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
       const auto source_sequence = source.sr_sequence;
       const auto claims = clock.claims;
       const auto before_proven = stats();
-      present_frame();
+      present_closed_frame();
       const auto proven = stats();
       Check(clock.claims == claims + 1 && clock.frame.sequence == source_sequence + 1
                 && clock.frame.generation == source.source_generation
@@ -1282,7 +1375,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     {
       load_present_mode("1", false);
       const auto before = stats();
-      present_frame();
+      present_closed_frame();
       const auto first = stats();
       const auto& clock = native::present_streams.at(&output).base_frame_clock;
       Check(native::present_frames == 1 && !native::edit_reuse_enabled && !native::WantsPresentBaseFrames()
@@ -1297,7 +1390,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
             "Game frames retains its completed output on a duplicate without another NR or base-history claim");
       reopen();
       swap();
-      present_frame();
+      present_closed_frame();
       const auto next = stats();
       Check(next.calls == first.calls + 1 && next.outputs == first.outputs + 1
                 && next.base_claims == first.base_claims + 1 && next.base_complete,
@@ -1377,6 +1470,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
                   &view_b_parameters, nullptr)),
               "second SR view produces its own guides via the wrapped Evaluate");
         submit();
+        retire_game_producer();
         const auto latest_capture = [](const NVSDK_NGX_Handle* source) {
           const native::PresentGuideSet* guide = nullptr;
           for (const auto& candidate : native::present_guide_sets) {
@@ -1491,7 +1585,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
         if (motion_mask) {
           upload(motion.Get(), std::array<float, 2>{2.f, -3.f}, NATIVE_INPUT_STATE);
         }
-        present_frame();
+        present_closed_frame();
         reopen();
         swap();
       }
@@ -1514,6 +1608,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
 
       record();
       submit();
+      retire_game_producer();
       const auto before_race = stats();
       const auto& stream = native::present_streams.at(&output);
       const auto& clock = stream.base_frame_clock;
@@ -1619,7 +1714,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
             recovered_mask = stages::Capture(gpu, mask, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
           };
         }
-        present_frame();
+        present_closed_frame();
       }
       const auto recovered = stats();
       Check(recovered.base_claims == before_recovery.base_claims + 1
@@ -1655,12 +1750,16 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
           upload(motion.Get(), std::array<float, 2>{0.f, 0.f}, NATIVE_INPUT_STATE);
         }
         load_present_mode("0");
-        present_frame();
+        present_closed_frame();
         reopen();
         swap();
       }
     }
 
+    const auto unregister_output = [](Swapchain* registered_output) {
+      addon::output_framerate::DestroyPresentOutput(reinterpret_cast<uintptr_t>(registered_output));
+    };
+    const std::unique_ptr<Swapchain, decltype(unregister_output)> output_registration(&output, unregister_output);
     {
       namespace signal_fault = present_stage_resolution_cases;
       ComPtr<ID3D12QueryHeap> execution_query;
@@ -1702,7 +1801,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
       const std::unique_ptr<int, decltype(unhook_signal)> signal_hook(&hook_key, unhook_signal);
 
       const auto before_first = stats();
-      present_frame();
+      present_closed_frame();
       const auto first = stats();
       const auto& stream = native::present_streams.at(&output);
       const auto& clock = stream.base_frame_clock;
@@ -1758,7 +1857,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
       Check(pixels != std::vector(size * size, GAME_PIXEL), "the failed-Signal submission actually writes edited BB pixels");
       swap();
 
-      present_frame();
+      present_closed_frame();
       const auto recovered = stats();
       Check(recovered.base_claims == failed.base_claims + 1 && recovered.base_outputs == failed.base_outputs + 1
                 && recovered.base_complete && !stream.base_history_unbound
@@ -1788,8 +1887,6 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
       substitutions.Atomic(&native::nr_adaptive_enabled);
       substitutions.Atomic(&native::nr_adaptive_selected_levels);
       substitutions.Atomic(&native::nr_adaptive_limited_residency);
-      const auto unregister = [&](int*) { addon::output_framerate::DestroyPresentOutput(swapchain_key); };
-      const std::unique_ptr<int, decltype(unregister)> output_registration(&hook_key, unregister);
       native::nr_adaptive_enabled = true;
       native::nr_adaptive_selected_levels = 2;
       native::nr_adaptive_limited_residency = false;
@@ -1956,12 +2053,15 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
         record(game_reset);
         submit();
         Check(native::queue_submit_entries.load() == queue_entries + 1, "raw Present producer submits one real SR-to-BB list");
+        retire_game_producer();
+        const auto first_execute = next_execute();
         if (route == Route::ORDINARY) {
           event();
         } else {
           forward(route);
         }
         const auto after = stats();
+        const auto [preparation_submissions, color_submissions] = present_submissions(first_execute);
         const auto& source = native::features.at(sr_handle);
         const int reset = (after.calls != before.calls ? model_resets.back() : -1);
         const auto pixels = read_back();
@@ -1970,6 +2070,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
                   << " claims=" << before.base_claims << ',' << after.base_claims
                   << " base_outputs=" << before.base_outputs << ',' << after.base_outputs
                   << " outputs=" << before.outputs << ',' << after.outputs << " complete=" << after.base_complete
+                  << " preparation_executes=" << preparation_submissions << " color_executes=" << color_submissions
                   << " calls=" << after.calls - before.calls << " reset=" << reset << " expected_reset=" << expected_reset
                   << " reset_epoch=" << before.reset_epoch << ',' << after.reset_epoch
                   << " history_unbound=" << stream.base_history_unbound
@@ -1985,7 +2086,8 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
                    && after.base_complete && !stream.base_history_unbound,
                scenario, "current ordered SR source publishes one complete Every present base in its existing epoch");
         expect(after.calls == before.calls + 1 && reset == expected_reset && after.outputs == before.outputs + 1
-                   && after.consumed_serial > before.consumed_serial && after.ring_submissions == before.ring_submissions + 1
+                   && after.consumed_serial > before.consumed_serial && color_submissions == 1
+                   && after.ring_submissions == before.ring_submissions + preparation_submissions + color_submissions
                    && native::PresentRingComplete() && after.reset_epoch == before.reset_epoch + static_cast<uint64_t>(game_reset)
                    && native::present_frames == 0
                    && (expected_reset != 0 || native::present_history_resets.load() == history_resets)
@@ -2090,7 +2192,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
     unchanged_pixels(read_back(), OVERWRITE_PIXEL);
     swap();
     const auto before_ini_recovery = stats();
-    present_frame();
+    present_closed_frame();
     Check(stats().base_outputs == before_ini_recovery.base_outputs + 1 && model_calls == before_ini_recovery.calls + 1
               && model_resets.back() == 1,
           "explicit one recovers when the next producer copies its successful SR output to the current BB");

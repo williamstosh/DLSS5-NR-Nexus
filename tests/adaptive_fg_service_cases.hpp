@@ -212,7 +212,8 @@ int Run() {
         && DetourAttach(reinterpret_cast<PVOID*>(&real_reset), reinterpret_cast<PVOID>(ObserveReset)) == NO_ERROR,
         "adaptive service lifecycle observer attach");
     Check(DetourTransactionCommit() == NO_ERROR, "adaptive service lifecycle observer commit");
-    const auto texture = [&](DXGI_FORMAT format) {
+    constexpr auto present_state = D3D12_RESOURCE_STATE_PRESENT;
+    const auto texture = [&](DXGI_FORMAT format, D3D12_RESOURCE_STATES resting = NATIVE_INPUT_STATE) {
       const D3D12_HEAP_PROPERTIES heap{.Type = D3D12_HEAP_TYPE_DEFAULT};
       const D3D12_RESOURCE_DESC desc{.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
           .Width = 16, .Height = 16, .DepthOrArraySize = 1, .MipLevels = 1,
@@ -221,10 +222,15 @@ int Run() {
       Check(SUCCEEDED(gpu.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
           &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&resource))), "adaptive service texture");
       gpu.Write(resource.Get(), 0);
-      gpu.Transition(resource.Get(), D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
+      if (resting != D3D12_RESOURCE_STATE_COMMON) {
+        gpu.Transition(resource.Get(), D3D12_RESOURCE_STATE_COMMON, resting);
+      }
       return resource;
     };
-    auto color = texture(DXGI_FORMAT_R8G8B8A8_UNORM);
+    auto color = texture(DXGI_FORMAT_R8G8B8A8_UNORM, present_state);
+    const auto surface_state = [&](ID3D12Resource* surface) {
+      return (surface == color.Get() ? present_state : NATIVE_INPUT_STATE);
+    };
     auto motion = texture(DXGI_FORMAT_R16G16_FLOAT);
     auto depth = texture(DXGI_FORMAT_R32_FLOAT);
     gpu.Submit();
@@ -232,6 +238,9 @@ int Run() {
     sdk_restore.Value(&adapter::modules[0]);
     sdk_restore.Value(&adapter::proxies[0]);
     sdk_restore.Atomic(&adapter::retire);
+    sdk_restore.Atomic(&adapter::service);
+    sdk_restore.Atomic(&adapter::prepare_capture);
+    sdk_restore.Atomic(&adapter::requested);
     sdk_restore.Value(&sdk_owner_proxy);
     struct SdkOwners {
       std::map<uintptr_t, ComPtr<ReceiptSwapchain>> proxies;
@@ -239,17 +248,21 @@ int Run() {
         for (const auto& [context, proxy] : proxies) Hooks::Destroy(reinterpret_cast<void*>(context));
       }
     } sdk_owners;
-    // Only the SDK exports and proxy boundary are MOCK. Production hooks own
-    // registration/epochs; the Service-only consumer receipt remains explicit.
+    // The SDK stands in for the proxy surface and return. The production
+    // Present call owns authorization, color submission and delivery.
     adapter::modules[0].complete = true;
     adapter::modules[0].real[0] = reinterpret_cast<void*>(+[](void*, ID3D12CommandQueue*, const xefg::abi::Init*) -> int32_t { return 0; });
     adapter::modules[0].real[2] = reinterpret_cast<void*>(+[](void*, REFIID iid, void** output) -> int32_t {
       return sdk_owner_proxy != nullptr && SUCCEEDED(sdk_owner_proxy->QueryInterface(iid, output)) ? 0 : -1;
     });
+    adapter::modules[0].real[3] = reinterpret_cast<void*>(&FakeResource);
+    adapter::modules[0].real[4] = reinterpret_cast<void*>(&FakeConstants);
+    adapter::modules[0].real[5] = reinterpret_cast<void*>(&FakeId);
     adapter::modules[0].real[6] = reinterpret_cast<void*>(+[](void*, uint32_t) -> int32_t { return 0; });
     adapter::modules[0].real[8] = reinterpret_cast<void*>(+[](void*) -> int32_t { return 0; });
     adapter::proxies[0].installed = adapter::proxies[0].complete = true;
-    adapter::retire.store(&native::fg_service::Retire);
+    xefg::Configure(&native::fg_service::Service, &Prepare, &native::fg_service::Retire,
+                    &native::fg_service::Requested);
     const auto retire_owners = [&] {
       for (const auto& [context, proxy] : sdk_owners.proxies) {
         Check(Hooks::Destroy(reinterpret_cast<void*>(context)) == 0, "adaptive Service SDK owner Destroy");
@@ -262,7 +275,7 @@ int Run() {
     input.epoch = 1;
     input.queue = gpu.queue.Get();
     input.backbuffer = color.Get();
-    input.backbuffer_state = NATIVE_INPUT_STATE;
+    input.backbuffer_state = present_state;
     input.depth = depth.Get();
     input.depth_state = NATIVE_INPUT_STATE;
     input.motion = motion.Get();
@@ -272,6 +285,7 @@ int Run() {
     input.has_constants = true;
     input.fg_enabled = true;
     input.color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    uint32_t present_id = 0;
     const auto service = [&] {
       const auto handle = reinterpret_cast<void*>(input.context);
       if (!sdk_owners.proxies.contains(input.context)) {
@@ -289,19 +303,41 @@ int Run() {
       }
       input.epoch = adapter::state.contexts.at(handle)->epoch;
       Check(xefg::ServiceContextCurrent(input.context, input.epoch), "adaptive Service input names a live SDK owner epoch");
-      ++input.application_frame;
+      const auto id = ++present_id;
+      const auto tag = [&](int32_t type, ID3D12Resource* resource, D3D12_RESOURCE_STATES state,
+                           uint32_t width, uint32_t height) {
+        const xefg::abi::Resource data{.type = type, .validity = UNTIL_NEXT_PRESENT,
+            .base = {0, 0}, .size = {width, height}, .resource = resource, .state = state};
+        Check(Hooks::Resource(handle, gpu.list.Get(), id, &data) == 0, "adaptive Service SDK resource tag");
+      };
+      tag(BACKBUFFER, input.backbuffer, input.backbuffer_state, input.color_width, input.color_height);
+      tag(DEPTH, input.depth, input.depth_state, input.guide_width, input.guide_height);
+      tag(MOTION, input.motion, input.motion_state, input.guide_width, input.guide_height);
+      if (input.hudless != nullptr) {
+        tag(HUDLESS, input.hudless, input.hudless_state, input.color_width, input.color_height);
+      }
+      const xefg::abi::Constants constants{.jitter_x = input.jitter_x, .jitter_y = input.jitter_y,
+          .motion_scale_x = input.motion_scale_x, .motion_scale_y = input.motion_scale_y,
+          .reset = static_cast<uint32_t>(input.reset), .frame_time_ms = input.frame_time_ms};
+      Check(Hooks::Constants(handle, id, &constants) == 0 && Hooks::PresentId(handle, id) == 0,
+            "adaptive Service SDK constants and application ID");
       const auto before_source = native::SourceSuccessfulEvaluations();
       observing_context = input.context;
       active_pass_masks = {};
       failed_pass_masks = {};
       reset_pass_masks = {};
       const auto before_list_calls = list_calls.size();
-      const auto result = native::fg_service::Service(input);
-      if (result == fg::Result::SUBMITTED) {
-        // This Service-only fixture supplies the consumer receipt explicitly.
-        // The XeFG proxy fixture covers issuing it after the original Present.
-        native::fg_service::OnXeFGPresentDelivery(input, true);
-      }
+      auto* const proxy = sdk_owners.proxies.at(input.context).Get();
+      auto present = adapter::BeginPresent(proxy, 0);
+      const auto sdk_result = FakePresent(proxy, 0, 0);
+      adapter::EndPresent(&present, sdk_result);
+      Check(present.service_eligible && present.completed && present.input.backbuffer == input.backbuffer
+                && present.input.hudless == input.hudless && present.input.epoch == input.epoch
+                && present.input.depth == input.depth && present.input.motion == input.motion
+                && present.input.color_width == input.color_width && present.input.color_height == input.color_height,
+            "adaptive Service runs within the matching SDK call and output epoch");
+      input.application_frame = present.input.application_frame;
+      const auto result = present.service_result;
       for (size_t index = before_list_calls; index < list_calls.size(); ++index) {
         const auto& call = list_calls[index];
         Check(call.identity != 0 && (call.identity & (uint64_t{1} << 63)) == 0,
@@ -402,9 +438,10 @@ int Run() {
       auto primary = gpu.CreateTextureTransfer(color.Get());
       auto auxiliary = gpu.CreateTextureTransfer(cold_hudless.Get());
       for (const auto& [surface, readback] : {std::pair{color.Get(), &primary}, std::pair{cold_hudless.Get(), &auxiliary}}) {
-        gpu.Transition(surface, NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        const auto state = surface_state(surface);
+        gpu.Transition(surface, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
         gpu.RecordTextureReadback(surface, *readback);
-        gpu.Transition(surface, D3D12_RESOURCE_STATE_COPY_SOURCE, NATIVE_INPUT_STATE);
+        gpu.Transition(surface, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
       }
       gpu.Submit();
       for (const auto* readback : {&primary, &auxiliary}) {
@@ -466,9 +503,7 @@ int Run() {
       gpu.Submit();
       native::DrainRetiredResources(true);
       native::ReleaseCodecPipeline();
-      gpu.Transition(color.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
       gpu.Write(color.Get(), 0);
-      gpu.Transition(color.Get(), D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
       gpu.Submit();
       input.context = 0xADAF6;
       input.application_frame = 0;
@@ -645,18 +680,23 @@ int Run() {
     auto paused_auxiliary_readback = gpu.CreateTextureTransfer(hudless.Get());
     const auto seed_paused_colors = [&] {
       for (auto* surface : {color.Get(), hudless.Get()}) {
-        gpu.Transition(surface, NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
+        if (surface != color.Get()) {
+          gpu.Transition(surface, NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
+        }
         gpu.Write(surface, 0x7f);
-        gpu.Transition(surface, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
+        if (surface != color.Get()) {
+          gpu.Transition(surface, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
+        }
       }
       gpu.Submit();
     };
     const auto check_paused_colors = [&] {
       for (const auto& [surface, readback] : {std::pair{color.Get(), &paused_primary_readback},
                std::pair{hudless.Get(), &paused_auxiliary_readback}}) {
-        gpu.Transition(surface, NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        const auto state = surface_state(surface);
+        gpu.Transition(surface, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
         gpu.RecordTextureReadback(surface, *readback);
-        gpu.Transition(surface, D3D12_RESOURCE_STATE_COPY_SOURCE, NATIVE_INPUT_STATE);
+        gpu.Transition(surface, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
       }
       gpu.Submit();
       for (const auto* readback : {&paused_primary_readback, &paused_auxiliary_readback}) {
@@ -861,9 +901,13 @@ int Run() {
     const auto many_worksets = native::worksets_created;
     for (size_t level = 0; level < many.adaptive_session->ladder.count; ++level) {
       for (auto* surface : {color.Get(), hudless.Get()}) {
-        gpu.Transition(surface, NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
+        if (surface != color.Get()) {
+          gpu.Transition(surface, NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
+        }
         gpu.Write(surface, 0x7f);
-        gpu.Transition(surface, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
+        if (surface != color.Get()) {
+          gpu.Transition(surface, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
+        }
       }
       gpu.Submit();
       many.adaptive_session->Request(level, native::SteadyNowNs());
@@ -877,9 +921,9 @@ int Run() {
             && feature.slots[1].create_input_width == many.adaptive_session->ladder.sizes[level][1].width,
             "both roles use the selected first- and second-Pass working dimensions");
       }
-      gpu.Transition(color.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      gpu.Transition(color.Get(), present_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
       gpu.RecordTextureReadback(color.Get(), primary_readback);
-      gpu.Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, NATIVE_INPUT_STATE);
+      gpu.Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, present_state);
       gpu.Transition(hudless.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
       gpu.RecordTextureReadback(hudless.Get(), auxiliary_readback);
       gpu.Transition(hudless.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, NATIVE_INPUT_STATE);
@@ -925,10 +969,8 @@ int Run() {
       Check(last_slot != nullptr && last_slot->color[0] != nullptr
           && many.fence->GetCompletedValue() != UINT64_MAX && many.fence->GetCompletedValue() >= many.submitted,
           "the final real Service slot completed on its healthy private Fence");
-      const auto service_recording = addon::submission::ObserveRecording(last_slot->list);
-      Check(service_recording->submitted.load() && !service_recording->closed.load()
-          && native::TeardownProof() == addon::submission::RecordedWork::kReplayable,
-          "completed private Service recording remains replayable before Off without another Service or Resize");
+      Check(native::TeardownProof() == addon::submission::RecordedWork::kComplete,
+            "the submitted private Service recording is already closed and GPU complete before Off");
 
       // A separate host recording really reads the service color on the GPU.
       // Its owner keeps replay eligibility after the completion Fence.
@@ -965,7 +1007,7 @@ int Run() {
       native::disabled_resources_released = false;
       native::shutdown_quiesce_latched = false;
       native::ServiceDisabledNr();
-      Check(service_recording->closed.load() && !host_recording->closed.load()
+      Check(!host_recording->closed.load()
           && native::fg_service::streams.empty() && !native::disabled_resources_released.load()
           && native::TeardownProof() == addon::submission::RecordedWork::kReplayable
           && native::codec_pipeline.root_signature == retained_root

@@ -1404,6 +1404,9 @@ inline NrDeclineReason EnsureBridgeUp(ID3D11DeviceContext* context) {
 // The watchdog can advance out before the GPU is done with these allocators.
 inline bool RetireBridgeRecordings() {
   if (!bridge_device_live.load(std::memory_order_acquire)) return true;
+  for (BridgeSlot& slot : bridge.ring) {
+    submission::DiscardOwnedRecording(slot.list, submission::RecordingOwner::kBridge);
+  }
   if (std::ranges::none_of(bridge.ring, [](const BridgeSlot& slot) { return slot.value != 0; })) return true;
   if (bridge_state.load(std::memory_order_acquire) != BridgeState::kUp || bridge.fence_done12 == nullptr) return false;
 
@@ -1841,6 +1844,7 @@ inline bool RunBridge(ID3D11DeviceContext* context,
       return;
     }
     submission::OnCommandListReset(slot.list);
+    submission::SetRecordingOwner(slot.list, submission::RecordingOwner::kBridge);
     // Discard recording proofs and tracked scratch before releasing the
     // device/runtime locks. A teardown can destroy the list after that point.
     struct RecordingScope {

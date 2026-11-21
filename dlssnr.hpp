@@ -143,6 +143,9 @@
 #include "report_bundle.hpp"
 #include "report_issue.hpp"
 #include "report_upload.hpp"
+#if defined(NR_NEXUS_DEV_CONTROL)
+#include "present_handoff_capture.hpp"
+#endif
 
 #include <nlohmann/json.hpp>
 #include "preset_store.hpp"
@@ -394,6 +397,11 @@ struct NrFeatureSlot {
   // RetiredNrFeature::tracker_proof).
   bool tracked_since_create = false;
   std::shared_ptr<submission::RecordingStatus> recording;
+  std::shared_ptr<submission::RecordingStatus> creation_recording;
+  bool creation_completed = false;
+  // Independent create-only recordings must finish on the GPU before a
+  // different recording can evaluate this model.
+  std::shared_ptr<submission::RecordingStatus> preparation_recording;
   // Reset-epoch acknowledgement (v5.3): the global history_reset_epoch value
   // this slot has already reset at.  Replaces the v5.2.2 global Boolean
   // latch, whose stacked short-circuit never reached the consuming
@@ -746,6 +754,7 @@ struct RetiredNrFeature {
   // With it, a non-empty `lease` is required as well: it covers the uses of
   // a feature created before the tracker was live (see ReleaseNrSlot).
   bool tracker_proof = false;
+  bool requires_legacy_proof = false;
   // The slot's look history (LookHistory), retired with its handle, or on
   // its own (handle null) when Stabilize goes off.  Every use is tracked.
   ID3D12Resource* look_history[2] = {};
@@ -5701,8 +5710,11 @@ inline std::atomic_bool queue_tracking_active = false;
 inline void TrackWorksetRecording(
     ID3D12GraphicsCommandList* command_list, const FinalResources& res,
     bool track_control_mask_history = false) {
+  // The heap also binds the active codec and view-ring objects. Their use
+  // must survive any attempted Provider switch, including a partial record.
+  submission::TrackUse(command_list, &codec_pipeline, submission::UseKind::kProvider);
   for (const void* object : CollectWorksetGpuObjects(res)) {
-    submission::TrackUse(command_list, object);
+    submission::TrackUse(command_list, object, submission::UseKind::kProvider);
   }
   for (const FinalResources* current = &res; current != nullptr; current = current->resolution_tail) {
     current->tracked_recording = queue_tracking_active.load(std::memory_order_relaxed);
@@ -5975,6 +5987,7 @@ inline RetiredNrFeature NrRetirement(const NrFeatureSlot& slot, const std::share
                : slot.tracked_since_create ? GpuLease{}
                                            : AcquireGpuLease(0),
       .tracker_proof = tracked,
+      .requires_legacy_proof = (!tracked || (slot.handle != nullptr && !slot.tracked_since_create)),
       .look_history = {slot.look_history.buffers[0], slot.look_history.buffers[1]},
       .edit_reuse = slot.edit_reuse,
       .adaptive_recording_token = adaptive_token,
@@ -6029,6 +6042,9 @@ inline void ReleaseNrSlot(
   slot.create_input_width = slot.create_input_height = 0;
   slot.create_output_width = slot.create_output_height = 0;
   slot.recording.reset();
+  slot.creation_recording.reset();
+  slot.creation_completed = false;
+  slot.preparation_recording.reset();
   slot.look_history = {};
   slot.edit_reuse.reset();
   RefreshActiveFeatureCount();
@@ -6260,6 +6276,7 @@ inline void DrainRetiredResources(bool nr_release_allowed) {
   if (!nr_release_allowed) return;
   for (auto it = retired_nr_features.begin(); it != retired_nr_features.end();) {
     if (it->tracker_proof ? submission::ResourceReleasable(it->handle)
+                                && submission::ResourceReleasable(it->parameters)
                                 && submission::ResourceReleasable(it->look_history[0])
                                 && submission::ResourceReleasable(it->look_history[1])
                                 && submission::ResourceReleasable(it->edit_reuse.get())
@@ -6275,9 +6292,19 @@ inline void DrainRetiredResources(bool nr_release_allowed) {
   nr_retirement_pending.store(!retired_nr_features.empty(), std::memory_order_relaxed);
 }
 
-// Requires runtime_mutex. Releases every retired entry immediately - used
-// before the direct runtime shuts down, after which its stale handles could
-// no longer be released safely.
+// Requires runtime_mutex and the NGX turn. Release the creating Provider's
+// handles and parameters before adopting another dispatch table.
+inline void FlushRetiredNrFeatures() {
+  for (const RetiredNrFeature& retired : retired_nr_features) {
+    ReleaseRetiredNrFeature(retired);
+    if (retired.handle != nullptr) ++nr_features_released;
+  }
+  retired_nr_features.clear();
+  nr_retirement_pending.store(false, std::memory_order_relaxed);
+}
+
+// Requires the whole-runtime teardown proof. A Provider switch with a
+// scoped proof leaves independent GPU retirements on their regular drain.
 inline void FlushRetiredResources() {
   if (worksets_released_logged < 16 && !retired_final_resources.empty()) {
     uint64_t flush_bytes = 0;
@@ -6298,12 +6325,7 @@ inline void FlushRetiredResources() {
     ++worksets_released;
   }
   retired_final_resources.clear();
-  for (const RetiredNrFeature& retired : retired_nr_features) {
-    ReleaseRetiredNrFeature(retired);
-    if (retired.handle != nullptr) ++nr_features_released;
-  }
-  retired_nr_features.clear();
-  nr_retirement_pending.store(false, std::memory_order_relaxed);
+  FlushRetiredNrFeatures();
 }
 
 // Safe at loader detach: no mutex, allocation, wait or driver/module release.
@@ -6340,36 +6362,40 @@ inline bool DiscardAsyncAutoscalePreparation() {
   return true;
 }
 
+inline void VisitCodecObjects(CodecPipeline* codec, auto visit) {
+  visit(codec->hdr_commit_capture);
+  visit(codec->hdr_commit_exposure_capture);
+  visit(codec->hdr_capture_root);
+  visit(codec->black_restore_apply);
+  visit(codec->block_mean_reduce);
+  visit(codec->block_mean_reduce_unshaped);
+  visit(codec->pedestal_reduce_unshaped);
+  visit(codec->decode);
+  visit(codec->control_mask);
+  visit(codec->encode);
+  visit(codec->autoscale);
+  visit(codec->commit);
+  visit(codec->exposure_scale);
+  visit(codec->commit_exposure);
+  visit(codec->pedestal_reduce);
+  visit(codec->resolve_v6);
+  visit(codec->encode_v6);
+  visit(codec->linearize);
+  visit(codec->root_signature);
+  visit(codec->look.compose_anchor);
+  visit(codec->look.anchor_root_signature);
+  visit(codec->look.compose);
+  visit(codec->look.band);
+  visit(codec->look.upsample);
+  visit(codec->look.trace);
+  visit(codec->look.root_signature);
+}
+
 inline void ReleaseCodecPipeline() {
   ++async_autoscale_cache_epoch;
   CancelAsyncAutoscalePreparation();
   DiscardAsyncAutoscalePreparation();
-  ReleaseCom(codec_pipeline.hdr_commit_capture);
-  ReleaseCom(codec_pipeline.hdr_commit_exposure_capture);
-  ReleaseCom(codec_pipeline.hdr_capture_root);
-  ReleaseCom(codec_pipeline.black_restore_apply);
-  ReleaseCom(codec_pipeline.block_mean_reduce);
-  ReleaseCom(codec_pipeline.block_mean_reduce_unshaped);
-  ReleaseCom(codec_pipeline.pedestal_reduce_unshaped);
-  ReleaseCom(codec_pipeline.decode);
-  ReleaseCom(codec_pipeline.control_mask);
-  ReleaseCom(codec_pipeline.encode);
-  ReleaseCom(codec_pipeline.autoscale);
-  ReleaseCom(codec_pipeline.commit);
-  ReleaseCom(codec_pipeline.exposure_scale);
-  ReleaseCom(codec_pipeline.commit_exposure);
-  ReleaseCom(codec_pipeline.pedestal_reduce);
-  ReleaseCom(codec_pipeline.resolve_v6);
-  ReleaseCom(codec_pipeline.encode_v6);
-  ReleaseCom(codec_pipeline.linearize);
-  ReleaseCom(codec_pipeline.root_signature);
-  ReleaseCom(codec_pipeline.look.compose_anchor);
-  ReleaseCom(codec_pipeline.look.anchor_root_signature);
-  ReleaseCom(codec_pipeline.look.compose);
-  ReleaseCom(codec_pipeline.look.band);
-  ReleaseCom(codec_pipeline.look.upsample);
-  ReleaseCom(codec_pipeline.look.trace);
-  ReleaseCom(codec_pipeline.look.root_signature);
+  VisitCodecObjects(&codec_pipeline, [](auto*& object) { ReleaseCom(object); });
   codec_pipeline = {};
 }
 
@@ -6379,11 +6405,15 @@ inline void ReleaseCodecPipeline() {
 // submissions to recordings; without it only a session that never recorded
 // NR work has nothing to wait for, and anything else keeps its state (v6's
 // behavior) rather than guess.
-inline submission::RecordedWork TeardownProof() {
+inline submission::RecordedWork TeardownProof(std::vector<submission::RecordingBlocker>* blockers = nullptr) {
   if (!submission::HasEverTrackedUses()) return submission::RecordedWork::kComplete;
-  return queue_tracking_active.load(std::memory_order_acquire)
-             ? submission::RecordedWorkState()
-             : submission::RecordedWork::kPending;
+  if (queue_tracking_active.load(std::memory_order_acquire)) {
+    return submission::RecordedWorkState(blockers);
+  }
+  if (blockers != nullptr) {
+    submission::RecordedWorkState(blockers);
+  }
+  return submission::RecordedWork::kPending;
 }
 
 // A completed list can still be replayed until Reset or destruction closes
@@ -6393,6 +6423,43 @@ inline submission::RecordedWork TeardownProof() {
 // proving execution or requiring Reset on that failed device.
 inline bool TeardownMayRelease(submission::RecordedWork proof) {
   return proof == submission::RecordedWork::kComplete;
+}
+
+inline void LogRecordedWorkBlockers(const char* reason,
+                                    std::span<const submission::RecordingBlocker> blockers) noexcept {
+  try {
+    constexpr const char* owners[]{"unknown", "ordinary", "XeFG", "Bridge", "borrowed", "conflicting"};
+    constexpr const char* closes[]{"open", "reset", "destroyed", "owner_discarded"};
+    constexpr const char* proof_states[]{
+        "unsubmitted", "unreserved", "reserved", "signal_failed", "in_flight", "complete", "device_removed"};
+    constexpr const char* kinds[]{"unknown", "independent_guide", "provider", "output_color"};
+    for (const auto& blocker : blockers) {
+      const auto& first = blocker.first_submission;
+      std::ostringstream message;
+      message << reason << ": list=" << blocker.list << ", generation=" << blocker.generation
+              << ", owner=" << owners[static_cast<size_t>(blocker.owner)]
+              << ", close=" << closes[static_cast<size_t>(blocker.close_reason)]
+              << ", work=" << (blocker.work == submission::RecordedWork::kReplayable ? "replayable" : "pending")
+              << ", first_execute=" << blocker.first_execute
+              << ", first_proof=" << proof_states[static_cast<size_t>(first.state)]
+              << ", first_fence=" << first.fence.fence << ", first_value=" << first.value
+              << ", first_completed=" << first.completed_value
+              << ", unreserved=" << blocker.unreserved_submissions;
+      for (const auto& receipt : blocker.submissions) {
+        message << ", submit=" << proof_states[static_cast<size_t>(receipt.state)]
+                << '@' << receipt.fence.fence << '/' << receipt.value << '/' << receipt.completed_value;
+      }
+      for (const auto& use : blocker.uses) {
+        message << ", use=" << kinds[static_cast<size_t>(use.kind)] << '@' << use.object;
+        if (use.kind == submission::UseKind::kOutputColor) {
+          message << " color=" << use.output.resource << '/' << use.output.subresource << '/' << use.output.version;
+        }
+      }
+      Log(reshade::log::level::info, message.str());
+    }
+  } catch (...) {
+    // Diagnostic allocation cannot change the caller's admission decision.
+  }
 }
 
 // Waits for the work already submitted on every tracked queue, bounded to
@@ -6548,12 +6615,91 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
         return false;
       }
     }
+    // Provider adoption and recording are serialized by the NGX turn and
+    // runtime_mutex. Scope this exception to a real Provider change on the
+    // same device. Other teardown paths still require every recording.
+    bool scoped_proof = same_device && !same_instance
+        && queue_tracking_active.load(std::memory_order_acquire);
+    std::vector<const void*> teardown_objects;
+    if (scoped_proof) {
+      for (const auto& [key, resources] : worksets) {
+        for (auto* current = &resources; current != nullptr; current = current->resolution_tail) {
+          scoped_proof &= current->tracked_recording;
+        }
+      }
+      teardown_objects = {&direct_api, &codec_pipeline, direct_device};
+      const auto add_object = [&](const void* object) {
+        if (object != nullptr) {
+          teardown_objects.push_back(object);
+        }
+      };
+      VisitCodecObjects(&codec_pipeline, add_object);
+      const auto add_edit = [&](const std::shared_ptr<edit_reuse::State>& edit) {
+        if (edit == nullptr) return;
+        add_object(edit.get());
+        add_object(edit->root.Get());
+        add_object(edit->pipeline.Get());
+        add_object(edit->anchor.Get());
+        add_object(edit->previous_motion.Get());
+        add_object(edit->validity.Get());
+        add_object(edit->composed_motion.Get());
+        for (const auto& binding : edit->bindings) {
+          add_object(binding.heap.Get());
+          for (const auto& resource : binding.resources) {
+            add_object(resource.Get());
+          }
+        }
+      };
+      const auto add_feature = [&](const auto& visit, const FeatureState& state) -> void {
+        add_object(state.norm.commit);
+        add_object(state.adaptive_recording_token.get());
+        add_object(state.control_mask_recording.get());
+        add_object(state.control_mask_stream.get());
+        for (const auto& slot : state.slots) {
+          scoped_proof &= slot.handle == nullptr || slot.tracked_since_create;
+          add_object(slot.handle);
+          add_object(slot.parameters);
+          add_object(slot.recording.get());
+          for (auto* history : slot.look_history.buffers) {
+            add_object(history);
+          }
+          add_edit(slot.edit_reuse);
+        }
+        if (state.adaptive_cache != nullptr) {
+          for (const auto& tier : state.adaptive_cache->tiers) {
+            add_object(tier.recording_token.get());
+            visit(visit, tier.state);
+          }
+        }
+        if (state.render_session != nullptr) {
+          visit(visit, *state.render_session);
+        }
+      };
+      for (const auto& [handle, state] : features) {
+        add_feature(add_feature, state);
+      }
+      for (const auto& retired : retired_nr_features) {
+        scoped_proof &= retired.tracker_proof && !retired.requires_legacy_proof
+            && (retired.lease.waits.empty() || QueryGpuLease(retired.lease) != GpuLeaseState::kPending);
+        add_object(retired.handle);
+        add_object(retired.parameters);
+        add_object(retired.adaptive_recording_token.get());
+        for (auto* history : retired.look_history) {
+          add_object(history);
+        }
+        add_edit(retired.edit_reuse);
+      }
+    }
     bool queues_finished = true;
-    if (runtime_switch_target != device) {
+    if (!scoped_proof && runtime_switch_target != device) {
       runtime_switch_target = device;
       queues_finished = WaitForTrackedQueues();
     }
-    const submission::RecordedWork proof = TeardownProof();
+    const auto inspect = [&](std::vector<submission::RecordingBlocker>* blockers) {
+      return scoped_proof ? submission::ProviderTeardownWorkState(teardown_objects, blockers)
+                          : TeardownProof(blockers);
+    };
+    const auto proof = inspect(nullptr);
     if (proof != submission::RecordedWork::kComplete) {
       if (decline != nullptr) *decline = NrDeclineReason::kRuntimeSwitchPending;
       static uint64_t logged_switch_pending = 0;
@@ -6573,6 +6719,10 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
                 + (logged_switch_pending == kRuntimeSwitchDeclineLogCap
                        ? "; further occurrences are not logged"
                        : ""));
+        std::vector<submission::RecordingBlocker> blockers;
+        inspect(&blockers);
+        LogRecordedWorkBlockers(private_signed_runtime ? "NR Provider switch to XeFG"
+                                                        : "NR Provider switch to ordinary", blockers);
       }
       device->Release();
       return false;
@@ -6587,17 +6737,27 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
                        " records in the world of its list)"
                      : "")
               + (exact_device ? "; provider change" : "; device/face change " + std::to_string(changes))
-              + "; NR's recorded work had completed and every recording was closed"
+              + (scoped_proof ? "; all Provider dependencies were closed and complete"
+                              : "; NR's recorded work had completed and every recording was closed")
               + (changes == kNrRuntimeDeviceChangeLogCap
                      ? ", further changes are not logged"
                      : ""));
     }
+    // Move even the active worksets out before releasing adaptive feature
+    // state. Worksets contain GPU objects only and can finish their normal
+    // retirement after the switch. Guide captures live in their own owner.
+    if (scoped_proof) {
+      RetireAllWorksets();
+    }
     ReleaseFeatureStates();
-    RetireAllWorksets();
     ReleaseCodecPipeline();
-    // Releases retirements without their own proofs: reached only on the
-    // closed-and-completed proof above.
-    FlushRetiredResources();
+    if (scoped_proof) {
+      DrainRetiredResources(true);
+      FlushRetiredNrFeatures();
+    } else {
+      RetireAllWorksets();
+      FlushRetiredResources();
+    }
     // Guard re-entrancy like create/evaluate/release do: this runs under
     // runtime_mutex, and if the signed runtime called back into a detoured
     // NGX export the wrapper would try to re-lock the (non-recursive) mutex
@@ -6715,6 +6875,7 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
     ReleaseCom(native_identity);
   }
   NVSDK_NGX_Result result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
+  const auto init_started_ns = SteadyNowNs();
   {
     DirectCallScope ngx_direct_call;
     if (direct_api.private_instance) native_runtime_unload_safe = false;
@@ -6731,6 +6892,14 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
       // has to lower the fence as well - leaving the scope does that.
       Log(reshade::log::level::error, "direct Init raised an exception");
     }
+  }
+  {
+    std::ostringstream message;
+    message << "NR Init finished: provider=" << (direct_api.private_instance ? "XeFG" : "ordinary")
+            << ", device=" << device << ", start_ns=" << init_started_ns
+            << ", duration_ms=" << (SteadyNowNs() - init_started_ns) / 1e6
+            << ", result=0x" << std::hex << static_cast<uint32_t>(result);
+    Log(reshade::log::level::info, message.str());
   }
   last_result = static_cast<uint32_t>(result);
   if (NVSDK_NGX_FAILED(result)) {
@@ -8967,6 +9136,9 @@ inline bool EnsureNrFeature(
            slot_index != 0 ? " (stack pass)" : "");
   Log(reshade::log::level::info, starting);
 
+  // Create may record opaque SDK work even before returning a handle.
+  submission::TrackUse(command_list, &direct_api, submission::UseKind::kProvider);
+  const auto create_started_ns = SteadyNowNs();
   NVSDK_NGX_Result result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
   {
     DirectCallScope ngx_direct_call;
@@ -9008,6 +9180,16 @@ inline bool EnsureNrFeature(
       slot.handle = nullptr;
       result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
     }
+  }
+  {
+    const auto create_finished_ns = SteadyNowNs();
+    const auto [list, generation] = submission::RecordingIdentity(command_list);
+    std::ostringstream message;
+    message << "feature 18 create finished: provider=" << (direct_api.private_instance ? "XeFG" : "ordinary")
+            << ", list=" << list << ", generation=" << generation << ", start_ns=" << create_started_ns
+            << ", duration_ms=" << (create_finished_ns - create_started_ns) / 1e6
+            << ", result=0x" << std::hex << static_cast<uint32_t>(result);
+    Log(reshade::log::level::info, message.str());
   }
   if (result == NVSDK_NGX_Result_FAIL_OutOfGPUMemory) {
     slot.memory_failure = true;
@@ -9051,7 +9233,9 @@ inline bool EnsureNrFeature(
   // TrackUse first: it arms the inert queue-detour gate on this session's
   // very first NR create, and the flag must then read TRUE - this handle's
   // submissions carry exact proofs from that moment, not lease fallbacks.
-  submission::TrackUse(command_list, slot.handle);
+  submission::TrackUse(command_list, slot.handle, submission::UseKind::kProvider);
+  submission::TrackUse(command_list, slot.parameters, submission::UseKind::kProvider);
+  slot.creation_recording = submission::ObserveRecording(command_list);
   if (control_mask_enabled.load(std::memory_order_relaxed) || state.control_mask_recording != nullptr) {
     slot.recording = submission::ObserveRecording(command_list);
   }
@@ -9089,6 +9273,19 @@ inline bool EnsureNrFeature(
   message << ", requested network=" << nr_model::PresetName(slot.nr_preset)
           << " (preset " << slot.nr_preset << "; runtime confirmation unavailable)";
   Log(reshade::log::level::info, message.str());
+  return true;
+}
+
+inline bool NrModelPreparationReady(NrFeatureSlot* slot, ID3D12CommandList* list) {
+  const auto current = submission::RecordingIdentity(list);
+  if (slot->creation_recording != nullptr
+      && current == std::pair{slot->creation_recording->list, slot->creation_recording->generation}) return false;
+  const auto& preparation = slot->preparation_recording;
+  if (preparation == nullptr) return true;
+  if (!preparation->closed.load() || !preparation->submitted.load()
+      || !submission::CanReuseRecordingObjects({slot->handle, slot->parameters}, current, preparation)) return false;
+  slot->preparation_recording.reset();
+  slot->creation_completed = true;
   return true;
 }
 
@@ -12161,7 +12358,7 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
     uint32_t source_outputs = 1, uint32_t observed_model_roles = 0, bool feature_reuse_binding = false,
     const BridgeAdaptiveSource* bridge_source = nullptr,
     const output_framerate::OutputIdentity& output_identity = {}, uint64_t display_source_generation = 0,
-    AdaptiveEditCadence edit_cadence = {}) {
+    AdaptiveEditCadence edit_cadence = {}, bool allow_measurement = true) {
   if (!nr_adaptive_enabled.load() && *owner == nullptr) return {};
   if (*owner == nullptr) *owner = std::make_shared<adaptive_resolution::Session>();
   auto baseline = FrozenGroupGeometry(plan, group, reference_width, reference_height, guide_width, guide_height);
@@ -12378,7 +12575,7 @@ inline adaptive_resolution::Frame FreezeAdaptiveFrame(
   session.status.resource_strategy_observed = nr_adaptive_enabled.load();
   session.status.resource_limited_residency = limited_residency;
   if (supported && levels < 2 && nr_adaptive_enabled.load()) session.status.reason = adaptive_resolution::Reason::BUDGET;
-  const bool measure = now_ns >= session.next_measure_ns;
+  const bool measure = allow_measurement && now_ns >= session.next_measure_ns;
   if (measure) session.next_measure_ns = now_ns + adaptive_resolution::SAMPLE_INTERVAL_NS;
   PublishAdaptiveStatus(session.status);
   return {.session = *owner, .sizes = session.status.requested, .upper = upper,
@@ -14226,6 +14423,17 @@ struct NrRecording {
 #endif
 };
 
+enum class NrModelPreparationState { READY, RECORDED, PENDING, FAILED };
+
+struct NrModelPreparationResult {
+  NrModelPreparationState state = NrModelPreparationState::FAILED;
+  std::shared_ptr<submission::RecordingStatus> recording;
+  std::vector<std::shared_ptr<submission::RecordingStatus>> recordings;
+  uint32_t required_mask = 0;
+  uint32_t created_mask = 0;
+  double cpu_ms = 0.;
+};
+
 inline present_frame_policy::GroupResult PresentGroupResult(
     std::span<const NrRecording> recordings, uint32_t required_roles, bool same_phase, uint32_t composed_roles = 0) {
   std::array<present_frame_policy::Product, 2> products{};
@@ -14747,7 +14955,8 @@ inline bool RecordInline(
 #if defined(NR_NEXUS_DEV_CONTROL)
     , bool inline_restore_bridge = false
 #endif
-    , const BridgeAdaptiveSource* bridge_source = nullptr
+    , const BridgeAdaptiveSource* bridge_source = nullptr,
+    NrModelPreparationResult* model_preparation = nullptr
 ) {
 #if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
   const ColdCpuTraceScope cold_trace("RecordInline");
@@ -14777,13 +14986,18 @@ inline bool RecordInline(
   const auto group = (plan.mixed ? plan.At(execution_stage)
                                 : stage_plan::Group{.stage = execution_stage, .count = plan.pass_count});
   if (group.count == 0) return false;
+  if (model_preparation != nullptr) {
+    model_preparation->required_mask = (1u << group.count) - 1u;
+  }
   if ((control_mask_use_core_context.load() || direct_api.borrowed_core_context)
       && (present != nullptr || plan.mixed || group.count != 1 || prepare_models_only)) return false;
   auto& stage_stats = stage_telemetry[static_cast<size_t>(execution_stage)];
-  ++stage_stats.groups;
+  if (!prepare_models_only) {
+    ++stage_stats.groups;
+  }
   stage_stats.pass_begin = group.begin;
   stage_stats.pass_count = group.count;
-  StageExecutionScope stage_scope{.stats = &stage_stats};
+  StageExecutionScope stage_scope{.stats = &stage_stats, .complete = prepare_models_only};
   if (plan.mixed && evaluate_chain.depth != 0
       && (present == nullptr || present->stage_execution_plan == nullptr)
       && (evaluate_chain.configuration_generation != configuration_generation.load()
@@ -14803,7 +15017,7 @@ inline bool RecordInline(
   // ratio cannot see; the health ledger reads this count instead.  Not while
   // Streamline tagged MVs this present: then the MVs NR reads are the
   // capture's, which ProcessStreamlineInline counts (it also calls here).
-  if (GetD3D12Resource(game_parameters, NVSDK_NGX_Parameter_Color) != nullptr
+  if (!prepare_models_only && GetD3D12Resource(game_parameters, NVSDK_NGX_Parameter_Color) != nullptr
       && (streamline_tag_mask_this_present.load(std::memory_order_relaxed) & 2u) == 0) {
     CountMotionPresence(
         GetD3D12Resource(game_parameters, NVSDK_NGX_Parameter_MotionVectors)
@@ -14919,7 +15133,8 @@ inline bool RecordInline(
   const uint8_t hdr_mode = present != nullptr
                                ? present->hdr_mode
                                : FrameHdrMode(output_format, feature.create_flags);
-  if (preparing_adaptive_frame == nullptr && (present == nullptr || !present->game_frame_observed)) {
+  if (!prepare_models_only && preparing_adaptive_frame == nullptr
+      && (present == nullptr || !present->game_frame_observed)) {
     ObserveGameFrame(current);
   }
   // KCD2 (and most titles) send the full DLSS subrect/size contract only at
@@ -15212,7 +15427,11 @@ inline bool RecordInline(
                   && present->stage_execution_plan == nullptr && !present->native_prefg_resolution_pair))),
           0, 1, false, adaptive_output_count, 0, feature_reuse_binding, bridge_source,
           adaptive_output_owner,
-           (present != nullptr ? present->diagnostic_source_generation : feature.source_generation), edit_cadence));
+           (present != nullptr ? present->diagnostic_source_generation : feature.source_generation), edit_cadence,
+          !prepare_models_only));
+  if (prepare_models_only) {
+    adaptive.measure = false;
+  }
   SelectAdaptiveTier(&feature, handle, &adaptive, present != nullptr && present->adaptive_frame != nullptr,
       present != nullptr ? present->workset_key : output, false, &group, present);
   if (feature.adaptive_output_blocked || feature.adaptive_retirement_blocked) {
@@ -15392,8 +15611,8 @@ inline bool RecordInline(
       && ((edit_reuse_fixed_workset
            && (edit_reuse_fixed_bilinear || CanCommitFullSizeEditReuse(feature, width, height, nr_input_width, nr_input_height)))
           || edit_reuse_adaptive_route);
-  if (edit_reuse_requested && !edit_reuse_route_eligible) ++edit_reuse_fallbacks;
-  if (!edit_reuse_route_eligible) {
+  if (!prepare_models_only && edit_reuse_requested && !edit_reuse_route_eligible) ++edit_reuse_fallbacks;
+  if (!prepare_models_only && !edit_reuse_route_eligible) {
     if (edit_monitor.device != nullptr || monitor_adapter_delivery) {
       if (plan.mixed || group.begin != 0 || (group.count != 1 && !same_stage_stack)) edit_monitor.reason = EditReuseBlock::PASSES;
       else if (control_mask_eligible) edit_monitor.reason = EditReuseBlock::MASK;
@@ -15414,7 +15633,7 @@ inline bool RecordInline(
       ? static_cast<uint32_t>(feature.adaptive_cache->active) : 0u);
   const bool track_control_mask_history = control_mask_eligible || edit_reuse_route_eligible || edit_reuse_adaptive_contract
       || feature.control_mask_recording != nullptr || feature.control_mask_stream != nullptr;
-  if (track_control_mask_history) {
+  if (track_control_mask_history && model_preparation == nullptr) {
     const auto current_recording = submission::RecordingIdentity(command_list);
     const auto reusable = [&](const std::vector<const void*>& objects,
                               const std::shared_ptr<submission::RecordingStatus>& previous) {
@@ -15529,6 +15748,22 @@ inline bool RecordInline(
       }
     }
   }
+  const std::array debounce_before{
+      std::array{feature.debounce_width, feature.debounce_height, feature.debounce_frames},
+      std::array{feature.second_resolution.debounce_width, feature.second_resolution.debounce_height,
+                 feature.second_resolution.debounce_frames}};
+  const auto restore_preparation_debounce = [&](FeatureState* prepared) {
+    prepared->debounce_width = debounce_before[0][0];
+    prepared->debounce_height = debounce_before[0][1];
+    prepared->debounce_frames = debounce_before[0][2];
+    prepared->second_resolution.debounce_width = debounce_before[1][0];
+    prepared->second_resolution.debounce_height = debounce_before[1][1];
+    prepared->second_resolution.debounce_frames = debounce_before[1][2];
+  };
+  // Preparation computes the contract the normal stage will use. Only that
+  // normal stage counts the source frame toward resolution settling.
+  const std::unique_ptr<FeatureState, decltype(restore_preparation_debounce)> preparation_debounce(
+      prepare_models_only ? &feature : nullptr, restore_preparation_debounce);
   const bool dims_committed =
       CommitNrResolution(feature, nr_input_width, nr_input_height, group.begin);
   const bool edit_reuse_committed_geometry = (nr_input_width == width && nr_input_height == height)
@@ -15672,6 +15907,9 @@ inline bool RecordInline(
 
   const auto pipeline_preparation = PrepareAdaptivePipelines(device, adaptive, hdr_mode, control_mask_eligible);
   if (pipeline_preparation != PipelinePreparationResult::READY) {
+    if (model_preparation != nullptr && pipeline_preparation == PipelinePreparationResult::PENDING) {
+      model_preparation->state = NrModelPreparationState::PENDING;
+    }
     if (!prepare_models_only && preparing_adaptive_frame == nullptr) {
       CountNrDecline(pipeline_preparation == PipelinePreparationResult::PENDING
           ? NrDeclineReason::kSlotWarmupMaturation : NrDeclineReason::kFailureBackoff);
@@ -15685,10 +15923,32 @@ inline bool RecordInline(
   // preserving frame-ahead maturation without evaluating or reading color.
   if (prepare_models_only) {
     bool prepared = true;
+    bool ready = true;
     for (uint32_t pass = 0; pass < requested_stack && prepared; ++pass) {
+      auto& slot = feature.slots[pass];
+      if (model_preparation != nullptr && !slot.creation_completed && slot.preparation_recording == nullptr) {
+        slot.preparation_recording = slot.creation_recording;
+      }
+      if (model_preparation != nullptr && slot.preparation_recording != nullptr
+          && slot.preparation_recording->closed.load() && !slot.preparation_recording->submitted.load()) {
+        ReleaseNrSlot(feature, pass, true);
+      }
+      const bool creating = slot.handle == nullptr;
+      if (model_preparation != nullptr && creating) {
+        model_preparation->recording = submission::ObserveRecording(command_list);
+      }
       prepared = EnsureNrFeature(command_list, feature, pass,
                                   FinalResources{.hdr_mode = hdr_mode},
                                   pass_widths[pass], pass_heights[pass], pass_widths[pass], pass_heights[pass]);
+      if (model_preparation != nullptr) {
+        if (creating && prepared) {
+          slot.preparation_recording = model_preparation->recording;
+          slot.recording = model_preparation->recording;
+          model_preparation->created_mask |= 1u << pass;
+        }
+        ready &= prepared && (slot.creation_completed || slot.creation_recording != nullptr)
+            && NrModelPreparationReady(&slot, command_list);
+      }
     }
     if (command_list_touched != nullptr) {
       *command_list_touched = true;
@@ -15696,8 +15956,21 @@ inline bool RecordInline(
     if (recording != nullptr) {
       recording->prepared = prepared;
     }
+    if (model_preparation != nullptr) {
+      model_preparation->state = (!prepared ? NrModelPreparationState::FAILED
+          : model_preparation->created_mask != 0 ? NrModelPreparationState::RECORDED
+          : ready ? NrModelPreparationState::READY : NrModelPreparationState::PENDING);
+    }
     device->Release();
     return prepared;
+  }
+
+  for (uint32_t pass = 0; pass < requested_stack; ++pass) {
+    if (!NrModelPreparationReady(&feature.slots[pass], command_list)) {
+      CountNrDecline(NrDeclineReason::kSlotWarmupMaturation);
+      device->Release();
+      return false;
+    }
   }
 
   const bool codec_ok = hdr_mode != 0 ? EnsureV6CodecPipeline(device)
@@ -15861,6 +16134,7 @@ inline bool RecordInline(
   if (setup_ok) {
     // Disabling the mask changes the workset, but the new unmasked work still
     // uses the guarded NR History until its recording is submitted or discarded.
+    submission::SetRecordingOwner(command_list, submission::RecordingOwner::kBorrowedGame, true);
     TrackWorksetRecording(command_list, *workset, track_control_mask_history);
     if (track_control_mask_history) {
       workset->control_mask_recording = workset->recording;
@@ -16749,7 +17023,9 @@ inline bool RecordInline(
 
       // The NGX runtime records this handle's work into the game's list: a
       // tracked use, so a later retirement waits for exactly this submission.
-      submission::TrackUse(command_list, feature.slots[pass].handle);
+      submission::TrackUse(command_list, &direct_api, submission::UseKind::kProvider);
+      submission::TrackUse(command_list, feature.slots[pass].handle, submission::UseKind::kProvider);
+      submission::TrackUse(command_list, feature.slots[pass].parameters, submission::UseKind::kProvider);
       if (control_mask_enabled.load(std::memory_order_relaxed) || feature.control_mask_recording != nullptr) {
         feature.slots[pass].recording = submission::ObserveRecording(command_list);
       }
@@ -17116,6 +17392,13 @@ inline bool RecordInline(
   // correct flicker-free behavior for this frame.  A failed pass also keeps
   // the write-back off - the failure path below retains the game output.
   if (executed >= 0 && !NVSDK_NGX_FAILED(stack_failure) && !adaptive.preparing && !edit_reuse_delivery_failed) {
+    const auto copy_output = [&](ID3D12Resource* source, uint32_t x = 0, uint32_t y = 0) {
+      submission::TrackUse(command_list, output, submission::UseKind::kOutputColor,
+          {.resource = renodx::utils::directx::NativeIdentity(output), .subresource = 0,
+           .version = (present != nullptr ? present->base_frame.sequence : feature.sr_sequence)});
+      Transition(command_list, output, output_rest, D3D12_RESOURCE_STATE_COPY_DEST, 0u);
+      CopyMip0(command_list, output, source, nullptr, x, y);
+    };
     if (executed + 1 == static_cast<int32_t>(requested_stack) && last_model_pass >= 0) {
       const auto& model_resources = (last_model_pass == 1 && second_workset != nullptr ? *second_workset : res);
       const uint64_t previous_capture_serial = (last_model_used_control_mask
@@ -17158,8 +17441,7 @@ inline bool RecordInline(
     }
     if (terminal_reuse) {
       Transition(command_list, res.decoded, *res.DecodedState(), D3D12_RESOURCE_STATE_COPY_SOURCE);
-      Transition(command_list, output, output_rest, D3D12_RESOURCE_STATE_COPY_DEST, 0u);
-      CopyMip0(command_list, output, res.decoded);
+      copy_output(res.decoded);
       Transition(command_list, output, D3D12_RESOURCE_STATE_COPY_DEST, output_rest, 0u);
       Transition(command_list, res.decoded, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
       *res.DecodedState() = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -17551,8 +17833,7 @@ inline bool RecordInline(
             && !native_fg_owns.load() && !auto_fg_fallback_active.load()) {
           fg::xefg::WithHostWritePermission(adaptive_output_owner, edit_off.available ? &edit_off : nullptr, [&] {
             copied = output_framerate::WithCurrentOutput(adaptive_output_owner, !edit_off.available, [&] {
-              Transition(command_list, output, output_rest, D3D12_RESOURCE_STATE_COPY_DEST, 0u);
-              CopyMip0(command_list, output, res.decoded, nullptr, output_rect.x, output_rect.y);
+              copy_output(res.decoded, output_rect.x, output_rect.y);
               Transition(command_list, output, D3D12_RESOURCE_STATE_COPY_DEST, output_rest, 0u);
             });
           });
@@ -17567,8 +17848,7 @@ inline bool RecordInline(
           ++edit_reuse_fallbacks;
         }
       } else {
-        Transition(command_list, output, output_rest, D3D12_RESOURCE_STATE_COPY_DEST, 0u);
-        CopyMip0(command_list, output, res.decoded, nullptr, output_rect.x, output_rect.y);
+        copy_output(res.decoded, output_rect.x, output_rect.y);
         if (hdr_capture_plan) {
           screenshot::RecordHdrReceiverCopy(device, command_list, output, output_rect.x, output_rect.y);
         }
@@ -17605,12 +17885,7 @@ inline bool RecordInline(
       if (capture_this_eval || capture_service_role) {
         capture_stage("packed_final", final_surface, D3D12_RESOURCE_STATE_COPY_SOURCE, width, height);
       }
-      Transition(
-          command_list, output,
-          output_rest,
-          D3D12_RESOURCE_STATE_COPY_DEST,
-          0u);
-      CopyMip0(command_list, output, final_surface, nullptr, output_rect.x, output_rect.y);
+      copy_output(final_surface, output_rect.x, output_rect.y);
       if (capture_service_role) {
         screenshot::RecordHdrReceiverCopy(device, command_list, output, output_rect.x, output_rect.y);
       }
@@ -17924,6 +18199,54 @@ inline bool ProcessInline(ID3D12GraphicsCommandList* command_list, const NVSDK_N
     }, present == nullptr);
   }
   return result;
+}
+
+// Caller owns the NGX turn and runtime_mutex, and an independent private
+// recording. This records only initialization work for the exact normal
+// input contract. The owner must submit, close future replay, and prove GPU
+// completion before using another recording for the first color delivery.
+inline bool PrepareNrModels(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle,
+                            const NVSDK_NGX_Parameter* parameters, const PresentTarget& target,
+                            NrModelPreparationResult* result) {
+  if (result == nullptr) return false;
+  *result = {};
+  const auto started_ns = SteadyNowNs();
+  const PipelinePreparationScope pipeline_scope;
+  const bool accepted = RecordInline(list, handle, parameters, nullptr, &target, nullptr, true, nullptr
+#if defined(NR_NEXUS_DEV_CONTROL)
+      , false
+#endif
+      , nullptr, result);
+  if (const auto feature = features.find(handle); feature != features.end()) {
+    bool model_failed = false;
+    for (uint32_t pass = 0; pass < kMaxNrPasses; ++pass) {
+      if ((result->required_mask & (1u << pass)) == 0) continue;
+      const auto& slot = feature->second.slots[pass];
+      model_failed |= slot.failed;
+      const auto& pending = slot.preparation_recording;
+      if (pending == nullptr) continue;
+      if (std::ranges::find(result->recordings, pending) == result->recordings.end()) {
+        result->recordings.push_back(pending);
+      }
+    }
+    if (!result->recordings.empty() && result->recording == nullptr) {
+      result->recording = result->recordings.front();
+    }
+    if (!accepted && !model_failed && !result->recordings.empty()) {
+      result->state = NrModelPreparationState::PENDING;
+    }
+  }
+  result->cpu_ms = (SteadyNowNs() - started_ns) / 1e6;
+  if (result->recording != nullptr
+      && (result->created_mask != 0 || result->state == NrModelPreparationState::FAILED)) {
+    std::ostringstream message;
+    message << "NR independent preparation: provider=" << (target.private_signed_runtime ? "XeFG" : "ordinary")
+            << ", list=" << result->recording->list << ", generation=" << result->recording->generation
+            << ", required_mask=" << result->required_mask << ", created_mask=" << result->created_mask
+            << ", cpu_ms=" << result->cpu_ms << ", accepted=" << accepted;
+    Log(reshade::log::level::info, message.str());
+  }
+  return accepted || result->state == NrModelPreparationState::PENDING;
 }
 
 // ---------------------------------------------------------------------------
@@ -18714,6 +19037,13 @@ inline bool RecordInlinePreSR(
     device->Release();
     return false;
   }
+  for (uint32_t pass = 0; pass < requested_stack; ++pass) {
+    if (!NrModelPreparationReady(&feature.slots[pass], command_list)) {
+      CountNrDecline(NrDeclineReason::kSlotWarmupMaturation);
+      device->Release();
+      return false;
+    }
+  }
   const bool codec_ok = hdr_mode != 0 ? EnsureV6CodecPipeline(device)
                                       : EnsureLegacyCodecPipeline(device);
   const bool control_mask_pipeline_ok = !control_mask_eligible
@@ -18796,6 +19126,7 @@ inline bool RecordInlinePreSR(
     res.pre_sr_source = color;
   }
   // Exact submission-use proof (issue 01) - see the post-SR path.
+  submission::SetRecordingOwner(command_list, submission::RecordingOwner::kBorrowedGame, true);
   TrackWorksetRecording(command_list, res, track_control_mask_history);
   if (track_control_mask_history) {
     workset->control_mask_recording = workset->recording;
@@ -19360,7 +19691,9 @@ inline bool RecordInlinePreSR(
       }
       // The NGX runtime records this handle's work into the game's list: a
       // tracked use, so a later retirement waits for exactly this submission.
-      submission::TrackUse(command_list, feature.slots[pass].handle);
+      submission::TrackUse(command_list, &direct_api, submission::UseKind::kProvider);
+      submission::TrackUse(command_list, feature.slots[pass].handle, submission::UseKind::kProvider);
+      submission::TrackUse(command_list, feature.slots[pass].parameters, submission::UseKind::kProvider);
       if (control_mask_enabled.load(std::memory_order_relaxed) || feature.control_mask_recording != nullptr) {
         feature.slots[pass].recording = submission::ObserveRecording(command_list);
       }
@@ -25559,7 +25892,7 @@ inline void OnInitDevice(reshade::api::device* device) {
   }
   fg::xefg::Configure(fg_service::Service, fg_service::PrepareCapture, fg_service::Retire,
       fg_service::Requested, present_block_hudless.load(std::memory_order_relaxed),
-      xefg_sdk_detours_enabled.load(std::memory_order_relaxed));
+      xefg_sdk_detours_enabled.load(std::memory_order_relaxed), fg_service::PrepareRuntime);
   fg::xefg::Poll();
   InstallHooks();
   const bool d3d12_device =
@@ -25612,7 +25945,7 @@ inline void OnInitSwapchain(reshade::api::swapchain* swapchain, bool /*resize*/)
   fg::native_options::Poll();
   fg::xefg::Configure(fg_service::Service, fg_service::PrepareCapture, fg_service::Retire,
       fg_service::Requested, present_block_hudless.load(std::memory_order_relaxed),
-      xefg_sdk_detours_enabled.load(std::memory_order_relaxed));
+      xefg_sdk_detours_enabled.load(std::memory_order_relaxed), fg_service::PrepareRuntime);
   fg::xefg::Poll();
   if (swapchain == nullptr) return;
   reshade::api::device* const device = swapchain->get_device();
@@ -36253,6 +36586,9 @@ inline void DetachLite() {
   // Flag the screenshot worker without touching its mutexes: the worker may
   // be mid-job holding them, and blocking here would stall the loader lock.
   screenshot::SignalShutdown();
+#if defined(NR_NEXUS_DEV_CONTROL)
+  present_handoff_capture::SignalShutdown();
+#endif
 }
 
 // Device-rebuild teardown: live threads, no loader lock, so the full release

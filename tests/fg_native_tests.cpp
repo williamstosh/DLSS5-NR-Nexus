@@ -204,7 +204,7 @@ int RunNativeOwnerIdleTest();
 int RunNativeOptionsResumeTest(bool delayed_options = false);
 void ResizeNativeTestOutput(Gpu& gpu, IDXGISwapChain3* output, ID3D12Resource* old_input);
 int RunNativeGuideContractTest();
-int RunPresentGuideModelsTest(bool native_ngx = false, const char* project_id_path = nullptr);
+int RunPresentGuideModelsTest(bool native_ngx = false, const char* project_id_path = nullptr, bool handoff_only = false);
 int RunNativePresentDecisionTest();
 int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_only = false);
 // Case bodies follow the Present fixture that supplies their shared Runtime.
@@ -758,6 +758,7 @@ static std::filesystem::path present_fixture_ini;
 #if defined(NR_NEXUS_DEV_CONTROL)
 #include "nr_fg_output_marker_gpu_cases.hpp"
 #include "fg_consumer_capture_cases.hpp"
+#include "present_handoff_capture_cases.hpp"
 #endif
 #include "nr_edit_reuse_xefg_cases.hpp"
 #include "control_mask_capture_cases.hpp"
@@ -1111,6 +1112,9 @@ int main(int argc, char** argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--native-guide-contract") == 0) return RunNativeGuideContractTest();
   if (argc == 2 && std::strcmp(argv[1], "--present-guide-models") == 0) return RunPresentGuideModelsTest();
+  if (argc == 2 && std::strcmp(argv[1], "--xefg-present-handoff") == 0) {
+    return run_edit_reuse_case([] { return RunPresentGuideModelsTest(false, nullptr, true); });
+  }
   if (argc == 2 && std::strcmp(argv[1], "--native-present-decision") == 0) {
     return run_edit_reuse_case(RunNativePresentDecisionTest);
   }
@@ -4174,7 +4178,9 @@ struct PresentRingFaceProbe final : reshade::api::swapchain {
     queue.device = &device;
     queue.native = gpu->queue.Get();
     queue.allow_submit = mode == Mode::NATIVE_ROUTE;
-    Check(active == nullptr, "one bounded Present face probe");
+    if (mode == Mode::PROXY_PROBE) {
+      Check(active == nullptr, "one bounded Present face probe");
+    }
     get_device_slot = {.object = back, .index = 7, .original = &original_get_device,
         .replacement = +[](ID3D12Resource* resource, REFIID iid, void** output) -> HRESULT {
           if (active != nullptr && resource == active->back) {
@@ -4183,8 +4189,10 @@ struct PresentRingFaceProbe final : reshade::api::swapchain {
           }
           return original_get_device(resource, iid, output);
         }};
-    if (mode == Mode::PROXY_PROBE) renodx::utils::vtable::Install(&get_device_slot);
-    active = this;
+    if (mode == Mode::PROXY_PROBE) {
+      renodx::utils::vtable::Install(&get_device_slot);
+      active = this;
+    }
     native::present_guides = native::kPresentGuidesRequired;
     native::present_pre_fg = 0;
     native::present_sdr_white_polled_ns = native::SteadyNowNs();
@@ -4193,8 +4201,10 @@ struct PresentRingFaceProbe final : reshade::api::swapchain {
     native::present_guides = saved_guides;
     native::present_pre_fg = saved_pre_fg;
     native::present_unusable = saved_unusable;
-    if (mode == Mode::PROXY_PROBE) renodx::utils::vtable::Uninstall(&get_device_slot);
-    active = nullptr;
+    if (mode == Mode::PROXY_PROBE) {
+      renodx::utils::vtable::Uninstall(&get_device_slot);
+      active = nullptr;
+    }
   }
   uint64_t get_native() const override { return reinterpret_cast<uintptr_t>(swapchain); }
   void get_private_data(const uint8_t[16], uint64_t*) const override { throw std::logic_error("unexpected swapchain data"); }
@@ -4236,14 +4246,20 @@ void ResizeNativeTestOutput(Gpu& gpu, IDXGISwapChain3* output, ID3D12Resource* o
 #include "output_framerate_registration_cases.hpp"
 
 #include "xefg_inline_handoff_cases.hpp"
+#include "xefg_present_handoff_cases.hpp"
 
-int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
+int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool handoff_only) {
   try {
     const HMODULE test_module = GetModuleHandleW(nullptr);
     reshade::internal::get_reshade_module_handle(test_module);
     native::addon_module = test_module;
     ComPtr<ID3D12Debug> debug;
     if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) debug->EnableDebugLayer();
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (!native_ngx && !handoff_only) {
+      RunPresentHandoffCaptureCases();
+    }
+#endif
     if (native_ngx) {
       Check(project_id_path != nullptr, "native FG ProjectID path");
     }
@@ -4544,6 +4560,17 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
     adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakePresent);
     adapter::proxies[0].real[1] = reinterpret_cast<void*>(&FakePresent1);
     xefg::Configure(&native::fg_service::Service, &Prepare, nullptr, &Requested);
+    if (handoff_only) {
+      native::RetirePresentStream(nullptr);
+      native::ForgetSourceHandleLocked(fg_handle);
+      native::DrainRetiredResources(true);
+      native::nr_adaptive_enabled = false;
+      native::codec_pipeline.incremental_preparation = false;
+      native::edit_reuse_enabled = false;
+      native::control_mask_enabled = false;
+      xefg_present_handoff_cases::Run(gpu, submit, wait_present_fence);
+      return 0;
+    }
     // Session::Tag declares COMMON. Finish these transitions before its
     // private queue consumes the same guide and HUDless resources.
     for (auto* resource : {hudless.Get(), guides[2].Get(), guides[3].Get()}) {
@@ -4786,6 +4813,34 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
       native::control_mask_mode.store(saved_control_mask_mode);
       native::control_mask_motion_enabled.store(saved_control_mask_motion);
       native::direct_runtime_requirements.file_version = saved_control_mask_runtime_version;
+      ComPtr<IDXGIAdapter3> memory_adapter;
+      DXGI_QUERY_VIDEO_MEMORY_INFO local_memory{};
+      auto memory_result = gpu.factory->EnumAdapterByLuid(gpu.device->GetAdapterLuid(), IID_PPV_ARGS(&memory_adapter));
+      if (SUCCEEDED(memory_result)) {
+        memory_result = memory_adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_memory);
+      }
+      auto& memory_receipt = native_handoff["gpu_memory"];
+      memory_receipt["after_shutdown_query_hresult"] = static_cast<uint32_t>(memory_result);
+      memory_receipt["after_shutdown_local_bytes"] = nullptr;
+      if (SUCCEEDED(memory_result)) {
+        memory_receipt["after_shutdown_local_bytes"] = local_memory.CurrentUsage;
+      }
+      size_t live_features = 0;
+      for (const auto& [_, feature] : native::features) {
+        live_features += std::ranges::count_if(feature.slots, [](const auto& slot) { return slot.handle != nullptr; });
+      }
+      memory_receipt["features_after_shutdown"] = {{"created", native::nr_features_created},
+          {"released", native::nr_features_released}, {"live", live_features}, {"retired", native::retired_nr_features.size()}};
+      uint64_t remaining_workset_bytes = 0;
+      for (const auto& [_, workset] : native::worksets) {
+        remaining_workset_bytes += workset.allocated_bytes;
+      }
+      for (const auto& retired : native::retired_final_resources) {
+        remaining_workset_bytes += retired.resources.allocated_bytes;
+      }
+      memory_receipt["worksets_after_shutdown"] = {{"created", native::worksets_created},
+          {"released", native::worksets_released}, {"live", native::worksets.size()},
+          {"retired", native::retired_final_resources.size()}, {"remaining_allocated_bytes", remaining_workset_bytes}};
       std::ofstream receipt("xefg-inline-handoff-native.json");
       receipt << native_handoff.dump(2) << '\n';
       receipt.close();
@@ -5073,8 +5128,8 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
         return model_calls > calls_before && ordinary.nr_presents > presents_before;
       };
       Check(run_ordinary() && native::present_ring.submitted != 0 && native::PresentRingComplete()
-                && native::TeardownProof() == submission::RecordedWork::kReplayable,
-            "ordinary Present has real completed GPU work that can still be replayed");
+                && native::TeardownProof() == submission::RecordedWork::kComplete,
+            "ordinary Present completes its real GPU work and closes its private generation at submission");
 
       // The shared safety suite tests Ensure directly. These two cases must
       // also retain the provider when the actual Proxy/Service requests it.
@@ -5108,9 +5163,26 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
       const auto old_destroy = native::core_destroy_parameters;
       const auto old_model = native::features.at(ordinary.Handle()).slots[0].handle;
       const auto old_parameters = native::features.at(ordinary.Handle()).slots[0].parameters;
+      if (!via_core) {
+        const auto& ring = native::present_ring;
+        const auto& slot = ring.slots[ring.submitted % native::kPresentRing];
+        const auto recording = submission::ObserveRecording(slot.list);
+        Check(recording != nullptr && recording->submitted.load() && recording->closed.load()
+                  && recording->close_reason.load() == submission::CloseReason::kOwnerDiscarded
+                  && !submission::ResourceReleasable(old_model),
+              "ordinary private replay ends at Execute while its actual model remains in flight");
+      }
       const auto release_count = model_released_handles.size();
       const auto destroyed = providers::provider_core.destroys;
       const auto blocked_calls = model_calls;
+      const auto handoff_waits = [] {
+        return std::ranges::count_if(captured_logs, [](const auto& entry) {
+          return entry.second.find("ordinary Present handoff wait: ") != std::string::npos;
+        });
+      };
+      const auto waits_before = handoff_waits();
+      auto* const outgoing_fence = native::present_ring.fence;
+      const auto outgoing_value = native::present_ring.submitted;
       Check(Hooks::Enable(session.handle, 1) == 0 && xefg::OwnsStream(), "public XeFG Enable takes Present ownership");
       Check(SUCCEEDED(adapter::ProxyHooks<0>::Present(session.proxy.Get(), 0, 0)), "blocked XeFG proxy Present");
       Check(xefg::CurrentResult() == fg::Result::NOT_SERVED && model_calls == blocked_calls
@@ -5129,15 +5201,27 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
         submission::PruneCompletedGenerations();
         gpu.uploads.clear();
       } else {
-        Check(native::present_ring.submitted != 0 && native::TeardownProof() == submission::RecordedWork::kPending,
-              "Service cannot release the pending owned Present ring");
+        Check(outgoing_fence != nullptr && outgoing_value != 0 && native::present_ring.fence == outgoing_fence
+                  && native::present_ring.submitted == outgoing_value && native::present_ring.handoff_wait_timed_out
+                  && handoff_waits() == waits_before + 1 && native::TeardownProof() == submission::RecordedWork::kPending,
+              "the bounded owner handoff wait times out once and retains the old ring and GPU work");
+        Check(SUCCEEDED(adapter::ProxyHooks<0>::Present(session.proxy.Get(), 0, 0)), "repeat Present during the same pending handoff");
+        Check(handoff_waits() == waits_before + 1 && xefg::CurrentResult() == fg::Result::NOT_SERVED
+                  && model_calls == blocked_calls && native::present_ring.fence == outgoing_fence
+                  && native::present_ring.submitted == outgoing_value && !native::PresentRingComplete()
+                  && !submission::ResourceReleasable(old_model) && model_released_handles.size() == release_count
+                  && native::features.at(ordinary.Handle()).slots[0].parameters == old_parameters,
+              "the same pending handoff cannot wait again or release in-flight model and parameters");
+        std::cout << "XEFG_HANDOFF_ORDINARY_TIMEOUT attempts=2 bounded_waits=1 resources=retained\n";
         Check(SUCCEEDED(queue_gate->Signal(1)), "release only the queue gate");
         gate_release.release();
         wait_present_fence(native::present_ring.fence, native::present_ring.submitted);
         wait_present_fence(gpu.fence.Get(), gpu.serial);
         gpu.submission_pending = false;
-        Check(native::TeardownProof() == submission::RecordedWork::kReplayable,
-              "actual WARP completion leaves owned Present replayable until Service retires it");
+        Check(native::TeardownProof() == submission::RecordedWork::kComplete,
+              "queue completion releases the owned work whose replay was already closed at submission");
+        submission::PruneCompletedGenerations();
+        Check(submission::ResourceReleasable(old_model), "the completed owned model is now releasable");
         gpu.uploads.clear();
       }
       std::cout << "XEFG_SERVICE_BLOCK provider=" << provider
@@ -5176,6 +5260,12 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
       uint64_t submitted = 0;
       uint32_t frame_evals = 0;
       uint32_t sustained_submissions = 0;
+      namespace rate = addon::output_framerate;
+      const auto swapchain_key = reinterpret_cast<uintptr_t>(session.proxy.Get());
+      const std::array buffers{reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(back.Get()))};
+      rate::RegisterPresentOutput(swapchain_key,
+          reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(gpu.device.Get())),
+          reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(session.proxy.Get())), buffers);
       const auto captures_before_service = native::present_captures.load();
       std::vector<NativeRuntimeEvaluation> observed;
       model_parameter_observer = [&](const NVSDK_NGX_Handle* model, const NVSDK_NGX_Parameter* block) {
@@ -5209,7 +5299,8 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
             ? sustained_submissions + 1 : 0);
         if (sustained_submissions == 6) break;
       }
-      std::cout << "XEFG_PRESENT_HANDOFF provider=" << provider << " initial_owned_work=replayable"
+      rate::DestroyPresentOutput(swapchain_key);
+      std::cout << "XEFG_PRESENT_HANDOFF provider=" << provider << " initial_owned_work=closed"
                 << " result=" << static_cast<unsigned>(result) << " model_evals=" << model_calls - previous_calls
                 << " frame_evals=" << frame_evals << " queue_submissions=" << submitted
                 << " source_captures=" << native::present_captures.load() - captures_before_service
@@ -5256,8 +5347,8 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
       if (via_core) {
         xefg_inline_handoff_cases::Run(gpu, session, back.Get(), guides[3].Get(), guides[2].Get(), submit, wait_present_fence);
       }
-      Check(native::direct_api.private_instance && native::TeardownProof() == submission::RecordedWork::kReplayable,
-            "completed XeFG list is still replayable just before public Disable");
+      Check(native::direct_api.private_instance && native::TeardownProof() == submission::RecordedWork::kComplete,
+            "successful XeFG delivery has already ended private replay just before public Disable");
       Check(Hooks::Enable(session.handle, 0) == 0 && !xefg::OwnsStream(),
             "public XeFG Disable returns Present ownership without a Resize");
       if (via_core) {
@@ -5344,7 +5435,7 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
       const auto reverse_switches = switch_count();
       const bool resumed = run_ordinary();
       std::cout << "XEFG_PRESENT_RESTORE provider=" << provider
-                << " disable=public no_resize=1 initial_owned_work=replayable"
+                << " disable=public no_resize=1 initial_owned_work=closed"
                 << " ordinary_model_evals=" << model_calls - ordinary_calls
                 << " ordinary_submissions=" << ordinary.nr_presents - ordinary_submissions
                 << " runtime_switch_pending=" << switch_count() - reverse_switches << std::endl;
@@ -5385,6 +5476,7 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
               "explicit private-provider handoff has no extra same-provider face-settling delay");
       }
     }
+    xefg_present_handoff_cases::Run(gpu, submit, wait_present_fence);
     if (info != nullptr) {
       for (UINT64 i = 0; i < info->GetNumStoredMessages(); ++i) {
         SIZE_T bytes = 0;

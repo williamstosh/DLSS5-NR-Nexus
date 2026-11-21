@@ -33,7 +33,7 @@ function Assert-PublishingIsolation {
     $text = [Text.Encoding]::ASCII.GetString($bytes)
     foreach ($marker in @('inline_restore_roi','inline_restore_roi_v1','mafia-same-frame-roi',
         'unsupported_inline_restore_contract','bridge_adaptive_experiment','edit_reuse_adaptive_experiment',
-        'edit_reuse_fg_experiment','adaptive_feature_experiment','fg_output_probe','xefg_present_probe','sdk_display_configuration_and_marker_recording_not_output_pixels',
+        'edit_reuse_fg_experiment','adaptive_feature_experiment','fg_output_probe','xefg_present_probe','present_handoff_capture','sdk_display_configuration_and_marker_recording_not_output_pixels',
         'linear_FP16_after_resolve_alpha_preserved','xefgSwapChainEnableDebugFeature','NR Nexus IME diagnostics')) {
         # Match UTF-16LE bytes at either alignment as well as plain ASCII.
         $wide = [Text.Encoding]::ASCII.GetString([Text.Encoding]::Unicode.GetBytes($marker))
