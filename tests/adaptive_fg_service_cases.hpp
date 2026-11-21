@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <map>
 #include <new>
 #include <utility>
 #include <vector>
@@ -26,6 +27,7 @@ struct ListCall {
   HRESULT result;
 };
 std::vector<ListCall> list_calls;
+inline IDXGISwapChain3* sdk_owner_proxy = nullptr;
 using CreatePipelineFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
 CreatePipelineFn real_create_pipeline = nullptr;
 uint32_t pipeline_calls = 0;
@@ -223,6 +225,35 @@ int Run() {
     auto motion = texture(DXGI_FORMAT_R16G16_FLOAT);
     auto depth = texture(DXGI_FORMAT_R32_FLOAT);
     gpu.Submit();
+    funnel_accounting_tests::Restore sdk_restore;
+    sdk_restore.Value(&adapter::modules[0]);
+    sdk_restore.Value(&adapter::proxies[0]);
+    sdk_restore.Atomic(&adapter::retire);
+    sdk_restore.Value(&sdk_owner_proxy);
+    struct SdkOwners {
+      std::map<uintptr_t, ComPtr<ReceiptSwapchain>> proxies;
+      ~SdkOwners() {
+        for (const auto& [context, proxy] : proxies) Hooks::Destroy(reinterpret_cast<void*>(context));
+      }
+    } sdk_owners;
+    // Only the SDK exports and proxy boundary are MOCK. Production hooks own
+    // registration/epochs; the Service-only consumer receipt remains explicit.
+    adapter::modules[0].complete = true;
+    adapter::modules[0].real[0] = reinterpret_cast<void*>(+[](void*, ID3D12CommandQueue*, const xefg::abi::Init*) -> int32_t { return 0; });
+    adapter::modules[0].real[2] = reinterpret_cast<void*>(+[](void*, REFIID iid, void** output) -> int32_t {
+      return sdk_owner_proxy != nullptr && SUCCEEDED(sdk_owner_proxy->QueryInterface(iid, output)) ? 0 : -1;
+    });
+    adapter::modules[0].real[6] = reinterpret_cast<void*>(+[](void*, uint32_t) -> int32_t { return 0; });
+    adapter::modules[0].real[8] = reinterpret_cast<void*>(+[](void*) -> int32_t { return 0; });
+    adapter::proxies[0].installed = adapter::proxies[0].complete = true;
+    adapter::retire.store(&native::fg_service::Retire);
+    const auto retire_owners = [&] {
+      for (const auto& [context, proxy] : sdk_owners.proxies) {
+        Check(Hooks::Destroy(reinterpret_cast<void*>(context)) == 0, "adaptive Service SDK owner Destroy");
+      }
+      sdk_owners.proxies.clear();
+      native::fg_service::Retire();
+    };
     fg::FrameInput input;
     input.context = 0xADAF6;
     input.epoch = 1;
@@ -239,6 +270,22 @@ int Run() {
     input.fg_enabled = true;
     input.color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
     const auto service = [&] {
+      const auto handle = reinterpret_cast<void*>(input.context);
+      if (!sdk_owners.proxies.contains(input.context)) {
+        auto& proxy = sdk_owners.proxies[input.context];
+        proxy.Attach(new ReceiptSwapchain(nullptr));
+        proxy->reported_device12 = gpu.device;
+        proxy->current_back_buffer = color;
+        sdk_owner_proxy = proxy.Get();
+        adapter::proxies[0].records[0].target = static_cast<uint8_t*>((*reinterpret_cast<void***>(proxy.Get()))[8]);
+        const xefg::abi::Init init{.application_swapchain = proxy.Get()};
+        Check(Hooks::Init(handle, gpu.queue.Get(), &init) == 0, "adaptive Service SDK owner Init");
+        ComPtr<IDXGISwapChain3> observed_proxy;
+        Check(Hooks::GetSwapchain(handle, IID_PPV_ARGS(&observed_proxy)) == 0 && observed_proxy.Get() == proxy.Get()
+            && Hooks::Enable(handle, 1) == 0, "adaptive Service SDK owner GetSwapchain and Enable");
+      }
+      input.epoch = adapter::state.contexts.at(handle)->epoch;
+      Check(xefg::ServiceContextCurrent(input.context, input.epoch), "adaptive Service input names a live SDK owner epoch");
       ++input.application_frame;
       const auto before_source = native::SourceSuccessfulEvaluations();
       observing_context = input.context;
@@ -408,7 +455,7 @@ int Run() {
           && DetourDetach(reinterpret_cast<PVOID*>(&real_create_pipeline), reinterpret_cast<PVOID>(ObserveCreatePipeline)) == NO_ERROR
           && DetourTransactionCommit() == NO_ERROR, "cold Service PSO observer detach");
       native::nr_adaptive_enabled = false;
-      native::fg_service::Retire();
+      retire_owners();
       gpu.Submit();
       native::DrainRetiredResources(true);
       native::ReleaseCodecPipeline();
@@ -558,7 +605,7 @@ int Run() {
           "explicit Service recovery waits for its own retirements and restores complete two-Pass output");
     }
     native::direct_api.create = CreateModel;
-    native::fg_service::Retire();
+    retire_owners();
     gpu.Submit();
     native::DrainRetiredResources(true);
     auto hudless = texture(DXGI_FORMAT_R8G8B8A8_UNORM);
@@ -746,14 +793,20 @@ int Run() {
     Check(service() == fg::Result::PREPARED && dual.adaptive_role_unavailable
         && dual.adaptive_session->status.reason == addon::adaptive_resolution::Reason::UNSUPPORTED,
         "a real contract transition starts while the old required role is unavailable");
-    ++input.epoch;
+    const auto previous_epoch = input.epoch;
+    const auto epoch_owner = reinterpret_cast<void*>(input.context);
+    Check(Hooks::Enable(epoch_owner, 0) == 0 && Hooks::Enable(epoch_owner, 1) == 0,
+        "public SDK Disable/Enable replaces the unavailable old Service epoch");
+    input.epoch = adapter::state.contexts.at(epoch_owner)->epoch;
+    Check(input.epoch != previous_epoch, "the replacement epoch comes from the production SDK lifecycle");
     for (uint32_t frame = 0; frame < 24; ++frame) service();
-    Check(!dual.adaptive_role_unavailable && dual.epoch == input.epoch
-        && dual.adaptive_session != nullptr && dual.adaptive_session->prepared
-        && dual.adaptive_required_roles == 1 && !dual.adaptive_session->failed
-        && native::features.at(dual.roles[0].Handle()).adaptive_cache != previous_primary,
+    auto& epoch_stream = native::fg_service::streams.at({false, input.context});
+    Check(!epoch_stream.adaptive_role_unavailable && epoch_stream.epoch == input.epoch
+        && epoch_stream.adaptive_session != nullptr && epoch_stream.adaptive_session->prepared
+        && epoch_stream.adaptive_required_roles == 1 && !epoch_stream.adaptive_session->failed
+        && native::features.at(epoch_stream.roles[0].Handle()).adaptive_cache != previous_primary,
         "a real epoch change retires the unavailable old contract and prepares the new single-role group");
-    const auto epoch_primary = native::features.at(dual.roles[0].Handle()).adaptive_cache;
+    const auto epoch_primary = native::features.at(epoch_stream.roles[0].Handle()).adaptive_cache;
     input.color_width = input.color_height = 8;
     for (uint32_t frame = 0; frame < 24; ++frame) service();
     auto& changed = native::fg_service::streams.at({false, input.context});
@@ -764,7 +817,7 @@ int Run() {
         && !changed.adaptive_session->failed,
         "a real same-epoch color geometry change prepares its new contract instead of waiting for an obsolete role");
 
-    native::fg_service::Retire();
+    retire_owners();
     gpu.Submit();
     native::DrainRetiredResources(true);
     native::nr_adaptive_selected_levels.store(5);
@@ -1008,7 +1061,7 @@ int Run() {
     native::nr_adaptive_limited_residency = false;
     native::nr_adaptive_selected_levels = 0;
     model_parameter_observer = {};
-    native::fg_service::Retire();
+    retire_owners();
     gpu.Submit();
     native::DrainRetiredResources(true);
     Check(DetourTransactionBegin() == NO_ERROR && DetourUpdateThread(GetCurrentThread()) == NO_ERROR,

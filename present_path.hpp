@@ -2945,12 +2945,9 @@ inline bool YieldPresentToNativeFg() {
 #include "native_fg_tag_source.hpp"
 #include "fg_native.hpp"
 
-// The stopped XeFG pool no longer rotates its owned lists. End replay
-// eligibility before the ordinary runtime checks the recorded-work proof.
 inline bool ResumeOrdinaryPresentLocked(ID3D12GraphicsCommandList* command_list = nullptr) {
   if (!direct_api.private_instance) return true;
   if (fg::xefg::OwnsStream()) return false;
-  fg_service::RetireServiceStreamsLocked();
   if (command_list != nullptr) {
     auto decline = NrDeclineReason::kNrRuntimeUnavailable;
     if (!EnsureDirectRuntime(command_list, &decline, false)) {
@@ -4126,26 +4123,6 @@ inline void RunPresentPath(
             "select Evaluated model buffers (NRScreenshotSource=2) for a diagnostic pair");
       }
     }
-  }
-  // SDK presentation continues after NR leaves Present, but OwnsStream then
-  // becomes false. The stopped private pool no longer rotates its lists.
-  // Removing that owned pool ends replay eligibility; GPU completion and
-  // external game/Native recordings still independently gate provider release.
-  if (enabled.load(std::memory_order_relaxed) && fg::xefg::Enabled()
-      && hook_point.load(std::memory_order_relaxed) != kHookPresent) {
-    bool stopped_service = false;
-    {
-      RuntimeTryLock lock(runtime_mutex);
-      if (lock.owns_lock()) {
-        if (workset_free_policy.load(std::memory_order_relaxed) == 0u
-            && !shutdown_quiesce_latched.load(std::memory_order_relaxed)) {
-          DrainPresentRetired();
-        }
-        stopped_service = std::ranges::any_of(fg_service::streams, [](const auto& entry) { return !entry.first.first; });
-      }
-    }
-    // Once removed, inline Presents do not take another NGX retirement turn.
-    if (stopped_service) fg_service::Retire();
   }
   if (fg::xefg::OwnsStream()) {
     if (observed_present_queue.load(std::memory_order_acquire) != nullptr) {

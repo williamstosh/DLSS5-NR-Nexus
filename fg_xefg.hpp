@@ -227,11 +227,22 @@ static_assert(sizeof(Init) == 72 && offsetof(Init, ui_mode) == 64);
 }  // namespace abi
 
 namespace internal {
+inline std::atomic<Retire> retire{nullptr};
+}  // namespace internal
+
+// Call only after SDK/configuration locks are released. The owner may already
+// hold runtime_mutex; maintenance neither enters NGX nor waits for its turn.
+inline void ReconcileNrService() noexcept {
+  if (const auto callback = internal::retire.load(std::memory_order_acquire); callback != nullptr) {
+    callback();
+  }
+}
+
+namespace internal {
 using Microsoft::WRL::ComPtr;
 inline constexpr int32_t kUiModeAuto = 0;
 inline std::atomic<Service> service{nullptr};
 inline std::atomic<PrepareCapture> prepare_capture{nullptr};
-inline std::atomic<Retire> retire{nullptr};
 inline std::atomic<bool (*)() noexcept> requested{nullptr};
 inline std::atomic_bool block_optional_hudless{false};
 // Startup-only diagnostic switch. When false, XeFG SDK exports and its proxy
@@ -924,8 +935,9 @@ inline void Initialize(void* handle, ID3D12CommandQueue* queue, const abi::Init*
         registered->epoch, registered->fg_environment_generation);
   });
 #endif
-#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
   lock.unlock();
+  ReconcileNrService();
+#if defined(NR_NEXUS_DEV_CONTROL) && defined(NR_NEXUS_TEST_FG_OUTPUT_PROBE)
   if (probe_sdk_slot < 2) {
     // The actual Init hook owns the opaque-handle lifecycle turn. This export
     // is resolved from that exact SDK slot, never from a library basename.
@@ -1880,8 +1892,6 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
 
 inline void BeforeResize(IDXGISwapChain* swapchain) {
   const auto identity = Identity(swapchain);
-  const auto callback = retire.load(std::memory_order_acquire);
-  if (callback != nullptr) callback();
   std::unique_lock lock(state.mutex);
   for (const auto& [handle, context] : state.contexts) {
     if (context->proxy_identity == identity) {
@@ -1890,6 +1900,8 @@ inline void BeforeResize(IDXGISwapChain* swapchain) {
     }
   }
   PublishResult(Result::NOT_SERVED);
+  lock.unlock();
+  ReconcileNrService();
 }
 
 struct ProxyEntryScope {
@@ -1979,6 +1991,8 @@ struct ProxyHooks {
           context->color_space = color;
         }
       }
+      lock.unlock();
+      ReconcileNrService();
     }
     return status;
   }
@@ -2187,6 +2201,7 @@ struct SdkHooks {
           }
         }
         RefreshOwnership();
+        ReconcileNrService();
       } catch (...) { PublishResult(Result::FAILED); }
     }
     return status;
@@ -2576,6 +2591,7 @@ struct SdkHooks {
     }
     if (status == 0) {
       RefreshOwnership();
+      ReconcileNrService();
     }
     return status;
   }
@@ -2604,6 +2620,9 @@ struct SdkHooks {
           static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(handle)), composition, status,
           static_cast<unsigned>(applied), static_cast<unsigned>(Requested()));
       LogDiagnostic(message);
+    }
+    if (status == 0) {
+      ReconcileNrService();
     }
     return status;
   }
@@ -2643,6 +2662,7 @@ struct SdkHooks {
       }
       lock.unlock();
       RefreshOwnership();
+      ReconcileNrService();
     }
     return status;
   }
@@ -2716,6 +2736,19 @@ inline std::array<void*, EXPORTS.size()> SdkDetours() {
   };
 }
 }  // namespace internal
+
+inline bool ServiceContextCurrent(std::uintptr_t context, std::uint64_t epoch) noexcept {
+  try {
+    if (internal::stopped.load(std::memory_order_acquire)
+        || !internal::sdk_detours_enabled.load(std::memory_order_acquire)) return false;
+    std::shared_lock lock(internal::state.mutex);
+    const auto it = internal::state.contexts.find(reinterpret_cast<void*>(context));
+    return it != internal::state.contexts.end() && it->second->epoch == epoch && it->second->enabled
+        && it->second->queue != nullptr && internal::UniqueProxyLocked(it->second->proxy_identity);
+  } catch (...) {
+    return false;
+  }
+}
 
 inline void SetPresentFailureHandler(const FrameInput& input, void (*callback)(const FrameInput&) noexcept) {
   // Register on this borrow only, so direct service calls and other contexts
@@ -2794,6 +2827,7 @@ inline void Configure(Service service, PrepareCapture capture, Retire retire, bo
   internal::prepare_capture.store(capture, std::memory_order_release);
   internal::retire.store(retire, std::memory_order_release);
   internal::requested.store(requested, std::memory_order_release);
+  ReconcileNrService();
 }
 
 inline void ConfigureBridgeSource(BridgeSourceObserver observer) noexcept {
@@ -3073,6 +3107,7 @@ inline void Stop() noexcept {
     }
     removed_sources.swap(internal::state.bridge_swapchains);
   }
+  ReconcileNrService();
   for (size_t index = 0; index < internal::modules.size(); ++index) {
     const auto& slot = internal::modules[index];
     if (!slot.installed) continue;

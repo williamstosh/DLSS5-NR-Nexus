@@ -3379,11 +3379,55 @@ int main(int argc, char** argv) {
         const ComPtr<ID3D12Resource> color12 = render_set.color12;
         const ComPtr<ID3D12Resource> motion12 = render_set.motion12;
         const ComPtr<ID3D12Resource> depth12 = render_set.depth12;
+        namespace service_adapter = xefg::internal;
+        static IDXGISwapChain3* service_sdk_proxy = nullptr;
+        struct ServiceSdkOwner {
+          service_adapter::SdkSlot saved_module = service_adapter::modules[0];
+          service_adapter::ProxySlot saved_proxy = service_adapter::proxies[0];
+          decltype(service_adapter::retire.load()) saved_retire = service_adapter::retire.load();
+          IDXGISwapChain3* saved_sdk_proxy = service_sdk_proxy;
+          ComPtr<ReceiptSwapchain> proxy;
+          void* handle = reinterpret_cast<void*>(uintptr_t{0xD11F});
+          bool registered = false;
+          ~ServiceSdkOwner() {
+            if (registered) Hooks::Destroy(handle);
+            service_sdk_proxy = saved_sdk_proxy;
+            service_adapter::retire.store(saved_retire);
+            service_adapter::proxies[0] = saved_proxy;
+            service_adapter::modules[0] = saved_module;
+          }
+        } sdk_owner;
+        // A MOCK proxy declares the existing real Bridge texture without
+        // creating DXGI work on the deliberately stalled queue.
+        sdk_owner.proxy.Attach(new ReceiptSwapchain(nullptr));
+        sdk_owner.proxy->reported_device12 = bridge_device;
+        sdk_owner.proxy->current_back_buffer = color12;
+        service_sdk_proxy = sdk_owner.proxy.Get();
+        service_adapter::modules[0].complete = true;
+        service_adapter::modules[0].real[0] = reinterpret_cast<void*>(+[](void*, ID3D12CommandQueue*, const xefg::abi::Init*) -> int32_t { return 0; });
+        service_adapter::modules[0].real[2] = reinterpret_cast<void*>(+[](void*, REFIID iid, void** output) -> int32_t {
+          return service_sdk_proxy != nullptr && SUCCEEDED(service_sdk_proxy->QueryInterface(iid, output)) ? 0 : -1;
+        });
+        service_adapter::modules[0].real[6] = reinterpret_cast<void*>(+[](void*, uint32_t) -> int32_t { return 0; });
+        service_adapter::modules[0].real[8] = reinterpret_cast<void*>(+[](void*) -> int32_t { return 0; });
+        service_adapter::proxies[0].installed = service_adapter::proxies[0].complete = true;
+        service_adapter::proxies[0].records[0].target = static_cast<uint8_t*>(
+            (*reinterpret_cast<void***>(sdk_owner.proxy.Get()))[8]);
+        service_adapter::retire.store(&native::fg_service::Retire);
+        const xefg::abi::Init sdk_init{.application_swapchain = sdk_owner.proxy.Get()};
+        Check(Hooks::Init(sdk_owner.handle, native::bridge.queue, &sdk_init) == 0, "Bridge Service SDK owner Init");
+        sdk_owner.registered = true;
+        ComPtr<IDXGISwapChain3> observed_proxy;
+        Check(Hooks::GetSwapchain(sdk_owner.handle, IID_PPV_ARGS(&observed_proxy)) == 0
+                  && observed_proxy.Get() == sdk_owner.proxy.Get() && Hooks::Enable(sdk_owner.handle, 1) == 0,
+            "Bridge Service SDK owner GetSwapchain and Enable");
         fg::FrameInput input{.queue = native::bridge.queue, .backbuffer = color12.Get(),
             .depth = depth12.Get(), .motion = motion12.Get(),
             .color_width = width, .color_height = height, .guide_width = width, .guide_height = height,
             .context = 0xD11F, .epoch = 1, .application_frame = 1,
             .color_space = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, .fg_enabled = true};
+        input.epoch = service_adapter::state.contexts.at(sdk_owner.handle)->epoch;
+        Check(xefg::ServiceContextCurrent(input.context, input.epoch), "Bridge handoff starts with a live SDK owner epoch");
         // Isolate the Bridge retirement from provider initialization by reusing
         // the ready fixture model on the same WARP device as a private provider.
         auto& symbols = native::ngx_loader_staging;
@@ -3420,6 +3464,16 @@ int main(int argc, char** argv) {
         }
         Check(result == fg::Result::SUBMITTED && service_submitted != 0 && model_calls > calls_before_service,
             "Service submits real WARP work using the model substitute after Bridge retirement");
+        Check(native::fg_service::streams.at({false, input.context}).awaiting_xefg_delivery,
+            "completed Service work still awaits its separate SDK consumer receipt");
+        // This direct-Service test explicitly models SDK consumption only after
+        // the real private fence above completes; it never advances that fence.
+        native::fg_service::OnXeFGPresentDelivery(input, true);
+        Check(!native::fg_service::streams.at({false, input.context}).awaiting_xefg_delivery,
+            "the explicit mock consumer receipt settles the submitted Service frame");
+        Check(Hooks::Destroy(sdk_owner.handle) == 0 && !xefg::ServiceContextCurrent(input.context, input.epoch),
+            "public SDK Destroy ends the Bridge Service owner before retirement");
+        sdk_owner.registered = false;
         native::fg_service::Retire();
         native::DrainRetiredResources(true);
         native::DrainPresentRetired();

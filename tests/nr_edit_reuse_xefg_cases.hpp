@@ -1069,6 +1069,7 @@ int Run() {
       Check(final_anchor != nullptr, "recovered XeFG source owns a new edit cache");
       std::weak_ptr<addon::edit_reuse::State> retired_anchor = final_anchor;
       final_anchor.reset();
+      Check(Hooks::Enable(session.handle, 0) == 0, "SDK Disable ends the XeFG source before owned retirement");
       native::fg_service::Retire();
       gpu.Submit();
       native::PruneCompletedSubmissionUses();

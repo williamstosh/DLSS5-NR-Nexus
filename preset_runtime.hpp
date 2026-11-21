@@ -654,6 +654,7 @@ inline bool Apply(const presets::Document& document, bool compatibility, bool re
   }
   notice = (restart ? "Preset applied. Restart the game for hook policy changes." : "Preset applied.");
   if (!changes.empty()) profile_commit_epoch.fetch_add(1, std::memory_order_relaxed);
+  fg::xefg::ReconcileNrService();
   return true;
 }
 

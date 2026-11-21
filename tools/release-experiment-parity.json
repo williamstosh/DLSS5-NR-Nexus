@@ -214,14 +214,22 @@
       "state": "ready",
       "intent": [],
       "commands": [],
-      "producer": "XeFG keeps its enabled context while the existing NRHookPoint setting selects an inline NR stage; no new setting",
-      "consumer": "OnPresent -> RunPresentPath -> stopped owned Service pool retirement -> ordinary inline provider",
-      "success": "Completed private recordings stop replaying with their removed pool; actual Render and Upscaled NR deliver readable results, then Present resumes with FG still enabled.",
-      "refusal": "Unsubmitted or externally replayable game recordings retain their original objects and block provider teardown.",
-      "fallback": "A genuinely pending handoff preserves the current game output and resumes on a later legal frame.",
+      "producer": "Committed NR owner configuration and successful public SDK owner exits call ReconcileNrService after configuration/SDK locks are released.",
+      "consumer": "Registered fg_service retirement callback closes disqualified private recordings and retains pending SDK/GPU operands per owner.",
+      "success": "Owner exit closes private replay before another callback. NR Off policy zero retains its objects. Other owners keep delivering, and Render/Upscaled then Present resume with FG enabled.",
+      "refusal": "Entered service recordings, pending EndPresent delivery and in-flight GPU operands retain their required objects; external game recordings still block provider teardown.",
+      "fallback": "Pending delivery settles against the exited owner. Re-entry uses fresh delivery identity while the previous pool stays protected.",
       "sources": [
-        ["present_path.hpp", "fg_service::Retire();"],
+        ["preset_runtime.hpp", "fg::xefg::ReconcileNrService();"],
+        ["dlssnr.hpp", "fg::xefg::ReconcileNrService();"],
+        ["fg_xefg.hpp", "inline void ReconcileNrService() noexcept"],
+        ["fg_xefg.hpp", "internal::retire.store(retire, std::memory_order_release);"],
+        ["fg_xefg.hpp", "ReconcileNrService();"],
         ["fg_native.hpp", "inline void RetireServiceStreamsLocked()"],
+        ["fg_native.hpp", "stream.service_exit_pending = true;"],
+        ["fg_native.hpp", "if (stream.service_recording)"],
+        ["fg_native.hpp", "submission::OnCommandListReset(slot.list);"],
+        ["fg_native.hpp", "if (stream.awaiting_xefg_delivery || keep_resources)"],
         ["dlssnr.hpp", ", nullptr, NVSDK_NGX_SUCCEED(result));"],
         ["dlssnr.hpp", "evaluate_chain.Injected(GetD3D12Resource(parameters, NVSDK_NGX_Parameter_Output))"]
       ],
@@ -229,16 +237,20 @@
         { "suite": "fg-native", "name": "present-guide-models", "log": "present-guide-models",
           "receipt": "^PASS XeFG Present handoff providers=ordinary-image\\+Core real_guides\\+Optional-no-ID passes=2 Service_owned_pending\\+external_replayable public_disable_restore evidence=WARP\\+MOCK real_NGX=NOT_RUN$",
           "existingTrace": true,
-          "scenarios": ["upscaled", "render", "upscaled-empty-pool", "render-empty-pool", "upscaled-off-hold", "render-off-hold", "upscaled-reclaim", "render-reclaim", "nested-delivery", "nested-failed-sr", "nested-source-first", "nested-source-next", "nested-recovery"],
+          "scenarios": ["upscaled", "render", "upscaled-empty-pool", "render-empty-pool", "upscaled-off-hold", "render-off-hold", "upscaled-reclaim", "render-reclaim", "upscaled-owner-exit", "render-owner-exit", "owner-isolation", "owner-pending", "nested-delivery", "nested-failed-sr", "nested-source-first", "nested-source-next", "nested-recovery"],
           "expect": {
             "upscaled": "^XEFG_INLINE_HANDOFF stage=Upscaled fg=held_on sr=MOCK sr_wrapper=actual inline_nr_evals=2 inline_delivery_readback=2 xefg_nr_evals=2 xefg_delivery_readback=2 game_pending_and_replayable=1 evidence=WARP\\+MOCK$",
             "render": "^XEFG_INLINE_HANDOFF stage=Render fg=held_on sr=MOCK sr_wrapper=actual inline_nr_evals=2 inline_delivery_readback=2 xefg_nr_evals=2 xefg_delivery_readback=2 game_pending_and_replayable=0 evidence=WARP\\+MOCK$",
             "upscaled-empty-pool": "^XEFG_INLINE_EMPTY_POOL stage=Upscaled serial_wait_delta=0$",
             "render-empty-pool": "^XEFG_INLINE_EMPTY_POOL stage=Render serial_wait_delta=0$",
-            "upscaled-off-hold": "^XEFG_INLINE_OFF_HOLD stage=Upscaled policy=0 replayable=retained$",
-            "render-off-hold": "^XEFG_INLINE_OFF_HOLD stage=Render policy=0 replayable=retained$",
+            "upscaled-off-hold": "^XEFG_INLINE_OFF_HOLD stage=Upscaled policy=0 objects=retained replayable=closed$",
+            "render-off-hold": "^XEFG_INLINE_OFF_HOLD stage=Render policy=0 objects=retained replayable=closed$",
             "upscaled-reclaim": "^XEFG_INLINE_RECLAIM stage=Upscaled completed_owned=drained$",
             "render-reclaim": "^XEFG_INLINE_RECLAIM stage=Render completed_owned=drained$",
+            "upscaled-owner-exit": "^XEFG_OWNER_EXIT stage=Upscaled trigger=config_commit old_callbacks=0 replayable=closed fg=held_on$",
+            "render-owner-exit": "^XEFG_OWNER_EXIT stage=Render trigger=config_commit old_callbacks=0 replayable=closed fg=held_on$",
+            "owner-isolation": "^XEFG_OWNER_ISOLATION exited=A active=B active_delivery=readback returned_delivery=readback$",
+            "owner-pending": "^XEFG_OWNER_PENDING replayable=closed gpu_in_flight=retained old_EndPresent=settled reentry=fresh$",
             "nested-delivery": "^XEFG_INLINE_NESTED stage=Upscaled wrappers=Cpp0>Cpp1 frames=2 sr_calls=2 nr_evals=2 source_owners=2 adaptive_levels=1 gpu_timers=1 delivery=DELIVERED completed_groups=2 full_readbacks=2 fg=held_on evidence=WARP\\+MOCK$",
             "nested-failed-sr": "^XEFG_INLINE_NESTED_SR_FAILURE stage=Upscaled sr_calls=1 nr_evals=0 source_owners=1 new_completed=0 full_readback=unchanged evidence=WARP\\+MOCK$",
             "nested-source-first": "^XEFG_INLINE_NESTED_SOURCE_OUTPUT frame=1 outer_enhanced=matched same_list_copy=1 output_registered=1 source_bound=1$",
@@ -293,6 +305,14 @@
       "end": "inline void AppendPremiseObservation(",
       "anchors": ["premise.snapshot = {};", "premise.live = {};", "++premise.epoch;"],
       "forbidden": "\\bstate\\b|\\btracking_versions\\b|\\b(?:Forget|Remove|Publish)Version\\b"
+    }
+  },
+  "ownershipBoundaries": {
+    "Present FG service ownership": {
+      "file": "present_path.hpp",
+      "start": "/*",
+      "anchors": ["inline void RunPresentPath("],
+      "forbidden": "\\bfg_service\\s*::\\s*(?:streams\\b|(?:Retire|RetireServiceStreamsLocked)\\s*\\()"
     }
   },
   "macroSites": {

@@ -195,8 +195,11 @@ function Assert-ReleaseParitySourceSection([string]$SourceRoot, [string]$Name, $
     $source = Get-Content -LiteralPath (Join-Path $SourceRoot $Section.file) -Raw
     $start = $source.IndexOf($Section.start, [StringComparison]::Ordinal)
     if ($start -lt 0) { throw "Missing $Name source entry: $($Section.start)" }
-    $end = $source.IndexOf($Section.end, $start + $Section.start.Length, [StringComparison]::Ordinal)
-    if ($end -lt 0) { throw "Missing $Name source boundary: $($Section.end)" }
+    $end = $source.Length
+    if ($Section.Contains('end')) {
+        $end = $source.IndexOf($Section.end, $start + $Section.start.Length, [StringComparison]::Ordinal)
+        if ($end -lt 0) { throw "Missing $Name source boundary: $($Section.end)" }
+    }
     $body = $source.Substring($start, $end - $start)
     foreach ($anchor in $Section.anchors) {
         if (-not $body.Contains($anchor, [StringComparison]::Ordinal)) { throw "Missing $Name effect: $anchor" }
@@ -309,6 +312,9 @@ function Get-ReleaseParityRegistration([string]$SourceRoot, [switch]$AllowPendin
     }
     foreach ($guard in $manifest.diagnosticWrites.Keys) {
         Assert-ReleaseParitySourceSection $SourceRoot $guard $manifest.diagnosticWrites[$guard]
+    }
+    foreach ($guard in $manifest.ownershipBoundaries.Keys) {
+        Assert-ReleaseParitySourceSection $SourceRoot $guard $manifest.ownershipBoundaries[$guard]
     }
 
     # Track the complete independent key catalogs, including the older keys

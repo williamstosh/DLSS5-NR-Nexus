@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <span>
@@ -307,7 +308,9 @@ inline void Run(Gpu& gpu, Session& session, ID3D12Resource* back,
   };
 
   const auto run_xefg = [&] {
-    native::hook_point = native::kHookPresent;
+    if (native::hook_point.load() != native::kHookPresent) {
+      native::kSetHookPoint.Commit(static_cast<float>(native::kHookPresent));
+    }
     uint32_t resumed = 0;
     nlohmann::json frames = nlohmann::json::array();
     const auto& telemetry = native::stage_telemetry[static_cast<size_t>(Stage::PRESENT)];
@@ -392,11 +395,276 @@ inline void Run(Gpu& gpu, Session& session, ID3D12Resource* back,
     run_xefg();
   }
 
+  {
+    funnel_accounting_tests::Restore owner_restore;
+    owner_restore.Atomic(&native::nr_adaptive_enabled);
+    owner_restore.Atomic(&native::nr_adaptive_min_scale);
+    owner_restore.Atomic(&native::nr_adaptive_selected_levels);
+    owner_restore.Atomic(&native::gpu_timers_enabled);
+    owner_restore.Value(&adapter::proxies[0].real[0]);
+    native::nr_adaptive_enabled = true;
+    native::nr_adaptive_min_scale = 1.f;
+    native::nr_adaptive_selected_levels = 0;
+    native::gpu_timers_enabled = true;
+    Session exiting(&gpu);
+    exiting.context->ui_composition = false;
+    exiting.extent_left = exiting.extent_top = 0;
+    exiting.extent_width = width;
+    exiting.extent_height = height;
+    const auto exiting_key = std::pair{false, reinterpret_cast<uintptr_t>(exiting.handle)};
+    ComPtr<ID3D12Resource> exiting_back;
+    Check(SUCCEEDED(exiting.proxy->GetBuffer(exiting.proxy->GetCurrentBackBufferIndex(),
+                                             IID_PPV_ARGS(&exiting_back))), "second owner actual DXGI backbuffer");
+    gpu.Write(exiting_back.Get(), 96);
+    gpu.Write(back, 160);
+    submit();
+    uint32_t exiting_id = 30000;
+    bool warm = false;
+    for (uint32_t frame = 0; frame < native::kContractDebounceFrames + 8 && !warm; ++frame) {
+      exiting.Guides(++exiting_id, sdk_depth, sdk_motion);
+      exiting.Present(exiting_id);
+      const auto& stream = native::fg_service::streams.at(exiting_key);
+      wait_fence(stream.fence, stream.submitted);
+      warm = xefg::CurrentResult() == fg::Result::SUBMITTED;
+    }
+    Check(warm, "the second SDK owner matures on its own production private pool");
+    warm = false;
+    for (uint32_t frame = 0; frame < native::kContractDebounceFrames + 8 && !warm; ++frame) {
+      session.Guides(++present_id, sdk_depth, sdk_motion);
+      session.Present(present_id);
+      const auto& stream = native::fg_service::streams.at(key);
+      wait_fence(stream.fence, stream.submitted);
+      warm = xefg::CurrentResult() == fg::Result::SUBMITTED;
+    }
+    Check(warm, "both SDK owners are active on the same warmed adaptive configuration");
+    gpu.Write(back, 160);
+    submit();
+    const auto* const surviving_role = native::fg_service::streams.at(key).roles[0].Handle();
+    const auto* const surviving_model = native::features.at(surviving_role).slots[0].handle;
+    const auto* const surviving_parameters = native::features.at(surviving_role).slots[0].parameters;
+    std::function<void(IDXGISwapChain*)> before_sdk_return;
+    static std::function<void(IDXGISwapChain*)>* active_owner_probe = nullptr;
+    owner_restore.Value(&active_owner_probe);
+    active_owner_probe = &before_sdk_return;
+    adapter::proxies[0].real[0] = reinterpret_cast<void*>(+[](IDXGISwapChain* proxy, UINT interval, UINT flags) -> HRESULT {
+      const auto result = FakePresent(proxy, interval, flags);
+      if (active_owner_probe != nullptr && *active_owner_probe) (*active_owner_probe)(proxy);
+      return result;
+    });
+    ComPtr<ID3D12Fence> gate;
+    Check(SUCCEEDED(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate))), "owner-exit GPU gate");
+    const auto unblock = [](ID3D12Fence* fence) { fence->Signal(1); };
+    std::unique_ptr<ID3D12Fence, decltype(unblock)> release_gate(gate.Get(), unblock);
+    ComPtr<ID3D12Fence> old_fence;
+    uint64_t old_fence_value = 0;
+    std::shared_ptr<submission::RecordingStatus> old_recording;
+    std::shared_ptr<addon::adaptive_resolution::DeliveryReceipt> old_delivery;
+    const auto old_epoch = exiting.context->epoch;
+    before_sdk_return = [&](IDXGISwapChain* proxy) {
+      if (proxy != exiting.proxy.Get()) return;
+      const auto& stream = native::fg_service::streams.at(exiting_key);
+      const auto slot = std::ranges::find_if(stream.slots, [&](const auto& candidate) {
+        return candidate.list != nullptr && candidate.fence_value == stream.submitted;
+      });
+      Check(slot != stream.slots.end() && stream.awaiting_xefg_delivery,
+            "the real proxy wrapper reaches SDK return with a submitted NR group awaiting EndPresent");
+      old_recording = submission::ObserveRecording(slot->list);
+      old_delivery = stream.pending_xefg_delivery.frame.delivery;
+      old_fence = stream.fence;
+      old_fence_value = stream.submitted;
+      const auto* const model = native::features.at(stream.roles[0].Handle()).slots[0].handle;
+      const auto releases = std::count(model_released_handles.begin(), model_released_handles.end(), model);
+      Check(old_delivery != nullptr && *old_delivery == addon::adaptive_resolution::DeliveryReceipt::PENDING
+                && old_fence->GetCompletedValue() < old_fence_value && !old_recording->closed.load(),
+            "the outgoing SDK delivery and its actual GPU submission are both still pending");
+      gpu.submission_pending = true;
+      Check(SUCCEEDED(gpu.queue->Signal(gpu.fence.Get(), ++gpu.serial)), "owner-exit fixture completion marker");
+      Check(Hooks::Enable(exiting.handle, 0) == 0, "public SDK Disable exits only the second owner");
+      Check(old_recording->closed.load() && *old_delivery == addon::adaptive_resolution::DeliveryReceipt::PENDING
+                && !submission::ResourceReleasable(model)
+                && std::count(model_released_handles.begin(), model_released_handles.end(), model) == releases
+                && old_fence->GetCompletedValue() < old_fence_value && fg_held()
+                && native::fg_service::streams.contains(key) && native::features.contains(surviving_role)
+                && native::features.at(surviving_role).slots[0].handle == surviving_model
+                && native::features.at(surviving_role).slots[0].parameters == surviving_parameters,
+            "owner exit closes replay, retains pending delivery and GPU operands, and preserves the other active owner");
+    };
+    Check(SUCCEEDED(gpu.queue->Wait(gate.Get(), 1)), "hold the actual private submission behind the GPU gate");
+    exiting.Guides(++exiting_id, sdk_depth, sdk_motion);
+    exiting.Present(exiting_id);
+    Check(old_delivery != nullptr && *old_delivery != addon::adaptive_resolution::DeliveryReceipt::PENDING
+              && old_recording->closed.load() && exiting.context->presents_in_flight == 0,
+          "the real late EndPresent settles its retained old delivery exactly after the SDK wrapper returns");
+    before_sdk_return = {};
+    const auto surviving_calls = nr_calls();
+    session.Guides(++present_id, sdk_depth, sdk_motion);
+    session.Present(present_id);
+    Check(xefg::CurrentResult() == fg::Result::SUBMITTED && nr_calls() == surviving_calls + 1 && fg_held(),
+          "the other SDK owner continues actual NR while the exited owner's GPU submission remains in flight");
+    Check(SUCCEEDED(gpu.queue->Signal(gpu.fence.Get(), ++gpu.serial)), "cover both owners' queued GPU work");
+    Check(SUCCEEDED(gate->Signal(1)), "release the owner-exit GPU gate");
+    release_gate.release();
+    wait_fence(old_fence.Get(), old_fence_value);
+    wait_fence(gpu.fence.Get(), gpu.serial);
+    gpu.submission_pending = false;
+    const auto private_output = [&](const auto& stream_key) {
+      const auto& stream = native::fg_service::streams.at(stream_key);
+      const auto slot = std::ranges::find_if(stream.slots, [&](const auto& candidate) {
+        return candidate.fence_value == stream.submitted && candidate.color[0] != nullptr;
+      });
+      Check(slot != stream.slots.end(), "owner delivery retains the private product matching its actual submission");
+      return Capture(gpu, slot->color[0], NATIVE_INPUT_STATE);
+    };
+    const auto surviving_output = Capture(gpu, back, D3D12_RESOURCE_STATE_COMMON);
+    const auto surviving_private_output = private_output(key);
+    submit();
+    Check(surviving_output.Pixels() == surviving_private_output.Pixels(),
+          "the surviving owner delivers its current private product to the whole SDK backbuffer");
+    if (native_ngx) {
+      const auto pixels = surviving_output.Pixels();
+      Check(pixels.size() == static_cast<size_t>(width) * height * 4,
+            "the surviving native owner delivers a full backbuffer");
+      for (size_t pixel = 3; pixel < pixels.size(); pixel += 4) {
+        Check(pixels[pixel] == 160, "the surviving native owner retains current full-frame alpha");
+      }
+    } else {
+      check_mock_pixels(surviving_output, 160);
+    }
+    std::shared_ptr<addon::adaptive_resolution::DeliveryReceipt> returned_delivery;
+    uint64_t returned_epoch = 0;
+    uint64_t returned_frame = 0;
+    addon::output_framerate::OutputIdentity returned_output_identity;
+    bool returned_awaiting = false;
+    bool returned_group_complete = false;
+    bool returned_delivery_complete = false;
+    before_sdk_return = [&](IDXGISwapChain* proxy) {
+      if (proxy != exiting.proxy.Get()) return;
+      const auto& stream = native::fg_service::streams.at(exiting_key);
+      returned_awaiting = stream.awaiting_xefg_delivery;
+      if (!returned_awaiting) return;
+      returned_epoch = stream.epoch;
+      returned_frame = stream.application_frame;
+      returned_output_identity = stream.xefg_delivery_output;
+      returned_delivery = stream.pending_xefg_delivery.frame.delivery;
+      returned_delivery_complete = stream.pending_xefg_delivery.complete;
+      const auto slot = std::ranges::find_if(stream.slots, [&](const auto& candidate) {
+        return candidate.list != nullptr && candidate.fence_value == stream.submitted;
+      });
+      returned_group_complete = slot != stream.slots.end() && slot->base_frame_group.complete;
+    };
+    Check(Hooks::Enable(exiting.handle, 1) == 0 && exiting.context->epoch != old_epoch,
+          "public SDK re-enable starts a fresh owner epoch");
+    warm = false;
+    size_t returned_nr_evals = 0;
+    for (uint32_t frame = 0; frame < native::kContractDebounceFrames + 8 && !warm; ++frame) {
+      returned_delivery.reset();
+      returned_awaiting = returned_group_complete = returned_delivery_complete = false;
+      const auto calls_before = nr_calls();
+      exiting.Guides(++exiting_id, sdk_depth, sdk_motion);
+      exiting.Present(exiting_id);
+      const auto& stream = native::fg_service::streams.at(exiting_key);
+      wait_fence(stream.fence, stream.submitted);
+      returned_nr_evals = nr_calls() - calls_before;
+      // A cold compatibility prefix can be SUBMITTED before its model group
+      // is complete. Stop on that independent group proof, never on receipt success.
+      warm = xefg::CurrentResult() == fg::Result::SUBMITTED && returned_group_complete;
+      if (warm) {
+        Check(returned_nr_evals == 1 && previous_nr_succeeded(),
+              "the returned owner's first complete group contains one actual successful NR Evaluate");
+      }
+    }
+    const auto& returned_stream = native::fg_service::streams.at(exiting_key);
+    const bool matched_delivery = warm && returned_awaiting && returned_delivery_complete
+        && !returned_stream.awaiting_xefg_delivery && returned_stream.epoch == returned_epoch
+        && returned_stream.application_frame == returned_frame && returned_stream.xefg_delivery_output == returned_output_identity
+        && exiting.context->epoch == returned_epoch && exiting.context->application_frame == returned_frame
+        && exiting.context->output_identity == returned_output_identity && exiting.context->last_submission_frame == returned_frame;
+    // Adaptive timing receipts are optional; SDK consumption is proved above
+    // by the matching pending transition and the real EndPresent outcome.
+    const bool adaptive_delivered = returned_delivery == nullptr || (returned_delivery != old_delivery
+        && *returned_delivery == addon::adaptive_resolution::DeliveryReceipt::DELIVERED);
+    if (!matched_delivery || !adaptive_delivered) {
+      using Delivery = addon::adaptive_resolution::DeliveryReceipt;
+      std::cerr << "XEFG_OWNER_REENTRY epoch=" << exiting.context->epoch
+                << " application_frame=" << exiting.context->application_frame
+                << " result=" << static_cast<unsigned>(xefg::CurrentResult())
+                << " group_complete=" << returned_group_complete << " nr_evals=" << returned_nr_evals
+                << " delivery_complete=" << returned_delivery_complete
+                << " awaiting_before=" << returned_awaiting << " awaiting_after=" << returned_stream.awaiting_xefg_delivery
+                << " sdk_last_submission=" << exiting.context->last_submission_frame
+                << " fresh_receipt=" << (returned_delivery != nullptr && returned_delivery != old_delivery)
+                << " receipt=" << (returned_delivery == nullptr ? "NONE" : *returned_delivery == Delivery::DELIVERED
+                    ? "DELIVERED" : *returned_delivery == Delivery::REJECTED ? "REJECTED" : "PENDING") << '\n';
+    }
+    Check(matched_delivery,
+          "the returned owner receives its own matched EndPresent delivery instead of reusing the old pending result");
+    Check(adaptive_delivered, "an optional adaptive receipt must belong to the returned owner and be DELIVERED");
+    const auto returned_output = Capture(gpu, exiting_back.Get(), D3D12_RESOURCE_STATE_COMMON);
+    const auto returned_private_output = private_output(exiting_key);
+    submit();
+    Check(returned_output.Pixels() == returned_private_output.Pixels(),
+          "the returned owner delivers its fresh private product to the whole SDK backbuffer");
+    if (native_ngx) {
+      const auto pixels = returned_output.Pixels();
+      Check(pixels.size() == static_cast<size_t>(width) * height * 4,
+            "the returned native owner delivers a full backbuffer");
+      for (size_t pixel = 3; pixel < pixels.size(); pixel += 4) {
+        Check(pixels[pixel] == 96, "the returned native owner delivers current full-frame alpha");
+      }
+    } else {
+      check_mock_pixels(returned_output, 96);
+    }
+    before_sdk_return = {};
+    Check(Hooks::Enable(exiting.handle, 0) == 0 && fg_held(), "final SDK Disable leaves the surviving owner active");
+    std::cout << "XEFG_OWNER_ISOLATION exited=A active=B active_delivery=readback returned_delivery=readback\n";
+    std::cout << "XEFG_OWNER_PENDING replayable=closed gpu_in_flight=retained old_EndPresent=settled reentry=fresh\n";
+  }
+
   for (const auto stage : {Stage::RENDER, Stage::UPSCALED}) {
     const bool render = stage == Stage::RENDER;
     const char* stage_name = (render ? "Render" : "Upscaled");
+    {
+      funnel_accounting_tests::Restore off_restore;
+      off_restore.Atomic(&native::disable_release_mode);
+      auto& stream = native::fg_service::streams.at(key);
+      wait_fence(stream.fence, stream.submitted);
+      const auto slot = std::ranges::find_if(stream.slots, [&](const auto& slot) {
+        return slot.list != nullptr && slot.fence_value == stream.submitted;
+      });
+      Check(slot != stream.slots.end(), "Off-policy fixture has a completed owned XeFG recording");
+      const auto recording = submission::ObserveRecording(slot->list);
+      const ComPtr<ID3D12GraphicsCommandList> retained_list = slot->list;
+      const ComPtr<ID3D12CommandAllocator> retained_allocator = slot->allocator;
+      const auto* const role = stream.roles[0].Handle();
+      const auto* const model = native::features.at(role).slots[0].handle;
+      native::disable_release_mode = 0;
+      native::kSetEnabled.Commit(0.f);
+      Check(!native::enabled.load() && fg_held() && recording->closed.load()
+                && native::direct_api.private_instance && native::features.contains(role)
+                && native::features.at(role).slots[0].handle == model
+                && native::fg_service::streams.contains(key)
+                && std::ranges::any_of(native::fg_service::streams.at(key).slots,
+                     [&](const auto& retained) {
+                       return retained.list == retained_list.Get() && retained.allocator == retained_allocator.Get();
+                     }),
+            "NR Off policy zero retains owned objects while ending their private replay eligibility without another callback");
+      std::cout << "XEFG_INLINE_OFF_HOLD stage=" << stage_name
+                << " policy=0 objects=retained replayable=closed\n";
+      native::kSetEnabled.Commit(1.f);
+      bool resumed = false;
+      for (uint32_t frame = 0; frame < native::kContractDebounceFrames + 8 && !resumed; ++frame) {
+        session.Guides(++present_id, sdk_depth, sdk_motion);
+        session.Present(present_id);
+        const auto& resumed_stream = native::fg_service::streams.at(key);
+        wait_fence(resumed_stream.fence, resumed_stream.submitted);
+        resumed = xefg::CurrentResult() == fg::Result::SUBMITTED;
+      }
+      Check(resumed && fg_held(), "public NR re-enable resumes the same SDK context before the hook-exit test");
+      Check(std::ranges::any_of(native::fg_service::streams.at(key).slots, [&](const auto& retained) {
+        return retained.list == retained_list.Get() && retained.allocator == retained_allocator.Get();
+      }), "NR re-enable rearms the retained private pool without discarding its list and allocator");
+    }
     const auto& old_stream = native::fg_service::streams.at(key);
-    wait_fence(old_stream.fence, old_stream.submitted);
     const auto old_slot = std::ranges::find_if(old_stream.slots, [&](const auto& slot) {
       return slot.list != nullptr && slot.fence_value == old_stream.submitted;
     });
@@ -406,20 +674,13 @@ inline void Run(Gpu& gpu, Session& session, ID3D12Resource* back,
     Check(!old_recording->closed.load(), "old XeFG recording is still replayable before the hook change");
     const std::array<ComPtr<IUnknown>, 4> old_owned_objects{
         old_slot->color[0], old_slot->color[1], old_slot->list, old_slot->allocator};
-
-    native::hook_point = (render ? native::kHookRender : native::kHookUpscaled);
-    {
-      funnel_accounting_tests::Restore off_restore;
-      off_restore.Atomic(&native::enabled);
-      off_restore.Atomic(&native::disable_release_mode);
-      native::enabled = false;
-      native::disable_release_mode = 0;
-      native::RunPresentPath(&route.queue, &route);
-      Check(native::fg_service::streams.contains(key) && !old_recording->closed.load()
-                && native::direct_api.private_instance,
-            "NR Off with release policy zero retains the old replayable private pool");
-      std::cout << "XEFG_INLINE_OFF_HOLD stage=" << stage_name << " policy=0 replayable=retained\n";
-    }
+    const auto old_submissions = xefg::SubmittedFrames();
+    native::kSetHookPoint.Commit(static_cast<float>(render ? native::kHookRender : native::kHookUpscaled));
+    Check(fg_held() && !xefg::OwnsStream() && old_recording->closed.load()
+              && xefg::SubmittedFrames() == old_submissions,
+          "the committed inline hook closes old owned replay before any ordinary Present or old Service callback");
+    std::cout << "XEFG_OWNER_EXIT stage=" << stage_name
+              << " trigger=config_commit old_callbacks=0 replayable=closed fg=held_on\n";
     const auto& telemetry = native::stage_telemetry[static_cast<size_t>(stage)];
     const auto model_before_switch = nr_calls();
     const auto pending_before_switch = pending_count();
@@ -428,7 +689,6 @@ inline void Run(Gpu& gpu, Session& session, ID3D12Resource* back,
     uint32_t source_frames = 0;
     nlohmann::json frames = nlohmann::json::array();
     for (; source_frames < native::kContractDebounceFrames + 8 && delivered < 2; ++source_frames) {
-      present();
       Check(!xefg::OwnsStream() && xefg::CurrentResult() == fg::Result::NOT_SERVED
                 && xefg::DisplayResult() == fg::Result::NOT_SERVED && xefg::SubmittedFrames() == service_before_switch,
             "XeFG stays enabled without claiming a live NR Present service in inline mode");
@@ -464,7 +724,7 @@ inline void Run(Gpu& gpu, Session& session, ID3D12Resource* back,
           const addon::ngx_serial::Call game_call;
           Check(addon::ngx_serial::unlocked_in_flight.load() != 0,
                 "an ordinary game-call reservation blocks unnecessary retirement turns");
-          native::RunPresentPath(&route.queue, &route);
+          xefg::ReconcileNrService();
         }
         Check(addon::ngx_serial::present_busy.load() == waits,
               "inline callback with no owned XeFG pool must not wait for an NGX retirement turn");
@@ -486,7 +746,7 @@ inline void Run(Gpu& gpu, Session& session, ID3D12Resource* back,
         const auto& slot = native::features.at(sr).slots[0];
         const auto* model = slot.handle;
         const auto* block = slot.parameters;
-        native::hook_point = native::kHookPresent;
+        native::kSetHookPoint.Commit(static_cast<float>(native::kHookPresent));
         const auto expect_blocked = [&](Work proof) {
           const auto declines = pending_count();
           Check(native::TeardownProof() == proof, "game recording supplies the expected lifetime obstruction");

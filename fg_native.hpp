@@ -44,6 +44,9 @@ struct Stream {
   AdaptiveDelivery pending_xefg_delivery;
   output_framerate::OutputIdentity xefg_delivery_output;
   bool awaiting_xefg_delivery = false;
+  bool service_recording = false;
+  bool service_exit_pending = false;
+  bool service_stopped = false;
   uint32_t adaptive_model_roles = 0;
   uint32_t adaptive_required_roles = 0;
   bool adaptive_role_unavailable = false;
@@ -103,8 +106,16 @@ struct Stream {
 
 // All access is under runtime_mutex; nodes also key NR worksets/history.
 static std::map<std::pair<bool, uintptr_t>, Stream> streams;
+// Extracted nodes keep role/slot addresses stable while a retired SDK scope
+// awaits its own receipt, without occupying a replacement context's key.
+static std::multimap<std::pair<bool, uintptr_t>, Stream> pending_service_streams;
 static std::map<const NVSDK_NGX_Handle*, uintptr_t> native_bindings;
 static std::atomic_uint32_t native_input_watches{0};
+
+// Caller owns runtime_mutex, including when checking explicit-off cleanup.
+inline bool HasResources() noexcept {
+  return !streams.empty() || !pending_service_streams.empty();
+}
 
 inline void SetNativeInputObservation(Stream* stream, NativeInputObservation observation) {
   const auto previous = std::exchange(stream->native_input_observation, observation);
@@ -150,12 +161,15 @@ inline void ResetNativeFrame(Stream* stream) {
   }
 }
 
-inline bool Requested() noexcept {
+inline bool OwnerRequested() noexcept {
   return enabled.load(std::memory_order_relaxed)
       && hooks_enabled.load(std::memory_order_acquire)
-      && !shutting_down.load(std::memory_order_acquire)
       && !NrYieldsToForeign() && hook_point.load(std::memory_order_relaxed) == kHookPresent
       && present_pre_fg.load(std::memory_order_relaxed) != kPresentPreFgOff;
+}
+
+inline bool Requested() noexcept {
+  return OwnerRequested() && !shutting_down.load(std::memory_order_acquire);
 }
 
 inline bool PrepareCapture(ID3D12GraphicsCommandList* list) noexcept {
@@ -216,7 +230,7 @@ inline void Release(Stream* stream) {
     owner_resident_nr_handles.erase(role.Handle());
   }
   for (auto& slot : stream->slots) {
-    if (slot.list != nullptr && !slot.quarantined) {
+    if (!stream->service_stopped && slot.list != nullptr && !slot.quarantined) {
       // This closes replay eligibility only. Exact submission proofs still
       // retain the objects until the GPU finishes their last submission.
       submission::OnCommandListReset(slot.list);
@@ -247,26 +261,96 @@ inline void Release(Stream* stream) {
   ReleaseCom(stream->device);
 }
 
-// Caller owns the NGX PresentTurn and runtime_mutex. These private XeFG lists
-// cannot be replayed after their pool is removed; outstanding GPU uses still
-// retain their retired resources. Native game recordings are never closed here.
+inline void CloseServiceRecordings(Stream* stream) {
+  stream->service_exit_pending = true;
+  if (stream->service_stopped) return;
+  for (auto& slot : stream->slots) {
+    if (slot.list != nullptr && !slot.quarantined) {
+      submission::OnCommandListReset(slot.list);
+    }
+  }
+  stream->service_stopped = true;
+  stream->base_frame_clock.complete = false;
+}
+
+inline void PreservePendingServiceStream(decltype(streams)::iterator it) {
+  CloseServiceRecordings(&it->second);
+  pending_service_streams.insert(streams.extract(it));
+}
+
+// Caller owns runtime_mutex. Only private, disqualified owners are stopped;
+// retirement queues retain GPU operands without calling any NGX API here.
 inline void RetireServiceStreamsLocked() {
+  const bool requested = OwnerRequested();
+  const bool keep_resources = shutdown_quiesce_latched.load(std::memory_order_relaxed)
+      || (!enabled.load(std::memory_order_relaxed)
+          && (disable_release_mode.load(std::memory_order_relaxed) == 0u
+              || workset_free_policy.load(std::memory_order_relaxed) != 0u));
   for (auto it = streams.begin(); it != streams.end();) {
+    auto& stream = it->second;
     if (it->first.first) {
       ++it;
       continue;
     }
-    Release(&it->second);
+    const bool current = fg::xefg::ServiceContextCurrent(it->first.second, stream.epoch);
+    if (!stream.service_exit_pending && !stream.service_stopped && requested && current) {
+      ++it;
+      continue;
+    }
+    stream.service_exit_pending = true;
+    // Reentrant configuration/core calls must not retire a FeatureState that
+    // the entered service is still using. Its scope finishes this exit.
+    if (stream.service_recording) {
+      ++it;
+      continue;
+    }
+    CloseServiceRecordings(&stream);
+    // SDK consumption/rollback is distinct from private replay eligibility.
+    // Keep this map node and its role handles stable until that receipt arrives.
+    if (stream.awaiting_xefg_delivery) {
+      if (!current) {
+        const auto pending = it++;
+        PreservePendingServiceStream(pending);
+      } else {
+        ++it;
+      }
+      continue;
+    }
+    stream.cached = nullptr;
+    // A retained pool can regain this same SDK owner. Only Service rearms its
+    // stopped recording/history after the outstanding delivery has settled.
+    if (keep_resources || (requested && current)) {
+      ++it;
+      continue;
+    }
+    Release(&stream);
     it = streams.erase(it);
+  }
+  for (auto it = pending_service_streams.begin(); it != pending_service_streams.end();) {
+    auto& stream = it->second;
+    if (stream.awaiting_xefg_delivery || keep_resources) {
+      ++it;
+      continue;
+    }
+    stream.cached = nullptr;
+    Release(&stream);
+    it = pending_service_streams.erase(it);
   }
 }
 
 inline void Retire() noexcept {
   try {
-    const ngx_serial::PresentTurn turn(true);
-    if (!turn.owns()) return;
-    RuntimeLock lock(runtime_mutex);
+    std::optional<RuntimeLock> lock;
+    if (!HoldingRuntimeLock()) {
+      lock.emplace(runtime_mutex);
+    }
+    if (!HasResources() && present_retired.empty()) return;
     RetireServiceStreamsLocked();
+    if (workset_free_policy.load(std::memory_order_relaxed) == 0u
+        && !shutdown_quiesce_latched.load(std::memory_order_relaxed)) {
+      PruneCompletedSubmissionUses();
+      DrainPresentRetired();
+    }
   } catch (...) {
   }
 }
@@ -1129,15 +1213,32 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
 inline void OnXeFGPresentDelivery(const fg::FrameInput& input, bool succeeded) noexcept {
   GuardHook([&] {
     RuntimeLock lock(runtime_mutex);
+    const auto matches = [&](const Stream& stream) {
+      return stream.awaiting_xefg_delivery && stream.epoch == input.epoch
+          && stream.application_frame == input.application_frame && stream.result == fg::Result::SUBMITTED
+          && stream.xefg_delivery_output == input.output;
+    };
+    Stream* pending = nullptr;
     const auto it = streams.find({false, input.context});
-    if (it == streams.end()) return;
-    auto& stream = it->second;
-    if (stream.epoch != input.epoch || stream.application_frame != input.application_frame
-        || stream.result != fg::Result::SUBMITTED || stream.xefg_delivery_output != input.output
-        || !std::exchange(stream.awaiting_xefg_delivery, false)) return;
+    if (it != streams.end() && matches(it->second)) {
+      pending = &it->second;
+    } else {
+      for (auto& [key, stream] : pending_service_streams) {
+        if (key.second == input.context && matches(stream)) {
+          pending = &stream;
+          break;
+        }
+      }
+    }
+    if (pending == nullptr) return;
+    auto& stream = *pending;
+    stream.awaiting_xefg_delivery = false;
     const auto delivery = std::exchange(stream.pending_xefg_delivery, {});
     ResolveAdaptiveDelivery(delivery, succeeded);
-    if (succeeded) return;
+    if (succeeded) {
+      Retire();
+      return;
+    }
     // The private list was submitted on the SDK queue. Keep its slot and
     // receipts while making the next application frame start fresh history.
     stream.base_frame_clock.complete = false;
@@ -1151,6 +1252,7 @@ inline void OnXeFGPresentDelivery(const fg::FrameInput& input, bool succeeded) n
     if (input.hudless != nullptr && input.hudless != input.backbuffer) {
       ResetPresentStreamHistory(&stream.roles[1]);
     }
+    Retire();
   });
 }
 
@@ -1177,9 +1279,24 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     const ngx_serial::PresentTurn turn(true);
     if (!turn.owns()) return fg::Result::NOT_SERVED;
     RuntimeLock lock(runtime_mutex);
+    if (!Requested() || !fg::xefg::ServiceContextCurrent(input.context, input.epoch)) {
+      Retire();
+      return fg::Result::NOT_SERVED;
+    }
     // The previous Present route no longer rotates these owned recordings.
     if ((present_ring.device != nullptr && !ReleasePresentRing()) || !RetireBridgeRecordings()) {
       return fg::Result::NOT_SERVED;
+    }
+    if (const auto it = streams.find({false, input.context}); it != streams.end()) {
+      auto& previous = it->second;
+      if (previous.service_recording) return fg::Result::NOT_SERVED;
+      if (previous.awaiting_xefg_delivery) {
+        if (previous.epoch == input.epoch && previous.xefg_delivery_output == input.output) {
+          return (!previous.service_exit_pending && !previous.service_stopped
+              && previous.application_frame == input.application_frame ? previous.result : fg::Result::NOT_SERVED);
+        }
+        PreservePendingServiceStream(it);
+      }
     }
     auto& stream = streams[{false, input.context}];
     if (stream.device != nullptr && (stream.device != device || stream.queue != queue || stream.epoch != input.epoch)) {
@@ -1198,6 +1315,23 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
         return fg::Result::FAILED;
       }
     }
+    if (stream.service_stopped) {
+      stream.base_frame_clock = {};
+      stream.has_frame = false;
+      stream.service_exit_pending = false;
+      stream.service_stopped = false;
+      stream.continuing_submission = false;
+      stream.last_model_frame[0] = stream.last_model_frame[1] = 0;
+      stream.last_output_frame[0] = stream.last_output_frame[1] = 0;
+      for (auto& role : stream.roles) {
+        ResetPresentStreamHistory(&role);
+      }
+    }
+    stream.service_recording = true;
+    const auto service_recording = std::unique_ptr<Stream, void (*)(Stream*)>(&stream, [](Stream* active) {
+      active->service_recording = false;
+      Retire();
+    });
     const present_frame_policy::Frame application_base{
         .kind = present_frame_policy::SourceKind::APPLICATION,
         .source = input.context, .generation = input.epoch, .sequence = input.application_frame,

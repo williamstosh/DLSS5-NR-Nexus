@@ -20253,6 +20253,7 @@ inline void ObserveReleasedD3D12Source(ID3D12GraphicsCommandList* list, const NV
   if (enabled.load() || (!edit_reuse_enabled.load() && !nr_adaptive_enabled.load())) return;
   RuntimeTryLock lock(runtime_mutex);
   if (!lock.owns_lock() || !CreatedSrHandle(handle)) return;
+  fg::xefg::ReconcileNrService();
   const SuccessfulSrCoreScope core_scope(list, handle);
 }
 
@@ -23532,6 +23533,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
     CountNrDecline(NrDeclineReason::kNgxNotDlssEvaluation);
     return result;
   }
+  fg::xefg::ReconcileNrService();
   const SuccessfulSrCoreScope core_scope(
       CreatedSrHandle(handle) ? command_list : nullptr, handle);
   ObserveAdaptiveSourceOutput(handle, parameters);
@@ -23844,6 +23846,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
     CountNrDecline(NrDeclineReason::kNgxNotDlssEvaluation);
     return result;
   }
+  fg::xefg::ReconcileNrService();
   const SuccessfulSrCoreScope core_scope(
       CreatedSrHandle(handle) ? command_list : nullptr, handle);
   ObserveAdaptiveSourceOutput(handle, parameters);
@@ -24850,6 +24853,7 @@ inline sl::Result HookedStreamlineEvaluate(
   // fallback needs a new one after loader work and before runtime_mutex.
   const ngx_serial::Call ngx_turn;
   RuntimeLock lock(runtime_mutex);
+  fg::xefg::ReconcileNrService();
   if (NrWaitsForTeardown(command_list)) {
     CountNrDecline(NrDeclineReason::kTeardownPending);
     command_list->Release();
@@ -25789,6 +25793,7 @@ inline void ToggleNrFromHotkey(uint32_t toggle_key, bool overlay_open) {
       "NR toggled " + std::string(next ? "ON" : "OFF") + " via "
           + VirtualKeyName(toggle_key) + (overlay_open ? " (overlay open)" : ""));
   if (next) RecreateFeatures();
+  fg::xefg::ReconcileNrService();
 }
 
 // Edge-polled once per present, after the generation bump. Toggles NR with the
@@ -28620,6 +28625,7 @@ inline void OnDestroyEffectRuntime(reshade::api::effect_runtime* runtime) {
 // and Render while cleanup retries; OnPresent's normal Present-only arming
 // cannot lower it. Every wait precedes runtime_mutex, and GPU proof is polled.
 inline void ServiceDisabledNr() {
+  fg::xefg::ReconcileNrService();
   if (!enabled.load(std::memory_order_acquire)) {
     CancelAsyncAutoscalePreparation();
     RuntimeTryLock lock(runtime_mutex);
@@ -28661,7 +28667,7 @@ inline void ServiceDisabledNr() {
   if (worksets.empty() && retired_final_resources.empty()
       && active_features.load(std::memory_order_relaxed) == 0u
       && retired_nr_features.empty() && present_ring.device == nullptr
-      && present_streams.empty() && fg_service::streams.empty() && present_retired.empty()
+      && present_streams.empty() && !fg_service::HasResources() && present_retired.empty()
       && codec_pipeline.root_signature == nullptr && codec_pipeline.look.root_signature == nullptr
       && codec_pipeline.hdr_capture_root == nullptr) {
     disabled_resources_released.store(true, std::memory_order_relaxed);
@@ -28674,16 +28680,12 @@ inline void ServiceDisabledNr() {
   }
   if (!RetireBridgeRecordings()) return;
   if (!ReleasePresentRing()) return;
-  // Switching away from Present stops XeFG Service before its final private
-  // lists can be recycled. Close that owned pool before asking the global
-  // proof; otherwise a completed but replayable service list blocks its own
-  // retirement forever. Foreign/game recordings retain the original gate.
-  fg_service::RetireServiceStreamsLocked();
   if (TeardownProof() != submission::RecordedWork::kComplete) return;
   // The addon owns the Present recordings and can discard them after their
   // fence; a game's completed but replayable recording NEVER passes this
   // proof. No age, CPU present count or abandoned-device rule can free it.
   if (!ReleasePresentPath()) return;
+  if (fg_service::HasResources()) return;
   ReleaseFeatureStates();
   ReleaseAllWorksets();
   FlushRetiredResources();
@@ -29092,6 +29094,7 @@ inline void OnPresent(
 }
 
 inline void RecreateFeaturesLocked() {
+  fg::xefg::ReconcileNrService();
   ++configuration_generation;
   codec_pipeline.preparation_failed = false;
   RequestHistoryReset(HistoryResetSource::kRecreate);
@@ -29277,6 +29280,7 @@ struct Setting {
     Persist();
     DropIniIssue(key);
     if (!model_selection) ApplySettingEffect(effect);
+    fg::xefg::ReconcileNrService();
   }
 
   const char* key;
@@ -30424,6 +30428,7 @@ inline void SetNrEnabledFromUi(bool on) {
   reshade::set_config_value(nullptr, kConfigSection, "NeuralUplift", on);
   NotifyNrOperation(on);
   if (on) RecreateFeatures();
+  fg::xefg::ReconcileNrService();
 }
 
 // i18n: begin - display strings (tools/i18n/ui_strings.py catalog)
