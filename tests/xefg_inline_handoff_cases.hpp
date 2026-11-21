@@ -746,16 +746,40 @@ inline void Run(Gpu& gpu, Session& session, ID3D12Resource* back,
         const auto& slot = native::features.at(sr).slots[0];
         const auto* model = slot.handle;
         const auto* block = slot.parameters;
+        const auto model_releases = (native_ngx ? 0 : std::count(model_released_handles.begin(), model_released_handles.end(), model));
+        const auto game_recording = submission::RecordingIdentity(gpu.list.Get());
         native::kSetHookPoint.Commit(static_cast<float>(native::kHookPresent));
         const auto expect_blocked = [&](Work proof) {
           const auto declines = pending_count();
           Check(native::TeardownProof() == proof, "game recording supplies the expected lifetime obstruction");
           present();
+          // Commit recreates active slots; the old game's model/parameters
+          // must remain together in retirement until its real recording closes.
+          const bool retired_pair = model != nullptr && block != nullptr
+              && std::ranges::any_of(native::retired_nr_features, [&](const auto& retired) {
+                return retired.handle == model && retired.parameters == block && retired.tracker_proof;
+              });
+          const bool model_retained = !submission::ResourceReleasable(model)
+              && (native_ngx || std::count(model_released_handles.begin(), model_released_handles.end(), model) == model_releases);
+          const bool recording_retained = !recording->closed.load()
+              && submission::RecordingIdentity(gpu.list.Get()) == game_recording;
+          const bool provider_retained = !native::direct_api.private_instance && native::direct_api.module == provider;
+          if (!retired_pair || !model_retained || !recording_retained || !provider_retained
+              || pending_count() != declines + 1 || nr_calls() != calls_before + 1
+              || xefg::SubmittedFrames() != service_before_switch || xefg::CurrentResult() != fg::Result::NOT_SERVED
+              || xefg::DisplayResult() != fg::Result::NOT_SERVED) {
+            std::cerr << "XEFG_EXTERNAL_BLOCK proof=" << (proof == Work::kPending ? "Pending" : "Replayable")
+                      << " retired_pair=" << retired_pair << " model_retained=" << model_retained
+                      << " recording_retained=" << recording_retained << " provider_retained=" << provider_retained
+                      << " pending_delta=" << pending_count() - declines << " nr_delta=" << nr_calls() - calls_before
+                      << " submitted_delta=" << xefg::SubmittedFrames() - service_before_switch
+                      << " result=" << static_cast<unsigned>(xefg::CurrentResult())
+                      << " display=" << static_cast<unsigned>(xefg::DisplayResult()) << '\n';
+          }
           Check(xefg::CurrentResult() == fg::Result::NOT_SERVED && xefg::DisplayResult() == fg::Result::NOT_SERVED
                     && xefg::SubmittedFrames() == service_before_switch && pending_count() == declines + 1
-                    && nr_calls() == calls_before + 1 && !recording->closed.load()
-                    && !native::direct_api.private_instance && native::direct_api.module == provider
-                    && native::features.at(sr).slots[0].handle == model && native::features.at(sr).slots[0].parameters == block,
+                    && nr_calls() == calls_before + 1 && recording_retained && provider_retained
+                    && retired_pair && model_retained,
                 "pending or replayable game work blocks XeFG without fake activity or provider release");
           if (native_ngx) {
             external_blocks.push_back({{"proof", proof == Work::kPending ? "Pending" : "Replayable"},
