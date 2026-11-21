@@ -235,6 +235,7 @@ int Run() {
     adapter::modules[0].real[3] = reinterpret_cast<void*>(&FakeResource);
     adapter::modules[0].real[4] = reinterpret_cast<void*>(&FakeConstants);
     adapter::modules[0].real[5] = reinterpret_cast<void*>(&FakeId);
+    adapter::modules[0].real[6] = reinterpret_cast<void*>(+[](void*, uint32_t) -> int32_t { return sdk_status; });
     adapter::modules[0].real[7] = reinterpret_cast<void*>(+[](void*, int32_t) { return sdk_status; });
     adapter::proxies[0].real[0] = reinterpret_cast<void*>(&ConsumeSdkPresent);
     adapter::proxies[0].real[1] = reinterpret_cast<void*>(&FakePresent1);
