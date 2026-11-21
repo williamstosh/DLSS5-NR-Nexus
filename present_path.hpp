@@ -4127,6 +4127,26 @@ inline void RunPresentPath(
       }
     }
   }
+  // SDK presentation continues after NR leaves Present, but OwnsStream then
+  // becomes false. The stopped private pool no longer rotates its lists.
+  // Removing that owned pool ends replay eligibility; GPU completion and
+  // external game/Native recordings still independently gate provider release.
+  if (enabled.load(std::memory_order_relaxed) && fg::xefg::Enabled()
+      && hook_point.load(std::memory_order_relaxed) != kHookPresent) {
+    bool stopped_service = false;
+    {
+      RuntimeTryLock lock(runtime_mutex);
+      if (lock.owns_lock()) {
+        if (workset_free_policy.load(std::memory_order_relaxed) == 0u
+            && !shutdown_quiesce_latched.load(std::memory_order_relaxed)) {
+          DrainPresentRetired();
+        }
+        stopped_service = std::ranges::any_of(fg_service::streams, [](const auto& entry) { return !entry.first.first; });
+      }
+    }
+    // Once removed, inline Presents do not take another NGX retirement turn.
+    if (stopped_service) fg_service::Retire();
+  }
   if (fg::xefg::OwnsStream()) {
     if (observed_present_queue.load(std::memory_order_acquire) != nullptr) {
       RuntimeLock lock(runtime_mutex);

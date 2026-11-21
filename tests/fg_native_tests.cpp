@@ -4235,6 +4235,8 @@ void ResizeNativeTestOutput(Gpu& gpu, IDXGISwapChain3* output, ID3D12Resource* o
 #include "adaptive_resource_strategy_cases.hpp"
 #include "output_framerate_registration_cases.hpp"
 
+#include "xefg_inline_handoff_cases.hpp"
+
 int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
   try {
     const HMODULE test_module = GetModuleHandleW(nullptr);
@@ -4538,6 +4540,7 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
     adapter::modules[0].real[3] = reinterpret_cast<void*>(&FakeResource);
     adapter::modules[0].real[4] = reinterpret_cast<void*>(&FakeConstants);
     adapter::modules[0].real[5] = reinterpret_cast<void*>(&FakeId);
+    adapter::modules[0].real[6] = reinterpret_cast<void*>(+[](void*, uint32_t) -> int32_t { return 0; });
     adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakePresent);
     adapter::proxies[0].real[1] = reinterpret_cast<void*>(&FakePresent1);
     xefg::Configure(&native::fg_service::Service, &Prepare, nullptr, &Requested);
@@ -4549,6 +4552,7 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
     submit();
     uintptr_t xefg_context = 0;
     fg::Result xefg_result = fg::Result::NOT_SERVED;
+    nlohmann::json native_handoff;
     {
       Session xefg_session(&gpu);
       xefg_session.context->ui_composition = false;
@@ -4557,6 +4561,7 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
         xefg_session.extent_top = 0;
         xefg_session.extent_width = width;
         xefg_session.extent_height = height;
+        Check(Hooks::Enable(xefg_session.handle, 1) == 0 && xefg::Enabled(), "native handoff starts with SDK FG enabled");
       }
       xefg_context = reinterpret_cast<uintptr_t>(xefg_session.handle);
       native::control_mask_enabled.store(false);
@@ -4714,6 +4719,23 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
       }
       std::cout << "CASE path=XeFG-service hot_toggle=off-on-off private_slots=3 motion=off"
                    " sustained_submissions=6+6 completion=Fence\n";
+      if (native_ngx) {
+        xefg::Configure(&native::fg_service::Service, &Prepare, &native::fg_service::Retire,
+                        &native::fg_service::Requested);
+        funnel_accounting_tests::Restore symbol_restore;
+        symbol_restore.Value(&native::ngx_loader_staging.core_evaluate);
+        symbol_restore.Atomic(&native::ngx_loader_published);
+        native::ngx_loader_staging.core_evaluate = ObserveNativeRuntimeEvaluation;
+        native::PublishNgxLoaderSymbols();
+        Check(native::NgxLoaderView().core_evaluate == ObserveNativeRuntimeEvaluation
+                  && native::NgxLoaderView().native_api.evaluate == ObserveNativeRuntimeEvaluation,
+              "both published native providers retain their real Evaluate observers across adoption");
+        ComPtr<ID3D12Resource> backbuffer;
+        Check(SUCCEEDED(xefg_session.proxy->GetBuffer(xefg_session.proxy->GetCurrentBackBufferIndex(),
+                                                     IID_PPV_ARGS(&backbuffer))), "native handoff DXGI backbuffer");
+        xefg_inline_handoff_cases::Run(gpu, xefg_session, backbuffer.Get(), guides[3].Get(), guides[2].Get(),
+                                       submit, wait_present_fence, &native_handoff);
+      }
     }
     xefg::Configure(&Service, &Prepare, nullptr, &Requested);
     if (auto stream = native::fg_service::streams.find({false, xefg_context});
@@ -4764,6 +4786,12 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
       native::control_mask_mode.store(saved_control_mask_mode);
       native::control_mask_motion_enabled.store(saved_control_mask_motion);
       native::direct_runtime_requirements.file_version = saved_control_mask_runtime_version;
+      std::ofstream receipt("xefg-inline-handoff-native.json");
+      receipt << native_handoff.dump(2) << '\n';
+      receipt.close();
+      Check(!receipt.fail(), "write the native XeFG inline handoff receipt");
+      std::cout << "PASS xefg-held-inline-handoff evidence=NATIVE_GPU+NATIVE_NGX+MOCK_XeFG"
+                   " stages=Present,Render,Present,Upscaled,Present\n";
       std::cout << "PASS native FG ControlMask roles=Backbuffer+HUDLess "
                    "evidence=NATIVE_GPU+NATIVE_NGX+MOCK_XeFG runtime=310.9.16.0" << std::endl;
       model_gpu = nullptr;
@@ -5002,7 +5030,6 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
 
       xefg::Configure(&native::fg_service::Service, &Prepare, &native::fg_service::Retire,
                       &native::fg_service::Requested);
-      adapter::modules[0].real[6] = reinterpret_cast<void*>(+[](void*, uint32_t) -> int32_t { return 0; });
       Session session(&gpu);
       Check(Hooks::Enable(session.handle, 0) == 0 && !xefg::OwnsStream(), "ordinary Present starts with XeFG off");
       session.context->ui_composition = false;
@@ -5226,6 +5253,9 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path) {
       std::cout << "XEFG_OPTIONAL_NO_ID provider=" << provider
                 << " result=SUBMITTED frame_evals=2 guides=neutral completion=Fence\n";
 
+      if (via_core) {
+        xefg_inline_handoff_cases::Run(gpu, session, back.Get(), guides[3].Get(), guides[2].Get(), submit, wait_present_fence);
+      }
       Check(native::direct_api.private_instance && native::TeardownProof() == submission::RecordedWork::kReplayable,
             "completed XeFG list is still replayable just before public Disable");
       Check(Hooks::Enable(session.handle, 0) == 0 && !xefg::OwnsStream(),

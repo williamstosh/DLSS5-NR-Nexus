@@ -46,6 +46,12 @@ function Get-CoreCaseReceipt([string]$Case, [string]$Stdout, [string]$Pattern) {
 }
 
 try {
+    $candidateReceiptChecks = @(& (Join-Path $repo 'tests/candidate_acceptance_tests.ps1'))
+    $candidateReceipt = @($candidateReceiptChecks | Where-Object {
+        $_ -is [string] -and $_ -cmatch '^PASS candidate acceptance: [1-9][0-9]* receipt negatives, input drift and preflight integration\.$'
+    })
+    if ($candidateReceipt.Count -ne 1) { throw 'Candidate receipt validation contracts did not complete.' }
+    $summary['candidateReceiptContracts'] = @{status='Passed'; evidence='CPU'; receipt=$candidateReceipt[0]}
     $registration = Get-ReleaseParityRegistration -SourceRoot $repo -AllowPending
     $summary['releaseParity'] = [ordered]@{ status='Running'; pending=$registration.pending; rows=@(); builds=@{} }
     if ($registration.pending.Count) {

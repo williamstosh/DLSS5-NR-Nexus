@@ -6,12 +6,15 @@ coordinated device window and never start a game. GitHub CI keeps its own scope.
 Software retains Suite all, then reuses its executables for existing independent
 stage, resolution, source-lifecycle and pre-FG cases. ReuseAllOutputDirectory may
 reuse a completed all run only when its source and recorded inputs still match.
-NativeGpu runs real D3D12 with model stand-ins. NativeNgx runs the existing real
-Init/Create/Evaluate FG case; a bounded ngx_probe is not functional evidence.
+NativeGpu runs real D3D12 with model stand-ins. NativeNgx requires the FG case's
+native inline handoff report and the paired full/on-demand adaptive preparation
+cost reports. NativeNgx requires an explicit SR runtime.
+CandidateAcceptance checks receipts for one specified candidate and run. It
+launches no workload and reports missing host evidence as PendingHost.
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Software','NativeGpu','NativeNgx')][string]$Mode = 'Software',
+    [ValidateSet('Software','NativeGpu','NativeNgx','CandidateAcceptance')][string]$Mode = 'Software',
     [string]$OutputDirectory = (Join-Path (Split-Path $PSScriptRoot -Parent) ('tmp/release-preflight/' + [guid]::NewGuid().ToString('N'))),
     [string]$ReuseAllOutputDirectory,
     [switch]$RefreshFg,
@@ -19,7 +22,15 @@ param(
     [string]$VulkanIncludeDirectory,
     [string]$NativeNgxProjectIdPath,
     [string]$NativeNgxSdkLibraryDirectory,
-    [string]$NativeNgxRuntimePath
+    [string]$NativeNgxRuntimePath,
+    [string]$NativeNgxSrRuntimePath,
+    [string]$CandidateReceipt,
+    [string]$CandidateDll,
+    [string]$CandidateRunId,
+    [string]$CandidateOfflineCase,
+    [string[]]$CandidateOfflineStages,
+    [string]$CandidateHostCase,
+    [string[]]$CandidateHostStages
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -41,13 +52,25 @@ $summary = [ordered]@{
     workingTreeFiles=@(& git --no-optional-locks -C $repo diff --name-only)
     startedUtc=[DateTimeOffset]::UtcNow.ToString('o'); status='Running'
     entrySha256=(Get-FileHash $PSCommandPath).Hash; checks=$checks
+    candidateAcceptance=@{status='NotEvaluated'; candidateComplete=$false}
     limits=@('No game or dynamic visual acceptance.',
         'Software uses NR/FG model stand-ins; native modes are separate.',
         'Bridge and native-present-decision fixtures do not assert all InfoQueue messages.',
         'Adaptive inline retains its existing initial phase; no new phase matrix.')
 }
 try {
-    if ($Mode -eq 'Software') {
+    if ($Mode -eq 'CandidateAcceptance') {
+        $summary.limits = @('Receipt verification for the selected candidate and cases.', 'Subjective VISUAL is outside this check.')
+        . (Join-Path $PSScriptRoot 'check-candidate-acceptance.ps1')
+        $candidate = Test-CandidateAcceptance -ReceiptPath $CandidateReceipt -DllPath $CandidateDll -RunId $CandidateRunId `
+            -OfflineCase $CandidateOfflineCase -OfflineStages $CandidateOfflineStages `
+            -HostCase $CandidateHostCase -HostStages $CandidateHostStages
+        $summary.candidateAcceptance = $candidate
+        if (-not $candidate.candidateComplete) {
+            $outcome = $candidate.status
+            throw "Candidate acceptance $($candidate.status): $($candidate.reason)"
+        }
+    } elseif ($Mode -eq 'Software') {
         $env:CL = ($previousCl + ' /DNR_NEXUS_TEST_WARP_ONLY').Trim()
         $all = if ($ReuseAllOutputDirectory) { [IO.Path]::GetFullPath($ReuseAllOutputDirectory) } else { Join-Path $OutputDirectory 'all' }
         Assert-TestArtifactPath $all
@@ -172,6 +195,7 @@ try {
     } else {
         if ($ReuseAllOutputDirectory) { throw 'Native mode does not rerun or consume Suite all.' }
         if ($previousCl -match 'NR_NEXUS_TEST_WARP_ONLY') { throw 'Native mode conflicts with the inherited WARP-only build guard.' }
+        $summary['softwareDefaultGroups'] = 'NotRun in this native branch; use the separate Software result.'
         $arguments = @{Suite=@('fg-native');OutputDirectory=(Join-Path $OutputDirectory 'native');RetentionMode='Standard'}
         if ($Mode -eq 'NativeGpu') {
             # Compile once, then keep separate receipts for the existing core,
@@ -210,24 +234,106 @@ try {
                 }
             }
         } else {
-            $arguments.NativeCase = @('control-mask-native-ngx-fg')
-            $checks.Add(@{name=$arguments.NativeCase[0];status='NotRun';evidence='NATIVE_NGX';reason='dependencies not yet verified'})
+            $fgCase = 'control-mask-native-ngx-fg'
+            $resizeCase = 'control-mask-native-ngx-resize'
+            $checks.Add(@{name=$fgCase;case=$fgCase;status='NotRun';evidence='NATIVE_GPU+NATIVE_NGX+MOCK_XeFG';
+                output=$arguments.OutputDirectory;reason='not reached';
+                report=(Join-Path $arguments.OutputDirectory 'fg-native/xefg-inline-handoff-native.json')})
+            foreach ($condition in @('full','on-demand')) {
+                $name = "adaptive-preparation-cost-$condition"
+                $output = Join-Path $OutputDirectory $name
+                $directory = Join-Path $output 'fg-native'
+                $checks.Add(@{name=$name;case=$resizeCase;condition=$condition;status='NotRun';
+                    evidence='NATIVE_GPU+NATIVE_NGX';output=$output;reason='not reached';
+                    stdout=(Join-Path $directory "$resizeCase.stdout.log");
+                    report=(Join-Path $directory 'adaptive-preparation-cost.json')})
+            }
             foreach ($pair in @(@('NativeNgxProjectIdPath',$NativeNgxProjectIdPath),@('NativeNgxSdkLibraryDirectory',$NativeNgxSdkLibraryDirectory),@('NativeNgxRuntimePath',$NativeNgxRuntimePath))) {
                 if (-not $pair[1] -or -not (Test-Path -LiteralPath $pair[1])) {
-                    $checks[0].reason = "Native NGX dependency missing: $($pair[0])"
-                    throw $checks[0].reason
+                    $reason = "Native NGX dependency missing: $($pair[0])"
+                    foreach ($record in $checks) { $record.reason = $reason }
+                    throw $reason
                 }
                 $arguments[$pair[0]] = $pair[1]
             }
-            $evidence = 'NATIVE_NGX'
-            $record = @{name=$arguments.NativeCase[0];status='NotRun';evidence=$evidence;reason='not started'}
-            $checks[0] = $record
-            try {
-                & (Join-Path $PSScriptRoot 'run-tests.ps1') @arguments
-                $record.status='Passed'; [void]$record.Remove('reason')
-            } catch { $record.status='Failed'; $record.reason=$_.Exception.Message; throw }
+            if (-not $NativeNgxSrRuntimePath -or -not (Test-Path -LiteralPath $NativeNgxSrRuntimePath -PathType Leaf)) {
+                $reason = 'Native NGX dependency missing: -NativeNgxSrRuntimePath must point to an existing SR DLL.'
+                foreach ($record in $checks) { $record.reason = $reason }
+                throw $reason
+            }
+            $arguments.NativeNgxSrRuntimePath = $NativeNgxSrRuntimePath
+            $previousCost = $env:NR_NEXUS_TEST_RESIZE_PREPARATION_COST
+            $fullInput = $null
+            foreach ($record in $checks) {
+                $arguments.NativeCase = @($record.case)
+                $arguments.OutputDirectory = $record.output
+                $condition = $record['condition']
+                try {
+                    if ($condition) { $env:NR_NEXUS_TEST_RESIZE_PREPARATION_COST = $condition }
+                    & (Join-Path $PSScriptRoot 'run-tests.ps1') @arguments
+                    if ($condition) {
+                        $expected = "PASS adaptive-preparation-cost evidence=NATIVE_GPU+NATIVE_NGX condition=$condition levels=3 passes=1 steady_per_tier=24 readbacks=2"
+                        if (@(Get-Content -LiteralPath $record.stdout | Where-Object { $_ -ceq $expected }).Count -ne 1) {
+                            throw "Expected exactly one '$expected' in $($record.stdout)."
+                        }
+                        $cost = Get-Content -LiteralPath $record.report -Raw | ConvertFrom-Json -AsHashtable
+                        if ($cost['schema'] -cne 'nr-nexus-adaptive-preparation-cost/1' -or $cost['status'] -cne 'Passed' -or
+                            $cost['evidence'] -cne 'NATIVE_GPU+NATIVE_NGX' -or $cost['condition'] -cne $condition -or
+                            $cost['host_sr'] -cne 'NATIVE_NGX' -or $cost['requested_model'] -cne 'B' -or
+                            $cost['passes'] -ne 1 -or $cost['plan']['levels'] -ne 3 -or -not $cost['input']) {
+                            throw "Invalid adaptive preparation cost receipt for $condition."
+                        }
+                        $inputIdentity = ConvertTo-Json -InputObject $cost.input -Depth 8 -Compress
+                        if ($condition -eq 'full') { $fullInput = $inputIdentity }
+                        elseif ($inputIdentity -cne $fullInput) { throw 'Full and on-demand cost receipts have different inputs.' }
+                    } else {
+                        $handoff = Get-Content -LiteralPath $record.report -Raw | ConvertFrom-Json -AsHashtable
+                        $expectedStages = @('Present', 'Render', 'Present', 'Upscaled', 'Present')
+                        if ($handoff -isnot [Collections.IDictionary] -or
+                            $handoff['schema'] -cne 'nr-nexus-xefg-inline-handoff/1' -or
+                            $handoff['status'] -cne 'Passed' -or $handoff['evidence'] -cne $record.evidence -or
+                            $handoff['case'] -cne 'xefg-held-inline-handoff' -or
+                            $handoff['phases'] -isnot [array] -or $handoff.phases.Count -ne $expectedStages.Count) {
+                            throw 'Native FG requires a Passed xefg-held-inline-handoff report with all five phases.'
+                        }
+                        if ($handoff['sr_evidence'] -cne 'NATIVE_NGX' -or
+                            $handoff['sdk_fg']['on_samples'] -lt 10 -or $handoff['sdk_fg']['off_samples'] -ne 0) {
+                            throw 'Native handoff requires real SR and FG held on across all delivered frames.'
+                        }
+                        $previousSequence = 0L
+                        for ($phaseIndex = 0; $phaseIndex -lt $expectedStages.Count; $phaseIndex++) {
+                            $phase = $handoff.phases[$phaseIndex]
+                            if ($phase -isnot [Collections.IDictionary] -or $phase['stage'] -isnot [string] -or
+                                $phase.stage -cne $expectedStages[$phaseIndex] -or $phase['frames'] -isnot [array] -or
+                                $phase.frames.Count -ne 2) {
+                                throw "Native FG handoff phase $($phaseIndex + 1) must be $($expectedStages[$phaseIndex])."
+                            }
+                            foreach ($frame in $phase.frames) {
+                                if ($frame['accepted_evaluate_sequence'] -le $previousSequence -or
+                                    $frame['delivery_complete'] -ne $true -or $frame['readback_complete'] -ne $true -or
+                                    $frame['readback_pixels'] -le 0 -or $frame['gpu_fence_healthy'] -ne $true -or
+                                    $frame['readback_fence_value'] -le 0 -or
+                                    $frame['readback_fence_completed'] -lt $frame.readback_fence_value -or
+                                    $frame['sdk_fg_enabled'] -ne $true) {
+                                    throw 'Native FG handoff lacks a fresh accepted Evaluate, complete delivery or healthy readback.'
+                                }
+                                $previousSequence = $frame.accepted_evaluate_sequence
+                            }
+                        }
+                        $record.stages = @($handoff.phases | ForEach-Object stage)
+                    }
+                    $record.reportSha256 = (Get-FileHash -LiteralPath $record.report).Hash
+                    $record.status = 'Passed'
+                    [void]$record.Remove('reason')
+                } catch {
+                    $record.status = 'Failed'
+                    $record.reason = $_.Exception.Message
+                    throw
+                } finally {
+                    $env:NR_NEXUS_TEST_RESIZE_PREPARATION_COST = $previousCost
+                }
+            }
         }
-        $summary['softwareDefaultGroups'] = 'NotRun in this native branch; use the separate Software result.'
     }
     if ((& git --no-optional-locks -C $repo rev-parse HEAD).Trim() -ne $source) { throw 'Source commit changed during preflight.' }
     $outcome = 'Passed'
@@ -239,7 +345,9 @@ try {
     $summary.status = $outcome
     $summary['finishedUtc'] = [DateTimeOffset]::UtcNow.ToString('o')
     $summary | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $OutputDirectory 'result.json') -Encoding utf8
-    Complete-TestOutput $OutputDirectory -Outcome $outcome
-    try { Invoke-TestWorkspaceMaintenanceIfDue }
-    catch { Write-Warning "Historical test maintenance could not run: $($_.Exception.Message)" }
+    Complete-TestOutput $OutputDirectory -Outcome $(if ($outcome -eq 'Passed') { 'Passed' } else { 'Failed' })
+    if ($Mode -ne 'CandidateAcceptance') {
+        try { Invoke-TestWorkspaceMaintenanceIfDue }
+        catch { Write-Warning "Historical test maintenance could not run: $($_.Exception.Message)" }
+    }
 }
