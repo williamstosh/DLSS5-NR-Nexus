@@ -1077,6 +1077,7 @@ int Run(bool hardware) {
       const auto creates_before_drag = native::nr_features_created;
       const auto* upper_before_edit = first_cache->tiers[0].state.slots[0].handle;
       const auto* lower_before_edit = native::features.at(ordinary_handle).slots[0].handle;
+      const auto lower_model_before_edit = *reinterpret_cast<const uint32_t*>(lower_before_edit);
       native::nr_adaptive_editing.store(true);
       for (const float minimum : {.6f, .5f}) {
         native::kSetAdaptiveMinScale.Store(minimum);
@@ -1092,9 +1093,19 @@ int Run(bool hardware) {
         submit();
       }
       auto revised_cache = native::features.at(ordinary_handle).adaptive_cache;
+      const auto* lower_after_edit = revised_cache->tiers[2].state.slots[0].handle;
+      Check(lower_after_edit != nullptr, "revised lower tuple owns a model");
+      const auto lower_model_after_edit = *reinterpret_cast<const uint32_t*>(lower_after_edit);
+      std::cout << "TRACE ordinary-minimum-edit cache_retained=" << (revised_cache == first_cache)
+                << " upper_retained=" << (native::features.at(ordinary_handle).slots[0].handle == upper_before_edit)
+                << " lower_address_reused=" << (lower_after_edit == lower_before_edit)
+                << " lower_model_before=" << lower_model_before_edit << " lower_model_after=" << lower_model_after_edit
+                << " lower_width=" << revised_cache->ladder.sizes[2][0].width << '\n';
+      // Released mock handles may reuse their allocation; model IDs distinguish
+      // a new tuple from retaining the previous model at that address.
       Check(revised_cache == first_cache && revised_cache->ladder.sizes[2][0].width == 8
                 && native::features.at(ordinary_handle).slots[0].handle == upper_before_edit
-                && revised_cache->tiers[2].state.slots[0].handle != lower_before_edit,
+                && lower_model_after_edit != lower_model_before_edit,
           "minimum edits retain the compatible upper model and replace the incompatible lower tuple");
       native::PollAdaptiveCache(revised_cache.get());
       Check(revised_cache->tiers[2].ready, "new minimum is not ready until its own first-evaluate completion");

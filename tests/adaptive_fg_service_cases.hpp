@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <map>
 #include <new>
 #include <utility>
 #include <vector>
@@ -22,10 +23,12 @@ CloseFn real_close = nullptr;
 ResetFn real_reset = nullptr;
 struct ListCall {
   ID3D12GraphicsCommandList* list;
+  uint64_t identity;
   bool reset;
   HRESULT result;
 };
 std::vector<ListCall> list_calls;
+inline IDXGISwapChain3* sdk_owner_proxy = nullptr;
 using CreatePipelineFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
 CreatePipelineFn real_create_pipeline = nullptr;
 uint32_t pipeline_calls = 0;
@@ -56,15 +59,17 @@ NVSDK_NGX_Result NVSDK_CONV ObserveCreateModel(ID3D12GraphicsCommandList* list, 
 }
 
 HRESULT STDMETHODCALLTYPE ObserveClose(ID3D12GraphicsCommandList* list) {
+  const auto identity = addon::submission::RecordingIdentity(list).first;
   const auto result = real_close(list);
-  list_calls.push_back({.list = list, .reset = false, .result = result});
+  list_calls.push_back({.list = list, .identity = identity, .reset = false, .result = result});
   return result;
 }
 
 HRESULT STDMETHODCALLTYPE ObserveReset(ID3D12GraphicsCommandList* list,
                                       ID3D12CommandAllocator* allocator, ID3D12PipelineState* state) {
+  const auto identity = addon::submission::RecordingIdentity(list).first;
   const auto result = real_reset(list, allocator, state);
-  list_calls.push_back({.list = list, .reset = true, .result = result});
+  list_calls.push_back({.list = list, .identity = identity, .reset = true, .result = result});
   return result;
 }
 
@@ -166,7 +171,7 @@ int Run() {
         if (verify_limited_commit && stream->second.adaptive_session->settings.limited_residency
             && stream->second.adaptive_frame.slot == stream->second.adaptive_session->level) {
           Check(stream->second.adaptive_session->status.applied == before_limited_commit
-              && stream->second.adaptive_session->applied_ns == 0,
+              && stream->second.adaptive_session->applied_generation != stream->second.adaptive_session->status.generation,
               "neither color nor an earlier Pass can commit the requested target before the complete Service output group");
         }
         bool identified = false;
@@ -207,7 +212,8 @@ int Run() {
         && DetourAttach(reinterpret_cast<PVOID*>(&real_reset), reinterpret_cast<PVOID>(ObserveReset)) == NO_ERROR,
         "adaptive service lifecycle observer attach");
     Check(DetourTransactionCommit() == NO_ERROR, "adaptive service lifecycle observer commit");
-    const auto texture = [&](DXGI_FORMAT format) {
+    constexpr auto present_state = D3D12_RESOURCE_STATE_PRESENT;
+    const auto texture = [&](DXGI_FORMAT format, D3D12_RESOURCE_STATES resting = NATIVE_INPUT_STATE) {
       const D3D12_HEAP_PROPERTIES heap{.Type = D3D12_HEAP_TYPE_DEFAULT};
       const D3D12_RESOURCE_DESC desc{.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
           .Width = 16, .Height = 16, .DepthOrArraySize = 1, .MipLevels = 1,
@@ -216,19 +222,60 @@ int Run() {
       Check(SUCCEEDED(gpu.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
           &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&resource))), "adaptive service texture");
       gpu.Write(resource.Get(), 0);
-      gpu.Transition(resource.Get(), D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
+      if (resting != D3D12_RESOURCE_STATE_COMMON) {
+        gpu.Transition(resource.Get(), D3D12_RESOURCE_STATE_COMMON, resting);
+      }
       return resource;
     };
-    auto color = texture(DXGI_FORMAT_R8G8B8A8_UNORM);
+    auto color = texture(DXGI_FORMAT_R8G8B8A8_UNORM, present_state);
+    const auto surface_state = [&](ID3D12Resource* surface) {
+      return (surface == color.Get() ? present_state : NATIVE_INPUT_STATE);
+    };
     auto motion = texture(DXGI_FORMAT_R16G16_FLOAT);
     auto depth = texture(DXGI_FORMAT_R32_FLOAT);
     gpu.Submit();
+    funnel_accounting_tests::Restore sdk_restore;
+    sdk_restore.Value(&adapter::modules[0]);
+    sdk_restore.Value(&adapter::proxies[0]);
+    sdk_restore.Atomic(&adapter::retire);
+    sdk_restore.Atomic(&adapter::service);
+    sdk_restore.Atomic(&adapter::prepare_capture);
+    sdk_restore.Atomic(&adapter::requested);
+    sdk_restore.Value(&sdk_owner_proxy);
+    struct SdkOwners {
+      std::map<uintptr_t, ComPtr<ReceiptSwapchain>> proxies;
+      ~SdkOwners() {
+        for (const auto& [context, proxy] : proxies) Hooks::Destroy(reinterpret_cast<void*>(context));
+      }
+    } sdk_owners;
+    // The SDK stands in for the proxy surface and return. The production
+    // Present call owns authorization, color submission and delivery.
+    adapter::modules[0].complete = true;
+    adapter::modules[0].real[0] = reinterpret_cast<void*>(+[](void*, ID3D12CommandQueue*, const xefg::abi::Init*) -> int32_t { return 0; });
+    adapter::modules[0].real[2] = reinterpret_cast<void*>(+[](void*, REFIID iid, void** output) -> int32_t {
+      return sdk_owner_proxy != nullptr && SUCCEEDED(sdk_owner_proxy->QueryInterface(iid, output)) ? 0 : -1;
+    });
+    adapter::modules[0].real[3] = reinterpret_cast<void*>(&FakeResource);
+    adapter::modules[0].real[4] = reinterpret_cast<void*>(&FakeConstants);
+    adapter::modules[0].real[5] = reinterpret_cast<void*>(&FakeId);
+    adapter::modules[0].real[6] = reinterpret_cast<void*>(+[](void*, uint32_t) -> int32_t { return 0; });
+    adapter::modules[0].real[8] = reinterpret_cast<void*>(+[](void*) -> int32_t { return 0; });
+    adapter::proxies[0].installed = adapter::proxies[0].complete = true;
+    xefg::Configure(&native::fg_service::Service, &Prepare, &native::fg_service::Retire,
+                    &native::fg_service::Requested);
+    const auto retire_owners = [&] {
+      for (const auto& [context, proxy] : sdk_owners.proxies) {
+        Check(Hooks::Destroy(reinterpret_cast<void*>(context)) == 0, "adaptive Service SDK owner Destroy");
+      }
+      sdk_owners.proxies.clear();
+      native::fg_service::Retire();
+    };
     fg::FrameInput input;
     input.context = 0xADAF6;
     input.epoch = 1;
     input.queue = gpu.queue.Get();
     input.backbuffer = color.Get();
-    input.backbuffer_state = NATIVE_INPUT_STATE;
+    input.backbuffer_state = present_state;
     input.depth = depth.Get();
     input.depth_state = NATIVE_INPUT_STATE;
     input.motion = motion.Get();
@@ -238,22 +285,69 @@ int Run() {
     input.has_constants = true;
     input.fg_enabled = true;
     input.color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    uint32_t present_id = 0;
     const auto service = [&] {
-      ++input.application_frame;
+      const auto handle = reinterpret_cast<void*>(input.context);
+      if (!sdk_owners.proxies.contains(input.context)) {
+        auto& proxy = sdk_owners.proxies[input.context];
+        proxy.Attach(new ReceiptSwapchain(nullptr));
+        proxy->reported_device12 = gpu.device;
+        proxy->current_back_buffer = color;
+        sdk_owner_proxy = proxy.Get();
+        adapter::proxies[0].records[0].target = static_cast<uint8_t*>((*reinterpret_cast<void***>(proxy.Get()))[8]);
+        const xefg::abi::Init init{.application_swapchain = proxy.Get()};
+        Check(Hooks::Init(handle, gpu.queue.Get(), &init) == 0, "adaptive Service SDK owner Init");
+        ComPtr<IDXGISwapChain3> observed_proxy;
+        Check(Hooks::GetSwapchain(handle, IID_PPV_ARGS(&observed_proxy)) == 0 && observed_proxy.Get() == proxy.Get()
+            && Hooks::Enable(handle, 1) == 0, "adaptive Service SDK owner GetSwapchain and Enable");
+      }
+      input.epoch = adapter::state.contexts.at(handle)->epoch;
+      Check(xefg::ServiceContextCurrent(input.context, input.epoch), "adaptive Service input names a live SDK owner epoch");
+      const auto id = ++present_id;
+      const auto tag = [&](int32_t type, ID3D12Resource* resource, D3D12_RESOURCE_STATES state,
+                           uint32_t width, uint32_t height) {
+        const xefg::abi::Resource data{.type = type, .validity = UNTIL_NEXT_PRESENT,
+            .base = {0, 0}, .size = {width, height}, .resource = resource, .state = state};
+        Check(Hooks::Resource(handle, gpu.list.Get(), id, &data) == 0, "adaptive Service SDK resource tag");
+      };
+      tag(BACKBUFFER, input.backbuffer, input.backbuffer_state, input.color_width, input.color_height);
+      tag(DEPTH, input.depth, input.depth_state, input.guide_width, input.guide_height);
+      tag(MOTION, input.motion, input.motion_state, input.guide_width, input.guide_height);
+      if (input.hudless != nullptr) {
+        tag(HUDLESS, input.hudless, input.hudless_state, input.color_width, input.color_height);
+      }
+      const xefg::abi::Constants constants{.jitter_x = input.jitter_x, .jitter_y = input.jitter_y,
+          .motion_scale_x = input.motion_scale_x, .motion_scale_y = input.motion_scale_y,
+          .reset = static_cast<uint32_t>(input.reset), .frame_time_ms = input.frame_time_ms};
+      Check(Hooks::Constants(handle, id, &constants) == 0 && Hooks::PresentId(handle, id) == 0,
+            "adaptive Service SDK constants and application ID");
       const auto before_source = native::SourceSuccessfulEvaluations();
       observing_context = input.context;
       active_pass_masks = {};
       failed_pass_masks = {};
       reset_pass_masks = {};
       const auto before_list_calls = list_calls.size();
-      const auto result = native::fg_service::Service(input);
+      auto* const proxy = sdk_owners.proxies.at(input.context).Get();
+      auto present = adapter::BeginPresent(proxy, 0);
+      const auto sdk_result = FakePresent(proxy, 0, 0);
+      adapter::EndPresent(&present, sdk_result);
+      Check(present.service_eligible && present.completed && present.input.backbuffer == input.backbuffer
+                && present.input.hudless == input.hudless && present.input.epoch == input.epoch
+                && present.input.depth == input.depth && present.input.motion == input.motion
+                && present.input.color_width == input.color_width && present.input.color_height == input.color_height,
+            "adaptive Service runs within the matching SDK call and output epoch");
+      input.application_frame = present.input.application_frame;
+      const auto result = present.service_result;
       for (size_t index = before_list_calls; index < list_calls.size(); ++index) {
         const auto& call = list_calls[index];
+        Check(call.identity != 0 && (call.identity & (uint64_t{1} << 63)) == 0,
+              "the lifecycle observer requires a COM object identity, not a pointer fallback");
         bool closed_twice = false;
         if (!call.reset) {
           for (size_t previous = index; previous > 0; --previous) {
             const auto& prior = list_calls[previous - 1];
-            if (prior.list != call.list) continue;
+            // Destroyed SDK pools can recycle addresses; compare live COM object identities.
+            if (prior.identity != call.identity) continue;
             closed_twice = !prior.reset && SUCCEEDED(prior.result);
             break;
           }
@@ -263,6 +357,7 @@ int Run() {
             const auto& event = list_calls[trace];
             std::cerr << "ADAPTIVE_LIST frame=" << input.application_frame
                 << " method=" << (event.reset ? "Reset" : "Close") << " list=" << event.list
+                << " identity=" << event.identity
                 << " hresult=0x" << std::hex << static_cast<uint32_t>(event.result) << std::dec << '\n';
           }
           Check(false, "Service closes each recording once, after its successful Reset");
@@ -343,9 +438,10 @@ int Run() {
       auto primary = gpu.CreateTextureTransfer(color.Get());
       auto auxiliary = gpu.CreateTextureTransfer(cold_hudless.Get());
       for (const auto& [surface, readback] : {std::pair{color.Get(), &primary}, std::pair{cold_hudless.Get(), &auxiliary}}) {
-        gpu.Transition(surface, NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        const auto state = surface_state(surface);
+        gpu.Transition(surface, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
         gpu.RecordTextureReadback(surface, *readback);
-        gpu.Transition(surface, D3D12_RESOURCE_STATE_COPY_SOURCE, NATIVE_INPUT_STATE);
+        gpu.Transition(surface, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
       }
       gpu.Submit();
       for (const auto* readback : {&primary, &auxiliary}) {
@@ -403,13 +499,11 @@ int Run() {
           && DetourDetach(reinterpret_cast<PVOID*>(&real_create_pipeline), reinterpret_cast<PVOID>(ObserveCreatePipeline)) == NO_ERROR
           && DetourTransactionCommit() == NO_ERROR, "cold Service PSO observer detach");
       native::nr_adaptive_enabled = false;
-      native::fg_service::Retire();
+      retire_owners();
       gpu.Submit();
       native::DrainRetiredResources(true);
       native::ReleaseCodecPipeline();
-      gpu.Transition(color.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
       gpu.Write(color.Get(), 0);
-      gpu.Transition(color.Get(), D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
       gpu.Submit();
       input.context = 0xADAF6;
       input.application_frame = 0;
@@ -553,7 +647,7 @@ int Run() {
           "explicit Service recovery waits for its own retirements and restores complete two-Pass output");
     }
     native::direct_api.create = CreateModel;
-    native::fg_service::Retire();
+    retire_owners();
     gpu.Submit();
     native::DrainRetiredResources(true);
     auto hudless = texture(DXGI_FORMAT_R8G8B8A8_UNORM);
@@ -574,22 +668,35 @@ int Run() {
         "dual-color cold maturation observes partial Pass masks without treating them as a complete color group");
     const auto role_models = native::nr_features_created;
     const auto role_worksets = native::worksets_created;
+    const auto confirmed_generation = dual.adaptive_session->applied_generation;
+    const auto confirmed_at = dual.adaptive_session->applied_ns;
+    Check(confirmed_generation == dual.adaptive_session->status.generation && confirmed_at != 0,
+        "the complete dual-color upper has a final delivery receipt before the interruptions");
+    const auto retains_confirmation = [&] {
+      return dual.adaptive_session->applied_generation == confirmed_generation
+          && dual.adaptive_session->applied_ns == confirmed_at;
+    };
     auto paused_primary_readback = gpu.CreateTextureTransfer(color.Get());
     auto paused_auxiliary_readback = gpu.CreateTextureTransfer(hudless.Get());
     const auto seed_paused_colors = [&] {
       for (auto* surface : {color.Get(), hudless.Get()}) {
-        gpu.Transition(surface, NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
+        if (surface != color.Get()) {
+          gpu.Transition(surface, NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
+        }
         gpu.Write(surface, 0x7f);
-        gpu.Transition(surface, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
+        if (surface != color.Get()) {
+          gpu.Transition(surface, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
+        }
       }
       gpu.Submit();
     };
     const auto check_paused_colors = [&] {
       for (const auto& [surface, readback] : {std::pair{color.Get(), &paused_primary_readback},
                std::pair{hudless.Get(), &paused_auxiliary_readback}}) {
-        gpu.Transition(surface, NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        const auto state = surface_state(surface);
+        gpu.Transition(surface, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
         gpu.RecordTextureReadback(surface, *readback);
-        gpu.Transition(surface, D3D12_RESOURCE_STATE_COPY_SOURCE, NATIVE_INPUT_STATE);
+        gpu.Transition(surface, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
       }
       gpu.Submit();
       for (const auto* readback : {&paused_primary_readback, &paused_auxiliary_readback}) {
@@ -617,12 +724,12 @@ int Run() {
     Check(service() == fg::Result::SUBMITTED && dual.adaptive_session->prepared
         && !dual.adaptive_role_unavailable && reset_pass_masks[0] == 3 && reset_pass_masks[1] == 3
         && dual.adaptive_session->status.ready_levels == 2
-        && dual.adaptive_session->stable_after_ns >= short_resume_ns + addon::adaptive_resolution::WARMUP_NS
+        && dual.adaptive_session->stable_after_ns >= short_resume_ns && dual.adaptive_session->gpu_count == 0
+        && retains_confirmation()
         && native::nr_features_created == role_models && native::worksets_created == role_worksets,
-        "both retained colors and both Passes resume with Reset and one new warmup without additional preparation allocation");
-    const auto short_resume_stable_ns = dual.adaptive_session->stable_after_ns;
-    Check(service() == fg::Result::SUBMITTED && dual.adaptive_session->stable_after_ns == short_resume_stable_ns,
-        "a subsequent healthy frame does not restart the resumed collection's warmup");
+        "both retained colors and both Passes resume with Reset and fresh comparison without reapplying the same confirmed tier");
+    Check(service() == fg::Result::SUBMITTED && retains_confirmation(),
+        "a subsequent healthy frame preserves the tier's first confirmed timestamp");
 
     seed_paused_colors();
     input.hudless = nullptr;
@@ -651,12 +758,12 @@ int Run() {
         && !dual.adaptive_role_unavailable && !dual.adaptive_session->failed
         && reset_pass_masks[0] == 3 && reset_pass_masks[1] == 3
         && dual.adaptive_session->status.ready_levels == 2
-        && dual.adaptive_session->stable_after_ns >= long_resume_ns + addon::adaptive_resolution::WARMUP_NS
+        && dual.adaptive_session->stable_after_ns >= long_resume_ns && dual.adaptive_session->gpu_count == 0
+        && retains_confirmation()
         && native::nr_features_created == role_models && native::worksets_created == role_worksets,
         "a long missing-input pause resumes both complete color/Pass groups with Reset and retained allocations");
-    const auto long_resume_stable_ns = dual.adaptive_session->stable_after_ns;
-    Check(service() == fg::Result::SUBMITTED && dual.adaptive_session->stable_after_ns == long_resume_stable_ns,
-        "continuous healthy output after a long pause preserves the resumed warmup deadline");
+    Check(service() == fg::Result::SUBMITTED && retains_confirmation(),
+        "continuous healthy output after a long pause preserves the tier's first confirmed timestamp");
 
     const auto dual_models = native::nr_features_created;
     const auto dual_worksets = native::worksets_created;
@@ -706,8 +813,17 @@ int Run() {
     native::kSetAdaptiveMinScale.Store(.8f);
     service();
     Check(primary->active == 0 && auxiliary->active == 0
-        && dual.adaptive_session->status.applied[0].width == 16 && !dual.adaptive_session->failed,
-        "a new minimum restores the complete legal upper group while the new selected endpoint prepares");
+        && dual.adaptive_session->status.requested == dual.adaptive_session->status.upper
+        && dual.adaptive_session->status.applied[0].width == 8
+        && dual.adaptive_session->applied_generation != dual.adaptive_session->status.generation
+        && !dual.adaptive_session->failed,
+        "a new minimum renders the legal upper while the newly selected collection prepares");
+    for (uint32_t frame = 0; frame < 20 && dual.adaptive_session->applied_generation != dual.adaptive_session->status.generation; ++frame) {
+      service();
+    }
+    Check(dual.adaptive_session->prepared && dual.adaptive_session->applied_generation == dual.adaptive_session->status.generation
+        && dual.adaptive_session->status.applied == dual.adaptive_session->status.upper,
+        "the eligible upper confirms after preparation and complete dual-color delivery");
 
     native::kSetPassPreset[0].Store(1.f);
     native::ApplySettingEffect(native::kSetPassPreset[0].effect);
@@ -724,14 +840,20 @@ int Run() {
     Check(service() == fg::Result::PREPARED && dual.adaptive_role_unavailable
         && dual.adaptive_session->status.reason == addon::adaptive_resolution::Reason::UNSUPPORTED,
         "a real contract transition starts while the old required role is unavailable");
-    ++input.epoch;
+    const auto previous_epoch = input.epoch;
+    const auto epoch_owner = reinterpret_cast<void*>(input.context);
+    Check(Hooks::Enable(epoch_owner, 0) == 0 && Hooks::Enable(epoch_owner, 1) == 0,
+        "public SDK Disable/Enable replaces the unavailable old Service epoch");
+    input.epoch = adapter::state.contexts.at(epoch_owner)->epoch;
+    Check(input.epoch != previous_epoch, "the replacement epoch comes from the production SDK lifecycle");
     for (uint32_t frame = 0; frame < 24; ++frame) service();
-    Check(!dual.adaptive_role_unavailable && dual.epoch == input.epoch
-        && dual.adaptive_session != nullptr && dual.adaptive_session->prepared
-        && dual.adaptive_required_roles == 1 && !dual.adaptive_session->failed
-        && native::features.at(dual.roles[0].Handle()).adaptive_cache != previous_primary,
+    auto& epoch_stream = native::fg_service::streams.at({false, input.context});
+    Check(!epoch_stream.adaptive_role_unavailable && epoch_stream.epoch == input.epoch
+        && epoch_stream.adaptive_session != nullptr && epoch_stream.adaptive_session->prepared
+        && epoch_stream.adaptive_required_roles == 1 && !epoch_stream.adaptive_session->failed
+        && native::features.at(epoch_stream.roles[0].Handle()).adaptive_cache != previous_primary,
         "a real epoch change retires the unavailable old contract and prepares the new single-role group");
-    const auto epoch_primary = native::features.at(dual.roles[0].Handle()).adaptive_cache;
+    const auto epoch_primary = native::features.at(epoch_stream.roles[0].Handle()).adaptive_cache;
     input.color_width = input.color_height = 8;
     for (uint32_t frame = 0; frame < 24; ++frame) service();
     auto& changed = native::fg_service::streams.at({false, input.context});
@@ -742,7 +864,7 @@ int Run() {
         && !changed.adaptive_session->failed,
         "a real same-epoch color geometry change prepares its new contract instead of waiting for an obsolete role");
 
-    native::fg_service::Retire();
+    retire_owners();
     gpu.Submit();
     native::DrainRetiredResources(true);
     native::nr_adaptive_selected_levels.store(5);
@@ -779,9 +901,13 @@ int Run() {
     const auto many_worksets = native::worksets_created;
     for (size_t level = 0; level < many.adaptive_session->ladder.count; ++level) {
       for (auto* surface : {color.Get(), hudless.Get()}) {
-        gpu.Transition(surface, NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
+        if (surface != color.Get()) {
+          gpu.Transition(surface, NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
+        }
         gpu.Write(surface, 0x7f);
-        gpu.Transition(surface, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
+        if (surface != color.Get()) {
+          gpu.Transition(surface, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
+        }
       }
       gpu.Submit();
       many.adaptive_session->Request(level, native::SteadyNowNs());
@@ -795,9 +921,9 @@ int Run() {
             && feature.slots[1].create_input_width == many.adaptive_session->ladder.sizes[level][1].width,
             "both roles use the selected first- and second-Pass working dimensions");
       }
-      gpu.Transition(color.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      gpu.Transition(color.Get(), present_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
       gpu.RecordTextureReadback(color.Get(), primary_readback);
-      gpu.Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, NATIVE_INPUT_STATE);
+      gpu.Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, present_state);
       gpu.Transition(hudless.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COPY_SOURCE);
       gpu.RecordTextureReadback(hudless.Get(), auxiliary_readback);
       gpu.Transition(hudless.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, NATIVE_INPUT_STATE);
@@ -843,10 +969,8 @@ int Run() {
       Check(last_slot != nullptr && last_slot->color[0] != nullptr
           && many.fence->GetCompletedValue() != UINT64_MAX && many.fence->GetCompletedValue() >= many.submitted,
           "the final real Service slot completed on its healthy private Fence");
-      const auto service_recording = addon::submission::ObserveRecording(last_slot->list);
-      Check(service_recording->submitted.load() && !service_recording->closed.load()
-          && native::TeardownProof() == addon::submission::RecordedWork::kReplayable,
-          "completed private Service recording remains replayable before Off without another Service or Resize");
+      Check(native::TeardownProof() == addon::submission::RecordedWork::kComplete,
+            "the submitted private Service recording is already closed and GPU complete before Off");
 
       // A separate host recording really reads the service color on the GPU.
       // Its owner keeps replay eligibility after the completion Fence.
@@ -883,7 +1007,7 @@ int Run() {
       native::disabled_resources_released = false;
       native::shutdown_quiesce_latched = false;
       native::ServiceDisabledNr();
-      Check(service_recording->closed.load() && !host_recording->closed.load()
+      Check(!host_recording->closed.load()
           && native::fg_service::streams.empty() && !native::disabled_resources_released.load()
           && native::TeardownProof() == addon::submission::RecordedWork::kReplayable
           && native::codec_pipeline.root_signature == retained_root
@@ -959,7 +1083,8 @@ int Run() {
     verify_limited_commit = false;
     Check(limited_primary->active == 3 && limited_auxiliary->active == 3 && limited.adaptive_session->TargetReady()
         && limited.adaptive_session->status.applied == limited.adaptive_session->ladder.sizes[3]
-        && limited.adaptive_session->applied_ns != 0 && !limited.adaptive_session->prepared
+        && limited.adaptive_session->applied_generation == limited.adaptive_session->status.generation
+        && !limited.adaptive_session->prepared
         && native::nr_features_created == before_limited_models + 8,
         "only complete successful output for both colors commits a cold target and starts its measurement warmup");
     limited.adaptive_session->Request(2, native::SteadyNowNs());
@@ -985,7 +1110,7 @@ int Run() {
     native::nr_adaptive_limited_residency = false;
     native::nr_adaptive_selected_levels = 0;
     model_parameter_observer = {};
-    native::fg_service::Retire();
+    retire_owners();
     gpu.Submit();
     native::DrainRetiredResources(true);
     Check(DetourTransactionBegin() == NO_ERROR && DetourUpdateThread(GetCurrentThread()) == NO_ERROR,

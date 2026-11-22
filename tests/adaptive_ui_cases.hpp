@@ -1,4 +1,214 @@
+// CPU ReShade interfaces for owner matching. The DEV fixture includes only these
+// declarations with NR_NEXUS_TEST_OUTPUT_RUNTIME_ONLY.
+namespace fixture_rate = renodx::addons::dlss5::output_framerate;
+namespace fixture_runtime = renodx::addons::dlss5::internal;
+struct OutputRuntimeFixture final : reshade::api::effect_runtime {
+  struct Device final : reshade::api::device, IUnknown {
+    reshade::api::resource_desc description{};
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** output) override {
+      if (output == nullptr) return E_POINTER;
+      *output = nullptr;
+      if (iid != __uuidof(IUnknown)) return E_NOINTERFACE;
+      *output = static_cast<IUnknown*>(this);
+      AddRef();
+      return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+    uint64_t get_native() const override { return reinterpret_cast<uintptr_t>(static_cast<const IUnknown*>(this)); }
+    void get_private_data(const uint8_t[16], uint64_t*) const override { throw std::logic_error("unsupported output fixture operation"); }
+    void set_private_data(const uint8_t[16], uint64_t) override { throw std::logic_error("unsupported output fixture operation"); }
+    reshade::api::device_api get_api() const override { return reshade::api::device_api::d3d12; }
+    bool check_capability(reshade::api::device_caps capability) const override { throw std::logic_error("unsupported output fixture operation"); }
+    bool check_format_support(reshade::api::format format, reshade::api::resource_usage usage) const override { throw std::logic_error("unsupported output fixture operation"); }
+    bool create_sampler(const reshade::api::sampler_desc &desc, reshade::api::sampler *out_sampler) override { throw std::logic_error("unsupported output fixture operation"); }
+    void destroy_sampler(reshade::api::sampler sampler) override { throw std::logic_error("unsupported output fixture operation"); }
+    bool create_resource(const reshade::api::resource_desc &desc, const reshade::api::subresource_data *initial_data, reshade::api::resource_usage initial_state, reshade::api::resource *out_resource, void **shared_handle = nullptr) override { throw std::logic_error("unsupported output fixture operation"); }
+    void destroy_resource(reshade::api::resource resource) override { throw std::logic_error("unsupported output fixture operation"); }
+    reshade::api::resource_desc get_resource_desc(reshade::api::resource resource) const override { return description; }
+    bool create_resource_view(reshade::api::resource resource, reshade::api::resource_usage usage_type, const reshade::api::resource_view_desc &desc, reshade::api::resource_view *out_view) override { throw std::logic_error("unsupported output fixture operation"); }
+    void destroy_resource_view(reshade::api::resource_view view) override { throw std::logic_error("unsupported output fixture operation"); }
+    reshade::api::resource get_resource_from_view(reshade::api::resource_view view) const override { throw std::logic_error("unsupported output fixture operation"); }
+    reshade::api::resource_view_desc get_resource_view_desc(reshade::api::resource_view view) const override { throw std::logic_error("unsupported output fixture operation"); }
+    bool map_buffer_region(reshade::api::resource resource, uint64_t offset, uint64_t size, reshade::api::map_access access, void **out_data) override { throw std::logic_error("unsupported output fixture operation"); }
+    void unmap_buffer_region(reshade::api::resource resource) override { throw std::logic_error("unsupported output fixture operation"); }
+    bool map_texture_region(reshade::api::resource resource, uint32_t subresource, const reshade::api::subresource_box *box, reshade::api::map_access access, reshade::api::subresource_data *out_data) override { throw std::logic_error("unsupported output fixture operation"); }
+    void unmap_texture_region(reshade::api::resource resource, uint32_t subresource) override { throw std::logic_error("unsupported output fixture operation"); }
+    void update_buffer_region(const void *data, reshade::api::resource dest, uint64_t dest_offset, uint64_t size) override { throw std::logic_error("unsupported output fixture operation"); }
+    void update_texture_region(const reshade::api::subresource_data &data, reshade::api::resource dest, uint32_t dest_subresource, const reshade::api::subresource_box *dest_box = nullptr) override { throw std::logic_error("unsupported output fixture operation"); }
+    bool create_pipeline(reshade::api::pipeline_layout layout, uint32_t subobject_count, const reshade::api::pipeline_subobject *subobjects, reshade::api::pipeline *out_pipeline) override { throw std::logic_error("unsupported output fixture operation"); }
+    void destroy_pipeline(reshade::api::pipeline pipeline) override { throw std::logic_error("unsupported output fixture operation"); }
+    bool create_pipeline_layout(uint32_t param_count, const reshade::api::pipeline_layout_param *params, reshade::api::pipeline_layout *out_layout) override { throw std::logic_error("unsupported output fixture operation"); }
+    void destroy_pipeline_layout(reshade::api::pipeline_layout layout) override { throw std::logic_error("unsupported output fixture operation"); }
+    bool allocate_descriptor_tables(uint32_t count, reshade::api::pipeline_layout layout, uint32_t param, reshade::api::descriptor_table *out_tables) override { throw std::logic_error("unsupported output fixture operation"); }
+    void free_descriptor_tables(uint32_t count, const reshade::api::descriptor_table *tables) override { throw std::logic_error("unsupported output fixture operation"); }
+    void get_descriptor_heap_offset(reshade::api::descriptor_table table, uint32_t binding, uint32_t array_offset, reshade::api::descriptor_heap *out_heap, uint32_t *out_offset) const override { throw std::logic_error("unsupported output fixture operation"); }
+    void copy_descriptor_tables(uint32_t count, const reshade::api::descriptor_table_copy *copies) override { throw std::logic_error("unsupported output fixture operation"); }
+    void update_descriptor_tables(uint32_t count, const reshade::api::descriptor_table_update *updates) override { throw std::logic_error("unsupported output fixture operation"); }
+    bool create_query_heap(reshade::api::query_type type, uint32_t count, reshade::api::query_heap *out_heap) override { throw std::logic_error("unsupported output fixture operation"); }
+    void destroy_query_heap(reshade::api::query_heap heap) override { throw std::logic_error("unsupported output fixture operation"); }
+    bool get_query_heap_results(reshade::api::query_heap heap, uint32_t first, uint32_t count, void *results, uint32_t stride) override { throw std::logic_error("unsupported output fixture operation"); }
+    void set_resource_name(reshade::api::resource resource, const char *name) override { throw std::logic_error("unsupported output fixture operation"); }
+    void set_resource_view_name(reshade::api::resource_view view, const char *name) override { throw std::logic_error("unsupported output fixture operation"); }
+    bool create_fence(uint64_t initial_value, reshade::api::fence_flags flags, reshade::api::fence *out_fence, void **shared_handle = nullptr) override { throw std::logic_error("unsupported output fixture operation"); }
+    void destroy_fence(reshade::api::fence fence) override { throw std::logic_error("unsupported output fixture operation"); }
+    uint64_t get_completed_fence_value(reshade::api::fence fence) const override { throw std::logic_error("unsupported output fixture operation"); }
+    bool wait(reshade::api::fence fence, uint64_t value, uint64_t timeout = UINT64_MAX) override { throw std::logic_error("unsupported output fixture operation"); }
+    bool signal(reshade::api::fence fence, uint64_t value) override { throw std::logic_error("unsupported output fixture operation"); }
+    bool get_property(reshade::api::device_properties property, void *data) const override { throw std::logic_error("unsupported output fixture operation"); }
+    uint64_t get_resource_view_gpu_address(reshade::api::resource_view view) const override { throw std::logic_error("unsupported output fixture operation"); }
+    void get_acceleration_structure_size(reshade::api::acceleration_structure_type type, reshade::api::acceleration_structure_build_flags flags, uint32_t input_count, const reshade::api::acceleration_structure_build_input *inputs, uint64_t *out_size, uint64_t *out_build_scratch_size, uint64_t *out_update_scratch_size) const override { throw std::logic_error("unsupported output fixture operation"); }
+    bool get_pipeline_shader_group_handles(reshade::api::pipeline pipeline, uint32_t first, uint32_t count, void *out_handles) override { throw std::logic_error("unsupported output fixture operation"); }
+  } device;
+  std::array<reshade::api::resource, 2> buffers{{{0xADA100}, {0xADA200}}};
+  uint32_t current_buffer = 0;
+  fixture_rate::OutputIdentity output;
+  reshade::api::effect_runtime* saved_owner = fixture_runtime::monitor_runtime.load();
+  fixture_runtime::MonitorCadence saved_cadence = fixture_runtime::monitor_cadence;
+  fixture_runtime::MonitorSnapshot saved_snapshot = fixture_runtime::monitor_snapshot;
+  decltype(fixture_rate::internal::state.present) saved_present;
+  decltype(fixture_rate::internal::state.xefg) saved_xefg;
+  decltype(fixture_rate::internal::state.native_options) saved_options;
+
+  OutputRuntimeFixture() {
+    {
+      std::unique_lock lock(fixture_rate::internal::state.mutex);
+      saved_present.swap(fixture_rate::internal::state.present);
+      saved_xefg.swap(fixture_rate::internal::state.xefg);
+      saved_options.swap(fixture_rate::internal::state.native_options);
+    }
+    device.description.texture.width = 3840;
+    device.description.texture.height = 2160;
+    const std::array<uintptr_t, 2> back_buffers{buffers[0].handle, buffers[1].handle};
+    fixture_rate::RegisterPresentOutput(reinterpret_cast<uintptr_t>(this), device.get_native(),
+        reinterpret_cast<uintptr_t>(this), back_buffers);
+    output = fixture_runtime::MatchRuntimeOutput(this);
+    fixture_runtime::monitor_runtime = this;
+    fixture_runtime::monitor_cadence = {.owner = this, .output = output,
+        .epoch = fixture_runtime::monitor_history_epoch.load()};
+    fixture_runtime::monitor_snapshot = {};
+  }
+
+  ~OutputRuntimeFixture() {
+    fixture_runtime::monitor_runtime = saved_owner;
+    fixture_runtime::monitor_cadence = std::move(saved_cadence);
+    fixture_runtime::monitor_snapshot = std::move(saved_snapshot);
+    std::unique_lock lock(fixture_rate::internal::state.mutex);
+    saved_present.swap(fixture_rate::internal::state.present);
+    saved_xefg.swap(fixture_rate::internal::state.xefg);
+    saved_options.swap(fixture_rate::internal::state.native_options);
+  }
+  uint64_t get_native() const override { return reinterpret_cast<uintptr_t>(this); }
+  void get_private_data(const uint8_t guid[16], uint64_t *data) const override { throw std::logic_error("unsupported output fixture operation"); }
+  void set_private_data(const uint8_t guid[16], const uint64_t data) override { throw std::logic_error("unsupported output fixture operation"); }
+  reshade::api::device *get_device() override { return &device; }
+  void *get_hwnd() const override { return nullptr; }
+  reshade::api::resource get_back_buffer(uint32_t index) override { return buffers.at(index); }
+  uint32_t get_back_buffer_count() const override { return static_cast<uint32_t>(buffers.size()); }
+  uint32_t get_current_back_buffer_index() const override { return current_buffer; }
+  reshade::api::command_queue *get_command_queue() override { return nullptr; }
+  void render_effects(reshade::api::command_list *cmd_list, reshade::api::resource_view rtv, reshade::api::resource_view rtv_srgb) override { throw std::logic_error("unsupported output fixture operation"); }
+  bool capture_screenshot(void *pixels) override { throw std::logic_error("unsupported output fixture operation"); }
+  void get_screenshot_width_and_height(uint32_t *out_width, uint32_t *out_height) const override { throw std::logic_error("unsupported output fixture operation"); }
+  bool is_key_down(uint32_t keycode) const override { throw std::logic_error("unsupported output fixture operation"); }
+  bool is_key_pressed(uint32_t keycode) const override { throw std::logic_error("unsupported output fixture operation"); }
+  bool is_key_released(uint32_t keycode) const override { throw std::logic_error("unsupported output fixture operation"); }
+  bool is_mouse_button_down(uint32_t button) const override { throw std::logic_error("unsupported output fixture operation"); }
+  bool is_mouse_button_pressed(uint32_t button) const override { throw std::logic_error("unsupported output fixture operation"); }
+  bool is_mouse_button_released(uint32_t button) const override { throw std::logic_error("unsupported output fixture operation"); }
+  void get_mouse_cursor_position(uint32_t *out_x, uint32_t *out_y, int16_t *out_wheel_delta = nullptr) const override { throw std::logic_error("unsupported output fixture operation"); }
+  void enumerate_uniform_variables(const char *effect_name, void(*callback)(reshade::api::effect_runtime *runtime, reshade::api::effect_uniform_variable variable, void *user_data), void *user_data) override { throw std::logic_error("unsupported output fixture operation"); }
+  reshade::api::effect_uniform_variable find_uniform_variable(const char *effect_name, const char *variable_name) const override { throw std::logic_error("unsupported output fixture operation"); }
+  void get_uniform_variable_type(reshade::api::effect_uniform_variable variable, reshade::api::format *out_base_type, uint32_t *out_rows = nullptr, uint32_t *out_columns = nullptr, uint32_t *out_array_length = nullptr) const override { throw std::logic_error("unsupported output fixture operation"); }
+  void get_uniform_variable_name(reshade::api::effect_uniform_variable variable, char *name, size_t *name_size) const override { throw std::logic_error("unsupported output fixture operation"); }
+  bool get_annotation_bool_from_uniform_variable(reshade::api::effect_uniform_variable variable, const char *name, bool *values, size_t count, size_t array_index = 0) const override { throw std::logic_error("unsupported output fixture operation"); }
+  bool get_annotation_float_from_uniform_variable(reshade::api::effect_uniform_variable variable, const char *name, float *values, size_t count, size_t array_index = 0) const override { throw std::logic_error("unsupported output fixture operation"); }
+  bool get_annotation_int_from_uniform_variable(reshade::api::effect_uniform_variable variable, const char *name, int32_t *values, size_t count, size_t array_index = 0) const override { throw std::logic_error("unsupported output fixture operation"); }
+  bool get_annotation_uint_from_uniform_variable(reshade::api::effect_uniform_variable variable, const char *name, uint32_t *values, size_t count, size_t array_index = 0) const override { throw std::logic_error("unsupported output fixture operation"); }
+  bool get_annotation_string_from_uniform_variable(reshade::api::effect_uniform_variable variable, const char *name, char *value, size_t *value_size) const override { throw std::logic_error("unsupported output fixture operation"); }
+  void get_uniform_value_bool(reshade::api::effect_uniform_variable variable, bool *values, size_t count, size_t array_index = 0) const override { throw std::logic_error("unsupported output fixture operation"); }
+  void get_uniform_value_float(reshade::api::effect_uniform_variable variable, float *values, size_t count, size_t array_index = 0) const override { throw std::logic_error("unsupported output fixture operation"); }
+  void get_uniform_value_int(reshade::api::effect_uniform_variable variable, int32_t *values, size_t count, size_t array_index = 0) const override { throw std::logic_error("unsupported output fixture operation"); }
+  void get_uniform_value_uint(reshade::api::effect_uniform_variable variable, uint32_t *values, size_t count, size_t array_index = 0) const override { throw std::logic_error("unsupported output fixture operation"); }
+  void set_uniform_value_bool(reshade::api::effect_uniform_variable variable, const bool *values, size_t count, size_t array_index = 0) override { throw std::logic_error("unsupported output fixture operation"); }
+  void set_uniform_value_float(reshade::api::effect_uniform_variable variable, const float *values, size_t count, size_t array_index = 0) override { throw std::logic_error("unsupported output fixture operation"); }
+  void set_uniform_value_int(reshade::api::effect_uniform_variable variable, const int32_t *values, size_t count, size_t array_index = 0) override { throw std::logic_error("unsupported output fixture operation"); }
+  void set_uniform_value_uint(reshade::api::effect_uniform_variable variable, const uint32_t *values, size_t count, size_t array_index = 0) override { throw std::logic_error("unsupported output fixture operation"); }
+  void enumerate_texture_variables(const char *effect_name, void(*callback)(reshade::api::effect_runtime *runtime, reshade::api::effect_texture_variable variable, void *user_data), void *user_data) override { throw std::logic_error("unsupported output fixture operation"); }
+  reshade::api::effect_texture_variable find_texture_variable(const char *effect_name, const char *variable_name) const override { throw std::logic_error("unsupported output fixture operation"); }
+  void get_texture_variable_name(reshade::api::effect_texture_variable variable, char *name, size_t *name_size) const override { throw std::logic_error("unsupported output fixture operation"); }
+  bool get_annotation_bool_from_texture_variable(reshade::api::effect_texture_variable variable, const char *name, bool *values, size_t count, size_t array_index = 0) const override { throw std::logic_error("unsupported output fixture operation"); }
+  bool get_annotation_float_from_texture_variable(reshade::api::effect_texture_variable variable, const char *name, float *values, size_t count, size_t array_index = 0) const override { throw std::logic_error("unsupported output fixture operation"); }
+  bool get_annotation_int_from_texture_variable(reshade::api::effect_texture_variable variable, const char *name, int32_t *values, size_t count, size_t array_index = 0) const override { throw std::logic_error("unsupported output fixture operation"); }
+  bool get_annotation_uint_from_texture_variable(reshade::api::effect_texture_variable variable, const char *name, uint32_t *values, size_t count, size_t array_index = 0) const override { throw std::logic_error("unsupported output fixture operation"); }
+  bool get_annotation_string_from_texture_variable(reshade::api::effect_texture_variable variable, const char *name, char *value, size_t *value_size) const override { throw std::logic_error("unsupported output fixture operation"); }
+  void update_texture(reshade::api::effect_texture_variable variable, const uint32_t width, const uint32_t height, const void *pixels) override { throw std::logic_error("unsupported output fixture operation"); }
+  void get_texture_binding(reshade::api::effect_texture_variable variable, reshade::api::resource_view *out_srv, reshade::api::resource_view *out_srv_srgb) const override { throw std::logic_error("unsupported output fixture operation"); }
+  void update_texture_bindings(const char *semantic, reshade::api::resource_view srv, reshade::api::resource_view srv_srgb) override { throw std::logic_error("unsupported output fixture operation"); }
+  void enumerate_techniques(const char *effect_name, void(*callback)(reshade::api::effect_runtime *runtime, reshade::api::effect_technique technique, void *user_data), void *user_data) override { throw std::logic_error("unsupported output fixture operation"); }
+  reshade::api::effect_technique find_technique(const char *effect_name, const char *technique_name) override { throw std::logic_error("unsupported output fixture operation"); }
+  void get_technique_name(reshade::api::effect_technique technique, char *name, size_t *name_size) const override { throw std::logic_error("unsupported output fixture operation"); }
+  bool get_annotation_bool_from_technique(reshade::api::effect_technique technique, const char *name, bool *values, size_t count, size_t array_index = 0) const override { throw std::logic_error("unsupported output fixture operation"); }
+  bool get_annotation_float_from_technique(reshade::api::effect_technique technique, const char *name, float *values, size_t count, size_t array_index = 0) const override { throw std::logic_error("unsupported output fixture operation"); }
+  bool get_annotation_int_from_technique(reshade::api::effect_technique technique, const char *name, int32_t *values, size_t count, size_t array_index = 0) const override { throw std::logic_error("unsupported output fixture operation"); }
+  bool get_annotation_uint_from_technique(reshade::api::effect_technique technique, const char *name, uint32_t *values, size_t count, size_t array_index = 0) const override { throw std::logic_error("unsupported output fixture operation"); }
+  bool get_annotation_string_from_technique(reshade::api::effect_technique technique, const char *name, char *value, size_t *value_size) const override { throw std::logic_error("unsupported output fixture operation"); }
+  bool get_technique_state(reshade::api::effect_technique technique) const override { throw std::logic_error("unsupported output fixture operation"); }
+  void set_technique_state(reshade::api::effect_technique technique, bool enabled) override { throw std::logic_error("unsupported output fixture operation"); }
+  bool get_preprocessor_definition(const char *name, char *value, size_t *value_size) const override { throw std::logic_error("unsupported output fixture operation"); }
+  void set_preprocessor_definition(const char *name, const char *value) override { throw std::logic_error("unsupported output fixture operation"); }
+  void render_technique(reshade::api::effect_technique technique, reshade::api::command_list *cmd_list, reshade::api::resource_view rtv, reshade::api::resource_view rtv_srgb = { 0 }) override { throw std::logic_error("unsupported output fixture operation"); }
+  bool get_effects_state() const override { throw std::logic_error("unsupported output fixture operation"); }
+  void set_effects_state(bool enabled) override { throw std::logic_error("unsupported output fixture operation"); }
+  void get_current_preset_path(char *path, size_t *path_size) const override { throw std::logic_error("unsupported output fixture operation"); }
+  void set_current_preset_path(const char *path) override { throw std::logic_error("unsupported output fixture operation"); }
+  void reorder_techniques(size_t count, const reshade::api::effect_technique *techniques) override { throw std::logic_error("unsupported output fixture operation"); }
+  void block_input_next_frame() override { throw std::logic_error("unsupported output fixture operation"); }
+  uint32_t last_key_pressed() const override { throw std::logic_error("unsupported output fixture operation"); }
+  uint32_t last_key_released() const override { throw std::logic_error("unsupported output fixture operation"); }
+  void get_uniform_variable_effect_name(reshade::api::effect_uniform_variable variable, char *effect_name, size_t *effect_name_size) const override { throw std::logic_error("unsupported output fixture operation"); }
+  void get_texture_variable_effect_name(reshade::api::effect_texture_variable variable, char *effect_name, size_t *effect_name_size) const override { throw std::logic_error("unsupported output fixture operation"); }
+  void get_technique_effect_name(reshade::api::effect_technique technique, char *effect_name, size_t *effect_name_size) const override { throw std::logic_error("unsupported output fixture operation"); }
+  void save_current_preset() const override { throw std::logic_error("unsupported output fixture operation"); }
+  bool get_preprocessor_definition_for_effect(const char *effect_name, const char *name, char *value, size_t *value_size) const override { throw std::logic_error("unsupported output fixture operation"); }
+  void set_preprocessor_definition_for_effect(const char *effect_name, const char *name, const char *value) override { throw std::logic_error("unsupported output fixture operation"); }
+  bool open_overlay(bool open, reshade::api::input_source source) override { throw std::logic_error("unsupported output fixture operation"); }
+  void set_color_space(reshade::api::color_space color_space) override { throw std::logic_error("unsupported output fixture operation"); }
+  void reset_uniform_value(reshade::api::effect_uniform_variable variable) override { throw std::logic_error("unsupported output fixture operation"); }
+  void reload_effect_next_frame(const char *effect_name) override { throw std::logic_error("unsupported output fixture operation"); }
+  void export_current_preset(const char *path) const override { throw std::logic_error("unsupported output fixture operation"); }
+  void save_screenshot(const char *postfix = nullptr) override { throw std::logic_error("unsupported output fixture operation"); }
+};
+
+#if !defined(NR_NEXUS_TEST_OUTPUT_RUNTIME_ONLY)
 {
+  OutputRuntimeFixture output_runtime;
+  check(static_cast<bool>(output_runtime.output), "the CPU runtime resolves its registered current backbuffer");
+  const bool saved_edit_reuse = runtime::edit_reuse_enabled.exchange(false);
+  namespace adaptive = renodx::addons::dlss5::adaptive_resolution;
+  using DisplayStage = renodx::addons::dlss5::stage_plan::Stage;
+  constexpr uint64_t display_source_generation = 73;
+  const auto publish_display_status = [&](adaptive::Status status, DisplayStage stage, uint64_t source_generation) {
+    status.display_output_generation = runtime::MatchRuntimeOutput(&output_runtime).generation;
+    status.display_source_generation = source_generation;
+    status.display_stage = static_cast<uint32_t>(stage);
+    runtime::PublishAdaptiveStatus(status);
+  };
+  const auto refresh_monitor = [&] {
+    runtime::monitor_cadence.frame = -1;
+    runtime::UpdateMonitorCadence(&output_runtime);
+    runtime::monitor_snapshot.attempted_ns = 0;
+    return runtime::RefreshMonitorSnapshot(true);
+  };
+  namespace fixture_timers = renodx::addons::dlss5::gpu_timers;
+  const auto saved_completion_observer = std::exchange(fixture_timers::completed_observer, &runtime::ObserveAdaptiveCompletion);
+  const auto publish_completion = [](const fixture_timers::Stats& sample) {
+    renodx::addons::dlss5::RuntimeLock lock(runtime::runtime_mutex);
+    const auto stage = fixture_timers::StageIndex(sample.path);
+    runtime::TouchAdaptiveCompletionScope(stage, {sample.identity.display_output_generation, sample.identity.source_generation},
+        sample.recorded_ns);
+    fixture_timers::internal::PublishCompleted(sample, 0, 1);
+  };
   runtime::ui_language_choice = 1;
   ui::SelectLanguage(0);
   panel_height = 1600.f;
@@ -180,20 +390,23 @@
   cadence.FormatRate(output, raw);
   check(cadence.text == "35" && std::string(cadence.fps_tip) == ui::frame_metrics::SourceTip(raw.source),
         "unknown output falls back to accurately labelled current cadence");
-  rate::Stream saved_stream;
-  {
-    std::unique_lock lock(rate::internal::state.mutex);
-    saved_stream = rate::internal::state.stream;
-    rate::internal::state.stream = {};
-  }
   const auto summary_for = [&](rate::Snapshot snapshot) {
     {
       std::unique_lock lock(rate::internal::state.mutex);
-      rate::internal::state.stream.snapshot = snapshot;
-      rate::internal::state.stream.previous_ns = runtime::SteadyNowNs();
+      auto& published = rate::internal::state.present.at(output_runtime.output.swapchain);
+      auto& stream = published.stream;
+      stream.snapshot = snapshot;
+      stream.identity = output_runtime.output.swapchain;
+      stream.previous_ns = runtime::SteadyNowNs();
+      if (snapshot.source == rate::Source::NATIVE_STATE) {
+        // The synthetic SDK estimate covers this output's current application-frame interval.
+        published.native.application_ns = stream.previous_ns;
+        ++published.native.coverage;
+        published.native.state_coverage = published.native.coverage;
+      }
     }
     runtime::monitor_snapshot.attempted_ns = 0;
-    return runtime::RefreshMonitorSnapshot(true).summary;
+    return refresh_monitor().summary;
   };
   check(summary_for({}).fg == "—", "unknown FG is not labelled disabled");
   check(summary_for({.fg_off = true}).fg == ui::Tr("Not enabled"), "confirmed disabled FG has a distinct value");
@@ -230,10 +443,7 @@
   runtime::hook_point = saved_hook;
   runtime::vulkan_present_seen = saved_vulkan;
   runtime::present_unusable = saved_unusable;
-  {
-    std::unique_lock lock(rate::internal::state.mutex);
-    rate::internal::state.stream = saved_stream;
-  }
+  rate::Invalidate(output_runtime.output);
   summary_fixture = false;
   panel_width = 1000.f;
   hook_editor_fixture = true;
@@ -280,21 +490,22 @@
           .serial = 1, .begin_ns = now - 500'000'000, .end_ns = now, .fps = (minimum_reached ? 50. : 120.)};
       session.Prepare(settings, upper, floor, 42, output, now - 10'000'000'000, true, false);
       session.Request(minimum_reached ? session.ladder.count - 1 : 0, now - 10'000'000'000);
-      session.Applied(session.status.generation, session.status.requested, now - 10'000'000'000);
       // Complete owner readiness and bind the output before collecting stable samples.
       const auto prepared_levels = static_cast<uint32_t>(session.ladder.count);
       session.UpdatePreparation(session.preparation_epoch, prepared_levels, prepared_levels,
           adaptive::Reason::PREPARING, now - 10'000'000'000);
+      session.Applied(session.status.generation, session.status.requested, now - 10'000'000'000);
       session.Prepare(settings, upper, floor, 42, output, now - 10'000'000'000, true, false);
       for (uint64_t sample = 0; sample < 5; ++sample) {
         session.ObserveGpu({.generation = session.status.generation, .frame = sample + 1, .sequence = sample + 1,
             .recorded_ns = now - 1'500'000'000 + static_cast<int64_t>(sample) * 250'000'000,
-            .completed_ns = now - 500'000'000, .total_us = 1000., .valid = true, .stable = true}, now);
+            .completed_ns = now - 500'000'000, .total_us = 1000., .valid = true, .stable = true,
+            .sampling_generation = session.sampling_generation}, now);
       }
       session.Prepare(settings, upper, floor, 42, output, now, true, false);
       check(session.status.reason == (minimum_reached ? adaptive::Reason::AT_MINIMUM : adaptive::Reason::OBSERVING),
           "the held-click fixture starts from normal or minimum-reached controller status");
-      runtime::PublishAdaptiveStatus(session.status);
+      publish_display_status(session.status, DisplayStage::PRESENT, display_source_generation);
       frame(); frame();
       check(find("##actual_resolution_scale").disabled && !find(label).disabled,
             "the complete Quality page restores interaction after the adaptive read-only control");
@@ -312,7 +523,7 @@
       frame();
       check(!runtime::nr_adaptive_editing.load(), "holding a Stage button never masquerades as an unpublished slider edit");
       session.Prepare(settings, upper, floor, 42, output, now, true, runtime::nr_adaptive_editing.load());
-      runtime::PublishAdaptiveStatus(session.status);
+      publish_display_status(session.status, DisplayStage::PRESENT, display_source_generation);
       frame();
       check(std::abs(find(label).rect.Min.y - button.rect.Min.y) < .5f,
           "temporary adaptive pause cannot move the pressed Stage button before mouse release");
@@ -360,7 +571,7 @@
   const auto confirm_stage_size = [&] {
     namespace timers = renodx::addons::dlss5::gpu_timers;
     runtime::monitor_snapshot.attempted_ns = 0;
-    auto snapshot = runtime::RefreshMonitorSnapshot(true);
+    auto snapshot = refresh_monitor();
     check(snapshot.summary.resolution_ratio.empty() && !snapshot.monitor.passes[0].execution_confirmed,
         "a Stage transition never reuses the previous Stage's completed dimensions");
     adaptive_editor_fixture = true;
@@ -380,13 +591,28 @@
     sample.width = (render ? 1920 : 3840);
     sample.height = (render ? 1080 : 2160);
     sample.passes[0] = {.id = 0, .model = runtime::preset.load(), .width = (render ? 960u : 2560u),
-        .height = (render ? 540u : 1440u), .state = timers::SampleState::VALID};
-    std::strcpy(sample.path, (render ? "preSR" : stage == 1 ? "upscaled" : "present"));
+        .height = (render ? 540u : 1440u), .output_width = (render ? 960u : 2560u),
+        .output_height = (render ? 540u : 1440u), .state = timers::SampleState::VALID};
+    std::strcpy(sample.path, (render ? "preSR" : stage == 1 ? "after" : "present"));
     runtime::comparison_ui::CaptureSettings(&sample.identity);
     sample.identity.device_session = timers::device_session;
     sample.identity.stable_epoch = runtime::comparison_stable_epochs[stage];
+    sample.identity.source_generation = display_source_generation;
+    sample.identity.display_output_generation = output_runtime.output.generation;
+    runtime::stage_telemetry[stage].last_evaluate = {.source_generation = display_source_generation};
+    publish_completion(sample);
+    publish_display_status({.reason = adaptive::Reason::OBSERVING}, static_cast<DisplayStage>(stage), display_source_generation);
+    if (stage == static_cast<size_t>(DisplayStage::UPSCALED)) {
+      const auto saved_api = runtime::stage_source_api.exchange(renodx::addons::dlss5::capability::Api::VULKAN);
+      const auto status = runtime::CopyAdaptiveStatus();
+      runtime::stage_source_api = saved_api;
+      check(status.reason == adaptive::Reason::OBSERVING
+                && status.display_output_generation == output_runtime.output.generation
+                && status.display_source_generation == display_source_generation,
+            "a Vulkan source observation preserves the matched D3D12 output's adaptive status");
+    }
     runtime::monitor_snapshot.attempted_ns = 0;
-    snapshot = runtime::RefreshMonitorSnapshot(true);
+    snapshot = refresh_monitor();
     const auto& current = snapshot.monitor.passes[0];
     const char* actual_size = (render ? "960 x 540 (50%)" : "2560 x 1440 (67%)");
     const char* reference = (render ? "1920 x 1080" : "3840 x 2160");
@@ -503,22 +729,33 @@
     ++runtime::configuration_generation;
     check(!runtime::CollectCardInputs(verdict, started + 300'000'000LL).recent->gpu_completed,
           "a settings change rejects both latest and retained old-configuration completions");
+    runtime::nr_adaptive_enabled = true;
     runtime::nr_resolution_scale = .42f;
     for (const auto hook : {runtime::kHookRender, runtime::kHookUpscaled, runtime::kHookPresent}) {
       runtime::hook_point = hook;
       const size_t stage = (hook == runtime::kHookRender ? 0 : hook == runtime::kHookUpscaled ? 1 : 2);
       auto& sample = timers::stage_stats[stage];
       sample = completed;
+      sample.sequence = ++timers::internal::next_sequence;
       sample.recorded_ns = sample.measured_ns = runtime::SteadyNowNs();
       sample.width = (hook == runtime::kHookRender ? 2560 : 3840);
       sample.height = (hook == runtime::kHookRender ? 1440 : 2160);
       sample.passes[0].width = (hook == runtime::kHookRender ? 1715 : 2573);
       sample.passes[0].height = (hook == runtime::kHookRender ? 965 : 1447);
-      std::strcpy(sample.path, (stage == 0 ? "preSR" : stage == 1 ? "upscaled" : "present"));
+      std::strcpy(sample.path, (stage == 0 ? "preSR" : stage == 1 ? "after" : "present"));
       runtime::comparison_ui::CaptureSettings(&sample.identity);
       sample.identity.device_session = timers::device_session;
+      sample.identity.stable_epoch = runtime::comparison_stable_epochs[stage];
+      sample.identity.source_generation = display_source_generation;
+      sample.identity.display_output_generation = output_runtime.output.generation;
+      sample.passes[0].model = runtime::preset.load();
+      sample.passes[0].output_width = sample.passes[0].width;
+      sample.passes[0].output_height = sample.passes[0].height;
+      runtime::stage_telemetry[stage].last_evaluate = {.source_generation = display_source_generation};
+      publish_completion(sample);
+      publish_display_status({.reason = adaptive::Reason::OBSERVING}, static_cast<DisplayStage>(stage), display_source_generation);
       runtime::monitor_snapshot.attempted_ns = 0;
-      const auto actual_snapshot = runtime::RefreshMonitorSnapshot(true);
+      const auto actual_snapshot = refresh_monitor();
       const auto reference = std::to_string(sample.width) + " x " + std::to_string(sample.height);
       const auto actual_size = std::to_string(sample.passes[0].width) + " x " + std::to_string(sample.passes[0].height);
       check(actual_snapshot.summary.resolution_ratio == "67%"
@@ -527,14 +764,21 @@
                 && actual_snapshot.summary.resolution_tip.find(actual_size) != std::string::npos,
             "the fourth field shares Pass 1 completed working dimensions and the selected Stage reference");
       sample.state = timers::SampleState::EXPIRED;
-      runtime::card_observation.completions[stage].recorded_ns = runtime::SteadyNowNs()
-          - timers::internal::kSampleAgeNs - 1;
+      const auto expired = runtime::SteadyNowNs() - timers::internal::kSampleAgeNs - 1;
+      runtime::card_observation.completions[stage].recorded_ns = expired;
+      runtime::adaptive_completion_scopes[stage].at({output_runtime.output.generation, display_source_generation})
+          .retained.recorded_ns = expired;
       runtime::monitor_snapshot.attempted_ns = 0;
-      check(runtime::RefreshMonitorSnapshot(true).summary.resolution_ratio.empty(),
+      check(refresh_monitor().summary.resolution_ratio.empty(),
             "an unknown actual ratio never falls back to the saved manual percentage");
     }
     const auto saved_policy = xefg::internal::requested.load();
     const bool saved_stream_owned = xefg::internal::owns_stream.load();
+    const auto saved_declaration = runtime::native_fg_declaration.exchange(runtime::NativeFgDeclaration::kOff);
+    constexpr uintptr_t secondary_swapchain = 0xADA600;
+    const std::array<uintptr_t, 1> secondary_buffers{0xADA700};
+    rate::RegisterPresentOutput(secondary_swapchain, output_runtime.device.get_native(), 0, secondary_buffers);
+    const auto secondary_output = rate::FindPresentOutput(output_runtime.device.get_native(), secondary_buffers[0]);
     xefg::internal::requested = runtime::fg_service::Requested;
     for (const bool private_fg : {false, true}) {
       runtime::hook_point = (private_fg ? runtime::kHookPresent : runtime::kHookUpscaled);
@@ -542,6 +786,26 @@
       const size_t stage = (private_fg ? 2 : 1);
       auto& sample = timers::stage_stats[stage];
       auto& proof = timers::execution_stats[stage];
+      const runtime::AdaptiveCompletionKey primary_key{output_runtime.output.generation, 99};
+      const auto evaluation_stage = static_cast<DisplayStage>(stage);
+      const auto observe = [&](const runtime::AdaptiveCompletionKey& key, bool reset, bool api_returned) {
+        const auto& [output, source] = key;
+        auto session = std::make_shared<adaptive::Session>();
+        session->status.display_output_generation = output;
+        session->status.display_source_generation = source;
+        session->status.display_stage = static_cast<uint32_t>(stage);
+        const adaptive::Frame frame{.session = session};
+        addon::RuntimeLock lock(runtime::runtime_mutex);
+        const runtime::AdaptiveFrameScope scope(&frame);
+        if (reset) {
+          runtime::ObserveLocalHistoryReset(evaluation_stage, source, runtime::kResetDimensions);
+        } else {
+          runtime::FeatureState feature;
+          feature.source_generation = source;
+          runtime::ObserveNrEvaluation(evaluation_stage, nullptr, feature, {}, 0,
+              NVSDK_NGX_Result_FAIL_UnableToInitializeFeature, runtime::RequestedStagePlan(), nullptr, api_returned);
+        }
+      };
       const auto seed = [&] {
         runtime::stage_telemetry[stage].last_evaluate = {.source_generation = 99};
         proof = {};
@@ -553,13 +817,16 @@
         sample.total_us = 6600;
         sample.passes[0] = {.id = 0, .model = runtime::preset.load(), .width = 2573, .height = 1447,
             .output_width = 2573, .output_height = 1447, .total_us = 6600, .state = timers::SampleState::VALID};
-        std::strcpy(sample.path, (private_fg ? "present" : "upscaled"));
+        std::strcpy(sample.path, (private_fg ? "present" : "after"));
         runtime::comparison_ui::CaptureSettings(&sample.identity);
         sample.identity.source_generation = 99;
+        sample.identity.display_output_generation = output_runtime.output.generation;
         sample.identity.stable_epoch = runtime::comparison_stable_epochs[stage];
         sample.identity.device_session = timers::device_session;
+        publish_completion(sample);
+        publish_display_status({.reason = adaptive::Reason::OBSERVING}, static_cast<DisplayStage>(stage), 99);
         runtime::monitor_snapshot.attempted_ns = 0;
-        const auto snapshot = runtime::RefreshMonitorSnapshot(true);
+        const auto snapshot = refresh_monitor();
         check(snapshot.summary.resolution_ratio == "67%" && snapshot.summary.gpu == "6.6ms",
               "inline and private FG share the same current completed size and measured GPU source");
         sample.state = timers::SampleState::REPLAYED;
@@ -567,7 +834,7 @@
       };
       seed();
       runtime::monitor_snapshot.attempted_ns = 0;
-      const auto rejected = runtime::RefreshMonitorSnapshot(true);
+      const auto rejected = refresh_monitor();
       check(rejected.summary.resolution_ratio == "67%" && rejected.summary.gpu.empty()
                 && rejected.monitor.passes[0].execution_confirmed,
             "a rejected latest recording retains bounded actual size while leaving GPU cost unavailable");
@@ -576,38 +843,113 @@
       proof.recorded_ns = proof.measured_ns = runtime::SteadyNowNs();
       proof.passes[0].width = 1920;
       proof.passes[0].height = 1080;
+      publish_completion(proof);
       runtime::monitor_snapshot.attempted_ns = 0;
-      check(runtime::RefreshMonitorSnapshot(true).summary.resolution_ratio == "50%",
+      check(refresh_monitor().summary.resolution_ratio == "50%",
             "a new completed working size takes priority over retained actual dimensions");
-      for (int rejection = 0; rejection < 8; ++rejection) {
+      // Model the process-wide declaration published by OptionsOn on the secondary output.
+      runtime::native_fg_declaration = runtime::NativeFgDeclaration::kOn;
+      const auto after_fg_declaration = refresh_monitor();
+      check(after_fg_declaration.summary.resolution_ratio == "50%"
+                && after_fg_declaration.monitor.passes[0].execution_confirmed,
+            "a secondary native FG On declaration preserves the selected output's completed size");
+      runtime::native_fg_declaration = runtime::NativeFgDeclaration::kOff;
+      const float saved_blend = runtime::kSetControlMaskBlendMode.Get();
+      runtime::kSetControlMaskBlendMode.Store(saved_blend == 0.f ? 1.f : 0.f);
+      const auto after_blend = refresh_monitor();
+      check(after_blend.summary.resolution_ratio == "50%" && after_blend.monitor.passes[0].execution_confirmed,
+            "a Blend edit preserves the selected output's completed size");
+      runtime::kSetControlMaskBlendMode.Store(saved_blend);
+      runtime::PublishAdaptiveStatus({.reason = adaptive::Reason::FAILED,
+          .display_output_generation = secondary_output.generation, .display_source_generation = 100,
+          .display_stage = static_cast<uint32_t>(stage)});
+      runtime::monitor_snapshot.attempted_ns = 0;
+      check(refresh_monitor().summary.resolution_ratio == "50%",
+          "a later secondary-output publication preserves the selected runtime's completed dimensions");
+      proof = {};
+      observe({secondary_output.generation, 99}, true, true);
+      runtime::monitor_snapshot.attempted_ns = 0;
+      check(refresh_monitor().summary.resolution_ratio == "50%",
+          "same Stage and source on a different output can reset while the selected output retains its completed size");
+      observe({output_runtime.output.generation, 100}, false, true);
+      runtime::monitor_snapshot.attempted_ns = 0;
+      const auto secondary_failure = refresh_monitor();
+      check(secondary_failure.summary.resolution_ratio == "50%" && secondary_failure.monitor.passes[0].execution_confirmed,
+          "same Stage and output with a different source can fail while the selected source retains its completed size");
+      for (int rejection = 0; rejection < 11; ++rejection) {
         seed();
-        auto& observed = runtime::stage_telemetry[stage].last_evaluate;
+        auto& scope = runtime::adaptive_completion_scopes[stage].at(primary_key);
         switch (rejection) {
-          case 0:
-            runtime::card_observation.completions[stage].recorded_ns = runtime::SteadyNowNs()
-                - timers::internal::kSampleAgeNs - 1;
+          case 0: {
+            const auto expired = runtime::SteadyNowNs() - timers::internal::kSampleAgeNs - 1;
+            runtime::card_observation.completions[stage].recorded_ns = expired;
+            scope.retained.recorded_ns = expired;
             break;
+          }
           case 1: ++runtime::configuration_generation; break;
           case 2: ++timers::device_session; break;
-          case 3: observed.source_released = true; break;
-          case 4: ++observed.source_generation; break;
-          case 5: ++runtime::comparison_stable_epochs[stage]; break;
+          case 3: {
+            const auto* released = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xADA800});
+            addon::RuntimeLock lock(runtime::runtime_mutex);
+            runtime::features[released].source_generation = 99;
+            scope.has_source = true;
+            runtime::ForgetSourceHandleLocked(released);
+            break;
+          }
+          case 4:
+            ++runtime::card_observation.completions[stage].identity.source_generation;
+            ++scope.retained.identity.source_generation;
+            break;
+          case 5: observe(primary_key, true, true); break;
           case 6:
           case 7:
-            observed.observed_ns = runtime::SteadyNowNs();
-            observed.api_returned = rejection == 7;
-            observed.result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
+            observe(primary_key, false, rejection == 7);
+            break;
+          case 8:
+            runtime::card_observation.completions[stage].identity.display_output_generation = secondary_output.generation;
+            scope.retained.identity.display_output_generation = secondary_output.generation;
+            break;
+          case 9:
+            publish_display_status({.reason = adaptive::Reason::OBSERVING}, static_cast<DisplayStage>(stage), 100);
+            break;
+          case 10:
+            std::strcpy(runtime::card_observation.completions[stage].path, (stage == 2 ? "after" : "present"));
+            std::strcpy(scope.retained.path, (stage == 2 ? "after" : "present"));
             break;
         }
         runtime::monitor_snapshot.attempted_ns = 0;
-        const auto invalid = runtime::RefreshMonitorSnapshot(true);
+        const auto invalid = refresh_monitor();
         check(invalid.summary.resolution_ratio.empty() && invalid.summary.gpu.empty()
                   && !invalid.monitor.passes[0].execution_confirmed,
               "expired, changed, released or truly failed execution cannot retain actual dimensions");
       }
+      constexpr uint64_t first_read_source = 101;
+      auto first = sample;
+      first.state = timers::SampleState::VALID;
+      first.sequence = ++timers::internal::next_sequence;
+      first.recorded_ns = first.measured_ns = runtime::SteadyNowNs();
+      first.identity.source_generation = first_read_source;
+      publish_display_status({.reason = adaptive::Reason::OBSERVING}, evaluation_stage, first_read_source);
+      publish_completion(first);
+      auto later = first;
+      later.sequence = ++timers::internal::next_sequence;
+      later.recorded_ns = later.measured_ns = runtime::SteadyNowNs();
+      later.identity.display_output_generation = secondary_output.generation;
+      later.identity.source_generation = 100;
+      later.passes[0].width = 1920;
+      later.passes[0].height = 1080;
+      publish_completion(later);
+      sample = proof = later;
+      const auto first_read = refresh_monitor();
+      check(timers::completed_stats[stage].sequence == later.sequence
+                && first_read.summary.resolution_ratio == "67%" && first_read.monitor.passes[0].execution_confirmed,
+            "the first monitor read finds A's producer-retained dimensions after B replaces every current Stage sample");
     }
     xefg::internal::requested = saved_policy;
     xefg::internal::owns_stream = saved_stream_owned;
+    runtime::native_fg_declaration = saved_declaration;
+    rate::DestroyPresentOutput(secondary_swapchain);
+    runtime::nr_adaptive_enabled = false;
   }
   {
     namespace addon = renodx::addons::dlss5;
@@ -679,7 +1021,7 @@
     };
     runtime::monitor_snapshot_before_lock = [] { interleave_card_snapshot(); };
     runtime::monitor_snapshot = {};
-    const auto snapshot = runtime::RefreshMonitorSnapshot(true);
+    const auto snapshot = refresh_monitor();
     check(interleaved && proof.sequence == sequence && snapshot.inputs.recent.has_value()
         && snapshot.inputs.recent->gpu_completed && snapshot.card.id == ui::CardId::kActive,
         "a monitor arriving after the newer lifecycle observation cannot clear Active using its older outer timestamp");
@@ -707,4 +1049,7 @@
         && ui::ComputeStatusCard(after_mirror).id == ui::CardId::kActive,
         "eligible-only classification rollback cannot discard the same current GPU proof or return to Checking");
   }
+  runtime::edit_reuse_enabled = saved_edit_reuse;
+  fixture_timers::completed_observer = saved_completion_observer;
 }
+#endif

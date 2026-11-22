@@ -30,6 +30,7 @@
 
 #include "brand.h"
 #include "adaptive_resolution.hpp"
+#include "output_framerate.hpp"
 
 #include <algorithm>
 #include <array>
@@ -163,6 +164,7 @@ struct Segment {
   uint64_t sequence = 0;
   SampleState proof = SampleState::PENDING;
   FenceRef proof_fence;
+  int64_t completed_ns = 0;
   bool expired = false;
   uint64_t guide_serial = 0;
   uint32_t color_role = 0;  // 0: ordinary chain, 1: FG backbuffer, 2: FG HUDLess.
@@ -172,6 +174,7 @@ struct Segment {
   uint64_t benchmark_token = 0;
 #endif
   adaptive_resolution::Frame adaptive;
+  bool adaptive_stable = true;
   bool service_scope = false;
   ID3D12GraphicsCommandList* service_list = nullptr;  // Borrowed only while current.active.
 };
@@ -227,6 +230,8 @@ inline uint64_t device_session = 0;
 // Optional experiment consumer; observes the original, unaveraged completion
 // result. A token belongs to the recording, never to the current configuration.
 inline void (*raw_observer)(const Stats&, uint64_t) = nullptr;
+// Receives complete, delivered groups under runtime_mutex, before display averaging.
+inline void (*completed_observer)(const Stats&, uint32_t, uint32_t) = nullptr;
 #if defined(NR_NEXUS_DEV_CONTROL)
 inline void (*benchmark_observer)(const Stats&, uint64_t) = nullptr;
 #endif
@@ -253,8 +258,7 @@ inline bool ComparisonActive() {
 }
 
 inline int64_t NowNs() {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             std::chrono::steady_clock::now().time_since_epoch()).count();
+  return output_framerate::NowNs();
 }
 
 inline uint32_t StageIndex(const char* path) {
@@ -384,11 +388,23 @@ inline bool Ensure(ID3D12Device* device) {
   return true;
 }
 
-// False for a segment the resolve never reached (counted as unexecuted).
-// `log`: the "NR gpu timers" lines, NRGpuTimers' own; the cost meter's
-// samples publish silently (the addon logs their sum as "NR cost:").
+inline bool DeliveryReady(const Segment& s) {
+  return s.adaptive.delivery == nullptr || *s.adaptive.delivery == adaptive_resolution::DeliveryReceipt::DELIVERED;
+}
+
+inline void PublishCompleted(const Stats& sample, uint32_t pass_begin, uint32_t pass_count) {
+  auto& completed = completed_stats[StageIndex(sample.path)];
+  if (sample.sequence > completed.sequence) {
+    completed = sample;
+  }
+  // A newer completion from another output can already occupy the Stage slot.
+  if (completed_observer != nullptr) {
+    completed_observer(sample, pass_begin, pass_count);
+  }
+}
+
 inline void Reject(const Segment& s, SampleState state) {
-  if (s.measure && s.adaptive.session != nullptr && state != SampleState::PENDING) {
+  if (s.measure && s.adaptive.session != nullptr && state != SampleState::PENDING && DeliveryReady(s)) {
     s.adaptive.session->ObserveGpu({.generation = s.adaptive.generation,
         .frame = s.adaptive.application_frame, .sequence = s.sequence,
         .recorded_ns = static_cast<int64_t>(s.comparison.recorded_ns), .completed_ns = NowNs(),
@@ -411,6 +427,7 @@ inline void Reject(const Segment& s, SampleState state) {
     if (s.benchmark_token != 0 && benchmark_observer != nullptr) benchmark_observer(rejected, s.benchmark_token);
 #endif
   }
+  if (state != SampleState::PENDING && !DeliveryReady(s)) return;
   if (!s.measure) {
     if (state != SampleState::PENDING) {
       auto& sequence = execution_result_sequences[StageIndex(s.path)];
@@ -439,6 +456,8 @@ inline void Reject(const Segment& s, SampleState state) {
   if (s.sequence >= stats.sequence) stats = target;
 }
 
+// `log` enables NRGpuTimers' rate-limited lines. Raw diagnostics still see
+// successful GPU execution when the output consumer rejects the result.
 inline bool Publish(const Segment& s, bool log, const void* queue) {
   const auto& previous_stage = stage_stats[StageIndex(s.path)];
   // Recording a newer pending sample does not supersede a completed result.
@@ -538,7 +557,7 @@ inline bool Publish(const Segment& s, bool log, const void* queue) {
   next.group_edit_reused = s.group_edit_reused;
   next.state = SampleState::VALID;
   next.sequence = s.sequence;
-  next.measured_ns = NowNs();
+  next.measured_ns = (s.completed_ns != 0 ? s.completed_ns : NowNs());
   next.identity = s.comparison.identity;
   next.recorded_ns = static_cast<int64_t>(s.comparison.recorded_ns);
   next.queue = queue;
@@ -546,26 +565,30 @@ inline bool Publish(const Segment& s, bool log, const void* queue) {
   const bool complete = s.group_edit_reused || (s.pass_count != 0 && s.pass_count <= kTimerMaxPasses
       && std::all_of(next.passes.begin(), next.passes.begin() + std::min(s.pass_count, kTimerMaxPasses),
           [](const auto& pass) { return pass.state == SampleState::VALID; }));
-  auto& completed = completed_stats[StageIndex(s.path)];
-  if (complete && next.sequence > completed.sequence) {
-    completed = next;
-  }
-  if (s.adaptive.session != nullptr) {
-    s.adaptive.session->ObserveGpu({.generation = s.adaptive.generation,
-        .frame = s.adaptive.application_frame, .sequence = s.sequence,
-        .context = reinterpret_cast<uintptr_t>(queue) ^ s.comparison.identity.device_session,
-        .recorded_ns = next.recorded_ns, .completed_ns = next.measured_ns,
-        .total_us = static_cast<double>(next.total_us), .role = s.adaptive.role,
-        .required_roles = s.adaptive.required_roles, .valid = complete,
-        .stable = s.comparison.stable, .paired = s.adaptive.paired,
-        .pair_first_frame = s.adaptive.pair_first_frame, .sampling_generation = s.adaptive.sampling_generation}, next.measured_ns);
-  }
   if (s.diagnostic_token != 0 && raw_observer != nullptr) {
     raw_observer(next, s.diagnostic_token);
   }
 #if defined(NR_NEXUS_DEV_CONTROL)
   if (s.benchmark_token != 0 && benchmark_observer != nullptr) benchmark_observer(next, s.benchmark_token);
 #endif
+  if (!DeliveryReady(s)) return false;
+  if (complete) {
+    PublishCompleted(next, s.pass_begin, s.pass_count);
+  }
+  if (s.adaptive.session != nullptr) {
+    const bool reused = s.group_edit_reused || (s.pass_count != 0 && s.pass_count <= kTimerMaxPasses
+        && std::ranges::all_of(std::span{s.passes}.first(s.pass_count), [](const auto& pass) { return pass.edit_reused; }));
+    const bool matching_phase = !s.adaptive.paired
+        || (reused == (s.adaptive.application_frame != s.adaptive.pair_first_frame));
+    s.adaptive.session->ObserveGpu({.generation = s.adaptive.generation,
+        .frame = s.adaptive.application_frame, .sequence = s.sequence,
+        .context = reinterpret_cast<uintptr_t>(queue) ^ s.comparison.identity.device_session,
+        .recorded_ns = next.recorded_ns, .completed_ns = next.measured_ns,
+        .total_us = static_cast<double>(next.total_us), .role = s.adaptive.role,
+        .required_roles = s.adaptive.required_roles, .valid = complete && matching_phase,
+        .stable = s.adaptive_stable, .paired = s.adaptive.paired,
+        .pair_first_frame = s.adaptive.pair_first_frame, .sampling_generation = s.adaptive.sampling_generation}, NowNs());
+  }
   if (superseded) return false;
   QueueMonitorSample(next);
   if (s.comparison.sequence != 0 && ComparisonActive()) {
@@ -771,6 +794,7 @@ inline bool Begin(
   s.sequence = ++internal::next_sequence;
   s.proof = SampleState::PENDING;
   s.proof_fence = {};
+  s.completed_ns = 0;
   s.expired = false;
   s.guide_serial = 0;
   s.color_role = 0;
@@ -781,6 +805,7 @@ inline bool Begin(
   s.benchmark_token = 0;
 #endif
   s.adaptive = {};
+  s.adaptive_stable = true;
   s.service_scope = service_scope;
   s.service_list = (service_scope ? command_list : nullptr);
   s.comparison.stage = StageIndex(path);
@@ -981,6 +1006,14 @@ inline void Poll(bool exact_proofs, bool log) {
     if (!s.expired) {
       if (!exact_proofs || s.proof == SampleState::PENDING) s.proof = SampleState::PROOF_UNAVAILABLE;
       if (s.bypass) s.proof = SampleState::BYPASSED;
+      if (s.proof == SampleState::VALID) {
+        if (s.completed_ns == 0) s.completed_ns = NowNs();
+        // Keep the existing segment and exact proof until the consumer
+        // answers. Other segments continue through this poll independently.
+        if (s.adaptive.delivery != nullptr && *s.adaptive.delivery == adaptive_resolution::DeliveryReceipt::PENDING) {
+          continue;
+        }
+      }
       if (s.proof == SampleState::VALID && !s.measure) {
         bool complete = s.pass_count != 0 && s.pass_count <= kTimerMaxPasses
             && (s.written & (uint64_t{1} << kSlotFrameStart)) != 0;
@@ -995,9 +1028,10 @@ inline void Poll(bool exact_proofs, bool log) {
             complete = false;
           }
         }
-        if (complete || (s.group_edit_reused && (s.written & (uint64_t{1} << kSlotCopyBackEnd)) != 0)) {
+        if (internal::DeliveryReady(s)
+            && (complete || (s.group_edit_reused && (s.written & (uint64_t{1} << kSlotCopyBackEnd)) != 0))) {
           Stats next{.width = s.width, .height = s.height, .valid = true, .group_edit_reused = s.group_edit_reused, .passes = s.passes,
-                     .state = SampleState::VALID, .sequence = s.sequence, .measured_ns = NowNs(),
+                     .state = SampleState::VALID, .sequence = s.sequence, .measured_ns = s.completed_ns,
                      .identity = s.comparison.identity,
                      .recorded_ns = static_cast<int64_t>(s.comparison.recorded_ns)};
           std::memcpy(next.path, s.path, sizeof(next.path));
@@ -1005,17 +1039,14 @@ inline void Poll(bool exact_proofs, bool log) {
             next.passes[pass].state = SampleState::VALID;
             next.passes[pass].look_measured = (s.written & (uint64_t{1} << PassLookEnd(pass))) != 0;
           }
-          auto& completed = completed_stats[StageIndex(s.path)];
-          if (next.sequence > completed.sequence) {
-            completed = next;
-          }
+          internal::PublishCompleted(next, s.pass_begin, s.pass_count);
           auto& target = execution_stats[StageIndex(s.path)];
           if (s.sequence >= internal::execution_result_sequences[StageIndex(s.path)]
               && (s.sequence >= target.sequence || target.state == SampleState::PENDING)) {
             internal::execution_result_sequences[StageIndex(s.path)] = s.sequence;
             target = next;
           }
-        } else {
+        } else if (internal::DeliveryReady(s)) {
           internal::Reject(s, SampleState::NOT_EXECUTED);
         }
       } else if (s.proof == SampleState::VALID) {
@@ -1047,6 +1078,7 @@ inline void Poll(bool exact_proofs, bool log) {
     }
     s.proof_fence = {};
     s.lease = {};
+    s.adaptive = {};
     s.recorded = false;
   }
 }

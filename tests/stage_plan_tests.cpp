@@ -441,7 +441,8 @@ int main() {
         const auto saved = capability_input;
         queried = capability::Query(capability_input);
         const bool supported = runtime == capability::Runtime::AVAILABLE
-            && ((api == capability::Api::DX12 && backend == capability::Backend::NATIVE)
+            && ((api == capability::Api::DX12 && (backend == capability::Backend::NATIVE
+                    || backend == capability::Backend::STREAMLINE_FALLBACK))
                 || (api == capability::Api::DX11 && backend == capability::Backend::DX11_BRIDGE));
         check(queried.CanSubmit() == supported, "unknown/unavailable/mismatched backend cannot admit new independent modes");
         check(capability_input.api == saved.api && capability_input.backend == saved.backend
@@ -494,8 +495,9 @@ int main() {
   capability_input.geometry[1] = {.reference_width = 3840, .reference_height = 2160};
   queried = capability::Query(capability_input);
   check(!queried.CanSubmit() && queried.configuration.status == Status::NEEDS_PROOF
-            && queried.configuration.reason == CapabilityReason::DIMENSIONS_UNKNOWN,
-        "a reference rectangle without current Guide evidence cannot prove a Follow-input mismatch");
+            && queried.configuration.reason == CapabilityReason::DIMENSIONS_UNKNOWN
+            && queried.working_sizes[0] == capability::Size{} && queried.working_sizes[2] == capability::Size{},
+        "a reference rectangle without current Guide evidence leaves Follow-input sizes unknown");
   capability_input.resolutions[0].mode = 0;
   check(capability::Query(capability_input).CanSubmit(), "identical settings establish same-size eligibility without observed dimensions");
   const std::array<capability::Resolution, 3> inheritance = {{{.mode = 2, .scale = 0.67f}, {.mode = 0}, {.mode = 1}}};

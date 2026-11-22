@@ -20,6 +20,7 @@ struct Identity {
   uint64_t config_epoch = 0, stable_epoch = 0;
   uint64_t source_generation = 0, source_feature = 0, device_session = 0, queue = 0;
   uint64_t route = 0, fg = 0, hdr = 0, sr_mode = 0, processing_hash = 0, display_format = 0;
+  uint64_t display_output_generation = 0;
   uint32_t sr_width = 0, sr_height = 0, out_width = 0, out_height = 0;
   bool operator==(const Identity&) const = default;
 };

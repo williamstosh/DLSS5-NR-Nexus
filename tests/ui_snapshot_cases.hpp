@@ -363,6 +363,7 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
     const float saved_adaptive_minimum = runtime::nr_adaptive_min_scale.load();
     const uint32_t saved_adaptive_levels = runtime::nr_adaptive_selected_levels.load();
     const bool saved_adaptive_limited = runtime::nr_adaptive_limited_residency.load();
+    const uint32_t saved_adaptive_strategy = runtime::adaptive_feature_mode.load();
     const bool motion_snapshot = scenario.action == "r7-depth-fine";
     const bool saved_motion_enabled = runtime::control_mask_motion_enabled.load();
     const float saved_motion_start = runtime::control_mask_motion_start.load();
@@ -544,6 +545,7 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
       runtime::nr_adaptive_min_scale = .67f;
       runtime::nr_adaptive_selected_levels = 6;
       runtime::nr_adaptive_limited_residency = false;
+      runtime::adaptive_feature_mode = runtime::AdaptiveFeatureMode::OFF;
     }
     if (edit_reuse_snapshot) {
       runtime::hook_point = runtime::kHookUpscaled;
@@ -767,6 +769,25 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
       check(runtime::nr_adaptive_limited_residency.load() && runtime::nr_adaptive_selected_levels.load() == 6
                 && runtime::nr_adaptive_target_fps.load() == 120.f,
             "the real preparation-mode choice preserves the six logical levels and target in both snapshot languages");
+      const auto* strategy_name = ui::Tr("Upper capacity on demand");
+      if (std::ranges::none_of(items, [&](const auto& entry) { return entry.second.label == strategy_name; })) {
+        const auto& windows = ImGui::GetCurrentContext()->Windows;
+        const auto quality_window = std::find_if(windows.begin(), windows.end(), [](const ImGuiWindow* window) {
+              return window->Active && std::strstr(window->Name, "/##nr_settings_") != nullptr;
+            });
+        check(quality_window != windows.end(), "adaptive strategy snapshot uses the production settings child");
+        const auto scope = ImHashStr(runtime::kSetAdaptiveResourceStrategy.key, 0,
+            ImHashStr("##quality_columns", 0, (*quality_window)->ID));
+        const auto combo_id = ImHashStr("##value", 0, scope);
+        check(items.contains(combo_id), "adaptive resource strategy dropdown is drawn");
+        click(items.at(combo_id));
+      }
+      click(find(strategy_name));
+      uint32_t persisted_strategy = 0;
+      reshade::get_config_value(nullptr, runtime::kConfigSection, runtime::kSetAdaptiveResourceStrategy.key, persisted_strategy);
+      check(runtime::adaptive_feature_mode.load() == runtime::AdaptiveFeatureMode::UPPER_CAPACITY_ON_DEMAND
+                && persisted_strategy == 3 && runtime::nr_adaptive_selected_levels.load() == 6 && runtime::nr_adaptive_limited_residency.load(),
+            "the real strategy control changes only the resource strategy, preserving previous residency and level count");
     }
     ImGuiID edit_reuse_toggle_id = 0;
     if (edit_reuse_snapshot) {
@@ -1635,6 +1656,7 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
     runtime::nr_adaptive_min_scale = saved_adaptive_minimum;
     runtime::nr_adaptive_selected_levels = saved_adaptive_levels;
     runtime::nr_adaptive_limited_residency = saved_adaptive_limited;
+    runtime::adaptive_feature_mode = saved_adaptive_strategy;
     if (motion_snapshot) {
       runtime::control_mask_motion_enabled = saved_motion_enabled;
       runtime::control_mask_motion_start = saved_motion_start;

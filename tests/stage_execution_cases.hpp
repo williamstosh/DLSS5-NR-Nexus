@@ -262,13 +262,16 @@ int Run(bool resolution_only = false, bool hardware = false, bool mixed_pair_onl
         Check(width == 8 && height == 8, "independent follow mode caps guides at stage dimensions");
         native::pass_resolution_mode[0].store(2);
         native::pass_resolution_scale[0].store(.67f);
+        const auto shared_plan = addon::stage_plan::Build({.pass_count = 2});
         Check(!native::ComputeNrGroupWorkingResolution(
+                  shared_plan,
                   {.stage = addon::stage_plan::Stage::UPSCALED, .begin = 0, .count = 2},
                   16, 16, 8, 8, &width, &height)
                   && native::stage_telemetry[1].resolution_blocked,
               "different actual sizes in one stage explicitly decline with blocked telemetry");
         native::pass_resolution_mode[0].store(0);
         Check(native::ComputeNrGroupWorkingResolution(
+                  shared_plan,
                   {.stage = addon::stage_plan::Stage::UPSCALED, .begin = 0, .count = 2},
                   16, 16, 8, 8, &width, &height)
                   && !native::stage_telemetry[1].resolution_blocked,

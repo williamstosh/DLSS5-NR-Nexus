@@ -57,6 +57,14 @@ JSON 与插件内部文本使用 UTF-8，Windows 文件操作使用宽路径；�
 
 `NREditReuse` 是全局画质选项，保存实验性 x2 编辑复用请求，默认关闭；不按层重复。旧共享预设缺少该键时保留当前值，实际运行仍须满足[隔帧条件](USER_GUIDE.md#zh-edit-reuse)。
 
+v0.6.1 新增质量项 `NRAdaptiveResourceStrategy`，仅接受整数 `0–3`：0 沿用 `NRAdaptiveLimitedResidency` 保存的预备方式，1 保留兼容模型，2 上限容量复用，3 上限容量按需准备。新 INI 缺键或值非法时取 0；预设缺键保留当前值，显式 0 恢复原预备方式，非法类型／范围拒绝导入。普通按需备档与策略 3 分别保存，不能互相解释。旧版可把共享预设中的新键保留为未知数据，但不应用。适用条件和实际回退见[玩家指南](USER_GUIDE.md#zh-resolution)。
+
+v0.6.1 adds the quality field `NRAdaptiveResourceStrategy`, accepting integers `0–3`: 0 follows the preparation mode saved in `NRAdaptiveLimitedResidency`, 1 retains compatible models, 2 uses upper-capacity reuse, and 3 prepares upper-capacity models on demand. Missing or invalid INI values use 0. A missing preset key keeps the current choice; explicit 0 restores ordinary preparation, and invalid types or ranges reject import. Ordinary On-demand and strategy 3 remain separate settings. Older versions can retain the new shared-preset key as unknown data without applying it. See the [User Guide](USER_GUIDE.md#en-resolution) for requirements and fallback.
+
+`NRPresentFrames` 属于 `COMPATIBILITY`，仅 Full 导出携带：`0` 为每次呈现处理，`1` 为游戏帧策略，执行条件见[Present 指南](USER_GUIDE.md#zh-present)。旧 INI 缺键沿用默认 `0`；导入预设缺键保留当前值，Full 的显式 `0` 必须按值应用，不能当作缺键。Schema v1、键名和 `0/1` 值义保持，退回支持此键的旧版仍可读取同一 INI／Full 预设。
+
+`NRPresentFrames` is a `COMPATIBILITY` field included by Full exports: `0` processes every present and `1` selects the game-frame policy under the [Present conditions](USER_GUIDE.md#en-present). Old INIs without the key retain default `0`. A missing preset field keeps the current value; an explicit Full-preset `0` must be applied rather than treated as absent. Schema v1, the key and the meanings of `0/1` are unchanged, so older versions supporting this field can read the same INI/Full preset on rollback.
+
 `NRPasses` 是整数 `1..4`。每个 `NRPass{2,3,4}` 均展开同一组字段：
 
 | 后缀 | loader 数值范围／类型 |
@@ -159,6 +167,10 @@ Quality excludes these six overrides; Quality + Multi-Pass exports enabled passe
 Slot 不是共享预设 schema 的扩展。独立文件为 `%LOCALAPPDATA%\NR Nexus\Profiles\<32hex-id>\slots.json`，实现见 [profile_store.hpp](../profile_store.hpp)、[profile_templates.hpp](../profile_templates.hpp) 和 [profile_runtime.hpp](../profile_runtime.hpp)。0.1.0 包不包含此功能；0.2.0已通过 Release／Debug 构建及受影响自动化检查，实机交互与画质仍待验收。
 
 manifest 严格包含 `format="nr-nexus-profiles"`、`schema_version=1`、无符号 64 位 `revision`、`owner`、`selected`、`last_applied` 和 `slots`。`slots` 恰好六个固定 ID：`official_lite`、`official_balanced`、`official_max`、`custom_slot_1`、`custom_slot_2`、`custom_slot_3`；显示名称不是 ID。每项包含 `name`（最多 128 UTF-8 字节）、`populated`、`template_version`（正 uint32）、`overrides`、`snapshot`。官方初始 populated，自定义初始为空；未选择时 `selected` 为空字符串。
+
+资源策略独立存入同目录的 `slots.json.resource-strategy.json`，不把新键写入主文件的 `last_applied`、`snapshot` 或 `overrides`，因此 v0.6.0 仍可读写实际 `slots.json`。新版本只在扩展与主文件内容匹配时恢复显式 0 或 1–3；扩展缺失、损坏或因旧版写入而失配时，原方案仍可用，新策略回到 0。备份这两个文件可保留全部新设置。共享预设仍直接携带质量字段，不使用槽扩展格式。
+
+Resource strategies use the adjacent `slots.json.resource-strategy.json`. The new key stays out of the main file's `last_applied`, `snapshot` and `overrides`, so v0.6.0 can still read and write the actual `slots.json`. Newer versions restore explicit 0 or 1–3 only when the extension matches the main file. A missing, damaged or stale extension leaves existing profiles usable with strategy 0. Back up both files to preserve the new setting. Shared presets continue to carry the quality field directly.
 
 所有配置对象均须通过 runtime 的 Slot 管理白名单（`QUALITY`／`MULTIPASS`，以及 `COMPATIBILITY` 中的 `NRPresentGuides`）及类型／范围验证，包含未启用层的保存值。`NRPresentGuides` 随方案保存 Present 的深度／运动策略；旧自定义快照缺少该键时保留当前值。未知字段不静默删除：非法文件拒读／拒写，非法解析结果拒绝应用并保留原文件。这里比共享预设中可保留的未知 `settings` 更严格。沿用 256 KiB、深度 8、每个配置对象最多 512 项、严格 UTF-8、重复键及字符串限制；未知 manifest／Slot 键、未来 schema 拒绝，未来 `template_version` 拒绝应用。
 

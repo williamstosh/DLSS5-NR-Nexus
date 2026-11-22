@@ -323,9 +323,6 @@ inline std::vector<Difference> Preview(const presets::Document& document, bool c
       row.status = "Skipped (outside scope)";
     } else if (!ValidateValue(*rule, value)) {
       row.status = "Invalid value";
-    } else if (key == "NRHookPoint" && value == kHookPresent
-               && (vulkan_present_seen.load() || (D3D11OnlySession() && !Dx11NativeRoute()) || present_unusable.load())) {
-      row.status = "Unsupported";
     } else if (rule->category == presets::FieldRule::Category::COMPATIBILITY && !compatibility) {
       row.status = "Skipped (compatibility)";
     } else if (row.before != row.after || inherited_scope) {
@@ -464,13 +461,13 @@ inline bool Apply(const presets::Document& document, bool compatibility, bool re
   Json writes = Json::object();
   SettingEffect effect = SettingEffect::kNone;
   bool restart = false;
-  bool non_model_change = false;
+  bool restore_configuration_changed = false;
   const auto previous_model_requests = ActiveNrModelRequests();
   for (auto& row : changes) {
     const auto* setting = FindSetting(row.key);
     writes[row.key] = row.after;
     if (setting == nullptr || !setting->IsModelSelection()) {
-      non_model_change = true;
+      restore_configuration_changed |= setting != &kSetEditReuse;
       if (setting != nullptr) effect = (std::max)(effect, setting->effect);
     }
     if (row.key == "NRPresentSdrRestorePolicy") {
@@ -625,7 +622,7 @@ inline bool Apply(const presets::Document& document, bool compatibility, bool re
     }
   }
   const bool model_requests_changed = previous_model_requests != ActiveNrModelRequests();
-  if (non_model_change || model_requests_changed) {
+  if (restore_configuration_changed || model_requests_changed) {
     ++present_restore_configuration.epoch;
   }
   policy_lock.unlock();
@@ -657,6 +654,7 @@ inline bool Apply(const presets::Document& document, bool compatibility, bool re
   }
   notice = (restart ? "Preset applied. Restart the game for hook policy changes." : "Preset applied.");
   if (!changes.empty()) profile_commit_epoch.fetch_add(1, std::memory_order_relaxed);
+  fg::xefg::ReconcileNrService();
   return true;
 }
 

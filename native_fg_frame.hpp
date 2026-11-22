@@ -4,15 +4,18 @@
  */
 #pragma once
 
-#if defined(NR_NEXUS_DEV_CONTROL)
+#include <cstdint>
 #include <windows.h>
 
-#include <array>
-#include <cstdint>
+#include <chrono>
 #include <mutex>
 #include <shared_mutex>
 
 #include <sl_pcl.h>
+
+#if defined(NR_NEXUS_DEV_CONTROL)
+#include <array>
+#endif
 
 namespace renodx::addons::dlss5::fg::native_options::frame_source {
 
@@ -22,8 +25,11 @@ struct Frame {
   uint64_t epoch = 0;
   uint64_t generation = 0;
   const char* reason = "reflex_marker_unobserved";
+  uint32_t viewport = 0;
+  bool conflicting = false;
 };
 
+#if defined(NR_NEXUS_DEV_CONTROL)
 struct Event {
   uint64_t sequence = 0;
   int64_t qpc = 0;
@@ -105,6 +111,14 @@ struct EvaluateEvents {
   NgxEvent ngx_fg_enter;
   NgxEvent ngx_fg_return;
 };
+#endif
+
+inline constexpr int64_t PRESENT_START_TTL_NS = 1'000'000'000;
+
+inline int64_t NowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 struct Metadata {
   uint64_t generation = 1;
@@ -112,12 +126,16 @@ struct Metadata {
   uint32_t in_flight = 0;
   uint32_t frame = 0;
   DWORD thread = 0;
+  int64_t started_ns = 0;
+  uint64_t active_claim = 0;
   bool published = false;
   bool claimed = false;
   bool stopped = false;
   const char* reason = "reflex_marker_unobserved";
+#if defined(NR_NEXUS_DEV_CONTROL)
   Events events;
   EvaluateEvents evaluations;
+#endif
 };
 struct State {
   std::shared_mutex mutex;
@@ -131,6 +149,7 @@ struct Binding {
   bool active = false;
 };
 static thread_local Binding sdk_binding;
+#if defined(NR_NEXUS_DEV_CONTROL)
 static thread_local uint32_t sdk_depth = 0;
 static thread_local EvaluateBinding evaluate_binding;
 static thread_local uint64_t ngx_call = 0;
@@ -315,6 +334,7 @@ inline ObservationSnapshot Snapshot() {
       .binding_active = sdk_binding.active, .binding_available = sdk_binding.source.available,
       .binding_frame = sdk_binding.source.frame, .binding_epoch = sdk_binding.source.epoch, .qpc = Qpc()};
 }
+#endif
 
 inline void Activate() {
   std::unique_lock lock(state.mutex);
@@ -324,6 +344,7 @@ inline void Activate() {
   ++metadata.epoch;
   metadata.published = false;
   metadata.claimed = false;
+  metadata.active_claim = 0;
   metadata.reason = "reflex_marker_unobserved";
 }
 
@@ -335,6 +356,7 @@ inline void Stop() {
   metadata.stopped = true;
   metadata.published = false;
   metadata.claimed = false;
+  metadata.active_claim = 0;
   metadata.reason = "frame_source_stopped";
 }
 
@@ -346,20 +368,28 @@ struct MarkerCall {
   uint32_t frame;
   uint64_t ticket = 0;
   uint64_t generation = 0;
+  int64_t started_ns;
   bool tracked = false;
+  bool conflicts = false;
   bool finished = false;
 
-  MarkerCall(sl::PCLMarker value, uint32_t index) : marker(value), frame(index) {
+  MarkerCall(sl::PCLMarker value, uint32_t index, int64_t now_ns = NowNs())
+      : marker(value), frame(index), started_ns(now_ns) {
     tracked = marker == sl::PCLMarker::ePresentStart || marker == sl::PCLMarker::ePresentEnd
         || marker == sl::PCLMarker::eRenderSubmitEnd
         || marker == sl::PCLMarker::eOutOfBandPresentStart || marker == sl::PCLMarker::eOutOfBandPresentEnd;
     std::unique_lock lock(state.mutex);
     auto& metadata = state.metadata;
+#if defined(NR_NEXUS_DEV_CONTROL)
     metadata.events.marker_enter = NextEvent(&metadata);
     metadata.events.marker_enter.marker = static_cast<uint32_t>(marker);
     metadata.events.marker_enter.frame = frame;
+#endif
     if (!tracked) return;
     if (metadata.stopped) return;
+    conflicts = marker == sl::PCLMarker::ePresentStart
+        && now_ns >= metadata.started_ns && now_ns - metadata.started_ns <= PRESENT_START_TTL_NS
+        && (metadata.active_claim != 0 || (metadata.published && !metadata.claimed && metadata.frame != frame));
     ticket = ++metadata.epoch;
     generation = metadata.generation;
     ++metadata.in_flight;
@@ -368,15 +398,17 @@ struct MarkerCall {
     metadata.reason = "reflex_marker_in_flight";
   }
 
-  void Finish(bool success) {
+  void Finish(bool success, int64_t now_ns = NowNs()) {
     if (finished) return;
     finished = true;
     std::unique_lock lock(state.mutex);
     auto& metadata = state.metadata;
+#if defined(NR_NEXUS_DEV_CONTROL)
     metadata.events.marker_return = NextEvent(&metadata);
     metadata.events.marker_return.marker = static_cast<uint32_t>(marker);
     metadata.events.marker_return.frame = frame;
     metadata.events.marker_return.success = success;
+#endif
     if (!tracked) {
       if (!success && !metadata.stopped) {
         ++metadata.epoch;
@@ -397,11 +429,16 @@ struct MarkerCall {
       metadata.reason = "frame_source_stopped";
     } else if (!success) {
       metadata.reason = "reflex_marker_failed";
-    } else if (!uninterrupted) {
+    } else if (!uninterrupted || conflicts) {
       metadata.reason = "reflex_marker_interleaved";
     } else if (marker == sl::PCLMarker::ePresentStart) {
+      if (started_ns <= 0 || now_ns < started_ns || now_ns - started_ns > PRESENT_START_TTL_NS) {
+        metadata.reason = "reflex_marker_expired";
+        return;
+      }
       metadata.frame = frame;
       metadata.thread = GetCurrentThreadId();
+      metadata.started_ns = started_ns;
       metadata.published = true;
       metadata.reason = "reflex_present_start";
     } else {
@@ -418,18 +455,27 @@ struct MarkerCall {
 
 using SetMarker = sl::Result (*)(sl::PCLMarker, const sl::FrameToken&);
 
-inline sl::Result ObserveMarker(SetMarker real, sl::PCLMarker marker, const sl::FrameToken& frame) {
-  MarkerCall observation(marker, static_cast<uint32_t>(frame));
+inline sl::Result ObserveMarker(SetMarker real, sl::PCLMarker marker, const sl::FrameToken& frame,
+    int64_t (*now_ns)() = NowNs) {
+  MarkerCall observation(marker, static_cast<uint32_t>(frame), now_ns());
   const auto result = real(marker, frame);
-  observation.Finish(result == sl::Result::eOk);
+  observation.Finish(result == sl::Result::eOk, now_ns());
   return result;
 }
 
 struct SdkScope {
   Binding previous;
+  uint64_t claim = 0;
+#if defined(NR_NEXUS_DEV_CONTROL)
   uintptr_t diagnostic_output;
+#endif
 
-  explicit SdkScope(uintptr_t output, bool enabled = true) : previous(sdk_binding), diagnostic_output(output) {
+  explicit SdkScope(uintptr_t output, bool enabled = true, int64_t now_ns = NowNs()) : previous(sdk_binding)
+#if defined(NR_NEXUS_DEV_CONTROL)
+      , diagnostic_output(output)
+#endif
+  {
+#if defined(NR_NEXUS_DEV_CONTROL)
     ++sdk_depth;
     {
       std::unique_lock lock(state.mutex);
@@ -440,6 +486,7 @@ struct SdkScope {
       metadata.events.sdk_enter.output = output;
       metadata.events.sdk_enter.depth = sdk_depth;
     }
+#endif
     if (previous.active && enabled && previous.output == output) return;
     sdk_binding = {.source = {.reason = "sdk_present_scope_unavailable"}, .output = output, .active = true};
     if (!enabled || output == 0) return;
@@ -467,11 +514,25 @@ struct SdkScope {
       sdk_binding.source.reason = "reflex_marker_already_consumed";
       return;
     }
+    if (now_ns < metadata.started_ns || now_ns - metadata.started_ns > PRESENT_START_TTL_NS) {
+      metadata.published = false;
+      metadata.reason = "reflex_marker_expired";
+      sdk_binding.source.reason = metadata.reason;
+      return;
+    }
     metadata.claimed = true;
+    claim = metadata.active_claim = metadata.epoch;
     sdk_binding.source.available = true;
   }
 
   ~SdkScope() {
+    if (claim != 0) {
+      std::unique_lock lock(state.mutex);
+      if (state.metadata.active_claim == claim) {
+        state.metadata.active_claim = 0;
+      }
+    }
+#if defined(NR_NEXUS_DEV_CONTROL)
     {
       std::unique_lock lock(state.mutex);
       auto& metadata = state.metadata;
@@ -482,13 +543,14 @@ struct SdkScope {
       metadata.events.sdk_exit.depth = sdk_depth;
     }
     --sdk_depth;
+#endif
     sdk_binding = previous;
   }
   SdkScope(const SdkScope&) = delete;
   SdkScope& operator=(const SdkScope&) = delete;
 };
 
-inline Frame CurrentFrame(uintptr_t output) {
+inline Frame CurrentFrame(uintptr_t output, int64_t now_ns = NowNs()) {
   std::shared_lock lock(state.mutex);
   const auto& metadata = state.metadata;
   Frame result{.frame = metadata.frame, .epoch = metadata.epoch,
@@ -512,8 +574,11 @@ inline Frame CurrentFrame(uintptr_t output) {
     result.reason = "reflex_marker_epoch_changed";
     return result;
   }
+  if (now_ns < metadata.started_ns || now_ns - metadata.started_ns > PRESENT_START_TTL_NS) {
+    result.reason = "reflex_marker_expired";
+    return result;
+  }
   return sdk_binding.source;
 }
 
 }  // namespace renodx::addons::dlss5::fg::native_options::frame_source
-#endif

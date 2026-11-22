@@ -394,6 +394,7 @@ struct Feature {
   bool commit_cleared = false;
 };
 inline std::unordered_map<const NVSDK_NGX_Handle*, Feature> features;
+inline uint64_t source_generation = 0;  // runtime_mutex
 
 // A Vulkan command buffer may be begun again or freed only when it is not
 // pending. That lifecycle event is the completion/discard proof for its
@@ -856,6 +857,36 @@ struct NrRuntime {
   bool failed = false;
 };
 inline NrRuntime runtime;
+
+struct ConfigurationFacts {
+  capability::Runtime runtime = capability::Runtime::UNKNOWN;
+  const NVSDK_NGX_Handle* source = nullptr;
+  uint64_t source_generation = 0;
+  bool ray_reconstruction = false;
+  capability::Geometry geometry;
+  stage_plan::Group group;
+  uint32_t recorded_passes = 0;
+};
+inline ConfigurationFacts configuration_facts;  // runtime_mutex; recording is not GPU completion.
+
+inline ConfigurationFacts ReadConfigurationFactsLocked() {
+  auto facts = configuration_facts;
+  if (runtime.failed) {
+    facts.runtime = capability::Runtime::UNAVAILABLE;
+  } else if (runtime.device != nullptr) {
+    facts.runtime = capability::Runtime::AVAILABLE;
+  }
+  return facts;
+}
+
+inline void ClearConfigurationFactsLocked() {
+  if (configuration_facts.source != nullptr
+      && stage_source_api.load(std::memory_order_relaxed) == capability::Api::VULKAN) {
+    stage_source_api.store(capability::Api::UNKNOWN, std::memory_order_relaxed);
+    stage_source_rr.store(false, std::memory_order_relaxed);
+  }
+  configuration_facts = {};
+}
 // The codec programs: the legacy pair and the v6 family, all from the D3D12
 // shaders compiled to SPIR-V (vk_*.comp.slang), on one push-descriptor
 // layout (t0..t3 = bindings 0..3, u0/u1 = 4/5) with the 28-dword v6
@@ -1904,14 +1935,30 @@ inline void SampleScale(reshade::api::command_list* cmd, reshade::api::device* a
   sample = {true, guarded, workset, cmd, false};
 }
 
-inline NrDeclineReason ProcessNr(VkCommandBuffer command_buffer,
-                                 const NVSDK_NGX_Handle* handle,
-                                 const NVSDK_NGX_Parameter* parameters) {
-  for (uint32_t pass = 1; pass < std::clamp(stack_passes.load(), 1u, kMaxNrPasses); ++pass) {
-    if (pass_resolution_mode[pass - 1].load() != 0) {
-      return NrDeclineReason::kStageResolutionBackend;
+inline capability::Input UpscaledExecutionInput(bool ray_reconstruction) {
+  std::shared_lock lock(present_restore_configuration.mutex);
+  capability::Input input{
+      .api = capability::Api::VULKAN,
+      .backend = capability::Backend::NATIVE,
+      .plan = RequestedStagePlan(ray_reconstruction, capability::Api::VULKAN),
+      .main_resolution = {.follow_input = nr_follow_input_res.load(), .scale = nr_resolution_scale.load()},
+      .mode = capability::GeometryMode::EXECUTION};
+  if (input.plan.valid && input.plan.group_count == 1) {
+    // The Vulkan adapter only records after SR. Keep the original request so
+    // preview can report the unsupported insertion point independently.
+    input.plan.groups[0].stage = stage_plan::Stage::UPSCALED;
+    std::fill_n(input.plan.effective.begin(), input.plan.pass_count, stage_plan::Stage::UPSCALED);
+    for (uint32_t pass = 1; pass < input.plan.pass_count; ++pass) {
+      input.resolutions[pass - 1].mode = pass_resolution_mode[pass - 1].load();
     }
   }
+  return input;
+}
+
+inline NrDeclineReason ProcessNr(VkCommandBuffer command_buffer,
+                                 const NVSDK_NGX_Handle* handle,
+                                 const NVSDK_NGX_Parameter* parameters,
+                                 capability::Input input) {
   using namespace reshade::api;
   command_list* cmd = nullptr;
   {
@@ -1922,24 +1969,6 @@ inline NrDeclineReason ProcessNr(VkCommandBuffer command_buffer,
   if (cmd == nullptr) return NrDeclineReason::kMalformedEvaluate;
   reshade::api::device* const api_device = cmd->get_device();
   const VkDevice device = reinterpret_cast<VkDevice>(api_device->get_native());
-  auto* const parameter_block = const_cast<NVSDK_NGX_Parameter*>(parameters);
-  const auto resource_vk = [&](const char* name) {
-    void* pointer = nullptr;
-    parameter_block->Get(name, &pointer);
-    auto* const resource = static_cast<NVSDK_NGX_Resource_VK*>(pointer);
-    return resource != nullptr && resource->Type == NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGEVIEW
-                   && resource->Resource.ImageViewInfo.Image != nullptr
-                   && resource->Resource.ImageViewInfo.ImageView != nullptr
-               ? resource
-               : nullptr;
-  };
-  NVSDK_NGX_Resource_VK* const output = resource_vk(NVSDK_NGX_Parameter_Output);
-  NVSDK_NGX_Resource_VK* const depth = resource_vk(NVSDK_NGX_Parameter_Depth);
-  NVSDK_NGX_Resource_VK* const motion = resource_vk(NVSDK_NGX_Parameter_MotionVectors);
-  if (depth == nullptr || motion == nullptr) return NrDeclineReason::kNgxMissingGuides;
-  if (output == nullptr || !output->ReadWrite) return NrDeclineReason::kNgxOutputGeometry;
-  const NVSDK_NGX_ImageViewInfo_VK& out = output->Resource.ImageViewInfo;
-  const resource output_image = {reinterpret_cast<uint64_t>(out.Image)};
   const ngx_serial::Call ngx_turn;
   {
     RuntimeLock owner_lock(runtime_mutex);
@@ -1964,15 +1993,42 @@ inline NrDeclineReason ProcessNr(VkCommandBuffer command_buffer,
   // Outside runtime_mutex: the query reaches the Windows loader
   // (runtime_lock.hpp). The owner it reads cannot change meanwhile; only
   // the owner's destruction clears it, and this evaluate records on it.
-  CheckExtensions();
-  if (extension_state.load(std::memory_order_relaxed) == 2) {
-    return NrDeclineReason::kVkExtensionMissing;
+  if (input.plan.valid) {
+    CheckExtensions();
   }
   RuntimeLock lock(runtime_mutex);
   const auto found = features.find(handle);
   if (found == features.end()) return NrDeclineReason::kNgxNotDlssEvaluation;
   Feature& feature = found->second;
   if (feature.device == nullptr) feature.device = api_device;
+  if (feature.device == api_device && feature.ngx.source_generation != 0) {
+    configuration_facts = {.source = handle, .source_generation = feature.ngx.source_generation,
+                           .ray_reconstruction = feature.id == kFeatureDlssd};
+    stage_source_rr.store(configuration_facts.ray_reconstruction, std::memory_order_relaxed);
+    stage_source_api.store(capability::Api::VULKAN, std::memory_order_relaxed);
+  }
+  if (!input.plan.valid) return NrDeclineReason::kStagePlanUnavailable;
+  if (extension_state.load(std::memory_order_relaxed) == 2) {
+    return NrDeclineReason::kVkExtensionMissing;
+  }
+  auto* const parameter_block = const_cast<NVSDK_NGX_Parameter*>(parameters);
+  const auto resource_vk = [&](const char* name) {
+    void* pointer = nullptr;
+    parameter_block->Get(name, &pointer);
+    auto* const resource = static_cast<NVSDK_NGX_Resource_VK*>(pointer);
+    return resource != nullptr && resource->Type == NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGEVIEW
+                   && resource->Resource.ImageViewInfo.Image != nullptr
+                   && resource->Resource.ImageViewInfo.ImageView != nullptr
+               ? resource
+               : nullptr;
+  };
+  NVSDK_NGX_Resource_VK* const output = resource_vk(NVSDK_NGX_Parameter_Output);
+  NVSDK_NGX_Resource_VK* const depth = resource_vk(NVSDK_NGX_Parameter_Depth);
+  NVSDK_NGX_Resource_VK* const motion = resource_vk(NVSDK_NGX_Parameter_MotionVectors);
+  if (depth == nullptr || motion == nullptr) return NrDeclineReason::kNgxMissingGuides;
+  if (output == nullptr || !output->ReadWrite) return NrDeclineReason::kNgxOutputGeometry;
+  const NVSDK_NGX_ImageViewInfo_VK& out = output->Resource.ImageViewInfo;
+  const resource output_image = {reinterpret_cast<uint64_t>(out.Image)};
   const resource_desc output_desc = api_device->get_resource_desc(output_image);
   if (out.SubresourceRange.baseMipLevel >= output_desc.texture.levels
       || out.SubresourceRange.baseArrayLayer >= output_desc.texture.depth_or_layers) {
@@ -2031,6 +2087,13 @@ inline NrDeclineReason ProcessNr(VkCommandBuffer command_buffer,
   if (width == 0 || height == 0) {
     return NrDeclineReason::kNgxOutputGeometry;
   }
+  const auto& group = input.plan.groups[0];
+  auto& geometry = input.geometry[static_cast<size_t>(group.stage)];
+  geometry = {.reference_width = width, .reference_height = height};
+  const auto evaluated = capability::EvaluateGroup(input, 0);
+  if (!evaluated.decision.CanSubmit()) return NrDeclineReason::kStageResolutionBackend;
+  width = evaluated.working_sizes[group.begin].width;
+  height = evaluated.working_sizes[group.begin].height;
 
   // Share D3D12's content inference: 10-bit UNORM is PQ only when the
   // game's create contract says HDR; SDR 10-bit surfaces stay SDR.
@@ -2116,7 +2179,7 @@ inline NrDeclineReason ProcessNr(VkCommandBuffer command_buffer,
     feature.ngx.norm.primed = false;
     for (NrFeatureSlot& slot : feature.slots) slot.pending_reset = true;
   }
-  const uint32_t stack = std::clamp(stack_passes.load(), 1u, kMaxNrPasses);
+  const uint32_t stack = group.count;
   // Explicit zero strength on an HDR frame: nothing is recorded and the
   // game's output passes through bit-identical (ChainActive).
   if (hdr_mode != 0 && !ChainActive(*workset, stack)) {
@@ -2687,6 +2750,7 @@ inline NrDeclineReason ProcessNr(VkCommandBuffer command_buffer,
   float final_transfer = 0.f;
   float final_color = 0.f;
   bool any_look_shaped = false;
+  uint32_t recorded_passes = 0;
   for (uint32_t pass = 0; pass < passes; ++pass) {
     const look::Settings& look_settings = result_settings[pass];
     const bool look_shape = result_shapes[pass];
@@ -2828,6 +2892,7 @@ inline NrDeclineReason ProcessNr(VkCommandBuffer command_buffer,
       return NrDeclineReason::kFailureBackoff;
     }
     nr_passes.fetch_add(1, std::memory_order_relaxed);
+    ++recorded_passes;
     slot.fail_count = 0;
 
     // 4. The look stage on this pass's N (RunLookStage's shaping half; the
@@ -3035,6 +3100,11 @@ inline NrDeclineReason ProcessNr(VkCommandBuffer command_buffer,
   // Make the output's writes visible to what the game records next.
   barrier(output_image, resource_usage::unordered_access, resource_usage::unordered_access);
   RestoreComputeState(cmd);
+  if (configuration_facts.source == handle && configuration_facts.source_generation == feature.ngx.source_generation) {
+    configuration_facts.geometry = geometry;
+    configuration_facts.group = group;
+    configuration_facts.recorded_passes = recorded_passes;
+  }
   const uint64_t count = nr_evaluates.fetch_add(1, std::memory_order_relaxed) + 1;
   ++successful_evaluations;
   if (count == 1 || count == 60 || count == 600) {
@@ -3055,7 +3125,10 @@ inline NrDeclineReason ProcessNr(VkCommandBuffer command_buffer,
 inline void ShutdownNr(VkDevice device) {
   // NGX Shutdown1(non-null) affects only that device. An auxiliary NGX
   // instance says nothing about pending work on the device serving NR.
-  if (runtime.device == nullptr || (device != nullptr && device != runtime.device)) return;
+  const auto owner = (runtime.device != nullptr ? runtime.device : game_device.load(std::memory_order_relaxed));
+  if (device != nullptr && device != owner) return;
+  ClearConfigurationFactsLocked();
+  if (runtime.device == nullptr) return;
   for (auto& [handle, feature] : features) {
     if (feature.device == game_api_device.load(std::memory_order_relaxed)) {
       FreeFeatureNr(&feature);
@@ -3116,6 +3189,7 @@ inline void OnDestroyGameDevice() {
     scale_calls = 0;
   }
   runtime = {};
+  ClearConfigurationFactsLocked();
   codec_failed = false;
   extension_state.store(0, std::memory_order_relaxed);
   game_api_device.store(nullptr, std::memory_order_relaxed);
@@ -3129,6 +3203,9 @@ inline void OnDestroyDeviceContext(reshade::api::device* device) {
   const VkDevice destroyed = reinterpret_cast<VkDevice>(device->get_native());
   for (auto it = features.begin(); it != features.end();) {
     if (it->second.device == device) {
+      if (configuration_facts.source == it->first) {
+        ClearConfigurationFactsLocked();
+      }
       FreeFeatureNr(&it->second, false);
       it = features.erase(it);
     } else {
@@ -3220,6 +3297,12 @@ inline NVSDK_NGX_Result CreateBody(Entry entry, VkDevice device,
         std::memory_order_relaxed);
   }
   FeatureState& contract = features[*output_handle].ngx;
+  if (feature == kFeatureDlss || feature == kFeatureDlssd) {
+    if (configuration_facts.source == *output_handle) {
+      ClearConfigurationFactsLocked();
+    }
+    contract.source_generation = ++source_generation;
+  }
   contract.declared_output_width = GetUInt(parameters, NVSDK_NGX_Parameter_OutWidth);
   contract.declared_output_height = GetUInt(parameters, NVSDK_NGX_Parameter_OutHeight);
   contract.output_subrects_enabled =
@@ -3319,6 +3402,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluate(
     CountNrDecline(NrDeclineReason::kSourceOther);
     return result;
   }
+  bool ray_reconstruction = false;
   {
     RuntimeLock lock(runtime_mutex);
     const auto feature = features.find(handle);
@@ -3327,29 +3411,26 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluate(
       CountNrDecline(NrDeclineReason::kNgxNotDlssEvaluation);
       return result;
     }
+    ray_reconstruction = feature->second.id == kFeatureDlssd;
   }
   if (dlss_evaluates.fetch_add(1, std::memory_order_relaxed) == 0) {
     Log(reshade::log::level::info,
         "first Vulkan DLSS evaluate intercepted (slot=" + std::to_string(Slot) + ")");
   }
-  if (hook_point.load(std::memory_order_relaxed) == kHookPresent
-      && present_fallback.fetch_add(1, std::memory_order_relaxed) == 0) {
-    Log(reshade::log::level::warning,
-        "NRHookPoint=Present is not served on Vulkan; NR runs at the Upscaled"
-        " hook point (vk[present_fallback=] counts these evaluates)");
-  }
   GuardHook([&] {
-    auto plan = RequestedStagePlan();
-    if (plan.mixed || !plan.valid) {
-      plan.valid = false;
-      if (plan.mixed) {
-        plan.reason = stage_plan::Reason::UNSUPPORTED_BACKEND;
-      }
-      StagePlanAdmitted(plan);
-      return;
+    const auto input = UpscaledExecutionInput(ray_reconstruction);
+    if (input.plan.valid && input.plan.requested[0] == stage_plan::Stage::PRESENT
+        && present_fallback.fetch_add(1, std::memory_order_relaxed) == 0) {
+      Log(reshade::log::level::warning,
+          "NRHookPoint=Present is not served on Vulkan; NR runs at the Upscaled"
+          " hook point (vk[present_fallback=] counts these evaluates)");
     }
-    const NrDeclineReason decline = ProcessNr(command_buffer, handle, parameters);
-    if (decline != NrDeclineReason::kCount) CountNrDecline(decline);
+    const NrDeclineReason decline = ProcessNr(command_buffer, handle, parameters, input);
+    if (decline == NrDeclineReason::kStagePlanUnavailable) {
+      StagePlanAdmitted(input.plan);
+    } else if (decline != NrDeclineReason::kCount) {
+      CountNrDecline(decline);
+    }
   });
   return result;
 }
@@ -3367,6 +3448,9 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedRelease(NVSDK_NGX_Handle* handle) {
     RuntimeLock lock(runtime_mutex);
     const auto feature = features.find(handle);
     if (feature != features.end()) {
+      if (configuration_facts.source == handle) {
+        ClearConfigurationFactsLocked();
+      }
       GuardHook([&] { FreeFeatureNr(&feature->second); });
       features.erase(feature);
     }

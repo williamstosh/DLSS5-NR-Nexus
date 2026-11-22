@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <atomic>
 
+#include "output_framerate.hpp"
+
 namespace renodx::addons::dlss5::fg {
 
 inline std::atomic_bool runtime_callback_pinned{false};
@@ -22,7 +24,11 @@ inline bool PinRuntimeCallback() noexcept {
   return true;
 }
 
-enum class Result : uint8_t { NOT_SERVED, PREPARED, SUBMITTED, FAILED };
+enum class Result : uint8_t { NOT_SERVED, PREPARED, SUBMITTED, FAILED, ORDINARY_SUBMITTED };
+
+constexpr bool Submitted(Result result) {
+  return result == Result::SUBMITTED || result == Result::ORDINARY_SUBMITTED;
+}
 
 // Borrowed for one application proxy Present. Early resources are private
 // copies ordered on queue; late resources retain their public tag lifetime.
@@ -70,6 +76,7 @@ struct FrameInput {
   // Internal diagnostics only. This points at the live XeFG Context held by
   // PresentFrame; it is never exposed to the SDK or used for routing.
   uintptr_t diagnostic_context = 0;
+  output_framerate::OutputIdentity output;
 };
 
 using Service = Result (*)(const FrameInput&) noexcept;

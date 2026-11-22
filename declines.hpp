@@ -316,7 +316,26 @@ inline thread_local MixedStageTerminal mixed_stage_terminal;
 inline std::atomic_uint64_t mixed_stage_group_successes{0};
 inline std::atomic_uint64_t mixed_stage_source_successes{0};
 
+// Pure model preparation is not another color opportunity. Return its
+// decline to the calling owner, which decides whether an opportunity ended.
+inline thread_local NrDeclineReason* nr_preparation_decline = nullptr;
+struct NrPreparationDeclineScope {
+  NrDeclineReason* previous = nr_preparation_decline;
+  explicit NrPreparationDeclineScope(NrDeclineReason* result) {
+    nr_preparation_decline = result;
+  }
+  ~NrPreparationDeclineScope() { nr_preparation_decline = previous; }
+  NrPreparationDeclineScope(const NrPreparationDeclineScope&) = delete;
+  NrPreparationDeclineScope& operator=(const NrPreparationDeclineScope&) = delete;
+};
+
 inline void CountNrDecline(NrDeclineReason reason) {
+  if (nr_preparation_decline != nullptr) {
+    if (*nr_preparation_decline == NrDeclineReason::kCount) {
+      *nr_preparation_decline = reason;
+    }
+    return;
+  }
   if (mixed_stage_terminal.active) {
     if (reason != NrDeclineReason::kNestedMirror
         && (mixed_stage_terminal.decline == NrDeclineReason::kCount

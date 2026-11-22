@@ -14,6 +14,7 @@ inline bool Allowed(std::string_view key) {
   constexpr std::string_view base[] = {
       "NeuralUplift", "NRDisableRelease", "NRHookPoint", "NRPasses", "NRFollowInputRes", "NRResolutionScale", "NREditReuse",
       "NRAdaptiveEnabled", "NRAdaptiveTargetFPS", "NRAdaptiveMinScale", "NRAdaptiveLevelCount", "NRAdaptiveLimitedResidency",
+      presets::ADAPTIVE_RESOURCE_STRATEGY_KEY,
       "NRControlMaskEnabled",
       "NRControlMaskMode", "NRControlMaskBlendMode", "NRControlMaskRed", "NRControlMaskGreen",
       "NRControlMaskBlue", "NRControlMaskDepthNear", "NRControlMaskDepthFar",
@@ -121,7 +122,7 @@ inline Json Snapshot() {
       sizes[name].push_back({{"pass", pass + 1}, {"width", (*values)[pass].width}, {"height", (*values)[pass].height}});
     }
   }
-  const auto output = output_framerate::Read(now);
+  const auto output = output_framerate::Read(MatchRuntimeOutput(monitor_runtime.load()), now);
   const auto fg_environment = ReadEditReuseFgEnvironmentLocked();
   Json native_evaluate = nullptr;
   if (edit_reuse_enabled.load() && edit_reuse_fg_experiment.load()) {
@@ -620,7 +621,8 @@ inline Json Execute(const Json& request) {
   const bool marker_operation = *operation == "fg_output_marker";
   const bool consumer_operation = *operation == "fg_consumer_capture";
   const bool benchmark_operation = *operation == "sr_benchmark";
-  const bool compact_operation = marker_operation || consumer_operation || benchmark_operation
+  const bool handoff_capture_operation = *operation == "present_handoff_capture";
+  const bool compact_operation = marker_operation || consumer_operation || benchmark_operation || handoff_capture_operation
 #if defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
       || xefg_operation
 #endif
@@ -659,6 +661,10 @@ inline Json Execute(const Json& request) {
   }
   if (benchmark_operation && request.value("action", Json(nullptr)) == "status") {
     return {{"id", *id}, {"ok", true}, {"status", "observed"}, {"capture", control_mask_capture::benchmark::Status()},
+        {"state", ProcessIdentityState()}};
+  }
+  if (handoff_capture_operation && request.value("action", Json(nullptr)) == "status") {
+    return {{"id", *id}, {"ok", true}, {"status", "observed"}, {"capture", present_handoff_capture::Status()},
         {"state", ProcessIdentityState()}};
   }
   if (*operation == "status") {
@@ -717,6 +723,39 @@ inline Json Execute(const Json& request) {
   const bool configuration_busy = shutting_down.load() || slider_pending != nullptr || stage_edit::pending || resolution_edit::pending
       || stage_edit_request.setting != nullptr || !resolution_edit_request.empty() || profile_ui::Busy()
       || profile_ui::pending_action != profile_ui::Action::NONE || preset_ui::manager_geometry.was_open;
+  if (handoff_capture_operation) {
+    const auto action = request.value("action", Json(nullptr));
+    const auto capture_id = request.find("capture_id");
+    response["reason"] = "invalid_capture_request";
+    if (capture_id == request.end() || !capture_id->is_string()) return finish();
+    const auto& name = capture_id->get_ref<const std::string&>();
+    if (action == "stop") {
+      const bool stopped = present_handoff_capture::Stop(name);
+      response["ok"] = stopped;
+      response["status"] = (stopped ? "stopping" : "rejected");
+      response["reason"] = (stopped ? "explicit_stop" : "capture_not_active");
+    } else if (action == "arm") {
+      const auto directory = request.find("run_directory");
+      const auto start_on_real_guides = request.value("start_on_real_guides", Json(false));
+      if (directory == request.end() || !directory->is_string() || !start_on_real_guides.is_boolean()) return finish();
+      if (shutting_down.load()) {
+        response["reason"] = "shutting_down";
+      } else {
+        const auto& path = directory->get_ref<const std::string&>();
+        try {
+          const std::string_view reason = present_handoff_capture::Arm(
+              std::filesystem::path(std::u8string(path.begin(), path.end())), name, start_on_real_guides.get<bool>());
+          response["ok"] = (reason == "queued");
+          response["status"] = (reason == "queued" ? "queued" : "rejected");
+          response["reason"] = reason;
+        } catch (...) {
+          response["reason"] = "capture_arm_failed";
+        }
+      }
+    }
+    response["capture"] = present_handoff_capture::Status();
+    return finish();
+  }
   if (benchmark_operation) {
     namespace benchmark = control_mask_capture::benchmark;
     const auto action = request.value("action", Json(nullptr));
@@ -992,15 +1031,11 @@ inline Json Execute(const Json& request) {
   const bool bridge_experiment = *operation == "bridge_adaptive_experiment";
   const bool fg_experiment = *operation == "edit_reuse_fg_experiment";
   const bool boolean_experiment = bridge_experiment || fg_experiment || *operation == "edit_reuse_adaptive_experiment";
-  if (*operation == "adaptive_feature_experiment" || boolean_experiment) {
-    const auto value = request.find(boolean_experiment ? "enabled" : "mode");
-    response["reason"] = (boolean_experiment ? "invalid_enabled" : "invalid_mode");
-    if (boolean_experiment) {
-      if (value == request.end() || !value->is_boolean()) return finish();
-    } else if (value == request.end() || !value->is_number_integer() || *value < 0 || *value > 3) {
-      return finish();
-    }
-    response["requested"] = {{boolean_experiment ? "enabled" : "mode", *value}};
+  if (boolean_experiment) {
+    const auto value = request.find("enabled");
+    response["reason"] = "invalid_enabled";
+    if (value == request.end() || !value->is_boolean()) return finish();
+    response["requested"] = {{"enabled", *value}};
     if (configuration_busy) {
       response["reason"] = "configuration_busy";
       return finish();
@@ -1014,28 +1049,21 @@ inline Json Execute(const Json& request) {
       } else if (!disabled_resources_released.load()) {
         response["reason"] = "resources_not_released";
       } else {
-        bool unchanged = false;
-        if (boolean_experiment) {
-          auto* requested_flag = &edit_reuse_adaptive_experiment;
-          if (bridge_experiment) {
-            requested_flag = &bridge_adaptive_experiment;
+        auto* requested_flag = &edit_reuse_adaptive_experiment;
+        if (bridge_experiment) {
+          requested_flag = &bridge_adaptive_experiment;
+        }
+        if (fg_experiment) {
+          requested_flag = &edit_reuse_fg_experiment;
+        }
+        const bool requested = value->get<bool>();
+        const bool unchanged = requested_flag->load() == requested;
+        requested_flag->store(requested);
+        if (fg_experiment && !unchanged) {
+          edit_fg_observation::SetEnabled(requested);
+          if (!requested) {
+            fg_output_marker_window.Stop("fg_experiment_disabled");
           }
-          if (fg_experiment) {
-            requested_flag = &edit_reuse_fg_experiment;
-          }
-          const bool requested = value->get<bool>();
-          unchanged = requested_flag->load() == requested;
-          requested_flag->store(requested);
-          if (fg_experiment && !unchanged) {
-            edit_fg_observation::SetEnabled(requested);
-            if (!requested) {
-              fg_output_marker_window.Stop("fg_experiment_disabled");
-            }
-          }
-        } else {
-          const auto requested = static_cast<AdaptiveFeatureMode>(value->get<uint32_t>());
-          unchanged = adaptive_feature_mode.load() == requested;
-          adaptive_feature_mode.store(requested);
         }
         response["ok"] = true;
         response["status"] = unchanged ? "unchanged" : "applied";
@@ -1044,15 +1072,21 @@ inline Json Execute(const Json& request) {
     }
     return finish();
   }
-  if (!request.contains("key") || !request["key"].is_string() || !request.contains("value")) return finish();
-  const auto key = request["key"].get<std::string>();
-  const auto& value = request["value"];
-  response["requested"] = {{"key", key}, {"value", value}};
+  const bool resource_strategy_command = *operation == "adaptive_feature_experiment";
+  if (!resource_strategy_command && (!request.contains("key") || !request["key"].is_string())) return finish();
+  const auto entry = request.find(resource_strategy_command ? "mode" : "value");
+  if (entry == request.end()) {
+    if (resource_strategy_command) response["reason"] = "invalid_mode";
+    return finish();
+  }
+  const auto key = (resource_strategy_command ? std::string(presets::ADAPTIVE_RESOURCE_STRATEGY_KEY) : request["key"].get<std::string>());
+  const auto& value = *entry;
+  response["requested"] = (resource_strategy_command ? Json{{"mode", value}} : Json{{"key", key}, {"value", value}});
   const auto* setting = preset_ui::FindSetting(key);
   const auto* rule = presets::FindRule(key);
   if (!Allowed(key) || setting == nullptr || rule == nullptr) return finish();
-  if (!preset_ui::ValidateValue(*rule, value)) {
-    response["reason"] = "invalid_value";
+  if ((resource_strategy_command && !value.is_number_integer()) || !preset_ui::ValidateValue(*rule, value)) {
+    response["reason"] = (resource_strategy_command ? "invalid_mode" : "invalid_value");
     return finish();
   }
   if (configuration_busy) {

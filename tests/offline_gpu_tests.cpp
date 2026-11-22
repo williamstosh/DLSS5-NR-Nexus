@@ -286,6 +286,15 @@ int wmain(int argc, wchar_t** argv) {
               addon::DescriptorHeapSlot(heap->GetCPUDescriptorHandleForHeapStart(),
                   addon::kDescriptorControlMaskDepthNullSrv,
                   gpu.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)));
+          null_depth_srv.Format = DXGI_FORMAT_R16G16_FLOAT;
+          gpu.device->CreateShaderResourceView(nullptr, &null_depth_srv,
+              addon::DescriptorHeapSlot(heap->GetCPUDescriptorHandleForHeapStart(),
+                  addon::kDescriptorControlMaskMotionNullSrv,
+                  gpu.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)));
+          gpu.device->CreateConstantBufferView(nullptr,
+              addon::DescriptorHeapSlot(heap->GetCPUDescriptorHandleForHeapStart(),
+                  addon::kDescriptorControlMaskDepthProofNullCbv,
+                  gpu.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)));
           const D3D12_UNORDERED_ACCESS_VIEW_DESC view{.Format = DXGI_FORMAT_R8G8B8A8_UNORM,
               .ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D};
           auto descriptor = heap->GetCPUDescriptorHandleForHeapStart();

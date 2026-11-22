@@ -24,6 +24,8 @@ extern "C" __declspec(dllexport) void ReShadeUnregisterAddon(void*) {}
 extern "C" __declspec(dllexport) void ReShadeLogMessage(void*, int, const char*) {}
 
 namespace addon = renodx::addons::dlss5::internal;
+namespace capability = renodx::addons::dlss5::capability;
+namespace stage_plan = renodx::addons::dlss5::stage_plan;
 namespace vk_test = nr::test::vk;
 
 namespace {
@@ -403,7 +405,8 @@ void RunNativeNgx(const wchar_t* project_id_path) {
     feature.device = &device;
     addon::vk::features.emplace(owner, std::move(feature));
 
-    const auto first = addon::vk::ProcessNr(context.command_buffer, owner, &parameters);
+    const auto first = addon::vk::ProcessNr(context.command_buffer, owner, &parameters,
+                                            addon::vk::UpscaledExecutionInput(false));
     std::cout << "PUBLIC_SDK production Feature18 Create result=0x" << std::hex
               << addon::last_result.load() << std::dec
               << " decline=" << static_cast<int>(first) << std::endl;
@@ -439,7 +442,8 @@ void RunNativeNgx(const wchar_t* project_id_path) {
       native_observed_mask_bound = false;
       native_observed_result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
       addon::vk::runtime.evaluate = ObserveNativeEvaluate;
-      const auto second = addon::vk::ProcessNr(context.command_buffer, owner, &parameters);
+      const auto second = addon::vk::ProcessNr(context.command_buffer, owner, &parameters,
+                                              addon::vk::UpscaledExecutionInput(false));
       addon::vk::runtime.evaluate = native_real_evaluate;
       std::cout << "PUBLIC_SDK production Feature18 Evaluate frame=" << frame
                 << " result=0x" << std::hex << static_cast<uint32_t>(native_observed_result)
@@ -758,13 +762,14 @@ struct RecoveryMock {
   VkImage game_output;
   VkBuffer readback;
   VkDeviceSize marker_offset;
-  std::array<uint64_t, 5> handle_tokens{};
-  std::array<NVSDK_NGX_Parameter*, 5> create_parameters{};
+  std::array<uint64_t, 7> handle_tokens{};
+  std::array<NVSDK_NGX_Parameter*, 7> create_parameters{};
   const char* borrowed_create_key = nullptr;
   size_t creates = 0;
   std::vector<NVSDK_NGX_Handle*> releases;
   std::vector<RecoveryEvaluate> evaluates;
   const NVSDK_NGX_Handle* fail_handle = nullptr;
+  capability::Size last_grid;
 
   NVSDK_NGX_Handle* Handle(size_t index) {
     return reinterpret_cast<NVSDK_NGX_Handle*>(&handle_tokens.at(index));
@@ -807,6 +812,8 @@ NVSDK_NGX_Result NVSDK_CONV EvaluateRecoveryFeature(
     return NVSDK_NGX_Result_FAIL_InvalidParameter;
   }
   mock.evaluates.push_back({handle, addon::GetInt(parameters, "DLSSNR.Reset", -1)});
+  mock.last_grid = {.width = addon::GetUInt(parameters, "DLSSNR.InputWidth"),
+                    .height = addon::GetUInt(parameters, "DLSSNR.InputHeight")};
   using reshade::api::resource_usage;
   const reshade::api::resource image{vk_test::ApiHandle(neural->Resource.ImageViewInfo.Image)};
   const reshade::api::resource_view view{vk_test::ApiHandle(neural->Resource.ImageViewInfo.ImageView)};
@@ -898,6 +905,7 @@ void RunEvaluateRecovery(bool hdr_zero_prefix) {
   recovery_mock = &mock;
 
   addon::hooks_enabled = false;
+  addon::enabled = true;
   addon::stack_passes = (hdr_zero_prefix ? 2 : 3);
   addon::chained_temporal_history = true;
   addon::workset_free_policy = 0;
@@ -909,19 +917,37 @@ void RunEvaluateRecovery(bool hdr_zero_prefix) {
       .create = CreateRecoveryFeature, .evaluate = EvaluateRecoveryFeature,
       .release = ReleaseRecoveryFeature, .shutdown = [](VkDevice) { return NVSDK_NGX_Result_Success; },
       .device = context.device};
-  const auto* owner = reinterpret_cast<const NVSDK_NGX_Handle*>(&context);
-  auto& feature = addon::vk::features[owner];
-  feature.id = addon::kFeatureDlss;
-  feature.device = &device;
+  renodx::addons::dlss5::bridge::OwnedParameters parameters;
+  const auto source_feature = (hdr_zero_prefix ? addon::kFeatureDlss : addon::kFeatureDlssd);
   if (hdr_zero_prefix) {
-    feature.create_flags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
+    parameters.Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, NVSDK_NGX_DLSS_Feature_Flags_IsHDR);
     addon::transfer_strength = 0.f;
     addon::color_strength = 0.f;
     addon::pass_transfer_strength[0] = 1.f;
     addon::pass_color_strength[0] = 1.f;
     addon::display_pedestal = 1;
   }
-  renodx::addons::dlss5::bridge::OwnedParameters parameters;
+  NVSDK_NGX_Handle* owner = nullptr;
+  const auto create_game_feature = [&] {
+    return addon::vk::CreateBody(addon::vk::kCreate1, context.device, context.command_buffer,
+        source_feature, &parameters, &owner, [&] {
+          owner = reinterpret_cast<NVSDK_NGX_Handle*>(&context);
+          return NVSDK_NGX_Result_Success;
+        });
+  };
+  Check(create_game_feature() == NVSDK_NGX_Result_Success, "register the game source through the Vulkan create body");
+  auto& feature = addon::vk::features.at(owner);
+  const auto read_configuration = [&] {
+    RuntimeLock lock(addon::runtime_mutex);
+    return addon::vk::ReadConfigurationFactsLocked();
+  };
+  addon::vk::slot_real[0].evaluate = reinterpret_cast<void*>(+[](
+      VkCommandBuffer, const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter*, PFN_NVSDK_NGX_ProgressCallback) {
+    return NVSDK_NGX_Result_Success;
+  });
+  addon::vk::slot_real[0].release = reinterpret_cast<void*>(+[](NVSDK_NGX_Handle*) {
+    return NVSDK_NGX_Result_Success;
+  });
   parameters.Set(NVSDK_NGX_Parameter_Output, &output.ngx);
   parameters.Set(NVSDK_NGX_Parameter_Depth, &depth.ngx);
   parameters.Set(NVSDK_NGX_Parameter_MotionVectors, &motion.ngx);
@@ -963,7 +989,8 @@ void RunEvaluateRecovery(bool hdr_zero_prefix) {
     }
     return true;
   };
-  const auto record_frame = [&](vk_test::CommandList* list, const NVSDK_NGX_Handle* failed) {
+  const auto record_frame = [&](vk_test::CommandList* list, const NVSDK_NGX_Handle* failed, bool wrapped = false,
+                                const capability::Input* frozen_input = nullptr) {
     mock.evaluates.clear();
     mock.fail_handle = failed;
     mock.command_list = list;
@@ -971,7 +998,15 @@ void RunEvaluateRecovery(bool hdr_zero_prefix) {
     list->barrier(1, &output.image, &storage, &copy_dest);
     list->clear_unordered_access_view_float(output.view, game_clear, 0, nullptr);
     list->barrier(1, &output.image, &copy_dest, &storage);
-    const auto result = addon::vk::ProcessNr(context.command_buffer, owner, &parameters);
+    auto result = NrDeclineReason::kCount;
+    if (wrapped) {
+      Check(addon::vk::HookedEvaluate<0>(context.command_buffer, owner, &parameters, nullptr) == NVSDK_NGX_Result_Success,
+            "production Vulkan wrapper returns the original SR result");
+    } else {
+      auto input = (frozen_input != nullptr ? *frozen_input
+          : addon::vk::UpscaledExecutionInput(source_feature == addon::kFeatureDlssd));
+      result = addon::vk::ProcessNr(context.command_buffer, owner, &parameters, std::move(input));
+    }
     list->barrier(1, &output.image, &storage, &copy_source);
     const VkBufferImageCopy copy{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {}, {width, height, 1}};
     context.DeviceProc<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(
@@ -985,9 +1020,10 @@ void RunEvaluateRecovery(bool hdr_zero_prefix) {
         0, 1, &host_read, 0, nullptr, 0, nullptr);
     return result;
   };
-  const auto submitted_frame = [&](const NVSDK_NGX_Handle* failed = nullptr) {
+  const auto submitted_frame = [&](const NVSDK_NGX_Handle* failed = nullptr, bool wrapped = false,
+                                   const capability::Input* frozen_input = nullptr) {
     begin_frame();
-    const auto result = record_frame(&command_list, failed);
+    const auto result = record_frame(&command_list, failed, wrapped, frozen_input);
     SubmitAndWait(context);
     return result;
   };
@@ -1029,6 +1065,8 @@ void RunEvaluateRecovery(bool hdr_zero_prefix) {
       Check(submitted_frame() == NrDeclineReason::kCount && !unchanged_output(), "HDR recovery resumes edited output");
       expect_evaluates({{third, 1}}, "the rebuilt HDR second pass receives Reset");
       cleanup();
+      Check(addon::stage_source_api.load() == capability::Api::UNKNOWN && !addon::stage_source_rr.load(),
+            "Vulkan shutdown and device destruction retract the current Vulkan source observation");
       std::cout << "PASS NATIVE_GPU+MOCK: HDR prefix layout, failure pixels and Reset after retry\n";
       return;
     }
@@ -1152,11 +1190,122 @@ void RunEvaluateRecovery(bool hdr_zero_prefix) {
     expect_evaluates({{first, 0}, {recovered, 0}, {third, 0}}, "recovery Reset is consumed once");
     std::cout << "recovery: prefix-only cooldown, middle-only rebuild with clean parameters, Reset=0/1/1 then 0/0/0,"
                  " full edited output restored\n";
+
+    addon::stack_passes = 2;
+    addon::hook_point = addon::kHookRender;
+    addon::pass_stage[0] = 2u;
+    addon::stage_source_api = capability::Api::DX12;
+    addon::stage_source_rr = false;
+    auto& mixed_declines = renodx::addons::dlss5::nr_decline_counts[static_cast<size_t>(NrDeclineReason::kStagePlanUnavailable)];
+    const auto before_mixed = mixed_declines.load();
+    submitted_frame(nullptr, true);
+    auto observed = read_configuration();
+    Check(addon::CurrentExecutionApi() == capability::Api::VULKAN && addon::stage_source_rr.load()
+              && observed.source == owner && observed.ray_reconstruction,
+          "a rejected mixed request still replaces a stale D3D12 source with the current Vulkan source");
+    Check(mixed_declines.load() == before_mixed + 1 && observed.recorded_passes == 0
+              && observed.geometry.reference_width == 0 && mock.evaluates.empty() && unchanged_output(),
+          "the mixed Vulkan request declines once without NR recording or writeback");
+    addon::pass_stage[0] = 0u;
+    addon::pass_resolution_mode[1] = 2u;
+    addon::hook_point = addon::kHookPresent;
+    addon::nr_resolution_scale = .67f;
+    const auto frozen = addon::vk::UpscaledExecutionInput(true);
+    addon::stack_passes = 3;
+    Check(submitted_frame(nullptr, false, &frozen) == NrDeclineReason::kCount
+              && mock.evaluates.size() == 2 && read_configuration().group.count == 2,
+          "an in-flight Vulkan recording uses the frozen group after live Pass settings change");
+    addon::stack_passes = 2;
+    addon::stage_source_api = capability::Api::DX12;
+    addon::stage_source_rr = false;
+    submitted_frame(nullptr, true);
+    observed = read_configuration();
+    Check(observed.source == owner && observed.source_generation == feature.ngx.source_generation
+              && observed.source_generation != 0 && observed.ray_reconstruction
+              && observed.runtime == capability::Runtime::AVAILABLE,
+          "Vulkan configuration facts identify the current RR source and initialized runtime");
+    Check(addon::CurrentExecutionApi() == capability::Api::VULKAN && addon::stage_source_rr.load(),
+          "the actual Vulkan RR source replaces a prior D3D12 source observation");
+    Check(observed.group.stage == stage_plan::Stage::UPSCALED && observed.group.begin == 0
+              && observed.group.count == 2 && observed.recorded_passes == 2
+              && observed.geometry.reference_width == width && observed.geometry.reference_height == height
+              && mock.evaluates.size() == 2 && mock.last_grid == capability::Size{width, height}
+              && addon::hook_point.load() == addon::kHookPresent && addon::nr_resolution_scale.load() == .67f,
+          "saved Present and 67 percent use the inherited full two-pass grid without rewriting intent");
+
+    addon::pass_resolution_mode[0] = 2u;
+    submitted_frame(nullptr, true);
+    Check(mock.evaluates.empty() && unchanged_output() && read_configuration().recorded_passes == 0,
+          "the same mode on an active pass declines without recording NR");
+    addon::pass_resolution_mode[0] = 0u;
+    addon::nr_follow_input_res = true;
+    parameters.Set(NVSDK_NGX_Parameter_OutWidth, 12u);
+    parameters.Set(NVSDK_NGX_Parameter_OutHeight, 10u);
+    for (unsigned frame = 0; frame < 3; ++frame) {
+      submitted_frame(nullptr, true);
+    }
+    observed = read_configuration();
+    Check(observed.geometry.reference_width == 12 && observed.geometry.reference_height == 10
+              && observed.recorded_passes == 2 && mock.last_grid == capability::Size{12, 10}
+              && addon::nr_follow_input_res.load(),
+          "saved Follow Input keeps its value and records the new full output rectangle");
+    const auto old_generation = observed.source_generation;
+    begin_frame();
+    Check(addon::vk::HookedRelease<0>(owner) == NVSDK_NGX_Result_Success, "release the observed Vulkan source");
+    observed = read_configuration();
+    Check(observed.source == nullptr && observed.source_generation == 0 && observed.recorded_passes == 0
+              && observed.geometry.reference_width == 0 && observed.runtime == capability::Runtime::AVAILABLE,
+          "release withdraws source facts while the device runtime stays initialized");
+    Check(addon::stage_source_api.load() == capability::Api::UNKNOWN && !addon::stage_source_rr.load(),
+          "releasing the current Vulkan source retracts its shared API and RR observation");
+    parameters.Set(NVSDK_NGX_Parameter_OutWidth, 0u);
+    parameters.Set(NVSDK_NGX_Parameter_OutHeight, 0u);
+    Check(create_game_feature() == NVSDK_NGX_Result_Success, "reuse the released Vulkan handle in a new source lifetime");
+    {
+      RuntimeLock lock(addon::runtime_mutex);
+      addon::vk::runtime.device = nullptr;
+      addon::vk::runtime.failed = true;
+    }
+    submitted_frame(nullptr, true);
+    observed = read_configuration();
+    Check(observed.source == owner && observed.source_generation > old_generation && observed.recorded_passes == 0
+              && observed.runtime == capability::Runtime::UNAVAILABLE && mock.evaluates.empty(),
+          "a reused handle has a fresh source generation and a latched Vulkan Init failure stays visible");
+
+    const auto* foreign_handle = reinterpret_cast<const NVSDK_NGX_Handle*>(&mock);
+    const auto observe_foreign_rr = [&] {
+      RuntimeLock lock(addon::runtime_mutex);
+      auto& foreign = addon::create_contracts[foreign_handle];
+      foreign.source_type_confirmed = true;
+      foreign.source_generation = 1;
+      addon::created_feature_ids[foreign_handle] = addon::kFeatureDlssd;
+      addon::ObserveSourcePlan(foreign_handle, stage_plan::Build({}));
+    };
+    observe_foreign_rr();
+    Check(addon::CurrentExecutionApi() == capability::Api::DX12 && addon::stage_source_rr.load(),
+          "a confirmed foreign D3D12 source supersedes the Vulkan observation");
+    begin_frame();
+    Check(addon::vk::HookedRelease<0>(owner) == NVSDK_NGX_Result_Success, "release Vulkan after D3D12 took over");
+    Check(read_configuration().source == nullptr && addon::CurrentExecutionApi() == capability::Api::DX12
+              && addon::stage_source_rr.load(),
+          "Vulkan release removes only Vulkan facts after another backend takes over");
+    Check(create_game_feature() == NVSDK_NGX_Result_Success, "register a new Vulkan source on the same device");
+    submitted_frame(nullptr, true);
+    Check(read_configuration().source == owner && addon::CurrentExecutionApi() == capability::Api::VULKAN,
+          "the newer Vulkan producer replaces the foreign observation again");
+    observe_foreign_rr();
   } catch (...) {
     cleanup();
     throw;
   }
   cleanup();
+  const auto destroyed = read_configuration();
+  Check(destroyed.runtime == capability::Runtime::UNKNOWN && destroyed.source == nullptr
+            && destroyed.recorded_passes == 0 && destroyed.geometry.reference_width == 0,
+        "device destruction withdraws the source, initialization and geometry observations");
+  Check(addon::CurrentExecutionApi() == capability::Api::DX12 && addon::stage_source_rr.load(),
+        "Vulkan device destruction preserves the foreign D3D12 API and RR observation");
+  std::cout << "PASS NATIVE_GPU+MOCK: Vulkan wrapper configuration facts and inherited Upscaled grid\n";
   std::cout << "PASS NATIVE_GPU+MOCK: Vulkan Evaluate failure recovery and unsubmitted discard\n";
 }
 }  // namespace

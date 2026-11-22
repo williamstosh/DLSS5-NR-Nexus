@@ -22,8 +22,7 @@ inline SignalFn real_signal = nullptr;
 HRESULT STDMETHODCALLTYPE Close(ID3D12GraphicsCommandList* list) {
   if (fail_close && list == fault_list) {
     fail_close = false;
-    // Actually close the list so the test does not manufacture a D3D validation error.
-    real_close(list);
+    // Leave the list open so production cancellation can close it once.
     return E_FAIL;
   }
   return real_close(list);
@@ -332,7 +331,32 @@ int Run(bool hardware) {
           Check(high > low && pair::evaluations[1].input.Pixels() != low_input,
               "Present Pass2 GPU input follows real Pass1 output with a positive pixel change");
           pair::stamps = {0x3400, 0x3400};
-          record(); gpu.Submit();
+          const bool submitted = record();
+          if (scenario == 0 && phase == 0) {
+            const auto& ring = native::present_ring;
+            const auto& slot = ring.slots[ring.submitted % native::kPresentRing];
+            const auto recording = submission::ObserveRecording(slot.list);
+            const auto& tail = native::worksets.at(key).resolution_tail;
+            Check(submitted && tail != nullptr && tail->proxy != nullptr && recording != nullptr
+                      && recording->submitted.load() && recording->closed.load()
+                      && recording->close_reason.load() == submission::CloseReason::kOwnerDiscarded,
+                  "ordinary Present submits its tail and discards private replay");
+            const auto completed_before_wait = ring.fence->GetCompletedValue();
+            Check(slot.value != 0 && completed_before_wait != UINT64_MAX, "ordinary Present has a healthy submission fence");
+            if (completed_before_wait < slot.value) {
+              Check(!submission::ResourceReleasable(tail->proxy), "in-flight Present still protects its submitted tail");
+            }
+            gpu.Submit();
+            const auto completed = ring.fence->GetCompletedValue();
+            Check(completed != UINT64_MAX && completed >= slot.value && submission::ResourceReleasable(tail->proxy),
+                "same-queue completion makes the submitted Present tail releasable");
+            std::lock_guard lock(submission::tracker_mutex);
+            Check(recording->completed_healthy
+                      && std::ranges::find(recording->completed_uses, tail->proxy) != recording->completed_uses.end(),
+                  "completion proof identifies the actual old tail resource");
+          } else {
+            gpu.Submit();
+          }
           const auto high_final = Capture(gpu, frame.Get(), D3D12_RESOURCE_STATE_COMMON);
           gpu.Submit();
           const float high_result = mean(high_final);
@@ -349,11 +373,8 @@ int Run(bool hardware) {
           if (phase == 1) {
             Check(work.id == parent_id && work.resolution_tail->id != old_tail_id,
                 "Pass2-only resize preserves full-size parent");
-            // GPU completion alone does not invalidate replayable private ring recordings.
-            Check(!submission::ResourceReleasable(old_proxy), "completed old tail remains protected by replayable ring lists");
-            for (uint32_t turn = 0; turn < native::kPresentRing; ++turn) { record(); gpu.Submit(); }
             native::DrainRetiredResources(true);
-            Check(submission::ResourceReleasable(old_proxy), "completed old Present tail releases");
+            Check(submission::ResourceReleasable(old_proxy), "resized Present can release the completed old tail without ring rotation");
           }
           generations = {pair::evaluations[0].generation, pair::evaluations[1].generation};
           parent_id = work.id;
@@ -424,10 +445,19 @@ int Run(bool hardware) {
           }
           // The Submit entry must withdraw stale authority after PreFG becomes active.
           for (auto* active : {&native::present_prefg_active, &native::present_prefg_upscaled_active}) {
+            write_frame(96); gpu.Submit();
+            const auto before_prefg = Capture(gpu, frame.Get(), D3D12_RESOURCE_STATE_COMMON);
+            gpu.Submit();
+            const auto calls_before_prefg = model_calls;
             active->store(true);
-            record(); gpu.Submit();
-            Check(!target.independent_resolution_pair, "Submit refresh rejects live PreFG state");
+            const bool submitted = record(false, nullptr, false);
+            gpu.Submit();
+            const auto after_prefg = Capture(gpu, frame.Get(), D3D12_RESOURCE_STATE_COMMON);
+            gpu.Submit();
             active->store(false);
+            Check(!submitted && model_calls == calls_before_prefg && pair::evaluations.empty()
+                      && before_prefg.Pixels() == after_prefg.Pixels(),
+                  "live PreFG rejects ordinary split-size colour without evaluation or writeback");
           }
           for (uint32_t warm = 0; warm < 6; ++warm) { record(); gpu.Submit(); }
           const auto before_failure = Capture(gpu, frame.Get(), D3D12_RESOURCE_STATE_COMMON);

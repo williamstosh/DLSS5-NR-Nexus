@@ -13,6 +13,8 @@
 
 namespace renodx::addons::dlss5::presets {
 
+inline constexpr char ADAPTIVE_RESOURCE_STRATEGY_KEY[] = "NRAdaptiveResourceStrategy";
+
 struct FieldRule {
   const char* key;
   const char* label;
@@ -142,6 +144,7 @@ inline const std::vector<FieldRule>& FieldRules() {
       {.key = "NRAdaptiveMinScale", .label = "Minimum relative scale", .group = "Resolution", .minimum = 0.33f, .maximum = 1, .category = FieldRule::QUALITY},
       {.key = "NRAdaptiveLevelCount", .label = "Resolution levels", .group = "Resolution", .minimum = 0, .maximum = adaptive_resolution::MAX_PREPARED_LEVELS, .category = FieldRule::QUALITY},
       {.key = "NRAdaptiveLimitedResidency", .label = "Preparation mode", .group = "Resolution", .minimum = 0, .maximum = 1, .category = FieldRule::QUALITY},
+      {.key = ADAPTIVE_RESOURCE_STRATEGY_KEY, .label = "Resource strategy", .group = "Resolution", .minimum = 0, .maximum = 3, .category = FieldRule::QUALITY},
       {.key = "NREditReuse", .label = "x2 edit reuse (experimental)", .group = "Resolution", .minimum = 0, .maximum = 1, .category = FieldRule::QUALITY},
       {.key = "NRLookUpsample", .label = "Upsampling", .group = "Resolution", .minimum = 0, .maximum = 3, .category = FieldRule::QUALITY},
       {.key = "NRCodecMode", .label = "HDR mode", .group = "HDR", .minimum = 0, .maximum = 3, .category = FieldRule::COMPATIBILITY},

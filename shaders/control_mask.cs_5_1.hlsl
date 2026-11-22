@@ -23,7 +23,12 @@ cbuffer Constants : register(b0) {
   float motion_scale_y;
   float motion_start;
   float motion_end;
-  uint4 padding;
+  uint check_depth_proof;
+  uint3 padding;
+};
+
+cbuffer DepthProof : register(b1) {
+  uint depth_proof_available;
 };
 
 RWTexture2D<float4> output_mask : register(u0);
@@ -50,7 +55,8 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     }
   } else if (mode == 2 && dispatch_id.x < rect_width && dispatch_id.y < rect_height) {
     value = float4(0.0, 0.0, 0.0, 1.0);
-  } else if (mode == 5 && depth_width != 0 && depth_height != 0 && depth_far > depth_near) {
+  } else if (mode == 5 && depth_width != 0 && depth_height != 0 && depth_far > depth_near
+             && (check_depth_proof == 0 || depth_proof_available != 0)) {
     const uint depth_x = depth_base_x + min(
         (uint)(((float)dispatch_id.x + 0.5) * (float)depth_width / (float)width), depth_width - 1);
     const uint depth_y = depth_base_y + min(

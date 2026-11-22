@@ -316,7 +316,7 @@ int main(int argc, char** argv) {
     if (test_case == "nr-resolution-adaptive") {
       Check(!runtime::nr_adaptive_enabled.load() && runtime::nr_adaptive_target_fps.load() == 60.f
                 && runtime::nr_adaptive_min_scale.load() == .67f && runtime::nr_adaptive_selected_levels.load() == 0
-                && !runtime::nr_adaptive_limited_residency.load(),
+                && !runtime::nr_adaptive_limited_residency.load() && runtime::kSetAdaptiveResourceStrategy.Get() == 0.f,
             "adaptive resolution defaults to Off, 60 output FPS and 67 percent relative minimum");
       const auto original = runtime::profile_ui::Snapshot();
       runtime::kSetAdaptiveEnabled.Commit(1.f);
@@ -361,6 +361,41 @@ int main(int argc, char** argv) {
       auto invalid_mode = saved;
       invalid_mode["NRAdaptiveLimitedResidency"] = 2;
       Check(!runtime::profile_ui::ApplySnapshot(invalid_mode, &error), "preparation mode requires a boolean preset value");
+      namespace presets = renodx::addons::dlss5::presets;
+      const auto* strategy_key = runtime::kSetAdaptiveResourceStrategy.key;
+      for (const uint32_t strategy : {1u, 2u, 3u, 0u}) {
+        const presets::Document preset{.scope = presets::Scope::FULL, .settings = {{strategy_key, strategy}}};
+        Check(runtime::preset_ui::Apply(preset, true, false, &error), "Full preset applies explicit resource strategy");
+        runtime::LoadConfiguration();
+        Check(runtime::preset_ui::ReadSetting(strategy_key) == strategy
+                  && runtime::profile_ui::Snapshot().at(strategy_key) == strategy
+                  && runtime::nr_adaptive_limited_residency.load() && runtime::nr_adaptive_selected_levels.load() == 15,
+              "Strategy persists through INI reload, preserving preparation mode and the chosen level count");
+        const auto captured = runtime::preset_ui::Capture(presets::Scope::QUALITY, {{"name", "Resource strategy"}});
+        Check(captured.settings.at(strategy_key) == strategy, "Quality export includes the exact strategy, including zero");
+        if (strategy == 3) {
+          Check(presets::WriteFile(std::filesystem::absolute(base_directory / "resource-strategy.nrnexus.json"), captured, true, &error),
+              "Export current resource strategy for the v0.6.0 reader");
+        }
+      }
+      runtime::kSetAdaptiveResourceStrategy.Commit(2.f);
+      Check(runtime::profile_ui::ApplySnapshot({{"NRAdaptiveLimitedResidency", true}}, &error)
+                && runtime::kSetAdaptiveResourceStrategy.Get() == 2.f,
+            "A partial legacy preset preserves the current resource strategy");
+      for (const auto* value : {"-1", "4", "1.5", "2junk"}) {
+        Check(WritePrivateProfileStringA(runtime::kConfigSection, strategy_key, value, ini_path.c_str()), "Write an invalid strategy to the real INI fixture");
+        runtime::LoadConfiguration();
+        Check(runtime::kSetAdaptiveResourceStrategy.Get() == 0.f && runtime::nr_adaptive_limited_residency.load(),
+              "Invalid resource strategy falls back to the saved ordinary preparation mode");
+      }
+      for (const presets::Json invalid : {presets::Json(-1), presets::Json(4), presets::Json(1.5), presets::Json(true)}) {
+        const presets::Document preset{.scope = presets::Scope::FULL, .settings = {{strategy_key, invalid}}};
+        const auto preview = runtime::preset_ui::Preview(preset, true);
+        const auto row = std::ranges::find_if(preview, [&](const auto& item) { return item.key == strategy_key; });
+        Check(row != preview.end() && !row->apply && std::string_view(row->status) == "Invalid value"
+                  && !runtime::profile_ui::ApplySnapshot(preset.settings, &error),
+              "Preset preview and profile application reject invalid strategy values");
+      }
       runtime::ResetSettings({runtime::kPerformanceSettings});
       Check(!runtime::nr_adaptive_enabled.load() && runtime::nr_adaptive_target_fps.load() == 60.f
                 && runtime::nr_adaptive_min_scale.load() == .67f && runtime::nr_adaptive_selected_levels.load() == 0
@@ -628,13 +663,14 @@ int main(int argc, char** argv) {
       runtime::pass_resolution_mode[1] = 0;
       renodx::addons::dlss5::stage_plan::Group group{.stage = renodx::addons::dlss5::stage_plan::Stage::UPSCALED,
                                                     .begin = 0, .count = 3};
+      const auto group_plan = renodx::addons::dlss5::stage_plan::Build({.pass_count = 3});
       uint32_t width = 0, height = 0;
-      Check(!runtime::ComputeNrGroupWorkingResolution(group, 1920, 1080, 1280, 720, &width, &height),
+      Check(!runtime::ComputeNrGroupWorkingResolution(group_plan, group, 1920, 1080, 1280, 720, &width, &height),
             "Three-pass shared resources reject incompatible actual sizes without changing other pass settings.");
       Check(runtime::pass_resolution_mode[0].load() == 2 && runtime::pass_resolution_scale[0].load() == .67f,
             "Rejecting incompatible dimensions retains the user's independent request.");
       runtime::pass_resolution_scale[0] = 1.f;
-      Check(runtime::ComputeNrGroupWorkingResolution(group, 1920, 1080, 1280, 720, &width, &height),
+      Check(runtime::ComputeNrGroupWorkingResolution(group_plan, group, 1920, 1080, 1280, 720, &width, &height),
             "Different modes with matching actual pixels do not create a false resolution conflict.");
       runtime::LoadConfiguration();
     }
@@ -1167,6 +1203,12 @@ int main(int argc, char** argv) {
       }
       runtime::LoadConfiguration();
       const auto persisted = capture();
+      constexpr const char* PRESENT_FRAMES_KEY = "NRPresentFrames";
+      const auto captured_present_frames = persisted.settings.find(PRESENT_FRAMES_KEY);
+      Check(Read(PRESENT_FRAMES_KEY) == "<absent>" && runtime::present_frames.load() == 0u
+                && captured_present_frames != persisted.settings.end()
+                && captured_present_frames->is_number_integer() && *captured_present_frames == 0u,
+            "The legacy INI key stays absent and Full capture exports the Every present default as integer zero.");
       const auto saved_local_size = GetEnvironmentVariableW(L"LOCALAPPDATA", nullptr, 0);
       std::wstring saved_local(saved_local_size, L'\0');
       if (saved_local_size != 0) {
@@ -1188,14 +1230,28 @@ int main(int argc, char** argv) {
         std::ofstream fixture(ini_path, std::ios::binary);
         fixture << "[GENERAL]\r\nPresetPath=game-two.ini\r\n[OTHER.ADDON]\r\nPersistent=29\r\n"
                    "[RenoDX.DLSS5]\r\n" << current_global << policy_keys
-                << "NRPresentRestoreScope=1\r\nNRPresentRestoreScopeConfigVersion=1\r\nNRIntensity=0.1\r\n";
+                << "NRPresentRestoreScope=1\r\nNRPresentRestoreScopeConfigVersion=1\r\n"
+                   "NRIntensity=0.1\r\nNRPresentFrames=1\r\n";
       }
       runtime::LoadConfiguration();
+      Check(runtime::present_frames.load() == 1u, "The legacy INI loads explicit one as Game frames.");
+      Check(apply({{"NRIntensity", 0.25f}}) && runtime::intensity.load() == 0.25f
+                && runtime::present_frames.load() == 1u && Read(PRESENT_FRAMES_KEY) == "1",
+            "A partial preset applies its change and preserves the omitted Game frames setting in memory and on disk.");
       std::filesystem::path library_two;
       Check(presets::LibraryPath(&library_two, &error) && library_two == library_one, "Separate game INIs share one preset library.");
       Check(presets::ReadFile(library_two / L"shared.nrnexus.json", &decoded, &error)
                 && adapter::Apply(decoded, true, true, &error), "Game two reads and applies game one's preset.");
+      const auto decoded_present_frames = decoded.settings.find(PRESENT_FRAMES_KEY);
+      Check(decoded.scope == presets::Scope::FULL && decoded_present_frames != decoded.settings.end()
+                && decoded_present_frames->is_number_integer() && *decoded_present_frames == 0u,
+            "Full preset file round trip preserves explicit NRPresentFrames integer zero.");
       Check(runtime::intensity.load() == 0.95f && Read("NRIntensity") != "0.1", "Game two writes only its selected INI.");
+      Check(runtime::present_frames.load() == 0u && Read(PRESENT_FRAMES_KEY) == "0",
+            "Applying the Full preset restores Every present from Game frames and writes the legacy INI value zero.");
+      runtime::LoadConfiguration();
+      Check(runtime::present_frames.load() == 0u && Read(PRESENT_FRAMES_KEY) == "0",
+            "Reloading the restored INI keeps explicit zero as Every present.");
       const auto game_two_bytes = Bytes();
       Check(game_two_bytes.find("Persistent=29") != std::string::npos && game_two_bytes.find("PresetPath=game-two.ini") != std::string::npos,
             "Game two unrelated sections remain intact.");

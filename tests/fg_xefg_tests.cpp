@@ -1,4 +1,5 @@
 #define RESHADE_ADDON 1
+#define NR_NEXUS_TEST_NATIVE_SDK_CLOCK
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -146,12 +147,13 @@ struct ReceiptDeviceIdentity : IUnknown {
     return remaining;
   }
 };
-struct ReceiptSwapchain : IDXGISwapChain {
+struct ReceiptSwapchain : IDXGISwapChain3 {
   ULONG references = 1;
   uint32_t get_device_calls = 0;
   ComPtr<IUnknown> reported_device;
   ComPtr<IDXGISwapChain> native_swapchain;
   ComPtr<IUnknown> reported_device12;
+  ComPtr<IUnknown> current_back_buffer;
   HRESULT device11_result = S_OK;
   HRESULT device12_result = S_OK;
   bool null_device11 = false;
@@ -164,6 +166,11 @@ struct ReceiptSwapchain : IDXGISwapChain {
     *output = nullptr;
     if (iid == __uuidof(renodx::utils::directx::ReShadeRetrieveBaseInterface) && native_swapchain != nullptr) {
       return native_swapchain->QueryInterface(__uuidof(IDXGISwapChain), output);
+    }
+    if (iid == __uuidof(IDXGISwapChain3) && current_back_buffer != nullptr) {
+      *output = static_cast<IDXGISwapChain3*>(this);
+      AddRef();
+      return S_OK;
     }
     if (iid != IID_IUnknown && iid != __uuidof(IDXGIObject) && iid != __uuidof(IDXGIDeviceSubObject)
         && iid != __uuidof(IDXGISwapChain)) return E_NOINTERFACE;
@@ -210,7 +217,9 @@ struct ReceiptSwapchain : IDXGISwapChain {
   HRESULT STDMETHODCALLTYPE Present(UINT interval, UINT flags) override {
     return (present_callback != nullptr ? present_callback(this, interval, flags) : E_NOTIMPL);
   }
-  HRESULT STDMETHODCALLTYPE GetBuffer(UINT, REFIID, void**) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetBuffer(UINT index, REFIID iid, void** output) override {
+    return (index == 0 && current_back_buffer != nullptr ? current_back_buffer->QueryInterface(iid, output) : E_NOTIMPL);
+  }
   HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL, IDXGIOutput*) override { return E_NOTIMPL; }
   HRESULT STDMETHODCALLTYPE GetFullscreenState(BOOL*, IDXGIOutput**) override { return E_NOTIMPL; }
   HRESULT STDMETHODCALLTYPE GetDesc(DXGI_SWAP_CHAIN_DESC*) override { return E_NOTIMPL; }
@@ -219,6 +228,30 @@ struct ReceiptSwapchain : IDXGISwapChain {
   HRESULT STDMETHODCALLTYPE GetContainingOutput(IDXGIOutput**) override { return E_NOTIMPL; }
   HRESULT STDMETHODCALLTYPE GetFrameStatistics(DXGI_FRAME_STATISTICS*) override { return E_NOTIMPL; }
   HRESULT STDMETHODCALLTYPE GetLastPresentCount(UINT*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetDesc1(DXGI_SWAP_CHAIN_DESC1*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetHwnd(HWND*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetCoreWindow(REFIID, void**) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE Present1(UINT, UINT, const DXGI_PRESENT_PARAMETERS*) override { return E_NOTIMPL; }
+  BOOL STDMETHODCALLTYPE IsTemporaryMonoSupported() override { return FALSE; }
+  HRESULT STDMETHODCALLTYPE GetRestrictToOutput(IDXGIOutput**) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE SetBackgroundColor(const DXGI_RGBA*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetBackgroundColor(DXGI_RGBA*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE SetRotation(DXGI_MODE_ROTATION) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetRotation(DXGI_MODE_ROTATION*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE SetSourceSize(UINT, UINT) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetSourceSize(UINT*, UINT*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT*) override { return E_NOTIMPL; }
+  HANDLE STDMETHODCALLTYPE GetFrameLatencyWaitableObject() override { return nullptr; }
+  HRESULT STDMETHODCALLTYPE SetMatrixTransform(const DXGI_MATRIX_3X2_F*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetMatrixTransform(DXGI_MATRIX_3X2_F*) override { return E_NOTIMPL; }
+  UINT STDMETHODCALLTYPE GetCurrentBackBufferIndex() override { return 0; }
+  HRESULT STDMETHODCALLTYPE CheckColorSpaceSupport(DXGI_COLOR_SPACE_TYPE, UINT*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE SetColorSpace1(DXGI_COLOR_SPACE_TYPE) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE ResizeBuffers1(UINT, UINT, UINT, DXGI_FORMAT, UINT, const UINT*, IUnknown* const*) override {
+    return E_NOTIMPL;
+  }
 };
 xefg::BridgeSourceIdentity receipt_source;
 bool receipt_source_available = true;
@@ -234,6 +267,9 @@ IUnknown* receipt_proxy = nullptr;  // Borrowed only across the mock SDK callbac
 IUnknown* receipt_secondary_proxy = nullptr;
 IDXGISwapChain* receipt_inner_source = nullptr;
 void* receipt_context_handle = nullptr;
+xefg::abi::PresentStatus receipt_present_status{.frames_presented = 1};
+int32_t receipt_present_status_result = 0;
+void (*receipt_during_present_status)() = nullptr;
 xefg::BridgeSourceObservation ObserveReceiptSource(uintptr_t device11) noexcept {
   xefg::BridgeSourceObservation observation{.queried_device11 = device11,
       .state = xefg::BridgeSnapshotState::RUNTIME_BUSY};
@@ -268,8 +304,11 @@ xefg::BridgeSourceObservation ObserveReceiptD3D12Source(uintptr_t device12) noex
   return observation;
 }
 int32_t FakeReceiptPresentStatus(void*, xefg::abi::PresentStatus* status) {
-  *status = {.frames_presented = 1, .frame_gen_result = 0, .enabled = 0};
-  return 0;
+  *status = receipt_present_status;
+  if (receipt_during_present_status != nullptr) {
+    std::exchange(receipt_during_present_status, nullptr)();
+  }
+  return receipt_present_status_result;
 }
 int32_t ReceiptSdkCall() {
   Check(!xefg::QueryBridgeOff(receipt_source).available, "old Off cannot authorize while the SDK contract call is in flight");
@@ -385,7 +424,7 @@ void TestRouteDiagnostics(Gpu* gpu) {
     }
     session.context->interval_start = std::chrono::steady_clock::now() - std::chrono::seconds(6);
     interval_diagnostic.clear();
-    adapter::EndPresent(&present);
+    adapter::EndPresent(&present, S_OK);
     Check(interval_diagnostic.find(std::string("last_nr_route=") + route + " ") != std::string::npos,
           "last route must match successful role counts, not available inputs or earlier frames");
     Check(interval_diagnostic.find(std::string("last_nr_route_reason=") + reason + ";") != std::string::npos,
@@ -431,10 +470,12 @@ void TestRouteDiagnostics(Gpu* gpu) {
   std::cout << "PASS last Present route/reason diagnostics: successful roles, SDK consumers, Off, skipped and failed\n";
 }
 }  // namespace
+#include "output_framerate_sdk_cases.hpp"
 int main(int argc, char** argv) {
   try {
     const bool bridge_off_cpu = argc == 2 && std::strcmp(argv[1], "--bridge-off-cpu") == 0;
     reshade::internal::get_reshade_module_handle(GetModuleHandleW(nullptr));
+    output_framerate_sdk_cases::Run();
     TestDiagnosticBudgets();
     std::cout << "PASS bounded XeFG contract diagnostics\n";
     fg::native_options::internal::state.real = &FakeOptions;
@@ -492,6 +533,7 @@ int main(int argc, char** argv) {
       adapter::modules[0].real[0] = reinterpret_cast<void*>(&FakeReceiptInit);
       adapter::modules[0].real[1] = reinterpret_cast<void*>(&FakeReceiptInitDesc);
       adapter::modules[0].real[2] = reinterpret_cast<void*>(&FakeReceiptGetSwapchain);
+      adapter::modules[0].real[5] = reinterpret_cast<void*>(&FakeId);
       adapter::modules[0].real[6] = reinterpret_cast<void*>(&FakeReceiptEnable);
       adapter::modules[0].real[8] = reinterpret_cast<void*>(&FakeReceiptDestroy);
       xefg::ConfigureBridgeSource(&ObserveReceiptSource);
@@ -1071,6 +1113,92 @@ int main(int argc, char** argv) {
         auto unobserved_off = linked;
         unobserved_off.available = false;
         Check(!unobserved_off.MatchesOutput(matched_output), "ready SDK Off samples cannot replace an explicit Disable receipt");
+
+        namespace rate = renodx::addons::dlss5::output_framerate;
+        const auto output = linked.output_identity;
+        int host_writes = 0;
+        const auto record_write = [&] { ++host_writes; };
+        rate::Invalidate(output);
+        Check(!rate::Read(output, rate::NowNs()).available && !xefg::BlocksHostWrite(output)
+                  && xefg::WithHostWritePermission(output, &linked, record_write) && host_writes == 1,
+            "a live Disable authorizes the write across a missing FPS window");
+
+        receipt_present_status.enabled = 1;
+        receipt_present_status_result = -19;
+        Check(run_source() == S_OK && xefg::QueryBridgeOff(receipt_source, output).available,
+            "a failed SDK status query cannot revoke an established Off receipt");
+        receipt_present_status_result = 0;
+        Check(run_source(DXGI_PRESENT_TEST) == S_OK && xefg::QueryBridgeOff(receipt_source, output).available,
+            "a TEST Present cannot revoke Off even when the status getter would report On");
+
+        ComPtr<ReceiptSwapchain> another_proxy;
+        another_proxy.Attach(new ReceiptSwapchain(other_identity.Get()));
+        auto another_context = std::make_shared<adapter::Context>();
+        auto* another_handle = reinterpret_cast<void*>(uintptr_t{0xEF003});
+        another_context->device_identity = other_identity;
+        another_context->bridge_application_device11 = other_identity;
+        another_context->proxy_identity = adapter::Identity(another_proxy.Get());
+        another_context->bridge_declaration = ++adapter::state.bridge_declaration;
+        another_context->get_status = &FakeReceiptPresentStatus;
+        adapter::state.contexts.emplace(another_handle, another_context);
+        Check(adapter::ProxyHooks<0>::Present(another_proxy.Get(), 0, 0) == S_OK
+                  && xefg::BlocksHostWrite(another_context->output_identity)
+                  && xefg::QueryBridgeOff(receipt_source, output).available
+                  && xefg::WithHostWritePermission(output, &linked, record_write) && host_writes == 2,
+            "On on a different output cannot invalidate an exact source/output receipt");
+        rate::ReleaseXeFGOutput(another_context->output_identity);
+        adapter::state.contexts.erase(another_handle);
+
+        receipt_during_present_status = +[] {
+          Check(Hooks::Enable(receipt_context_handle, 0) == 0, "explicit Disable while the prior status query returns");
+        };
+        Check(run_source() == S_OK, "SDK Present returns an On status from before the newer Disable");
+        const auto fresh_off = xefg::QueryBridgeOff(receipt_source, output);
+        Check(fresh_off.available && fresh_off.declaration != linked.declaration && !xefg::BlocksHostWrite(output)
+                  && fresh_off.write_epoch == linked.write_epoch
+                  && xefg::WithHostWritePermission(output, &linked, record_write)
+                  && xefg::WithHostWritePermission(output, &fresh_off, record_write) && host_writes == 4,
+            "an older On cannot revoke a newer Disable, and equivalent Off receipts preserve write permission");
+
+        receipt_during_present_status = +[] {
+          std::thread overlapping([] {
+            Check(adapter::ProxyHooks<0>::Present(static_cast<IDXGISwapChain*>(receipt_proxy), 0, DXGI_PRESENT_TEST) == S_OK,
+                "a concurrent proxy Present enters before the first status return");
+          });
+          overlapping.join();
+        };
+        Check(run_source() == S_OK && xefg::QueryBridgeOff(receipt_source, output).available,
+            "ambiguous overlapping Presents cannot revoke a still-current Disable");
+
+        constexpr uint32_t repeated_id = 42;
+        receipt_present_status.enabled = 0;
+        Check(Hooks::PresentId(context_handle, repeated_id) == 0 && run_source() == S_OK,
+            "publish Off status for a tagged application frame");
+        receipt_present_status.enabled = 1;
+        Check(Hooks::PresentId(context_handle, repeated_id) == 0 && run_source() == S_OK
+                  && !rate::Read(output, rate::NowNs()).available
+                  && !xefg::QueryBridgeOff(receipt_source, output).available && xefg::BlocksHostWrite(output)
+                  && !xefg::WithHostWritePermission(output, &fresh_off, record_write)
+                  && !xefg::WithHostWritePermission(output, nullptr, record_write) && host_writes == 4,
+            "one current SDK On on a repeated ID immediately blocks both XeFG and same-output Native Off writes");
+        receipt_present_status.enabled = 0;
+        Check(run_source() == S_OK && xefg::BlocksHostWrite(output)
+                  && !xefg::QueryBridgeOff(receipt_source, output).available,
+            "a subsequent Off status cannot restore either write route");
+        Check(Hooks::Enable(context_handle, 0) == 0 && !xefg::BlocksHostWrite(output)
+                  && xefg::QueryBridgeOff(receipt_source, output).available
+                  && !xefg::WithHostWritePermission(output, &fresh_off, record_write) && host_writes == 4,
+            "a new successful Disable restores the current source/output permission");
+        source_swapchain->present_callback = +[](ReceiptSwapchain*, UINT interval, UINT flags) {
+          Check(adapter::ProxyHooks<0>::Present(static_cast<IDXGISwapChain*>(receipt_proxy), interval, flags) == S_OK
+                    && Hooks::Enable(receipt_context_handle, 0) == 0,
+              "a fresh Disable completes inside the old outer Present");
+          return E_FAIL;
+        };
+        Check(run_source() == E_FAIL && xefg::QueryBridgeOff(receipt_source, output).available,
+            "a late failed mapping observation cannot revoke a newer Disable");
+        source_swapchain->present_callback = normal_present;
+
         Check(run_source() == S_OK && Hooks::Enable(context_handle, 0) == 0
                   && xefg::QueryBridgeOff(receipt_source).available
                   && context->epoch == linked.epoch && context->bridge_link_generation == linked.source_link_generation
@@ -1118,8 +1246,16 @@ int main(int argc, char** argv) {
             "a nested proxy on another D3D12 device cannot authorize the source");
         context->device_identity = native_device12.Get();
         accept_link();
-        Hooks::Enable(context_handle, 1);
-        Check(!xefg::QueryBridgeOff(receipt_source).available, "D3D12 Enable immediately revokes explicit Off");
+        const auto before_enable = context->output_identity;
+        receipt_during_sdk = +[] {
+          const auto inflight_output = adapter::state.contexts.at(receipt_context_handle)->output_identity;
+          Check(xefg::BlocksHostWrite(inflight_output), "same-output Enable in flight blocks the Native Off shortcut");
+        };
+        Check(Hooks::Enable(context_handle, 1) == 0, "D3D12 Enable succeeds at the real hook");
+        receipt_during_sdk = nullptr;
+        Check(!xefg::QueryBridgeOff(receipt_source).available && xefg::BlocksHostWrite(before_enable)
+                  && context->output_identity && xefg::BlocksHostWrite(context->output_identity),
+            "D3D12 Enable revokes Off and keeps the current output claimed before another Present");
         Hooks::Enable(context_handle, 0);
         Check(xefg::QueryBridgeOff(receipt_source).available && context->epoch != linked.epoch,
             "D3D12 reenable/disable changes the epoch before accepting a new receipt");
@@ -1325,6 +1461,7 @@ int main(int argc, char** argv) {
             receipt_during_sdk = nullptr;
             const auto reentrant_events = events_after(trace_before_reentry);
             Check(reentrant_status == 0 && !xefg::QueryBridgeOff(receipt_source).available
+                      && xefg::BlocksHostWrite(context->output_identity)
                       && context->bridge_enable_inflight == 0 && reentrant_events.size() == 4
                       && reentrant_events[0].kind == xefg::BridgeEventKind::ENABLE_BEGIN
                       && reentrant_events[1].kind == xefg::BridgeEventKind::ENABLE_BEGIN

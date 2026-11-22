@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 
@@ -19,6 +20,8 @@ enum class Api : uint8_t { UNKNOWN, DX11, DX12, VULKAN, OTHER };
 enum class Backend : uint8_t { UNKNOWN, NATIVE, DX11_BRIDGE, STREAMLINE_FALLBACK };
 enum class Runtime : uint8_t { UNKNOWN, AVAILABLE, UNAVAILABLE };
 enum class Fg : uint8_t { UNKNOWN, OFF, ON };
+enum class GeometryMode : uint8_t { PREVIEW, EXECUTION };
+enum class Delivery : uint8_t { ORDINARY, FG_INPUT };
 enum class Reason : uint8_t {
   NONE, ENVIRONMENT_UNKNOWN, RUNTIME_UNAVAILABLE, BACKEND_UNSUPPORTED, PLAN_REJECTED,
   INVALID_PLAN, INVALID_RESOLUTION, INDEPENDENT_MODE_UNSUPPORTED, GROUP_SIZE_MISMATCH,
@@ -87,6 +90,12 @@ struct Input {
   // Caller must invalidate this when any configuration/environment/source
   // generation changes. This does not authorize execution or prove visual quality.
   bool current_execution_proven = false;
+  GeometryMode mode = GeometryMode::PREVIEW;
+  Delivery delivery = Delivery::ORDINARY;
+  uint32_t required_roles = 1;  // Bitmask of model roles for each source output.
+  uint32_t source_outputs = 1;
+  bool independent_size_bindings = true;  // The consumer can bind a separate workset for each pass.
+  std::array<Size, stage_plan::kMaxPasses> applied_sizes{};  // Execution-only selected grids, indexed by logical pass.
 };
 inline constexpr uint32_t kNoIndex = stage_plan::kMaxPasses;
 struct Decision {
@@ -96,6 +105,11 @@ struct Decision {
   uint32_t group = kNoIndex;
   bool independent_sizes_allowed = false;
   bool CanSubmit() const { return status == Status::SUPPORTED; }
+};
+struct GroupEvaluation {
+  Decision decision;
+  std::array<Size, stage_plan::kMaxPasses> working_sizes{};
+  uint32_t output_count = 0;
 };
 struct Result {
   Decision configuration;
@@ -132,67 +146,105 @@ inline constexpr const char* ReasonText(Reason reason) {
   return "Unknown capability reason";
 }
 
-// Shared policy boundary for ComputeNrGroupWorkingResolution and the dual-size
-// execution branches. It grants configuration eligibility only, never resource,
-// queue, producer identity, feature availability or successful GPU execution.
-namespace internal {
-
-// Query validates the plan and environment before entering this boundary.
-inline Decision QueryGroup(const Input& input, uint32_t group_index) {
+// Evaluates one effective group. Query checks the whole plan and environment;
+// execution supplies the group and delivery selected for the current frame.
+inline GroupEvaluation EvaluateGroup(const Input& input, uint32_t group_index) {
+  if (!input.plan.valid) return {.decision = {.status = Status::UNSUPPORTED, .reason = Reason::PLAN_REJECTED}};
+  if (group_index >= input.plan.group_count || group_index >= input.plan.groups.size()) {
+    return {.decision = {.status = Status::UNSUPPORTED, .reason = Reason::INVALID_PLAN}};
+  }
   const auto& group = input.plan.groups[group_index];
+  if (group.begin >= stage_plan::kMaxPasses || group.count == 0
+      || group.count > stage_plan::kMaxPasses - group.begin
+      || static_cast<uint32_t>(group.stage) >= input.geometry.size()) {
+    return {.decision = {.status = Status::UNSUPPORTED, .reason = Reason::INVALID_PLAN, .group = group_index}};
+  }
   const auto& geometry = input.geometry[static_cast<uint32_t>(group.stage)];
+  GroupEvaluation evaluation{
+      .decision = {.pass = group.begin, .group = group_index},
+      .output_count = static_cast<uint32_t>(std::popcount(input.required_roles)) * input.source_outputs};
+  if (input.api == Api::VULKAN) {
+    // Vulkan records on the full SR output rectangle. A stored base size
+    // request can fall back to that rectangle, but cannot be newly submitted.
+    if (input.mode == GeometryMode::PREVIEW
+        && (input.main_resolution.follow_input || std::abs(input.main_resolution.scale - 1.f) > 0.00001f)) {
+      evaluation.decision.status = Status::UNSUPPORTED;
+      evaluation.decision.reason = Reason::INDEPENDENT_MODE_UNSUPPORTED;
+      return evaluation;
+    }
+    for (uint32_t pass = group.begin; pass < group.begin + group.count; ++pass) {
+      if (pass != 0 && input.resolutions[pass - 1].mode != 0) {
+        evaluation.decision = {.status = Status::UNSUPPORTED, .reason = Reason::INDEPENDENT_MODE_UNSUPPORTED,
+                               .pass = pass, .group = group_index};
+        return evaluation;
+      }
+      evaluation.working_sizes[pass] = {.width = geometry.reference_width, .height = geometry.reference_height};
+    }
+    return evaluation;
+  }
+  const bool execution = input.mode == GeometryMode::EXECUTION;
+  if (execution) {
+    for (uint32_t pass = group.begin; pass < group.begin + group.count; ++pass) {
+      const auto& applied = input.applied_sizes[pass];
+      if ((applied.width == 0) != (applied.height == 0)) {
+        evaluation.decision = {.status = Status::UNSUPPORTED, .reason = Reason::INVALID_RESOLUTION,
+                               .pass = pass, .group = group_index};
+        return evaluation;
+      }
+    }
+  }
   const auto first = ResolveResolution(group.begin, input.main_resolution, input.resolutions);
-  const auto known_size = [&](EffectiveResolution settings) {
-    // A cached reference rectangle does not establish the current Guide size.
-    // The executor may use a saved-scale fallback, but a UI query must not
-    // misclassify an unobserved Follow-input combination as a proven mismatch.
-    if (settings.follow_input && (geometry.guide_width == 0 || geometry.guide_height == 0)) return Size{};
+  const auto working_size = [&](uint32_t pass, EffectiveResolution settings) {
+    if (execution && input.applied_sizes[pass].width != 0) return input.applied_sizes[pass];
+    if (!execution && settings.follow_input
+        && (geometry.guide_width == 0 || geometry.guide_height == 0)) return Size{};
     return ResolveWorkingSize(settings, geometry);
   };
-  const auto first_size = known_size(first);
+  const auto first_size = working_size(group.begin, first);
+  evaluation.working_sizes[group.begin] = first_size;
   bool differs = false;
   bool unknown = false;
-  uint32_t different_pass = group.begin;
+  auto& decision = evaluation.decision;
   for (uint32_t pass = group.begin + 1; pass < group.begin + group.count; ++pass) {
     const auto settings = ResolveResolution(pass, input.main_resolution, input.resolutions);
-    const auto size = known_size(settings);
-    const bool same_settings = settings.follow_input == first.follow_input && settings.scale == first.scale;
+    const auto size = working_size(pass, settings);
+    evaluation.working_sizes[pass] = size;
+    const bool same_settings = settings.follow_input == first.follow_input
+        && (settings.scale == first.scale || (input.mode == GeometryMode::PREVIEW && first.follow_input));
     if (size.width != 0 && first_size.width != 0) {
       if (size == first_size) continue;
       differs = true;
-    } else if (same_settings) {
+    } else if (same_settings && (!execution
+                   || (input.applied_sizes[pass].width == 0 && input.applied_sizes[group.begin].width == 0))) {
       continue;
     } else {
       unknown = true;
     }
-    different_pass = pass;
+    decision.pass = pass;
   }
-  Decision result{.pass = different_pass, .group = group_index};
-  const bool native_pair = group.count == 2 && input.api != Api::VULKAN;
-  result.independent_sizes_allowed = input.api != Api::VULKAN && SupportsIndependentSizes(group.stage, group.count,
-      !input.plan.mixed && !input.native_prefg_resolution_experiment
-          && input.fg == Fg::OFF && !input.fg_owns_input && !input.xefg_enabled && !input.auto_fg_fallback);
-  if (!differs && !unknown) return result;
-  if (result.independent_sizes_allowed) return result;
-  if (native_pair && !input.plan.mixed) {
+  const bool fg_delivery = input.delivery == Delivery::FG_INPUT;
+  decision.independent_sizes_allowed = !fg_delivery && input.independent_size_bindings
+      && SupportsIndependentSizes(group.stage, group.count,
+          !input.plan.mixed && !input.native_prefg_resolution_experiment && input.fg == Fg::OFF
+              && !input.fg_owns_input && !input.xefg_enabled && !input.auto_fg_fallback);
+  if ((!differs && !unknown) || decision.independent_sizes_allowed) return evaluation;
+  if (!fg_delivery && input.independent_size_bindings && group.count == 2 && !input.plan.mixed) {
     if (input.native_prefg_resolution_experiment) {
-      result.status = Status::EXPERIMENTAL;
-      result.reason = Reason::NATIVE_PREFG_BLOCKED;
+      decision.status = Status::EXPERIMENTAL;
+      decision.reason = Reason::NATIVE_PREFG_BLOCKED;
     } else if (input.fg_owns_input || input.xefg_enabled || input.auto_fg_fallback) {
-      result.status = Status::UNSUPPORTED;
-      result.reason = Reason::FG_OWNS_INPUT;
+      decision.status = Status::UNSUPPORTED;
+      decision.reason = Reason::FG_OWNS_INPUT;
     } else if (input.fg != Fg::OFF) {
-      result.status = (input.fg == Fg::UNKNOWN ? Status::NEEDS_PROOF : Status::UNSUPPORTED);
-      result.reason = Reason::FG_OFF_REQUIRED;
+      decision.status = (input.fg == Fg::UNKNOWN ? Status::NEEDS_PROOF : Status::UNSUPPORTED);
+      decision.reason = Reason::FG_OFF_REQUIRED;
     }
-    return result;
+    return evaluation;
   }
-  result.status = (differs ? Status::UNSUPPORTED : Status::NEEDS_PROOF);
-  result.reason = (differs ? Reason::GROUP_SIZE_MISMATCH : Reason::DIMENSIONS_UNKNOWN);
-  return result;
+  decision.status = (differs ? Status::UNSUPPORTED : Status::NEEDS_PROOF);
+  decision.reason = (differs ? Reason::GROUP_SIZE_MISMATCH : Reason::DIMENSIONS_UNKNOWN);
+  return evaluation;
 }
-
-}  // namespace internal
 
 inline Result Query(const Input& input) {
   Result result{.plan_reason = input.plan.reason};
@@ -208,7 +260,10 @@ inline Result Query(const Input& input) {
   const bool native_dx12 = input.api == Api::DX12 && input.backend == Backend::NATIVE;
   const bool bridge_dx11 = input.api == Api::DX11 && input.backend == Backend::DX11_BRIDGE;
   const bool native_vk = input.api == Api::VULKAN && input.backend == Backend::NATIVE;
-  if (!native_dx12 && !bridge_dx11 && !native_vk) return reject(Status::UNSUPPORTED, Reason::BACKEND_UNSUPPORTED);
+  const bool streamline = input.api == Api::DX12 && input.backend == Backend::STREAMLINE_FALLBACK;
+  if (!native_dx12 && !bridge_dx11 && !native_vk && !streamline) {
+    return reject(Status::UNSUPPORTED, Reason::BACKEND_UNSUPPORTED);
+  }
   const auto& plan = input.plan;
   if (plan.pass_count == 0 || plan.pass_count > stage_plan::kMaxPasses
       || plan.group_count == 0 || plan.group_count > plan.groups.size()) {
@@ -228,6 +283,12 @@ inline Result Query(const Input& input) {
     covered += group.count;
   }
   if (covered != plan.pass_count) return reject(Status::UNSUPPORTED, Reason::INVALID_PLAN);
+  if (native_vk && (plan.mixed || plan.groups[0].stage != stage_plan::Stage::UPSCALED)) {
+    return reject(Status::UNSUPPORTED, Reason::BACKEND_UNSUPPORTED);
+  }
+  if (streamline && (plan.mixed || plan.groups[0].stage == stage_plan::Stage::RENDER)) {
+    return reject(Status::UNSUPPORTED, Reason::BACKEND_UNSUPPORTED);
+  }
   if (!input.game_source_known) {
     for (uint32_t pass = 0; pass < plan.pass_count; ++pass) {
       if (plan.requested[pass] == stage_plan::Stage::RENDER) {
@@ -240,13 +301,6 @@ inline Result Query(const Input& input) {
     // RR may legitimately collapse a requested mixed chain into one group.
     if (!plan.mixed || plan.reason != stage_plan::Reason::RR_AFTER) return reject(Status::UNSUPPORTED, Reason::INVALID_PLAN);
   }
-  if (plan.mixed && native_vk) return reject(Status::UNSUPPORTED, Reason::BACKEND_UNSUPPORTED);
-  if (native_vk && plan.requested[0] != stage_plan::Stage::UPSCALED) {
-    return reject(Status::UNSUPPORTED, Reason::BACKEND_UNSUPPORTED);
-  }
-  if (native_vk && (input.main_resolution.follow_input || std::abs(input.main_resolution.scale - 1.f) > 0.00001f)) {
-    return reject(Status::UNSUPPORTED, Reason::INDEPENDENT_MODE_UNSUPPORTED);
-  }
   if (plan.mixed && input.fg_owns_input) return reject(Status::UNSUPPORTED, Reason::FG_OWNS_INPUT);
   const auto present = plan.At(stage_plan::Stage::PRESENT);
   const bool b1 = mixed && present.count != 0;
@@ -257,14 +311,15 @@ inline Result Query(const Input& input) {
     if (pass != 0 && input.resolutions[pass - 1].mode > 2) return reject(Status::UNSUPPORTED, Reason::INVALID_RESOLUTION, pass);
     const auto settings = ResolveResolution(pass, input.main_resolution, input.resolutions);
     if (!std::isfinite(settings.scale)) return reject(Status::UNSUPPORTED, Reason::INVALID_RESOLUTION, pass);
-    if (native_vk && pass != 0 && input.resolutions[pass - 1].mode != 0) {
-      return reject(Status::UNSUPPORTED, Reason::INDEPENDENT_MODE_UNSUPPORTED, pass);
-    }
-    result.working_sizes[pass] = ResolveWorkingSize(settings, input.geometry[static_cast<uint32_t>(plan.effective[pass])]);
   }
   for (uint32_t index = 0; index < plan.group_count; ++index) {
-    result.groups[index] = internal::QueryGroup(input, index);
-    if (!result.groups[index].CanSubmit() && result.configuration.CanSubmit()) result.configuration = result.groups[index];
+    const auto evaluation = EvaluateGroup(input, index);
+    result.groups[index] = evaluation.decision;
+    const auto& group = plan.groups[index];
+    for (uint32_t pass = group.begin; pass < group.begin + group.count; ++pass) {
+      result.working_sizes[pass] = evaluation.working_sizes[pass];
+    }
+    if (!evaluation.decision.CanSubmit() && result.configuration.CanSubmit()) result.configuration = evaluation.decision;
   }
   result.group_count = plan.group_count;
   if (b1) {

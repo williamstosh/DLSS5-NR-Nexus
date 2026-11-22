@@ -475,6 +475,23 @@ Remove-Item Env:NR_NEXUS_TEST_CONTROL_MASK_COST_MODE
 SDK 动态计数、固定倍率失效和来源切换。配置保存／方案另用
 `tests/run-present-restore-configuration-tests.ps1 -Case nr-resolution-adaptive,profiles`。
 
+资源策略四档回退的原生定向入口如下。参数使用已有 ProjectID、SDK 静态库及匹配的 NR／SR Runtime。
+该用例要求 NR 310.9.16.0；NR／SR Runtime DLL 与输出目录须位于同一卷，runner 使用硬链接并在结束时移除。
+
+~~~powershell
+./tools/run-tests.ps1 -Suite fg-native -NativeCase adaptive-resource-strategy-native `
+  -NativeNgxProjectIdPath $projectIdPath -NativeNgxSdkLibraryDirectory $sdkLibraryDirectory `
+  -NativeNgxRuntimePath $runtimePath -NativeNgxSrRuntimePath $srRuntimePath `
+  -UiPreview None -RetentionMode Standard -OutputDirectory tmp/offline/resource-strategy-native
+~~~
+
+该入口以正式设置请求策略 0、2、3，保持显式四档、全档预备、单 B Pass、单输出及 FP16。
+真实 SR 为 640×360→960×540，固定模型 Color 输入，每档从 Reset 对齐四次真实 NR Evaluate。
+`adaptive-resource-strategy-native.json` 记录实际策略、逐档 Create／Evaluate 格点、完成 Fence、
+proxy／NR 原始结果／最终输出的 CRC 与残差，以及原 SR alpha 保留情况。
+档位请求由夹具直接发给 Session，证据为 NATIVE_GPU＋NATIVE_NGX；内部实际模型、游戏动态画质和性能仍各自验收。
+需要 NVIDIA GPU，`-SoftwareOnly` 会拒绝该用例；`-BuildOnly` 可只编译。
+
 双 Present 的自适应开关与预备使用独立的小型 Service 入口：
 
 ~~~powershell

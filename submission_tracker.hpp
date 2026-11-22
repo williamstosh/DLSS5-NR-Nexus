@@ -41,8 +41,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
-#include <mutex>
 #include <memory>
+#include <mutex>
+#include <span>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -66,6 +67,31 @@ struct GenerationSubmission {
   uint64_t recording_generation = 0;
 };
 
+enum class RecordingOwner : uint8_t {
+  kUnknown,
+  kOrdinaryPresent,
+  kXeFg,
+  kBridge,
+  kBorrowedGame,
+  kConflicting,
+};
+
+enum class UseKind : uint8_t { kUnknown, kIndependentGuide, kProvider, kOutputColor };
+enum class CloseReason : uint8_t { kOpen, kReset, kDestroyed, kOwnerDiscarded };
+
+struct OutputUse {
+  const void* resource = nullptr;
+  uint32_t subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  uint64_t version = 0;
+  bool operator==(const OutputUse&) const = default;
+};
+
+struct ResourceUse {
+  const void* object = nullptr;
+  UseKind kind = UseKind::kUnknown;
+  OutputUse output;
+};
+
 // Optional observation survives pruning, so a CPU state ledger can distinguish
 // a discarded recording from one whose submitted work completed.
 struct RecordingStatus {
@@ -73,6 +99,7 @@ struct RecordingStatus {
   uint64_t generation = 0;
   std::atomic_bool submitted{false};
   std::atomic_bool closed{false};
+  std::atomic<CloseReason> close_reason{CloseReason::kOpen};
   // Protected by tracker_mutex. Survives pruning as positive evidence for
   // objects whose last recording is no longer in live_uses.
   bool completed_healthy = false;
@@ -84,10 +111,17 @@ struct Generation {
   // False once the recording was discarded (Reset) or the list destroyed:
   // the app can no longer replay it.
   bool open = true;
+  RecordingOwner owner = RecordingOwner::kUnknown;
+  CloseReason close_reason = CloseReason::kOpen;
   // Addon-owned GPU objects this recording can reference (deduplicated).
   std::vector<const void*> uses;
+  std::vector<ResourceUse> classified_uses;
   std::vector<GenerationSubmission> submissions;
   std::shared_ptr<RecordingStatus> status;
+  // The first observed Execute has its own reservation. A later Execute may
+  // complete its reservation first and cannot supply this one's proof.
+  uint64_t first_execute = 0;
+  size_t first_submission_index = SIZE_MAX;
   // Marked before any reservation allocation. If bookkeeping throws, the
   // real Execute still runs and Reset must not turn this into a discarded use.
   uint64_t unreserved_submissions = 0;
@@ -97,6 +131,7 @@ struct ListState {
   // Generation id currently being recorded; entries are created lazily by the
   // first use or submission, so untouched game lists cost nothing.
   uint64_t current = 1;
+  bool current_observed = false;
   bool destroyed = false;
   std::unordered_map<uint64_t, Generation> generations;
   // Every pointer seen to carry this identity - under ReShade two, the
@@ -175,6 +210,7 @@ inline std::unordered_map<const void*, uint64_t> identity_by_pointer;
 // Live-use refcount per tracked pointer: how many generations can still
 // execute or replay it. Absent/zero means nothing retains the object.
 inline std::unordered_map<const void*, uint64_t> live_uses;
+inline uint64_t next_execute = 1;  // tracker_mutex
 // What PruneCompletedGenerations may still act on, so the per-present prune
 // skips tracker_mutex and the walk of every tracked list while there is none
 // (NR off or idle).  Exact after each prune (the generations it left; it
@@ -236,22 +272,54 @@ inline ID3D12CommandList* DestroyAlias(ID3D12CommandList* list) {
 
 // Record-time (evaluate thread): the list's current recording can reference
 // `resource`. Idempotent within a generation.
-inline void TrackUse(ID3D12CommandList* list, const void* resource) {
+inline void SetRecordingOwner(ID3D12CommandList* list, RecordingOwner owner, bool only_if_unknown = false) {
+  if (list == nullptr || owner == RecordingOwner::kUnknown) return;
+  ID3D12CommandList* const native = DestroyAlias(list);
+  std::lock_guard lock(tracker_mutex);
+  const uint64_t key = ListIdentity(list, true);
+  ListState& state = tracked_lists[key];
+  state.current_observed = true;
+  RememberAliasLocked(list, key, state);
+  if (native != list) RememberAliasLocked(native, key, state);
+  auto& recorded_owner = state.generations[state.current].owner;
+  if (recorded_owner == RecordingOwner::kUnknown) {
+    recorded_owner = owner;
+  } else if (!only_if_unknown && recorded_owner != owner) {
+    recorded_owner = RecordingOwner::kConflicting;
+  }
+}
+
+inline void TrackUse(ID3D12CommandList* list, const void* resource,
+                     UseKind kind = UseKind::kUnknown, const OutputUse& output = {}) {
   if (list == nullptr || resource == nullptr) return;
   ever_tracked_uses.store(true, std::memory_order_release);
   ID3D12CommandList* const native = DestroyAlias(list);
   std::lock_guard<std::mutex> lock(tracker_mutex);
   const uint64_t key = ListIdentity(list, true);
   ListState& state = tracked_lists[key];
+  state.current_observed = true;
   RememberAliasLocked(list, key, state);
   if (native != list) RememberAliasLocked(native, key, state);
   Generation& generation = state.generations[state.current];
-  for (const void* use : generation.uses) {
-    if (use == resource) return;
+  if (std::ranges::none_of(generation.classified_uses, [&](const ResourceUse& use) {
+        return use.object == resource && use.kind == kind && use.output == output;
+      })) {
+    generation.classified_uses.push_back({.object = resource, .kind = kind, .output = output});
   }
+  if (std::ranges::find(generation.uses, resource) != generation.uses.end()) return;
   generation.uses.push_back(resource);
   ++live_uses[resource];
   generations_outstanding.fetch_add(1, std::memory_order_relaxed);
+}
+
+inline void CloseRecordingLocked(Generation* generation, CloseReason reason) {
+  if (!generation->open) return;
+  generation->open = false;
+  generation->close_reason = reason;
+  if (generation->status != nullptr) {
+    generation->status->close_reason.store(reason);
+    generation->status->closed.store(true);
+  }
 }
 
 // Reset hook: the recorded generation can never be replayed or submitted
@@ -260,9 +328,9 @@ inline void TrackUse(ID3D12CommandList* list, const void* resource) {
 // borrowed native alias so raw command observers can end the same recording.
 inline ID3D12CommandList* OnCommandListReset(ID3D12CommandList* list) {
   if (list == nullptr) return nullptr;
-  const uint64_t key = ListIdentity(list, false);
   ID3D12CommandList* const native = DestroyAlias(list);
   std::lock_guard<std::mutex> lock(tracker_mutex);
+  const uint64_t key = ListIdentity(list, false);
   const auto it = tracked_lists.find(key);
   if (it == tracked_lists.end()) return native;
   ListState& state = it->second;
@@ -272,15 +340,37 @@ inline ID3D12CommandList* OnCommandListReset(ID3D12CommandList* list) {
   // ones) has anything to close.  Through rc4 this created an empty closed
   // one on every Reset of every list NR ever touched, and the next prune
   // erased it again: with NR off that was one entry per list per frame, so
-  // generations_outstanding could never read 0.
+  // generations_outstanding could never read 0. Advance only an observed
+  // recording, so the native Reset hook and a private pool reporting the
+  // same successful Reset do not invent a second recording generation.
   if (const auto current = state.generations.find(state.current);
       current != state.generations.end()) {
-    current->second.open = false;
-    if (current->second.status != nullptr) current->second.status->closed.store(true);
+    CloseRecordingLocked(&current->second, CloseReason::kReset);
     generations_outstanding.fetch_add(1, std::memory_order_relaxed);
   }
-  ++state.current;
+  if (state.current_observed) {
+    ++state.current;
+    state.current_observed = false;
+  }
   return native;
+}
+
+// The owner has irrevocably canceled submission of its own recording.
+// Closing a D3D12 list alone does not provide this guarantee.
+inline bool DiscardOwnedRecording(ID3D12CommandList* list, RecordingOwner owner) {
+  if (list == nullptr || (owner != RecordingOwner::kOrdinaryPresent
+      && owner != RecordingOwner::kXeFg && owner != RecordingOwner::kBridge)) return false;
+  std::lock_guard lock(tracker_mutex);
+  const auto found = tracked_lists.find(ListIdentity(list, false));
+  if (found == tracked_lists.end()) return false;
+  auto& state = found->second;
+  const auto recording = state.generations.find(state.current);
+  if (recording == state.generations.end() || recording->second.owner != owner) return false;
+  CloseRecordingLocked(&recording->second, CloseReason::kOwnerDiscarded);
+  // Keep this generation current until the real Reset. The owner may still
+  // destroy the list, and a stale Execute must stay attributed to this record.
+  generations_outstanding.fetch_add(1, std::memory_order_relaxed);
+  return true;
 }
 
 // Destruction (final Release observed): replay is impossible, so open
@@ -298,8 +388,7 @@ inline void OnCommandListDestroyed(ID3D12CommandList* list) {
   if (it == tracked_lists.end()) return;
   it->second.destroyed = true;
   for (auto& [id, generation] : it->second.generations) {
-    generation.open = false;
-    if (generation.status != nullptr) generation.status->closed.store(true);
+    CloseRecordingLocked(&generation, CloseReason::kDestroyed);
   }
   generations_outstanding.fetch_add(1, std::memory_order_relaxed);
 }
@@ -316,6 +405,7 @@ struct PendingSubmission {
   // opened by the record side through a different object (see ListIdentity).
   uint64_t list = 0;
   uint64_t generation = 0;
+  size_t submission_index = 0;
 };
 
 #ifdef NR_NEXUS_TEST_SUBMISSION_FAILURE
@@ -327,6 +417,7 @@ inline std::vector<PendingSubmission> BeginSubmission(
   std::vector<PendingSubmission> pending;
   if (lists == nullptr) return pending;
   std::lock_guard<std::mutex> lock(tracker_mutex);
+  const uint64_t execute = next_execute++;
   // Cover the whole batch before any operation that can allocate. A throw
   // on the first list must also retain every later list that Execute forwards.
   for (UINT i = 0; i < count; ++i) {
@@ -335,8 +426,14 @@ inline std::vector<PendingSubmission> BeginSubmission(
     if (list == tracked_lists.end()) continue;
     const auto generation = list->second.generations.find(list->second.current);
     if (generation == list->second.generations.end() || generation->second.uses.empty()) continue;
-    ++generation->second.unreserved_submissions;
-    if (generation->second.status != nullptr) generation->second.status->submitted.store(true);
+    auto& recording = generation->second;
+    ++recording.unreserved_submissions;
+    if (recording.first_execute == 0) {
+      recording.first_execute = execute;
+    }
+    if (recording.status != nullptr) {
+      recording.status->submitted.store(true);
+    }
   }
   for (UINT i = 0; i < count; ++i) {
     ID3D12CommandList* list = lists[i];
@@ -357,11 +454,16 @@ inline std::vector<PendingSubmission> BeginSubmission(
 #ifdef NR_NEXUS_TEST_SUBMISSION_FAILURE
     if (reservation_fault != nullptr) reservation_fault(0);
 #endif
-    generation.submissions.push_back({});
+    const size_t submission_index = generation.submissions.size();
+    generation.submissions.push_back({
+        .list_identity = key, .recording_generation = state.current});
 #ifdef NR_NEXUS_TEST_SUBMISSION_FAILURE
     if (reservation_fault != nullptr) reservation_fault(1);
 #endif
-    pending.push_back({key, state.current});
+    pending.push_back({.list = key, .generation = state.current, .submission_index = submission_index});
+    if (generation.first_execute == execute && generation.first_submission_index == SIZE_MAX) {
+      generation.first_submission_index = submission_index;
+    }
     --generation.unreserved_submissions;
   }
   return pending;
@@ -381,15 +483,13 @@ inline void CompleteSubmission(
     if (list_it == tracked_lists.end()) continue;
     const auto gen_it = list_it->second.generations.find(reservation.generation);
     if (gen_it == list_it->second.generations.end()) continue;
-    for (GenerationSubmission& submission : gen_it->second.submissions) {
-      if (!submission.pending) continue;
-      submission.pending = false;
-      submission.fence = FenceRef(fence);
-      submission.value = value;
-      submission.list_identity = reservation.list;
-      submission.recording_generation = reservation.generation;
-      break;
-    }
+    auto& submissions = gen_it->second.submissions;
+    if (reservation.submission_index >= submissions.size()) continue;
+    auto& submission = submissions[reservation.submission_index];
+    if (!submission.pending) continue;
+    submission.pending = false;
+    submission.fence = FenceRef(fence);
+    submission.value = value;
   }
 }
 
@@ -489,21 +589,31 @@ inline bool ResourceReleasable(const void* resource) {
 // The B1 source and its final copy must be recorded in this exact order on
 // the same recording; equal queue fence values alone cannot prove that.
 inline std::pair<uint64_t, uint64_t> RecordingIdentity(ID3D12CommandList* list) {
-  const auto identity = ListIdentity(list, true);
+  if (list == nullptr) return {};
+  ID3D12CommandList* const native = DestroyAlias(list);
   std::lock_guard lock(tracker_mutex);
+  const auto identity = ListIdentity(list, true);
   auto& state = tracked_lists[identity];
+  state.current_observed = true;
+  RememberAliasLocked(list, identity, state);
+  if (native != list) RememberAliasLocked(native, identity, state);
   return {identity, state.current};
 }
 
 inline std::shared_ptr<RecordingStatus> ObserveRecording(ID3D12CommandList* list) {
-  const auto identity = ListIdentity(list, true);
+  if (list == nullptr) return {};
   std::lock_guard lock(tracker_mutex);
+  const auto identity = ListIdentity(list, true);
   auto& state = tracked_lists[identity];
+  state.current_observed = true;
   auto& generation = state.generations[state.current];
   if (generation.status == nullptr) {
     generation.status = std::make_shared<RecordingStatus>();
     generation.status->list = identity;
     generation.status->generation = state.current;
+    generation.status->submitted.store(generation.first_execute != 0);
+    generation.status->close_reason.store(generation.close_reason);
+    generation.status->closed.store(!generation.open);
   }
   return generation.status;
 }
@@ -599,32 +709,165 @@ inline bool HasUnprovenSubmissions() {
   return false;
 }
 
-inline RecordedWork RecordedWorkState() {
-  std::lock_guard<std::mutex> lock(tracker_mutex);
-  bool replayable = false;
-  for (const auto& [key, state] : tracked_lists) {
+enum class SubmissionProofState : uint8_t {
+  kUnsubmitted,
+  kUnreserved,
+  kReserved,
+  kSignalFailed,
+  kInFlight,
+  kComplete,
+  kDeviceRemoved,
+};
+
+struct SubmissionFact {
+  SubmissionProofState state = SubmissionProofState::kUnsubmitted;
+  FenceRef fence;
+  uint64_t value = 0;
+  uint64_t completed_value = 0;
+};
+
+struct RecordingBlocker {
+  uint64_t list = 0;
+  uint64_t generation = 0;
+  RecordingOwner owner = RecordingOwner::kUnknown;
+  CloseReason close_reason = CloseReason::kOpen;
+  RecordedWork work = RecordedWork::kPending;
+  std::vector<ResourceUse> uses;
+  uint64_t first_execute = 0;
+  SubmissionFact first_submission;
+  uint64_t unreserved_submissions = 0;
+  std::vector<SubmissionFact> submissions;
+};
+
+inline SubmissionFact ReadSubmission(const GenerationSubmission& submission) {
+  if (submission.pending) return {.state = SubmissionProofState::kReserved};
+  if (submission.fence.empty()) return {.state = SubmissionProofState::kSignalFailed};
+  const uint64_t completed = submission.fence->GetCompletedValue();
+  const auto state = (completed == UINT64_MAX ? SubmissionProofState::kDeviceRemoved
+                      : completed >= submission.value ? SubmissionProofState::kComplete
+                                                      : SubmissionProofState::kInFlight);
+  return {.state = state, .fence = submission.fence, .value = submission.value, .completed_value = completed};
+}
+
+// Pending takes precedence over replayable. When requested, keep every
+// blocker, including closed generations with outstanding executions.
+template <typename Includes>
+inline RecordedWork InspectRecordedWork(Includes includes, std::vector<RecordingBlocker>* blockers,
+                                        ID3D12Fence* ordered_queue_fence = nullptr) {
+  if (blockers != nullptr) {
+    blockers->clear();
+  }
+  std::lock_guard lock(tracker_mutex);
+  RecordedWork overall = RecordedWork::kComplete;
+  for (const auto& [identity, state] : tracked_lists) {
     for (const auto& [id, generation] : state.generations) {
-      if (generation.uses.empty()) continue;
-      if (generation.unreserved_submissions != 0) return RecordedWork::kPending;
-      if (generation.submissions.empty()) {
-        if (generation.open) return RecordedWork::kPending;
-        continue;
-      }
-      bool device_removed = true;
+      if (generation.uses.empty() || !includes(identity, id, generation)) continue;
+      bool pending = (generation.unreserved_submissions != 0
+                      || (generation.open && generation.submissions.empty()));
+      bool device_removed = !generation.submissions.empty();
       for (const GenerationSubmission& submission : generation.submissions) {
         if (submission.pending || submission.fence.empty()) {
-          return RecordedWork::kPending;
+          pending = true;
+          device_removed = false;
+          continue;
         }
         const uint64_t completed = submission.fence->GetCompletedValue();
         device_removed &= completed == UINT64_MAX;
-        if (completed != UINT64_MAX && completed < submission.value) {
-          return RecordedWork::kPending;
-        }
+        const bool already_ordered = !generation.open && ordered_queue_fence != nullptr
+            && submission.fence.fence == ordered_queue_fence && submission.value != 0;
+        pending |= completed != UINT64_MAX && completed < submission.value && !already_ordered;
       }
-      replayable = replayable || (generation.open && !device_removed);
+      const auto work = (pending ? RecordedWork::kPending
+                         : generation.open && !device_removed ? RecordedWork::kReplayable
+                                                              : RecordedWork::kComplete);
+      if (work == RecordedWork::kComplete) continue;
+      if (work == RecordedWork::kPending || overall == RecordedWork::kComplete) {
+        overall = work;
+      }
+      if (blockers == nullptr) {
+        if (overall == RecordedWork::kPending) return overall;
+        continue;
+      }
+      RecordingBlocker blocker{
+          .list = identity, .generation = id, .owner = generation.owner,
+          .close_reason = generation.close_reason, .work = work,
+          .uses = generation.classified_uses, .first_execute = generation.first_execute,
+          .unreserved_submissions = generation.unreserved_submissions};
+      if (generation.first_submission_index < generation.submissions.size()) {
+        blocker.first_submission = ReadSubmission(generation.submissions[generation.first_submission_index]);
+      } else if (generation.first_execute != 0) {
+        blocker.first_submission.state = SubmissionProofState::kUnreserved;
+      }
+      for (const auto& submission : generation.submissions) {
+        blocker.submissions.push_back(ReadSubmission(submission));
+      }
+      blockers->push_back(std::move(blocker));
     }
   }
-  return replayable ? RecordedWork::kReplayable : RecordedWork::kComplete;
+  return overall;
+}
+
+inline RecordedWork RecordedWorkState(std::vector<RecordingBlocker>* blockers = nullptr) {
+  return InspectRecordedWork([](uint64_t, uint64_t, const Generation&) { return true; }, blockers);
+}
+
+// The caller inventories everything its Provider replacement will release.
+// Only positively classified borrowed guide recordings can survive it.
+inline RecordedWork ProviderTeardownWorkState(std::span<const void* const> objects,
+                                              std::vector<RecordingBlocker>* blockers = nullptr) {
+  return InspectRecordedWork([&](uint64_t identity, uint64_t, const Generation& generation) {
+    if ((identity >> 63) != 0 || list_identity_fallbacks.load(std::memory_order_relaxed) != 0
+        || generation.owner != RecordingOwner::kBorrowedGame || generation.classified_uses.empty()) return true;
+    return std::ranges::any_of(generation.classified_uses, [&](const ResourceUse& use) {
+      return use.kind != UseKind::kIndependentGuide || use.output.resource != nullptr
+          || std::ranges::find(objects, use.object) != objects.end();
+    });
+  }, blockers);
+}
+
+inline RecordedWork OutputWorkState(std::span<const OutputUse> outputs,
+                                    const std::pair<uint64_t, uint64_t>& current_recording = {},
+                                    std::vector<RecordingBlocker>* blockers = nullptr,
+                                    ID3D12Fence* ordered_queue_fence = nullptr) {
+  return InspectRecordedWork([&](uint64_t identity, uint64_t id, const Generation& generation) {
+    if (std::pair{identity, id} == current_recording) return false;
+    return std::ranges::any_of(generation.classified_uses, [&](const ResourceUse& use) {
+      return std::ranges::any_of(outputs, [&](const OutputUse& output) {
+        if (use.kind == UseKind::kUnknown) {
+          return output.resource == nullptr || use.object == output.resource;
+        }
+        if (use.kind != UseKind::kOutputColor) return false;
+        return output.resource == nullptr || use.output.resource == nullptr
+              || (use.output.resource == output.resource
+                  && (use.output.subresource == output.subresource
+                      || use.output.subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES
+                      || output.subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES));
+      });
+    });
+  }, blockers, ordered_queue_fence);
+}
+
+inline RecordedWork OutputWorkState(const OutputUse& output,
+                                    const std::pair<uint64_t, uint64_t>& current_recording = {},
+                                    std::vector<RecordingBlocker>* blockers = nullptr) {
+  return OutputWorkState(std::span{&output, 1}, current_recording, blockers);
+}
+
+// The caller supplies the completion tracker fence of the actual queue that
+// will submit the new write. CompleteSubmission published its Signal only
+// after enqueuing it, so closed same-queue work needs no GPU wait.
+inline bool OutputWriteOrdered(std::span<const OutputUse> outputs,
+                               const std::pair<uint64_t, uint64_t>& current_recording,
+                               ID3D12Fence* ordered_queue_fence,
+                               std::vector<RecordingBlocker>* blockers = nullptr) {
+  return OutputWorkState(outputs, current_recording, blockers, ordered_queue_fence) == RecordedWork::kComplete;
+}
+
+inline bool OutputWriteOrdered(const OutputUse& output,
+                               const std::pair<uint64_t, uint64_t>& current_recording,
+                               ID3D12Fence* ordered_queue_fence,
+                               std::vector<RecordingBlocker>* blockers = nullptr) {
+  return OutputWriteOrdered(std::span{&output, 1}, current_recording, ordered_queue_fence, blockers);
 }
 
 // The completion proofs of the submissions that carried `use`, for a consumer

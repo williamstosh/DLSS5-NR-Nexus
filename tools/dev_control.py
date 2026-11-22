@@ -327,6 +327,28 @@ class Client:
             request['tail_frames'] = tail_frames
         return self._mutation(request, deadline)
 
+    def present_handoff_capture(self, action, *, run_directory=None, capture_id=None,
+                                start_on_real_guides=False, deadline=None):
+        """Arm, observe, or stop a bounded BB pair capture for an owned protected run."""
+        deadline = deadline if deadline is not None else time.monotonic() + self.timeout
+        request = dict(id=str(uuid.uuid4()), op='present_handoff_capture', action=action)
+        if type(start_on_real_guides) is not bool:
+            raise ValueError('start_on_real_guides requires a Boolean')
+        if action == 'status':
+            if run_directory is not None or capture_id is not None or start_on_real_guides:
+                raise ValueError('status takes no capture parameters')
+            return self._request(request, deadline)
+        if action not in ('arm', 'stop') or not isinstance(capture_id, str) or not capture_id:
+            raise ValueError('arm and stop require capture_id')
+        request['capture_id'] = capture_id
+        if action == 'arm':
+            if not isinstance(run_directory, str) or not run_directory:
+                raise ValueError('arm requires the protected run directory')
+            request.update(run_directory=run_directory, start_on_real_guides=start_on_real_guides)
+        elif run_directory is not None or start_on_real_guides:
+            raise ValueError('stop takes only capture_id')
+        return self._mutation(request, deadline)
+
     def edit_reuse_fg_experiment(self, enabled, *, deadline=None):
         """Request fixed-size Upscaled x2 with FG On; actual execution is observed separately."""
         if type(enabled) is not bool:
@@ -345,12 +367,17 @@ def main():
     parser.add_argument('--query-id', help='status only: look up an uncertain original request receipt')
     parser.add_argument('--confirm', action='store_true', help='Explicitly approve a returned configuration proposal')
     parser.add_argument('--tail-frames', type=int, help='inline-restore-roi only: capture 2–48 consecutive evaluations at the character ROI')
-    parser.add_argument('op', choices=('status', 'set', 'reset-nr', 'inline-restore-roi'))
+    parser.add_argument('--capture-id', help='Present handoff capture batch ID, required for arm and stop')
+    parser.add_argument('--start-on-real-guides', action='store_true',
+                        help='Wait up to 60 seconds for a Present with confirmed real guides')
+    parser.add_argument('op', choices=('status', 'set', 'reset-nr', 'inline-restore-roi', 'present-handoff-capture'))
     parser.add_argument('key', nargs='?')
     parser.add_argument('value', nargs='?', help='JSON typed value')
     args = parser.parse_args()
     if args.tail_frames is not None and (args.op != 'inline-restore-roi' or not 2 <= args.tail_frames <= 48):
         parser.error('--tail-frames requires inline-restore-roi and a value from 2 to 48')
+    if args.op != 'present-handoff-capture' and (args.capture_id is not None or args.start_on_real_guides):
+        parser.error('capture options require present-handoff-capture')
     journal_file = open(args.journal, 'x', encoding='utf-8') if args.journal else None
 
     def journal(kind, **values):
@@ -369,6 +396,20 @@ def main():
             if not args.key or args.value is not None or args.query_id or args.confirm:
                 parser.error('inline-restore-roi requires one output directory and no setting or confirmation')
             response = client.inline_restore_roi(args.key, tail_frames=args.tail_frames)
+        elif args.op == 'present-handoff-capture':
+            if args.key not in ('arm', 'status', 'stop') or args.query_id or args.confirm:
+                parser.error('present-handoff-capture requires arm, status, or stop')
+            if args.key == 'arm' and (not args.value or not args.capture_id):
+                parser.error('present-handoff-capture arm requires a protected run directory and --capture-id')
+            if args.key == 'stop' and not args.capture_id:
+                parser.error('present-handoff-capture stop requires --capture-id')
+            if args.key != 'arm' and (args.value is not None or args.start_on_real_guides):
+                parser.error('run directory and --start-on-real-guides apply to arm only')
+            if args.key == 'status' and args.capture_id is not None:
+                parser.error('present-handoff-capture status takes no capture options')
+            response = client.present_handoff_capture(args.key, run_directory=args.value,
+                                                      capture_id=args.capture_id,
+                                                      start_on_real_guides=args.start_on_real_guides)
         elif args.op == 'reset-nr':
             if args.key is not None or args.value is not None or args.query_id is not None or args.confirm:
                 parser.error('reset-nr accepts no setting, query or confirmation')
