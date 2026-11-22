@@ -208,9 +208,11 @@ struct Runtime {
   }
 };
 
-template <typename Stats, typename PresentFrame, typename ReadBack, typename ReadSr, typename Swap>
+template <typename Stats, typename PresentFrame, typename ReadBack, typename ReadSr, typename Swap,
+          typename NextExecute, typename PresentSubmissions>
 void Run(Runtime& runtime, const Gpu& gpu, const Stats& stats, const PresentFrame& present_frame,
-         const ReadBack& read_back, const ReadSr& read_sr, const Swap& swap) {
+         const ReadBack& read_back, const ReadSr& read_sr, const Swap& swap,
+         const NextExecute& next_execute, const PresentSubmissions& present_submissions) {
   using nlohmann::json;
   auto* color = native::GetD3D12Resource(runtime.sr_parameters, NVSDK_NGX_Parameter_Color);
   auto* sr_output = native::GetD3D12Resource(runtime.sr_parameters, NVSDK_NGX_Parameter_Output);
@@ -306,17 +308,27 @@ void Run(Runtime& runtime, const Gpu& gpu, const Stats& stats, const PresentFram
   swap();
 
   bool warmed = false;
-  uint32_t prepared = 0;
+  size_t prepared = 0;
   native::enabled = true;
   for (uint32_t attempt = 1; attempt <= WARMUP_LIMIT; ++attempt) {
     const auto before = stats();
     const auto nr_calls = runtime.nr_calls;
+    const auto first_execute = next_execute();
     const auto after = frame(false);
+    const auto [preparation_submissions, color_submissions] = present_submissions(first_execute);
+    const bool ring_matches = after.ring_submissions == before.ring_submissions + preparation_submissions + color_submissions;
     if (after.outputs != before.outputs) {
-      Check(after.outputs == before.outputs + 1 && runtime.nr_calls == nr_calls + 1
-                && after.refreshes == before.refreshes + 1 && after.reuses == before.reuses
-                && after.consumed_serial > before.consumed_serial && after.ring_submissions == before.ring_submissions + 1,
-            "ordinary Present x2 first accepted native frame refreshes once");
+      const bool refreshed = after.outputs == before.outputs + 1 && runtime.nr_calls == nr_calls + 1
+          && after.refreshes == before.refreshes + 1 && after.reuses == before.reuses
+          && after.consumed_serial > before.consumed_serial && color_submissions == 1 && ring_matches;
+      if (!refreshed) {
+        std::cerr << "Present x2 warmup attempt=" << attempt << " outputs=" << after.outputs - before.outputs
+                  << " NR calls=" << runtime.nr_calls - nr_calls << " refreshes=" << after.refreshes - before.refreshes
+                  << " reuses=" << after.reuses - before.reuses << " consumed=" << before.consumed_serial
+                  << "->" << after.consumed_serial << " ring=" << after.ring_submissions - before.ring_submissions
+                  << " preparation=" << preparation_submissions << " color=" << color_submissions << '\n';
+      }
+      Check(refreshed, "ordinary Present x2 first accepted native frame refreshes once");
       report["warmup_attempts"] = attempt;
       report["warmup_prepared_only_submissions"] = prepared;
       report["warmup_completed_present_fence"] = ring_completion();
@@ -326,12 +338,15 @@ void Run(Runtime& runtime, const Gpu& gpu, const Stats& stats, const PresentFram
       break;
     }
     Check(runtime.nr_calls == nr_calls && after.consumed_serial == before.consumed_serial
-              && after.refreshes == before.refreshes && after.reuses == before.reuses,
+              && after.refreshes == before.refreshes && after.reuses == before.reuses
+              && color_submissions == 0 && ring_matches,
           "native warmup leaves the base unconsumed until an output completes");
     const auto retained = capture(false);
-    if (after.ring_submissions > before.ring_submissions) {
-      prepared += 1;
-      if (prepared == 1) report["prepared_only_readback"] = retained;
+    if (preparation_submissions != 0) {
+      if (prepared == 0) {
+        report["prepared_only_readback"] = retained;
+      }
+      prepared += preparation_submissions;
     }
     swap();
   }

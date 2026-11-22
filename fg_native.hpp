@@ -5,6 +5,24 @@
 #pragma once
 
 // Included inside dlss5::internal after present_path.hpp's resource helpers.
+using NativeParameterInputs = std::array<NativePreFgBindings::ColorBinding, 2>;
+struct NativeParameterBorrow {
+  uint64_t serial = 0;
+  NativeParameterInputs inputs;
+};
+// Access is serialized under runtime_mutex with surface preparation.
+static std::unordered_map<const NVSDK_NGX_Parameter*, NativeParameterBorrow> native_parameter_borrows;
+static uint64_t native_parameter_borrow_serial = 0;
+
+inline bool NativeParameterBorrowsResource(const ID3D12Resource* resource) {
+  if (resource == nullptr) return false;
+  return std::ranges::any_of(native_parameter_borrows, [resource](const auto& borrow) {
+    return std::ranges::any_of(borrow.second.inputs, [resource](const auto& input) {
+      return input.replacement.Get() == resource;
+    });
+  });
+}
+
 namespace fg_service {
 
 struct Slot {
@@ -74,6 +92,7 @@ struct Stream {
   NativeInputObservation native_input_observation = NativeInputObservation::NONE;
   const NVSDK_NGX_Parameter* native_pending_parameters = nullptr;
   bool native_pending_redelivery = false;
+  NativePreFgBindings native_legacy_bindings;
   uint64_t native_pair_attempt_frame = 0;
   std::pair<uint64_t, uint64_t> native_pair_recording{};
   std::shared_ptr<submission::RecordingStatus> native_pair_recording_status;
@@ -440,7 +459,7 @@ inline bool PrepareNativeColorInputs(Stream* stream, Slot* slot, const fg::Frame
                                   L"DLSS5 native FG color inputs", "native FG color inputs")) return false;
   for (auto** resource : {&slot->coupled_hudless, &slot->coupled_ui}) {
     if (*resource != nullptr && ((*resource)->GetDesc().Width != input.color_width
-        || (*resource)->GetDesc().Height != input.color_height)) {
+        || (*resource)->GetDesc().Height != input.color_height || NativeParameterBorrowsResource(*resource))) {
       RetirePresentResource(resource);
     }
     if (*resource == nullptr && !CreateScratchTexture(stream->device, input.color_width, input.color_height,
@@ -534,7 +553,9 @@ inline bool PrepareSurfaces(Stream* stream, Slot* slot, const fg::FrameInput& in
         || width > desc.Width - input.color_x || height > desc.Height - input.color_y) return false;
     if (*output != nullptr) {
       const auto have = (*output)->GetDesc();
-      if (have.Width != width || have.Height != height || have.Format != desc.Format) {
+      // An unreturned SDK binding can read this surface again after GPU completion.
+      if (have.Width != width || have.Height != height || have.Format != desc.Format
+          || (stream->native && NativeParameterBorrowsResource(*output))) {
         RetirePresentResource(output);
       }
     }
@@ -1955,12 +1976,87 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
 
 }  // namespace fg_service
 
+static constexpr std::array NATIVE_COLOR_INPUT_KEYS{
+    NVSDK_NGX_DLSSG_Parameter_HUDLess, NVSDK_NGX_DLSSG_Parameter_UI};
+
+// Caller holds runtime_mutex. A failed setter never relinquishes the private
+// resource while this parameter block can still expose its pointer.
+inline bool RestoreNativeParameterInputs(const NVSDK_NGX_Parameter* parameters, NativeParameterInputs* inputs,
+                                         bool used_after_original_call) {
+  bool restored = true;
+  const auto read_binding = [parameters](const char* key) -> std::optional<ID3D12Resource*> {
+    ID3D12Resource* resource = nullptr;
+    const auto typed = parameters->Get(key, &resource);
+    if (NVSDK_NGX_SUCCEED(typed)) return resource;
+    void* pointer = nullptr;
+    const auto untyped = parameters->Get(key, &pointer);
+    if (NVSDK_NGX_SUCCEED(untyped)) return static_cast<ID3D12Resource*>(pointer);
+    if (typed == NVSDK_NGX_Result_FAIL_MissingInput && untyped == NVSDK_NGX_Result_FAIL_MissingInput) return nullptr;
+    return std::nullopt;
+  };
+  for (size_t index = 0; index < inputs->size(); ++index) {
+    auto& input = (*inputs)[index];
+    if (input.replacement == nullptr) continue;
+    const char* key = NATIVE_COLOR_INPUT_KEYS[index];
+    auto bound = read_binding(key);
+    if (bound == input.replacement.Get()) {
+      NVSDK_NGX_Parameter_SetVoidPointer(const_cast<NVSDK_NGX_Parameter*>(parameters), key, input.original.Get());
+      bound = read_binding(key);
+    }
+    restored &= bound == input.original.Get();
+    if (bound.has_value() && *bound != input.replacement.Get()) {
+      if (used_after_original_call) {
+        auto* retained = input.replacement.Detach();
+        RetirePresentResource(&retained);
+      } else {
+        input.replacement.Reset();
+      }
+      input.original.Reset();
+    }
+  }
+  return restored;
+}
+
+inline bool RecoverNativePreFgParameters(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Parameter* parameters) {
+  const auto borrow = native_parameter_borrows.find(parameters);
+  if (borrow == native_parameter_borrows.end()) return true;
+  auto& inputs = borrow->second.inputs;
+  RestoreNativeParameterInputs(parameters, &inputs, true);
+  const bool retained = std::ranges::any_of(inputs, [](const auto& input) { return input.replacement != nullptr; });
+  if (retained) {
+    for (const auto& input : inputs) submission::TrackUse(list, input.replacement.Get());
+  } else {
+    native_parameter_borrows.erase(borrow);
+  }
+  return !retained;
+}
+
+inline uint64_t NativePreFgParameterBorrowSerial(const NVSDK_NGX_Parameter* parameters) {
+  std::optional<RuntimeLock> lock;
+  if (!HoldingRuntimeLock()) lock.emplace(runtime_mutex);
+  const auto borrow = native_parameter_borrows.find(parameters);
+  return borrow == native_parameter_borrows.end() ? 0 : borrow->second.serial;
+}
+
+inline void RetireNativePreFgParameters(const NVSDK_NGX_Parameter* parameters, uint64_t serial) {
+  std::optional<RuntimeLock> lock;
+  if (!HoldingRuntimeLock()) lock.emplace(runtime_mutex);
+  const auto borrow = native_parameter_borrows.find(parameters);
+  if (borrow == native_parameter_borrows.end() || borrow->second.serial != serial) return;
+  for (auto& input : borrow->second.inputs) {
+    auto* retained = input.replacement.Detach();
+    RetirePresentResource(&retained);
+  }
+  native_parameter_borrows.erase(borrow);
+}
+
 inline void PreserveNativePreFgProof(
     const void* marker, const std::vector<submission::GenerationSubmission>& submissions) {
   native_tag_source::PreserveProof(marker, submissions);
   if (IsPresentGuideMarker(marker) || screenshot::WantsFinalPresent() || experimental_present_chain.load()) {
     PreservePresentCaptureProof(marker, submissions);
   }
+  PreservePresentColourProof(marker, submissions);
   // An opt-out must still retain the previous producer's exact receipt so
   // a same-frame rollback never treats a pruned recording as unproven work.
   for (auto& [key, stream] : fg_service::streams) {
@@ -1981,10 +2077,11 @@ inline void PreserveNativePreFgProof(
   }
 }
 
-inline void OnNativePresentPassthrough(const PresentStream* owner) {
+inline void OnNativePresentPassthrough(PresentStream* owner) {
+  const auto* feature = std::exchange(owner->native_fg_handle, nullptr);
   const auto binding = fg_service::native_bindings.find(native_fg_owner);
-  if (binding == fg_service::native_bindings.end()
-      || binding->second != reinterpret_cast<uintptr_t>(owner)) return;
+  if ((feature == nullptr || feature != native_fg_owner)
+      && (binding == fg_service::native_bindings.end() || binding->second != reinterpret_cast<uintptr_t>(owner))) return;
   native_fg_owner = nullptr;
   native_fg_owner_identity.store(0, std::memory_order_release);
   native_fg_owns.store(false, std::memory_order_release);
@@ -1993,15 +2090,49 @@ inline void OnNativePresentPassthrough(const PresentStream* owner) {
   native_fg_result.store(fg::Result::NOT_SERVED, std::memory_order_release);
 }
 
+inline bool OnNativeOutputOptionsChanged(const output_framerate::OutputIdentity& output, bool mode_enabled) {
+  std::optional<RuntimeLock> lock;
+  if (!HoldingRuntimeLock()) lock.emplace(runtime_mutex);
+  if (!output) {
+    return std::ranges::any_of(present_streams, [](const auto& entry) {
+      return entry.second.output && entry.second.native_fg_handle != nullptr;
+    });
+  }
+  const auto owner = present_streams.find(reinterpret_cast<const void*>(output.swapchain));
+  if (owner == present_streams.end() || owner->second.output != output) return false;
+  auto& present = owner->second;
+  if (present.native_options_enabled == mode_enabled) return true;
+  const bool reset = present.native_options_enabled.has_value() || !mode_enabled;
+  present.native_options_enabled = mode_enabled;
+  if (!reset) return true;
+  ++present.native_options_revision;
+  if (!mode_enabled) OnNativePresentPassthrough(&present);
+  const auto context = reinterpret_cast<uintptr_t>(&present);
+  const auto stream = fg_service::streams.find({true, context});
+  if (stream != fg_service::streams.end() && stream->second.native_pending_parameters == nullptr) {
+    fg_service::ResetNativeFrame(&stream->second);
+  }
+  return true;
+}
+
 inline void OnNativeFgFeatureReleased(const NVSDK_NGX_Handle* handle) {
   if (handle == nullptr) return;
+  auto output = output_framerate::NativeFeatureOutput(reinterpret_cast<uintptr_t>(handle));
+  const auto binding = fg_service::native_bindings.find(handle);
+  for (auto& [_, owner] : present_streams) {
+    if (!output && (owner.native_fg_handle == handle
+            || (binding != fg_service::native_bindings.end() && binding->second == reinterpret_cast<uintptr_t>(&owner)))) {
+      output = owner.output;
+    }
+    if (owner.native_fg_handle == handle) owner.native_fg_handle = nullptr;
+  }
   output_framerate::ReleaseNativeFeature(reinterpret_cast<uintptr_t>(handle));
   if (const auto source = created_feature_ids.find(handle);
       source != created_feature_ids.end() && source->second == NVSDK_NGX_Feature_FrameGeneration) {
 #if defined(NR_NEXUS_DEV_CONTROL)
     native_ui_alpha_observation::EndScope("fg_handle_released");
 #endif
-    native_tag_source::Reset();
+    if (output) native_tag_source::Reset(output);
   }
   if (native_fg_owner == handle) {
     native_fg_owner = nullptr;
@@ -2011,18 +2142,26 @@ inline void OnNativeFgFeatureReleased(const NVSDK_NGX_Handle* handle) {
     native_fg_continuing_submission.store(false, std::memory_order_release);
     native_fg_result.store(fg::Result::NOT_SERVED, std::memory_order_release);
   }
-  const auto binding = fg_service::native_bindings.find(handle);
   if (binding == fg_service::native_bindings.end()) return;
   if (const auto entry = fg_service::streams.find({true, binding->second});
       entry != fg_service::streams.end() && entry->second.native_handle == handle) {
     fg_service::ResetNativeFrame(&entry->second);
     entry->second.native_handle = nullptr;
+    entry->second.native_pending_parameters = nullptr;
+    entry->second.native_pending_redelivery = false;
   }
   fg_service::native_bindings.erase(binding);
 }
 
 // Caller holds runtime_mutex. Native game list generations retain their uses.
-inline void RetireNativePresentOwner(const void* owner) {
+inline void RetireNativePresentOwner(PresentStream* owner) {
+  OnNativePresentPassthrough(owner);
+  if (owner->output) native_tag_source::Reset(owner->output);
+  owner->native_color = {};
+  owner->ordinary_color = {};
+  owner->ordinary_color_guide_serial = 0;
+  owner->native_options_enabled.reset();
+  owner->native_options_revision = 0;
   const auto context = reinterpret_cast<uintptr_t>(owner);
   for (auto binding = fg_service::native_bindings.begin(); binding != fg_service::native_bindings.end();) {
     if (binding->second == context) {
@@ -2046,14 +2185,14 @@ inline void RetireNativePresentOwner(const void* owner) {
   }
 }
 
-inline void OnNativePresentStreamRetired(const void* owner) {
-  native_tag_source::Reset();
+inline void OnNativePresentStreamRetired(PresentStream* owner) {
   RetireNativePresentOwner(owner);
 }
 
 inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
                                      const NVSDK_NGX_Parameter* parameters,
-                                     const NVSDK_NGX_Handle* handle, bool* backbuffer_replaced) {
+                                     const NVSDK_NGX_Handle* handle, bool* backbuffer_replaced,
+                                     NativePreFgBindings* bindings) {
   // Observation only. Log the first unmet condition, rather than attributing
   // a downstream NOT_SERVED verdict to an input that was never inspected.
   struct ExperimentalDiagnostic {
@@ -2258,8 +2397,6 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
   if (!fg_service::Requested()) return nullptr;
   diagnostic.reason = "command_list_missing";
   if (list == nullptr) return nullptr;
-  diagnostic.reason = "public_fg_off_without_present_decisions";
-  if (native_fg_public_off.load(std::memory_order_acquire) && !fg::native_options::ObservesPresentDecisions()) return nullptr;
   diagnostic.reason = "queue_tracking_unavailable";
   if (!queue_tracking_active.load(std::memory_order_acquire)) return nullptr;
   auto* backbuffer = PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_Backbuffer);
@@ -2276,6 +2413,19 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
         && (output == backbuffer || renodx::utils::directx::SameNativeObject(output, backbuffer))) return nullptr;
   }
   const auto desc = backbuffer->GetDesc();
+  const uint32_t color_x = GetUInt(parameters, NVSDK_NGX_DLSSG_Parameter_InputBackbufferSubrectBaseX,
+      GetUInt(parameters, NVSDK_NGX_DLSSG_Parameter_BackbufferSubrectBaseX));
+  const uint32_t color_y = GetUInt(parameters, NVSDK_NGX_DLSSG_Parameter_InputBackbufferSubrectBaseY,
+      GetUInt(parameters, NVSDK_NGX_DLSSG_Parameter_BackbufferSubrectBaseY));
+  const uint32_t color_width = GetUInt(parameters, NVSDK_NGX_DLSSG_Parameter_InputBackbufferSubrectWidth,
+      GetUInt(parameters, NVSDK_NGX_DLSSG_Parameter_BackbufferSubrectWidth, static_cast<uint32_t>(desc.Width)));
+  const uint32_t color_height = GetUInt(parameters, NVSDK_NGX_DLSSG_Parameter_InputBackbufferSubrectHeight,
+      GetUInt(parameters, NVSDK_NGX_DLSSG_Parameter_BackbufferSubrectHeight, desc.Height));
+  diagnostic.reason = "native_color_subrect_unsupported";
+  if (color_x != 0 || color_y != 0 || color_width != desc.Width || color_height != desc.Height) {
+    display_recording.preserve_current = true;
+    return nullptr;
+  }
   ID3D12Device* device = nullptr;
   diagnostic.reason = "list_device";
   if (FAILED(list->GetDevice(IID_PPV_ARGS(&device)))) return nullptr;
@@ -2320,9 +2470,17 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     }
 #endif
   }
-  const PresentStream* owner = nullptr;
-  for (const auto& [key, candidate] : present_streams) {
+  auto proved_output = output_framerate::FindPresentOutput(0,
+      reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(backbuffer)));
+  if (tag_input_claimed) {
+    const auto tagged = output_framerate::NativeViewportOutput(tag_input_frame.viewport);
+    if (proved_output && tagged && proved_output != tagged) return nullptr;
+    if (tagged) proved_output = tagged;
+  }
+  PresentStream* owner = nullptr;
+  for (auto& [key, candidate] : present_streams) {
     if (!candidate.d3d11 && candidate.prefg_target_valid
+        && (!proved_output || candidate.output == proved_output || reinterpret_cast<uintptr_t>(key) == proved_output.swapchain)
         && (candidate.device_identity == identity || candidate.streamline_identity == identity)
         && candidate.backbuffer_width == desc.Width && candidate.backbuffer_height == desc.Height
         && ConcreteResourceFormat(candidate.backbuffer_format) == ConcreteResourceFormat(desc.Format)) {
@@ -2334,6 +2492,40 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
   diagnostic.reason = "owner_missing";
   if (owner == nullptr) return nullptr;
   diagnostic.owner = owner;
+  const auto public_mode = output_framerate::NativeMode(proved_output);
+  const bool public_off = (public_mode ? *public_mode == 0
+      : !proved_output && native_fg_public_off.load(std::memory_order_acquire));
+  diagnostic.reason = "public_fg_off_without_present_decisions";
+  if (public_off && !fg::native_options::ObservesPresentDecisions()) return nullptr;
+  const auto backbuffer_identity = renodx::utils::directx::NativeIdentity(backbuffer);
+  const auto color_version = (proved_output && proved_output == owner->output
+      ? PresentColourVersion(*owner, backbuffer_identity) : 0);
+  const auto& ordinary = owner->ordinary_color;
+  const auto active_present = ordinary_present_attempts.find(reinterpret_cast<const void*>(ordinary.attempt.owner));
+  const bool same_attempt = active_present != ordinary_present_attempts.end()
+      && active_present->second.attempt == ordinary.attempt && !active_present->second.producer_conflict;
+  if (ordinary.executed && proved_output && ordinary.output == proved_output
+      && ordinary.backbuffer == reinterpret_cast<uintptr_t>(backbuffer_identity)
+      && (same_attempt || (color_version != 0 && color_version == owner->ordinary_color_guide_serial))) {
+    const auto completed = (present_ring.fence != nullptr
+            && reinterpret_cast<uintptr_t>(present_ring.fence) == ordinary.submission.fence
+        ? present_ring.fence->GetCompletedValue() : ordinary.submission.completed_value);
+    const bool ordered = ordinary.proofs_healthy && ordinary.submission.signaled
+        && (ordinary.proofs_complete || (completed != UINT64_MAX && completed >= ordinary.submission.fence_value));
+    const bool complete = ordinary.output_ready && ordinary.group_complete && ordinary.subresource == 0
+        && ordinary.x == color_x && ordinary.y == color_y && ordinary.width == color_width && ordinary.height == color_height
+        && (hudless == nullptr || renodx::utils::directx::NativeIdentity(hudless) == backbuffer_identity)
+        && ui == nullptr && tagged_roles.alpha == nullptr;
+    diagnostic.reason = (ordered && complete && color_version != 0
+        ? "ordinary_color_already_delivered" : "ordinary_color_write_owned");
+    display_recording.preserve_current = true;
+    return nullptr;
+  }
+  uint32_t no_game = 0;
+  const bool has_no_game = GetUIntIfPresent(parameters, NVSDK_NGX_DLSSG_Parameter_NotRenderingGameFrames, &no_game);
+  if (proved_output && handle != nullptr && no_game == 0) {
+    owner->native_fg_handle = handle;
+  }
   auto* current_depth = tagged_roles.depth;
   auto* current_motion = tagged_roles.motion;
   const auto motion_desc = (current_motion != nullptr ? current_motion->GetDesc() : D3D12_RESOURCE_DESC{});
@@ -2341,7 +2533,7 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
       && GetUInt(parameters, NVSDK_NGX_DLSSG_Parameter_MVecsSubrectWidth,
                  static_cast<uint32_t>(motion_desc.Width)) != 0
       && GetUInt(parameters, NVSDK_NGX_DLSSG_Parameter_MVecsSubrectHeight, motion_desc.Height) != 0
-      && GetUInt(parameters, NVSDK_NGX_DLSSG_Parameter_NotRenderingGameFrames) == 0;
+      && no_game == 0;
   const auto pair_plan = RequestedStagePlan();
   const bool resolution_pair = experimental_native_prefg_resolution.load()
       && pair_plan.valid && !pair_plan.mixed && pair_plan.pass_count == 2
@@ -2371,10 +2563,10 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
   }
   const auto native_frame = (native_tag_frame ? tagged_frame : sdk_frame);
   auto* ui_alpha = tagged_roles.alpha;
-  uint32_t no_game = 0, declared_index = 0, motion_jittered = 0;
+  uint32_t declared_index = 0, motion_jittered = 0;
   float jitter_x = 0.f, jitter_y = 0.f, motion_scale_x = 0.f, motion_scale_y = 0.f;
-  const bool frame_parameters = GetUIntIfPresent(parameters, NVSDK_NGX_DLSSG_Parameter_NotRenderingGameFrames, &no_game)
-      && no_game == 0 && GetUIntIfPresent(parameters, NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, &declared_index)
+  const bool frame_parameters = has_no_game && no_game == 0
+      && GetUIntIfPresent(parameters, NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, &declared_index)
       && declared_index >= 1
       && GetFloatIfPresent(parameters, NVSDK_NGX_DLSSG_Parameter_JitterOffsetX, jitter_x)
       && GetFloatIfPresent(parameters, NVSDK_NGX_DLSSG_Parameter_JitterOffsetY, jitter_y)
@@ -2391,7 +2583,7 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
   bool native_edit_source = native_frame.available && frame_parameters
       && source_feature != created_feature_ids.end() && source_feature->second == NVSDK_NGX_Feature_FrameGeneration
       && pair_plan.valid && !pair_plan.mixed && pair_plan.pass_count == 1 && !resolution_pair && !coupled_ui
-      && !native_fg_public_off.load() && current_guides && !fg::xefg::Enabled();
+      && !public_off && current_guides && !fg::xefg::Enabled();
   if (native_edit_source && native_tag_frame && index == 1) {
     native_edit_source = claimed_tag_epoch != 0 && tagged_frame.epoch == claimed_tag_epoch
         && tagged_frame.frame == tag_input_frame.frame
@@ -2585,6 +2777,17 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     display_recording.preserve_current = true;
     return nullptr;
   }
+  if (no_game != 0) {
+    if (diagnostics::GuideMode(owner->prefg_target.diagnostic.guides, present_guides.load()) == kPresentGuidesRequired) {
+      fg_service::ResetNativeFrame(&stream);
+      stream.result = fg::Result::NOT_SERVED;
+      native_fg_marker.store(nullptr, std::memory_order_release);
+    } else {
+      display_recording.preserve_current = true;
+    }
+    diagnostic.reason = "native_no_game_frame";
+    return nullptr;
+  }
   if (native_claim == present_frame_policy::Claim::STALE
       || (index > 1 && (native_edit_source || stream.native_edit_source)
           && native_claim != present_frame_policy::Claim::REPEATED)) {
@@ -2638,7 +2841,11 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     return nullptr;
   }
   const auto configuration = configuration_generation.load(std::memory_order_relaxed);
-  const auto options_generation = native_fg_options_generation.load(std::memory_order_acquire);
+  const auto current_options_generation = [&] {
+    return (proved_output ? owner->native_options_revision
+                          : native_fg_options_generation.load(std::memory_order_acquire));
+  };
+  const auto options_generation = current_options_generation();
   const std::array pair_resolutions{CurrentPassResolution(0), CurrentPassResolution(1)};
   const auto same_resolutions = [](const auto& first, const auto& second) {
     for (size_t i = 0; i < first.size(); ++i) {
@@ -2647,7 +2854,8 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     }
     return true;
   };
-  if (stream.native_pair_producer_marker != nullptr) {
+  if (stream.native_pair_producer_marker != nullptr
+      && (stream.native_resolution_pair || stream.native_edit_frame != 0)) {
     const bool same_recording = stream.native_pair_recording == submission::RecordingIdentity(list)
         && stream.native_pair_recording_status != nullptr && !stream.native_pair_recording_status->closed.load()
         && !stream.native_pair_recording_status->submitted.load();
@@ -2739,14 +2947,53 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
       return nullptr;
     }
   }
+  const bool legacy_redelivery = repeated_frame && !native_edit_source && !stream.native_resolution_pair;
+  if (legacy_redelivery) {
+    // FrameID or SDK scope identifies the image. It cannot order a second
+    // borrowed recording behind the producer or close that producer's replay.
+    const auto& producer = stream.native_pair_recording_status;
+    const auto recording = submission::RecordingIdentity(list);
+    bool ordered = producer != nullptr && stream.native_pair_recording == recording
+        && !producer->commands_closed.load() && !producer->closed.load() && !producer->submitted.load();
+    if (!ordered && producer != nullptr && producer->closed.load() && producer->submitted.load()
+        && !stream.native_pair_discarded && !stream.native_pair_replayed) {
+      std::vector<std::pair<FenceRef, uint64_t>> receipts;
+      const auto proof = submission::UseSubmissionTokens(stream.native_pair_producer_marker, &receipts);
+      if (proof == submission::UseSubmission::kComplete) {
+        ordered = submission::CanReuseRecordingObjects({stream.native_pair_producer_marker}, recording, producer);
+      } else if (proof == submission::UseSubmission::kTokens && receipts.size() == 1
+                 && submission::OnlyRecordingUses(stream.native_pair_producer_marker, stream.native_pair_recording)) {
+        const auto completed = receipts.front().first->GetCompletedValue();
+        ordered = completed != UINT64_MAX && completed >= receipts.front().second;
+      }
+    }
+    if (!ordered) {
+      diagnostic.reason = "mfg_producer_unordered";
+      display_recording.preserve_current = true;
+      return nullptr;
+    }
+  }
+  const auto output_recording = (proved_output ? submission::RecordingIdentity(list) : std::pair<uint64_t, uint64_t>{});
+  const submission::OutputUse output_use{.resource = backbuffer_identity, .subresource = 0, .version = color_version};
+  if (proved_output && (!repeated_frame || legacy_redelivery)
+      && !submission::OutputWriteOrdered(output_use, output_recording, nullptr)) {
+    diagnostic.reason = "native_output_recording_pending";
+    display_recording.preserve_current = true;
+    return nullptr;
+  }
+  if (!repeated_frame && color_version != 0 && owner->native_color.guide_serial == color_version
+      && owner->native_color.output == proved_output && owner->native_color.backbuffer == backbuffer_identity) {
+    diagnostic.reason = "native_color_write_owned";
+    display_recording.preserve_current = true;
+    return nullptr;
+  }
   if (index > 1 || repeated_frame) {
     if (stream.native_input_observation == fg_service::NativeInputObservation::OVERWRITTEN) {
       diagnostic.reason = "synchronous_mfg_inputs_overwritten";
       return nullptr;
     }
-    if (!repeated_frame && frame_id == 0 && sdk_decision != 0 && stream.source_sdk_decision != 0
-        && stream.source_sdk_decision != sdk_decision) {
-      diagnostic.reason = "mfg_sdk_decision_mismatch";
+    if (!repeated_frame) {
+      diagnostic.reason = "mfg_frame_unproven_or_mismatched";
       display_recording.preserve_current = true;
       return nullptr;
     }
@@ -2851,14 +3098,10 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     input.ui_state = input_state;
     input.depth = PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_Depth);
     input.motion = PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_MVecs);
-    if (GetUInt(parameters, NVSDK_NGX_DLSSG_Parameter_NotRenderingGameFrames) != 0) {
-      input.depth = nullptr;
-      input.motion = nullptr;
-    }
     input.ui = PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_UIAlpha);
     if (input.ui == nullptr) input.ui = PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_UI);
-    input.color_width = static_cast<uint32_t>(desc.Width);
-    input.color_height = desc.Height;
+    input.color_width = color_width;
+    input.color_height = color_height;
     if (input.motion != nullptr && input.depth != nullptr) {
       input.guide_width = GetUInt(parameters, "DLSSG.MVecsSubrectWidth", static_cast<uint32_t>(input.motion->GetDesc().Width));
       input.guide_height = GetUInt(parameters, "DLSSG.MVecsSubrectHeight", input.motion->GetDesc().Height);
@@ -2885,17 +3128,21 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     input.application_frame = ++stream.application_frame;
     diagnostic.reason = "private_surfaces_unavailable";
     if (!fg_service::PrepareSurfaces(&stream, slot, input, coupled_ui, ui_recomposition)) return nullptr;
-    if (protect_recording) {
-      // Cover feature-only and partial warm-up recordings as well as a final
-      // image. Discarding any such recording invalidates its GPU state ledger.
-      stream.native_resolution_pair = resolution_pair;
-      stream.native_pair_producer_marker = slot->original_backbuffer;
-      stream.native_pair_recording = submission::RecordingIdentity(list);
-      stream.native_pair_recording_status = submission::ObserveRecording(list);
+    const auto remember_producer = [&](ID3D12Resource* marker) {
+      stream.native_pair_producer_marker = marker;
+      stream.native_pair_recording = (marker != nullptr ? submission::RecordingIdentity(list)
+                                                       : std::pair<uint64_t, uint64_t>{});
+      stream.native_pair_recording_status = (marker != nullptr ? submission::ObserveRecording(list) : nullptr);
       stream.native_pair_completion = {};
       stream.native_pair_completion_value = 0;
       stream.native_pair_discarded = false;
       stream.native_pair_replayed = false;
+    };
+    if (protect_recording) {
+      // Cover feature-only and partial warm-up recordings as well as a final
+      // image. Discarding any such recording invalidates its GPU state ledger.
+      stream.native_resolution_pair = resolution_pair;
+      remember_producer(slot->original_backbuffer);
       submission::TrackUse(list, stream.native_pair_producer_marker);
     }
     bool output_ready = false;
@@ -2928,7 +3175,7 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
       }
     }
     if (protect_recording && (configuration != configuration_generation.load()
-        || options_generation != native_fg_options_generation.load()
+         || options_generation != current_options_generation()
         || display_epoch != history_reset_epoch.load()
         || (resolution_pair && !experimental_native_prefg_resolution.load())
         || !same_resolutions(pair_resolutions, std::array{CurrentPassResolution(0), CurrentPassResolution(1)}))) {
@@ -2959,14 +3206,8 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     stream.native_resolution_pair = resolution_pair;
     stream.native_pair_resolutions = pair_resolutions;
     if (!protect_recording) {
-      // This output supersedes the protected producer without inheriting its receipt.
-      stream.native_pair_producer_marker = nullptr;
-      stream.native_pair_recording = {};
-      stream.native_pair_recording_status.reset();
-      stream.native_pair_completion = {};
-      stream.native_pair_completion_value = 0;
-      stream.native_pair_discarded = false;
-      stream.native_pair_replayed = false;
+      // Only a repeatable base needs a producer receipt on the legacy route.
+      remember_producer(frame_id != 0 || sdk_decision != 0 ? slot->original_backbuffer : nullptr);
     }
     stream.source_backbuffer = backbuffer;
     stream.source_hudless = hudless;
@@ -2982,37 +3223,57 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
     stream.result = fg::Result::PREPARED;
     stream.native_serial = native_fg_recording_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
     stream.native_display_epoch = display_epoch;
-    if (!native_edit_source) {
-      native_fg_marker.store(slot->color[0], std::memory_order_release);
-    }
   }
-  if (!native_edit_source || !repeated_frame) {
+  if (!repeated_frame) {
     native_fg_display_epoch.store(stream.native_display_epoch, std::memory_order_relaxed);
     native_fg_continuing_submission.store(stream.continuing_submission, std::memory_order_release);
     native_fg_result.store(fg::Result::PREPARED, std::memory_order_release);
   }
   {
+    if (proved_output) {
+      submission::TrackUse(list, backbuffer, submission::UseKind::kOutputColor, output_use);
+    }
+    RegisterPresentNativeColourWrite(owner, list, proved_output, backbuffer_identity,
+                                     color_version, stream.native_serial, repeated_frame);
     const native_tag_source::NativeBackbufferWrite write(backbuffer);
     fg_service::CopyColor(list, backbuffer, input_state, stream.cached->color[0],
                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   }
-  if (backbuffer_replaced != nullptr) {
-    *backbuffer_replaced = true;
-    if (native_edit_source) {
-      stream.native_pending_parameters = parameters;
-      stream.native_pending_redelivery = repeated_frame;
-    }
+  if (backbuffer_replaced != nullptr) *backbuffer_replaced = true;
+  if (bindings != nullptr || backbuffer_replaced != nullptr || (hudless != nullptr && hudless != backbuffer)
+      || stream.cached->color_inputs_prepared) {
+    stream.native_pending_parameters = parameters;
+    stream.native_pending_redelivery = repeated_frame;
+    if (bindings == nullptr) bindings = &stream.native_legacy_bindings;
+    *bindings = {};
+    bindings->backbuffer = backbuffer;
+    bindings->original_backbuffer = stream.cached->original_backbuffer;
+    bindings->list = list;
+    submission::RecordingIdentity(list);
+    bindings->recording = submission::ObserveRecording(list);
+    bindings->context = context;
+    bindings->serial = stream.native_serial;
+    bindings->decision = sdk_decision;
+    bindings->redelivery = repeated_frame;
   }
   envelope.MarkInjectionCommandsRecorded();
   if (hudless != nullptr && hudless != backbuffer) {
     auto* replacement = (stream.cached->color_inputs_prepared
         ? stream.cached->coupled_hudless : stream.cached->color[1]);
+    if (bindings != nullptr) {
+      bindings->inputs[0].original = hudless;
+      bindings->inputs[0].replacement = replacement;
+    }
     submission::TrackUse(list, replacement);
     Transition(list, replacement, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, input_state);
     NVSDK_NGX_Parameter_SetVoidPointer(const_cast<NVSDK_NGX_Parameter*>(parameters),
         NVSDK_NGX_DLSSG_Parameter_HUDLess, replacement);
   }
   if (stream.cached->color_inputs_prepared) {
+    if (bindings != nullptr) {
+      bindings->inputs[1].original = ui;
+      bindings->inputs[1].replacement = stream.cached->coupled_ui;
+    }
     submission::TrackUse(list, stream.cached->coupled_ui);
     NVSDK_NGX_Parameter_SetVoidPointer(const_cast<NVSDK_NGX_Parameter*>(parameters),
                                       NVSDK_NGX_DLSSG_Parameter_UI, stream.cached->coupled_ui);
@@ -3024,34 +3285,66 @@ inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* list,
 
 inline void RestoreNativePreFg(ID3D12GraphicsCommandList* list,
                                const NVSDK_NGX_Parameter* parameters, ID3D12Resource* hudless, bool succeeded,
-                               const NVSDK_NGX_Handle* handle, bool backbuffer_replaced) {
+                                const NVSDK_NGX_Handle* handle, bool backbuffer_replaced,
+                                const NativePreFgBindings* bindings) {
   if (InsideDirectCall() || parameters == nullptr) return;
   RuntimeLock lock(runtime_mutex);
   auto context = reinterpret_cast<uintptr_t>(parameters);
   if (handle != nullptr) {
     const auto binding = fg_service::native_bindings.find(handle);
-    if (binding == fg_service::native_bindings.end()) return;
-    context = binding->second;
+    context = (binding == fg_service::native_bindings.end() ? 0 : binding->second);
   }
   const auto it = fg_service::streams.find({true, context});
+  const bool wrapper_call = bindings != nullptr;
+  NativePreFgBindings legacy;
+  if (bindings == nullptr && it != fg_service::streams.end() && it->second.native_pending_parameters == parameters
+      && (backbuffer_replaced || hudless != nullptr)) {
+    legacy = std::exchange(it->second.native_legacy_bindings, {});
+    bindings = &legacy;
+  }
+  const bool borrowed = bindings != nullptr && bindings->serial != 0;
+  bool restored = true;
+  if (borrowed) {
+    auto inputs = bindings->inputs;
+    restored = RestoreNativeParameterInputs(parameters, &inputs, false);
+    if (std::ranges::any_of(inputs, [](const auto& input) { return input.replacement != nullptr; })) {
+      native_parameter_borrows.insert_or_assign(parameters,
+          NativeParameterBorrow{.serial = ++native_parameter_borrow_serial, .inputs = std::move(inputs)});
+    }
+  }
   if (it == fg_service::streams.end()) return;
   auto& stream = it->second;
-  const bool proved_consumption = backbuffer_replaced && stream.native_pending_parameters == parameters;
+  if (borrowed && (context != bindings->context || stream.native_serial != bindings->serial
+          || stream.native_pending_parameters != parameters)) return;
+  const bool matched_replacement = (borrowed || backbuffer_replaced) && stream.native_pending_parameters == parameters;
+  const bool proved_consumption = matched_replacement && stream.native_edit_source;
   bool redelivery = false;
-  if (proved_consumption) {
+  if (matched_replacement) {
     stream.native_pending_parameters = nullptr;
     redelivery = std::exchange(stream.native_pending_redelivery, false);
   }
+  bool rollback_recorded = false;
+  if (borrowed && !succeeded && !redelivery && bindings->original_backbuffer != nullptr
+      && list != nullptr && list == bindings->list.Get() && bindings->recording != nullptr
+      && !bindings->recording->closed.load() && !bindings->recording->commands_closed.load()
+      && !bindings->recording->submitted.load()
+      && submission::RecordingIdentity(list) == std::pair{bindings->recording->list, bindings->recording->generation}) {
+    constexpr auto input_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const native_tag_source::NativeBackbufferWrite write(bindings->backbuffer.Get());
+    fg_service::CopyColor(list, bindings->backbuffer.Get(), input_state, bindings->original_backbuffer.Get(), input_state);
+    rollback_recorded = true;
+  }
   // A proved re-delivery writes the already accepted edited BB. Restoring
   // the first replacement's raw snapshot would undo that earlier delivery.
-  if (!succeeded && !redelivery && backbuffer_replaced && list != nullptr && stream.cached != nullptr
+  if (!borrowed && !succeeded && !redelivery && backbuffer_replaced && list != nullptr && stream.cached != nullptr
       && stream.cached->original_backbuffer != nullptr && stream.source_backbuffer != nullptr) {
     constexpr auto input_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     const native_tag_source::NativeBackbufferWrite write(stream.source_backbuffer);
     fg_service::CopyColor(list, stream.source_backbuffer, input_state,
                           stream.cached->original_backbuffer, input_state);
+    rollback_recorded = true;
   }
-  if (hudless != nullptr && stream.cached != nullptr) {
+  if (!borrowed && hudless != nullptr && stream.cached != nullptr) {
     NVSDK_NGX_Parameter_SetVoidPointer(const_cast<NVSDK_NGX_Parameter*>(parameters),
                                       NVSDK_NGX_DLSSG_Parameter_HUDLess, hudless);
     if (stream.cached->color_inputs_prepared) {
@@ -3059,15 +3352,37 @@ inline void RestoreNativePreFg(ID3D12GraphicsCommandList* list,
                                         NVSDK_NGX_DLSSG_Parameter_UI, stream.source_ui);
     }
   }
-  const bool restored = (hudless == nullptr || PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_HUDLess) == hudless)
-      && (stream.cached == nullptr || !stream.cached->color_inputs_prepared
-          || PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_UI) == stream.source_ui);
-  if (succeeded && restored && backbuffer_replaced && stream.cached != nullptr) {
+  if (!borrowed) {
+    restored = (hudless == nullptr || PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_HUDLess) == hudless)
+        && (stream.cached == nullptr || !stream.cached->color_inputs_prepared
+            || PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_UI) == stream.source_ui);
+  }
+  const bool current_display = native_fg_recording_serial.load(std::memory_order_acquire) == stream.native_serial
+      && (wrapper_call ? native_fg_owns.load(std::memory_order_acquire) && native_fg_owner == handle
+                       : handle == nullptr || native_fg_owner == nullptr || native_fg_owner == handle);
+  const bool same_decision = !borrowed || native_sdk_present_input.decision_id == bindings->decision;
+  if (handle != nullptr && matched_replacement && borrowed && !redelivery) {
+    SettlePresentNativeColourWrite(reinterpret_cast<PresentStream*>(context), bindings->recording,
+                                   bindings->serial, succeeded && restored, rollback_recorded);
+  }
+  if (succeeded && restored && (borrowed || backbuffer_replaced) && stream.cached != nullptr) {
+    if (borrowed && !proved_consumption && !redelivery && current_display) {
+      const auto* marker = stream.cached->color[0];
+      native_fg_marker.store(marker, std::memory_order_release);
+      std::vector<std::pair<FenceRef, uint64_t>> receipts;
+      if (submission::UseSubmissionTokens(marker, &receipts) == submission::UseSubmission::kTokens && receipts.size() == 1
+          && receipts.front().first->GetCompletedValue() != UINT64_MAX) {
+        native_fg_result.store(fg::Result::SUBMITTED, std::memory_order_release);
+        CountNativeFgSubmission(stream.native_serial);
+        native_fg_last_submission_ns.store(SteadyNowNs(), std::memory_order_release);
+        native_fg_continuing_submission.store(true, std::memory_order_release);
+      }
+    }
     if (proved_consumption && !redelivery) {
       const bool ordered = !stream.native_pair_discarded && !stream.native_pair_replayed;
       present_frame_policy::Publish(&stream.base_frame_clock, stream.cached->base_frame, ordered,
           stream.cached->base_frame_group.complete);
-      if (stream.base_frame_clock.complete) {
+      if (stream.base_frame_clock.complete && current_display) {
         native_fg_marker.store(stream.cached->color[0], std::memory_order_release);
         // An SDK may submit its borrowed list before returning acceptance.
         // Count that submission only when the producer has an actual receipt.
@@ -3084,7 +3399,7 @@ inline void RestoreNativePreFg(ID3D12GraphicsCommandList* list,
         }
       }
     }
-    if (handle != nullptr && (!proved_consumption || stream.base_frame_clock.complete)) {
+    if (handle != nullptr && same_decision && (!proved_consumption || stream.base_frame_clock.complete)) {
       const auto* owner = reinterpret_cast<const PresentStream*>(context);
       if (native_sdk_present_input.identity != nullptr
           && native_sdk_present_input.identity == owner->native_output_identity) {
@@ -3110,8 +3425,8 @@ inline void RestoreNativePreFg(ID3D12GraphicsCommandList* list,
   }
   // Older internal consumers return the borrowed HUDLess without the BB flag.
   // A declined invocation owns neither binding and cannot retract another base.
-  if (!succeeded && !redelivery && (backbuffer_replaced || hudless != nullptr)) {
-    if (native_sdk_present_input.owner == reinterpret_cast<const PresentStream*>(context)) {
+  if ((!succeeded && !redelivery || !restored) && (backbuffer_replaced || hudless != nullptr)) {
+    if (same_decision && native_sdk_present_input.owner == reinterpret_cast<const PresentStream*>(context)) {
       const auto input = native_sdk_present_input;
       native_sdk_present_input = {.identity = input.identity, .decision_id = input.decision_id,
           .owner = (input.guides_unavailable ? input.owner : nullptr),
@@ -3119,14 +3434,16 @@ inline void RestoreNativePreFg(ID3D12GraphicsCommandList* list,
           .backbuffer = (input.guides_unavailable ? input.backbuffer : nullptr),
           .guides_unavailable = input.guides_unavailable};
     }
-    native_fg_continuing_submission.store(false, std::memory_order_release);
     if (adaptive_rejected) {
       fg_service::ResetNativeFrame(&stream);
     } else {
       fg_service::Invalidate(&stream);
     }
     stream.result = fg::Result::FAILED;
-    native_fg_marker.store(nullptr, std::memory_order_release);
-    native_fg_result.store(fg::Result::FAILED, std::memory_order_release);
+    if (current_display) {
+      native_fg_continuing_submission.store(false, std::memory_order_release);
+      native_fg_marker.store(nullptr, std::memory_order_release);
+      native_fg_result.store(fg::Result::FAILED, std::memory_order_release);
+    }
   }
 }

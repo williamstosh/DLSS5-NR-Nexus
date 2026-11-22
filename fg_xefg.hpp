@@ -2741,8 +2741,39 @@ struct SdkHooks {
   }
   static int32_t Constants(void* handle, uint32_t id, const abi::Constants* data) {
     if (!stopped.load()) PinRuntimeCallback();
+#if defined(NR_NEXUS_DEV_CONTROL)
+    uint64_t edit_fg_generation = 0;
+    edit_fg_observation::XefgConstantsObservation observation;
+    try {
+      edit_fg_generation = edit_fg_observation::CaptureGeneration();
+      if (edit_fg_generation != 0) {
+        observation = {.sdk_slot = static_cast<uint32_t>(Index), .sdk_context = reinterpret_cast<uintptr_t>(handle),
+            .present_id = id, .frame_time_ms = data != nullptr ? data->frame_time_ms : 0.f,
+            .has_frame_time = data != nullptr};
+        std::shared_lock lock(state.mutex);
+        if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
+          observation.context_identity = reinterpret_cast<uintptr_t>(it->second.get());
+          observation.epoch = it->second->epoch;
+        }
+      }
+    } catch (...) {
+      edit_fg_generation = 0;
+      edit_fg_observation::Stop("observation_failed");
+    }
+#endif
     const auto status = reinterpret_cast<int32_t (*)(void*, uint32_t, const abi::Constants*)>(modules[Index].real[4])(
         handle, id, data);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (edit_fg_generation != 0) {
+      const auto returned_ns = edit_fg_observation::NowNs();
+      try {
+        edit_fg_observation::Record(edit_fg_generation, {.kind = edit_fg_observation::Kind::XEFG_CONSTANTS,
+            .api_return_ns = returned_ns, .api_result = status, .xefg_constants = observation});
+      } catch (...) {
+        edit_fg_observation::Stop("observation_failed");
+      }
+    }
+#endif
     if (Requested() && data != nullptr) {
       try {
         std::unique_lock lock(state.mutex);

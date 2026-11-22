@@ -54,6 +54,19 @@
 
 namespace renodx::addons::dlss5::submission {
 
+// CPU ordering of real Execute forwards on one observed Present queue.
+// An owned Execute in the exclusive gate follows game entry E and precedes E+1.
+struct QueueOrderProof {
+  uint64_t domain = 0;
+  uint64_t entry = 0;
+  bool owned_after = false;
+
+  constexpr bool Precedes(const QueueOrderProof& next) const noexcept {
+    return domain != 0 && domain == next.domain
+        && (entry < next.entry || (entry == next.entry && !owned_after && next.owned_after));
+  }
+};
+
 // One completion token attached to a generation by one ExecuteCommandLists
 // call. `pending` marks the two-phase window: reserved before the real
 // forward, filled with the fence proof after the post-submit Signal. A
@@ -65,6 +78,7 @@ struct GenerationSubmission {
   uint64_t value = 0;
   uint64_t list_identity = 0;
   uint64_t recording_generation = 0;
+  QueueOrderProof queue_order;
 };
 
 enum class RecordingOwner : uint8_t {
@@ -76,7 +90,14 @@ enum class RecordingOwner : uint8_t {
   kConflicting,
 };
 
-enum class UseKind : uint8_t { kUnknown, kIndependentGuide, kProvider, kOutputColor };
+enum class UseKind : uint8_t {
+  kUnknown,
+  kIndependentGuide,
+  kProvider,
+  kOutputColor,
+  // A CPU completion receipt with separately tracked GPU and Provider dependencies.
+  kIndependentCpuObservation,
+};
 enum class CloseReason : uint8_t { kOpen, kReset, kDestroyed, kOwnerDiscarded };
 
 struct OutputUse {
@@ -99,6 +120,7 @@ struct RecordingStatus {
   uint64_t generation = 0;
   std::atomic_bool submitted{false};
   std::atomic_bool closed{false};
+  std::atomic_bool commands_closed{false};
   std::atomic<CloseReason> close_reason{CloseReason::kOpen};
   // Protected by tracker_mutex. Survives pruning as positive evidence for
   // objects whose last recording is no longer in live_uses.
@@ -475,7 +497,8 @@ inline std::vector<PendingSubmission> BeginSubmission(
 inline void CompleteSubmission(
     const std::vector<PendingSubmission>& pending,
     ID3D12Fence* fence,
-    uint64_t value) {
+    uint64_t value,
+    QueueOrderProof queue_order = {}) {
   if (pending.empty()) return;
   std::lock_guard<std::mutex> lock(tracker_mutex);
   for (const PendingSubmission& reservation : pending) {
@@ -490,6 +513,7 @@ inline void CompleteSubmission(
     submission.pending = false;
     submission.fence = FenceRef(fence);
     submission.value = value;
+    submission.queue_order = queue_order;
   }
 }
 
@@ -616,6 +640,17 @@ inline std::shared_ptr<RecordingStatus> ObserveRecording(ID3D12CommandList* list
     generation.status->closed.store(!generation.open);
   }
   return generation.status;
+}
+
+// D3D12 Close forbids appending to this recording while leaving it replayable.
+inline void ObserveCommandListClose(ID3D12CommandList* list) {
+  std::lock_guard lock(tracker_mutex);
+  const auto state = tracked_lists.find(ListIdentity(list, false));
+  if (state == tracked_lists.end()) return;
+  const auto recording = state->second.generations.find(state->second.current);
+  if (recording != state->second.generations.end() && recording->second.status != nullptr) {
+    recording->second.status->commands_closed.store(true);
+  }
 }
 
 inline bool OnlyRecordingUses(const void* use, std::pair<uint64_t, uint64_t> recording) {
@@ -812,14 +847,15 @@ inline RecordedWork RecordedWorkState(std::vector<RecordingBlocker>* blockers = 
 }
 
 // The caller inventories everything its Provider replacement will release.
-// Only positively classified borrowed guide recordings can survive it.
+// Independent guides and CPU observations keep their own recording lifetimes.
 inline RecordedWork ProviderTeardownWorkState(std::span<const void* const> objects,
                                               std::vector<RecordingBlocker>* blockers = nullptr) {
   return InspectRecordedWork([&](uint64_t identity, uint64_t, const Generation& generation) {
     if ((identity >> 63) != 0 || list_identity_fallbacks.load(std::memory_order_relaxed) != 0
         || generation.owner != RecordingOwner::kBorrowedGame || generation.classified_uses.empty()) return true;
     return std::ranges::any_of(generation.classified_uses, [&](const ResourceUse& use) {
-      return use.kind != UseKind::kIndependentGuide || use.output.resource != nullptr
+      return (use.kind != UseKind::kIndependentGuide && use.kind != UseKind::kIndependentCpuObservation)
+          || use.output.resource != nullptr
           || std::ranges::find(objects, use.object) != objects.end();
     });
   }, blockers);

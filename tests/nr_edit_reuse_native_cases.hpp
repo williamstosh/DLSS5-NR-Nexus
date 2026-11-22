@@ -197,7 +197,8 @@ int Run() {
     ComPtr<ReceiptSwapchain> output;
     output.Attach(new ReceiptSwapchain(nullptr));
     output->current_back_buffer = backbuffer.Get();
-    auto& owner = native::present_streams[nullptr];
+    const auto output_key = reinterpret_cast<uintptr_t>(output.Get());
+    auto& owner = native::present_streams[output.Get()];
     owner.device_identity = renodx::utils::directx::NativeIdentity(gpu.device.Get());
     owner.native_output_identity = renodx::utils::directx::NativeIdentity(output.Get());
     owner.backbuffer_width = width;
@@ -247,8 +248,11 @@ int Run() {
     const auto output_identity = reinterpret_cast<uintptr_t>(owner.native_output_identity);
     const uintptr_t registered_buffers[]{reinterpret_cast<uintptr_t>(
         renodx::utils::directx::NativeIdentity(backbuffer.Get()))};
-    rate::RegisterPresentOutput(context, reinterpret_cast<uintptr_t>(owner.device_identity),
+    rate::RegisterPresentOutput(output_key, reinterpret_cast<uintptr_t>(owner.device_identity),
         output_identity, registered_buffers);
+    owner.output = rate::MatchPresentOutput(output_key, registered_buffers[0]);
+    Check(owner.output && rate::FindPresentOutput(0, registered_buffers[0]) == owner.output,
+        "the registered PQ backbuffer identifies its Native Present owner");
     struct SdkConsumer {
       const void* context = nullptr;
       void (*evaluate)(const void*) = nullptr;
@@ -1612,12 +1616,29 @@ int Run() {
     const auto refreshed = read_progress();
     Check(refreshed.anchor != nullptr && refreshed.anchor->valid && stream.native_edit_history,
         "a fresh Native SDK frame tracks its live anchor before the Off transition");
-    native::OnNativeFgOptions(false);
-    const auto off = record({.token = ++token});
-    Check(!off.replaced && off.evaluates == 0 && off.reuses == 0
-            && matches(off.restored_back, source_back),
-        "explicit native FG Off retains the original safe path without cached edits");
-    native::OnNativeFgOptions(true);
+    {
+      funnel_accounting_tests::Restore options_substitutions;
+      options_substitutions.Value(&native_adapter::state.real);
+      options_substitutions.Atomic(&native_adapter::decisions_ready);
+      options_substitutions.Atomic(&native_adapter::options_changed);
+      native_adapter::state.real = +[](const sl::ViewportHandle&, const sl::DLSSGOptions&) { return sl::Result::eOk; };
+      native_adapter::decisions_ready = false;
+      native_adapter::options_changed = native::OnNativeFgOptions;
+      rate::BindNativeOutput(owner.output, 0);
+      sl::DLSSGOptions options;
+      options.mode = sl::DLSSGMode::eOff;
+      Check(native_adapter::HookedSetOptions(sl::ViewportHandle{0}, options) == sl::Result::eOk
+                && rate::NativeMode(owner.output) == 0u,
+            "the real Options hook disables the registered Native output");
+      const auto off = record({.token = ++token, .source_scope = false});
+      Check(!off.replaced && off.evaluates == 0 && off.reuses == 0
+                && matches(off.restored_back, source_back),
+            "explicit native FG Off retains the original safe path without cached edits");
+      options.mode = sl::DLSSGMode::eOn;
+      Check(native_adapter::HookedSetOptions(sl::ViewportHandle{0}, options) == sl::Result::eOk
+                && rate::NativeMode(owner.output) == 1u,
+            "the real Options hook re-enables the registered Native output");
+    }
     recover();
     {
       const addon::RuntimeLock lock(native::runtime_mutex);
@@ -1975,7 +1996,7 @@ int Run() {
           "tag-source retirement cannot expose a completed old clone ticket");
       Check(!tag_source::CurrentFrame(hudless.Get(), gpu.list.Get()).available,
           "tag-source retirement cannot expose an old directly tagged resource ticket");
-      native::RetirePresentStream(nullptr);
+      native::RetirePresentStream(output.Get());
       native::ForgetSourceHandleLocked(handle);
     }
     submit();
@@ -1983,10 +2004,10 @@ int Run() {
             && retired_anchor.expired() && native::retired_nr_features.empty()
             && native::retired_final_resources.empty(),
         "native source retirement releases all edit caches, models and worksets after actual Fence completion");
-    rate::DestroyPresentOutput(context);
+    rate::DestroyPresentOutput(output_key);
     backbuffer = gpu.Texture(width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     output->current_back_buffer = backbuffer.Get();
-    auto& fp16_owner = native::present_streams[nullptr];
+    auto& fp16_owner = native::present_streams[output.Get()];
     fp16_owner.device_identity = renodx::utils::directx::NativeIdentity(gpu.device.Get());
     fp16_owner.native_output_identity = reinterpret_cast<const void*>(output_identity);
     fp16_owner.backbuffer_width = width;
@@ -2006,8 +2027,11 @@ int Run() {
     const auto fp16_context = reinterpret_cast<uintptr_t>(&fp16_owner);
     const uintptr_t fp16_buffers[]{reinterpret_cast<uintptr_t>(
         renodx::utils::directx::NativeIdentity(backbuffer.Get()))};
-    rate::RegisterPresentOutput(fp16_context, reinterpret_cast<uintptr_t>(fp16_owner.device_identity),
+    rate::RegisterPresentOutput(output_key, reinterpret_cast<uintptr_t>(fp16_owner.device_identity),
         output_identity, fp16_buffers);
+    fp16_owner.output = rate::MatchPresentOutput(output_key, fp16_buffers[0]);
+    Check(fp16_owner.output && rate::FindPresentOutput(0, fp16_buffers[0]) == fp16_owner.output,
+        "the registered FP16 backbuffer identifies its Native Present owner");
     addon::bridge::OwnedParameters fp16_parameters = parameters;
     fp16_parameters.Set(NVSDK_NGX_DLSSG_Parameter_Backbuffer, backbuffer.Get());
     fp16_parameters.Set(NVSDK_NGX_DLSSG_Parameter_HUDLess, static_cast<ID3D12Resource*>(nullptr));
@@ -2076,11 +2100,11 @@ int Run() {
         "NRPresentPreFg=0 leaves the FP16 SDK path untouched");
     {
       const addon::RuntimeLock lock(native::runtime_mutex);
-      native::RetirePresentStream(nullptr);
+      native::RetirePresentStream(output.Get());
       native::ForgetSourceHandleLocked(fp16_handle);
     }
     submit();
-    rate::DestroyPresentOutput(fp16_context);
+    rate::DestroyPresentOutput(output_key);
     native_adapter::state.present = nullptr;
     native_adapter::decisions_ready = false;
     Check(SUCCEEDED(proof_list->Close()), "close the unsubmitted foreign proof-query list");
@@ -2119,7 +2143,7 @@ int Run() {
                  " adaptive_tokenless_after_prune=two_delivered fixed_recovery=refresh/reuse/MFG"
                  " motion_rejection/reset/gap/off/missing_scope/FG_failure/retirement=checked"
                  " production_Execute_and_Fence=real NR=MOCK FG_consumer=readback"
-                 " per_output_identity=Unknown no_game_or_visual_acceptance\n";
+                 " fixture_output_identity=registered_PQ_and_FP16 no_game_or_visual_acceptance\n";
     return 0;
   } catch (const std::exception& error) {
     fail_call = 0;

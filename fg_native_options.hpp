@@ -235,7 +235,8 @@ static sl::Result HookedSetOptions(const sl::ViewportHandle& viewport, const sl:
     output_framerate::ObserveNativeOptions(static_cast<uint32_t>(viewport), options.structVersion,
         static_cast<uint32_t>(options.mode),
         options.numFramesToGenerate < UINT32_MAX ? options.numFramesToGenerate + 1 : 0, entered_output);
-    if (const auto callback = options_changed.load(std::memory_order_acquire); callback != nullptr) {
+    if (const auto callback = options_changed.load(std::memory_order_acquire);
+        callback != nullptr && output_framerate::NativeViewportOutput(static_cast<uint32_t>(viewport)) == entered_output) {
       const auto previous_output = std::exchange(options_output, entered_output);
       callback(options.mode != sl::DLSSGMode::eOff);
       options_output = previous_output;

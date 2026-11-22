@@ -1158,7 +1158,15 @@ inline bool ClaimFrame(const fg::native_options::frame_source::Frame& frame,
 
 // Caller holds runtime_mutex; an in-flight Scope can no longer publish after
 // its version is erased. Serial identities are never recycled by Reset.
-inline void Reset() {
+inline void Reset(output_framerate::OutputIdentity output = {}) {
+  if (output) {
+    std::erase_if(state.versions, [&](Version& version) {
+      if (version.output != output) return false;
+      RetirePresentResource(&version.clone);
+      return true;
+    });
+    return;
+  }
 #if defined(NR_NEXUS_DEV_CONTROL)
   ResetPremise();
 #endif

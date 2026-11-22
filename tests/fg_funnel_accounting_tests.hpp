@@ -183,10 +183,14 @@ void Run(Gpu* gpu) {
     check(card().id == dlss5::ui::CardId::kActive, "inline mode initially active");
     nr::hook_point.store(nr::kHookPresent);
     nr::native_fg_owns.store(true);
+    nr::PresentStream owner;
+    owner.native_fg_handle = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{1});
+    const nr::PresentStream independent;
+    check(!nr::YieldPresentToNativeFg(independent), "an independent output retains its Present route");
     bool yielded = true;
     for (uint32_t present = 0; present < 500; ++present) {
       nr::present_frames_seen.fetch_add(1);
-      yielded &= nr::YieldPresentToNativeFg();
+      yielded &= nr::YieldPresentToNativeFg(owner);
     }
     check(yielded && dlss5::nr_decline_counts[
               static_cast<size_t>(dlss5::NrDeclineReason::kPresentPreFg)].load() == 500,
@@ -195,7 +199,7 @@ void Run(Gpu* gpu) {
     nr::intercepted_evaluations.fetch_add(100);
     nr::successful_evaluations.fetch_add(100);
     const auto after = nr::CollectFunnelInputs();
-    check(!nr::YieldPresentToNativeFg() && after.seen == 1000 && after.eligible == 500
+    check(!nr::YieldPresentToNativeFg(owner) && after.seen == 1000 && after.eligible == 500
               && after.injected == 500 && after.unaccounted == 0
               && card().id == dlss5::ui::CardId::kActive,
           "inline to native Present and back remains active without resetting history");

@@ -140,8 +140,12 @@ inline Json Snapshot() {
         {"canonical_available", resource.canonical != 0}};
   };
   const auto recording_identity = [](const edit_fg_observation::RecordingIdentity& recording) {
-    return Json{{"raw", recording.raw}, {"list_id", recording.list_id}, {"generation", recording.generation},
+    Json identity{{"raw", recording.raw}, {"list_id", recording.list_id}, {"generation", recording.generation},
         {"identity_available", recording.list_id != 0 && recording.generation != 0}};
+    if (recording.reshade_base != 0) {
+      identity["reshade_base"] = recording.reshade_base;
+    }
+    return identity;
   };
   const auto source_observation = [&](const edit_fg_observation::SrCopyback& source) {
     return Json{{"handle", source.source_handle}, {"generation", source.source_generation},
@@ -169,6 +173,11 @@ inline Json Snapshot() {
     Json event{{"sequence", observed.sequence}, {"observed_ns", observed.observed_ns},
         {"thread_id", observed.thread_id}};
     switch (observed.kind) {
+      case edit_fg_observation::Kind::SOURCE_SUCCESS:
+        event["kind"] = "source_success";
+        event["source"] = {{"handle", observed.sr.source_handle},
+            {"generation", observed.sr.source_generation}, {"sequence", observed.sr.sr_sequence}};
+        break;
       case edit_fg_observation::Kind::SR_COPYBACK:
         event["kind"] = "sr_copyback_recorded";
         event["source"] = source_observation(observed.sr);
@@ -209,6 +218,31 @@ inline Json Snapshot() {
             {"repeated", present.repeated}, {"proxy", resource_identity(present.proxy)},
             {"backbuffer", resource_identity(present.backbuffer)}, {"method", present.method},
             {"interval", present.interval}, {"flags", present.flags}};
+        break;
+      }
+      case edit_fg_observation::Kind::XEFG_CONSTANTS: {
+        const auto& constants = observed.xefg_constants;
+        event["kind"] = "xefg_constants";
+        event["call_id"] = observed.call_id;
+        event["api_result"] = observed.api_result;
+        event["api_return_ns"] = observed.api_return_ns;
+        event["constants"] = {{"sdk_slot", constants.sdk_slot}, {"sdk_context", constants.sdk_context},
+            {"context_identity", constants.context_identity}, {"epoch", constants.epoch},
+            {"present_id", constants.present_id},
+            {"frame_time_ms", constants.has_frame_time ? Json(constants.frame_time_ms) : Json(nullptr)}};
+        break;
+      }
+      case edit_fg_observation::Kind::SR_QUEUE_SUBMISSION: {
+        const auto& submission = observed.queue_submission;
+        const auto& execution = submission.execution;
+        event["kind"] = "sr_queue_submission";
+        event["submission"] = {{"queue", submission.queue}, {"list", submission.list},
+            {"list_id", submission.list_id}, {"generation", submission.generation},
+            {"submission_index", submission.submission_index}, {"batch_index", submission.batch_index},
+            {"first_submission", submission.first_submission}, {"execute_entry_ns", execution.execute_entry_ns},
+            {"execute_return_ns", execution.execute_return_ns}, {"forward_calls", execution.forward_calls},
+            {"signal_fence", execution.signal_fence}, {"signal_value", execution.signal_value},
+            {"signal_succeeded", execution.signal_fence != 0 ? Json(execution.signal_succeeded) : Json(nullptr)}};
         break;
       }
       case edit_fg_observation::Kind::NATIVE_FG_RETURN:
@@ -376,6 +410,7 @@ inline Json Snapshot() {
               {"reason", fg_observed.stop_reason}, {"request_generation", fg_observed.request_generation},
               {"source_frames", fg_observed.source_frames}, {"event_count", fg_observed.count},
               {"overflow", fg_observed.overflow},
+              {"source_copyback_observed", fg_observed.source_copyback_observed},
               {"source", source_observation(fg_observed.source)}, {"events", std::move(fg_observation_events)},
               {"evidence", "cpu_call_and_recording_observations_not_gpu_completion_or_pixel_handoff"},
               {"resource_identity_scope", "IUnknown_after_known_ReShade_unwrap;Streamline_faces_remain_distinct"},
@@ -622,7 +657,10 @@ inline Json Execute(const Json& request) {
   const bool consumer_operation = *operation == "fg_consumer_capture";
   const bool benchmark_operation = *operation == "sr_benchmark";
   const bool handoff_capture_operation = *operation == "present_handoff_capture";
+  const bool fg_observation_operation = *operation == "fg_execution_observation";
+  const auto fg_observation_action = (fg_observation_operation ? request.value("action", Json(nullptr)) : Json(nullptr));
   const bool compact_operation = marker_operation || consumer_operation || benchmark_operation || handoff_capture_operation
+      || fg_observation_operation
 #if defined(NR_NEXUS_TEST_XEFG_PRESENT_PROBE)
       || xefg_operation
 #endif
@@ -667,12 +705,20 @@ inline Json Execute(const Json& request) {
     return {{"id", *id}, {"ok", true}, {"status", "observed"}, {"capture", present_handoff_capture::Status()},
         {"state", ProcessIdentityState()}};
   }
-  if (*operation == "status") {
+  if (*operation == "status" || (fg_observation_action == "status" && request.size() == 3)) {
     auto state = Snapshot();
-    return {{"id", *id}, {"ok", true}, {"status", "observed"}, {"state", state},
+    Json response{{"id", *id}, {"ok", true}, {"status", "observed"}, {"state", state},
         {"identity", state.value("identity", Json(nullptr))},
         {"receipt", request.contains("query_id") && last_request.is_object()
                 && request["query_id"] == last_request["id"] ? last_receipt : Json(nullptr)}};
+    if (!response["receipt"].is_null() && state.value("available", false)) {
+      auto& observation = response["state"]["edit_reuse"]["fg_observation"];
+      if (!observation["events"].empty() && response.dump().size() > dev_control_pipe::internal::MAX_FRAME_BYTES) {
+        observation["events"] = Json::array();
+        observation["events_in_status_without_receipt"] = true;
+      }
+    }
+    return response;
   }
   if (*operation != "set" && *operation != "adaptive_feature_experiment"
       && *operation != "bridge_adaptive_experiment" && *operation != "edit_reuse_adaptive_experiment"
@@ -720,6 +766,17 @@ inline Json Execute(const Json& request) {
         + " status=" + response["status"].get<std::string>() + " reason=" + response["reason"].get<std::string>());
     return response;
   };
+  if (fg_observation_operation) {
+    response["reason"] = "invalid_fg_observation_action";
+    if (request.size() != 3 || (fg_observation_action != "arm" && fg_observation_action != "stop")) return finish();
+    if (fg_observation_action == "arm") {
+      response["request_generation"] = edit_fg_observation::Arm();
+    } else {
+      edit_fg_observation::Stop("requested_stop");
+    }
+    response.update({{"ok", true}, {"status", "accepted"}, {"reason", "fg_observation_request_accepted"}});
+    return finish();
+  }
   const bool configuration_busy = shutting_down.load() || slider_pending != nullptr || stage_edit::pending || resolution_edit::pending
       || stage_edit_request.setting != nullptr || !resolution_edit_request.empty() || profile_ui::Busy()
       || profile_ui::pending_action != profile_ui::Action::NONE || preset_ui::manager_geometry.was_open;

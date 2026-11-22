@@ -156,6 +156,18 @@ struct Swapchain final : reshade::api::swapchain {
     }
   }
 
+  std::vector<uintptr_t> BackbufferIdentities() const {
+    // Match ObserveOutputInit: Present and Native receive different COM faces.
+    std::vector<uintptr_t> identities;
+    for (const auto& buffer : buffers) {
+      const auto raw = reinterpret_cast<uintptr_t>(buffer.Get());
+      identities.push_back(raw);
+      const auto canonical = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(buffer.Get()));
+      if (canonical != 0 && canonical != raw) identities.push_back(canonical);
+    }
+    return identities;
+  }
+
   uint64_t get_native() const override {
     return reinterpret_cast<uintptr_t>(present_face != nullptr ? present_face : swapchain.Get());
   }
@@ -177,9 +189,10 @@ struct Swapchain final : reshade::api::swapchain {
 NVSDK_NGX_Result NVSDK_CONV CreateSr(ID3D12GraphicsCommandList*, NVSDK_NGX_Feature feature,
                                    NVSDK_NGX_Parameter*, NVSDK_NGX_Handle** handle) {
   Check(feature == native::kFeatureDlss, "Present x2 registers a game SR feature");
-  static uint32_t sr_handles[2] = {1, 2};
-  static size_t next_source = 0;
-  *handle = reinterpret_cast<NVSDK_NGX_Handle*>(&sr_handles[next_source++ % 2]);
+  static std::vector<std::unique_ptr<uint32_t>> sr_handles;
+  static uint32_t next_source = 0;
+  sr_handles.push_back(std::make_unique<uint32_t>(++next_source));
+  *handle = reinterpret_cast<NVSDK_NGX_Handle*>(sr_handles.back().get());
   return NVSDK_NGX_Result_Success;
 }
 
@@ -213,10 +226,12 @@ struct ParkedExecute {
   void* const original = native::real_queue_execute_command_lists;
   const Event entered{CreateEventW(nullptr, TRUE, FALSE, nullptr), &CloseHandle};
   const Event release{CreateEventW(nullptr, TRUE, FALSE, nullptr), &CloseHandle};
+  const bool after_forward;
   DWORD release_wait = WAIT_FAILED;
   std::atomic_bool forwarded = false;
 
-  ParkedExecute(ID3D12CommandQueue* native_queue, ID3D12CommandList* writer_list) : queue(native_queue), writer(writer_list) {
+  ParkedExecute(ID3D12CommandQueue* native_queue, ID3D12CommandList* writer_list, bool park_after_forward = false)
+      : queue(native_queue), writer(writer_list), after_forward(park_after_forward) {
     Check(entered && release && original != nullptr, "Present x2 can park a native Execute at its trampoline");
     active = this;
     native::real_queue_execute_command_lists = reinterpret_cast<void*>(Forward);
@@ -230,13 +245,19 @@ struct ParkedExecute {
   static void STDMETHODCALLTYPE Forward(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists) {
     auto& gate = *active;
     const bool parked_writer = queue == gate.queue && count == 1 && lists != nullptr && lists[0] == gate.writer;
+    if (parked_writer && gate.after_forward) {
+      reinterpret_cast<native::QueueExecuteCommandListsFn>(gate.original)(queue, count, lists);
+      gate.forwarded.store(true);
+    }
     if (parked_writer) {
       if (!SetEvent(gate.entered.get())) return;
       gate.release_wait = WaitForSingleObject(gate.release.get(), TIMEOUT_MS);
       // A fixture timeout must never leave a GPU submission referencing resources being unwound.
       if (gate.release_wait != WAIT_OBJECT_0) return;
     }
-    reinterpret_cast<native::QueueExecuteCommandListsFn>(gate.original)(queue, count, lists);
+    if (!parked_writer || !gate.after_forward) {
+      reinterpret_cast<native::QueueExecuteCommandListsFn>(gate.original)(queue, count, lists);
+    }
     if (parked_writer) {
       gate.forwarded.store(true);
     }
@@ -669,7 +690,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
         Check(SUCCEEDED(gpu.list->Close()), "close empty recording before native backbuffer readback");
         return pixels;
       };
-      nr_edit_reuse_present_native_cases::Run(*runtime, gpu, stats, present_closed_frame, read_back, read_sr, swap);
+      nr_edit_reuse_present_native_cases::Run(*runtime, gpu, stats, present_closed_frame, read_back, read_sr, swap, next_execute, present_submissions);
       Check(SUCCEEDED(gpu.list->Close()), "close empty fixture list before NGX teardown");
       Check(NVSDK_NGX_SUCCEED(native::HookedReleaseFeatureSlot<Runtime::SR_SLOT>(sr_handle)),
             "ordinary Present x2 releases the real SR handle");
@@ -1878,8 +1899,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
                 << " recovery_reset=" << model_resets.back() << '\n';
 
       auto& present_stream = native::present_streams.at(&output);
-      const std::array back_buffers{reinterpret_cast<uintptr_t>(output.buffers[0].Get()),
-          reinterpret_cast<uintptr_t>(output.buffers[1].Get())};
+      const auto back_buffers = output.BackbufferIdentities();
       const auto swapchain_key = reinterpret_cast<uintptr_t>(&output);
       const auto native_device = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(gpu.device.Get()));
       addon::output_framerate::RegisterPresentOutput(swapchain_key, native_device,
@@ -1990,7 +2010,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
       Check(options::ObservesPresentDecisions() && native::present_frames == 0 && !native::WantsPresentBaseFrames(),
             "native SDK routing tests start with the file-backed Every present strategy");
 
-      const auto& stream = native::present_streams.at(&output);
+      auto& stream = native::present_streams.at(&output);
       const auto& clock = stream.base_frame_clock;
       bool raw_contracts_passed = true;
       const auto expect = [&](bool ok, const char* scenario, const char* message) {
@@ -2176,6 +2196,716 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
       }
       trusted("after-enhanced-steady", Route::OUTER_FIRST, 0);
       Check(raw_contracts_passed, "Every present raw SDK_FORWARD contracts (see PRESENT_EVERY_RAW witnesses)");
+
+      {
+        substitutions.Atomic(&native::present_pre_fg);
+        substitutions.Value(&native::ngx_slot_real[1].evaluate);
+        native::present_pre_fg = 1;
+        static std::function<NVSDK_NGX_Result(ID3D12GraphicsCommandList*)> sdk_consumer;
+        static std::array<ID3D12Resource*, 2> sdk_color_inputs;
+        sdk_consumer = {};
+        sdk_color_inputs = {};
+        native::ngx_slot_real[1].evaluate = reinterpret_cast<void*>(+[](
+            ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter* parameters,
+            PFN_NVSDK_NGX_ProgressCallback) -> NVSDK_NGX_Result {
+          sdk_color_inputs = {native::PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_Backbuffer),
+              native::PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_HUDLess)};
+          return (sdk_consumer ? sdk_consumer(list) : NVSDK_NGX_Result_Success);
+        });
+        addon::bridge::OwnedParameters fg_parameters;
+        fg_parameters.Set(NVSDK_NGX_DLSSG_Parameter_Depth, depth.Get());
+        fg_parameters.Set(NVSDK_NGX_DLSSG_Parameter_MVecs, motion.Get());
+        fg_parameters.Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, 1u);
+        const auto* fg_handle = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xF62});
+        {
+          const addon::RuntimeLock lock(native::runtime_mutex);
+          native::RegisterCreatedFeatureLocked(fg_handle, NVSDK_NGX_Feature_FrameGeneration, &fg_parameters);
+        }
+        const auto evaluate_fg = [&](unsigned long long frame_id) {
+          fg_parameters.Set(NVSDK_NGX_DLSSG_Parameter_Backbuffer, back());
+          fg_parameters.Set(NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID, frame_id);
+          fg_parameters.Set(NVSDK_NGX_DLSSG_Parameter_NotRenderingGameFrames, 0u);
+          reopen();
+          gpu.Transition(back(), PRESENT, NATIVE_INPUT_STATE);
+          Check(NVSDK_NGX_SUCCEED(native::HookedEvaluateFeatureSlot<1>(
+                    gpu.list.Get(), fg_handle, &fg_parameters, nullptr)),
+                "ordinary and Native interop reaches the original SDK call");
+          gpu.Transition(back(), NATIVE_INPUT_STATE, PRESENT);
+        };
+        const auto read_closed = [&](ID3D12Resource* texture = nullptr, D3D12_RESOURCE_STATES resting = PRESENT) {
+          auto pixels = read_back(texture, resting);
+          Check(SUCCEEDED(gpu.list->Close()), "close the empty readback continuation before another Reset");
+          return pixels;
+        };
+        const auto context = std::pair{true, reinterpret_cast<uintptr_t>(&stream)};
+        record();
+        submit();
+        retire_game_producer();
+        event();
+        const auto ordinary_calls = model_calls;
+        const auto ordinary_worksets = native::worksets_created;
+        Check(stream.ordinary_color_guide_serial != 0 && stream.ordinary_color.proofs_healthy,
+              "ordinary owner supplies the current SR-to-BB version and first submission proof");
+        Check(addon::output_framerate::FindPresentOutput(0, reinterpret_cast<uintptr_t>(directx::NativeIdentity(back()))) == stream.output,
+              "Native finds the same registered output through the BB's canonical identity");
+        Check(stream.ordinary_color.output == stream.output
+                  && stream.ordinary_color.backbuffer == reinterpret_cast<uintptr_t>(directx::NativeIdentity(back())),
+              "the ordinary receipt belongs to the same output and canonical BB");
+        Check(!native::fg_service::streams.contains(context), "ordinary delivery has not created a Native service stream");
+        {
+          const addon::RuntimeLock lock(native::runtime_mutex);
+          Check(native::PresentColourVersion(stream, directx::NativeIdentity(back())) == stream.ordinary_color_guide_serial,
+                "the completed ordinary color retains its version after its Present attempt ends");
+        }
+        evaluate_fg(1);
+        std::cout << "NATIVE_ORDINARY_COLOR ordinary_to_native models=" << ordinary_calls << ',' << model_calls
+                  << " worksets=" << ordinary_worksets << ',' << native::worksets_created
+                  << " native_stream=" << native::fg_service::streams.contains(context)
+                  << " sdk_backbuffer_current=" << (sdk_color_inputs[0] == back())
+                  << " sdk_hudless_unchanged=" << (sdk_color_inputs[1] == nullptr) << '\n';
+        Check(model_calls == ordinary_calls, "ordinary to Native same color performs zero additional model Evaluates");
+        Check(native::worksets_created == ordinary_worksets, "ordinary to Native same color creates zero additional NR worksets");
+        Check(!native::fg_service::streams.contains(context), "ordinary to Native same color creates no Native service stream");
+        Check(sdk_color_inputs[0] == back() && sdk_color_inputs[1] == nullptr,
+              "the original SDK consumes the submitted ordinary BB without a replacement HUDLess");
+        submit();
+        alpha_preserved(read_back());
+        const auto delivered_ordinary = stream.ordinary_color_guide_serial;
+        Check(stream.ordinary_color_order.domain != 0 && stream.ordinary_color_order.owned_after,
+              "ordinary color retains its position after the game submission in the shared queue domain");
+        record(true);
+        submit();
+        retire_game_producer();
+        unchanged_pixels(read_closed(), game_pixel);
+        {
+          const addon::RuntimeLock lock(native::runtime_mutex);
+          native::PruneCompletedSubmissionUses();
+          Check(native::PresentColourVersion(stream, directx::NativeIdentity(back())) != delivered_ordinary,
+                "a real newer SR copy followed by readback supersedes ordinary color despite different completion fences");
+        }
+        const auto before_ordinary_recovery = stats();
+        forward(Route::SDK_FIRST);
+        Check(stats().calls == before_ordinary_recovery.calls + 1
+                  && stats().ring_submissions == before_ordinary_recovery.ring_submissions + 1,
+              "ordinary Every present enhances the real new SR color after an intervening readback");
+        alpha_preserved(read_back());
+        std::cout << "NATIVE_ORDINARY_COLOR ordinary_new_sr_readback=one-evaluate,one-write shared_queue_domain=1\n";
+        swap();
+
+        bool proved_native = false;
+        for (unsigned long long frame = 2; frame < 12 && !proved_native; ++frame) {
+          record();
+          submit();
+          {
+            const options::internal::PresentDecisionScope decision(output.swapchain.Get(), 0);
+            evaluate_fg(frame);
+            // The observer's queue fence cannot retire uploads recorded on
+            // the game's still-unsubmitted Native producer list.
+            const auto producer_uploads = gpu.uploads;
+            const auto producer_resources = gpu.retained_resources;
+            proved_native = stream.native_color.accepted;
+            const auto before_forward = stats();
+            if (proved_native) {
+              decision.Publish(S_FALSE, false);
+              event();
+              Check(stats().calls == before_forward.calls && stats().ring_submissions == before_forward.ring_submissions,
+                    "direct Present does not write the already recorded Native color while its first Execute is pending");
+            } else {
+              decision.Publish(S_OK, true);
+              native::TakeNativePassthrough(identity, nullptr);
+            }
+            submit();
+          }
+          if (proved_native) {
+            auto* const same_backbuffer = back();
+            const auto* backbuffer_identity = directx::NativeIdentity(same_backbuffer);
+            const auto native_version = stream.native_color.guide_serial;
+            const auto* native_marker = stream.native_color.marker;
+            retire_game_producer();
+            {
+              const addon::RuntimeLock lock(native::runtime_mutex);
+              native::PruneCompletedSubmissionUses();
+              Check(native_marker != nullptr && addon::submission::ResourceReleasable(native_marker)
+                        && !stream.native_color.retired_fence.empty(),
+                    "Native Execute, Reset and prune retain the first receipt without a replayable recording");
+              Check(std::ranges::none_of(native::present_guide_sets, [&](const auto& capture) {
+                      return capture.serial == native_version && capture.base_frame.backbuffer == backbuffer_identity;
+                    }), "The same-decision handoff already cleared the ordinary SR-to-BB capture");
+              native::OnNativePresentPassthrough(&native::present_streams.at(&output));
+            }
+            const auto before_return = stats();
+            event();
+            Check(stats().calls == before_return.calls && stats().ring_submissions == before_return.ring_submissions,
+                  "a later ordinary callback does not re-evaluate or write the same retired Native color");
+            const auto pixels = read_closed();
+            alpha_preserved(pixels);
+            Check(pixels != std::vector(size * size, game_pixel), "the single Native writer supplies edited RGB");
+
+            {
+              const addon::RuntimeLock lock(native::runtime_mutex);
+              native::PruneCompletedSubmissionUses();
+              Check(native::PresentColourVersion(stream, backbuffer_identity) == native_version,
+                    "a real readback Execute, Reset and prune preserve the owned BB color version");
+            }
+            const auto after_readback = stats();
+            event();
+            Check(stats().calls == after_readback.calls && stats().ring_submissions == after_readback.ring_submissions,
+                  "a readback after Native delivery cannot reopen ordinary Every present writing");
+            Check(read_closed() == pixels, "ordinary callbacks after readback preserve the exact Native RGBA");
+
+            {
+              const auto other_window = CreateWindowExW(0, L"STATIC", L"NR Nexus color version output",
+                  WS_OVERLAPPED, 0, 0, size, size, nullptr, nullptr, module, nullptr);
+              Check(other_window != nullptr, "a separate output owns the intervening color write");
+              const std::unique_ptr<std::remove_pointer_t<HWND>, decltype(&DestroyWindow)> window_owner(other_window, &DestroyWindow);
+              Swapchain other(gpu, other_window, size, size);
+              namespace rate = addon::output_framerate;
+              const auto key = reinterpret_cast<uintptr_t>(&other);
+              const auto device = reinterpret_cast<uintptr_t>(directx::NativeIdentity(gpu.device.Get()));
+              const auto buffers = other.BackbufferIdentities();
+              rate::RegisterPresentOutput(key, device,
+                  reinterpret_cast<uintptr_t>(directx::NativeIdentity(other.swapchain.Get())), buffers);
+              auto* const other_back = other.buffers.at(other.get_current_back_buffer_index()).Get();
+              const auto queue_entries = native::queue_submit_entries.load();
+              reopen();
+              upload(other_back, OVERWRITE_PIXEL, PRESENT);
+              submit();
+              retire_game_producer();
+              {
+                const addon::RuntimeLock lock(native::runtime_mutex);
+                native::PruneCompletedSubmissionUses();
+                Check(native::queue_submit_entries.load() > queue_entries
+                          && native::PresentColourVersion(stream, backbuffer_identity) == native_version,
+                      "another output's real Execute, Reset and prune preserve this output's color version");
+              }
+              const auto after_other_output = stats();
+              event();
+              Check(stats().calls == after_other_output.calls
+                        && stats().ring_submissions == after_other_output.ring_submissions,
+                    "another output's submission cannot reopen ordinary writing of the unchanged BB");
+              Check(read_closed() == pixels, "another output's GPU write leaves the Native BB RGBA intact");
+              unchanged_pixels(read_closed(other_back), OVERWRITE_PIXEL);
+              rate::DestroyPresentOutput(key);
+            }
+            reopen();
+            upload(back(), OVERWRITE_PIXEL, PRESENT);
+            {
+              const auto discarded_uploads = gpu.uploads;
+              const auto discarded_resources = gpu.retained_resources;
+              Check(SUCCEEDED(gpu.list->Close()), "close the discarded overwrite before resetting its allocator");
+              retire_game_producer();
+            }
+            {
+              const addon::RuntimeLock lock(native::runtime_mutex);
+              native::PruneCompletedSubmissionUses();
+              Check(native::PresentColourVersion(stream, backbuffer_identity) == native_version,
+                    "discarding an unsubmitted overwrite keeps the previous accepted color version");
+            }
+            const auto after_discard = stats();
+            event();
+            Check(stats().calls == after_discard.calls && stats().ring_submissions == after_discard.ring_submissions,
+                  "a discarded overwrite cannot reopen the same accepted BB");
+            Check(read_closed() == pixels, "discarded color commands preserve the previous exact Native RGBA");
+
+            reopen();
+            record(true);
+            submit();
+            retire_game_producer();
+            const auto before_new_colour = stats();
+            event();
+            Check(back() == same_backbuffer && stream.ordinary_color_guide_serial != 0
+                      && stream.ordinary_color_guide_serial != native_version
+                      && stats().calls == before_new_colour.calls + 1
+                      && stats().ring_submissions == before_new_colour.ring_submissions + 1,
+                  "a new successful SR and full copy to the same BB restore the ordinary color write");
+            const auto new_pixels = read_back();
+            alpha_preserved(new_pixels);
+            Check(new_pixels != std::vector(size * size, game_pixel), "the new same-address BB receives the ordinary edit");
+            std::cout << "NATIVE_ORDINARY_COLOR retired_repeat=zero-evaluate,zero-write"
+                         " readback_repeat=zero-evaluate,zero-write other_output_repeat=zero-evaluate,zero-write"
+                         " discarded_overwrite_repeat=zero-evaluate,zero-write"
+                         " new_sr_same_bb=one-evaluate,one-write,alpha-preserved\n";
+          } else {
+            reopen();
+          }
+          swap();
+        }
+        Check(proved_native, "the source-proven Native route produces an accepted same-color receipt");
+        {
+          record();
+          submit();
+          evaluate_fg(20);
+          submit();
+          reopen();
+          Check(stream.native_fg_handle == fg_handle && stream.native_color.accepted,
+                "the first output has an accepted Native color before testing a second output");
+          const auto other_window = CreateWindowExW(0, L"STATIC", L"NR Nexus independent ordinary output",
+              WS_OVERLAPPED, 0, 0, size, size, nullptr, nullptr, module, nullptr);
+          Check(other_window != nullptr, "the independent output has its own window");
+          const std::unique_ptr<std::remove_pointer_t<HWND>, decltype(&DestroyWindow)> other_owner(other_window, &DestroyWindow);
+          Swapchain other(gpu, other_window, size, size);
+          namespace rate = addon::output_framerate;
+          const auto key = reinterpret_cast<uintptr_t>(&other);
+          const auto device = reinterpret_cast<uintptr_t>(directx::NativeIdentity(gpu.device.Get()));
+          const auto other_buffers = other.BackbufferIdentities();
+          rate::RegisterPresentOutput(key, device,
+              reinterpret_cast<uintptr_t>(directx::NativeIdentity(other.swapchain.Get())), other_buffers);
+          native::OnPresent(&other.queue, &other, nullptr, nullptr, 0, nullptr);
+          auto& normal = native::present_streams.at(&other);
+          auto parameters = base;
+          parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, jitter_x);
+          parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, jitter_y);
+          NVSDK_NGX_Handle* other_source = nullptr;
+          Check(NVSDK_NGX_SUCCEED(native::HookedCreateFeatureSlot<0>(gpu.list.Get(), native::kFeatureDlss,
+                    &parameters, &other_source)) && other_source != nullptr && other_source != sr_handle,
+                "the independent output uses its own registered SR source");
+          auto* other_back = other.buffers.at(other.get_current_back_buffer_index()).Get();
+          const auto expected_output = rate::MatchPresentOutput(key, reinterpret_cast<uintptr_t>(other_back));
+          const auto output_count = normal.base_frame_clock.outputs;
+          bool delivered = false;
+          for (uint32_t attempt = 0; attempt < 4 && !delivered; ++attempt) {
+            upload(color.Get(), game_pixel, NATIVE_INPUT_STATE);
+            Check(NVSDK_NGX_SUCCEED(native::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), other_source, &parameters, nullptr)),
+                  "the independent source passes the real SR wrapper while the first output owns Native FG");
+            gpu.Transition(sr_output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            gpu.Transition(other_back, PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+            gpu.list->CopyResource(other_back, sr_output.Get());
+            gpu.Transition(other_back, D3D12_RESOURCE_STATE_COPY_DEST, PRESENT);
+            gpu.Transition(sr_output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            submit();
+            retire_game_producer();
+            native::OnPresent(&other.queue, &other, nullptr, nullptr, 0, nullptr);
+            finish();
+            delivered = normal.base_frame_clock.outputs == output_count + 1;
+            if (!delivered) reopen();
+          }
+          Check(delivered && normal.base_frame_clock.complete
+                    && normal.base_frame_clock.frame.source == reinterpret_cast<uintptr_t>(other_source)
+                    && stream.native_fg_handle == fg_handle,
+                "the independent output produces a complete ordinary SR-to-BB version without revoking Native A");
+          const auto other_pixels = read_back(other_back);
+          alpha_preserved(other_pixels);
+          Check(other_pixels != std::vector(size * size, game_pixel), "the independent BB receives its own RGB edit");
+          {
+            const addon::RuntimeLock lock(native::runtime_mutex);
+            funnel_accounting_tests::Restore fallback;
+            fallback.Atomic(&native::present_unusable);
+            fallback.Atomic(&native::present_unpresented_evaluates);
+            fallback.Atomic(&native::present_format_fallbacks);
+            fallback.Value(&native::present_inline_fallback_pending);
+            fallback.Value(&native::present_fallback_episode);
+            native::present_unusable = true;
+            auto native_source_parameters = base;
+            native_source_parameters.Set(NVSDK_NGX_Parameter_Output, back());
+            Check(native::ResolvePresentSourceOutput(other_source, sr_output.Get()) == expected_output
+                      && native::PresentTakesEvaluate(sr_handle, &native_source_parameters)
+                      && !native::PresentTakesEvaluate(other_source, &parameters),
+                  "Native A protects its own fallback while the known independent SR source may fall back");
+          }
+          Check(NVSDK_NGX_SUCCEED(native::HookedReleaseFeatureSlot<0>(other_source)),
+                "the independent SR source releases after its GPU work completes");
+          {
+            const addon::RuntimeLock lock(native::runtime_mutex);
+            native::RetirePresentStream(&other);
+          }
+          rate::DestroyPresentOutput(key);
+        }
+        for (const bool overlapping : {false, true}) {
+          record();
+          submit();
+          const auto previous_serial = stream.native_color.serial;
+          const options::internal::PresentDecisionScope decision(output.swapchain.Get(), 0);
+          evaluate_fg(overlapping ? 22 : 21);
+          Check(stream.native_color.accepted && stream.native_color.serial != previous_serial,
+                "Native A records a new accepted color before another list records an SR-to-BB overwrite");
+          const auto native_version = stream.native_color.guide_serial;
+          const auto native_recording = stream.native_color.recording_status;
+          const auto native_list = gpu.list;
+          const auto native_allocator = gpu.allocator;
+          const auto native_uploads = std::exchange(gpu.uploads, {});
+          const auto native_resources = std::exchange(gpu.retained_resources, {});
+          Check(SUCCEEDED(native_list->Close()), "Native A closes without Execute before raw B records");
+
+          ComPtr<ID3D12CommandAllocator> overwrite_allocator;
+          ComPtr<ID3D12GraphicsCommandList> overwrite_list;
+          Check(SUCCEEDED(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&overwrite_allocator)))
+                    && SUCCEEDED(gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        overwrite_allocator.Get(), nullptr, IID_PPV_ARGS(&overwrite_list))),
+                "raw B uses a different real hooked command list and allocator");
+          gpu.allocator = overwrite_allocator;
+          gpu.list = overwrite_list;
+          record(true);
+          const auto overwrite_recording = addon::submission::ObserveRecording(gpu.list.Get());
+          if (overlapping) {
+            Check(addon::control_mask_execution::internal::active_recordings.load() == 0,
+                  "the overlap fixture uses the production path without ControlMask queue serialization");
+            Check(SUCCEEDED(gpu.list->Close()), "raw B closes before its overlapping Execute");
+            ParkedExecute parked(gpu.queue.Get(), gpu.list.Get(), true);
+            ID3D12CommandList* raw_lists[]{gpu.list.Get()};
+            std::thread raw_submit([&] { gpu.queue->ExecuteCommandLists(1, raw_lists); });
+            const auto entered = WaitForSingleObject(parked.entered.get(), ParkedExecute::TIMEOUT_MS);
+            if (entered == WAIT_OBJECT_0) {
+              ID3D12CommandList* native_lists[]{native_list.Get()};
+              gpu.queue->ExecuteCommandLists(1, native_lists);
+            }
+            SetEvent(parked.release.get());
+            raw_submit.join();
+            Check(entered == WAIT_OBJECT_0 && parked.release_wait == WAIT_OBJECT_0 && parked.forwarded.load(),
+                  "raw B really Executes before Native A but returns for its Signal only after A");
+            finish();
+            std::vector<std::pair<addon::FenceRef, uint64_t>> receipts;
+            const auto native_receipt = native::NativeColourSubmission(stream.native_color);
+            Check(addon::submission::UseSubmissionTokens(overwrite_recording.get(), &receipts) == addon::submission::UseSubmission::kTokens
+                      && receipts.size() == 1 && receipts.front().first.fence == native_receipt.first.fence
+                      && receipts.front().second > native_receipt.second,
+                  "the real post-Execute Signals run in the opposite order to the BB writes");
+          } else {
+            submit();
+          }
+          retire_game_producer();
+          gpu.allocator = native_allocator;
+          gpu.list = native_list;
+          if (!overlapping) {
+            ID3D12CommandList* lists[]{gpu.list.Get()};
+            gpu.queue->ExecuteCommandLists(1, lists);
+            finish();
+          }
+          retire_game_producer();
+          decision.Publish(S_FALSE, false);
+          event();
+          {
+            const addon::RuntimeLock lock(native::runtime_mutex);
+            native::PruneCompletedSubmissionUses();
+            const auto delivered = native::NativeColourOrder(stream.native_color);
+            const auto write = std::ranges::find_if(stream.colour_overwrites, [&](const auto& candidate) {
+              return candidate.guide_serial == native_version && candidate.recording == overwrite_recording;
+            });
+            Check(write != stream.colour_overwrites.end(), "raw B records an overwrite candidate for Native A's exact color version");
+            const auto overwrite = native::ColourRecordingOrder(write->recording, write->retired_order);
+            Check(overlapping ? delivered.domain == 0 && overwrite.domain == 0 : overwrite.Precedes(delivered),
+                  "only non-overlapping Execute evidence can order raw B before Native A");
+            Check(native_recording->closed.load() && overwrite_recording->closed.load()
+                      && native::PresentColourVersion(stream, directx::NativeIdentity(back())) == native_version,
+                  "Reset and prune retain Native A's version when the raw overwrite actually executed earlier");
+            native::OnNativePresentPassthrough(&stream);
+          }
+          const auto expected = read_closed(native::fg_service::streams.at(context).cached->color[0], NATIVE_INPUT_STATE);
+          const auto pixels = read_closed();
+          Check(pixels == expected && pixels != std::vector(size * size, game_pixel),
+                "the actual last writer is Native A's edited RGBA rather than raw B's SR pixels");
+          alpha_preserved(pixels);
+          const auto before_forward = stats();
+          event();
+          Check(stats().calls == before_forward.calls && stats().ring_submissions == before_forward.ring_submissions
+                    && read_closed() == pixels,
+                "ordinary Every present performs zero Evaluate and zero write after B then A Execute, Reset and prune");
+          reopen();
+          if (!overlapping) {
+            record(true);
+            submit();
+            retire_game_producer();
+            const auto before_new_source = stats();
+            event();
+            Check(stats().calls == before_new_source.calls + 1 && stats().ring_submissions == before_new_source.ring_submissions + 1,
+                  "a genuinely later SR-to-BB write restores ordinary NR after the reverse Execute order counterexample");
+            alpha_preserved(read_back());
+          }
+          std::cout << "NATIVE_ORDINARY_COLOR raw_b_then_native_a=edited-rgba,zero-evaluate,zero-write overlapping=" << overlapping
+                    << " signal_order=" << (overlapping ? "reversed-unknown" : "execute-order") << '\n';
+          swap();
+        }
+        {
+          record();
+          submit();
+          evaluate_fg(30);
+          Check(stream.native_color.accepted, "Native A is accepted before the cross-generation redelivery counterexample");
+          const auto native_version = stream.native_color.guide_serial;
+          const auto accepted_recording = stream.native_color.recording_status;
+          const auto accepted_calls = model_calls;
+          submit();
+          retire_game_producer();
+          evaluate_fg(30);
+          const auto discarded_recording = addon::submission::ObserveRecording(gpu.list.Get());
+          Check(discarded_recording != accepted_recording && model_calls == accepted_calls,
+                "a same-color redelivery records on a new real generation without another model Evaluate");
+          const auto discarded_uploads = gpu.uploads;
+          const auto discarded_resources = gpu.retained_resources;
+          Check(SUCCEEDED(gpu.list->Close()), "close the unsubmitted redelivery before Reset");
+          retire_game_producer();
+          {
+            const addon::RuntimeLock lock(native::runtime_mutex);
+            native::PruneCompletedSubmissionUses();
+            Check(stream.native_color.accepted && stream.native_color.recording_status == accepted_recording
+                      && native::NativeColourWriteOutstanding(stream.native_color),
+                  "discarding R leaves the accepted A writer and its color ownership intact");
+          }
+          evaluate_fg(30);
+          const auto redelivery_recording = addon::submission::ObserveRecording(gpu.list.Get());
+          Check(model_calls == accepted_calls && redelivery_recording != accepted_recording
+                    && std::ranges::any_of(stream.native_color.writes, [&](const auto& write) { return write.recording == redelivery_recording; }),
+                "every real cached-color redelivery registers its own writer while retaining A's producer");
+          const auto redelivery_list = gpu.list;
+          const auto redelivery_allocator = gpu.allocator;
+          const auto redelivery_uploads = std::exchange(gpu.uploads, {});
+          const auto redelivery_resources = std::exchange(gpu.retained_resources, {});
+          Check(SUCCEEDED(redelivery_list->Close()), "R closes before the raw B list records");
+          ComPtr<ID3D12CommandAllocator> raw_allocator;
+          ComPtr<ID3D12GraphicsCommandList> raw_list;
+          Check(SUCCEEDED(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&raw_allocator)))
+                    && SUCCEEDED(gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        raw_allocator.Get(), nullptr, IID_PPV_ARGS(&raw_list))),
+                "raw B has its own real list while R waits for Execute");
+          gpu.allocator = raw_allocator;
+          gpu.list = raw_list;
+          record(true);
+          const auto raw_recording = addon::submission::ObserveRecording(gpu.list.Get());
+          submit();
+          retire_game_producer();
+          {
+            const addon::RuntimeLock lock(native::runtime_mutex);
+            native::OnNativePresentPassthrough(&stream);
+          }
+          const auto before_pending = stats();
+          event();
+          Check(stats().calls == before_pending.calls && stats().ring_submissions == before_pending.ring_submissions,
+                "raw B executing after A cannot grant ordinary writing while the same-color R is still unsubmitted");
+          gpu.allocator = redelivery_allocator;
+          gpu.list = redelivery_list;
+          ID3D12CommandList* lists[]{gpu.list.Get()};
+          gpu.queue->ExecuteCommandLists(1, lists);
+          finish();
+          retire_game_producer();
+          {
+            const addon::RuntimeLock lock(native::runtime_mutex);
+            native::PruneCompletedSubmissionUses();
+            const auto raw = std::ranges::find_if(stream.colour_overwrites, [&](const auto& write) {
+              return write.guide_serial == native_version && write.recording == raw_recording;
+            });
+            Check(raw != stream.colour_overwrites.end()
+                      && native::ColourRecordingOrder(raw->recording, raw->retired_order).Precedes(native::NativeColourOrder(stream.native_color))
+                      && native::PresentColourVersion(stream, directx::NativeIdentity(back())) == native_version,
+                  "the color ledger orders raw B before the last Native R rather than comparing B only with A");
+          }
+          const auto expected = read_closed(native::fg_service::streams.at(context).cached->color[0], NATIVE_INPUT_STATE);
+          const auto pixels = read_closed();
+          Check(pixels == expected && pixels != std::vector(size * size, game_pixel), "R is the actual last writer of the complete edited RGBA");
+          const auto before_return = stats();
+          event();
+          Check(stats().calls == before_return.calls && stats().ring_submissions == before_return.ring_submissions
+                    && read_closed() == pixels,
+                "Reset and prune after raw B then R Execute preserve RGBA with zero ordinary Evaluate and zero write");
+          std::cout << "NATIVE_ORDINARY_COLOR cross_generation_r=last-writer,zero-evaluate,zero-write discarded_r=keeps-A\n";
+          reopen();
+          swap();
+        }
+        {
+          record();
+          submit();
+          const auto previous_serial = stream.native_color.serial;
+          const options::internal::PresentDecisionScope decision(output.swapchain.Get(), 0);
+          fg_parameters.Set(NVSDK_NGX_DLSSG_Parameter_Backbuffer, back());
+          fg_parameters.Set(NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID, 31ull);
+          fg_parameters.Set(NVSDK_NGX_DLSSG_Parameter_NotRenderingGameFrames, 0u);
+          reopen();
+          gpu.Transition(back(), PRESENT, NATIVE_INPUT_STATE);
+          sdk_consumer = [](ID3D12GraphicsCommandList*) { return NVSDK_NGX_Result_Fail; };
+          const auto result = native::HookedEvaluateFeatureSlot<1>(gpu.list.Get(), fg_handle, &fg_parameters, nullptr);
+          sdk_consumer = {};
+          Check(NVSDK_NGX_FAILED(result) && stream.native_color.serial != previous_serial
+                    && !stream.native_color.accepted && stream.native_color.rollback_recorded,
+                "first SDK rejection records the original-color rollback on the same Native generation");
+          gpu.Transition(back(), NATIVE_INPUT_STATE, PRESENT);
+          const auto rejected_color = stream.native_color;
+          const auto rollback_uploads = gpu.uploads;
+          const auto rollback_resources = gpu.retained_resources;
+          submit();
+          ID3D12CommandList* lists[]{gpu.list.Get()};
+          gpu.queue->ExecuteCommandLists(1, lists);
+          finish();
+          {
+            const addon::RuntimeLock lock(native::runtime_mutex);
+            std::vector<std::pair<addon::FenceRef, uint64_t>> receipts;
+            Check(addon::submission::UseSubmissionTokens(rejected_color.marker, &receipts) == addon::submission::UseSubmission::kTokens
+                      && receipts.size() == 2 && native::NativeColourWriteOutstanding(rejected_color),
+                  "two real healthy Executes retain the rollback writer while its generation can still replay");
+          }
+          retire_game_producer();
+          {
+            const addon::RuntimeLock lock(native::runtime_mutex);
+            native::PruneCompletedSubmissionUses();
+            Check(!native::NativeColourWriteOutstanding(rejected_color),
+                  "all healthy executions of the exact closed rollback generation settle its color ownership after prune");
+            native::PresentColourVersion(stream, directx::NativeIdentity(back()));
+            Check(stream.native_color.guide_serial == 0, "settled multi-Execute rollback releases the Native color receipt");
+            native::OnNativePresentPassthrough(&stream);
+          }
+          unchanged_pixels(read_closed(), game_pixel);
+          const auto before_forward = stats();
+          decision.Publish(S_FALSE, false);
+          event();
+          Check(stats().calls == before_forward.calls + 1 && stats().ring_submissions == before_forward.ring_submissions + 1,
+                "ordinary NR can enhance the restored raw BB after the multi-Execute rollback completes");
+          const auto pixels = read_back();
+          alpha_preserved(pixels);
+          Check(pixels != std::vector(size * size, game_pixel), "the recovered ordinary output contains its own edited RGB");
+          std::cout << "NATIVE_ORDINARY_COLOR rejected_rollback_two_executes=raw-rgba,closed,healthy,settled"
+                       " ordinary_recovery=one-evaluate,one-write\n";
+          swap();
+        }
+        {
+          bool ready = false;
+          for (unsigned long long frame = 32; frame < 36 && !ready; ++frame) {
+            record();
+            submit();
+            retire_game_producer();
+            unchanged_pixels(read_closed(), game_pixel);
+            const auto previous_serial = stream.native_color.serial;
+            evaluate_fg(frame);
+            ready = stream.native_color.accepted && stream.native_color.serial != previous_serial;
+            submit();
+            retire_game_producer();
+            if (!ready) reopen();
+          }
+          Check(ready && stream.native_color.guide_serial == 0,
+                "Native A really Executes a color without an SR version after ordinary source ordering was displaced by readback");
+          const auto accepted_recording = stream.native_color.recording_status;
+          const auto accepted_serial = stream.native_color.serial;
+          const auto pixels = read_closed();
+          {
+            const options::internal::PresentDecisionScope decision(output.swapchain.Get(), 0);
+            fg_parameters.Set(NVSDK_NGX_DLSSG_Parameter_Backbuffer, back());
+            fg_parameters.Set(NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID, 36ull);
+            fg_parameters.Set(NVSDK_NGX_DLSSG_Parameter_NotRenderingGameFrames, 0u);
+            reopen();
+            gpu.Transition(back(), PRESENT, NATIVE_INPUT_STATE);
+            std::shared_ptr<addon::submission::RecordingStatus> discarded;
+            sdk_consumer = [&](ID3D12GraphicsCommandList* list) {
+              discarded = addon::submission::ObserveRecording(list);
+              Check(stream.native_color.guide_serial == 0 && stream.native_color.serial != accepted_serial
+                        && std::ranges::any_of(stream.native_color.writes, [&](const auto& write) { return write.recording == accepted_recording; })
+                        && std::ranges::any_of(stream.native_color.writes, [&](const auto& write) { return write.recording == discarded; }),
+                    "unversioned B really records a non-redelivery write while retaining executed A");
+              const auto discarded_uploads = gpu.uploads;
+              const auto discarded_resources = gpu.retained_resources;
+              Check(SUCCEEDED(gpu.list->Close()), "the rejecting SDK closes B before its real Reset");
+              retire_game_producer();
+              return NVSDK_NGX_Result_Fail;
+            };
+            const auto result = native::HookedEvaluateFeatureSlot<1>(gpu.list.Get(), fg_handle, &fg_parameters, nullptr);
+            sdk_consumer = {};
+            Check(NVSDK_NGX_FAILED(result) && discarded != nullptr && discarded->closed.load() && !discarded->submitted.load()
+                      && std::ranges::any_of(stream.native_color.writes, [&](const auto& write) { return write.recording == accepted_recording; })
+                      && std::ranges::none_of(stream.native_color.writes, [&](const auto& write) { return write.recording == discarded; }),
+                  "late rejection settles only discarded B and retains the exact executed A writer");
+            const auto before_forward = stats();
+            decision.Publish(S_FALSE, false);
+            event();
+            {
+              const addon::RuntimeLock lock(native::runtime_mutex);
+              native::PruneCompletedSubmissionUses();
+              Check(native::NativeColourWriteOutstanding(stream.native_color), "A remains protected after B's Reset, rejection and prune");
+            }
+            Check(stats().calls == before_forward.calls && stats().ring_submissions == before_forward.ring_submissions
+                      && read_closed() == pixels,
+                  "SDK_FORWARD after discarded B preserves A's exact RGBA with zero Evaluate and zero write");
+          }
+          size_t peak_writers = stream.native_color.writes.size();
+          uint32_t actual_writes = 0;
+          for (unsigned long long frame = 37; frame < 45; ++frame) {
+            const auto previous_serial = stream.native_color.serial;
+            evaluate_fg(frame);
+            actual_writes += stream.native_color.accepted && stream.native_color.serial != previous_serial;
+            submit();
+            retire_game_producer();
+            {
+              const addon::RuntimeLock lock(native::runtime_mutex);
+              native::PruneCompletedSubmissionUses();
+              peak_writers = (std::max)(peak_writers, stream.native_color.writes.size());
+              Check(stream.native_color.guide_serial == 0 && stream.native_color.writes.size() <= 2,
+                    "closed healthy unversioned Native frames compact metadata only after a real replacement completes without rollback");
+            }
+          }
+          Check(actual_writes >= 4, "the metadata convergence loop contains repeated real Native color writes");
+          std::cout << "NATIVE_ORDINARY_COLOR late_reset_reject=keeps-A,exact-rgba,zero-evaluate,zero-write"
+                    << " completed_unversioned_writes=" << actual_writes << " peak_writers=" << peak_writers << '\n';
+          reopen();
+        }
+        {
+          record();
+          submit();
+          const auto previous_serial = stream.native_color.serial;
+          {
+            const options::internal::PresentDecisionScope decision(output.swapchain.Get(), 0);
+            fg_parameters.Set(NVSDK_NGX_DLSSG_Parameter_Backbuffer, back());
+            fg_parameters.Set(NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID, 60ull);
+            fg_parameters.Set(NVSDK_NGX_DLSSG_Parameter_NotRenderingGameFrames, 0u);
+            reopen();
+            gpu.Transition(back(), PRESENT, NATIVE_INPUT_STATE);
+            sdk_consumer = [&](ID3D12GraphicsCommandList* list) {
+              Check(list == gpu.list.Get() && stream.native_color.serial != previous_serial
+                        && stream.native_color.guide_serial != 0
+                        && stream.native_color.recording == addon::submission::RecordingIdentity(list),
+                    "the rejecting SDK receives this invocation's newly recorded Native BB write");
+              gpu.Transition(back(), NATIVE_INPUT_STATE, PRESENT);
+              submit();
+              return NVSDK_NGX_Result_Fail;
+            };
+            const auto result = native::HookedEvaluateFeatureSlot<1>(gpu.list.Get(), fg_handle, &fg_parameters, nullptr);
+            sdk_consumer = {};
+            Check(NVSDK_NGX_FAILED(result) && !stream.native_color.accepted && !stream.native_color.rollback_recorded
+                      && stream.native_color.recording_status != nullptr && stream.native_color.recording_status->submitted.load(),
+                  "SDK rejection after real Execute retains the issued BB write without appending a rollback");
+            const auto rejected_version = stream.native_color.guide_serial;
+            const auto before_forward = stats();
+            decision.Publish(S_FALSE, false);
+            event();
+            Check(stats().calls == before_forward.calls && stats().ring_submissions == before_forward.ring_submissions,
+                  "SDK_FORWARD after an issued Native write was rejected cannot enhance the same BB again");
+            retire_game_producer();
+            {
+              const addon::RuntimeLock lock(native::runtime_mutex);
+              native::PruneCompletedSubmissionUses();
+              Check(native::NativeColourWriteOutstanding(stream.native_color)
+                        && native::PresentColourVersion(stream, directx::NativeIdentity(back())) == rejected_version,
+                    "Reset and prune preserve rejected but unrolled-back GPU color ownership");
+            }
+          }
+          const auto before_forward = stats();
+          forward(Route::SDK_FIRST);
+          Check(stats().calls == before_forward.calls && stats().ring_submissions == before_forward.ring_submissions,
+                "a later direct SDK Present also preserves the rejected GPU color without a second write");
+          const auto pixels = read_back();
+          alpha_preserved(pixels);
+          Check(pixels != std::vector(size * size, game_pixel), "late SDK rejection preserves the actually executed edited RGBA");
+          std::cout << "NATIVE_ORDINARY_COLOR late_sdk_reject_after_execute=edited-rgba,zero-evaluate,zero-write"
+                       " rejected_reset_prune=owned-version\n";
+          swap();
+        }
+        {
+          const addon::RuntimeLock lock(native::runtime_mutex);
+          native::ForgetSourceHandleLocked(fg_handle);
+        }
+      }
+
+      load_present_mode("1");
+      for (const auto route : {Route::SDK_FIRST, Route::OUTER_FIRST}) {
+        for (uint32_t frame = 0; frame < 4; ++frame) {
+          const uint32_t expected_models = (frame % 2 == 0 ? 1u : 0u);
+          const auto before = stats();
+          record(frame == 0);
+          submit();
+          retire_game_producer();
+          forward(route);
+          const auto after = stats();
+          Check(after.base_claims == before.base_claims + 1 && after.base_outputs == before.base_outputs + 1
+                    && after.calls == before.calls + expected_models && after.base_complete,
+                "Game frames follows the proved SR-to-BB version through SDK_FORWARD");
+          const auto pixels = read_back();
+          alpha_preserved(pixels);
+          Check(pixels != std::vector(size * size, game_pixel), "Game frames SDK_FORWARD writes edited RGB");
+          swap();
+        }
+      }
     }
 
     load_present_mode("1");
@@ -2216,7 +2946,7 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
       }
       rate::RegisterPresentOutput(reinterpret_cast<uintptr_t>(&output),
           reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(gpu.device.Get())),
-          reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(output.swapchain.Get())), buffers);
+          reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(output.swapchain.Get())), output.BackbufferIdentities());
       const auto owner = rate::FindPresentOutput(0, buffers[output.get_current_back_buffer_index()]);
       Check(static_cast<bool>(owner), "Streamline source fixture has an actual output owner");
       sl::Resource buffer(sl::ResourceType::eTex2d, back());
@@ -2594,6 +3324,14 @@ int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_
       std::cerr << "FAIL Present x2 recycled recording must bypass the Draw/Dispatch source observer runtime lock\n";
     }
     if (!preserves_cross_epoch_writer || !reset_observer_bypassed) return 1;
+    std::cout << "NR_RELEASE_PARITY native-prefg-present-x2 native-ordinary-handoff"
+                 " ordinary-to-native=zero-evaluate,no-native-workset"
+                 " native-to-ordinary-pending=zero-evaluate,zero-present-submit"
+                 " native-to-ordinary-submitted=zero-evaluate,zero-present-submit"
+                 " native-rgba=rgb-edited,alpha-preserved"
+                 " independent-output=sr-to-bb,rgb-edited,alpha-preserved,scoped-fallback"
+                 " game-frames-sdk-first=1/0/1/0 game-frames-outer-first=1/0/1/0"
+                 " game-frames-rgba=rgb-edited,alpha-preserved\n";
     std::cout << "PASS ordinary D3D12 Present x2 WARP+MOCK: A/G/R 1/0/1/0 ordered RGBA, source replacement, prepared/output, "
                  "wrong buffer, discarded producer, missing jitter, late writes, failed model, "
                  "XeFG ownership, DXGI resize, cross-epoch writer, recycled list and legacy INI source/strategy\n";

@@ -77,8 +77,8 @@ inline int Run() {
     rate::ObserveNativeOptions(7, 1, 1, 2);
     Check(options::internal::HookedSetOptions(sl::ViewportHandle(9), off) == sl::Result::eOk
             && runtime::native_fg_owns.load() && runtime::history_reset_epoch.load() == history
-            && !rate::NativeMode(main_output).has_value(),
-        "an unassociated declaration withdraws fixed-rate evidence without resetting the actual owner's image history");
+            && rate::NativeMode(main_output) == 1u,
+        "an unassociated declaration preserves the actual owner's fixed-rate evidence and image history");
     Check(options::internal::HookedSetOptions(sl::ViewportHandle(8), off) == sl::Result::eOk
             && runtime::native_fg_owns.load() && !runtime::native_fg_public_off.load()
             && runtime::history_reset_epoch.load() == history && rate::NativeMode(secondary_output) == 0,

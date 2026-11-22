@@ -357,6 +357,16 @@ class Client:
         request = dict(id=str(uuid.uuid4()), op='edit_reuse_fg_experiment', enabled=enabled)
         return self._mutation(request, deadline)
 
+    def fg_execution_observation(self, action, *, deadline=None):
+        """Arm, stop, or read the bounded CPU trace without changing NR settings."""
+        if action not in ('arm', 'stop', 'status'):
+            raise ValueError('fg_execution_observation requires arm, stop, or status')
+        deadline = deadline if deadline is not None else time.monotonic() + self.timeout
+        request = dict(id=str(uuid.uuid4()), op='fg_execution_observation', action=action)
+        if action == 'status':
+            return self._request(request, deadline)
+        return self._mutation(request, deadline)
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

@@ -493,7 +493,7 @@ struct Scope {
     if (state.rows.size() == state.capacity) return false;
     if (track_queue) {
       observation.recording = submission::ObserveRecording(list);
-      submission::TrackUse(list, observation.recording.get());
+      submission::TrackUse(list, observation.recording.get(), submission::UseKind::kIndependentCpuObservation);
     }
     state.rows.emplace_back();
     frame = std::move(observation);
