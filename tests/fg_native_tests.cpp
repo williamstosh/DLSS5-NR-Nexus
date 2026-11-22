@@ -5561,14 +5561,34 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool
         const auto calls_before = model_calls;
         session.Guides(950u, guides[3].Get(), guides[2].Get());
         session.Tag(950u, DEPTH, guides[3].Get(), ONLY_NOW);
+        session.Tag(950u, MOTION, guides[2].Get(), ONLY_NOW);
         const auto copied_recording = submission::ObserveRecording(gpu.list.Get());
         Check(copied_recording != nullptr && !copied_recording->closed.load()
                   && native::TeardownProof() == submission::RecordedWork::kPending,
               "SDK ONLY_NOW snapshot remains real work on its external source list");
+        {
+          std::lock_guard lock(submission::tracker_mutex);
+          const auto& generation = submission::tracked_lists.at(copied_recording->list)
+                                       .generations.at(copied_recording->generation);
+          for (const auto type : {DEPTH, MOTION}) {
+            const auto& tagged = session.context->frames.at(950u)->resources[type];
+            const auto use = std::ranges::find(generation.classified_uses, tagged.resource.Get(),
+                                               &submission::ResourceUse::object);
+            std::cout << "XEFG_ONLY_NOW_SNAPSHOT type=" << type << " source=" << guides[type == DEPTH ? 3 : 2].Get()
+                      << " snapshot=" << tagged.resource.Get() << " list=" << copied_recording->list
+                      << " generation=" << copied_recording->generation
+                      << " kind=" << (use == generation.classified_uses.end() ? -1 : static_cast<int>(use->kind))
+                      << std::endl;
+            Check(tagged.copy != nullptr && tagged.resource == tagged.copy->texture
+                      && use != generation.classified_uses.end() && use->kind == submission::UseKind::kIndependentGuide
+                      && generation.owner == submission::RecordingOwner::kBorrowedGame && use->output.resource == nullptr,
+                  "actual SDK Depth and Motion snapshots have independent ownership in their exact source generation");
+          }
+        }
         session.Present(950u);
         Check(xefg::CurrentResult() == fg::Result::NOT_SERVED && model_calls == calls_before
                   && !native::direct_api.private_instance && native::core_destroy_parameters == old_provider,
-              "an unsubmitted SDK snapshot still retains the ordinary provider");
+              "unsubmitted SDK snapshots still prevent consumption and leave the ordinary provider unchanged");
         submit();
         Check(copied_recording->closed.load(), "source legitimately submits and resets its SDK snapshot recording");
       }
@@ -5591,6 +5611,8 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool
           reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(gpu.device.Get())),
           reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(session.proxy.Get())), buffers);
       const auto captures_before_service = native::present_captures.load();
+      auto ordinary_submissions_before_service = ordinary.nr_presents;
+      std::array<ComPtr<ID3D12Resource>, 2> last_snapshots;
       std::vector<NativeRuntimeEvaluation> observed;
       model_parameter_observer = [&](const NVSDK_NGX_Handle* model, const NVSDK_NGX_Parameter* block) {
         observed.push_back({.model = model,
@@ -5598,6 +5620,12 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool
             .motion = native::GetD3D12Resource(block, "DLSSNR.MVec")});
       };
       for (uint32_t frame = 0; frame < native::kContractDebounceFrames + 16; ++frame) {
+        if (frame < 3) {
+          Check(Hooks::Enable(session.handle, 0) == 0 && run_ordinary()
+                    && Hooks::Enable(session.handle, 1) == 0,
+                "continuous ONLY_NOW input survives repeated public Off/On provider handoffs");
+          ordinary_submissions_before_service = ordinary.nr_presents;
+        }
         const auto calls_before = model_calls;
         observed.clear();
         {
@@ -5609,9 +5637,34 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool
               D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON);
         }
         session.Guides(1000u + frame, guides[3].Get(), guides[2].Get());
+        session.Tag(1000u + frame, DEPTH, guides[3].Get(), ONLY_NOW);
+        session.Tag(1000u + frame, MOTION, guides[2].Get(), ONLY_NOW);
+        const auto& tagged_frame = session.context->frames.at(1000u + frame);
+        last_snapshots = {tagged_frame->resources[DEPTH].resource, tagged_frame->resources[MOTION].resource};
+        const auto source_recording = submission::ObserveRecording(gpu.list.Get());
+        ComPtr<ID3D12Fence> snapshot_gate;
+        Check(SUCCEEDED(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&snapshot_gate))),
+              "ONLY_NOW source queue gate");
+        std::unique_ptr<ID3D12Fence, decltype(release_gate)> snapshot_gate_release(snapshot_gate.Get(), release_gate);
+        Check(SUCCEEDED(gpu.queue->Wait(snapshot_gate.Get(), 1)) && SUCCEEDED(gpu.list->Close()),
+              "source snapshot generation closes behind its actual queue gate");
+        ID3D12CommandList* lists[]{gpu.list.Get()};
+        gpu.queue->ExecuteCommandLists(1, lists);
+        Check(SUCCEEDED(gpu.queue->Signal(gpu.fence.Get(), ++gpu.serial)), "source snapshot completion signal");
+        auto in_flight_allocator = std::move(gpu.allocator);
+        Check(SUCCEEDED(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&gpu.allocator)))
+                  && SUCCEEDED(gpu.list->Reset(gpu.allocator.Get(), nullptr)),
+              "game resets the source list with a fresh allocator while the preceding generation remains in flight");
+        Check(source_recording != nullptr && source_recording->submitted.load() && source_recording->closed.load()
+                  && gpu.fence->GetCompletedValue() < gpu.serial
+                  && !submission::ResourceReleasable(last_snapshots[0].Get())
+                  && !submission::ResourceReleasable(last_snapshots[1].Get()),
+              "both ONLY_NOW snapshots retain their exact submitted-and-reset in-flight generation");
         session.Present(1000u + frame);
         result = xefg::CurrentResult();
         frame_evals = model_calls - calls_before;
+        Check(SUCCEEDED(snapshot_gate->Signal(1)), "release the snapshot producer after the actual proxy service");
+        snapshot_gate_release.release();
         if (const auto stream = native::fg_service::streams.find(key); stream != native::fg_service::streams.end()) {
           wait_service_fence(stream->second);
           submitted = stream->second.submitted;
@@ -5635,11 +5688,13 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool
             "XeFG Service must take over completed ordinary Present work and submit both passes");
       Check(sustained_submissions == 6 && native::present_captures.load() == captures_before_service,
             "XeFG must converge under continuous source evaluations without recording unused ordinary guides");
+      Check(ordinary.nr_presents == ordinary_submissions_before_service,
+            "ordinary Present never adds a second writer while XeFG consumes the snapshot stream");
       Check(observed.size() == 2 && observed[0].model != observed[1].model
                 && std::ranges::all_of(observed, [&](const auto& call) {
-                     return call.depth == guides[3].Get() && call.motion == guides[2].Get();
+                      return call.depth == last_snapshots[0].Get() && call.motion == last_snapshots[1].Get();
                    }) && session.context->interval_nr_hudless_processes.load() == 0,
-            "one Backbuffer feeds two distinct models with the actual tagged guides and no HUDLess pass");
+            "one Backbuffer feeds two distinct models with the actual owned ONLY_NOW guides and no HUDLess pass");
       if (via_core) {
         Check(providers::provider_core.handles.empty() && providers::provider_core.parameters.empty(),
               "Core handoff retires the retained Core objects with their original allocator");

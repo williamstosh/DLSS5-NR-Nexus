@@ -2619,7 +2619,12 @@ struct SdkHooks {
               }
               // Retention is registered before recording. If a later SDK tag
               // fails, these GPU operands still belong to the original list.
-              submission::TrackUse(graphics.Get(), tagged.copy->texture.Get());
+              // Guide snapshots belong to this SDK context, not the NR
+              // Provider. Color/UI captures retain the conservative gate.
+              submission::SetRecordingOwner(graphics.Get(), submission::RecordingOwner::kBorrowedGame, true);
+              submission::TrackUse(graphics.Get(), tagged.copy->texture.Get(),
+                  (data->type == 1 || data->type == 2
+                      ? submission::UseKind::kIndependentGuide : submission::UseKind::kUnknown));
               std::array<D3D12_RESOURCE_BARRIER, 2> barriers{};
               for (auto& barrier : barriers) {
                 barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
