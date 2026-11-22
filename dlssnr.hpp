@@ -6502,6 +6502,18 @@ inline bool WaitForTrackedQueues() {
   return true;
 }
 
+// Under runtime_mutex. A caller that owns native lists and can use either signed
+// image may keep an initialized one on the exact interface that created its lists.
+// This does not adopt a runtime or grant the caller any right to write a color.
+inline bool CanReuseActivePrivateRuntime(ID3D12Device* native_device) {
+  return native_device != nullptr && native_device == direct_device
+      && direct_api.private_instance && direct_api.module != nullptr
+      && direct_load_state == DirectLoadState::Ready && parameter_runtime_ready
+      && !parameter_runtime_via_core.load() && !direct_api.borrowed_core_context
+      && !control_mask_use_core_context.load() && !direct_runtime_failed
+      && direct_api.module != native_runtime_failed_instance;
+}
+
 // `decline`, when given, is set to the terminal of an evaluate the runtime
 // passes through while it waits to switch device or face (v8, LIFE-12), and
 // left as the caller set it for every other failure.

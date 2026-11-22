@@ -61,6 +61,7 @@ std::function<void()> model_ui_observer;
 std::function<void(const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter*)> model_parameter_observer;
 struct NativeRuntimeEvaluation {
   const NVSDK_NGX_Handle* model = nullptr;
+  ID3D12GraphicsCommandList* list = nullptr;
   ID3D12Resource* depth = nullptr;
   ID3D12Resource* motion = nullptr;
   ID3D12Resource* mask = nullptr;
@@ -188,6 +189,7 @@ NVSDK_NGX_Result NVSDK_CONV ObserveNativeRuntimeEvaluation(
     PFN_NVSDK_NGX_ProgressCallback progress) {
   native_runtime_evaluations.push_back({
       .model = handle,
+      .list = list,
       .depth = native::GetD3D12Resource(parameters, "DLSSNR.Depth"),
       .motion = native::GetD3D12Resource(parameters, "DLSSNR.MVec"),
       .mask = native::GetD3D12Resource(parameters, "DLSSNR.ControlMask")});
@@ -205,7 +207,7 @@ int RunNativeOptionsResumeTest(bool delayed_options = false);
 void ResizeNativeTestOutput(Gpu& gpu, IDXGISwapChain3* output, ID3D12Resource* old_input);
 int RunNativeGuideContractTest();
 int RunPresentGuideModelsTest(bool native_ngx = false, const char* project_id_path = nullptr, bool handoff_only = false,
-                              bool ordinary_signal_loss_only = false);
+                              bool ordinary_signal_loss_only = false, bool bridge_shared_provider = false);
 int RunNativePresentDecisionTest();
 int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_only = false);
 // Case bodies follow the Present fixture that supplies their shared Runtime.
@@ -895,8 +897,12 @@ int main(int argc, char** argv) {
   if (argc == 3 && std::strcmp(argv[1], "--control-mask-native-ngx-fg") == 0) {
     return RunPresentGuideModelsTest(true, argv[2]);
   }
+  if (argc == 3 && std::strcmp(argv[1], "--bridge-xefg-private-provider") == 0) {
+    return RunPresentGuideModelsTest(true, argv[2], false, false, true);
+  }
 #else
   if (argc >= 2 && (std::strncmp(argv[1], "--control-mask-native-ngx", 25) == 0
+                    || std::strcmp(argv[1], "--bridge-xefg-private-provider") == 0
                     || std::strcmp(argv[1], "--nr-edit-reuse-history") == 0
                     || std::strcmp(argv[1], "--nr-edit-reuse-jitter") == 0
                     || std::strcmp(argv[1], "--nr-edit-reuse-cache") == 0
@@ -4563,8 +4569,9 @@ void ResizeNativeTestOutput(Gpu& gpu, IDXGISwapChain3* output, ID3D12Resource* o
 
 #include "xefg_inline_handoff_cases.hpp"
 #include "xefg_present_handoff_cases.hpp"
+#include "bridge_xefg_provider_cases.hpp"
 
-int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool handoff_only, bool ordinary_signal_loss_only) {
+int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool handoff_only, bool ordinary_signal_loss_only, bool bridge_shared_provider) {
   try {
     const HMODULE test_module = GetModuleHandleW(nullptr);
     reshade::internal::get_reshade_module_handle(test_module);
@@ -5080,6 +5087,15 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool
                                        submit, wait_present_fence, &native_handoff);
       }
     }
+#if defined(NR_NEXUS_TEST_NATIVE_NGX)
+    if (native_ngx && bridge_shared_provider) {
+      native::stack_passes.store(2);
+      bridge_xefg_provider_cases::Run(gpu, guides[3].Get(), guides[2].Get(), submit, wait_present_fence);
+      native::stack_passes.store(1);
+    }
+#else
+    (void)bridge_shared_provider;
+#endif
     xefg::Configure(&Service, &Prepare, nullptr, &Requested);
     if (auto stream = native::fg_service::streams.find({false, xefg_context});
         stream != native::fg_service::streams.end()) {

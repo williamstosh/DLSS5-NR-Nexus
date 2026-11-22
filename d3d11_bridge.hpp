@@ -1925,6 +1925,11 @@ inline bool RunBridge(ID3D11DeviceContext* context,
         PresentTarget at_present = present != nullptr ? *present : PresentTarget{};
         at_present.output_state = nr_twin_state;
         at_present.d3d11_bridge = true;
+        // The ring lists were created on this native device. A Present on its
+        // own color does not require tearing down a compatible signed instance.
+        if (present != nullptr && CanReuseActivePrivateRuntime(bridge.device12)) {
+          at_present.private_signed_runtime = true;
+        }
         at_present.independent_resolution_pair = independent_present_pair;
 #if defined(NR_NEXUS_DEV_CONTROL)
         const bool capture_inline_restore = present == nullptr && !plan.mixed
