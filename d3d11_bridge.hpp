@@ -1535,7 +1535,8 @@ inline bool RunBridge(ID3D11DeviceContext* context,
                       const NVSDK_NGX_Parameter* parameters,
                       bridge::ScopedD3D11Redirect* redirect,
                       const PresentTarget* present = nullptr,
-                      const BridgeSrAttempt* ordered_sr = nullptr) {
+                      const BridgeSrAttempt* ordered_sr = nullptr,
+                      const fg::xefg::OrdinaryPresentAccess* ordinary_access = nullptr) {
   using bridge::ResourceKey;
   stage_plan::Plan plan;
   {
@@ -1662,6 +1663,12 @@ inline bool RunBridge(ID3D11DeviceContext* context,
     const BridgeDeviceLock device_lock(context);
     const ngx_serial::Call ngx_turn;
     RuntimeLock lock(runtime_mutex);
+    if (ordinary_access != nullptr && (!ordinary_access->allowed
+        || fg::xefg::QueryOrdinaryPresent(ordinary_access->swapchain, ordinary_access->backbuffer,
+               ordinary_access->output) != *ordinary_access)) {
+      name(NrDeclineReason::kPresentPreFg);
+      return;
+    }
     if (ordered_sr != nullptr && !pre && present == nullptr && !plan.mixed
         && edit_reuse_enabled.load() && monitor_requested.load()) {
       if (const auto source = features.find(handle);
@@ -2214,7 +2221,18 @@ inline bool RunBridge(ID3D11DeviceContext* context,
     }
     bridge_waits11.fetch_add(1, std::memory_order_relaxed);
     if (!pre) {
-      ctx->CopySubresourceRegion(output, 0, 0, 0, 0, set->output11, 0, nullptr);
+      // The private twin is complete; only its copy to the consumer's actual
+      // color commits the ordinary write. An intervening revocation wins.
+      const auto copy_to_output = [&] { ctx->CopySubresourceRegion(output, 0, 0, 0, 0, set->output11, 0, nullptr); };
+      if (ordinary_access != nullptr) {
+        if (!fg::xefg::WithOrdinaryPresentCommit(*ordinary_access, copy_to_output)) {
+          ordinary_delivery_failed = true;
+          name(NrDeclineReason::kPresentPreFg);
+          return;
+        }
+      } else {
+        copy_to_output();
+      }
       screenshot::RecordNativeHdrReceiverCopy(ctx, output);
       delivered = true;
     } else if (swapped) {

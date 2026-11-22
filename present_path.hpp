@@ -6044,7 +6044,7 @@ inline void RunPresentPath(
     bool delivered = false;
     {
       const EvaluateChainScope chain_scope;
-      delivered = RunBridge(context, handle, &block, nullptr, &target);
+      delivered = RunBridge(context, handle, &block, nullptr, &target, nullptr, &ordinary_access);
     }
     context->Release();
     if (!delivered) return;

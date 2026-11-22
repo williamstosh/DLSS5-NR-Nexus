@@ -2160,6 +2160,128 @@ int main(int argc, char** argv) {
                   && enabled_status.output_fps == 0.,
             "Bridge cannot use the SDK window for adaptation after the matching Disable is revoked");
         std::cout << "PASS Bridge Adaptive XeFG Off output ownership, resize and failure revocation dev=" << dev << '\n';
+        {
+          // Reuse the exact application/proxy pair established above, not a
+          // guessed association between the two devices or adjacent Presents.
+          receipt_context->get_status = &FakeReceiptPresentStatus;
+          Check(Hooks::Enable(receipt_cleanup.handle, 0) == 0 && xefg::QueryBridgeOff(receipt_source).available,
+              "ordinary Bridge commit test starts from a public Off declaration on the existing output");
+          const auto saved_hook = native::hook_point.exchange(native::kHookPresent);
+          const auto saved_pre_fg = native::present_pre_fg.exchange(1);
+          const auto saved_adaptive = native::nr_adaptive_enabled.exchange(false);
+          // Enable may reconcile its NR service after publishing the SDK state.
+          // This test isolates that state boundary while the Bridge owns its
+          // runtime lock and the test fence holds its private queue.
+          const auto saved_retire = receipt_adapter::retire.exchange(nullptr);
+          const auto saved_prepare = receipt_adapter::prepare_runtime.exchange(nullptr);
+          auto* const target_buffer = application.buffers[0].Get();
+          const auto native_buffer = reinterpret_cast<uintptr_t>(
+              renodx::utils::directx::NativeIdentity(target_buffer));
+          const auto native_chain = receipt_adapter::Identity(application.native.Get());
+          const auto query = [&] {
+            return xefg::QueryOrdinaryPresent(native_chain, native_buffer,
+                framerate::MatchPresentOutput(host_owner, application.get_current_back_buffer().handle));
+          };
+          const auto initial = query();
+          Check(native::fg_service::Requested() && initial.allowed
+                    && initial.context == reinterpret_cast<uintptr_t>(receipt_cleanup.handle)
+                    && initial.output == xefg::QueryBridgeOff(receipt_source).output_identity,
+              "the ordinary access starts allowed on the exact SDK-associated output");
+          int ordinary_stream_key = 0;
+          auto& present_stream = native::present_streams[&ordinary_stream_key];
+          native::FeatureState contract;
+          contract.input_width = adaptive_output_width;
+          contract.input_height = adaptive_output_height;
+          contract.has_motion_scale_x = contract.has_motion_scale_y = true;
+          contract.motion_scale_x = contract.motion_scale_y = 1.f;
+          const std::vector<uint32_t> neutral(adaptive_output_width * adaptive_output_height, 0);
+          const auto motion = make_texture(adaptive_output_width, adaptive_output_height, DXGI_FORMAT_R16G16_FLOAT,
+              D3D11_BIND_SHADER_RESOURCE, neutral.data(), adaptive_output_width * sizeof(uint32_t));
+          const auto depth = make_texture(adaptive_output_width, adaptive_output_height, DXGI_FORMAT_R32_FLOAT,
+              D3D11_BIND_SHADER_RESOURCE, neutral.data(), adaptive_output_width * sizeof(uint32_t));
+          auto& block = native::FillPresentBlock(&present_stream, target_buffer, motion.Get(), depth.Get(),
+              contract, adaptive_output_width, adaptive_output_height, 1.f, 0);
+          native::PresentTarget target{
+              .domain = renodx::addons::dlss5::present_restore_scope::Domain::FINAL_PRESENT};
+          target.swapchain_identity = host_owner;
+          target.swapchain_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+          target.hdr_mode = 1;
+          target.hdr_color_space = reshade::api::color_space::scrgb;
+          target.units = {native::codec::Encoding::Linear, true, 80.f, false};
+          target.d3d11_bridge = true;
+          target.capture_display = true;
+          target.workset_key = reinterpret_cast<const ID3D12Resource*>(&present_stream);
+          native::SnapshotPresentRestoreConfiguration(&target);
+          const auto run_ordinary = [&](const auto& access) {
+            target.adaptive_output = access.output;
+            ++native::present_generation;
+            const renodx::addons::dlss5::EvaluateChainScope evaluation;
+            return native::RunBridge(context.Get(), present_stream.Handle(), &block, nullptr, &target, nullptr, &access);
+          };
+          const auto seed_backbuffer = [&] {
+            context->CopyResource(target_buffer, wrong_surface.Get());
+            Check(Read11(target_buffer, 8) == original, "the exact ordinary DX11 backbuffer holds known source pixels");
+          };
+          seed_backbuffer();
+          bool delivered = false;
+          bool edited = false;
+          const auto warm_model_calls = model_calls;
+          const auto warm_submission = native::bridge_submitted_value.load();
+          for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8 && !edited; ++attempt) {
+            delivered = run_ordinary(initial);
+            edited = delivered && model_calls > warm_model_calls && Read11(target_buffer, 8) != original;
+          }
+          std::cout << "BRIDGE_ORDINARY_COMMIT warmup evals=" << model_calls - warm_model_calls
+                    << " submits=" << native::bridge_submitted_value.load() - warm_submission
+                    << " delivered=" << delivered << " edited=" << edited << '\n';
+          Check(delivered && edited,
+              "the still-current Off access permits an actual Bridge write to the ordinary backbuffer");
+
+          seed_backbuffer();
+          const auto calls_before = model_calls;
+          const auto timeouts_before = native::bridge_timeouts.load();
+          const auto next_submit = native::bridge_submitted_value.load() + 1;
+          ComPtr<ID3D12Fence> gate;
+          Check(SUCCEEDED(native::bridge.device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)))
+                    && SUCCEEDED(native::bridge.queue->Wait(gate.Get(), 1)),
+              "hold real GPU completion after the ordinary model has recorded");
+          bool saw_submit = false;
+          HRESULT gate_result = E_FAIL;
+          int32_t enable_result = -1;
+          std::jthread enable_after_recording([&] {
+            const auto deadline = GetTickCount64() + 350;
+            while (native::bridge_submitted_value.load(std::memory_order_acquire) < next_submit
+                   && GetTickCount64() < deadline) {
+              Sleep(1);
+            }
+            saw_submit = native::bridge_submitted_value.load(std::memory_order_acquire) == next_submit
+                && native::bridge.fence_done12->GetCompletedValue() < next_submit;
+            if (saw_submit) {
+              enable_result = Hooks::Enable(receipt_cleanup.handle, 1);
+            }
+            gate_result = gate->Signal(1);
+          });
+          delivered = run_ordinary(initial);
+          enable_after_recording.join();
+          Check(saw_submit && enable_result == 0 && SUCCEEDED(gate_result)
+                    && model_calls == calls_before + 1 && native::bridge_submitted_value.load() == next_submit
+                    && native::bridge_timeouts.load() == timeouts_before,
+              "the public On declaration is accepted after real ordinary model submission, before GPU done");
+          WaitForGpu(native::bridge.fence_done12, next_submit);
+          Check(!query().allowed && !delivered && Read11(target_buffer, 8) == original,
+              "a completed Bridge submission cannot change DX11 pixels after its matching access was revoked");
+          Check(Hooks::Enable(receipt_cleanup.handle, 0) == 0 && query().allowed,
+              "a new successful Off declaration restores ordinary access");
+          Check(run_ordinary(query()) && Read11(target_buffer, 8) != original,
+              "the fresh Off access restores actual ordinary color delivery");
+          native::RetirePresentStream(&ordinary_stream_key);
+          receipt_adapter::prepare_runtime.store(saved_prepare);
+          receipt_adapter::retire.store(saved_retire);
+          native::nr_adaptive_enabled.store(saved_adaptive);
+          native::present_pre_fg.store(saved_pre_fg);
+          native::hook_point.store(saved_hook);
+          std::cout << "PASS Bridge ordinary XeFG permission at DX11 copyback evidence=WARP+MOCK dev=" << dev << '\n';
+        }
         output.Swap(unassociated_output);
         parameters.Set(NVSDK_NGX_Parameter_Output, static_cast<ID3D11Resource*>(output.Get()));
       }
