@@ -3189,40 +3189,110 @@ int main(int argc, char** argv) {
           seed_backbuffer();
           const auto calls_before = model_calls;
           const auto timeouts_before = native::bridge_timeouts.load();
-          const auto next_submit = native::bridge_submitted_value.load() + 1;
+          static ID3D12CommandQueue* expected_queue = nullptr;
+          static ID3D12Fence* expected_done = nullptr;
+          static uint64_t expected_value = 0;
+          expected_queue = native::bridge.queue;
+          expected_done = native::bridge.fence_done12;
+          expected_value = native::bridge_submitted_value.load() + 1;
           ComPtr<ID3D12Fence> gate;
           Check(SUCCEEDED(native::bridge.device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)))
-                    && SUCCEEDED(native::bridge.queue->Wait(gate.Get(), 1)),
-              "hold real GPU completion after the ordinary model has recorded");
-          bool saw_submit = false;
-          HRESULT gate_result = E_FAIL;
-          int32_t enable_result = -1;
-          std::jthread enable_after_recording([&] {
-            const auto deadline = GetTickCount64() + 350;
-            while (native::bridge_submitted_value.load(std::memory_order_acquire) < next_submit
-                   && GetTickCount64() < deadline) {
-              Sleep(1);
-            }
-            saw_submit = native::bridge_submitted_value.load(std::memory_order_acquire) == next_submit
-                && native::bridge.fence_done12->GetCompletedValue() < next_submit;
-            if (saw_submit) {
-              enable_result = Hooks::Enable(receipt_cleanup.handle, 1);
-            }
-            gate_result = gate->Signal(1);
-          });
-          delivered = run_ordinary(initial);
-          enable_after_recording.join();
-          Check(saw_submit && enable_result == 0 && SUCCEEDED(gate_result)
-                    && model_calls == calls_before + 1 && native::bridge_submitted_value.load() == next_submit
-                    && native::bridge_timeouts.load() == timeouts_before,
-              "the public On declaration is accepted after real ordinary model submission, before GPU done");
-          WaitForGpu(native::bridge.fence_done12, next_submit);
+                    && SUCCEEDED(expected_queue->Wait(gate.Get(), 1)),
+              "hold real GPU completion while testing the last ordinary write permission");
+          StallRelease release_gate{.gate = gate.Get()};
+          const auto close_event = [](void* value) { if (value != nullptr) { CloseHandle(value); } };
+          std::unique_ptr<void, decltype(close_event)> submitted(CreateEventW(nullptr, TRUE, FALSE, nullptr), close_event);
+          std::unique_ptr<void, decltype(close_event)> revoked(CreateEventW(nullptr, TRUE, FALSE, nullptr), close_event);
+          Check(submitted != nullptr && revoked != nullptr, "the real submission and public revocation have separate acknowledgments");
+          static HANDLE submitted_event = nullptr;
+          static HANDLE revoked_event = nullptr;
+          static bool acknowledged_revocation = false;
+          submitted_event = submitted.get();
+          revoked_event = revoked.get();
+          acknowledged_revocation = false;
+          using SignalQueue = HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
+          static SignalQueue original_signal = nullptr;
+          {
+            renodx::utils::vtable::Slot<SignalQueue> signal_slot{
+                .object = expected_queue, .index = 14, .original = &original_signal,
+                .replacement = [](ID3D12CommandQueue* queue, ID3D12Fence* fence, UINT64 value) -> HRESULT {
+                  const auto hr = original_signal(queue, fence, value);
+                  if (SUCCEEDED(hr) && queue == expected_queue && fence == expected_done && value == expected_value) {
+                    // The private work is now genuinely submitted. Hold only this test's call before it returns
+                    // to the native immediate context's final ownership check; GPU completion alone cannot do that.
+                    acknowledged_revocation = SetEvent(submitted_event)
+                        && WaitForSingleObject(revoked_event, 350) == WAIT_OBJECT_0;
+                  }
+                  return hr;
+                }};
+            renodx::utils::vtable::Install(&signal_slot);
+            const auto restore_signal = [](auto* slot) { renodx::utils::vtable::Uninstall(slot); };
+            std::unique_ptr<decltype(signal_slot), decltype(restore_signal)> observed(&signal_slot, restore_signal);
+            bool saw_pending = false;
+            HRESULT gate_result = E_FAIL;
+            int32_t enable_result = -1;
+            std::jthread enable_after_submission([&] {
+              const auto status = WaitForSingleObject(submitted.get(), 350);
+              const auto done = expected_done->GetCompletedValue();
+              saw_pending = status == WAIT_OBJECT_0 && done != UINT64_MAX && done < expected_value;
+              if (saw_pending) {
+                enable_result = Hooks::Enable(receipt_cleanup.handle, 1);
+              }
+              SetEvent(revoked.get());
+              gate_result = gate->Signal(1);
+            });
+            delivered = run_ordinary(initial);
+            enable_after_submission.join();
+            Check(acknowledged_revocation && saw_pending && enable_result == 0 && SUCCEEDED(gate_result)
+                      && model_calls == calls_before + 1 && native::bridge_submitted_value.load() == expected_value
+                      && native::bridge_timeouts.load() == timeouts_before,
+                "public On has revoked permission after actual submission and before copy recording while real GPU work was pending");
+          }
+          release_gate.gate = nullptr;
+          WaitForGpu(expected_done, expected_value);
           Check(!query().allowed && !delivered && Read11(target_buffer, 8) == original,
-              "a completed Bridge submission cannot change DX11 pixels after its matching access was revoked");
+              "a completed Bridge submission cannot change DX11 pixels after its matching access was revoked before recording");
           Check(Hooks::Enable(receipt_cleanup.handle, 0) == 0 && query().allowed,
               "a new successful Off declaration restores ordinary access");
           Check(run_ordinary(query()) && Read11(target_buffer, 8) != original,
               "the fresh Off access restores actual ordinary color delivery");
+
+          seed_backbuffer();
+          const auto still_current = query();
+          const auto recorded_value = native::bridge_submitted_value.load() + 1;
+          ComPtr<ID3D12Fence> recorded_gate;
+          Check(SUCCEEDED(native::bridge.device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&recorded_gate)))
+                    && SUCCEEDED(expected_queue->Wait(recorded_gate.Get(), 1)),
+              "hold a separately authorized group's actual private GPU work");
+          StallRelease release_recorded{.gate = recorded_gate.Get()};
+          std::jthread release_at_deadline([recorded_gate](std::stop_token stop) {
+            const auto deadline = GetTickCount64() + 350;
+            while (!stop.stop_requested() && GetTickCount64() < deadline) Sleep(1);
+            if (!stop.stop_requested()) { recorded_gate->Signal(1); }
+          });
+          const bool recorded = run_ordinary(still_current);
+          const auto done_before_on = expected_done->GetCompletedValue();
+          const auto enabled = Hooks::Enable(receipt_cleanup.handle, 1);
+          const auto done_after_on = expected_done->GetCompletedValue();
+          const bool pending_on = recorded_gate->GetCompletedValue() == 0
+              && done_before_on != UINT64_MAX && done_before_on < recorded_value
+              && done_after_on != UINT64_MAX && done_after_on < recorded_value;
+          const bool stale_recorded = run_ordinary(still_current);
+          const auto release_status = recorded_gate->Signal(1);
+          release_recorded.gate = nullptr;
+          release_at_deadline.request_stop();
+          release_at_deadline.join();
+          Check(recorded && pending_on && enabled == 0 && !query().allowed
+                    && !stale_recorded && native::bridge_submitted_value.load() == recorded_value
+                    && SUCCEEDED(release_status),
+              "On after a legal Wait and copy recording revokes future attempts without changing pending GPU completion");
+          WaitForGpu(expected_done, recorded_value);
+          Check(Read11(target_buffer, 8) != original,
+              "the originally authorized copy still reaches the original DX11 pixels after a later On");
+          Check(Hooks::Enable(receipt_cleanup.handle, 0) == 0 && query().allowed,
+              "the test restores the actual Off state");
+          std::cout << "BRIDGE_ORDINARY_COMMIT_ORDER revoked_before_record=1 unchanged=1"
+                    << " revoked_after_record=1 prior_copy=1 stale_retry=0 fresh_off=1\n";
           native::RetirePresentStream(&ordinary_stream_key);
           receipt_adapter::prepare_runtime.store(saved_prepare);
           receipt_adapter::retire.store(saved_retire);
