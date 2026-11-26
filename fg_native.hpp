@@ -3396,8 +3396,10 @@ inline void RestoreNativePreFg(ID3D12GraphicsCommandList* list,
       const auto* marker = stream.cached->color[0];
       native_fg_marker.store(marker, std::memory_order_release);
       std::vector<std::pair<FenceRef, uint64_t>> receipts;
-      if (submission::UseSubmissionTokens(marker, &receipts) == submission::UseSubmission::kTokens && receipts.size() == 1
-          && receipts.front().first->GetCompletedValue() != UINT64_MAX) {
+      const auto proof = submission::UseSubmissionTokens(marker, &receipts, bindings->recording.get());
+      if ((proof == submission::UseSubmission::kTokens && receipts.size() == 1
+           && receipts.front().first->GetCompletedValue() != UINT64_MAX)
+          || proof == submission::UseSubmission::kRetiredOnce) {
         native_fg_result.store(fg::Result::SUBMITTED, std::memory_order_release);
         CountNativeFgSubmission(stream.native_serial);
         native_fg_last_submission_ns.store(SteadyNowNs(), std::memory_order_release);
