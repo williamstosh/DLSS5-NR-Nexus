@@ -445,6 +445,13 @@ struct Context {
   std::map<uint32_t, std::shared_ptr<Frame>> frames;
   std::vector<std::shared_ptr<Surface>> surfaces;
   uint64_t epoch = 1;
+  // One short wait for the same Provider transition on this SDK owner epoch.
+  struct ProviderBridgeTailWait {
+    uint64_t epoch = 0;
+    HMODULE previous = nullptr;
+    HMODULE next = nullptr;
+    bool operator==(const ProviderBridgeTailWait&) const = default;
+  } provider_bridge_tail_wait;
 #if defined(NR_NEXUS_DEV_CONTROL)
   uint64_t fg_environment_generation = 0;
 #endif
@@ -3181,6 +3188,24 @@ inline bool AcceptOrdinaryPresentReceipt(const FrameInput& input, const Ordinary
   return true;
 }
 
+inline bool ServiceWriteCurrent(const FrameInput& input) {
+  const auto* const present = internal::recording_service;
+  if (present == nullptr || &present->input != &input) return false;
+  std::shared_lock lock(internal::state.mutex);
+  return internal::Requested() && internal::PresentWriteCurrentLocked(*present);
+}
+
+inline bool TryClaimProviderBridgeTailWait(const FrameInput& input, HMODULE previous, HMODULE next) {
+  const auto* const present = internal::recording_service;
+  if (present == nullptr || &present->input != &input) return false;
+  std::unique_lock lock(internal::state.mutex);
+  if (!internal::Requested() || !internal::PresentWriteCurrentLocked(*present)) return false;
+  const internal::Context::ProviderBridgeTailWait key{input.epoch, previous, next};
+  if (present->context->provider_bridge_tail_wait == key) return false;
+  present->context->provider_bridge_tail_wait = key;
+  return true;
+}
+
 // Runtime/NGX serialization precedes state.mutex. Publish only the already
 // recorded private list here. The original Present and owner notification
 // run after this lock is released.
@@ -3595,19 +3620,40 @@ inline OrdinaryPresentAccess QueryOrdinaryPresent(uintptr_t swapchain, uintptr_t
   return internal::QueryOrdinaryPresentLocked(swapchain, backbuffer, output);
 }
 
-// Same order as XeFG's final commit. The callback issues only the owned
-// queue submission and cannot reenter the adapter or call the SDK.
+enum class OrdinaryPresentRecordResult { kOwnerRejected, kRecordFailed, kRecorded };
+
+// Same lock and order as XeFG's final commit. Record must only issue the
+// native commands for this handoff, without reentering the adapter or SDK.
+template <typename Record>
+inline OrdinaryPresentRecordResult TryRecordOrdinaryPresentDelivery(const OrdinaryPresentAccess& access, Record&& record) {
+  if (!access.allowed) return OrdinaryPresentRecordResult::kOwnerRejected;
+  std::unique_lock lock(internal::state.mutex);
+  if (internal::QueryOrdinaryPresentLocked(access.swapchain, access.backbuffer, access.output) != access) {
+    return OrdinaryPresentRecordResult::kOwnerRejected;
+  }
+
+  const auto mark_recorded = [&] {
+    if (access.call != 0) {
+      auto& context = *internal::state.contexts.at(reinterpret_cast<void*>(access.context));
+      context.present_colors.at(access.call).ordinary_committed = true;
+    }
+  };
+  if constexpr (std::is_void_v<std::invoke_result_t<Record>>) {
+    // The existing infallible recorder retains its pre-callback commit order.
+    mark_recorded();
+    std::forward<Record>(record)();
+  } else {
+    static_assert(std::is_same_v<std::invoke_result_t<Record>, bool>);
+    if (!std::forward<Record>(record)()) return OrdinaryPresentRecordResult::kRecordFailed;
+    mark_recorded();
+  }
+  return OrdinaryPresentRecordResult::kRecorded;
+}
+
 template <typename Publish>
 inline bool WithOrdinaryPresentCommit(const OrdinaryPresentAccess& access, Publish&& publish) {
-  if (!access.allowed) return false;
-  std::unique_lock lock(internal::state.mutex);
-  if (internal::QueryOrdinaryPresentLocked(access.swapchain, access.backbuffer, access.output) != access) return false;
-  if (access.call != 0) {
-    auto& context = *internal::state.contexts.at(reinterpret_cast<void*>(access.context));
-    context.present_colors.at(access.call).ordinary_committed = true;
-  }
-  std::forward<Publish>(publish)();
-  return true;
+  return TryRecordOrdinaryPresentDelivery(access, std::forward<Publish>(publish))
+      == OrdinaryPresentRecordResult::kRecorded;
 }
 
 // Diagnostics only. The reason must have static lifetime, including when a
