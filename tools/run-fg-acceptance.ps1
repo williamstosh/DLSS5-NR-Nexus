@@ -33,6 +33,7 @@ param(
     [ValidateRange(-1,1)][int]$NrEditReuse = -1,
     [switch]$UncapGameFps,
     [switch]$XeFgGpuCapture,
+    [switch]$XeFgExtensionLogging,
     [ValidateSet('T0','T1','T2','T3','T4','T5','T6','GRect','BRect','DepthFar','DepthFarOff')][string]$ControlMaskCase,
     [switch]$ControlMaskUseCoreContext,
     [ValidateRange(-1,1)][int]$ControlMaskAutoMask = -1,
@@ -56,9 +57,17 @@ if ($NrEditReuse -ge 0 -and (-not $RestoreInstallation -or $InstallOnly -or $Con
         -not $BlockOptionalHudless -or $XeFGUiComposition -ne 0 -or $SdrGameOutput)) {
     throw 'NrEditReuse requires a restored HDR XeFG single-Backbuffer Present test: model B, one pass, blocked optional HUDless and UIComposition 0.'
 }
-if ($XeFgGpuCapture -and ($NrEditReuse -lt 0 -or -not $StartNrDisabled -or
-        $ControlMaskGpuSamples -le 0 -or -not $GpuTimers)) {
-    throw 'XeFgGpuCapture requires a restored NrEditReuse A/B, StartNrDisabled, GpuTimers and a positive sample target.'
+if ($XeFgGpuCapture -and (-not $StartNrDisabled -or -not $GpuTimers -or $ControlMaskGpuSamples -le 0)) {
+    throw 'XeFgGpuCapture requires StartNrDisabled, GpuTimers and a positive sample target.'
+}
+if ($XeFgExtensionLogging -and -not $XeFgGpuCapture) {
+    throw 'XeFgExtensionLogging requires the protected XeFgGpuCapture session.'
+}
+if ($XeFgGpuCapture -and $NrEditReuse -lt 0 -and
+    (-not $RestoreInstallation -or $InstallOnly -or $ControlMaskCase -or $SrOnly -or $SdrGameOutput -or
+        $NrPreset -ne 1 -or $NrPasses -ne 1 -or $NrHookPoint -notin @(0,2) -or
+        -not $BlockOptionalHudless -or $XeFGUiComposition -ne 0 -or -not $CaptureScript)) {
+    throw 'Scripted XeFgGpuCapture requires a restored HDR XeFG session with CaptureScript, preset 1, one pass, Upscaled or Present, blocked optional HUDless and UIComposition 0.'
 }
 if ($ControlMaskUseCoreContext) {
     throw '-ControlMaskUseCoreContext is retired: production uses the owned backend. Use the offline tools/run-tests.ps1 -Suite fg-native entry for P0 Core diagnostics.'
@@ -382,6 +391,11 @@ function Set-XeFgDetourSetting([string]$Text, [bool]$Enabled) {
     }
     return $Text.TrimEnd() + [Environment]::NewLine + $taskPolicy + [Environment]::NewLine + [Environment]::NewLine
 }
+function Set-XeFgExtensionLogging([string]$Text) {
+    $pattern = '(?m)^DisableLogging[^\S\r\n]*=[^\S\r\n]*(true|false)[^\S\r\n]*(?=\r?$)'
+    if ([regex]::Matches($Text, $pattern).Count -ne 1) { throw 'Expected one XeFGUnlock DisableLogging setting' }
+    return [regex]::Replace($Text, $pattern, 'DisableLogging=false')
+}
 $taskRoot = Split-Path -Parent $PSScriptRoot
 $OutputRoot = [IO.Path]::GetFullPath($OutputRoot)
 if (-not (@('tmp','artifacts') | Where-Object { $OutputRoot.StartsWith((Join-Path $taskRoot $_) + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) })) {
@@ -406,6 +420,12 @@ $taskDll = Join-Path $taskGame 'renodx-dlss5.addon64'
 $taskConfig = Join-Path $taskGame 'ReShade.ini'
 $taskGameConfig = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'The Witcher 3/dx12user.settings'
 $taskBackupFiles = @($taskDll, $taskConfig)
+$taskExtensionConfig = $null
+if ($XeFgExtensionLogging) {
+    $taskExtensionConfig = Join-Path $taskGame 'OptiScaler/plugins/XeFGUnlock.ini'
+    if (-not (Test-Path -LiteralPath $taskExtensionConfig -PathType Leaf)) { throw 'Missing installed XeFGUnlock config' }
+    $taskBackupFiles += $taskExtensionConfig
+}
 $taskRuntimePlan = $null
 if ($NrRuntimePath) {
     $taskRuntimeVersion = (Get-Item -LiteralPath $NrRuntimePath).VersionInfo
@@ -492,6 +512,7 @@ $taskReceipt = [ordered]@{
     requested_control_mask_depth_far=$(if ($taskHasMaskFar) { $ControlMaskDepthFar } else { $null })
     control_mask_gpu_capture=@{target_valid_samples=$ControlMaskGpuSamples; seconds=$ControlMaskGpuSeconds; warmup_seconds=$ControlMaskGpuWarmupSeconds}
     xefg_gpu_capture=[bool]$XeFgGpuCapture
+    xefg_extension_logging=[bool]$XeFgExtensionLogging
     temporary_game_sdr=[bool]$SdrGameOutput
     game_fps_limit=$(if ($UncapGameFps) { @{original=$taskOriginalFpsLimit; requested=0; configured=$false} } else { $null })
     start_nr_disabled=[bool]$StartNrDisabled
@@ -515,6 +536,10 @@ $taskReceipt | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $taskReceiptPa
 $taskChanged = $false
 try {
     $taskChanged = $true
+    if ($taskExtensionConfig) {
+        $taskExtensionText = [IO.File]::ReadAllText($taskExtensionConfig)
+        [IO.File]::WriteAllText($taskExtensionConfig, (Set-XeFgExtensionLogging $taskExtensionText), [Text.UTF8Encoding]::new($false))
+    }
     if ($CleanEnvironment) {
         $taskOtherAddons = @(Get-ChildItem -LiteralPath $taskGame -File | Where-Object {
             $_.Extension -in @('.addon', '.addon64') -and $_.FullName -ne $taskDll

@@ -445,6 +445,13 @@ struct Context {
   std::map<uint32_t, std::shared_ptr<Frame>> frames;
   std::vector<std::shared_ptr<Surface>> surfaces;
   uint64_t epoch = 1;
+  // One short wait for the same Provider transition on this SDK owner epoch.
+  struct ProviderBridgeTailWait {
+    uint64_t epoch = 0;
+    HMODULE previous = nullptr;
+    HMODULE next = nullptr;
+    bool operator==(const ProviderBridgeTailWait&) const = default;
+  } provider_bridge_tail_wait;
 #if defined(NR_NEXUS_DEV_CONTROL)
   uint64_t fg_environment_generation = 0;
 #endif
@@ -2619,7 +2626,12 @@ struct SdkHooks {
               }
               // Retention is registered before recording. If a later SDK tag
               // fails, these GPU operands still belong to the original list.
-              submission::TrackUse(graphics.Get(), tagged.copy->texture.Get());
+              // Guide snapshots belong to this SDK context, not the NR
+              // Provider. Color/UI captures retain the conservative gate.
+              submission::SetRecordingOwner(graphics.Get(), submission::RecordingOwner::kBorrowedGame, true);
+              submission::TrackUse(graphics.Get(), tagged.copy->texture.Get(),
+                  (data->type == 1 || data->type == 2
+                      ? submission::UseKind::kIndependentGuide : submission::UseKind::kUnknown));
               std::array<D3D12_RESOURCE_BARRIER, 2> barriers{};
               for (auto& barrier : barriers) {
                 barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -2741,8 +2753,39 @@ struct SdkHooks {
   }
   static int32_t Constants(void* handle, uint32_t id, const abi::Constants* data) {
     if (!stopped.load()) PinRuntimeCallback();
+#if defined(NR_NEXUS_DEV_CONTROL)
+    uint64_t edit_fg_generation = 0;
+    edit_fg_observation::XefgConstantsObservation observation;
+    try {
+      edit_fg_generation = edit_fg_observation::CaptureGeneration();
+      if (edit_fg_generation != 0) {
+        observation = {.sdk_slot = static_cast<uint32_t>(Index), .sdk_context = reinterpret_cast<uintptr_t>(handle),
+            .present_id = id, .frame_time_ms = data != nullptr ? data->frame_time_ms : 0.f,
+            .has_frame_time = data != nullptr};
+        std::shared_lock lock(state.mutex);
+        if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
+          observation.context_identity = reinterpret_cast<uintptr_t>(it->second.get());
+          observation.epoch = it->second->epoch;
+        }
+      }
+    } catch (...) {
+      edit_fg_generation = 0;
+      edit_fg_observation::Stop("observation_failed");
+    }
+#endif
     const auto status = reinterpret_cast<int32_t (*)(void*, uint32_t, const abi::Constants*)>(modules[Index].real[4])(
         handle, id, data);
+#if defined(NR_NEXUS_DEV_CONTROL)
+    if (edit_fg_generation != 0) {
+      const auto returned_ns = edit_fg_observation::NowNs();
+      try {
+        edit_fg_observation::Record(edit_fg_generation, {.kind = edit_fg_observation::Kind::XEFG_CONSTANTS,
+            .api_return_ns = returned_ns, .api_result = status, .xefg_constants = observation});
+      } catch (...) {
+        edit_fg_observation::Stop("observation_failed");
+      }
+    }
+#endif
     if (Requested() && data != nullptr) {
       try {
         std::unique_lock lock(state.mutex);
@@ -3142,6 +3185,24 @@ inline bool AcceptOrdinaryPresentReceipt(const FrameInput& input, const Ordinary
   present->handoff_reason = reason;
   present->service_result = (claim == OrdinaryPresentClaim::COVERED
       ? Result::ORDINARY_SUBMITTED : Result::NOT_SERVED);
+  return true;
+}
+
+inline bool ServiceWriteCurrent(const FrameInput& input) {
+  const auto* const present = internal::recording_service;
+  if (present == nullptr || &present->input != &input) return false;
+  std::shared_lock lock(internal::state.mutex);
+  return internal::Requested() && internal::PresentWriteCurrentLocked(*present);
+}
+
+inline bool TryClaimProviderBridgeTailWait(const FrameInput& input, HMODULE previous, HMODULE next) {
+  const auto* const present = internal::recording_service;
+  if (present == nullptr || &present->input != &input) return false;
+  std::unique_lock lock(internal::state.mutex);
+  if (!internal::Requested() || !internal::PresentWriteCurrentLocked(*present)) return false;
+  const internal::Context::ProviderBridgeTailWait key{input.epoch, previous, next};
+  if (present->context->provider_bridge_tail_wait == key) return false;
+  present->context->provider_bridge_tail_wait = key;
   return true;
 }
 
@@ -3559,19 +3620,40 @@ inline OrdinaryPresentAccess QueryOrdinaryPresent(uintptr_t swapchain, uintptr_t
   return internal::QueryOrdinaryPresentLocked(swapchain, backbuffer, output);
 }
 
-// Same order as XeFG's final commit. The callback issues only the owned
-// queue submission and cannot reenter the adapter or call the SDK.
+enum class OrdinaryPresentRecordResult { kOwnerRejected, kRecordFailed, kRecorded };
+
+// Same lock and order as XeFG's final commit. Record must only issue the
+// native commands for this handoff, without reentering the adapter or SDK.
+template <typename Record>
+inline OrdinaryPresentRecordResult TryRecordOrdinaryPresentDelivery(const OrdinaryPresentAccess& access, Record&& record) {
+  if (!access.allowed) return OrdinaryPresentRecordResult::kOwnerRejected;
+  std::unique_lock lock(internal::state.mutex);
+  if (internal::QueryOrdinaryPresentLocked(access.swapchain, access.backbuffer, access.output) != access) {
+    return OrdinaryPresentRecordResult::kOwnerRejected;
+  }
+
+  const auto mark_recorded = [&] {
+    if (access.call != 0) {
+      auto& context = *internal::state.contexts.at(reinterpret_cast<void*>(access.context));
+      context.present_colors.at(access.call).ordinary_committed = true;
+    }
+  };
+  if constexpr (std::is_void_v<std::invoke_result_t<Record>>) {
+    // The existing infallible recorder retains its pre-callback commit order.
+    mark_recorded();
+    std::forward<Record>(record)();
+  } else {
+    static_assert(std::is_same_v<std::invoke_result_t<Record>, bool>);
+    if (!std::forward<Record>(record)()) return OrdinaryPresentRecordResult::kRecordFailed;
+    mark_recorded();
+  }
+  return OrdinaryPresentRecordResult::kRecorded;
+}
+
 template <typename Publish>
 inline bool WithOrdinaryPresentCommit(const OrdinaryPresentAccess& access, Publish&& publish) {
-  if (!access.allowed) return false;
-  std::unique_lock lock(internal::state.mutex);
-  if (internal::QueryOrdinaryPresentLocked(access.swapchain, access.backbuffer, access.output) != access) return false;
-  if (access.call != 0) {
-    auto& context = *internal::state.contexts.at(reinterpret_cast<void*>(access.context));
-    context.present_colors.at(access.call).ordinary_committed = true;
-  }
-  std::forward<Publish>(publish)();
-  return true;
+  return TryRecordOrdinaryPresentDelivery(access, std::forward<Publish>(publish))
+      == OrdinaryPresentRecordResult::kRecorded;
 }
 
 // Diagnostics only. The reason must have static lifetime, including when a

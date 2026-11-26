@@ -1846,6 +1846,7 @@ struct NgxModuleReal {
   void* evaluate = nullptr;
   void* evaluate_c = nullptr;
   void* release = nullptr;
+  void* destroy_parameters = nullptr;
 };
 inline NgxModuleReal ngx_slot_real[kMaxNgxSlots];
 inline bool ngx_slot_used[kMaxNgxSlots] = {};
@@ -1927,10 +1928,13 @@ inline std::atomic<ID3D12GraphicsCommandList*> present_source_lists[kPresentGuid
 // Game submits may forward concurrently. Present takes the exclusive side
 // briefly to verify the tail and enqueue its private list without overtaking
 // application work on this queue.
+inline std::atomic_uint64_t present_queue_order_domains{0};
 struct PresentQueueOrder {
-  explicit PresentQueueOrder(ID3D12CommandQueue* value) : queue(value) {}
+  explicit PresentQueueOrder(ID3D12CommandQueue* value)
+      : queue(value), domain_id(present_queue_order_domains.fetch_add(1, std::memory_order_relaxed) + 1) {}
 
   ID3D12CommandQueue* const queue;
+  const uint64_t domain_id;
   std::shared_mutex submit_mutex;
   std::atomic_uint64_t entered{0};
   std::atomic_uint64_t returned{0};
@@ -2495,14 +2499,20 @@ inline void RequestHistoryReset(
 #if defined(NR_NEXUS_DEV_CONTROL)
 inline std::atomic_uint64_t edit_reuse_native_fg_generation{1};
 #endif
+// The Native Present owner is defined after the NGX wrappers in present_path.hpp.
+inline bool OnNativeOutputOptionsChanged(const output_framerate::OutputIdentity& output, bool mode_enabled);
 inline void OnNativeFgOptions(bool mode_enabled) noexcept {
   const auto declared_output = fg::native_options::ChangedOutput();
-  const auto owner = output_framerate::NativeFeatureOutput(native_fg_owner_identity.load(std::memory_order_acquire));
-  if (declared_output.has_value() && owner) {
-    if (!*declared_output) {
-      output_framerate::WithdrawNativeFixedness(owner);
+  if (declared_output.has_value()) {
+    try {
+      if (OnNativeOutputOptionsChanged(*declared_output, mode_enabled)) return;
+    } catch (...) {
       return;
     }
+  }
+  const auto owner = output_framerate::NativeFeatureOutput(native_fg_owner_identity.load(std::memory_order_acquire));
+  if (declared_output.has_value() && owner) {
+    if (!*declared_output) return;
     if (*declared_output != owner) return;
   }
   if (!mode_enabled) mixed_present_fg_seen.store(false);
@@ -3828,7 +3838,9 @@ inline std::atomic_uint32_t shutdown_quiesce_arms{0};
 inline void NgxLifecycleTick();
 // The Present hook point's evaluate side (present_path.hpp), called by the
 // evaluate hooks under runtime_mutex after the game's real evaluate.
-inline bool PresentTakesEvaluate();
+inline bool PresentTakesEvaluate(const NVSDK_NGX_Handle* handle = nullptr, const NVSDK_NGX_Parameter* parameters = nullptr);
+// Present owns the map of known outputs used by the inline route's write check.
+inline bool NativeOwnsExecutionOutput(const output_framerate::OutputIdentity& output);
 inline bool WantsPresentBaseFrames();
 inline bool ObservesPresentBaseFrames();
 // NGX wrappers precede the Present source-proof storage and copy hooks.
@@ -6433,7 +6445,7 @@ inline void LogRecordedWorkBlockers(const char* reason,
     constexpr const char* closes[]{"open", "reset", "destroyed", "owner_discarded"};
     constexpr const char* proof_states[]{
         "unsubmitted", "unreserved", "reserved", "signal_failed", "in_flight", "complete", "device_removed"};
-    constexpr const char* kinds[]{"unknown", "independent_guide", "provider", "output_color"};
+    constexpr const char* kinds[]{"unknown", "independent_guide", "provider", "output_color", "independent_cpu_observation"};
     for (const auto& blocker : blockers) {
       const auto& first = blocker.first_submission;
       std::ostringstream message;
@@ -6488,6 +6500,18 @@ inline bool WaitForTrackedQueues() {
     if (fence->GetCompletedValue() < value) return false;
   }
   return true;
+}
+
+// Under runtime_mutex. A caller that owns native lists and can use either signed
+// image may keep an initialized one on the exact interface that created its lists.
+// This does not adopt a runtime or grant the caller any right to write a color.
+inline bool CanReuseActivePrivateRuntime(ID3D12Device* native_device) {
+  return native_device != nullptr && native_device == direct_device
+      && direct_api.private_instance && direct_api.module != nullptr
+      && direct_load_state == DirectLoadState::Ready && parameter_runtime_ready
+      && !parameter_runtime_via_core.load() && !direct_api.borrowed_core_context
+      && !control_mask_use_core_context.load() && !direct_runtime_failed
+      && direct_api.module != native_runtime_failed_instance;
 }
 
 // `decline`, when given, is set to the terminal of an evaluate the runtime
@@ -15360,7 +15384,9 @@ inline bool RecordInline(
   const bool bridge_adaptive = bridge_source != nullptr
       && BridgeAdaptiveEligible(*bridge_source, command_list, device, handle, plan, &bridge_adaptive_output);
   auto adaptive_output_owner = (present != nullptr ? present->adaptive_output : bridge_adaptive_output);
-  if (!adaptive_output_owner && present == nullptr && (nr_adaptive_enabled.load() || feature.adaptive_session != nullptr)) {
+  const bool edit_reuse_requested = edit_reuse_enabled.load(std::memory_order_relaxed);
+  if (!adaptive_output_owner && present == nullptr
+      && (edit_reuse_requested || nr_adaptive_enabled.load() || feature.adaptive_session != nullptr)) {
     const output_framerate::SourceIdentity source{
         .handle = reinterpret_cast<uintptr_t>(handle), .generation = feature.source_generation,
         .device = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(device)),
@@ -15371,13 +15397,12 @@ inline bool RecordInline(
       adaptive_output_owner = output_framerate::FindPresentOutput(source.device, source.resource);
     }
   }
-  const bool edit_reuse_requested = edit_reuse_enabled.load(std::memory_order_relaxed);
   const edit_reuse_policy::Source inline_source{
       .generation = feature.source_generation,
       .sequence = (bridge_source != nullptr ? bridge_source->sr_sequence : feature.sr_sequence),
       .current_color = present == nullptr && current_sr_color, .ordered = current_sr_color};
   const auto no_fg_owner = [&] {
-    return !native_fg_owns.load() && !fg::xefg::OwnsStream() && !auto_fg_fallback_active.load();
+    return !NativeOwnsExecutionOutput(adaptive_output_owner) && !fg::xefg::OwnsStream() && !auto_fg_fallback_active.load();
   };
   const bool fixed_inline_source = edit_reuse_requested && present == nullptr
       && edit_reuse_policy::CanUseHistory(inline_source)
@@ -15397,8 +15422,8 @@ inline bool RecordInline(
   const auto adaptive_reuse_route = [&] {
     edit_off = {};
     if (!fixed_inline_source || bridge_source != nullptr || hook_point.load() != kHookUpscaled
-        || successful_sr_device != device || !adaptive_output_owner || mixed_present_fg_seen.load()
-        || !nr_adaptive_enabled.load() || native_fg_owns.load() || auto_fg_fallback_active.load()
+        || successful_sr_device != device || !adaptive_output_owner
+        || !nr_adaptive_enabled.load() || NativeOwnsExecutionOutput(adaptive_output_owner) || auto_fg_fallback_active.load()
         || fg::xefg::BlocksHostWrite(adaptive_output_owner)) return false;
     if (output_framerate::NativeMode(adaptive_output_owner) == 0u) {
       return true;
@@ -17835,8 +17860,8 @@ inline bool RecordInline(
         // shares the list with SR and its consumer. Serialize it against
         // withdrawal of that output's write permission, after private work.
         bool copied = false;
-        if (!edit_reuse_delivery_failed && !mixed_present_fg_seen.load()
-            && !native_fg_owns.load() && !auto_fg_fallback_active.load()) {
+        if (!edit_reuse_delivery_failed
+            && !NativeOwnsExecutionOutput(adaptive_output_owner) && !auto_fg_fallback_active.load()) {
           fg::xefg::WithHostWritePermission(adaptive_output_owner, edit_off.available ? &edit_off : nullptr, [&] {
             copied = output_framerate::WithCurrentOutput(adaptive_output_owner, !edit_off.available, [&] {
               copy_output(res.decoded, output_rect.x, output_rect.y);
@@ -18050,18 +18075,20 @@ inline bool RecordInline(
     return true;
   }
 #if defined(NR_NEXUS_DEV_CONTROL)
-  if (edit_reuse_dev_inline_route && edit_fg_environment.available && edit_reuse_route_eligible && !adaptive.preparing
-      && stage_scope.complete && (edit_reused || model_evaluated)) {
-    if (const auto generation = edit_fg_observation::CaptureGeneration(true); generation != 0) {
+  if (execution_stage == stage_plan::Stage::UPSCALED && present == nullptr && bridge_source == nullptr
+      && !adaptive.preparing && stage_scope.complete && (edit_reused || model_evaluated)) {
+    const bool legacy_eligible = edit_reuse_dev_inline_route && edit_fg_environment.available && edit_reuse_route_eligible;
+    if (const auto generation = edit_fg_observation::CaptureSrCopyback(legacy_eligible); generation != 0) {
       try {
+        const auto environment = (legacy_eligible ? edit_fg_environment : ReadEditReuseFgEnvironmentLocked());
         edit_fg_observation::RecordSrCopyback(generation,
             {.source_handle = reinterpret_cast<uintptr_t>(handle), .source_generation = feature.source_generation,
               .sr_sequence = feature.sr_sequence, .reused = edit_reused,
               .output = edit_fg_observation::ObserveResource(output), .width = width, .height = height,
               .format = static_cast<uint32_t>(output_desc.Format),
               .recording = edit_fg_observation::ObserveRecording(command_list),
-              .environment_provider = edit_fg_environment.provider, .environment_context = edit_fg_environment.context,
-              .environment_generation = edit_fg_environment.generation});
+              .environment_provider = environment.provider, .environment_context = environment.context,
+              .environment_generation = environment.generation});
       } catch (...) {
         edit_fg_observation::Stop("observation_failed");
       }
@@ -20524,7 +20551,7 @@ inline bool ProcessStreamlineInline(
 
   // The Present hook point takes the guides here as the NGX hooks do; the
   // tags' own states are the before-states (unknown = the guide 3.4 state).
-  const bool present_takes = fg::xefg::OwnsStream() || PresentTakesEvaluate();
+  const bool present_takes = fg::xefg::OwnsStream() || PresentTakesEvaluate(synthetic_handle, parameters);
   if (present_takes) {
     const auto tag_state = [](uint32_t state) {
       return state == UINT_MAX ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
@@ -20740,20 +20767,47 @@ inline bool FrameGenerationEvaluate(const NVSDK_NGX_Handle* handle,
   return true;
 }
 
+inline bool NativeEvaluateCanOwnPresent(const output_framerate::OutputIdentity& output) {
+  if (!enabled.load() || hook_point.load() != kHookPresent || fg::xefg::OwnsStream()) return false;
+  if (fg::native_options::ObservesPresentDecisions()) return true;
+  return output ? output_framerate::NativeMode(output) != 0u : !native_fg_public_off.load(std::memory_order_acquire);
+}
+
 // present_path.hpp: NR on DLSS-G's input before its evaluate (NRPresentPreFg).
 // Returns the game's DLSSG.HUDLess when NR's stand-in replaced it in the block,
 // which RestorePresentPreFg puts back after the real evaluate.
+struct NativePreFgBindings {
+  struct ColorBinding {
+    Microsoft::WRL::ComPtr<ID3D12Resource> original;
+    Microsoft::WRL::ComPtr<ID3D12Resource> replacement;
+  };
+  Microsoft::WRL::ComPtr<ID3D12Resource> backbuffer;
+  Microsoft::WRL::ComPtr<ID3D12Resource> original_backbuffer;
+  Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+  std::shared_ptr<submission::RecordingStatus> recording;
+  std::array<ColorBinding, 2> inputs;
+  uintptr_t context = 0;
+  uint64_t serial = 0;
+  uint64_t decision = 0;
+  bool redelivery = false;
+};
+
 // Wrappers precede the present helpers they invoke; this dependency requires a declaration.
 inline ID3D12Resource* RunNativePreFg(ID3D12GraphicsCommandList* command_list, const NVSDK_NGX_Parameter* parameters,
-                                    const NVSDK_NGX_Handle* handle = nullptr, bool* backbuffer_replaced = nullptr);
+                                    const NVSDK_NGX_Handle* handle = nullptr, bool* backbuffer_replaced = nullptr,
+                                    NativePreFgBindings* bindings = nullptr);
 // The same wrapper ordering also requires the paired consumer restoration declaration.
 inline void RestoreNativePreFg(ID3D12GraphicsCommandList* command_list,
                                const NVSDK_NGX_Parameter* parameters, ID3D12Resource* hudless, bool succeeded,
-                               const NVSDK_NGX_Handle* handle = nullptr, bool backbuffer_replaced = false);
+                                const NVSDK_NGX_Handle* handle = nullptr, bool backbuffer_replaced = false,
+                                const NativePreFgBindings* bindings = nullptr);
 // Native stream storage follows these wrappers; release must retire its
 // models before a game can reuse the source handle identity.
 inline void OnNativeFgFeatureReleased(const NVSDK_NGX_Handle* handle);
-inline void OnNativePresentStreamRetired(const void* owner);
+// These callbacks own failed Native parameter borrows beyond one SDK call.
+inline bool RecoverNativePreFgParameters(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Parameter* parameters);
+inline uint64_t NativePreFgParameterBorrowSerial(const NVSDK_NGX_Parameter* parameters);
+inline void RetireNativePreFgParameters(const NVSDK_NGX_Parameter* parameters, uint64_t serial);
 inline ID3D12Resource* RunPresentPreFg(ID3D12GraphicsCommandList* command_list,
                                        const NVSDK_NGX_Parameter* parameters);
 inline void ObservePresentFrameGeneration(const NVSDK_NGX_Parameter* parameters);
@@ -21195,6 +21249,8 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedCreateFeatureSlot(
 
 
 inline void* real_cmd_reset = nullptr;
+inline void* real_native_cmd_close = nullptr;
+inline constexpr uint32_t kNativeCmdCloseSlot = 9;
 inline void* real_cmd_clear_state = nullptr;
 inline void* real_cmd_set_pipeline_state = nullptr;
 inline void* real_cmd_execute_bundle = nullptr;
@@ -21443,6 +21499,13 @@ inline void GuardHook(Work&& work) noexcept {
 // shipped state machine and the sentinel tests run identical code.  Our own
 // codec/internal-NGX traffic is suppressed from observation (it runs through
 // these same detours and would otherwise overwrite the state to restore).
+
+inline HRESULT STDMETHODCALLTYPE HookedNativeCmdClose(ID3D12GraphicsCommandList* list) {
+  const auto result = reinterpret_cast<HRESULT (STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*)>(
+      real_native_cmd_close)(list);
+  GuardHook([&] { submission::ObserveCommandListClose(list); });
+  return result;
+}
 
 inline HRESULT STDMETHODCALLTYPE HookedCmdReset(
     ID3D12GraphicsCommandList* command_list,
@@ -22024,6 +22087,9 @@ inline bool InstallCommandListStateHooks(ID3D12GraphicsCommandList* command_list
     }
   }
   real_cmd_reset = targets[kCmdSlotReset];
+  auto* native_list = command_list;
+  renodx::utils::directx::NativeFromReShadeProxy(&native_list);
+  real_native_cmd_close = (*reinterpret_cast<void***>(native_list))[kNativeCmdCloseSlot];
   real_cmd_clear_state = targets[kCmdSlotClearState];
   real_cmd_set_pipeline_state = targets[kCmdSlotSetPipelineState];
   real_cmd_execute_bundle = targets[kCmdSlotExecuteBundle];
@@ -22050,6 +22116,7 @@ inline bool InstallCommandListStateHooks(ID3D12GraphicsCommandList* command_list
     DetourUpdateThread(GetCurrentThread());
     detours_installed =
         DetourAttach(&real_cmd_reset, &HookedCmdReset) == NO_ERROR
+        && DetourAttach(&real_native_cmd_close, &HookedNativeCmdClose) == NO_ERROR
         && DetourAttach(&real_cmd_clear_state, &HookedCmdClearState) == NO_ERROR
         && DetourAttach(&real_cmd_set_pipeline_state, &HookedCmdSetPipelineState)
                == NO_ERROR
@@ -22086,6 +22153,7 @@ inline bool InstallCommandListStateHooks(ID3D12GraphicsCommandList* command_list
   if (!detours_installed) {
     DetourTransactionAbort();
     real_cmd_reset = nullptr;
+    real_native_cmd_close = nullptr;
     real_cmd_clear_state = nullptr;
     real_cmd_set_pipeline_state = nullptr;
     real_cmd_execute_bundle = nullptr;
@@ -22105,7 +22173,7 @@ inline bool InstallCommandListStateHooks(ID3D12GraphicsCommandList* command_list
     return false;
   }
   cmd_hook_fail_streak = 0;
-  ID3D12GraphicsCommandList* native_list = command_list;
+  native_list = command_list;
   cmd_hooks_on_reshade_proxy.store(
       renodx::utils::directx::NativeFromReShadeProxy(&native_list),
       std::memory_order_relaxed);
@@ -22184,6 +22252,7 @@ inline void UnhookCommandListStateHooks() {
     DetourUpdateThread(GetCurrentThread());
     detours_detached =
         DetourDetach(&real_cmd_reset, &HookedCmdReset) == NO_ERROR
+        && DetourDetach(&real_native_cmd_close, &HookedNativeCmdClose) == NO_ERROR
         && DetourDetach(&real_cmd_clear_state, &HookedCmdClearState) == NO_ERROR
         && DetourDetach(&real_cmd_set_pipeline_state, &HookedCmdSetPipelineState)
                == NO_ERROR
@@ -22226,6 +22295,7 @@ inline void UnhookCommandListStateHooks() {
     cmd_hooks_installed = false;
     cmd_hooks_attempted = false;
     real_cmd_reset = nullptr;
+    real_native_cmd_close = nullptr;
     real_cmd_clear_state = nullptr;
     real_cmd_set_pipeline_state = nullptr;
     real_cmd_execute_bundle = nullptr;
@@ -22804,10 +22874,25 @@ inline void STDMETHODCALLTYPE HookedQueueExecuteCommandLists(
       native_ui_alpha_observation::ObserveExecute(ui_alpha_generation, queue, count, command_lists, "entry");
     });
   }
+  uint64_t edit_fg_generation = 0;
+  std::vector<edit_fg_observation::QueueSubmissionObservation> edit_fg_submissions;
+  if (!pending_submissions.empty()) {
+    GuardHook([&] {
+      edit_fg_generation = edit_fg_observation::CaptureGeneration();
+      edit_fg_submissions = edit_fg_observation::CaptureQueueSubmissions(
+          edit_fg_generation, queue, count, command_lists, pending_submissions);
+    });
+  }
+  const auto edit_fg_execute_entry_ns = (!edit_fg_submissions.empty() ? edit_fg_observation::NowNs() : 0);
 #endif
   const auto ordered = control_mask_execution::ExecuteOrdered(queue, count, command_lists,
       reinterpret_cast<QueueExecuteCommandListsFn>(real_queue_execute_command_lists));
+  const auto queue_order = (present_submit.isolated && ordered.forward_calls != 0
+                            && present_order->entered.load() == present_submit.entry
+      ? submission::QueueOrderProof{.domain = present_order->domain_id, .entry = present_submit.entry}
+      : submission::QueueOrderProof{});
 #if defined(NR_NEXUS_DEV_CONTROL)
+  const auto edit_fg_execute_return_ns = (!edit_fg_submissions.empty() ? edit_fg_observation::NowNs() : 0);
   if (ui_alpha_generation != 0 && !enabled.load()) {
     GuardHook([&] {
       native_ui_alpha_observation::ObserveExecute(ui_alpha_generation, queue, count, command_lists, "return");
@@ -22852,6 +22937,10 @@ inline void STDMETHODCALLTYPE HookedQueueExecuteCommandLists(
     // below would otherwise AddRef a released fence.
     FenceRef completion_fence;
     uint64_t completion_value = 0;
+#if defined(NR_NEXUS_DEV_CONTROL)
+    uintptr_t edit_fg_signal_fence = 0;
+    uint64_t edit_fg_signal_value = 0;
+#endif
     {
       std::shared_lock<std::shared_mutex> map(queue_completion_mutex,
                                               std::defer_lock);
@@ -22882,6 +22971,12 @@ inline void STDMETHODCALLTYPE HookedQueueExecuteCommandLists(
       if (tracker != nullptr && !tracker->faulted) {
         const uint64_t value =
             tracker->last_assigned.fetch_add(1, std::memory_order_relaxed) + 1;
+#if defined(NR_NEXUS_DEV_CONTROL)
+        if (!edit_fg_submissions.empty()) {
+          edit_fg_signal_fence = reinterpret_cast<uintptr_t>(tracker->fence);
+          edit_fg_signal_value = value;
+        }
+#endif
         if (SUCCEEDED(queue->Signal(tracker->fence, value))) {
           if (!pending_submissions.empty()) {
             completion_fence = FenceRef(tracker->fence);
@@ -22901,13 +22996,21 @@ inline void STDMETHODCALLTYPE HookedQueueExecuteCommandLists(
     // the reservations unprovable - their generations retain until teardown,
     // never guessed.
     submission::CompleteSubmission(
-        pending_submissions, completion_fence.fence, completion_value);
+        pending_submissions, completion_fence.fence, completion_value, queue_order);
     if (present_submit.isolated && count == 1 && !completion_fence.empty()
         && present_order->entered.load() == present_submit.entry) {
       present_order->producer_entry = present_submit.entry;
       present_order->producer_value = completion_value;
     }
 #if defined(NR_NEXUS_DEV_CONTROL)
+    if (!edit_fg_submissions.empty()) {
+      GuardHook([&] {
+        edit_fg_observation::RecordQueueSubmissions(edit_fg_generation, edit_fg_submissions,
+            {.execute_entry_ns = edit_fg_execute_entry_ns, .execute_return_ns = edit_fg_execute_return_ns,
+                .forward_calls = ordered.forward_calls, .signal_fence = edit_fg_signal_fence,
+                .signal_value = edit_fg_signal_value, .signal_succeeded = !completion_fence.empty() && completion_value != 0});
+      });
+    }
     if (NativePremiseEnabled()) {
       if (auto observe = native_premise_submit.load()) {
         observe(queue, pending_submissions);
@@ -23660,9 +23763,14 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
   PreSrSwap pre_sr;
   ID3D12Resource* prefg_hudless = nullptr;
   bool prefg_backbuffer_replaced = false;
+  NativePreFgBindings prefg_bindings;
   bool prefg_owner = false;
   bool frame_generation = false;
+  output_framerate::OutputIdentity native_output;
+  std::optional<uint64_t> native_binding_generation;
 #if defined(NR_NEXUS_DEV_CONTROL)
+  uint64_t edit_fg_sr_sequence = 0;
+  uint64_t edit_fg_sr_generation = 0;
   native_ui_alpha_observation::ConsumerCall ui_alpha_call;
   std::optional<control_mask_capture::benchmark::Scope> sr_benchmark;
   if (source_scope.owner && control_mask_capture::benchmark::active.load()) {
@@ -23680,9 +23788,10 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
     if (source_scope.owner) {
 #if defined(NR_NEXUS_DEV_CONTROL)
       if (auto source = features.find(handle); source != features.end()) {
-        ++source->second.sr_sequence;
+        edit_fg_sr_sequence = ++source->second.sr_sequence;
+        edit_fg_sr_generation = source->second.source_generation;
         edit_fg_observation::ObserveSourceFrame(reinterpret_cast<uintptr_t>(handle),
-            source->second.source_generation, source->second.sr_sequence);
+            edit_fg_sr_generation, edit_fg_sr_sequence);
       }
 #else
       if (auto source = features.find(handle); source != features.end()) ++source->second.sr_sequence;
@@ -23693,35 +23802,39 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
     // a HUD-less stand-in in its block for the duration of real().
     frame_generation =
         handle != nullptr && FrameGenerationEvaluate(handle, parameters);
+    const bool native_bindings_ready = RecoverNativePreFgParameters(command_list, parameters);
+    bool native_may_own = false;
     if (frame_generation) {
 #if defined(NR_NEXUS_DEV_CONTROL)
       if (source_scope.owner && native_ui_alpha_observation::Active() != 0) {
         GuardHook([&] { ui_alpha_call = ObserveNativeUiAlphaInput(command_list, handle, parameters, Slot); });
       }
 #endif
-      mixed_present_fg_seen.store(true);
-      ObservePresentFrameGeneration(parameters);
       // Streamline applies options at a later application Present. A valid
       // FG evaluate still consumes this image even after an Off request.
-      if (enabled.load() && hook_point.load() == kHookPresent && !fg::xefg::OwnsStream()
-          && (!native_fg_public_off.load(std::memory_order_acquire)
-              || fg::native_options::ObservesPresentDecisions())) {
+      native_output = output_framerate::FindPresentOutput(0,
+          reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(
+              PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_Backbuffer))));
+      native_binding_generation = output_framerate::BeginNativeEvaluation(native_output,
+          reinterpret_cast<uintptr_t>(handle), fg::native_options::ObservesPresentDecisions());
+      if (!native_output || native_binding_generation.has_value()) {
+        mixed_present_fg_seen.store(true);
+        ObservePresentFrameGeneration(parameters);
+      }
+      native_may_own = NativeEvaluateCanOwnPresent(native_output);
+      if (native_may_own) {
         native_fg_owner = handle;
         native_fg_owner_identity.store(reinterpret_cast<uintptr_t>(handle), std::memory_order_release);
-        output_framerate::BindNativeFeatureOutput(output_framerate::FindPresentOutput(0,
-            reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(
-                PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_Backbuffer)))), reinterpret_cast<uintptr_t>(handle));
         native_fg_owns.store(true, std::memory_order_release);
       }
     }
-    if (enabled.load() && frame_generation && !evaluate_chain.prefg_ran
+    if (native_may_own && native_bindings_ready && !evaluate_chain.prefg_ran
         && !NrYieldsToForeign() && !NrWaitsForTeardown(command_list)
         && InstallCommandListStateHooks(command_list)) {
       evaluate_chain.prefg_ran = true;
       prefg_owner = true;
-      prefg_hudless = RunNativePreFg(command_list, parameters, handle, &prefg_backbuffer_replaced);
-    } else if (enabled.load() && frame_generation && !evaluate_chain.prefg_ran
-               && native_fg_owns.load(std::memory_order_acquire) && hook_point.load() == kHookPresent) {
+      prefg_hudless = RunNativePreFg(command_list, parameters, handle, &prefg_backbuffer_replaced, &prefg_bindings);
+    } else if (native_may_own && !evaluate_chain.prefg_ran) {
       native_fg_marker.store(nullptr, std::memory_order_release);
       native_fg_continuing_submission.store(false, std::memory_order_release);
       native_fg_result.store(fg::Result::NOT_SERVED, std::memory_order_release);
@@ -23813,18 +23926,15 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
   RestorePreSrColor(parameters, pre_sr, NVSDK_NGX_SUCCEED(result));
   // A nested delegate must not invalidate the cache before the wrapper
   // that replaced FG inputs has restored the original parameter bindings.
-  if (prefg_owner || !evaluate_chain.prefg_ran) {
+  if (prefg_owner) {
     RestoreNativePreFg(command_list, parameters, prefg_hudless, NVSDK_NGX_SUCCEED(result), handle,
-                       prefg_backbuffer_replaced);
+                       prefg_backbuffer_replaced, &prefg_bindings);
   }
-  if (frame_generation && source_scope.owner) {
-    auto* const backbuffer = PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_Backbuffer);
-    const auto output = output_framerate::FindPresentOutput(0,
-        reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(backbuffer)));
+  if (native_binding_generation.has_value() && source_scope.owner) {
     uint32_t count = 0;
     const bool declared = GetUIntIfPresent(parameters, NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, &count);
-    output_framerate::ObserveNativeEvaluation(output, declared && count < 16 ? count + 1 : 0,
-        NVSDK_NGX_SUCCEED(result), SteadyNowNs(), reinterpret_cast<uintptr_t>(handle));
+    output_framerate::ObserveNativeEvaluation(native_output, declared && count < 16 ? count + 1 : 0,
+        NVSDK_NGX_SUCCEED(result), SteadyNowNs(), reinterpret_cast<uintptr_t>(handle), native_binding_generation);
   }
   // Item 19: name every terminal.  This compound early-out used to return
   // without counting anything, so an NR-off session's evaluates (7807 in
@@ -23873,6 +23983,15 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
     CountNrDecline(NrDeclineReason::kNgxNotDlssEvaluation);
     return result;
   }
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (edit_fg_sr_sequence != 0 && CreatedSrHandle(handle)) {
+    if (const auto source = features.find(handle); source != features.end()
+        && source->second.source_generation == edit_fg_sr_generation) {
+      GuardHook([&] { edit_fg_observation::ObserveSourceSuccess(
+          reinterpret_cast<uintptr_t>(handle), edit_fg_sr_generation, edit_fg_sr_sequence); });
+    }
+  }
+#endif
   fg::xefg::ReconcileNrService();
   const SuccessfulSrCoreScope core_scope(
       CreatedSrHandle(handle) ? command_list : nullptr, handle);
@@ -23898,7 +24017,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureSlot(
   // The Present hook point: this evaluate lends NR its guides and NR runs
   // at the present (present_path.hpp).  When the present path cannot serve
   // (starved presents, an unusable swapchain) the after path below runs.
-  if (fg::xefg::OwnsStream() || PresentTakesEvaluate()) {
+  if (fg::xefg::OwnsStream() || PresentTakesEvaluate(handle, parameters)) {
     if (!source_scope.owner && ObservesPresentBaseFrames()) {
       CountNrDecline(NrDeclineReason::kNestedMirror);
       return result;
@@ -24019,9 +24138,14 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
   PreSrSwap pre_sr;
   ID3D12Resource* prefg_hudless = nullptr;
   bool prefg_backbuffer_replaced = false;
+  NativePreFgBindings prefg_bindings;
   bool prefg_owner = false;
   bool frame_generation = false;
+  output_framerate::OutputIdentity native_output;
+  std::optional<uint64_t> native_binding_generation;
 #if defined(NR_NEXUS_DEV_CONTROL)
+  uint64_t edit_fg_sr_sequence = 0;
+  uint64_t edit_fg_sr_generation = 0;
   native_ui_alpha_observation::ConsumerCall ui_alpha_call;
   std::optional<control_mask_capture::benchmark::Scope> sr_benchmark;
   if (source_scope.owner && control_mask_capture::benchmark::active.load()) {
@@ -24033,9 +24157,10 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
     if (source_scope.owner) {
 #if defined(NR_NEXUS_DEV_CONTROL)
       if (auto source = features.find(handle); source != features.end()) {
-        ++source->second.sr_sequence;
+        edit_fg_sr_sequence = ++source->second.sr_sequence;
+        edit_fg_sr_generation = source->second.source_generation;
         edit_fg_observation::ObserveSourceFrame(reinterpret_cast<uintptr_t>(handle),
-            source->second.source_generation, source->second.sr_sequence);
+            edit_fg_sr_generation, edit_fg_sr_sequence);
       }
 #else
       if (auto source = features.find(handle); source != features.end()) ++source->second.sr_sequence;
@@ -24045,35 +24170,39 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
     // C++ wrapper).
     frame_generation =
         handle != nullptr && FrameGenerationEvaluate(handle, parameters);
+    const bool native_bindings_ready = RecoverNativePreFgParameters(command_list, parameters);
+    bool native_may_own = false;
     if (frame_generation) {
 #if defined(NR_NEXUS_DEV_CONTROL)
       if (source_scope.owner && native_ui_alpha_observation::Active() != 0) {
         GuardHook([&] { ui_alpha_call = ObserveNativeUiAlphaInput(command_list, handle, parameters, Slot); });
       }
 #endif
-      mixed_present_fg_seen.store(true);
-      ObservePresentFrameGeneration(parameters);
       // Streamline applies options at a later application Present. A valid
       // FG evaluate still consumes this image even after an Off request.
-      if (enabled.load() && hook_point.load() == kHookPresent && !fg::xefg::OwnsStream()
-          && (!native_fg_public_off.load(std::memory_order_acquire)
-              || fg::native_options::ObservesPresentDecisions())) {
+      native_output = output_framerate::FindPresentOutput(0,
+          reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(
+              PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_Backbuffer))));
+      native_binding_generation = output_framerate::BeginNativeEvaluation(native_output,
+          reinterpret_cast<uintptr_t>(handle), fg::native_options::ObservesPresentDecisions());
+      if (!native_output || native_binding_generation.has_value()) {
+        mixed_present_fg_seen.store(true);
+        ObservePresentFrameGeneration(parameters);
+      }
+      native_may_own = NativeEvaluateCanOwnPresent(native_output);
+      if (native_may_own) {
         native_fg_owner = handle;
         native_fg_owner_identity.store(reinterpret_cast<uintptr_t>(handle), std::memory_order_release);
-        output_framerate::BindNativeFeatureOutput(output_framerate::FindPresentOutput(0,
-            reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(
-                PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_Backbuffer)))), reinterpret_cast<uintptr_t>(handle));
         native_fg_owns.store(true, std::memory_order_release);
       }
     }
-    if (enabled.load() && frame_generation && !evaluate_chain.prefg_ran
+    if (native_may_own && native_bindings_ready && !evaluate_chain.prefg_ran
         && !NrYieldsToForeign() && !NrWaitsForTeardown(command_list)
         && InstallCommandListStateHooks(command_list)) {
       evaluate_chain.prefg_ran = true;
       prefg_owner = true;
-      prefg_hudless = RunNativePreFg(command_list, parameters, handle, &prefg_backbuffer_replaced);
-    } else if (enabled.load() && frame_generation && !evaluate_chain.prefg_ran
-               && native_fg_owns.load(std::memory_order_acquire) && hook_point.load() == kHookPresent) {
+      prefg_hudless = RunNativePreFg(command_list, parameters, handle, &prefg_backbuffer_replaced, &prefg_bindings);
+    } else if (native_may_own && !evaluate_chain.prefg_ran) {
       native_fg_marker.store(nullptr, std::memory_order_release);
       native_fg_continuing_submission.store(false, std::memory_order_release);
       native_fg_result.store(fg::Result::NOT_SERVED, std::memory_order_release);
@@ -24148,18 +24277,15 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
   inside_game_evaluate_wrapper = false;
   state_envelope.StopCapture();
   RestorePreSrColor(parameters, pre_sr, NVSDK_NGX_SUCCEED(result));
-  if (prefg_owner || !evaluate_chain.prefg_ran) {
+  if (prefg_owner) {
     RestoreNativePreFg(command_list, parameters, prefg_hudless, NVSDK_NGX_SUCCEED(result), handle,
-                       prefg_backbuffer_replaced);
+                       prefg_backbuffer_replaced, &prefg_bindings);
   }
-  if (frame_generation && source_scope.owner) {
-    auto* const backbuffer = PreFgResource(parameters, NVSDK_NGX_DLSSG_Parameter_Backbuffer);
-    const auto output = output_framerate::FindPresentOutput(0,
-        reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(backbuffer)));
+  if (native_binding_generation.has_value() && source_scope.owner) {
     uint32_t count = 0;
     const bool declared = GetUIntIfPresent(parameters, NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, &count);
-    output_framerate::ObserveNativeEvaluation(output, declared && count < 16 ? count + 1 : 0,
-        NVSDK_NGX_SUCCEED(result), SteadyNowNs(), reinterpret_cast<uintptr_t>(handle));
+    output_framerate::ObserveNativeEvaluation(native_output, declared && count < 16 ? count + 1 : 0,
+        NVSDK_NGX_SUCCEED(result), SteadyNowNs(), reinterpret_cast<uintptr_t>(handle), native_binding_generation);
   }
   if (InsideDirectCall()) {
     return result;
@@ -24189,6 +24315,15 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
     CountNrDecline(NrDeclineReason::kNgxNotDlssEvaluation);
     return result;
   }
+#if defined(NR_NEXUS_DEV_CONTROL)
+  if (edit_fg_sr_sequence != 0 && CreatedSrHandle(handle)) {
+    if (const auto source = features.find(handle); source != features.end()
+        && source->second.source_generation == edit_fg_sr_generation) {
+      GuardHook([&] { edit_fg_observation::ObserveSourceSuccess(
+          reinterpret_cast<uintptr_t>(handle), edit_fg_sr_generation, edit_fg_sr_sequence); });
+    }
+  }
+#endif
   fg::xefg::ReconcileNrService();
   const SuccessfulSrCoreScope core_scope(
       CreatedSrHandle(handle) ? command_list : nullptr, handle);
@@ -24213,7 +24348,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeatureCSlot(
   // The Present hook point: this evaluate lends NR its guides and NR runs
   // at the present (present_path.hpp).  When the present path cannot serve
   // (starved presents, an unusable swapchain) the after path below runs.
-  if (fg::xefg::OwnsStream() || PresentTakesEvaluate()) {
+  if (fg::xefg::OwnsStream() || PresentTakesEvaluate(handle, parameters)) {
     if (!source_scope.owner && ObservesPresentBaseFrames()) {
       CountNrDecline(NrDeclineReason::kNestedMirror);
       return result;
@@ -24328,6 +24463,22 @@ using NgxEvaluateFn = decltype(&NVSDK_NGX_D3D12_EvaluateFeature);
 using NgxEvaluateCFn = decltype(&NVSDK_NGX_D3D12_EvaluateFeature_C);
 using NgxReleaseFn = decltype(&NVSDK_NGX_D3D12_ReleaseFeature);
 
+template <int Slot>
+inline NVSDK_NGX_Result NVSDK_CONV HookedDestroyNativeParametersSlot(NVSDK_NGX_Parameter* parameters) {
+  const auto real = reinterpret_cast<DestroyParametersFn>(ngx_slot_real[Slot].destroy_parameters);
+  uint64_t serial = 0;
+  const auto result = [&] {
+    const ngx_serial::Call call;
+    if (!InsideDirectCall()) GuardHook([&] { serial = NativePreFgParameterBorrowSerial(parameters); });
+    return real(parameters);
+  }();
+  if (NVSDK_NGX_SUCCEED(result) && serial != 0) {
+    // The SDK can already have reused this address when the old call returns.
+    GuardHook([&] { RetireNativePreFgParameters(parameters, serial); });
+  }
+  return result;
+}
+
 inline NgxCreateFn const kNgxCreateWrappers[kMaxNgxSlots] = {
     HookedCreateFeatureSlot<0>, HookedCreateFeatureSlot<1>, HookedCreateFeatureSlot<2>,
     HookedCreateFeatureSlot<3>, HookedCreateFeatureSlot<4>, HookedCreateFeatureSlot<5>,
@@ -24367,6 +24518,7 @@ inline void NoteDetourRemoval(detour_guard::Removal removal) {
 // knows or to none - so a slot is checked against the image, not the handle.
 struct NgxSlotGuard {
   detour_guard::Record records[4];
+  detour_guard::Record destroy_parameters;
   uint64_t image = 0;
 };
 using NgxSlotHooks = std::array<detour_guard::Hook, 4>;
@@ -24412,6 +24564,19 @@ inline const NgxSlotFamily kNgx12Slots = {
     "D3D12",          ngx_slot_used,        ngx_slot_module, ngx_slot_noncore,
     ngx_slot_guard,   &ngx_refused_modules, MakeNgxHookItems};
 
+inline detour_guard::Hook NativeParameterDestroyHook(int slot) {
+  static constexpr DestroyParametersFn wrappers[]{
+      HookedDestroyNativeParametersSlot<0>, HookedDestroyNativeParametersSlot<1>,
+      HookedDestroyNativeParametersSlot<2>, HookedDestroyNativeParametersSlot<3>,
+      HookedDestroyNativeParametersSlot<4>, HookedDestroyNativeParametersSlot<5>,
+      HookedDestroyNativeParametersSlot<6>, HookedDestroyNativeParametersSlot<7>};
+  static_assert(std::size(wrappers) == kMaxNgxSlots);
+  return {.name = "NVSDK_NGX_D3D12_DestroyParameters",
+      .real = &ngx_slot_real[slot].destroy_parameters,
+      .detour = reinterpret_cast<void*>(wrappers[slot]),
+      .record = &ngx_slot_guard[slot].destroy_parameters};
+}
+
 // Resolves and attaches one slot's exports, returning how many are live.  A
 // resolved export Detours cannot attach (a prologue it cannot relocate is a
 // per-function property, so Create can fail while Release takes) leaves the
@@ -24436,6 +24601,14 @@ inline size_t AttachNgxSlot(const NgxSlotFamily& family, int slot,
   size_t failed = 0;
   const size_t attached = detour_guard::AttachAll(hooks, &failed);
   if (attached == 0) return 0;
+  if (&family == &kNgx12Slots) {
+    const auto destroy = NativeParameterDestroyHook(slot);
+    *destroy.real = reinterpret_cast<void*>(GetProcAddress(module, destroy.name));
+    if (*destroy.real != nullptr) {
+      size_t destroy_failed = 0;
+      detour_guard::AttachAll(std::span{&destroy, 1}, &destroy_failed);
+    }
+  }
   family.guard[slot].image = detour_guard::ImageIdentity(module);
   if (failed != 0) {
     hook_surface.partial.fetch_add(1, std::memory_order_relaxed);
@@ -24465,6 +24638,14 @@ inline void ReleaseNgxSlot(const NgxSlotFamily& family, int slot) {
       NoteDetourRemoval(detour_guard::Detach(hook));
     } else {
       detour_guard::Forget(hook);
+    }
+  }
+  if (&family == &kNgx12Slots) {
+    const auto destroy = NativeParameterDestroyHook(slot);
+    if (same_image) {
+      NoteDetourRemoval(detour_guard::Detach(destroy));
+    } else {
+      detour_guard::Forget(destroy);
     }
   }
   family.guard[slot].image = 0;

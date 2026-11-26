@@ -11,6 +11,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string_view>
 #include <thread>
 #include <tuple>
@@ -661,6 +662,91 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
   auto* const retained_depth = latest_guide->depth;
   auto* const retained_motion = latest_guide->motion;
   const void* const retained_marker = latest_guide->marker;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  namespace benchmark = addon::control_mask_capture::benchmark;
+  const std::array<const void*, 1> provider_objects{&native::direct_api};
+  Check(submission::ProviderTeardownWorkState(provider_objects) == submission::RecordedWork::kComplete,
+        "without benchmark the independent guide recording permits provider retirement");
+  Check(benchmark::Arm(8, 30, nullptr, nullptr), "arm the real benchmark owner across the provider handoff");
+  const auto observe_source = [&](ID3D12GraphicsCommandList* list) {
+    {
+      benchmark::Scope scope(reinterpret_cast<uintptr_t>(source), list);
+      native::ObserveSrBenchmarkResult(&scope, list, source, &parameters, NVSDK_NGX_Result_Success,
+                                       true, false, addon::gpu_timers::NowNs());
+    }
+    std::shared_lock lock(benchmark::state.mutex);
+    Check(!benchmark::state.rows.empty() && benchmark::state.rows.back().wrapper_finalized,
+          "the actual benchmark Scope finalizes the mock SR result");
+    const auto& row = benchmark::state.rows.back();
+    Check(row.frame.recording != nullptr && row.frame.recording->list != 0
+              && row.frame.recording->generation != 0,
+          "the benchmark row owns the exact source recording status");
+    return row.frame.recording;
+  };
+  const auto benchmark_recording = observe_source(guide.list.Get());
+  bool benchmark_object_mapped = false;
+  bool benchmark_kind_unknown = false;
+  bool benchmark_cpu_observation = false;
+  {
+    std::lock_guard lock(submission::tracker_mutex);
+    const auto& generation = submission::tracked_lists.at(benchmark_recording->list)
+                                 .generations.at(benchmark_recording->generation);
+    Check(generation.status == benchmark_recording, "the benchmark row and tracker refer to the same status object");
+    for (const auto& use : generation.classified_uses) {
+      if (use.object != benchmark_recording.get()) continue;
+      benchmark_object_mapped = true;
+      benchmark_kind_unknown |= use.kind == submission::UseKind::kUnknown;
+      benchmark_cpu_observation |= use.kind == submission::UseKind::kIndependentCpuObservation;
+    }
+  }
+  std::vector<submission::RecordingBlocker> benchmark_blockers;
+  const auto benchmark_gate = submission::ProviderTeardownWorkState(provider_objects, &benchmark_blockers);
+  bool benchmark_object_blocks = false;
+  for (const auto& blocker : benchmark_blockers) {
+    if (blocker.list != benchmark_recording->list || blocker.generation != benchmark_recording->generation) continue;
+    benchmark_object_blocks = std::ranges::any_of(blocker.uses, [&](const auto& use) {
+      return use.object == benchmark_recording.get() && use.kind == submission::UseKind::kUnknown;
+    });
+  }
+  std::cout << "SR_BENCHMARK_PROVIDER mapping=" << benchmark_object_mapped
+            << " kind_unknown=" << benchmark_kind_unknown << " exact_object_blocker=" << benchmark_object_blocks
+            << " recording=" << benchmark_recording->list << '/' << benchmark_recording->generation << std::endl;
+  Check(benchmark_object_mapped && benchmark_gate == submission::RecordedWork::kComplete,
+        "arming benchmark preserves the independent guide's provider retirement permission");
+  Check(benchmark_cpu_observation && !benchmark_kind_unknown,
+        "the pure CPU benchmark observation has its own provider-independent classification");
+  for (const auto kind : {submission::UseKind::kUnknown, submission::UseKind::kProvider}) {
+    auto blocking = create_list();
+    const auto observation = observe_source(blocking.list.Get());
+    submission::SetRecordingOwner(blocking.list.Get(), submission::RecordingOwner::kBorrowedGame);
+    if (kind == submission::UseKind::kUnknown) {
+      // The old benchmark call used this exact default classification.
+      submission::TrackUse(blocking.list.Get(), observation.get());
+    } else {
+      submission::TrackUse(blocking.list.Get(), &native::direct_api, kind);
+    }
+    Check(submission::ProviderTeardownWorkState(provider_objects) == submission::RecordedWork::kPending,
+          "an unsubmitted unknown or real provider use remains a provider retirement blocker");
+    close_list(&blocking);
+    execute_and_wait(gpu.queue.Get(), blocking);
+    Check(submission::ProviderTeardownWorkState(provider_objects) == submission::RecordedWork::kReplayable,
+          "healthy completion still retains unknown and provider uses while the recording can replay");
+    {
+      const addon::ngx_serial::PresentTurn turn;
+      Check(turn.owns(), "provider rejection owns the existing NGX turn");
+      const addon::RuntimeLock lock(native::runtime_mutex);
+      auto decline = addon::NrDeclineReason::kNrRuntimeUnavailable;
+      Check(!native::EnsureDirectRuntime(blocking.list.Get(), &decline, true)
+                && decline == addon::NrDeclineReason::kRuntimeSwitchPending && !native::direct_api.private_instance,
+            "the actual provider handoff waits for replayable unknown and provider uses");
+    }
+    reset_list(&blocking);
+    submission::PruneCompletedGenerations();
+    Check(submission::ProviderTeardownWorkState(provider_objects) == submission::RecordedWork::kComplete
+              && submission::ResourceReleasable(observation.get()),
+          "Reset and healthy completion retire the blocking generation while benchmark rows still own its status");
+  }
+#endif
   close_list(&guide);
   Check(Hooks::Enable(session.handle, 1) == 0, "real SDK handoff starts while the independent guide is unsubmitted");
   const bool guide_handoff = frame("independent-unsubmitted-guide-allows-first-sdk", &route, scene_b, 1, true, true, true, 1);
@@ -668,6 +754,17 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
       && !submission::ResourceReleasable(retained_depth) && !submission::ResourceReleasable(retained_motion)
       && !submission::ResourceReleasable(retained_marker);
   accepted &= guide_handoff && guide_retained && native::direct_api.private_instance;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  Check(benchmark::active.load() && benchmark_recording == guide.recording && guide_handoff,
+        "the real provider handoff accepts the same retained guides while benchmark remains active");
+  Check(benchmark::Stop("provider_handoff_fixture", nullptr, true), "stop the benchmark through its actual owner");
+  Check(!benchmark_recording->submitted.load() && !benchmark_recording->closed.load()
+            && !submission::ResourceReleasable(benchmark_recording.get())
+            && !submission::ResourceReleasable(retained_depth) && !submission::ResourceReleasable(retained_motion),
+        "benchmark Stop cannot retire an unsubmitted source recording or its retained guides");
+  benchmark::Tick(addon::gpu_timers::NowNs(), false);
+  benchmark::write_pending.store(false);
+#endif
   execute_and_wait(gpu.queue.Get(), guide);
   Check(!submission::ResourceReleasable(retained_depth) && !submission::ResourceReleasable(retained_motion)
             && !submission::ResourceReleasable(retained_marker), "completed external guide remains alive while replayable");
@@ -698,6 +795,24 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
   const bool guide_retired = submission::ResourceReleasable(retained_depth) && submission::ResourceReleasable(retained_motion)
       && submission::ResourceReleasable(retained_marker);
   accepted &= guide_retired;
+#if defined(NR_NEXUS_DEV_CONTROL)
+  {
+    std::shared_lock rows_lock(benchmark::state.mutex);
+    std::lock_guard tracker_lock(submission::tracker_mutex);
+    Check(benchmark::state.rows.front().frame.recording == benchmark_recording
+              && benchmark_recording->closed.load() && benchmark_recording->submitted.load()
+              && benchmark_recording->completed_healthy && !submission::live_uses.contains(benchmark_recording.get()),
+          "the benchmark row can keep its status after replay, Reset and healthy GPU completion pruned its tracker use");
+  }
+  std::cout << "SR_BENCHMARK_PROVIDER active_handoff=accepted stop=source-retained"
+               " unknown-and-provider=replay-blocked row-retained-after-prune=1 evidence=WARP+MOCK\n";
+  {
+    std::unique_lock lock(benchmark::state.mutex);
+    benchmark::state.rows.clear();
+    benchmark::state.sources.clear();
+    benchmark::state.status = "idle";
+  }
+#endif
   std::cout << "XEFG_HANDOFF_GUIDES " << nlohmann::json{{"unsubmitted_handoff", guide_handoff},
       {"retained", guide_retained}, {"replayed", true}, {"depth_bytes", depth_bytes}, {"motion_bytes", motion_bytes},
       {"releasable_after_reset", guide_retired}}.dump() << std::endl;

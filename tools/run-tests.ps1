@@ -13,14 +13,14 @@ param(
     [string]$PythonExecutable,
     [ValidateSet('Auto','Quick','Full','None')][string]$UiPreview = 'Auto',
     [ValidateSet('Auto','Off','On')][string]$DevControlMode = 'Auto',
-    [ValidateSet('inline-restore-roi','control-mask','control-mask-safety','control-mask-safety-hardware','control-mask-capture','control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','control-mask-native-ngx-fg','gpu-pass-diagnostics','native-required-menu','native-owner-idle','native-options-resume','native-options-delayed','native-guide-contract','present-guide-models','xefg-ordinary-receipt-first-signal','adaptive-fg-service','adaptive-inline','adaptive-resource-strategy','adaptive-resource-strategy-native','adaptive-status','output-framerate-registration','output-framerate-sdk','vulkan-recorded-use-contract','native-present-decision','trace-metadata','stage-chain','stage-resolution','stage-resolution-hardware','same-stage-resolution','same-stage-resolution-hardware','render-stage-resolution','render-stage-resolution-hardware','present-stage-resolution','present-stage-resolution-hardware','native-prefg-resolution','native-prefg-resolution-hardware','native-frame-identity','same-stage-model-pair','same-stage-mixed-pair','source-lifecycle','feature-switch','feature-switch-hardware','f5-mixed','present-chain','present-chain-hardware','present-chain-scrgb','present-chain-hdr10','native-full','native-full-hardware','nr-edit-reuse-contracts','nr-edit-reuse-contracts-public','nr-edit-reuse-render-contracts','nr-edit-reuse-present-contracts','nr-edit-reuse-present-diagnostic','nr-edit-reuse-present-native','nr-edit-reuse-xefg-contracts','nr-edit-reuse-native-contracts','native-frame-source','nr-fg-output-marker','fg-consumer-capture','xefg-present-probe')]
+    [ValidateSet('inline-restore-roi','control-mask','control-mask-safety','control-mask-safety-hardware','control-mask-capture','control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','control-mask-native-ngx-fg','bridge-xefg-private-provider','gpu-pass-diagnostics','native-required-menu','native-owner-idle','native-options-resume','native-options-delayed','native-guide-contract','present-guide-models','xefg-ordinary-receipt-first-signal','adaptive-fg-service','adaptive-inline','adaptive-resource-strategy','adaptive-resource-strategy-native','adaptive-status','output-framerate-registration','output-framerate-sdk','vulkan-recorded-use-contract','native-present-decision','native-mfg-ordering','trace-metadata','stage-chain','stage-resolution','stage-resolution-hardware','same-stage-resolution','same-stage-resolution-hardware','render-stage-resolution','render-stage-resolution-hardware','present-stage-resolution','present-stage-resolution-hardware','native-prefg-resolution','native-prefg-resolution-hardware','native-frame-identity','same-stage-model-pair','same-stage-mixed-pair','source-lifecycle','feature-switch','feature-switch-hardware','f5-mixed','present-chain','present-chain-hardware','present-chain-scrgb','present-chain-hdr10','native-full','native-full-hardware','nr-edit-reuse-contracts','nr-edit-reuse-contracts-public','nr-edit-reuse-render-contracts','nr-edit-reuse-present-contracts','nr-edit-reuse-present-diagnostic','nr-edit-reuse-present-native','nr-edit-reuse-xefg-contracts','nr-edit-reuse-native-contracts','native-frame-source','nr-fg-output-marker','fg-consumer-capture','xefg-present-probe')]
     [string[]]$NativeCase = @(),
     [switch]$VulkanNativeNgx,
     [string]$NativeNgxProjectIdPath,
     [string]$NativeNgxSdkLibraryDirectory,
     [string]$NativeNgxRuntimePath = $(if ($env:NR_NEXUS_NGX_RUNTIME_DIR) { Join-Path $env:NR_NEXUS_NGX_RUNTIME_DIR 'nvngx_dlssnr.dll' }),
     [string]$NativeNgxSrRuntimePath,
-    [ValidateSet('dlaa','sr','stage-resolution','same-stage-resolution','render-stage-resolution','present-stage-resolution','ordinary-watchdog','edit-reuse-production','adaptive','adaptive-hardware','adaptive-native-ngx','adaptive-native-snippet')][string[]]$BridgeCase = @(),
+    [ValidateSet('dlaa','sr','stage-resolution','same-stage-resolution','render-stage-resolution','present-stage-resolution','ordinary-watchdog','ordinary-present-watchdog','ordinary-present-prequeue','edit-reuse-production','adaptive','adaptive-hardware','adaptive-native-ngx','adaptive-native-snippet')][string[]]$BridgeCase = @(),
     [switch]$BuildOnly,
     [ValidateSet('Standard','Full','Acceptance')][string]$RetentionMode = $(if ($env:NR_NEXUS_TEST_RETENTION) { $env:NR_NEXUS_TEST_RETENTION } else { 'Standard' }),
     [switch]$SoftwareOnly
@@ -97,7 +97,7 @@ if ($SoftwareOnly -and @($BridgeCase | Where-Object { $_ -in @('adaptive-hardwar
     throw 'Explicit Bridge hardware cases conflict with -SoftwareOnly; no hardware or WARP fallback is permitted.'
 }
 $nativeNgxCases = @('control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb',
-    'control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','control-mask-native-ngx-fg',
+    'control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','control-mask-native-ngx-fg','bridge-xefg-private-provider',
     'nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','nr-edit-reuse-present-native',
     'adaptive-resource-strategy-native')
 $usesNativeNgx = $bridgeNativeNgx -or $VulkanNativeNgx -or (@($NativeCase | Where-Object { $_ -in $nativeNgxCases }).Count -gt 0)
@@ -242,6 +242,25 @@ foreach ($item in $Suite) {
     if ($explicitMode) { $executableHash = (Get-FileHash -LiteralPath $exe).Hash }
     $dependencyFile = Join-Path $directory 'dependencies.json'
     $inputPaths = @((Join-Path $testRoot "$name.cpp"), $PSCommandPath)
+    $providerFixture = $null
+    if ($item -eq 'bridge-motion' -and $BridgeCase -contains 'ordinary-present-prequeue') {
+        # Separate real loader identity for the two mocked model Providers.
+        # Its name is intentionally not a vendor runtime discovery name.
+        $fixtureSource = Join-Path $testRoot 'native_runtime_fixture.cpp'
+        $providerFixture = Join-Path $directory 'nexus-test-runtime-image.dll'
+        $fixtureObject = Join-Path $directory 'nexus-test-runtime-image.obj'
+        $fixtureDependencies = Join-Path $directory 'nexus-test-runtime-image.dependencies.json'
+        Register-TestCompilerOutput $directory -ObjectPath $fixtureObject -ExecutablePath $providerFixture
+        Register-TestDisposable -Directory $directory -Path $providerFixture -Kind 'synthetic-runtime-image'
+        $fixtureArguments = $common + @('/LD', $fixtureSource, "/Fo$fixtureObject", "/Fe$providerFixture",
+            '/sourceDependencies', $fixtureDependencies, '/link', '/INCREMENTAL:NO',
+            'd3d12.lib', 'dxgi.lib', 'dxguid.lib', 'uuid.lib')
+        & $compiler @fixtureArguments *> (Join-Path $directory 'nexus-test-runtime-image.compile.log')
+        if ($LASTEXITCODE -ne 0) { throw "Compile/link failed: $providerFixture" }
+        $providerFixtureHash = (Get-FileHash -LiteralPath $providerFixture).Hash
+        $inputPaths += $fixtureSource
+        $inputPaths += @((Get-Content -LiteralPath $fixtureDependencies -Raw | ConvertFrom-Json).Data.Includes)
+    }
     if ($explicitMode) {
         $inputPaths += @((Join-Path $repositoryRoot 'host/lock.json'), (Join-Path $repositoryRoot 'host/tools.lock.json'),
             (Join-Path $PSScriptRoot 'check-release-experiment-parity.ps1'), (Join-Path $testRoot 'test-support.ps1'))
@@ -482,6 +501,12 @@ foreach ($item in $Suite) {
         }
     }
     if ($item -in $dependencyCheckedSuites) { $result.dependency_policy = 'passed' }
+    if ($providerFixture) {
+        if ((Get-FileHash -LiteralPath $providerFixture).Hash -cne $providerFixtureHash) {
+            throw "Test fixture DLL changed: $providerFixture"
+        }
+        $result['providerFixture'] = @{ name = [IO.Path]::GetFileName($providerFixture); sha256 = $providerFixtureHash }
+    }
     if ($skipVulkanRun) { $result.skip_reason = 'software_only_native_gpu_required' }
     $result | ConvertTo-Json -Depth 9 | Set-Content -LiteralPath "$directory/result.json" -Encoding utf8
     if (-not $BuildOnly) { Complete-TestOutput $directory }

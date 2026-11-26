@@ -94,6 +94,26 @@
             "mfg-recovery": "^repeated=redelivered missing-role/changed-guide/foreign-list=original sdk-reject=ngx-detour\\+rgba-rollback recovery=reset\\+refresh$",
             "adaptive-worksets": "^active-upper=1/0 lower-per-frame=edited-rgba repeated=identical zero-advance=1 missing-version/alpha-retag/guide-overwrite=original tokenless=two-deliveries evidence=WARP\\+MOCK$",
             "rejected-redelivery": "^sdk-reject=ngx-detour sdk-input=edited-rgba backbuffer=exact-rgba bindings=restored cache-history-base=unchanged retry=redelivered$"
+          } },
+        { "suite": "fg-native", "name": "native-mfg-ordering", "log": "native-mfg-ordering", "receipt": "^PASS case=native-mfg-ordering evidence=WARP\\+MOCK dev={dev}$",
+          "scenarios": ["legacy-mfg-ordering"],
+          "expect": {
+            "legacy-mfg-ordering": "^unsubmitted-consumer-first=raw-rgba,zero-evaluate open-replayable=original-binding same-recording=edited-rgba,zero-evaluate retired-producer=edited-rgba,zero-evaluate first-signal-loss-after-replay=raw-rgba,zero-evaluate next-base=edited$"
+          } },
+        { "suite": "fg-native", "name": "native-options-delayed", "log": "native-options-delayed", "receipt": "^PASS case=native-options-delayed evidence=WARP\\+MOCK dev={dev}$",
+          "scenarios": ["legacy-sdk-delivery"],
+          "expect": {
+            "legacy-sdk-delivery": "^rejected-redelivery=edited-bb,hudless-restored,retry-edited,zero-evaluate failed-binding-restore=sdk-success,cache-invalidated,zero-publish,recovery-reset retained-parameters=same-block,private-rgba,restored-by-wrapper late-reset=preserved-new-bb,other-display-unchanged,no-premature-submit no-game=raw-bb,original-hudless,zero-evaluate unknown-mfg=raw-bb,original-hudless,zero-evaluate$"
+          } },
+        { "suite": "fg-native", "name": "native-present-decision", "log": "native-present-decision", "receipt": "^PASS case=native-present-decision evidence=WARP\\+MOCK dev={dev}$",
+          "scenarios": ["native-output-isolation"],
+          "expect": {
+            "native-output-isolation": "^off=other-options-unchanged release=other-owner-and-tag-preserved unknown-viewport=established-options-preserved options-only-off=c-and-cpp-forwarded retire=other-owner-and-tag-preserved handled-and-failed=terminal,no-forward$"
+          } },
+        { "suite": "fg-native", "name": "nr-edit-reuse-present-contracts", "log": "nr-edit-reuse-present-contracts", "receipt": "^PASS case=nr-edit-reuse-present-contracts evidence=WARP\\+MOCK dev={dev}$",
+          "scenarios": ["native-ordinary-handoff"],
+          "expect": {
+            "native-ordinary-handoff": "^ordinary-to-native=zero-evaluate,no-native-workset native-to-ordinary-pending=zero-evaluate,zero-present-submit native-to-ordinary-submitted=zero-evaluate,zero-present-submit native-rgba=rgb-edited,alpha-preserved independent-output=sr-to-bb,rgb-edited,alpha-preserved,scoped-fallback game-frames-sdk-first=1/0/1/0 game-frames-outer-first=1/0/1/0 game-frames-rgba=rgb-edited,alpha-preserved$"
           } }
       ]
     },
@@ -234,11 +254,26 @@
         ["present_path.hpp", "fg::xefg::WithOrdinaryPresentCommit("],
         ["present_path.hpp", "submission::OutputWriteOrdered("],
         ["fg_xefg.hpp", "inline OrdinaryPresentAccess QueryOrdinaryPresent("],
+        ["fg_xefg.hpp", "inline OrdinaryPresentRecordResult TryRecordOrdinaryPresentDelivery("],
+        ["d3d11_bridge.hpp", "fg::xefg::TryRecordOrdinaryPresentDelivery("],
         ["submission_tracker.hpp", "inline RecordedWork ProviderTeardownWorkState("],
         ["dlssnr.hpp", ", nullptr, NVSDK_NGX_SUCCEED(result));"],
         ["dlssnr.hpp", "evaluate_chain.Injected(GetD3D12Resource(parameters, NVSDK_NGX_Parameter_Output))"]
       ],
       "cases": [
+        { "suite": "bridge-motion", "name": "ordinary-present-prequeue", "log": "warp-ordinary-present-prequeue",
+          "receipt": "^PASS case=ordinary-present-prequeue evidence=WARP\\+MOCK dev={dev} two_actual_first_readers=1 adjacent_pending=1 real_ngx=NOT_TESTED$",
+          "existingTrace": true,
+          "scenarios": ["held-two-frames", "actual-first-readers", "late-owner-rejected", "wait-failed", "cold-provider-ready", "same-provider", "cold-provider-timeout"],
+          "expect": {
+            "held-two-frames": "^BRIDGE_ORDINARY_PREQUEUE_HELD first=[0-9]+ second=[0-9]+ out=[0-9]+ done=[0-9]+ consumers_done=[0-9]+ (?<trace>passes=2,2 copies=1,1 cpu_waits=0 distinct_slots=1)$",
+            "actual-first-readers": "^BRIDGE_ORDINARY_PREQUEUE_READERS frames=2 passes=2,2 gpu_pass_signatures=4 first_current=1 second_current=1 old_frame=0 originals=0$",
+            "late-owner-rejected": "^BRIDGE_ORDINARY_PREQUEUE_REJECT kind=owner_epoch wait_calls=0 rejected_copies=0 committed=0 original_reader=1 first_reset=1,1 next_reset=0,0 recovered_copies=1,1$",
+            "wait-failed": "^BRIDGE_ORDINARY_PREQUEUE_REJECT kind=wait_failure wait_calls=1 rejected_copies=0 committed=0 original_reader=1 first_reset=1,1 next_reset=0,0 recovered_copies=1,1$",
+            "cold-provider-ready": "^BRIDGE_XEFG_PREQUEUE_HANDOFF phase=cold_ready waits=1 initialized=1 real_done=1 same_call=1$",
+            "same-provider": "^BRIDGE_XEFG_PREQUEUE_HANDOFF phase=same_provider waits=0 old_pending=1 sdk_submitted=1 first_pixels=1 passes=2,2$",
+            "cold-provider-timeout": "^BRIDGE_XEFG_PREQUEUE_HANDOFF phase=cold_timeout waits=1,1,1 old_lifetime=retained retry_tail=advanced initialized=1$"
+          } },
         { "suite": "fg-native", "name": "present-guide-models", "log": "present-guide-models",
           "receipt": "^PASS XeFG Present handoff providers=ordinary-image\\+Core real_guides\\+Optional-no-ID passes=2 Service_owned_pending\\+external_replayable public_disable_restore evidence=WARP\\+MOCK real_NGX=NOT_RUN$",
           "existingTrace": true,
@@ -287,6 +322,7 @@
     "inline_restore_roi": "Instrumentation readback.",
     "fg_consumer_capture": "FG consumer capture.",
     "present_handoff_capture": "Bounded original and final BB ROI readback for an owned protected run.",
+    "fg_execution_observation": "Bounded SR, submission and FG SDK CPU observations.",
     "native_ui_alpha_preflight": "UI alpha observation."
   },
   "testCommands": {
@@ -335,6 +371,7 @@
     "dlssnr.hpp edit_fg_observation::ObserveRecording": "diagnostic",
     "dlssnr.hpp edit_fg_observation::ObserveResource": "diagnostic",
     "dlssnr.hpp edit_fg_observation::ObserveSourceFrame": "diagnostic",
+    "dlssnr.hpp edit_fg_observation::ObserveSourceSuccess": "diagnostic",
     "dlssnr.hpp InstallCommandListStateHooks": "diagnostic",
     "dlssnr.hpp InstallMixedPresentCopyHooks": "diagnostic",
     "dlssnr.hpp InstallNativePremiseBarrierHooks": "diagnostic",

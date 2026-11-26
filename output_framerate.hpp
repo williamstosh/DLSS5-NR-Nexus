@@ -399,6 +399,14 @@ inline void ResetNativeBinding(Output* output) {
   output->native = {.generation = ++state.generation};
 }
 
+inline void BindNativeFeature(Output* output, uintptr_t feature) {
+  if (feature == 0 || output->native.feature == feature) return;
+  auto& native = output->native;
+  output->stream.Reset();
+  native = {.viewport = native.viewport, .generation = ++state.generation, .feature = feature,
+      .tagged_source = native.tagged_source, .tagged_source_frame = native.tagged_source_frame};
+}
+
 inline Snapshot ReadOutput(const Output& output, int64_t now_ns) {
   auto snapshot = output.stream.Read(now_ns);
   snapshot.output = output.identity;
@@ -900,11 +908,8 @@ inline void BindNativeFeatureOutput(const OutputIdentity& identity, uintptr_t fe
   if (feature == 0) return;
   std::unique_lock lock(internal::state.mutex);
   auto* output = internal::FindOutput(identity);
-  if (output == nullptr || identity.view != 0 || output->native.feature == feature) return;
-  auto& native = output->native;
-  output->stream.Reset();
-  native = {.viewport = native.viewport, .generation = ++internal::state.generation, .feature = feature,
-      .tagged_source = native.tagged_source, .tagged_source_frame = native.tagged_source_frame};
+  if (output == nullptr || identity.view != 0) return;
+  internal::BindNativeFeature(output, feature);
 }
 
 inline void ReleaseNativeFeature(uintptr_t feature) {
@@ -935,20 +940,38 @@ inline void ObserveNativeOptions(uint32_t viewport, uint64_t version, uint32_t m
   if (mode == 0 && native.routed) {
     output->stream.Reset();
     native = {.viewport = viewport, .generation = ++internal::state.generation};
+  } else if (mode == 0) {
+    native.generation = ++internal::state.generation;
   } else if (output->stream.snapshot.source == Source::NATIVE_FIXED) {
     output->stream.Reset(Reason::kUNKNOWN_FG);
   }
 }
 
+inline std::optional<uint64_t> BeginNativeEvaluation(const OutputIdentity& identity, uintptr_t feature,
+                                                    bool observes_present_decisions) {
+  if (!identity) return std::nullopt;
+  std::unique_lock lock(internal::state.mutex);
+  auto* output = internal::FindOutput(identity);
+  if (output == nullptr || identity.view != 0) return std::nullopt;
+  const auto* options = internal::Options(output->native);
+  if (!observes_present_decisions && options != nullptr && options->mode == 0) return std::nullopt;
+  internal::BindNativeFeature(output, feature);
+  return output->native.generation;
+}
+
 inline void ObserveNativeEvaluation(const OutputIdentity& identity, uint32_t multiplier, bool success, int64_t now_ns,
-                                    uintptr_t feature = 0) {
+                                    uintptr_t feature = 0, std::optional<uint64_t> binding_generation = std::nullopt) {
   if (!identity) return;
-  BindNativeFeatureOutput(identity, feature);
   std::unique_lock lock(internal::state.mutex);
   auto* output = internal::FindOutput(identity);
   if (output == nullptr || identity.view != 0) return;
   auto& native = output->native;
   const auto* options = internal::Options(native);
+  if (binding_generation.has_value()) {
+    if (native.generation != *binding_generation || native.feature != feature) return;
+  } else {
+    internal::BindNativeFeature(output, feature);
+  }
   if (!success || now_ns < native.evaluation_ns) {
     native.evaluation_ns = native.fixed_since_ns = native.state_ns = 0;
     native.declared_multiplier = 0;

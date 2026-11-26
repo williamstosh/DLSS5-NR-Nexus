@@ -5,10 +5,19 @@ $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile(
     (Join-Path $PSScriptRoot '../tools/run-fg-acceptance.ps1'), [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw $parseErrors[0] }
-foreach ($name in @('Set-FgPresentSection','Set-StreamlineFallback','Set-XeFgUiComposition','Get-ControlMaskSettings','Get-NrEditReuseSettings','Set-WitcherUnlimitedFps','Set-ModelDiagnosticSection','Set-OptiFgDisabled','Copy-ControlMaskGpuEvidence')) {
+foreach ($name in @('Set-FgPresentSection','Set-StreamlineFallback','Set-XeFgUiComposition','Set-XeFgExtensionLogging','Get-ControlMaskSettings','Get-NrEditReuseSettings','Set-WitcherUnlimitedFps','Set-ModelDiagnosticSection','Set-OptiFgDisabled','Copy-ControlMaskGpuEvidence')) {
     $definition = $ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}, $true)
     if ($null -eq $definition) { throw "Missing production transform: $name" }
     . ([scriptblock]::Create($definition.Extent.Text))
+}
+$extensionFixture = "[XeFG]`r`nUnlockMFG=true`r`nExtraPacing=true`r`nDisableLogging=true`r`n"
+if ((Set-XeFgExtensionLogging $extensionFixture) -cne $extensionFixture.Replace('DisableLogging=true','DisableLogging=false')) {
+    throw 'Extension logging changed unrelated pacing or config bytes'
+}
+foreach ($invalidExtension in @($extensionFixture.Replace('DisableLogging=true', ''), ($extensionFixture + "DisableLogging=false`r`n"))) {
+    $rejected = $false
+    try { Set-XeFgExtensionLogging $invalidExtension | Out-Null } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Extension logging accepted a missing or ambiguous setting' }
 }
 $fpsFixture = "[Rendering]`r`nVSync=false`r`nHdrEnabled=true`r`nDLSSGMode=1`r`n[Engine]`r`nLimitFPS=120`r`n[StartupFlow]`r`nLaunchCounter=8`r`n"
 if ((Set-WitcherUnlimitedFps $fpsFixture) -cne $fpsFixture.Replace('LimitFPS=120', 'LimitFPS=0')) {
@@ -44,6 +53,62 @@ foreach ($invalidSession in @(@(), @('-RestoreInstallation','-InstallOnly'))) {
     }
 }
 $global:LASTEXITCODE = 0
+$acceptanceEntry = Join-Path $PSScriptRoot '../tools/run-fg-acceptance.ps1'
+$scriptedXeFg = @{
+    CandidateManifest='unused-synthetic-candidate'; GameBinaryDirectory='unused-synthetic-game'; Save='synthetic.sav'
+    Python=(Join-Path $PSScriptRoot ('missing-' + [guid]::NewGuid().ToString('N') + '.exe'))
+    XeFgGpuCapture=$true; RestoreInstallation=$true; StartNrDisabled=$true; GpuTimers=$true
+    BlockOptionalHudless=$true; XeFGUiComposition=0; NrPreset=1; NrPasses=1; NrHookPoint=0
+    CaptureScript=(Join-Path $PSScriptRoot '../tools/game-test/static_capture.py')
+    ControlMaskGpuSamples=1024; ControlMaskGpuSeconds=90; ControlMaskGpuWarmupSeconds=1
+}
+# A missing explicit interpreter stops accepted fixtures before deployment.
+foreach ($probe in @(
+    @{Overrides=@{}; Expected='Python interpreter is missing'},
+    @{Overrides=@{NrHookPoint=2}; Expected='Python interpreter is missing'},
+    @{Overrides=@{NrHookPoint=2; NrPreset=2; NrEditReuse=0; CaptureScript=''}; Expected='Python interpreter is missing'},
+    @{Overrides=@{NrHookPoint=2; NrPreset=2; NrEditReuse=1; CaptureScript=''}; Expected='Python interpreter is missing'},
+    @{Overrides=@{RestoreInstallation=$false}; Expected='Scripted XeFgGpuCapture requires'},
+    @{Overrides=@{InstallOnly=$true}; Expected='Scripted XeFgGpuCapture requires'},
+    @{Overrides=@{CaptureScript=''}; Expected='Scripted XeFgGpuCapture requires'},
+    @{Overrides=@{CaptureHoldSeconds=0}; Expected='CaptureScript requires an automatic capture hold'},
+    @{Overrides=@{NrPreset=2}; Expected='Scripted XeFgGpuCapture requires'},
+    @{Overrides=@{NrPasses=2}; Expected='Scripted XeFgGpuCapture requires'},
+    @{Overrides=@{NrHookPoint=1}; Expected='Scripted XeFgGpuCapture requires'},
+    @{Overrides=@{XeFGUiComposition=1}; Expected='Scripted XeFgGpuCapture requires'},
+    @{Overrides=@{BlockOptionalHudless=$false}; Expected='Scripted XeFgGpuCapture requires'},
+    @{Overrides=@{SrOnly=$true}; Expected='Scripted XeFgGpuCapture requires'},
+    @{Overrides=@{SdrGameOutput=$true}; Expected='Scripted XeFgGpuCapture requires'},
+    @{Overrides=@{ControlMaskCase='DepthFar'}; Expected='Scripted XeFgGpuCapture requires'},
+    @{Overrides=@{StartNrDisabled=$false}; Expected='XeFgGpuCapture requires StartNrDisabled'},
+    @{Overrides=@{GpuTimers=$false}; Expected='XeFgGpuCapture requires StartNrDisabled'},
+    @{Overrides=@{ControlMaskGpuSamples=0}; Expected='XeFgGpuCapture requires StartNrDisabled'},
+    @{Overrides=@{ControlMaskGpuSeconds=1}; Expected='warmup must be shorter'})) {
+    $session = $scriptedXeFg.Clone()
+    foreach ($key in $probe.Overrides.Keys) { $session[$key] = $probe.Overrides[$key] }
+    $message = ''
+    try { & $acceptanceEntry @session | Out-Null } catch { $message = $_.Exception.Message }
+    if (-not $message.Contains($probe.Expected)) {
+        throw "Unexpected XeFG capture preflight for $($probe.Overrides | ConvertTo-Json -Compress): $message"
+    }
+}
+$gpuSettings = $ast.Find({param($node)
+    $node -is [Management.Automation.Language.IfStatementAst] -and
+    $node.Extent.Text.StartsWith('if ($ControlMaskCase -or $XeFgGpuCapture)')
+}, $true)
+if ($null -eq $gpuSettings) { throw 'Missing production GPU capture settings' }
+$captureKeys = [scriptblock]::Create(@'
+$XeFgGpuCapture = $true
+$ControlMaskCase = ''
+$ControlMaskGpuSamples = 1024
+$ControlMaskGpuSeconds = 90
+$ControlMaskGpuWarmupSeconds = 1
+$taskModelSettings = @{}
+'@ + "`n" + $gpuSettings.Extent.Text + "`n" + '$taskModelSettings')
+$settings = & $captureKeys
+if ($settings.Count -ne 4 -or $settings.NRXeFgGpuCapture -ne 1 -or
+    $settings.NRControlMaskGpuCaptureSamples -ne 1024 -or $settings.NRControlMaskGpuCaptureSeconds -ne 90 -or
+    $settings.NRControlMaskGpuCaptureWarmupSeconds -ne 1) { throw 'Scripted XeFG capture must write exactly the four diagnostic keys' }
 $diagnosticFixture = "[RenoDX.DLSS5]`nNRToggleKey=117`nNRScreenshotKey=116`nNRScreenshotSource=0`nNRDebugCapturePlanes=0`nNRIntensity=0.75`n"
 $diagnosticExpected = $diagnosticFixture.Replace('NRScreenshotKey=116','NRScreenshotKey=121').Replace('NRScreenshotSource=0','NRScreenshotSource=2').Replace('NRDebugCapturePlanes=0','NRDebugCapturePlanes=1')
 if ((Set-ModelDiagnosticSection $diagnosticFixture) -cne $diagnosticExpected) {

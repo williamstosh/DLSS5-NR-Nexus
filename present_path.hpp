@@ -552,6 +552,42 @@ struct PresentStream {
   uint64_t nr_presents = 0;
   uint64_t native_route_id = 0;
   const void* native_output_identity = nullptr;
+  const NVSDK_NGX_Handle* native_fg_handle = nullptr;
+  uint64_t native_options_revision = 0;
+  std::optional<bool> native_options_enabled;
+  fg::xefg::OrdinaryPresentReceipt ordinary_color;
+  uint64_t ordinary_color_guide_serial = 0;
+  submission::QueueOrderProof ordinary_color_order;
+  struct NativeColour {
+    struct Write {
+      std::shared_ptr<submission::RecordingStatus> recording;
+      submission::QueueOrderProof retired_order;
+      uint64_t serial = 0;
+      bool comparable = false;
+      bool rollback_recorded = false;
+      std::shared_ptr<submission::RecordingStatus> replacement;
+      uint64_t replacement_serial = 0;
+    };
+    output_framerate::OutputIdentity output;
+    const void* backbuffer = nullptr;
+    uint64_t guide_serial = 0;
+    std::pair<uint64_t, uint64_t> recording;
+    const void* marker = nullptr;
+    uint64_t serial = 0;
+    bool accepted = false;
+    FenceRef retired_fence;
+    uint64_t retired_value = 0;
+    std::shared_ptr<submission::RecordingStatus> recording_status;
+    bool rollback_recorded = false;
+    std::vector<Write> writes;
+  } native_color;
+  struct ColourOverwrite {
+    uint64_t guide_serial = 0;
+    const void* backbuffer = nullptr;
+    std::shared_ptr<submission::RecordingStatus> recording;
+    submission::QueueOrderProof retired_order;
+  };
+  std::vector<ColourOverwrite> colour_overwrites;
 };
 
 struct PresentRetired {
@@ -629,6 +665,9 @@ inline void EndOrdinaryPresentAttempt(fg::xefg::OrdinaryPresentAttempt attempt, 
     if (status != S_OK && found->second.receipt.executed) {
       if (const auto stream = present_streams.find(reinterpret_cast<const void*>(attempt.owner)); stream != present_streams.end()) {
         ResetPresentStreamHistory(&stream->second, kResetRecovery);
+        if (stream->second.ordinary_color.attempt == attempt) {
+          stream->second.ordinary_color.group_complete = false;
+        }
       }
     }
     ordinary_present_attempts.erase(found);
@@ -698,13 +737,38 @@ inline void RefreshOrdinaryPresentCompletionLocked() {
   }
 }
 
-// Existing successful SR and proven SR-to-BB copy observations call here.
-// Recording a new producer invalidates coverage, but does not prove that
-// the recorded replacement has executed or authorize another color write.
-inline void ObserveOrdinaryPresentProducerLocked(const void* output) {
+// Recording order cannot prove which BB write executes last. Retain each
+// generation so its actual queue receipt can order it against the owned color.
+inline void ObserveOrdinaryPresentProducerLocked(const void* output, ID3D12GraphicsCommandList* list) {
   for (auto& [_, state] : ordinary_present_attempts) {
     if (state.receipt.executed && state.backbuffer == reinterpret_cast<uintptr_t>(output)) {
       state.producer_conflict = true;
+    }
+  }
+  for (auto& [_, stream] : present_streams) {
+    const uint64_t ordinary_version = (stream.ordinary_color.backbuffer == reinterpret_cast<uintptr_t>(output)
+        ? stream.ordinary_color_guide_serial : 0);
+    const bool native_write = stream.native_color.backbuffer == output && !stream.native_color.writes.empty();
+    const uint64_t native_version = (native_write ? stream.native_color.guide_serial : 0);
+    std::erase_if(stream.colour_overwrites, [&](const auto& write) {
+      return (!(write.guide_serial == stream.ordinary_color_guide_serial
+                    && write.backbuffer == reinterpret_cast<const void*>(stream.ordinary_color.backbuffer))
+                 && !(write.guide_serial == stream.native_color.guide_serial && write.backbuffer == stream.native_color.backbuffer))
+          || (write.recording->closed.load() && !write.recording->submitted.load());
+    });
+    std::shared_ptr<submission::RecordingStatus> recording;
+    for (const auto [version, owned] : {std::pair{ordinary_version, ordinary_version != 0}, std::pair{native_version, native_write}}) {
+      if (!owned) continue;
+      if (recording == nullptr) {
+        recording = submission::ObserveRecording(list);
+      }
+      if (std::ranges::none_of(stream.colour_overwrites, [&](const auto& write) {
+            return write.guide_serial == version && write.backbuffer == output && write.recording == recording;
+          })) {
+        stream.colour_overwrites.push_back({.guide_serial = version, .backbuffer = output, .recording = recording});
+        submission::TrackUse(list, output, submission::UseKind::kOutputColor, {.resource = output, .subresource = 0});
+        submission::TrackUse(list, recording.get());
+      }
     }
   }
 }
@@ -972,6 +1036,9 @@ inline void InvalidatePresentBaseFrames(PresentStream* stream, bool preserve_obs
   ResetPresentStreamHistory(stream, kResetSourceChange);
 }
 
+// Native storage follows the ordinary owner; retiring either route needs this callback.
+inline void OnNativePresentStreamRetired(PresentStream* owner);
+
 // Caller holds runtime_mutex.
 inline void RetirePresentStream(const void* swapchain, bool keep_source_observation = false) {
   InvalidateOrdinaryPresentAttemptsLocked(reinterpret_cast<uintptr_t>(swapchain));
@@ -1161,6 +1228,37 @@ inline bool ReleasePresentPath() {
   return true;
 }
 
+inline output_framerate::OutputIdentity ResolvePresentSourceOutput(
+    const NVSDK_NGX_Handle* handle, ID3D12Resource* resource) {
+  if (resource == nullptr) return {};
+  const auto identity = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(resource));
+  if (const auto output = output_framerate::FindPresentOutput(0, identity)) return output;
+  const auto source = features.find(handle);
+  if (source == features.end()) return {};
+  return output_framerate::FindSourceOutput({.handle = reinterpret_cast<uintptr_t>(handle),
+      .generation = source->second.source_generation,
+      .device = reinterpret_cast<uintptr_t>(source->second.source_device12_identity.Get()),
+      .resource = identity, .resource_generation = AdaptiveResourceGeneration(resource)});
+}
+
+inline bool NativeOwnsPresentOutput(const output_framerate::OutputIdentity& output,
+                                    const NVSDK_NGX_Handle* scoped_handle) {
+  if (scoped_handle != nullptr) return true;
+  return output && native_fg_owns.load(std::memory_order_acquire)
+      && output == output_framerate::NativeFeatureOutput(native_fg_owner_identity.load(std::memory_order_acquire));
+}
+
+inline bool NativeOwnsExecutionOutput(const output_framerate::OutputIdentity& output) {
+  if (!output) {
+    return native_fg_owns.load(std::memory_order_acquire)
+        || std::ranges::any_of(present_streams, [](const auto& entry) { return entry.second.native_fg_handle != nullptr; });
+  }
+  const auto stream = present_streams.find(reinterpret_cast<const void*>(output.swapchain));
+  const auto* scoped_handle = (stream != present_streams.end() && stream->second.output == output
+      ? stream->second.native_fg_handle : nullptr);
+  return NativeOwnsPresentOutput(output, scoped_handle);
+}
+
 // Called by every evaluate hook, under runtime_mutex, after the game's real
 // evaluate.  False at another hook point, in a session the path does not
 // serve (PresentHookServes: a Direct3D 11 session off the native route, where
@@ -1176,13 +1274,10 @@ inline bool ReleasePresentPath() {
 // that: measured, the first Required frame-generation run fell back on its
 // very first evaluate and built an Upscaled NR feature and workset (1.5 s of
 // CPU) for four frames the present path then served anyway.
-inline bool PresentTakesEvaluate() {
+inline bool PresentTakesEvaluate(const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* parameters) {
   // Auto-FG serves a stream with no DLSS evaluates. A real DLSS evaluate
   // (including an independent view) keeps its selected inline insertion.
   if (!PresentHookServes(false)) return false;
-  // Native FG consumes NR before interpolation, independently of ReShade's
-  // final-Present cadence. A focus loss must not also enhance its SR input.
-  if (native_fg_owns.load(std::memory_order_acquire)) return true;
   if (screenshot::WantsFinalPresent()) {
     // F5 temporarily reserves this unenhanced game frame for a final-display
     // comparison. Inline fallback must not enhance it first.
@@ -1197,6 +1292,10 @@ inline bool PresentTakesEvaluate() {
     present_fallback_episode = false;
     return true;
   }
+  // Only the SR source feeding the Native owner inherits its pre-FG fallback
+  // protection. An unresolved source still cannot rule out a second write.
+  const auto output = ResolvePresentSourceOutput(handle, GetD3D12Resource(parameters, NVSDK_NGX_Parameter_Output));
+  if (NativeOwnsExecutionOutput(output)) return true;
   (starved ? present_starved_fallbacks : unusable ? present_format_fallbacks : present_prefg_upscaled)
       .fetch_add(1, std::memory_order_relaxed);
   present_inline_fallback_pending = true;
@@ -1411,7 +1510,9 @@ inline void CapturePresentGuides(
   ID3D12Resource* const output = GetD3D12Resource(parameters, NVSDK_NGX_Parameter_Output);
   if (successful_dlss_sr && output != nullptr) {
     const auto resource = renodx::utils::directx::NativeIdentity(output);
-    if (!SuppressCommandStateObservation()) ObserveOrdinaryPresentProducerLocked(resource);
+    if (!SuppressCommandStateObservation()) {
+      ObserveOrdinaryPresentProducerLocked(resource, command_list);
+    }
     if (output_framerate::FindPresentOutput(0, reinterpret_cast<uintptr_t>(resource))) {
       submission::SetRecordingOwner(command_list, submission::RecordingOwner::kBorrowedGame, true);
       const auto source = features.find(handle);
@@ -1441,19 +1542,7 @@ inline void CapturePresentGuides(
     }
   }
   if (!mixed_predecessor) CountNrDecline(NrDeclineReason::kPresentHook);
-  output_framerate::OutputIdentity capture_output;
-  if (output != nullptr) {
-    const auto resource = renodx::utils::directx::NativeIdentity(output);
-    capture_output = output_framerate::FindPresentOutput(0, reinterpret_cast<uintptr_t>(resource));
-    if (!capture_output) {
-      if (const auto source = features.find(handle); source != features.end()) {
-        capture_output = output_framerate::FindSourceOutput({.handle = reinterpret_cast<uintptr_t>(handle),
-            .generation = source->second.source_generation,
-            .device = reinterpret_cast<uintptr_t>(source->second.source_device12_identity.Get()),
-            .resource = reinterpret_cast<uintptr_t>(resource), .resource_generation = AdaptiveResourceGeneration(output)});
-      }
-    }
-  }
+  const auto capture_output = ResolvePresentSourceOutput(handle, output);
   // SDK tags supply this output's guides while it is owned by XeFG. Copies
   // for an independent output have their own lifetime and remain useful.
   if (!mixed_predecessor && capture_output && !fg::xefg::QueryOrdinaryPresent(0,
@@ -2407,6 +2496,7 @@ struct NativePresentInput {
   const void* marker = nullptr;
   uint64_t serial = 0;
   bool guides_unavailable = false;
+  fg::native_options::PresentPhase phase = fg::native_options::PresentPhase::SDK_FORWARD;
 };
 inline uint64_t native_route_serial = 0;  // runtime_mutex
 inline thread_local NativeDeferredPresent native_deferred_present;
@@ -2425,13 +2515,14 @@ inline bool TakeNativePassthrough(const void* identity, const void* base_identit
   if (input != nullptr) {
     *input = native_passthrough_input;
   }
+  const bool forwarded = native_passthrough_input.phase == fg::native_options::PresentPhase::SDK_FORWARD;
   native_passthrough_identity = nullptr;
   native_passthrough_input = {};
-  return true;
+  return forwarded;
 }
 
 // fg_native.hpp follows this path and owns the handle-to-output bindings.
-inline void OnNativePresentPassthrough(const PresentStream* owner);
+inline void OnNativePresentPassthrough(PresentStream* owner);
 
 // Record every D3D12 presenting stream, including ones not yet served, so
 // auto-FG never selects a different device or guesses between equal views.
@@ -3143,11 +3234,306 @@ inline ID3D12Resource* RunPresentPreFg(ID3D12GraphicsCommandList* command_list,
 
 // The final-Present observation is not another NR opportunity when native
 // FG already owns the application image. It still needs a funnel terminal.
-inline bool YieldPresentToNativeFg() {
-  if (!native_fg_owns.load(std::memory_order_acquire)
-      || hook_point.load(std::memory_order_relaxed) != kHookPresent) return false;
+inline bool YieldPresentToNativeFg(const PresentStream& stream) {
+  if (hook_point.load(std::memory_order_relaxed) != kHookPresent) return false;
+  if (!NativeOwnsPresentOutput(stream.output, stream.native_fg_handle)) return false;
   CountNrDecline(NrDeclineReason::kPresentPreFg);
   return true;
+}
+
+inline bool CurrentPresentSource(const PresentGuideSet& capture, const PresentStream& stream,
+    ID3D12CommandQueue* queue) {
+  const auto& frame = capture.base_frame;
+  const auto source = features.find(capture.source_handle);
+  return frame.sealed && !capture.completed_multiple_queues
+      && frame.configuration == configuration_generation.load(std::memory_order_relaxed)
+      && source != features.end() && source->second.source_generation == frame.source_generation
+      && source->second.sr_sequence == frame.sequence
+      && stream.mixed_queue == renodx::utils::directx::NativeIdentity(queue);
+}
+
+inline bool MatchPresentSourceSubmission(ID3D12CommandQueue* queue, PresentGuideSet* capture,
+    const std::shared_ptr<PresentQueueOrder>& order) {
+  // Caller holds order->submit_mutex. The isolated one-list tail orders the full copy.
+  // A Signal failure, replay ambiguity or later submission cannot prove it.
+  if (order->producer_entry == 0 || order->producer_entry != order->entered.load()) return false;
+  std::vector<std::pair<FenceRef, uint64_t>> receipts;
+  if (submission::UseSubmissionTokens(capture->marker, &receipts) == submission::UseSubmission::kUnsubmitted) return false;
+  if (!capture->completed_fence.empty()) receipts.emplace_back(capture->completed_fence, capture->completed_value);
+  if (receipts.size() != 1 || receipts.front().second != order->producer_value
+      || !submission::OnlyRecordingUses(capture->marker, capture->base_frame.recording)) return false;
+  std::shared_lock lock(queue_completion_mutex);
+  const auto own = queue_completions.find(queue);
+  if (own == queue_completions.end() || own->second.fence != receipts.front().first.fence
+      || receipts.front().first->GetCompletedValue() == UINT64_MAX) return false;
+  capture->base_frame.queue_entry = order->producer_entry;
+  return true;
+}
+
+// Fence values prove completion, not the relative order of concurrent Execute
+// calls. This helper is used only for the completion observation below.
+inline std::pair<FenceRef, uint64_t> LatestColourSubmission(
+    const std::vector<std::pair<FenceRef, uint64_t>>& receipts) {
+  std::pair<FenceRef, uint64_t> last;
+  for (const auto& [fence, value] : receipts) {
+    if (fence.empty() || value == 0 || fence->GetCompletedValue() == UINT64_MAX
+        || (!last.first.empty() && last.first.fence != fence.fence)) return {};
+    last.first = fence;
+    last.second = (std::max)(last.second, value);
+  }
+  return last;
+}
+
+inline submission::QueueOrderProof LatestColourOrder(
+    const std::vector<submission::GenerationSubmission>& submissions, std::pair<uint64_t, uint64_t> recording) {
+  submission::QueueOrderProof last;
+  for (const auto& proof : submissions) {
+    if (proof.pending || proof.fence.empty() || proof.value == 0 || proof.fence->GetCompletedValue() == UINT64_MAX
+        || std::pair{proof.list_identity, proof.recording_generation} != recording || proof.queue_order.domain == 0
+        || (last.domain != 0 && last.domain != proof.queue_order.domain)) return {};
+    if (last.domain == 0 || last.Precedes(proof.queue_order)) last = proof.queue_order;
+  }
+  return last;
+}
+
+// tracker_mutex protects the completed-use snapshot, including generations
+// whose fences have already been pruned from the live tracker.
+inline bool ColourRecordingCompletedLocked(const std::shared_ptr<submission::RecordingStatus>& recording) {
+  return recording != nullptr && recording->closed.load() && recording->submitted.load() && recording->completed_healthy
+      && std::ranges::find(recording->completed_uses, recording.get()) != recording->completed_uses.end();
+}
+
+inline void CompactPresentNativeColourWritesLocked(PresentStream::NativeColour& color) {
+  std::vector<std::pair<std::shared_ptr<submission::RecordingStatus>, uint64_t>> completed;
+  for (const auto& write : color.writes) {
+    const bool rollback = write.rollback_recorded
+        || (write.recording == color.recording_status && write.serial == color.serial && color.rollback_recorded);
+    if (!rollback && ColourRecordingCompletedLocked(write.recording)) completed.emplace_back(write.recording, write.serial);
+  }
+  std::erase_if(color.writes, [&](const auto& write) {
+    if (write.recording->closed.load() && !write.recording->submitted.load()) return true;
+    const bool rollback = write.rollback_recorded
+        || (write.recording == color.recording_status && write.serial == color.serial && color.rollback_recorded);
+    if (rollback && ColourRecordingCompletedLocked(write.recording)) return true;
+    // This replacement was nominated only after this exact older writer had
+    // completed, before any commands for the replacement were recorded.
+    return write.replacement != nullptr && std::ranges::any_of(completed, [&](const auto& next) {
+      return next.first == write.replacement && next.second == write.replacement_serial;
+    });
+  });
+}
+
+// Called by the tracker prune callback with runtime_mutex and tracker_mutex
+// held. Preserve ordering before the exact generation's receipts are removed.
+inline void PreservePresentColourProof(
+    const void* marker, const std::vector<submission::GenerationSubmission>& submissions) {
+  const auto last_submission = [&](std::pair<uint64_t, uint64_t> recording) {
+    std::vector<std::pair<FenceRef, uint64_t>> receipts;
+    for (const auto& proof : submissions) {
+      if (proof.pending || std::pair{proof.list_identity, proof.recording_generation} != recording) {
+        return std::pair<FenceRef, uint64_t>{};
+      }
+      receipts.emplace_back(proof.fence, proof.value);
+    }
+    return LatestColourSubmission(receipts);
+  };
+  for (auto& [_, stream] : present_streams) {
+    auto& color = stream.native_color;
+    if (marker == color.marker) {
+      auto [fence, value] = last_submission(color.recording);
+      color.retired_fence = std::move(fence);
+      color.retired_value = value;
+    }
+    for (auto& write : color.writes) {
+      if (marker == write.recording.get()) {
+        write.retired_order = LatestColourOrder(submissions, {write.recording->list, write.recording->generation});
+      }
+    }
+    for (auto& write : stream.colour_overwrites) {
+      if (marker != write.recording.get()) continue;
+      write.retired_order = LatestColourOrder(submissions, {write.recording->list, write.recording->generation});
+    }
+    CompactPresentNativeColourWritesLocked(color);
+  }
+}
+
+inline submission::QueueOrderProof ColourRecordingOrder(
+    const std::shared_ptr<submission::RecordingStatus>& recording, const submission::QueueOrderProof& retired_order) {
+  if (recording == nullptr || !recording->submitted.load()) return {};
+  submission::QueueOrderProof order;
+  bool live = false;
+  submission::InspectRecordedWork([&](uint64_t list, uint64_t generation, const submission::Generation& data) {
+    if (list == recording->list && generation == recording->generation) {
+      live = true;
+      if (data.first_execute != 0 && data.first_submission_index < data.submissions.size() && data.unreserved_submissions == 0) {
+        order = LatestColourOrder(data.submissions, {list, generation});
+      }
+    }
+    return false;
+  }, nullptr);
+  if (live) return order;
+  std::lock_guard lock(submission::tracker_mutex);
+  return (recording->completed_healthy
+      && std::ranges::find(recording->completed_uses, recording.get()) != recording->completed_uses.end() ? retired_order
+                                                                                                      : submission::QueueOrderProof{});
+}
+
+inline std::pair<FenceRef, uint64_t> NativeColourSubmission(const PresentStream::NativeColour& color) {
+  if (color.marker == nullptr) return {};
+  std::vector<std::pair<FenceRef, uint64_t>> receipts;
+  switch (submission::UseSubmissionTokens(color.marker, &receipts)) {
+    case submission::UseSubmission::kComplete: return {color.retired_fence, color.retired_value};
+    case submission::UseSubmission::kTokens: return LatestColourSubmission(receipts);
+    case submission::UseSubmission::kUnsubmitted: return {};
+  }
+  return {};
+}
+
+inline bool NativeColourWriterOutstanding(const PresentStream::NativeColour& color, const PresentStream::NativeColour::Write& write) {
+  const auto& recording = write.recording;
+  if (recording == nullptr || !recording->closed.load()) return true;
+  if (!recording->submitted.load()) return false;
+  if (!write.rollback_recorded
+      && !(recording == color.recording_status && write.serial == color.serial && color.rollback_recorded)) return true;
+  std::lock_guard lock(submission::tracker_mutex);
+  return !recording->completed_healthy
+      || std::ranges::find(recording->completed_uses, recording.get()) == recording->completed_uses.end();
+}
+
+inline bool NativeColourWriteOutstanding(const PresentStream::NativeColour& color) {
+  return std::ranges::any_of(color.writes, [&](const auto& write) { return NativeColourWriterOutstanding(color, write); });
+}
+
+inline submission::QueueOrderProof NativeColourOrder(const PresentStream::NativeColour& color) {
+  submission::QueueOrderProof last;
+  for (const auto& write : color.writes) {
+    if (!NativeColourWriterOutstanding(color, write)) continue;
+    if (!write.comparable || !write.recording->closed.load()) return {};
+    const auto order = ColourRecordingOrder(write.recording, write.retired_order);
+    if (order.domain == 0 || (last.domain != 0 && last.domain != order.domain)) return {};
+    if (last.domain == 0 || last.Precedes(order)) last = order;
+  }
+  return last;
+}
+
+inline bool PresentColourSuperseded(const PresentStream& stream, uint64_t version,
+    const submission::QueueOrderProof& delivered, const void* backbuffer) {
+  if (delivered.domain == 0) return false;
+  return std::ranges::any_of(stream.colour_overwrites, [&](const auto& write) {
+    return write.guide_serial == version && write.backbuffer == backbuffer
+        && delivered.Precedes(ColourRecordingOrder(write.recording, write.retired_order));
+  });
+}
+
+// Every real cached-color copy has a writer, including a redelivery on another
+// recording. Discarding that recording must not discard the accepted producer.
+inline void RegisterPresentNativeColourWrite(PresentStream* owner, ID3D12GraphicsCommandList* list,
+    const output_framerate::OutputIdentity& output, const void* canonical_backbuffer,
+    uint64_t color_version, uint64_t serial, bool redelivery) {
+  if (owner == nullptr || list == nullptr || canonical_backbuffer == nullptr) return;
+  auto& color = owner->native_color;
+  const bool same_buffer = color.backbuffer == canonical_backbuffer;
+  const bool cached_color = redelivery && same_buffer && color.serial == serial && color.output
+      && (!output || output == color.output);
+  if (!output && !cached_color && (!same_buffer || color.writes.empty())) return;
+  const auto recording = submission::ObserveRecording(list);
+  if (redelivery && !cached_color && output && (!same_buffer || color.output != output)) {
+    // The physical write is known, but its source version is not. It cannot
+    // grant a later ordinary write merely because the old cache was retired.
+    color = {.output = output, .backbuffer = canonical_backbuffer, .serial = serial};
+  }
+  if (!redelivery && output) {
+    for (auto& write : color.writes) {
+      if (write.recording == color.recording_status && write.serial == color.serial) write.rollback_recorded |= color.rollback_recorded;
+    }
+    auto writes = (same_buffer && color.output == output
+            && !PresentColourSuperseded(*owner, color.guide_serial, NativeColourOrder(color), canonical_backbuffer)
+        ? std::move(color.writes) : std::vector<PresentStream::NativeColour::Write>{});
+    color = {.output = output, .backbuffer = canonical_backbuffer, .guide_serial = color_version,
+        .recording = {recording->list, recording->generation}, .marker = recording.get(), .serial = serial,
+        .recording_status = recording, .writes = std::move(writes)};
+  }
+  if (std::ranges::none_of(color.writes, [&](const auto& write) { return write.recording == recording && write.serial == serial; })) {
+    color.writes.push_back({.recording = recording, .serial = serial, .comparable = cached_color || (!redelivery && output)});
+  }
+  submission::TrackUse(list, recording.get());
+  {
+    std::lock_guard lock(submission::tracker_mutex);
+    CompactPresentNativeColourWritesLocked(color);
+    for (auto& write : color.writes) {
+      if (write.recording == recording || !ColourRecordingCompletedLocked(write.recording)) continue;
+      const auto replacement = std::ranges::find_if(color.writes, [&](const auto& candidate) {
+        return candidate.recording == write.replacement && candidate.serial == write.replacement_serial;
+      });
+      if (replacement != color.writes.end() && !replacement->rollback_recorded
+          && !(replacement->recording->closed.load() && !replacement->recording->submitted.load())) continue;
+      write.replacement = recording;
+      write.replacement_serial = serial;
+    }
+  }
+}
+
+inline void SettlePresentNativeColourWrite(PresentStream* owner,
+    const std::shared_ptr<submission::RecordingStatus>& recording, uint64_t serial, bool accepted, bool rollback_recorded) {
+  if (owner == nullptr || recording == nullptr) return;
+  auto& color = owner->native_color;
+  if (color.recording_status == recording && color.serial == serial) {
+    color.accepted = accepted;
+    color.rollback_recorded = rollback_recorded;
+  }
+  const auto write = std::ranges::find_if(color.writes, [&](const auto& candidate) {
+    return candidate.recording == recording && candidate.serial == serial;
+  });
+  if (write == color.writes.end()) return;
+  if (recording->closed.load() && !recording->submitted.load()) {
+    color.writes.erase(write);
+    if (color.writes.empty()) color = {};
+    return;
+  }
+  write->rollback_recorded = rollback_recorded;
+}
+
+inline uint64_t PresentColourVersion(PresentStream& stream, const void* backbuffer) {
+  if (backbuffer == nullptr) return 0;
+  if (stream.native_color.backbuffer == backbuffer && !NativeColourWriteOutstanding(stream.native_color)) {
+    stream.native_color = {};
+  }
+  const auto order = present_queue_order.load(std::memory_order_acquire);
+  if (order != nullptr) {
+    std::unique_lock gate(order->submit_mutex, std::try_to_lock);
+    if (gate) {
+      PresentGuideSet* match = nullptr;
+      for (auto& capture : present_guide_sets) {
+        const auto& frame = capture.base_frame;
+        if (capture.serial == 0 || frame.backbuffer != backbuffer || frame.swapchain_epoch != stream.base_frame_epoch
+            || !CurrentPresentSource(capture, stream, order->queue)) continue;
+        if (match != nullptr) {
+          match = nullptr;
+          break;
+        }
+        match = &capture;
+      }
+      if (match != nullptr && MatchPresentSourceSubmission(order->queue, match, order)) {
+        const auto& color = stream.native_color;
+        if (color.output == stream.output && color.backbuffer == backbuffer && NativeColourWriteOutstanding(color)
+            && !PresentColourSuperseded(stream, color.guide_serial, NativeColourOrder(color), backbuffer)) return color.guide_serial;
+        return match->serial;
+      }
+    }
+  }
+  // Queue progress orders consumers, but a readback or another output's
+  // Execute cannot change this BB version after its SR guides were cleared.
+  const auto& color = stream.native_color;
+  if (color.output == stream.output && color.backbuffer == backbuffer && color.guide_serial != 0
+      && !PresentColourSuperseded(stream, color.guide_serial, NativeColourOrder(color), backbuffer)) return color.guide_serial;
+  const auto& ordinary = stream.ordinary_color;
+  if (ordinary.executed && ordinary.output == stream.output && ordinary.backbuffer == reinterpret_cast<uintptr_t>(backbuffer)
+      && stream.ordinary_color_guide_serial != 0
+      && !(ordinary.proofs_healthy && ordinary.submission.signaled
+          && PresentColourSuperseded(stream, stream.ordinary_color_guide_serial, stream.ordinary_color_order, backbuffer))) {
+    return stream.ordinary_color_guide_serial;
+  }
+  return 0;
 }
 
 #include "native_fg_tag_source.hpp"
@@ -3254,8 +3640,10 @@ inline void ConfigureOrdinaryPresentOwner() {
 // Caller holds runtime_mutex. The independent preparation Execute never
 // reaches this entry; only the ordinary color recording publishes a receipt.
 inline void PublishOrdinaryPresentColour(const fg::xefg::OrdinaryPresentAccess& access,
+    PresentStream* stream, bool frame_ordered,
     ID3D12Resource* backbuffer, const PresentTarget& target, const NrRecording& recording,
-    const fg::xefg::OrdinarySubmissionFact& submission_fact, bool reset_observed) {
+    const fg::xefg::OrdinarySubmissionFact& submission_fact, bool reset_observed,
+    const submission::QueueOrderProof& queue_order) {
   const auto found = ordinary_present_attempts.find(reinterpret_cast<const void*>(target.ordinary_attempt.owner));
   if (found == ordinary_present_attempts.end()) return;
   auto* owner = &found->second;
@@ -3268,6 +3656,9 @@ inline void PublishOrdinaryPresentColour(const fg::xefg::OrdinaryPresentAccess& 
       .executed = true, .output_ready = recording.output_ready, .group_complete = recording.group_complete,
       .game_reset_observed = reset_observed, .submission = submission_fact};
   SnapshotOrdinaryPresentProof(&owner->receipt);
+  stream->ordinary_color = owner->receipt;
+  stream->ordinary_color_guide_serial = (frame_ordered ? target.guide_serial : 0);
+  stream->ordinary_color_order = queue_order;
 }
 
 inline bool ResumeOrdinaryPresentLocked(ID3D12GraphicsCommandList* command_list = nullptr,
@@ -3607,9 +3998,13 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
         || owner->second.backbuffer != write_access.backbuffer
         || owner->second.receipt.executed) return false;
   }
+  submission::QueueOrderProof color_order;
   const bool write_permitted = fg::xefg::WithOrdinaryPresentCommit(write_access, [&] {
     // Our own Execute joins the existing tracker without reopening the
     // application's handoff or being counted as a later game submission.
+    if (present_order.owns_lock() && base_order != nullptr && base_order->queue == native_queue) {
+      color_order = {.domain = base_order->domain_id, .entry = base_order->entered.load(), .owned_after = true};
+    }
     execute_owned(list);
   });
   if (!write_permitted) {
@@ -3629,7 +4024,8 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
       .completed_value = present_ring.fence->GetCompletedValue(), .signaled = signaled};
   const bool reset_observed = DeriveFeatureState(&block).frame_reset != 0 && (target.game_frame_observed
       || history_reset_counts[static_cast<size_t>(HistoryResetSource::kGameReset)].load() != game_resets_before);
-  PublishOrdinaryPresentColour(write_access, backbuffer, target, recording, submission_fact, reset_observed);
+  PublishOrdinaryPresentColour(write_access, &stream, frame_ordered, backbuffer, target, recording,
+                               submission_fact, reset_observed, color_order);
   submission::DiscardOwnedRecording(slot->list, submission::RecordingOwner::kOrdinaryPresent);
 #if defined(NR_NEXUS_DEV_CONTROL)
   handoff_capture.Submitted(native_queue, present_ring.fence, slot->value, signaled);
@@ -3817,12 +4213,23 @@ inline void ObservePresentSourceWork(ID3D12GraphicsCommandList* list, bool unkno
 
 inline void ObservePresentSourceCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* source,
                                      ID3D12Resource* destination, bool full) {
-  if (source == nullptr || destination == nullptr || !IsPresentSourceList(list)
+  if (source == nullptr || destination == nullptr || SuppressCommandStateObservation()
       || (!ObservesPresentBaseFrames() && !ObservesAdaptiveSourceDelivery())) return;
-  RuntimeLock lock(runtime_mutex);
   const auto input = renodx::utils::directx::NativeIdentity(source);
   const auto output = renodx::utils::directx::NativeIdentity(destination);
   if (input == nullptr || output == nullptr || input == output) return;
+  if (output == renodx::utils::directx::NativeIdentity(native_tag_source::NativeBackbufferWrite::destination)) return;
+  const bool watched = IsPresentSourceList(list);
+  const auto output_owner = output_framerate::FindPresentOutput(0, reinterpret_cast<uintptr_t>(output));
+  if (!watched && !output_owner) return;
+  std::optional<RuntimeLock> lock;
+  if (!HoldingRuntimeLock()) {
+    lock.emplace(runtime_mutex);
+  }
+  if (output_owner) {
+    ObserveOrdinaryPresentProducerLocked(output, list);
+  }
+  if (!watched) return;
   const auto recording = submission::RecordingIdentity(list);
   PresentStream* target = nullptr;
   for (auto& [_, stream] : present_streams) {
@@ -3870,7 +4277,6 @@ inline void ObservePresentSourceCopy(ID3D12GraphicsCommandList* list, ID3D12Reso
     }
     frame.backbuffer = output;
     frame.swapchain_epoch = target->base_frame_epoch;
-    ObserveOrdinaryPresentProducerLocked(output);
     set.output = target->output;
     submission::TrackUse(list, destination, submission::UseKind::kOutputColor,
         {.resource = output, .subresource = 0, .version = frame.sequence});
@@ -4396,35 +4802,6 @@ inline bool RunMixedPresent(ID3D12CommandQueue* queue, reshade::api::command_que
   // Normal queue order establishes the dependency; no additional Wait.
   mixed_present_status = "tail_not_submitted";
   return SubmitPresentGroup(queue, api_queue, slot, stream, block, guides, target, false, {});
-}
-
-inline bool CurrentPresentSource(const PresentGuideSet& capture, const PresentStream& stream,
-    ID3D12CommandQueue* queue) {
-  const auto& frame = capture.base_frame;
-  const auto source = features.find(capture.source_handle);
-  return frame.sealed && !capture.completed_multiple_queues
-      && frame.configuration == configuration_generation.load(std::memory_order_relaxed)
-      && source != features.end() && source->second.source_generation == frame.source_generation
-      && source->second.sr_sequence == frame.sequence
-      && stream.mixed_queue == renodx::utils::directx::NativeIdentity(queue);
-}
-
-inline bool MatchPresentSourceSubmission(ID3D12CommandQueue* queue, PresentGuideSet* capture,
-    const std::shared_ptr<PresentQueueOrder>& order) {
-  // Caller holds order->submit_mutex. The isolated one-list tail orders the full copy.
-  // A Signal failure, replay ambiguity or later submission cannot prove it.
-  if (order->producer_entry == 0 || order->producer_entry != order->entered.load()) return false;
-  std::vector<std::pair<FenceRef, uint64_t>> receipts;
-  if (submission::UseSubmissionTokens(capture->marker, &receipts) == submission::UseSubmission::kUnsubmitted) return false;
-  if (!capture->completed_fence.empty()) receipts.emplace_back(capture->completed_fence, capture->completed_value);
-  if (receipts.size() != 1 || receipts.front().second != order->producer_value
-      || !submission::OnlyRecordingUses(capture->marker, capture->base_frame.recording)) return false;
-  std::shared_lock lock(queue_completion_mutex);
-  const auto own = queue_completions.find(queue);
-  if (own == queue_completions.end() || own->second.fence != receipts.front().first.fence
-      || receipts.front().first->GetCompletedValue() == UINT64_MAX) return false;
-  capture->base_frame.queue_entry = order->producer_entry;
-  return true;
 }
 
 inline void BindAdaptivePresentSource(ID3D12CommandQueue* queue, PresentStream* stream,
@@ -5159,7 +5536,8 @@ inline void RunPresentPath(
                 && native_fg_counted_serial.load(std::memory_order_relaxed) == input.serial);
         const bool ordered = submitted
             && std::ranges::all_of(tokens, [own_fence](const auto& token) {
-                 return token.first.fence == own_fence || token.first->GetCompletedValue() >= token.second;
+                 const auto completed = token.first->GetCompletedValue();
+                 return completed != UINT64_MAX && (token.first.fence == own_fence || completed >= token.second);
                });
         if (ordered) {
           CountNrDecline(NrDeclineReason::kPresentPreFg);
@@ -5169,6 +5547,10 @@ inline void RunPresentPath(
         return;
       }
       OnNativePresentPassthrough(&stream);
+    } else if (input.decision_id != 0) {
+      CountNrDecline(input.phase == fg::native_options::PresentPhase::SDK_HANDLED
+          ? NrDeclineReason::kPresentPreFg : NrDeclineReason::kGameEvaluateFailed);
+      return;
     } else if (base_identity != nullptr) {
       // ReShade wraps the SL proxy. The SDK has not decided whether this
       // application image will generate frames or go straight to Present.
@@ -5179,9 +5561,27 @@ inline void RunPresentPath(
       return;
     }
   }
-  if (!native_passthrough && YieldPresentToNativeFg()) {
+  if (!native_passthrough && YieldPresentToNativeFg(stream)) {
     InvalidatePresentBaseFrames(&stream);
     return;
+  }
+  if (!d3d11 && !stream.native_color.writes.empty()
+      && stream.native_color.output == output
+      && stream.native_color.backbuffer == renodx::utils::directx::NativeIdentity(back)) {
+    if (!NativeColourWriteOutstanding(stream.native_color)) {
+      stream.native_color = {};
+    } else {
+      const auto written = NativeColourOrder(stream.native_color);
+      if (!PresentColourSuperseded(stream, stream.native_color.guide_serial, written, stream.native_color.backbuffer)) {
+        // An issued BB write remains owned after SDK rejection until its
+        // original generation proves discard or completes the raw rollback.
+        const auto [fence, value] = NativeColourSubmission(stream.native_color);
+        const auto completed = (fence.empty() ? UINT64_MAX : fence->GetCompletedValue());
+        CountNrDecline(stream.native_color.accepted && written.domain != 0 && completed != UINT64_MAX && completed >= value
+            ? NrDeclineReason::kPresentPreFg : NrDeclineReason::kPresentBusy);
+        return;
+      }
+    }
   }
   // Only this final-Present route can interpret its own skipped work as a
   // display gap. Native FG's normal bypass above is already served pre-FG.
@@ -5370,14 +5770,6 @@ inline void RunPresentPath(
   auto* native_queue = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
   if (!d3d11 && ordinary_base_frames && WantsPresentBaseFrames()
       && !screenshot::WantsFinalPresent()) {
-    if (native_passthrough || deferred) {
-      InvalidatePresentBaseFrames(&stream);
-      ++edit_reuse_fallbacks;
-      CountNrDecline(NrDeclineReason::kPresentBaseUnproven);
-      ++stream.base_frame_attempt;
-      PublishPresentBaseRejection(&stream, renodx::utils::directx::NativeIdentity(back), target.hdr_color_space);
-      return;
-    }
     renodx::utils::directx::NativeFromReShadeProxy(&native_queue);
     // ReShade work queued by an earlier add-on can have changed the image.
     // Flush it before checking how many submissions followed this SR.
@@ -5652,7 +6044,7 @@ inline void RunPresentPath(
     bool delivered = false;
     {
       const EvaluateChainScope chain_scope;
-      delivered = RunBridge(context, handle, &block, nullptr, &target);
+      delivered = RunBridge(context, handle, &block, nullptr, &target, nullptr, &ordinary_access);
     }
     context->Release();
     if (!delivered) return;
@@ -5700,10 +6092,9 @@ inline void OnNativePresentObserved(IDXGISwapChain* swapchain, UINT flags,
     if (pending.identity != identity) {
       // If ReShade is inside SL, its callback has not run yet. Only the
       // upcoming Present of this exact output on this thread may use it.
-      if (phase == fg::native_options::PresentPhase::SDK_FORWARD) {
-        native_passthrough_identity = identity;
-        native_passthrough_input = input;
-      }
+      native_passthrough_identity = identity;
+      native_passthrough_input = input;
+      native_passthrough_input.phase = phase;
       return;
     }
     native_deferred_present = {};

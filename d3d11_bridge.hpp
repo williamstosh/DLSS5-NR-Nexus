@@ -389,8 +389,7 @@ inline void MarkBridgeLost(const char* why) {
   }
   Log(reshade::log::level::error,
       std::string("D3D11 bridge lost: ") + why
-          + "; Neural Rendering stays off for the rest of this Direct3D 11"
-            " session and the game's own DLSS image is untouched");
+          + "; Neural Rendering stays off for the rest of this Direct3D 11 session");
 }
 
 // ---------------------------------------------------------------------------
@@ -1401,6 +1400,33 @@ inline NrDeclineReason EnsureBridgeUp(ID3D11DeviceContext* context) {
 }
 
 // The caller holds the Bridge device section, NGX turn and runtime_mutex.
+// Only call this after finite GPU completion of this slot.
+inline bool ResetCompletedBridgeRecording(BridgeSlot* slot) {
+  if (slot->allocator == nullptr || slot->list == nullptr
+      || FAILED(slot->allocator->Reset()) || FAILED(slot->list->Reset(slot->allocator, nullptr))) {
+    return false;
+  }
+  submission::OnCommandListReset(slot->list);
+  if (FAILED(slot->list->Close())) return false;
+  slot->value = 0;
+  return true;
+}
+
+// A reused Provider need not retire its other users. The old ordinary tail
+// can finish asynchronously while the SDK records its own color.
+inline void ReclaimCompletedBridgeRecordings() {
+  if (!bridge_device_live.load(std::memory_order_acquire)
+      || bridge_state.load(std::memory_order_acquire) != BridgeState::kUp || bridge.fence_done12 == nullptr
+      || std::ranges::none_of(bridge.ring, [](const BridgeSlot& slot) { return slot.value != 0; })) return;
+  const uint64_t done = bridge.fence_done12->GetCompletedValue();
+  if (done == UINT64_MAX) return;
+  for (BridgeSlot& slot : bridge.ring) {
+    if (slot.value == 0 || slot.value > done) continue;
+    submission::DiscardOwnedRecording(slot.list, submission::RecordingOwner::kBridge);
+    ResetCompletedBridgeRecording(&slot);
+  }
+}
+
 // The watchdog can advance out before the GPU is done with these allocators.
 inline bool RetireBridgeRecordings() {
   if (!bridge_device_live.load(std::memory_order_acquire)) return true;
@@ -1414,46 +1440,89 @@ inline bool RetireBridgeRecordings() {
   if (done == UINT64_MAX || done < bridge_submitted_value.load(std::memory_order_acquire)) return false;
   for (BridgeSlot& slot : bridge.ring) {
     if (slot.value == 0) continue;
-    if (slot.allocator == nullptr || slot.list == nullptr
-        || FAILED(slot.allocator->Reset()) || FAILED(slot.list->Reset(slot.allocator, nullptr))) {
-      return false;
-    }
-    submission::OnCommandListReset(slot.list);
-    if (FAILED(slot.list->Close())) return false;
-    slot.value = 0;
+    if (!ResetCompletedBridgeRecording(&slot)) return false;
   }
   return true;
 }
 
+// Wait once only for ordinary work already ordered on the D11 immediate
+// context. At this point the old input Signal/Flush and private Execute/Signal
+// were posted; the old tail has no dependency on the new SDK recording.
+template <typename Claim>
+inline void WaitForAcceptedOrdinaryBridgeTail(ID3D12Device* device, Claim&& claim) {
+  if (!bridge_device_live.load(std::memory_order_acquire) || bridge.device12 != device
+      || bridge_state.load(std::memory_order_acquire) != BridgeState::kUp
+      || bridge.fence_done12 == nullptr || bridge.completion_event == nullptr
+      || bridge_pending_delivery_value != 0 || bridge_tripped.load(std::memory_order_acquire)
+      || bridge_device_removed.load(std::memory_order_acquire)) return;
+  const uint64_t target = bridge_submitted_value.load(std::memory_order_acquire);
+  const uint64_t completed = bridge.fence_done12->GetCompletedValue();
+  if (completed == UINT64_MAX || completed >= target || !std::forward<Claim>(claim)()) return;
+
+  constexpr DWORD kHandoffWaitMs = 50;
+  const int64_t start = SteadyNowNs();
+  const uint64_t deadline = GetTickCount64() + kHandoffWaitMs;
+  ++bridge_completion_waits;
+  DWORD status = WAIT_FAILED;
+  if (ResetEvent(bridge.completion_event)
+      && SUCCEEDED(bridge.fence_done12->SetEventOnCompletion(target, bridge.completion_event))) {
+    status = WAIT_OBJECT_0;
+    while (bridge.fence_done12->GetCompletedValue() < target && !bridge_tripped.load(std::memory_order_acquire)
+           && !bridge_device_removed.load(std::memory_order_acquire)) {
+      const uint64_t now = GetTickCount64();
+      if (now >= deadline) {
+        status = WAIT_TIMEOUT;
+        break;
+      }
+      status = WaitForSingleObject(bridge.completion_event, static_cast<DWORD>(deadline - now));
+      if (status != WAIT_OBJECT_0) break;
+    }
+  }
+  const int64_t elapsed = SteadyNowNs() - start;
+  bridge_completion_wait_ns += elapsed;
+  const uint64_t after = bridge.fence_done12->GetCompletedValue();
+  // The event may instead come from the watchdog or a prior request. This is
+  // observational only: retirement independently checks the true fence.
+  char message[192];
+  std::snprintf(message, sizeof(message),
+      "XeFG Provider Bridge tail: target=%llu done=%llu wait_ms=%.3f wait_status=0x%08lx complete=%u",
+      static_cast<unsigned long long>(target), static_cast<unsigned long long>(after), elapsed / 1e6,
+      static_cast<unsigned long>(status), static_cast<unsigned>(after != UINT64_MAX && after >= target));
+  Log(reshade::log::level::info, message);
+}
+
 // Shutdown, before NR state is released: every submission must be off the
-// GPU before its worksets and features go.  Bounded, like every teardown
-// wait; a queue that never drains gets its fences CPU-signalled so no D3D11
-// wait can outlive this.  Returns whether every submission is proven off the
-// GPU: when not, Shutdown keeps all NR state (v8, TIME-12; until then it was
-// released anyway, under a queue that could still run it).
+// GPU before its worksets and features go. This bounded wait can nudge the
+// input and legacy return fences, but only the private GPU queue proves done.
+// Without finite completion, Shutdown keeps the in-flight NR state.
 inline bool DrainBridgeQueue() {
   if (!bridge_device_live.load(std::memory_order_acquire)
       || bridge.fence_done12 == nullptr) {
     return true;
   }
   const uint64_t target = bridge_submitted_value.load(std::memory_order_acquire);
-  if (bridge.fence_done12->GetCompletedValue() >= target) return true;
+  const uint64_t completed = bridge.fence_done12->GetCompletedValue();
+  if (completed == UINT64_MAX) return false;
+  if (completed >= target) return true;
   if (HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr)) {
     if (SUCCEEDED(bridge.fence_done12->SetEventOnCompletion(target, event))
         && WaitForSingleObject(event, 5000) == WAIT_TIMEOUT) {
       bridge.fence_in12->Signal(target);
       bridge.fence_out12->Signal(target);
-      const bool drained = WaitForSingleObject(event, 1000) == WAIT_OBJECT_0;
+      WaitForSingleObject(event, 1000);
+      const uint64_t retry_completed = bridge.fence_done12->GetCompletedValue();
+      const bool drained = retry_completed != UINT64_MAX && retry_completed >= target;
       Log(reshade::log::level::warning,
           std::string("D3D11 bridge: the Direct3D 12 queue had not drained 5 s"
-                      " into teardown; its fences were CPU-signalled")
+                      " into teardown; its input and legacy return fences were CPU-signalled")
               + (drained ? " and it drained"
                          : " and it still has not drained; its objects and NR"
                            " state are kept"));
     }
     CloseHandle(event);
   }
-  return bridge.fence_done12->GetCompletedValue() >= target;
+  const uint64_t final_completed = bridge.fence_done12->GetCompletedValue();
+  return final_completed != UINT64_MAX && final_completed >= target;
 }
 
 // Shutdown, after NR state and the runtime are gone.  Re-armable: the next
@@ -1535,7 +1604,8 @@ inline bool RunBridge(ID3D11DeviceContext* context,
                       const NVSDK_NGX_Parameter* parameters,
                       bridge::ScopedD3D11Redirect* redirect,
                       const PresentTarget* present = nullptr,
-                      const BridgeSrAttempt* ordered_sr = nullptr) {
+                      const BridgeSrAttempt* ordered_sr = nullptr,
+                      const fg::xefg::OrdinaryPresentAccess* ordinary_access = nullptr) {
   using bridge::ResourceKey;
   stage_plan::Plan plan;
   {
@@ -1662,6 +1732,12 @@ inline bool RunBridge(ID3D11DeviceContext* context,
     const BridgeDeviceLock device_lock(context);
     const ngx_serial::Call ngx_turn;
     RuntimeLock lock(runtime_mutex);
+    if (ordinary_access != nullptr && (!ordinary_access->allowed
+        || fg::xefg::QueryOrdinaryPresent(ordinary_access->swapchain, ordinary_access->backbuffer,
+               ordinary_access->output) != *ordinary_access)) {
+      name(NrDeclineReason::kPresentPreFg);
+      return;
+    }
     if (ordered_sr != nullptr && !pre && present == nullptr && !plan.mixed
         && edit_reuse_enabled.load() && monitor_requested.load()) {
       if (const auto source = features.find(handle);
@@ -1925,6 +2001,11 @@ inline bool RunBridge(ID3D11DeviceContext* context,
         PresentTarget at_present = present != nullptr ? *present : PresentTarget{};
         at_present.output_state = nr_twin_state;
         at_present.d3d11_bridge = true;
+        // The ring lists were created on this native device. A Present on its
+        // own color does not require tearing down a compatible signed instance.
+        if (present != nullptr && CanReuseActivePrivateRuntime(bridge.device12)) {
+          at_present.private_signed_runtime = true;
+        }
         at_present.independent_resolution_pair = independent_present_pair;
 #if defined(NR_NEXUS_DEV_CONTROL)
         const bool capture_inline_restore = present == nullptr && !plan.mixed
@@ -2079,8 +2160,48 @@ inline bool RunBridge(ID3D11DeviceContext* context,
       if (plan.mixed) decline(NrDeclineReason::kBridgeLost, "the D3D12 stage submission failed");
       return;
     }
-    // The D3D11 context cannot cancel a queued copy or SR read when the
-    // watchdog signals `out`. Keep delivery on the CPU side until `done`.
+    const auto copy_to_output = [&] { ctx->CopySubresourceRegion(output, 0, 0, 0, 0, set->output11, 0, nullptr); };
+    if (present != nullptr && ordinary_access != nullptr && !pre && !strict_delivery) {
+      if (measure_cpu) {
+        cpu_start = SteadyNowNs();
+      }
+      bool removed = false;
+      bool timed_out = false;
+      using fg::xefg::OrdinaryPresentRecordResult;
+      const auto record_result = fg::xefg::TryRecordOrdinaryPresentDelivery(*ordinary_access, [&] {
+        removed = bridge_device_removed.load(std::memory_order_acquire)
+            || bridge.fence_done12->GetCompletedValue() == UINT64_MAX;
+        timed_out = bridge_timeouts.load(std::memory_order_acquire) != timeouts_before;
+        if (removed || timed_out || FAILED(ctx->Wait(bridge.fence_done11, value))) return false;
+        copy_to_output();
+        return true;
+      });
+      if (record_result != OrdinaryPresentRecordResult::kRecorded) {
+        ordinary_delivery_failed = true;
+        if (record_result == OrdinaryPresentRecordResult::kOwnerRejected) {
+          name(NrDeclineReason::kPresentPreFg);
+        } else if (removed || timed_out) {
+          ++bridge_completion_failures;
+          if (removed) {
+            MarkBridgeLost("the private device was removed before ordinary delivery");
+          }
+        } else {
+          bridge_skew.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+      }
+      bridge_waits11.fetch_add(1, std::memory_order_relaxed);
+      // Only the unrecorded handoff is settled. The next immediate-context
+      // input follows this Wait/Copy; ring and surface retirement still use done.
+      bridge_pending_delivery_value = 0;
+      screenshot::RecordNativeHdrReceiverCopy(ctx, output);
+      delivered = true;
+      if (measure_cpu) {
+        cpu.return_ns += SteadyNowNs() - cpu_start;
+      }
+      return;
+    }
+    // Other stages retain CPU confirmation of GPU-only done before handoff.
     uint64_t completed_value = bridge.fence_done12->GetCompletedValue();
     DWORD wait_result = WAIT_OBJECT_0;
     if (strict_delivery || completed_value < value) {
@@ -2209,7 +2330,17 @@ inline bool RunBridge(ID3D11DeviceContext* context,
     }
     bridge_waits11.fetch_add(1, std::memory_order_relaxed);
     if (!pre) {
-      ctx->CopySubresourceRegion(output, 0, 0, 0, 0, set->output11, 0, nullptr);
+      // The private twin is complete; only its copy to the consumer's actual
+      // color commits the ordinary write. An intervening revocation wins.
+      if (ordinary_access != nullptr) {
+        if (!fg::xefg::WithOrdinaryPresentCommit(*ordinary_access, copy_to_output)) {
+          ordinary_delivery_failed = true;
+          name(NrDeclineReason::kPresentPreFg);
+          return;
+        }
+      } else {
+        copy_to_output();
+      }
       screenshot::RecordNativeHdrReceiverCopy(ctx, output);
       delivered = true;
     } else if (swapped) {

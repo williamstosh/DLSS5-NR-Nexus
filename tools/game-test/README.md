@@ -86,14 +86,24 @@ x2 先平均相邻两源再统计；未满窗口或过期时为 null。请求、
 明确属于录制状态；须与GPU完成、实际FG输出及同帧作用证据分别核验。原XeFG单Backbuffer Present路径与Off两档实验保持各自准入。
 
 从关闭切换到开启该DEV实验时，会同时准备一次`state.edit_reuse.fg_observation`有界观察；相同请求或重复开启不重置它。
-完整`events`通过`status`读取；修改请求的缓存回执只保留`event_count`等摘要，并标记`events_in_status_only=true`，避免查询回执时重复装入整个观察窗口。
-首个合格SR写回才开始记录，最多覆盖4个源帧、64个事件；第5个源帧入口停止，关闭实验保留已有快照，重新关闭／开启才准备新一轮。
+采集稳态时可调用 `Client.fg_execution_observation("arm")`，在 NR 运行中重新准备独立的观察代次。该操作只重置诊断快照。
+`stop` 封存当前观察，`status` 读取同一快照。若含缓存回执的状态超过管道限制，`events_in_status_without_receipt=true` 表示完整事件可从无回执的状态查询读取。
+独立观察从下一次实际成功的 SR 开始，最多覆盖四次成功 SR、64 个事件。它将 `source_success` 与录制了 NR 写回的 `sr_copyback_recorded` 分开记录。Present 路径也能从成功 SR 开始。
+旧实验的观察从首个合格 SR 写回开始，保留原来的四源帧窗口。停止后可读取已封存的快照。
 记录区分SR写回、native FG调用与返回、XeFG实际转发Tag及Proxy Present；返回事件用`call_id`关联本轮入口。
+`xefg_constants` 按原 SDK context、epoch 和 Present ID 记录实传 `frame_time_ms` 及返回码，保留零值及失败调用。
+`sr_queue_submission` 按 list ID 和录制代次匹配已观察的 SR 写回，记录原生队列和列表接口、批次位置、reservation index、首笔标志及该批 Signal 的 fence、value 和结果。
+该事件的 `execute_entry_ns` 和 `execute_return_ns` 围绕 CPU 调用 `ExecuteOrdered`。当 `forward_calls` 大于 1 时，同一段覆盖多个真实转发调用。Signal 结果用于定位提交，GPU 退休另取队列证据。
 `api_return_ns`采样在实际调用返回后，`observed_ns`是随后记录事件的时刻。native的`environment_generation`仅是已观察的FG环境修订代次。
 资源的规范身份或录制身份不可用时明确标记，未读到的FrameID为`null`；可读FrameID只表示SDK参数读取成功，尚未证明它与SR序号对应。
 native颜色记录包含Backbuffer、HUDLess、UI及UIAlpha的身份。XeFG区域声明和无有效列表契约的Tag不会被当作可解引用的命令列表。
-规范身份沿宿主只解包已知ReShade代理；Streamline接口面保持独立，身份不同本身也不能证明不存在后续数据流。
+录制的 `reshade_base` 仅在宿主成功解包已知 ReShade 代理时出现在状态中，值为原生命令列表接口地址。资源规范身份另用 IUnknown，Streamline 接口面保持独立。
 这些CPU观察不包含GPU完成或像素交接结论，首个SR帧之前的Tag前缀也未覆盖。源／FG环境代次变化会停止观察；缺少返回或未读到颜色角色时保留缺口，不根据临近时刻关联来源。
+离线关联使用 `python tools/game-test/fg_timing.py --trace trace.json --observation observation.json --output timing.json`。
+`observation.json` 保存 `Client.fg_execution_observation('status')` 的完整 JSON 回执，包含 `state.pid` 和 `state.edit_reuse.fg_observation`。工具核对进程身份后关联提交；溢出、缺字段和无法唯一关联的结果保留为未知。SDK 区间末次启用状态与完整区间的状态覆盖分别记录，缺状态样本时不估算整窗 SDK 帧率或倍率。
+`--cadence cadence.json` 接收同一 PID 的分窗记录：`phases` 每项包含 `name`、`start.ns`、`end.ns` 和 `sdk_intervals` 原日志行；相邻成功 SR 的 GPU 成本另由 `--benchmark` 读取。配合 `--service present-service.json` 时，分窗文件还须保留 `service_export.name`（原始 `control-mask-<pid>-<stamp>-<capture>.json` 文件名）及 `service_export.sha256`，工具先核对来源与内容再统计私有服务。与分窗文件同目录的 `<name>-display.csv` 可提供 PresentMon 显示事件；这些事件不标识逐张生成帧或物理扫描。
+开始计时前先核对目标阶段的实际 NR 接受计数持续增长；x2 窗还须有实际刷新和复用增量。设置已应用的窗口可能仍在等待运行时切换，只有 SR 旁路的样本不纳入该阶段的 NR 性能对照。跨阶段对照先停止并导出前一份 benchmark；每份最多 16 个阶段标记（含初始 `unmarked`），转镜与静止窗口分批保存。
+原受保护 `run-fg-acceptance.ps1` 入口的 `-XeFgGpuCapture` 可配合单 Pass A、Upscaled／Present 和 `-CaptureScript` 采集同场对照；四个 GPU 诊断键由安装事务备份并恢复。已安装 XeFGUnlock 时，`-XeFgExtensionLogging` 只打开该扩展的日志，配置也纳入同一事务，保留原倍率和节奏设置。记录启用配置与实际分支回执时仍须分开判断。
 
 专用输出验证构建同时定义`NR_NEXUS_DEV_CONTROL`与`NR_NEXUS_TEST_FG_OUTPUT_PROBE`时，
 `state.edit_reuse.fg_output_probe`报告实际SDK诊断调用回执：XeFG按真实模块／context调用仅显示生成帧及生成帧标记，
