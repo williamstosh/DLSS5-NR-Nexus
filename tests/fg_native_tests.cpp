@@ -4934,6 +4934,9 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool
     adapter::modules[0].real[4] = reinterpret_cast<void*>(&FakeConstants);
     adapter::modules[0].real[5] = reinterpret_cast<void*>(&FakeId);
     adapter::modules[0].real[6] = reinterpret_cast<void*>(+[](void*, uint32_t) -> int32_t { return 0; });
+    funnel_accounting_tests::Restore sdk_destroy_restore;
+    sdk_destroy_restore.Value(&adapter::modules[0].real[8]);
+    adapter::modules[0].real[8] = reinterpret_cast<void*>(+[](void*) -> int32_t { return 0; });
     adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakePresent);
     adapter::proxies[0].real[1] = reinterpret_cast<void*>(&FakePresent1);
     xefg::Configure(&native::fg_service::Service, &Prepare, nullptr, &Requested);
@@ -5140,6 +5143,7 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool
         xefg_inline_handoff_cases::Run(gpu, xefg_session, backbuffer.Get(), guides[3].Get(), guides[2].Get(),
                                        submit, wait_present_fence, &native_handoff);
       }
+      xefg_session.CloseSdk();
     }
 #if defined(NR_NEXUS_TEST_NATIVE_NGX)
     if (native_ngx && bridge_shared_provider) {
@@ -5924,6 +5928,7 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool
                   && providers::runtime_initializations == initializations_before + 1 && ordinary_proxy.references == 1,
               "explicit private-provider handoff has no extra same-provider face-settling delay");
       }
+      session.CloseSdk();
     }
     xefg_present_handoff_cases::Run(gpu, submit, wait_present_fence);
     if (info != nullptr) {
