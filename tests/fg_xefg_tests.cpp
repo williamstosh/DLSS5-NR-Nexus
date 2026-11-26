@@ -358,6 +358,7 @@ struct Session {
   uint32_t extent_top = 2;
   uint32_t extent_width = 4;
   uint32_t extent_height = 3;
+  bool sdk_closed = false;
   explicit Session(Gpu* value, int32_t ui_mode = 0, uint32_t init_flags = 17,
                    DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM) : gpu(value), proxy(value->Swapchain(format)) {
     xefg::abi::Init init{.application_swapchain = proxy.Get(), .flags = init_flags, .max_interpolated = 1, .ui_mode = ui_mode};
@@ -368,8 +369,23 @@ struct Session {
     context->ui_composition = true;
     adapter::RefreshOwnership();
   }
+  void CloseSdk() {
+    const auto previous_output = context->output_identity;
+    Check(context->presents_in_flight == 0 && context->present_colors.empty()
+              && previous_output && renodx::addons::dlss5::output_framerate::IsCurrentOutput(previous_output),
+          "close an idle SDK fixture with its live output still registered");
+    Check(Hooks::Destroy(handle) == 0, "SDK fixture Destroy reaches the application hook");
+    {
+      const std::shared_lock lock(adapter::state.mutex);
+      Check(!adapter::state.contexts.contains(handle), "closed SDK context no longer matches another output");
+    }
+    Check(!renodx::addons::dlss5::output_framerate::IsCurrentOutput(previous_output),
+          "closed SDK fixture retires its old output generation");
+    sdk_closed = true;
+  }
   ~Session() {
-    // The fake SDK has no Destroy callback. Do not leave a dead proxy's
+    if (sdk_closed) return;
+    // Some fixtures do not install an SDK Destroy callback. Do not leave a dead proxy's
     // recycled COM identity eligible for another session's Present.
     context->enabled = false;
     context->proxy_identity = 0;

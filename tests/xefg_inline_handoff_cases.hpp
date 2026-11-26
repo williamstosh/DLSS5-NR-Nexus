@@ -651,6 +651,8 @@ inline void Run(Gpu& gpu, Session& session, ID3D12Resource* back,
     }
     before_sdk_return = {};
     Check(Hooks::Enable(exiting.handle, 0) == 0 && fg_held(), "final SDK Disable leaves the surviving owner active");
+    exiting.CloseSdk();
+    Check(fg_held(), "retiring the closed SDK context leaves the surviving owner active");
     std::cout << "XEFG_OWNER_ISOLATION exited=A active=B active_delivery=readback returned_delivery=readback\n";
     std::cout << "XEFG_OWNER_PENDING replayable=closed gpu_in_flight=retained old_EndPresent=settled reentry=fresh\n";
   }
