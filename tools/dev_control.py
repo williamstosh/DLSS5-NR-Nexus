@@ -295,6 +295,29 @@ class Client:
         request = dict(id=str(uuid.uuid4()), op='adaptive_feature_experiment', mode=mode)
         return self._mutation(request, deadline)
 
+    def online_update(self, action='status', *, enabled=None, directory=None, completed=None, deadline=None):
+        """Use the production updater without changing NR or image presets."""
+        if action not in ('status', 'check', 'download', 'auto_check', 'download_directory',
+                          'choose_directory', 'open_directory', 'open_release'):
+            raise ValueError('Unknown online update action')
+        if (action == 'auto_check' and type(enabled) is not bool) or (action != 'auto_check' and enabled is not None):
+            raise ValueError('auto_check requires Boolean enabled')
+        if (action == 'download_directory' and (not isinstance(directory, str) or not directory or '\0' in directory)) or (action != 'download_directory' and directory is not None):
+            raise ValueError('download_directory requires a filesystem path')
+        if completed is not None and (action != 'open_directory' or type(completed) is not bool):
+            raise ValueError('completed applies only to open_directory')
+        deadline = deadline if deadline is not None else time.monotonic() + self.timeout
+        request = dict(id=str(uuid.uuid4()), op='online_update', action=action)
+        if enabled is not None:
+            request['enabled'] = enabled
+        if directory is not None:
+            request['directory'] = directory
+        if completed is not None:
+            request['completed'] = completed
+        if action == 'status':
+            return self._request(request, deadline)
+        return self._mutation(request, deadline)
+
     def reset_nr(self, *, deadline=None):
         """Request the UI-equivalent NR reset; model and GPU completion require later observations."""
         deadline = deadline if deadline is not None else time.monotonic() + self.timeout
@@ -380,7 +403,7 @@ def main():
     parser.add_argument('--capture-id', help='Present handoff capture batch ID, required for arm and stop')
     parser.add_argument('--start-on-real-guides', action='store_true',
                         help='Wait up to 60 seconds for a Present with confirmed real guides')
-    parser.add_argument('op', choices=('status', 'set', 'reset-nr', 'inline-restore-roi', 'present-handoff-capture'))
+    parser.add_argument('op', choices=('status', 'set', 'online-update', 'reset-nr', 'inline-restore-roi', 'present-handoff-capture'))
     parser.add_argument('key', nargs='?')
     parser.add_argument('value', nargs='?', help='JSON typed value')
     args = parser.parse_args()
@@ -402,6 +425,16 @@ def main():
             if not args.key or args.value is None or args.query_id:
                 parser.error('set requires key and JSON value')
             response = client.set(args.key, json.loads(args.value), confirm=args.confirm)
+        elif args.op == 'online-update':
+            if args.query_id or args.confirm:
+                parser.error('online-update accepts an action and optional typed value')
+            options = {}
+            if args.value is not None:
+                field = {'auto_check': 'enabled', 'download_directory': 'directory', 'open_directory': 'completed'}.get(args.key)
+                if field is None:
+                    parser.error('this online-update action accepts no value')
+                options[field] = json.loads(args.value)
+            response = client.online_update(args.key or 'status', **options)
         elif args.op == 'inline-restore-roi':
             if not args.key or args.value is not None or args.query_id or args.confirm:
                 parser.error('inline-restore-roi requires one output directory and no setting or confirmation')

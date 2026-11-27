@@ -17,7 +17,7 @@ $previousCl = $env:CL
 $outcome = 'Failed'
 $policySuites = @('edit-reuse-policy','present-frame-policy','capability-policy','adaptive-resolution')
 $suites = @('native','sdr-policy','hdr-policy','scope','config','constants','stage-plan') +
-    $policySuites + @('copy-slots','lifecycle','fg-native')
+    $policySuites + @('copy-slots','lifecycle','fg-native','update')
 $independentCases = [ordered]@{
     'native-prefg-resolution'='^PASS native-prefg-resolution hardware=0 steady_pairs_observed='
     'present-chain'='^PASS B1 WARP format=DXGI_FORMAT_R8G8B8A8_UNORM source_input='
@@ -98,7 +98,7 @@ try {
             $state = Get-Content -LiteralPath (Join-Path $directory 'artifact-lifecycle.json') -Raw | ConvertFrom-Json -AsHashtable
             $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json -AsHashtable
             $identity = $result['buildIdentity']
-            $explicitOff = $suite -notin @('fg-native','adaptive-resolution') -or
+            $explicitOff = $suite -notin @('fg-native','adaptive-resolution','update') -or
                 ($identity -and $identity.mode -ceq 'Off' -and $identity.softwareOnly -eq $true)
             if ($state.status -ceq 'Passed' -and $state.sourceCommit -ceq $summary.sourceCommit -and
                 $result.suite -ceq $suite -and $result.build -ceq 'passed' -and $result.run -ceq 'passed' -and $explicitOff) {
@@ -117,7 +117,7 @@ try {
     })
     if ($needed.Count) {
         $baseRun = @{Suite=$needed; SoftwareOnly=$true; UiPreview='None'; OutputDirectory=$suiteOutput; RetentionMode='Standard'}
-        if (@($needed | Where-Object { $_ -in @('fg-native','adaptive-resolution') }).Count) { $baseRun.DevControlMode = 'Off' }
+        if (@($needed | Where-Object { $_ -in @('fg-native','adaptive-resolution','update') }).Count) { $baseRun.DevControlMode = 'Off' }
         & (Join-Path $PSScriptRoot 'run-tests.ps1') @baseRun @compileInputs
     }
     $summary['reusedSuites'] = $reusedSuites
@@ -192,14 +192,14 @@ try {
         -PublicLog (Join-Path $caseDirectories['nr-edit-reuse-contracts-public'] 'test.stdout.log') -BridgeLog $bridgeStdout
 
     $devOutput = Join-Path $OutputDirectory 'dev-suites'
-    & (Join-Path $PSScriptRoot 'run-tests.ps1') -Suite fg-native,bridge-motion,adaptive-resolution `
+    & (Join-Path $PSScriptRoot 'run-tests.ps1') -Suite fg-native,bridge-motion,adaptive-resolution,update `
         -NativeCase $devCases -BridgeCase $pairedBridgeCases -DevControlMode On `
         -SoftwareOnly -UiPreview None -OutputDirectory $devOutput -RetentionMode Standard @compileInputs
     $after = Get-ReleaseParityBuildContext $repo $hostRoot
     if (($after | ConvertTo-Json -Depth 5 -Compress) -cne ($buildContext | ConvertTo-Json -Depth 5 -Compress)) {
         throw 'Core source or locked dependencies changed between the two modes.'
     }
-    $ordinaryBuilds = @{ 'fg-native'=$fg; 'bridge-motion'=$bridge; 'adaptive-resolution'=$ordinary['adaptive-resolution'] }
+    $ordinaryBuilds = @{ 'fg-native'=$fg; 'bridge-motion'=$bridge; 'adaptive-resolution'=$ordinary['adaptive-resolution']; update=$ordinary['update'] }
     foreach ($suite in $ordinaryBuilds.Keys) {
         $summary.releaseParity.builds[$suite] = Assert-ReleaseParityBuildPair $suite $ordinaryBuilds[$suite] `
             (Join-Path $devOutput $suite) $buildContext

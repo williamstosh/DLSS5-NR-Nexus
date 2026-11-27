@@ -4944,9 +4944,9 @@ inline void RunPresentPath(
     float game_nits = 0.f;
     const bool mod_white =
         renodx_mod_loaded.load(std::memory_order_relaxed)
-        && reshade::get_config_value(nullptr, "renodx-preset1", "ToneMapType", tone_mapper)
+        && configuration::Get(nullptr, "renodx-preset1", "ToneMapType", tone_mapper)
         && tone_mapper != 0.f
-        && reshade::get_config_value(nullptr, "renodx-preset1", "ToneMapGameNits", game_nits)
+        && configuration::Get(nullptr, "renodx-preset1", "ToneMapGameNits", game_nits)
         && game_nits >= 48.f && game_nits <= 10000.f;
     present_mod_white.store(mod_white ? game_nits : 0.f, std::memory_order_relaxed);
   }

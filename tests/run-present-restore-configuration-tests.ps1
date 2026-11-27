@@ -48,6 +48,11 @@ try {
     $libraries = $buildInputs.Libraries
     $inputs = @($testSource, $PSCommandPath, $projectPath,
         (Join-Path $addonDirectory 'dlssnr.hpp'),
+        (Join-Path $addonDirectory 'update.hpp'),
+        (Join-Path $addonDirectory 'http_winhttp.hpp'),
+        (Join-Path $addonDirectory 'reshade_config.hpp'),
+        (Join-Path $addonDirectory 'ui/update.hpp'),
+        (Join-Path $PSScriptRoot 'update_configuration_cases.hpp'),
         (Join-Path $addonDirectory 'capability.hpp'),
         (Join-Path $addonDirectory 'stage_plan.hpp'),
         (Join-Path $addonDirectory 'gpu_timers.hpp'),
@@ -150,7 +155,7 @@ try {
         'nr-stage-default', 'nr-stage-explicit', 'nr-stage-invalid',
         'pass-result-default', 'pass-result-custom', 'pass-result-invalid', 'control-mask-depth', 'presets',
         'nr-resolution-default', 'nr-resolution-explicit', 'nr-resolution-invalid', 'nr-resolution-adaptive', 'native-prefg-resolution-config', 'profiles', 'capability-ui',
-        'legacy-core-upscaled', 'legacy-core-render', 'legacy-core-present')
+        'legacy-core-upscaled', 'legacy-core-render', 'legacy-core-present', 'online-update')
     if ($Case.Count) {
         foreach ($requested in $Case) {
             if ($requested -notin $cases) { throw "Unknown configuration case: $requested" }

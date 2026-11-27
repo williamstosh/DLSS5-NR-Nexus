@@ -1,6 +1,51 @@
 {
   "rows": [
     {
+      "id": "online-update",
+      "state": "ready",
+      "intent": [],
+      "commands": [],
+      "producer": "An independent startup callback or player command starts the same module-pinned worker in ordinary and DEV builds; host unload drains it before releasing the host reference.",
+      "consumer": "The shared About panel reads coherent release and download snapshots; the frame callback persists the independent update preferences.",
+      "success": "A valid official release is compared numerically; a unique ZIP is published only after exact-size streaming and successful final rename, or matching existing-file reuse.",
+      "refusal": "Invalid releases, unsafe redirects, rate limits, incomplete transfers and conflicting files remain retryable failures without changing NR or image presets.",
+      "fallback": "A failed recheck retains stale release information; a failed download removes only its owned temporary file and never replaces a conflicting completed ZIP.",
+      "sources": [
+        ["addon.cpp", "void AddonUninit("],
+        ["update.hpp", "inline bool StartCheck("],
+        ["update.hpp", "inline bool StartDownload("],
+        ["ui/update.hpp", "inline void DrawUpdatePanel("],
+        ["dlssnr.hpp", "inline void OnUpdateInit("],
+        ["dlssnr.hpp", "inline void OnUpdatePresent("]
+      ],
+      "cases": [
+        {
+          "suite": "update", "name": "unit", "log": "unit", "existingTrace": true,
+          "receipt": "^NR_RELEASE_PARITY online-update semver_release_asset_url=passed$",
+          "scenarios": ["version-release-assets", "startup-directory-thread"],
+          "expect": {
+            "version-release-assets": "^NR_RELEASE_PARITY online-update semver_release_asset_url=passed$",
+            "startup-directory-thread": "^NR_RELEASE_PARITY online-update directory_startup_thread_failure=passed$"
+          }
+        },
+        {
+          "suite": "update", "name": "loopback", "log": "loopback", "existingTrace": true,
+          "receipt": "^NR_RELEASE_PARITY online-update startup_manual_get_etag_redirect_reuse=passed$",
+          "scenarios": ["check-cache-reuse", "stale-throttle-http", "redirect-retry", "directory-conflict", "rename-race", "progress-cancel-deadline", "folder-actions", "module-lifetime"],
+          "expect": {
+            "check-cache-reuse": "^NR_RELEASE_PARITY online-update startup_manual_get_etag_redirect_reuse=passed$",
+            "stale-throttle-http": "^NR_RELEASE_PARITY online-update stale_boot_throttle_http_metadata_limits=passed$",
+            "redirect-retry": "^NR_RELEASE_PARITY online-update redirect_policy_sizes_disconnect_retry=passed$",
+            "directory-conflict": "^NR_RELEASE_PARITY online-update directory_unavailable_denied_existing_conflict=passed$",
+            "rename-race": "^NR_RELEASE_PARITY online-update same_and_different_size_rename_race=passed$",
+            "progress-cancel-deadline": "^NR_RELEASE_PARITY online-update progress_frozen_directory_cancel_deadline=passed$",
+            "folder-actions": "^NR_RELEASE_PARITY online-update chooser_fallback_cancel_background_shell=passed$",
+            "module-lifetime": "^NR_RELEASE_PARITY online-update module_pin_and_release=passed$"
+          }
+        }
+      ]
+    },
+    {
       "id": "vulkan-recording-lifetime",
       "state": "ready",
       "intent": [],
@@ -419,7 +464,11 @@
     "presets": { "count": 283, "sha256": "4ACC3F4E7FAB3CB35E2122C66668C9AFB293C0A6DD52E0B8183422A7FF206FA1" },
     "ini": { "count": 170, "sha256": "B334112E310AE66299BE73D5E8C34CC01B9987B043F3C9ECF10ED7F90EE39DC3" }
   },
-  "nonGameplaySettings": {},
+  "nonGameplaySettings": {
+    "AutoCheck": { "catalogs": ["ini"], "purpose": "Startup release checks in the independent RenoDX.DLSS5.Update section." },
+    "DownloadDirectory": { "catalogs": ["ini"], "purpose": "Player-selected release ZIP directory, independent of image presets." },
+    "NextAutoCheckUtc": { "catalogs": ["ini"], "purpose": "Persisted startup check cooldown in complete UTC Unix seconds." }
+  },
   "diagnosticCommands": {
     "status": "Snapshot readout.",
     "sr_benchmark": "Bounded SR benchmark capture.",
@@ -434,6 +483,12 @@
     "xefg_present_probe": "Test-only XeFG output/controller probe and calibration."
   },
   "sharedOperationAdapters": {
+    "online_update": {
+      "file": "dev_control.hpp",
+      "start": "if (*operation == \"online_update\")",
+      "end": "if (*operation == \"native_ui_alpha_preflight\")",
+      "anchors": ["update::StartCheck()", "update::StartDownload()", "update::SetAutoCheck(", "update::SetDownloadDirectory(", "update::ChooseDirectory()", "update::OpenDirectory(", "update::OpenRelease()"]
+    },
     "reset_nr": {
       "file": "dev_control.hpp",
       "start": "response[\"reason\"] = \"invalid_reset_request\";",

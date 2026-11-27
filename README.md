@@ -80,7 +80,8 @@ NR Nexus 通过 [ReShade](https://reshade.me/) 为兼容游戏提供 NVIDIA DLSS
 
 **避免重复 NR 插件：** RHI 的 **Install Neural Rendering** 会安装 ShortFuse、DLSS5 Tool 等独立 NR 工具，与上面的 **Deploy DLL** 不同。使用 Nexus 时不要额外安装这些工具；已有安装应先按各自流程卸载，并将旧 Lecram／Nexus 副本移出生效的 Add-on 目录。RHI 可备份、更新或恢复它管理的文件；检查 `AddonPath` 与自动更新设置，避免旧副本重新生效。
 
-**升级：** 关闭游戏、备份，按新版说明替换插件。**卸载：** 关闭游戏，移除插件或恢复旧版。
+**升级：** 关闭游戏、备份，按新版说明替换插件。内置更新检查和下载属于 **0.7.0-dev.1 开发版**功能，尚未随正式安装包发布，操作见[玩家指南](docs/USER_GUIDE.md#zh-install)。
+**卸载：** 关闭游戏，移除插件或恢复旧版。
 保留无关的 DLSS／FG 文件、ReShade 预设、配置和存档。
 
 #### 常用快捷键
@@ -313,6 +314,7 @@ For a first installation, use the third-party **RHI** tool to prepare ReShade an
 **Avoid duplicate NR add-ons:** RHI's **Install Neural Rendering** installs separate tools such as ShortFuse or DLSS5 Tool; it is different from **Deploy DLL** above. Do not install those alongside Nexus. Uninstall existing methods through their own procedures and move older Lecram/Nexus copies out of active add-on directories. RHI can back up, update or restore files it manages; check `AddonPath` and automatic-update settings so old copies do not become active again.
 
 **Upgrade:** close the game, back up and replace the add-on according to the new release's notes.
+For built-in update checks and downloads in **0.7.0-dev.1** (development version, yet to ship in an official package), see the [User Guide](docs/USER_GUIDE.md#en-install).
 **Uninstall:** close the game and remove the add-on or restore the previous version.
 Keep unrelated DLSS/FG files, ReShade presets, configuration and saves.
 

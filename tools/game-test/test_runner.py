@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import ctypes
 from ctypes import wintypes
 import json
+import os
 from pathlib import Path
 import sys
 import threading
@@ -14,6 +15,113 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 from project_temp import project_temporary_directory
 from PIL import Image, ImageDraw
 import runner
+
+
+class UpdatePreferencesFixtureTests(unittest.TestCase):
+    def setUp(self):
+        temp = project_temporary_directory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.run = self.root / 'acceptance-synthetic'
+        self.backup = self.run / 'backup/ReShade.ini'
+        self.backup.parent.mkdir(parents=True)
+        game = self.root / 'game'
+        game.mkdir()
+        saves = self.root / 'profile/saves'
+        saves.mkdir(parents=True)
+        self.config = game / 'ReShade.ini'
+        self.other = game / 'OptiScaler.ini'
+        self.settings = saves.parent / 'dx12user.settings.bak'
+        self.save = saves / 'original.sav'
+        self.protected = [self.backup, self.other, self.settings, self.save]
+        for path in self.protected:
+            path.write_bytes(b'original bytes\r\n')
+        self.config.write_bytes(b'test preferences\r\n')
+        self.cfg = dict(executable=str(game / 'witcher3.exe'), profile=str(saves.parent), save_dir='saves')
+        self.receipt_path = self.run / 'receipt.json'
+        self.owner_path = self.run / 'artifact-lifecycle.json'
+        runner.dump(self.owner_path, dict(schema='nr-nexus-test-output/1', status='Running', ownerPid=os.getppid(),
+                                          entry=str(runner.ROOT / 'tools/run-fg-acceptance.ps1'), runId='fixture-run'))
+        self.receipt = dict(restore_installation=True, install_only=False, installation_verified=True, restored=False,
+                            original_files=[dict(path=str(self.config), backup=str(self.backup),
+                                                 sha256=runner.sha(self.backup).upper())],
+                            test_config_sha256=runner.sha(self.config).upper(),
+                            update_preferences=dict(run_id='fixture-run', requested=dict(
+                                AutoCheck=True, DownloadDirectory='', NextAutoCheckUtc=0)))
+
+    def validate(self, *, preflight=False):
+        runner.dump(self.receipt_path, self.receipt)
+        return runner.update_preferences_fixture(self.cfg, self.receipt_path, preflight=preflight)
+
+    def assert_write_denied(self, path):
+        with self.assertRaises(PermissionError):
+            path.write_bytes(b'unexpected write')
+
+    def test_default_config_remains_read_only(self):
+        with runner.protected_game_run(self.cfg, self.root / 'default', runner.protected_game_files(self.cfg)):
+            self.assert_write_denied(self.config)
+
+    def test_only_fixture_writable_and_original_files_locked_until_process_exit(self):
+        self.cfg['update_preferences_fixture'] = self.validate()
+        out = self.root / 'attempt'
+        observations = iter([[], [{'ProcessId': 42}], [], []])
+
+        def inventory(_):
+            for path in self.protected:
+                self.assert_write_denied(path)
+            return next(observations)
+
+        with (mock.patch.object(runner, 'process_inventory', side_effect=inventory),
+              mock.patch.object(runner.time, 'sleep') as sleep,
+              mock.patch('builtins.print')):
+            with runner.protected_game_run(self.cfg, out, runner.protected_game_files(self.cfg)) as guard:
+                self.assertEqual({Path(entry['path']) for entry in guard.manifest}, set(self.protected))
+                self.config.write_bytes(b'flushed preferences\r\n')
+            sleep.assert_called_once_with(2)
+        self.assertEqual(self.config.read_bytes(), b'flushed preferences\r\n')
+        self.assertTrue(all(path.read_bytes() == b'original bytes\r\n' for path in self.protected))
+
+    def test_rejects_bad_path_hash_owner_and_missing_restoration(self):
+        original = self.receipt['original_files'][0]
+        for record, key, value in (
+                (self.receipt, 'restore_installation', None), (self.receipt, 'install_only', True),
+                (self.receipt, 'test_config_sha256', '0' * 64), (original, 'sha256', '0' * 64),
+                (original, 'path', str(self.other)), (original, 'backup', str(self.other)),
+                (self.receipt['update_preferences'], 'run_id', 'other-run')):
+            with self.subTest(field=key), mock.patch.dict(record, {key: value}):
+                if value is None:
+                    del record[key]
+                with self.assertRaises(ValueError):
+                    self.validate()
+        with (mock.patch.object(runner.os, 'getppid', return_value=os.getppid() + 1),
+              mock.patch.object(runner.subprocess, 'run', return_value=mock.Mock(stdout=''))):
+            with self.assertRaisesRegex(ValueError, 'active acceptance wrapper'):
+                self.validate()
+        self.config.unlink()
+        os.link(self.backup, self.config)
+        with self.assertRaisesRegex(ValueError, 'independent file'):
+            self.validate()
+
+    def test_acceptance_owner_allows_known_windows_python_launcher(self):
+        owner_pid = os.getppid()
+        process = dict(ParentProcessId=owner_pid, ExecutablePath=sys.executable)
+        with (mock.patch.object(runner.os, 'getppid', return_value=owner_pid + 1),
+              mock.patch.object(runner.subprocess, 'run', return_value=mock.Mock(stdout=json.dumps(process)))):
+            self.assertTrue(runner.acceptance_owner_is_parent(owner_pid))
+            self.assertFalse(runner.acceptance_owner_is_parent(owner_pid + 2))
+
+    def test_preflight_binds_original_and_runner_rechecks_hash_under_guard(self):
+        with mock.patch.dict(self.receipt, installation_verified=False):
+            with self.assertRaisesRegex(ValueError, 'ReShade.ini hash mismatch'):
+                self.validate(preflight=True)
+            self.config.write_bytes(self.backup.read_bytes())
+            self.validate(preflight=True)
+        self.config.write_bytes(b'test preferences\r\n')
+        self.cfg['update_preferences_fixture'] = self.validate()
+        self.backup.write_bytes(b'changed after preflight')
+        with self.assertRaisesRegex(ValueError, 'changed before launch'):
+            with runner.protected_game_run(self.cfg, self.root / 'attempt', runner.protected_game_files(self.cfg)):
+                self.fail('Fixture with a changed backup reached launch')
 
 
 class DumpTests(unittest.TestCase):

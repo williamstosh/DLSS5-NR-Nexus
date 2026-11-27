@@ -517,6 +517,83 @@ inline Json Execute(const Json& request) {
   if (operation == request.end() || !operation->is_string()) {
     return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "invalid_operation"}};
   }
+  if (*operation == "online_update") {
+    if (last_request.is_object() && last_request["id"] == *id) {
+      if (request == last_request) return last_receipt;
+      return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "request_id_reused"}};
+    }
+    const auto action = request.find("action");
+    if (action == request.end() || !action->is_string()) {
+      return {{"id", *id}, {"ok", false}, {"status", "rejected"}, {"reason", "invalid_action"}};
+    }
+    bool accepted = false;
+    std::string reason = "invalid_action";
+    if (*action == "status") {
+      accepted = true;
+      reason = "observed";
+    } else if (*action == "check") {
+      accepted = update::StartCheck();
+      reason = "check_requested";
+    } else if (*action == "download") {
+      accepted = update::StartDownload();
+      reason = "download_requested";
+    } else if (*action == "auto_check") {
+      if (const auto value = request.find("enabled"); value != request.end() && value->is_boolean()) {
+        update::SetAutoCheck(value->get<bool>());
+        accepted = true;
+        reason = "preferences_updated";
+      }
+    } else if (*action == "download_directory") {
+      if (const auto value = request.find("directory"); value != request.end() && value->is_string()) {
+        try {
+          const auto& utf8 = value->get_ref<const std::string&>();
+          accepted = update::SetDownloadDirectory(std::filesystem::path(std::u8string(utf8.begin(), utf8.end())));
+          reason = "directory_requested";
+        } catch (const std::filesystem::filesystem_error&) {
+          reason = "invalid_directory";
+        }
+      }
+    } else if (*action == "choose_directory") {
+      accepted = update::ChooseDirectory();
+      reason = "directory_dialog_requested";
+    } else if (*action == "open_directory") {
+      const auto completed = request.find("completed");
+      if (completed == request.end() || completed->is_boolean()) {
+        accepted = update::OpenDirectory(completed != request.end() && completed->get<bool>());
+        reason = "directory_open_requested";
+      }
+    } else if (*action == "open_release") {
+      accepted = update::OpenRelease();
+      reason = "release_page_requested";
+    }
+    const auto snapshot = update::GetSnapshot();
+    const auto path_text = [](const std::filesystem::path& path) {
+      const auto value = path.u8string();
+      return std::string(value.begin(), value.end());
+    };
+    const auto failure = [](const update::Failure& error) {
+      return Json{{"code", static_cast<uint32_t>(error.code)}, {"os_code", error.os_code}, {"http_status", error.http_status}};
+    };
+    Json state{{"busy", snapshot.busy}, {"auto_check", snapshot.settings.auto_check},
+        {"next_auto_check_utc", snapshot.settings.next_auto_check_utc},
+        {"check_state", static_cast<uint32_t>(snapshot.check_state)}, {"stale", snapshot.stale},
+        {"download_state", static_cast<uint32_t>(snapshot.download_state)},
+        {"downloaded_bytes", snapshot.downloaded_bytes}, {"download_size", snapshot.download_size},
+        {"retry_after_utc", snapshot.retry_after_utc},
+        {"check_error", failure(snapshot.check_error)}, {"download_error", failure(snapshot.download_error)},
+        {"action_error", failure(snapshot.action_error)},
+        {"addon_directory", path_text(snapshot.addon_directory)},
+        {"download_directory", path_text(snapshot.settings.download_directory)},
+        {"completed_path", path_text(snapshot.completed_path)},
+        {"release_tag", snapshot.release ? Json(snapshot.release->tag) : Json(nullptr)}};
+    Json response{{"id", *id}, {"ok", accepted}, {"status", accepted ? "accepted" : "rejected"},
+        {"reason", reason}, {"state", ProcessIdentityState()}, {"update", std::move(state)}};
+    if (*action != "status") {
+      last_request = request;
+      last_receipt = response;
+    }
+    return response;
+  }
   if (*operation == "native_ui_alpha_preflight") {
     const auto action = request.find("action");
     if (action == request.end() || !action->is_string()

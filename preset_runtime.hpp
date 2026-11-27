@@ -514,19 +514,19 @@ inline bool Apply(const presets::Document& document, bool compatibility, bool re
   }
   const auto write = [](const std::string& key, const Json& value) {
     if (value.is_null()) {
-      reshade::set_config_value(nullptr, kConfigSection, key.c_str(), static_cast<const char*>(nullptr));
+      configuration::Set(nullptr, kConfigSection, key.c_str(), static_cast<const char*>(nullptr));
     } else if (value.is_string()) {
-      reshade::set_config_value(nullptr, kConfigSection, key.c_str(), value.get_ref<const std::string&>().c_str());
+      configuration::Set(nullptr, kConfigSection, key.c_str(), value.get_ref<const std::string&>().c_str());
     } else if (value.is_boolean()) {
-      reshade::set_config_value(nullptr, kConfigSection, key.c_str(), value.get<bool>());
+      configuration::Set(nullptr, kConfigSection, key.c_str(), value.get<bool>());
     } else if (key == "UiHudAnchor") {
-      reshade::set_config_value(nullptr, kConfigSection, key.c_str(), value.get<int>());
+      configuration::Set(nullptr, kConfigSection, key.c_str(), value.get<int>());
     } else if (key == "UiHudOffsetX" || key == "UiHudOffsetY") {
-      reshade::set_config_value(nullptr, kConfigSection, key.c_str(), value.get<float>());
+      configuration::Set(nullptr, kConfigSection, key.c_str(), value.get<float>());
     } else if (const auto* setting = FindSetting(key); setting != nullptr && setting->f != nullptr) {
-      reshade::set_config_value(nullptr, kConfigSection, key.c_str(), value.get<float>());
+      configuration::Set(nullptr, kConfigSection, key.c_str(), value.get<float>());
     } else {
-      reshade::set_config_value(nullptr, kConfigSection, key.c_str(), value.get<uint32_t>());
+      configuration::Set(nullptr, kConfigSection, key.c_str(), value.get<uint32_t>());
     }
   };
   const auto matches = [](const std::string& key, const Json& value) {
@@ -538,20 +538,20 @@ inline bool Apply(const presets::Document& document, bool compatibility, bool re
     }
     if (value.is_boolean()) {
       bool actual = !value.get<bool>();
-      return reshade::get_config_value(nullptr, kConfigSection, key.c_str(), actual) && actual == value.get<bool>();
+      return configuration::Get(nullptr, kConfigSection, key.c_str(), actual) && actual == value.get<bool>();
     }
     if (key == "UiHudAnchor") {
       int actual = -2;
-      return reshade::get_config_value(nullptr, kConfigSection, key.c_str(), actual) && actual == value.get<int>();
+      return configuration::Get(nullptr, kConfigSection, key.c_str(), actual) && actual == value.get<int>();
     }
     if (const auto* setting = FindSetting(key); (setting != nullptr && setting->f != nullptr)
         || key == "UiHudOffsetX" || key == "UiHudOffsetY") {
       float actual = NAN;
-      return reshade::get_config_value(nullptr, kConfigSection, key.c_str(), actual)
+      return configuration::Get(nullptr, kConfigSection, key.c_str(), actual)
              && std::isfinite(actual) && std::abs(actual - value.get<float>()) <= 0.000001f;
     }
     uint32_t actual = UINT32_MAX;
-    return reshade::get_config_value(nullptr, kConfigSection, key.c_str(), actual) && actual == value.get<uint32_t>();
+    return configuration::Get(nullptr, kConfigSection, key.c_str(), actual) && actual == value.get<uint32_t>();
   };
   for (const auto& [key, value] : writes.items()) {
     write(key, value);
@@ -563,7 +563,7 @@ inline bool Apply(const presets::Document& document, bool compatibility, bool re
   if (!verified) {
     bool restored = true;
     for (const auto& [key, value] : backup) {
-      reshade::set_config_value(nullptr, kConfigSection, key.c_str(), value ? value->c_str() : nullptr);
+      configuration::Set(nullptr, kConfigSection, key.c_str(), value ? value->c_str() : nullptr);
     }
     for (const auto& [key, value] : backup) {
       restored &= ReadPresentRestoreRaw(key.c_str()) == value;

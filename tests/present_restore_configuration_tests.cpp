@@ -7,6 +7,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -23,6 +24,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -50,6 +52,27 @@ uint32_t failures = 0;
 uint32_t reads = 0;
 uint32_t base_queries = 0;
 uint32_t non_global_calls = 0;
+bool probe_config_concurrency = false;
+std::atomic_uint32_t live_config_calls = 0;
+std::atomic_bool overlapping_config_calls = false;
+
+struct ConfigCallScope {
+  bool probing = probe_config_concurrency;
+
+  ConfigCallScope() {
+    if (!probing) return;
+    if (live_config_calls.fetch_add(1) != 0) {
+      overlapping_config_calls = true;
+    }
+    Sleep(1);
+  }
+
+  ~ConfigCallScope() {
+    if (probing) {
+      live_config_calls.fetch_sub(1);
+    }
+  }
+};
 
 struct WriteEvent {
   std::string key;
@@ -118,6 +141,7 @@ extern "C" __declspec(dllexport) bool ReShadeGetBasePath(char* path, size_t* siz
 extern "C" __declspec(dllexport) bool ReShadeGetConfigValue(
     void*, reshade::api::effect_runtime* effect_runtime, const char* section,
     const char* key, char* value, size_t* size) {
+  const ConfigCallScope config_call;
   ++reads;
   if (effect_runtime) ++non_global_calls;
   char buffer[32768]{};
@@ -147,6 +171,7 @@ extern "C" __declspec(dllexport) bool ReShadeGetConfigValue(
 extern "C" __declspec(dllexport) void ReShadeSetConfigValue(
     void*, reshade::api::effect_runtime* effect_runtime, const char* section,
     const char* key, const char* value) {
+  const ConfigCallScope config_call;
   if (effect_runtime) ++non_global_calls;
   const bool stored = failed_key != key
                       && WritePrivateProfileStringA(section, key, value, ini_path.c_str()) != FALSE;
@@ -229,7 +254,7 @@ int main(int argc, char** argv) {
           || test_case == "save-fail-version" || test_case == "reset") {
         addon += "NRPresentRestoreScope=0\r\nNRPresentRestoreScopeConfigVersion=1\r\n";
         if (test_case == "reset") addon += "UnregisteredPersistentKnob=42\r\n";
-      } else if (test_case == "scope1") {
+      } else if (test_case == "scope1" || test_case == "online-update") {
         addon += "NRPresentRestoreScope=1\r\nNRPresentRestoreScopeConfigVersion=1\r\n";
       } else if (test_case == "malformed-scope") {
         addon += "NRPresentRestoreScope=garbage\r\nNRPresentRestoreScopeConfigVersion=1\r\n";
@@ -313,6 +338,23 @@ int main(int argc, char** argv) {
     if (test_case == "fail-sdr-version") failed_key = "NRPresentSdrRestoreConfigVersion";
     if (test_case == "fail-hdr-version") failed_key = "NRPresentHdrPedestalConfigVersion";
     runtime::LoadConfiguration();
+    if (test_case == "future-global" || test_case == "malformed-global") {
+      namespace updater = renodx::addons::dlss5::update;
+      const auto original_create = updater::internal::service.create_thread;
+      updater::internal::service.create_thread = +[](LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE,
+                                                     LPVOID, DWORD, LPDWORD) -> HANDLE {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return nullptr;
+      };
+      const auto before_update = Bytes();
+      const auto before_writes = writes.size();
+      runtime::OnUpdateInit(nullptr);
+      runtime::OnUpdatePresent(nullptr);
+      updater::internal::service.create_thread = original_create;
+      Check(Bytes() == before_update && writes.size() == before_writes,
+            "automatic update cooldown preserves future or invalid global configuration read-only protection");
+    }
+#include "update_configuration_cases.hpp"
     if (test_case == "nr-resolution-adaptive") {
       Check(!runtime::nr_adaptive_enabled.load() && runtime::nr_adaptive_target_fps.load() == 60.f
                 && runtime::nr_adaptive_min_scale.load() == .67f && runtime::nr_adaptive_selected_levels.load() == 0

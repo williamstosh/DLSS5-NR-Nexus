@@ -29,6 +29,8 @@
 
 Quick 使用 Cyber Neon／简体中文，包含四页真实“展开全部／折叠全部”、模型选择、方案库任务、确认窗、辅助输入入口及代表性 Pass／诊断状态。Full 另作已注册主题、中英与长文本、多宽度／字号的正交覆盖；文档模式覆盖现有七个主题，原有完整菜单回归矩阵仍独立运行。
 
+在线更新的 Quick 场景为 `updates-checking`、`updates-available`、`updates-error`、`updates-downloading` 和 `updates-complete`。英文另有 `updates-available-en`（窄宽度）与 `updates-complete-en`。场景将合成快照交给生产更新面板。文档模式复用完成状态，按面板实际边界裁剪 `updates.webp` 与 `updates-zh.webp`。
+
 完整页面保持真实宽度、字体及间距，按实际内容增高虚拟视口，稳定后要求内容区无未捕获滚动范围且底部在界内，不拉伸、不拼接。下拉、Tooltip、模态窗及滚动检查使用独立真实视口。原生文件选择器、Unicode 编辑窗口及 IME 候选不属于 ImGui DrawData，沿用原有专项测试；离屏预览只展示其 ImGui 入口。
 
 夹具使用本机系统字体，中文已覆盖；没有加载 ReShade 的 ForkAwesome 图标字体，状态卡的部分图标可能显示替代字形，覆盖报告保留此限制。控件布局与文字的离屏检查不认证该图标或宿主实际字体的保真。

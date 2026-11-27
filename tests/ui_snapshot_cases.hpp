@@ -33,6 +33,13 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
   const char* pages[] = {"quality", "multipass", "diagnostics", "advanced"};
   std::vector<Scenario> scenarios;
   if (!docs_only) {
+    for (const char* action : {"updates-checking", "updates-available", "updates-error",
+                               "updates-downloading", "updates-complete"}) {
+      scenarios.push_back({.id = action, .page = 3, .action = action});
+    }
+    scenarios.push_back({.id = "updates-available-en", .page = 3, .action = "updates-available",
+                         .language = 1, .width = 450.f});
+    scenarios.push_back({.id = "updates-complete-en", .page = 3, .action = "updates-complete", .language = 1});
     scenarios.push_back({.id = "adaptive-resolution", .action = "adaptive-resolution", .language = 1});
     scenarios.push_back({.id = "adaptive-resolution-zh", .action = "adaptive-resolution", .language = 14});
     for (int language : {1, 14}) {
@@ -274,6 +281,8 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
   if (include_docs) {
     for (int language : {1, 14}) {
       const std::string suffix = (language == 14 ? "-zh" : "");
+      scenarios.push_back({.id = "doc-updates" + suffix, .page = 3, .action = "updates-complete",
+                           .language = language, .doc_role = "updates"});
       for (const auto& [role, page] : {std::pair{"quality", 0}, {"multipass", 1}, {"results", 0},
                                      {"diagnostics", 2}, {"advanced", 3}, {"presets", 0}}) {
         scenarios.push_back({.id = std::string("doc-") + role + suffix, .page = page,
@@ -358,6 +367,34 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
         == registry["expected"].end()) continue;
     const bool round_seven = scenario.action.starts_with("r7-");
     const bool edit_reuse_snapshot = scenario.action == "edit-reuse-enabled";
+    const bool updates_snapshot = scenario.action.starts_with("updates-");
+    update::Snapshot update_evidence;
+    if (updates_snapshot) {
+      update_evidence.addon_directory = LR"(C:\Example Game\Addons)";
+      if (scenario.action == "updates-checking") {
+        update_evidence.check_state = update::CheckState::CHECKING;
+        update_evidence.busy = true;
+      } else if (scenario.action == "updates-error") {
+        update_evidence.settings.auto_check = false;
+        update_evidence.check_state = update::CheckState::FAILED;
+        update_evidence.check_error = {.code = update::Error::NETWORK, .os_code = 12007};
+      } else {
+        update_evidence.release = UpdateUiRelease();
+        update_evidence.check_state = update::CheckState::UPDATE_AVAILABLE;
+        update_evidence.settings.download_directory = LR"(C:\Downloads\NR Nexus)";
+        if (scenario.action == "updates-downloading") {
+          update_evidence.download_state = update::DownloadState::DOWNLOADING;
+          update_evidence.downloaded_bytes = 1966080;
+          update_evidence.download_size = update_evidence.release->asset->size;
+          update_evidence.busy = true;
+        } else if (scenario.action == "updates-complete") {
+          update_evidence.download_state = update::DownloadState::COMPLETED;
+          update_evidence.completed_path = update_evidence.settings.download_directory / update_evidence.release->asset->name;
+          update_evidence.settings.download_directory = LR"(C:\Next Download)";
+        }
+      }
+      update_fixture = &update_evidence;
+    }
     const bool saved_adaptive_enabled = runtime::nr_adaptive_enabled.load();
     const float saved_adaptive_target = runtime::nr_adaptive_target_fps.load();
     const float saved_adaptive_minimum = runtime::nr_adaptive_min_scale.load();
@@ -734,7 +771,8 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
     for (auto& scope : ui::fold_scopes) scope = {};
     settle();
     drain_workers();
-    if (scenario.action != "doc-default" && scenario.action != "r7-common" && !edit_reuse_snapshot && !synthetic_window) {
+    if (scenario.action != "doc-default" && scenario.action != "r7-common"
+        && !edit_reuse_snapshot && !synthetic_window && !updates_snapshot) {
       // The manager inherits the page's fold scope; keep its custom tools folded until explicitly clicked.
       click(find(collapsed ? "collapse_all" : "expand_all"));
     }
@@ -861,6 +899,41 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
       check(scroller, "fixed viewport must expose the production vertical scroller");
     }
     std::string interaction = (scenario.action == "doc-default" ? "production default folds" : "real expand_all/collapse_all button");
+    if (updates_snapshot) {
+      interaction = "production update panel; synthetic update state without network or file actions";
+      for (const char* id : {"update_check", "update_choose_directory", "update_open_directory"}) {
+        check(find(id).disabled == update_evidence.busy, "update action interlock disagrees with snapshot task state");
+      }
+      check(!find(ui::Tr(ui::text::kUpdateAutoCheck)).disabled,
+            "automatic checks remain independently configurable during a task");
+      const auto shows = [&](std::string_view text) {
+        return std::ranges::any_of(rendered_text, [&](const auto& item) { return item.text.find(text) != std::string::npos; });
+      };
+      const char* status = ui::text::kUpdateAvailable;
+      if (scenario.action == "updates-checking") {
+        status = ui::text::kUpdateChecking;
+      } else if (scenario.action == "updates-error") {
+        status = ui::text::kUpdateCheckFailed;
+        check(shows(ui::Tr(ui::text::kUpdateErrorNetwork)), "check failure draws the error category");
+      } else if (scenario.action == "updates-complete") {
+        status = ui::text::kUpdateComplete;
+        check(shows("C:\\Downloads\\NR Nexus") && shows("C:\\Next Download") && shows("C:\\Example Game\\Addons")
+                  && shows(update_evidence.release->asset->name) && shows(ui::Tr(ui::text::kUpdateInstallSteps)),
+              "completion shows the finished ZIP, its directory, the next destination, the installed directory and replacement steps");
+      }
+      if (update_evidence.release != nullptr) {
+        check(find("update_download").disabled == update_evidence.busy
+                  && find("update_release_page").disabled == update_evidence.busy
+                  && shows("2026-11-26T10:42:50Z"),
+              "release information and explicit actions agree with the snapshot");
+      }
+      if (scenario.action == "updates-downloading") {
+        std::string label = ui::Tr(ui::text::kUpdateDownloading);
+        label.replace(label.find("%s"), 2, update_evidence.release->version);
+        check(shows(label), "download progress names the official version");
+      }
+      check(shows(ui::Tr(status)), "update snapshot displays its intended status");
+    }
     if (edit_reuse_snapshot) {
       interaction = "real x2 request switch; no NR or FG execution";
     }
@@ -1518,9 +1591,14 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
       regions[name] = {(std::max)(0.f, rect.Min.x - 4.f), (std::max)(0.f, rect.Min.y - 4.f),
                        (std::min)(panel_width, rect.Max.x + 4.f), (std::min)(panel_height, rect.Max.y + 4.f)};
     }
+    if (updates_snapshot) {
+      check(snapshot_regions.contains("updates") && snapshot_regions.at("updates").Max.y <= panel_height,
+            "the captured update panel fits within the fixture viewport");
+    }
     if (!scenario.doc_role.empty()) {
       const std::string region = (scenario.doc_role == "gpu-comparison" ? "gpu_comparison"
                                   : scenario.doc_role == "results" ? "result_controls"
+                                  : scenario.doc_role == "updates" ? "updates"
                                   : scenario.doc_role == "presets" ? "library" : "page_body");
       check(regions.contains(region), "documentation semantic crop region missing");
       regions["doc"] = regions[region];
@@ -1618,6 +1696,7 @@ if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr || std::getenv("NR_NEXUS_DOC
       profile::observed_snapshot = profile::Snapshot();
     }
     monitor_fixture = nullptr;
+    update_fixture = nullptr;
     hud_fixture = false;
     independent_hud_fixture = false;
     runtime::monitor_requested = false;

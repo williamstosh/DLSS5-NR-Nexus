@@ -123,6 +123,104 @@ def sha(path):
     with open(path, 'rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
+def acceptance_owner_is_parent(owner_pid):
+    if type(owner_pid) is not int or owner_pid <= 0:
+        return False
+    parent = os.getppid()
+    if parent == owner_pid:
+        return True
+    # Windows venv redirectors and the supported py.exe launcher can add one process.
+    command = (f'Get-CimInstance Win32_Process -Filter "ProcessId={parent}" | '
+               'Select-Object ParentProcessId,ExecutablePath | ConvertTo-Json -Compress')
+    result = subprocess.run(PS + [command], capture_output=True, encoding='utf-8', timeout=20, check=True)
+    launcher = json.loads(result.stdout) if result.stdout.strip() else {}
+    executable = Path(launcher.get('ExecutablePath') or '')
+    return (launcher.get('ParentProcessId') == owner_pid
+            and (executable == Path(sys.executable) or executable.name.lower() == 'py.exe'))
+
+def independent_fixture_file(path):
+    from guard import _plain_path
+    path = _plain_path(path, file=True)
+    if path.stat().st_nlink != 1:
+        raise ValueError(f'Update preferences fixture requires an independent file: {path}')
+    return path
+
+def update_preferences_fixture(cfg, receipt_path, *, preflight=False):
+    receipt_path = independent_fixture_file(receipt_path)
+    run = receipt_path.parent
+    if (receipt_path.name != 'receipt.json' or not run.name.startswith('acceptance-')
+            or not any(run.is_relative_to(ROOT / name) for name in ('tmp', 'artifacts'))):
+        raise ValueError('Update preferences fixture requires a repository acceptance receipt')
+    marker = independent_fixture_file(run / 'artifact-lifecycle.json')
+    owner = json.loads(marker.read_text(encoding='utf-8-sig'), object_pairs_hook=_unique_json_object)
+    receipt = json.loads(receipt_path.read_text(encoding='utf-8-sig'), object_pairs_hook=_unique_json_object)
+    preferences = receipt.get('update_preferences') or {}
+    if (owner.get('schema') != 'nr-nexus-test-output/1' or owner.get('status') != 'Running'
+            or not acceptance_owner_is_parent(owner.get('ownerPid'))
+            or Path(owner.get('entry') or '') != ROOT / 'tools/run-fg-acceptance.ps1'
+            or not owner.get('runId') or owner['runId'] != preferences.get('run_id')
+            or set(preferences.get('requested') or {}) != {'AutoCheck', 'DownloadDirectory', 'NextAutoCheckUtc'}):
+        raise ValueError('Update preferences fixture does not belong to the active acceptance wrapper')
+    if (receipt.get('restore_installation') is not True or receipt.get('install_only') is not False
+            or receipt.get('installation_verified') is not (not preflight)
+            or receipt.get('restored') is not False or receipt.get('restore_pending')):
+        raise ValueError('Update preferences fixture requires an active game run with full restoration')
+
+    config = independent_fixture_file(Path(cfg['executable']).parent / 'ReShade.ini')
+    originals = [entry for entry in receipt['original_files'] if Path(entry['path']) == config]
+    backup = run / 'backup/ReShade.ini'
+    if len(originals) != 1 or Path(originals[0]['backup']) != backup:
+        raise ValueError('Update preferences fixture requires the matching game ReShade.ini and acceptance backup')
+    original_hash = originals[0]['sha256'].lower()
+    if sha(independent_fixture_file(backup)) != original_hash:
+        raise ValueError('Update preferences original backup hash mismatch')
+    initial_hash = original_hash if preflight else receipt['test_config_sha256'].lower()
+    if sha(config) != initial_hash:
+        raise ValueError('Update preferences ReShade.ini hash mismatch')
+    return dict(receipt=str(receipt_path), run_id=owner['runId'], path=str(config), backup=str(backup),
+                original_sha256=original_hash, initial_sha256=initial_hash)
+
+def protected_game_files(cfg):
+    profile = Path(cfg['profile'])
+    protected = [p for p in (profile / cfg['save_dir']).iterdir() if p.is_file()]
+    protected += list(profile.glob('*.settings*'))
+    protected += list(Path(cfg['executable']).parent.glob('*.ini'))
+    return protected
+
+def wait_for_fixture_exit(cfg, out):
+    waiting = False
+    while True:
+        try:
+            if not process_inventory(cfg['executable']) and not process_inventory('CrashReporter.exe'):
+                return
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass  # An unknown process state cannot authorize release of file locks.
+        if not waiting:
+            print('HUMAN_INTERVENTION_REQUIRED=' + str(out), flush=True)
+            waiting = True
+        time.sleep(2)
+
+@contextmanager
+def protected_game_run(cfg, out, protected):
+    from guard import ProtectedFiles
+
+    fixture = cfg.get('update_preferences_fixture')
+    if fixture:
+        config, backup = Path(fixture['path']), Path(fixture['backup'])
+        protected.remove(config)
+        protected.append(backup)
+    with ProtectedFiles(protected, out / 'protected') as guard:
+        if fixture:
+            backup_entry = next(entry for entry in guard.manifest if Path(entry['path']) == backup)
+            if (backup_entry['sha256'] != fixture['original_sha256']
+                    or sha(independent_fixture_file(config)) != fixture['initial_sha256']):
+                raise ValueError('Update preferences fixture hash changed before launch')
+        try:
+            yield guard
+        finally:
+            if fixture:
+                wait_for_fixture_exit(cfg, out)
+
 def resolve_target(game, platform, save, addon_absent_control=False, target_path=None, control_backend='script'):
     if not re.fullmatch(r'[a-z0-9-]+', game) or not re.fullmatch(r'[a-z0-9-]+', platform):
         raise ValueError('Invalid target name')
@@ -1442,7 +1540,6 @@ def finish_artifacts(out, final, guard_ok):
 
 
 def run_attempt(cfg, out):
-    from guard import ProtectedFiles
     output_lifecycle.initialize(out)
     dump(out / 'target.json', cfg)
     source = out / 'source'
@@ -1461,10 +1558,7 @@ def run_attempt(cfg, out):
     dump(out / 'source-manifest.json', dict(files=sources, target_sha256=sha(out / 'target.json'),
                                           ocr_sha256=sha(cfg['ocr_executable']) if cfg.get('ocr_executable') else None))
     print('RUN_DIRECTORY=' + str(out), flush=True)
-    profile = Path(cfg['profile'])
-    protected = [p for p in (profile / cfg['save_dir']).iterdir() if p.is_file()]
-    protected += list(profile.glob('*.settings*'))
-    protected += list(Path(cfg['executable']).parent.glob('*.ini'))
+    protected = protected_game_files(cfg)
     child, capture_child, capture_log, owned, problem, guard_ok = None, None, None, None, None, False
     mod_lease = None
     mod_installed_by_runner = False
@@ -1482,7 +1576,7 @@ def run_attempt(cfg, out):
             dump(out / 'temporary-mod.json', dict(time=stamp(), name='modNRNexusTestBridge',
                 installed_by_runner=mod_lease.owned,
                 files=[dict(path=str(path), sha256=sha(path)) for path in mod_files]))
-        with ProtectedFiles(protected, out / 'protected') as guard:
+        with protected_game_run(cfg, out, protected) as guard:
             dump(out / 'protected-files.json', guard.manifest)
             freeze_logs(cfg, out / 'logs-before')
             crash_evidence.configurations(cfg, out / 'deployment-config')
@@ -1775,12 +1869,15 @@ def main():
     parser.add_argument('--manual-ime-session', action='store_true')
     parser.add_argument('--save')
     parser.add_argument('--preflight', action='store_true')
+    parser.add_argument('--update-preferences-receipt', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--addon-absent-control', action='store_true')
     parser.add_argument('--retries', type=int, choices=range(3), default=0,
                         help='Retries after a safely recovered failure (default: 0)')
     parser.add_argument('--worker', type=Path)
     args = parser.parse_args()
     filesystem_context = normal_process.require_normal_context()
+    if args.update_preferences_receipt and (args.worker or args.scenario == 'calibrate' or args.retries):
+        parser.error('Update preferences require a single protected acceptance game run')
     try:
         validate_capture_hold_scenario(args.scenario, args.capture_hold_seconds)
     except ValueError as error:
@@ -1797,10 +1894,17 @@ def main():
         parser.error('--capture-script requires nonzero capture hold and cannot use --manual-ime-session')
     script = capture_script_path(args.capture_script) if args.capture_script else None
     output_root = local_output_root(args.output_root)
-    output_lifecycle.maintain_workspace(ROOT)
+    if not (args.update_preferences_receipt and args.preflight):
+        output_lifecycle.maintain_workspace(ROOT)
     control_backend = 'desktop' if args.manual_ime_session else 'script'
     cfg = resolve_target(args.game, args.platform, args.save, args.addon_absent_control,
                          args.target, control_backend=control_backend)
+    if 'update_preferences_fixture' in cfg:
+        raise ValueError('Update preferences fixture must come from the active acceptance wrapper')
+    if args.update_preferences_receipt:
+        fixture = update_preferences_fixture(cfg, args.update_preferences_receipt, preflight=args.preflight)
+        if not args.preflight:
+            cfg['update_preferences_fixture'] = fixture
     cfg['scenario'] = args.scenario
     cfg['capture_hold_seconds'] = args.capture_hold_seconds
     cfg['manual_ime_session'] = args.manual_ime_session

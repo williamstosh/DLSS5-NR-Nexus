@@ -46,9 +46,13 @@ param(
     [switch]$InstallOnly,
     [switch]$ManualImeSession,
     [switch]$RestoreInstallation,
-    [switch]$AddonAbsentControl
+    [switch]$AddonAbsentControl,
+    [string]$UpdatePreferencesPath
 )
 $ErrorActionPreference = 'Stop'
+if ($PSBoundParameters.ContainsKey('UpdatePreferencesPath') -and (-not $RestoreInstallation -or $InstallOnly)) {
+    throw '-UpdatePreferencesPath requires -RestoreInstallation and a game run; -InstallOnly is not supported.'
+}
 if ($UncapGameFps -and (-not $RestoreInstallation -or $InstallOnly)) {
     throw 'UncapGameFps requires a restored test session, not InstallOnly.'
 }
@@ -396,7 +400,142 @@ function Set-XeFgExtensionLogging([string]$Text) {
     if ([regex]::Matches($Text, $pattern).Count -ne 1) { throw 'Expected one XeFGUnlock DisableLogging setting' }
     return [regex]::Replace($Text, $pattern, 'DisableLogging=false')
 }
+function Read-FgAcceptanceUpdatePreferences([string]$Path, [string]$RepositoryRoot) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or $Path -match '\p{Cc}') {
+        throw '-UpdatePreferencesPath must name a JSON file below repository tmp/ or artifacts/.'
+    }
+    $utf8 = [Text.UTF8Encoding]::new($false, $true)
+    $null = $utf8.GetByteCount($Path)
+    $source = Resolve-NexusProjectPath -Root $RepositoryRoot -Path $Path
+    if ([IO.Path]::GetExtension($source) -ine '.json' -or
+        -not (@('tmp','artifacts') | Where-Object {
+            $source.StartsWith((Join-Path $RepositoryRoot $_) + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
+        }) -or -not (Test-Path -LiteralPath $source -PathType Leaf)) {
+        throw '-UpdatePreferencesPath must name a JSON file below repository tmp/ or artifacts/.'
+    }
+
+    $bytes = [IO.File]::ReadAllBytes($source)
+    $json = $utf8.GetString($bytes)
+    if ($json.StartsWith([char]0xFEFF)) { $json = $json.Substring(1) }
+    $document = [System.Text.Json.JsonDocument]::Parse($json, [System.Text.Json.JsonDocumentOptions]::new())
+    $requested = [ordered]@{}
+    try {
+        if ($document.RootElement.ValueKind -ne 'Object') { throw 'Update preferences must be a JSON object.' }
+        foreach ($property in $document.RootElement.EnumerateObject()) {
+            $name = $property.Name
+            $value = $property.Value
+            if ($name -cnotin @('AutoCheck','DownloadDirectory','NextAutoCheckUtc') -or $requested.Contains($name)) {
+                throw 'Update preferences contain an unknown or duplicate field.'
+            }
+            switch ($name) {
+                'AutoCheck' {
+                    if ($value.ValueKind -notin @('True','False')) { throw 'AutoCheck must be a JSON boolean.' }
+                    $requested[$name] = $value.GetBoolean()
+                }
+                'DownloadDirectory' {
+                    if ($value.ValueKind -ne 'String') { throw 'DownloadDirectory must be a JSON string.' }
+                    $directory = $value.GetString()
+                    if ($directory -match '\p{Cc}' -or $directory.IndexOfAny([IO.Path]::GetInvalidPathChars()) -ge 0 -or
+                        $directory.EndsWith(' ') -or ($directory -ne '' -and -not [IO.Path]::IsPathFullyQualified($directory))) {
+                        throw 'DownloadDirectory must be empty or a fully qualified path that ReShade can preserve.'
+                    }
+                    $requested[$name] = $directory
+                }
+                'NextAutoCheckUtc' {
+                    $utc = 0L
+                    if ($value.ValueKind -ne 'Number' -or -not $value.TryGetInt64([ref]$utc) -or $utc -lt 0) {
+                        throw 'NextAutoCheckUtc must be a nonnegative JSON int64.'
+                    }
+                    $requested[$name] = $utc
+                }
+            }
+        }
+        if ($requested.Count -ne 3) { throw 'Update preferences require AutoCheck, DownloadDirectory and NextAutoCheckUtc.' }
+    } finally {
+        $document.Dispose()
+    }
+    return [ordered]@{
+        source_sha256=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+        requested=$requested
+    }
+}
+function Set-FgAcceptanceUpdateSection([string]$Text, $Preferences) {
+    $name = 'RenoDX.DLSS5.Update'
+    $headers = [regex]::Matches($Text, '(?m)^[ \t]*\[[^\r\n]*(?:\r?\n|\z)')
+    $section = $null
+    $bodyEnd = $Text.Length
+    foreach ($header in $headers) {
+        if ($header.Value.Split(']', 2)[0].Trim([char[]]" `t`r`n[") -ceq $name) {
+            if ($null -ne $section) { throw "Duplicate [$name] sections in ReShade.ini." }
+            $section = $header
+        } elseif ($null -ne $section -and $bodyEnd -eq $Text.Length) {
+            $bodyEnd = $header.Index
+        }
+    }
+    $newline = [regex]::Match($Text, '\r?\n').Value
+    if ($null -ne $section) {
+        $sectionNewline = [regex]::Match($section.Value, '\r?\n\z').Value
+        if ($sectionNewline) { $newline = $sectionNewline }
+    }
+    if (-not $newline) { $newline = [Environment]::NewLine }
+    # ReShade's scalar string format doubles literal commas inside a value.
+    $values = @(
+        "AutoCheck=$([int]$Preferences.AutoCheck)"
+        "DownloadDirectory=$($Preferences.DownloadDirectory.Replace(',', ',,'))"
+        "NextAutoCheckUtc=$($Preferences.NextAutoCheckUtc.ToString([Globalization.CultureInfo]::InvariantCulture))"
+    ) -join $newline
+    if ($null -eq $section) {
+        if ($Text.Length -gt 0 -and -not $Text.EndsWith("`n")) { $Text += $newline }
+        return $Text + "[$name]" + $newline + $values + $newline
+    }
+
+    $bodyStart = $section.Index + $section.Length
+    $body = $Text.Substring($bodyStart, $bodyEnd - $bodyStart)
+    # Remove old entries for these keys so ReShade reads exactly one value per key.
+    $body = [regex]::Replace($body, '(?m)^[ \t]*(?:AutoCheck|DownloadDirectory|NextAutoCheckUtc)[ \t]*(?:=[^\r\n]*)?(?:\r?\n|\z)', '')
+    $prefix = $Text.Substring(0, $bodyStart)
+    if (-not $prefix.EndsWith("`n")) { $prefix += $newline }
+    return $prefix + $values + $newline + $body + $Text.Substring($bodyEnd)
+}
+function Set-FgAcceptanceConfigFixture([string]$Path, [byte[]]$Bytes) {
+    # Install a separate file at ReShade's normal path so it can flush normally.
+    $staged = Join-Path ([IO.Path]::GetDirectoryName($Path)) ('.nr-nexus-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    $stream = [IO.File]::Open($staged, 'CreateNew', 'Write', 'None')
+    try {
+        try { $stream.Write($Bytes, 0, $Bytes.Length) } finally { $stream.Dispose() }
+        if ([IO.File]::Exists($Path)) {
+            [IO.File]::Replace($staged, $Path, [NullString]::Value)
+        } else {
+            [IO.File]::Move($staged, $Path)
+        }
+    } finally {
+        [IO.File]::Delete($staged)
+    }
+}
+function Get-FgAcceptanceUpdateEvidence([byte[]]$Bytes) {
+    $text = [Text.UTF8Encoding]::new($false, $true).GetString($Bytes).TrimStart([char]0xFEFF)
+    $sections = [regex]::Matches($text, '(?ms)^[ \t]*\[RenoDX\.DLSS5\.Update\][ \t]*\r?$\n?(?:(?!^[ \t]*\[).)*')
+    return [ordered]@{
+        final_sha256=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($Bytes))
+        update_section=$(if ($sections.Count -eq 1) { $sections[0].Value })
+    }
+}
+function Restore-FgAcceptanceConfigFixture($Original) {
+    $bytes = [IO.File]::ReadAllBytes($Original.backup)
+    if ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)) -ne $Original.sha256) {
+        throw 'Update preferences restoration backup hash mismatch'
+    }
+    Set-FgAcceptanceConfigFixture $Original.path $bytes
+    if ((Get-FileHash -LiteralPath $Original.path).Hash -ne $Original.sha256) {
+        throw 'Acceptance restoration hash mismatch'
+    }
+}
 $taskRoot = Split-Path -Parent $PSScriptRoot
+$taskUpdatePreferences = $null
+if ($PSBoundParameters.ContainsKey('UpdatePreferencesPath')) {
+    . (Join-Path $PSScriptRoot 'project-paths.ps1')
+    $taskUpdatePreferences = Read-FgAcceptanceUpdatePreferences $UpdatePreferencesPath $taskRoot
+}
 $OutputRoot = [IO.Path]::GetFullPath($OutputRoot)
 if (-not (@('tmp','artifacts') | Where-Object { $OutputRoot.StartsWith((Join-Path $taskRoot $_) + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) })) {
     throw 'Acceptance output must remain below repository tmp/ or artifacts/.'
@@ -471,6 +610,9 @@ foreach ($taskFile in @($taskBackupFiles) + @($taskCandidate.path)) {
 if ((Get-FileHash -LiteralPath $taskCandidate.path).Hash -ne $taskCandidate.sha256) { throw 'Frozen candidate hash mismatch' }
 $taskRunning = @(Get-Process -Name witcher3,CrashReporter -ErrorAction SilentlyContinue)
 if ($taskRunning.Count) { throw 'Game or crash reporter is already running; installation was not changed' }
+if ($taskUpdatePreferences) {
+    $null = Set-FgAcceptanceUpdateSection ([IO.File]::ReadAllText($taskConfig)) $taskUpdatePreferences.requested
+}
 $taskRun = Join-Path $OutputRoot ('acceptance-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ'))
 . (Join-Path $PSScriptRoot '../tests/test-support.ps1')
 # Keep acceptance cleanup scoped to this output; run-tests owns workspace-wide sweeps.
@@ -481,6 +623,7 @@ $taskOutputState.retainedPaths = @('backup')
 $taskOutputState | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $taskRun 'artifact-lifecycle.json') -Encoding utf8
 $taskReceiptPath = Join-Path $taskRun 'receipt.json'
 $taskOutcome = 'Failed'
+$taskConfigBackupLock = $null
 try {
 $taskBackup = Join-Path $taskRun 'backup'
 New-Item -ItemType Directory -Path $taskBackup | Out-Null
@@ -531,8 +674,26 @@ $taskReceipt = [ordered]@{
     keepRawArtifacts=($env:NR_NEXUS_TEST_KEEP_RAW -eq '1')
     isolated_addons=@()
 }
+if ($taskUpdatePreferences) {
+    $taskReceipt.restore_installation = [bool]$RestoreInstallation
+    $taskUpdatePreferences.run_id = $taskOutputState.runId
+    $taskReceipt.update_preferences = $taskUpdatePreferences
+}
 $taskReceiptPath = Join-Path $taskRun 'receipt.json'
 $taskReceipt | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $taskReceiptPath -Encoding utf8
+if ($taskUpdatePreferences) {
+    $taskConfigOriginal = $taskOriginal | Where-Object { $_.path -eq $taskConfig }
+    $taskConfigBackupLock = [IO.File]::Open($taskConfigOriginal.backup, 'Open', 'Read', 'Read')
+    $taskFixtureArguments = @('-B', (Join-Path $PSScriptRoot 'game-test/runner.py'), '--target', $TargetPath,
+        '--output-root', $OutputRoot, '--scenario', $Scenario, '--capture-hold-seconds', "$CaptureHoldSeconds",
+        '--update-preferences-receipt', $taskReceiptPath)
+    if ($Save) { $taskFixtureArguments += @('--save', $Save) }
+    if ($CaptureScript) { $taskFixtureArguments += @('--capture-script', $CaptureScript) }
+    if ($ManualImeSession) { $taskFixtureArguments += '--manual-ime-session' }
+    & $Python @taskFixtureArguments --preflight | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Update preferences fixture preflight failed before installation.' }
+    if ($AddonAbsentControl) { $taskFixtureArguments += '--addon-absent-control' }
+}
 $taskChanged = $false
 try {
     $taskChanged = $true
@@ -677,7 +838,13 @@ try {
         $taskSectionText = [regex]::Replace($taskSectionText, '(?m)^NRGpuTimers=[^\r\n]*', 'NRGpuTimers=1')
     }
     $taskConfigText = $taskConfigText.Substring(0,$taskSection.Index) + $taskSectionText + $taskConfigText.Substring($taskSection.Index+$taskSection.Length)
-    [IO.File]::WriteAllText($taskConfig, $taskConfigText, [Text.UTF8Encoding]::new($false))
+    if ($taskUpdatePreferences) {
+        $taskConfigText = Set-FgAcceptanceUpdateSection $taskConfigText $taskUpdatePreferences.requested
+        $taskConfigBytes = [Text.Encoding]::UTF8.GetBytes($taskConfigText)
+        Set-FgAcceptanceConfigFixture $taskConfig $taskConfigBytes
+    } else {
+        [IO.File]::WriteAllText($taskConfig, $taskConfigText, [Text.UTF8Encoding]::new($false))
+    }
     if ($SdrGameOutput) {
         $taskGameConfigText = [IO.File]::ReadAllText($taskGameConfig)
         $taskGameConfigText = [regex]::Replace($taskGameConfigText, '(?m)^HdrEnabled=(true|false)(?=\r?$)', 'HdrEnabled=false')
@@ -721,12 +888,19 @@ try {
         [IO.File]::WriteAllText($taskGameConfig, $taskGameConfigText, [Text.UTF8Encoding]::new($false))
         $taskReceipt.test_game_config_sha256 = (Get-FileHash -LiteralPath $taskGameConfig).Hash
     }
-    $taskReceipt.installation_verified = $true
     $taskReceipt.test_config_sha256 = (Get-FileHash -LiteralPath $taskConfig).Hash
+    if ($taskUpdatePreferences -and $taskReceipt.test_config_sha256 -ne
+        [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($taskConfigBytes))) {
+        throw 'Update preferences configuration copy hash mismatch'
+    }
+    $taskReceipt.installation_verified = $true
     $taskReceipt | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $taskReceiptPath -Encoding utf8
     Write-Output "ACCEPTANCE_RECEIPT=$taskReceiptPath"
     if ($InstallOnly) {
         $taskReceipt.test_exit_code = 0
+    } elseif ($taskUpdatePreferences) {
+        & $Python @taskFixtureArguments
+        $taskReceipt.test_exit_code = $LASTEXITCODE
     } else {
         & (Join-Path $PSScriptRoot 'run-game-test.ps1') -Python $Python -TargetPath $TargetPath -OutputRoot $OutputRoot -Scenario $Scenario -Save $Save -CaptureHoldSeconds $CaptureHoldSeconds -CaptureScript $CaptureScript -Retries 0 -AddonAbsentControl:$AddonAbsentControl -ManualImeSession:$ManualImeSession
         $taskReceipt.test_exit_code = $LASTEXITCODE
@@ -735,14 +909,49 @@ try {
     if (-not $InstallOnly) {
         foreach ($taskLog in @('ReShade.log','OptiScaler.log','RenoDX-DLSS5-crash.log')) {
             $taskPath = Join-Path $taskGame $taskLog
-            if (Test-Path -LiteralPath $taskPath -PathType Leaf) { Copy-Item -LiteralPath $taskPath -Destination (Join-Path $taskRun $taskLog) }
+            try {
+                if (Test-Path -LiteralPath $taskPath -PathType Leaf) { Copy-Item -LiteralPath $taskPath -Destination (Join-Path $taskRun $taskLog) }
+            } catch {
+                if (-not $taskUpdatePreferences) { throw }
+                $taskReceipt.test_exit_code = 1
+                Write-Warning "Could not copy $taskLog before restoration: $($_.Exception.Message)"
+            }
         }
     }
     $taskRunning = @(Get-Process -Name witcher3,CrashReporter -ErrorAction SilentlyContinue)
+    if ($taskChanged -and $taskUpdatePreferences -and $taskRunning.Count) {
+        $taskReceipt.restore_pending = 'Waiting for game/crash reporter exit with the original ReShade.ini backup locked'
+        try {
+            $taskReceipt | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $taskReceiptPath -Encoding utf8
+        } catch {
+            Write-Warning "Could not write pending restore receipt: $($_.Exception.Message)"
+        }
+        Write-Warning $taskReceipt.restore_pending
+        do {
+            Start-Sleep -Seconds 2
+            $taskRunning = @(Get-Process -Name witcher3,CrashReporter -ErrorAction SilentlyContinue)
+        } while ($taskRunning.Count)
+        $taskReceipt.Remove('restore_pending')
+    }
     if ($taskChanged -and $taskRunning.Count -eq 0) {
+        if ($taskUpdatePreferences -and $taskReceipt.installation_verified) {
+            try {
+                $taskReceipt.update_preferences.test_configuration = Get-FgAcceptanceUpdateEvidence ([IO.File]::ReadAllBytes($taskConfig))
+                if ($null -eq $taskReceipt.update_preferences.test_configuration.update_section) {
+                    throw 'Expected one saved [RenoDX.DLSS5.Update] section.'
+                }
+            } catch {
+                $taskReceipt.update_preferences.evidence_error = $_.Exception.Message
+                $taskReceipt.test_exit_code = 1
+            }
+        }
         foreach ($taskFile in $taskOriginal) {
-            Copy-Item -LiteralPath $taskFile.backup -Destination $taskFile.path
-            if ((Get-FileHash -LiteralPath $taskFile.path).Hash -ne $taskFile.sha256) { throw 'Acceptance restoration hash mismatch' }
+            if ($taskUpdatePreferences -and $taskFile.path -eq $taskConfig) {
+                Restore-FgAcceptanceConfigFixture $taskFile
+            } else {
+                Copy-Item -LiteralPath $taskFile.backup -Destination $taskFile.path
+                if ((Get-FileHash -LiteralPath $taskFile.path).Hash -ne $taskFile.sha256) { throw 'Acceptance restoration hash mismatch' }
+            }
         }
         foreach ($taskAddon in $taskReceipt.isolated_addons) {
             if (-not $taskAddon.isolated) { continue }
@@ -790,6 +999,7 @@ try {
 }
 if ($taskReceipt.test_exit_code -eq 0 -and ($taskReceipt.restored -or $taskReceipt.candidate_retained)) { $taskOutcome = 'Passed' }
 } finally {
+    if ($taskConfigBackupLock) { $taskConfigBackupLock.Dispose() }
     try {
         if (Test-Path -LiteralPath $taskReceiptPath -PathType Leaf) {
             $taskCleanup = Remove-FgAcceptanceBinaryBackups -ReceiptPath $taskReceiptPath -CurrentRun

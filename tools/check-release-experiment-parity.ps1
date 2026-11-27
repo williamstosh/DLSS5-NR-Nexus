@@ -237,7 +237,7 @@ function Get-ReleaseParitySettingCatalog([string]$Config, [string]$Presets, [str
         else { throw "Unresolved preset key: $($field.Groups[3].Value)" }
     })
     $iniKeys = @(foreach ($source in $IniSources) {
-        foreach ($reader in [regex]::Matches($source, '(?:get|set)_config_value\s*\(\s*[^,;]+,\s*[^,;]+,\s*(?:"([A-Za-z_]\w*)"|(?:presets::)?(\w+))\s*,')) {
+        foreach ($reader in [regex]::Matches($source, '(?:(?:get|set)_config_value|configuration::(?:Get|Set))\s*\(\s*[^,;]+,\s*[^,;]+,\s*(?:"([A-Za-z_]\w*)"|(?:presets::)?(\w+))\s*,')) {
             if ($reader.Groups[1].Success) { $reader.Groups[1].Value }
             elseif ($aliases.ContainsKey($reader.Groups[2].Value)) { $aliases[$reader.Groups[2].Value] }
         }
@@ -284,7 +284,7 @@ function Get-ReleaseParityRegistration([string]$SourceRoot, [switch]$AllowPendin
         }
         $caseNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         foreach ($case in $row.cases) {
-            if ($case.suite -cnotin @('fg-native','bridge-motion','adaptive-resolution') -or
+            if ($case.suite -cnotin @('fg-native','bridge-motion','adaptive-resolution','update') -or
                 -not $caseNames.Add("$($case.suite)/$($case.name)") -or $case.log -cnotmatch '^[a-z0-9-]+$' -or
                 -not $case.receipt.StartsWith('^') -or @($case.scenarios).Count -eq 0 -or
                 @($case.scenarios | Sort-Object -Unique).Count -ne $case.scenarios.Count -or
@@ -326,7 +326,7 @@ function Get-ReleaseParityRegistration([string]$SourceRoot, [switch]$AllowPendin
     $presets = Get-Content -LiteralPath (Join-Path $SourceRoot 'preset_fields.hpp') -Raw
     $presetRuntime = Get-Content -LiteralPath (Join-Path $SourceRoot 'preset_runtime.hpp') -Raw
     $iniSources = @(Get-ChildItem -LiteralPath $SourceRoot -File | Where-Object Extension -in @('.hpp','.cpp') |
-        Select-String -Pattern '\b(get_config_value|set_config_value|ReadPresentRestoreRaw)\(' -List |
+        Select-String -Pattern '\b(get_config_value|set_config_value|ReadPresentRestoreRaw|configuration::Get|configuration::Set)\(' -List |
         ForEach-Object { Get-Content -LiteralPath $_.Path -Raw })
     $catalog = Get-ReleaseParitySettingCatalog $config $presets $presetRuntime $iniSources
     foreach ($directory in $catalog.Keys) {

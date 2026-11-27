@@ -977,7 +977,7 @@ inline void SaveMonitorVisibility() {
     }
   }
   if (visible_preference.has_value()) {
-    reshade::set_config_value(nullptr, kConfigSection, "UiMonitorVisible", *visible_preference);
+    configuration::Set(nullptr, kConfigSection, "UiMonitorVisible", *visible_preference);
   }
 }
 
@@ -992,22 +992,22 @@ inline void SaveMonitorSettings() {
   const auto& state = ui_runtime_monitor_state;
   const auto& geometry = state.geometry;
   if (geometry.valid) {
-    reshade::set_config_value(nullptr, kConfigSection, "UiMonitorX", geometry.position.x);
-    reshade::set_config_value(nullptr, kConfigSection, "UiMonitorY", geometry.position.y);
-    reshade::set_config_value(nullptr, kConfigSection, "UiMonitorWidth", geometry.size.x);
-    reshade::set_config_value(nullptr, kConfigSection, "UiMonitorHeight", geometry.size.y);
-    reshade::set_config_value(nullptr, kConfigSection, "UiMonitorScale", geometry.ui_scale);
+    configuration::Set(nullptr, kConfigSection, "UiMonitorX", geometry.position.x);
+    configuration::Set(nullptr, kConfigSection, "UiMonitorY", geometry.position.y);
+    configuration::Set(nullptr, kConfigSection, "UiMonitorWidth", geometry.size.x);
+    configuration::Set(nullptr, kConfigSection, "UiMonitorHeight", geometry.size.y);
+    configuration::Set(nullptr, kConfigSection, "UiMonitorScale", geometry.ui_scale);
   }
-  reshade::set_config_value(nullptr, kConfigSection, "UiMonitorPinned", state.pin);
-  reshade::set_config_value(nullptr, kConfigSection, "UiMonitorDetailed", state.detailed);
-  reshade::set_config_value(nullptr, kConfigSection, "UiMonitorAutoFit", state.auto_fit);
-  reshade::set_config_value(nullptr, kConfigSection, "UiMonitorOpacity", state.background_opacity);
-  reshade::set_config_value(nullptr, kConfigSection, "UiMonitorTrends", state.trends);
-  reshade::set_config_value(nullptr, kConfigSection, "UiMonitorHistorySeconds", state.history_seconds);
-  reshade::set_config_value(nullptr, kConfigSection, "UiMonitorTrendMask", state.trend_mask);
-  reshade::set_config_value(nullptr, kConfigSection, "UiMonitorAnchor", state.anchor);
-  reshade::set_config_value(nullptr, kConfigSection, "UiMonitorOffsetX", state.offset.x);
-  reshade::set_config_value(nullptr, kConfigSection, "UiMonitorOffsetY", state.offset.y);
+  configuration::Set(nullptr, kConfigSection, "UiMonitorPinned", state.pin);
+  configuration::Set(nullptr, kConfigSection, "UiMonitorDetailed", state.detailed);
+  configuration::Set(nullptr, kConfigSection, "UiMonitorAutoFit", state.auto_fit);
+  configuration::Set(nullptr, kConfigSection, "UiMonitorOpacity", state.background_opacity);
+  configuration::Set(nullptr, kConfigSection, "UiMonitorTrends", state.trends);
+  configuration::Set(nullptr, kConfigSection, "UiMonitorHistorySeconds", state.history_seconds);
+  configuration::Set(nullptr, kConfigSection, "UiMonitorTrendMask", state.trend_mask);
+  configuration::Set(nullptr, kConfigSection, "UiMonitorAnchor", state.anchor);
+  configuration::Set(nullptr, kConfigSection, "UiMonitorOffsetX", state.offset.x);
+  configuration::Set(nullptr, kConfigSection, "UiMonitorOffsetY", state.offset.y);
   ui_monitor_geometry_dirty = false;
   ui_monitor_saved_pin = state.pin;
   ui_monitor_saved_detailed = state.detailed;

@@ -87,6 +87,12 @@ void UnregisterOutputSampling() {
 extern "C" __declspec(dllexport) constexpr const char* NAME = NR_NEXUS_ADDON_NAME;
 extern "C" __declspec(dllexport) constexpr const char* DESCRIPTION = NR_NEXUS_DESCRIPTION;
 
+// ReShade calls this before releasing its module reference, outside the loader lock.
+// Finish our worker here so a delayed reference cannot unload a newly created device's add-on.
+extern "C" __declspec(dllexport) void AddonUninit(HMODULE, HMODULE) {
+  renodx::addons::dlss5::update::StopForHostUnload();
+}
+
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
   if (reason == DLL_PROCESS_ATTACH) {
     // Before register_addon: the last-gasp reporter covers even a death in

@@ -74,6 +74,7 @@
 
 #include <deps/imgui/imgui.h>
 #include <include/reshade.hpp>
+#include "reshade_config.hpp"
 #include <embed/shaders.h>
 
 // After imgui.h + reshade.hpp: lastgasp.hpp's reshade::log use must see the
@@ -119,6 +120,7 @@
 #include "ui/profile_hotkeys.hpp"
 #include "ui/runtime_monitor.hpp"
 #include "ui/text_input.hpp"
+#include "ui/update.hpp"
 #include "submission_tracker.hpp"
 #include "edit_reuse.hpp"
 #include "edit_reuse_policy.hpp"
@@ -26564,7 +26566,7 @@ inline void ToggleNrFromHotkey(uint32_t toggle_key, bool overlay_open) {
     native_fg_result.store(fg::Result::PREPARED, std::memory_order_release);
   }
   enabled = next;
-  reshade::set_config_value(nullptr, kConfigSection, "NeuralUplift", next);
+  configuration::Set(nullptr, kConfigSection, "NeuralUplift", next);
   NotifyNrOperation(next);
   Log(
       reshade::log::level::info,
@@ -27861,11 +27863,11 @@ inline void PersistHudPosition() {
     if (!present_restore_configuration.global_writable) return;
   }
   const auto position = GetHudPosition();
-  reshade::set_config_value(nullptr, kConfigSection, "UiHudAnchor", position.anchor);
-  reshade::set_config_value(nullptr, kConfigSection, "UiHudOffsetX", position.offset.x);
-  reshade::set_config_value(nullptr, kConfigSection, "UiHudOffsetY", position.offset.y);
-  reshade::set_config_value(nullptr, kConfigSection, "UiHudX", position.legacy_percent.x);
-  reshade::set_config_value(nullptr, kConfigSection, "UiHudY", position.legacy_percent.y);
+  configuration::Set(nullptr, kConfigSection, "UiHudAnchor", position.anchor);
+  configuration::Set(nullptr, kConfigSection, "UiHudOffsetX", position.offset.x);
+  configuration::Set(nullptr, kConfigSection, "UiHudOffsetY", position.offset.y);
+  configuration::Set(nullptr, kConfigSection, "UiHudX", position.legacy_percent.x);
+  configuration::Set(nullptr, kConfigSection, "UiHudY", position.legacy_percent.y);
 }
 
 inline void MaybeEmitStatusCard(const NrVerdict& verdict, int64_t now_ns,
@@ -28035,14 +28037,14 @@ inline std::atomic<ui::ThemeId> ui_theme_choice{ui::ThemeId::CYBER_NEON};
 inline void StoreUiTheme(ui::ThemeId id) {
   const auto& theme = ui::GetTheme(id);
   ui_theme_choice.store(theme.id, std::memory_order_relaxed);
-  reshade::set_config_value(nullptr, kConfigSection, "UiTheme", theme.slug);
+  configuration::Set(nullptr, kConfigSection, "UiTheme", theme.slug);
 }
 
 // Sets UiLanguage and writes it: the Language row, its reset and
 // PersistConfig.
 inline void StoreUiLanguage(int choice) {
   ui_language_choice = choice;
-  reshade::set_config_value(nullptr, kConfigSection, "UiLanguage",
+  configuration::Set(nullptr, kConfigSection, "UiLanguage",
                             choice == 0 ? "auto" : ui::kLanguages[choice - 1].code);
 }
 
@@ -30139,15 +30141,15 @@ struct Setting {
     if (b == &debug_bypass_hdr_pedestal || u == &debug_hdr_capture_mode) return;
     if (u == &present_sdr_restore_policy) {
       if (!present_sdr_restore_config_writable.load(std::memory_order_relaxed)) return;
-      reshade::set_config_value(nullptr, kConfigSection, "NRPresentSdrRestoreConfigVersion",
+      configuration::Set(nullptr, kConfigSection, "NRPresentSdrRestoreConfigVersion",
                                 present_sdr_restore::CONFIG_VERSION);
     }
     if (f != nullptr) {
-      reshade::set_config_value(nullptr, kConfigSection, key, f->load());
+      configuration::Set(nullptr, kConfigSection, key, f->load());
     } else if (u != nullptr) {
-      reshade::set_config_value(nullptr, kConfigSection, key, u->load());
+      configuration::Set(nullptr, kConfigSection, key, u->load());
     } else {
-      reshade::set_config_value(nullptr, kConfigSection, key, b->load());
+      configuration::Set(nullptr, kConfigSection, key, b->load());
     }
     if (const auto* rule = presets::FindRule(key); rule != nullptr
         && (rule->category == presets::FieldRule::QUALITY || rule->category == presets::FieldRule::MULTIPASS)) {
@@ -31221,18 +31223,18 @@ inline void ResetSettings(std::initializer_list<SettingGroup> groups) {
 // session and were gone at the next launch.
 inline std::optional<std::string> ReadPresentRestoreRaw(const char* key) {
   size_t length = 0;
-  if (!reshade::get_config_value(nullptr, kConfigSection, key, nullptr, &length)) return std::nullopt;
+  if (!configuration::Get(nullptr, kConfigSection, key, nullptr, &length)) return std::nullopt;
   if (length > 4096) return std::string{};
   std::string text(length + 1, '\0');
   size_t capacity = text.size();
-  if (!reshade::get_config_value(nullptr, kConfigSection, key, text.data(), &capacity)) return std::string{};
+  if (!configuration::Get(nullptr, kConfigSection, key, text.data(), &capacity)) return std::string{};
   text.resize((std::min)(capacity, text.size()));
   while (!text.empty() && text.back() == '\0') text.pop_back();
   return text;
 }
 
 inline void WritePresentRestoreValue(const char* key, uint32_t value) {
-  reshade::set_config_value(nullptr, kConfigSection, key, value);
+  configuration::Set(nullptr, kConfigSection, key, value);
 }
 
 inline bool ApplyPresentRestoreDefaults() {
@@ -31276,12 +31278,12 @@ inline void PersistConfig(bool persist_present_restore = true) {
   if (persist_present_restore) {
     std::shared_lock policy_lock(hdr_pedestal_policy_state.mutex);
     if (hdr_pedestal_policy_state.configuration.writable) {
-      reshade::set_config_value(nullptr, kConfigSection, "NRPresentHdrPedestalPolicy",
+      configuration::Set(nullptr, kConfigSection, "NRPresentHdrPedestalPolicy",
                                 static_cast<uint32_t>(hdr_pedestal_policy_state.configuration.policy));
-      reshade::set_config_value(nullptr, kConfigSection, "NRPresentHdrPedestalConfigVersion", present_hdr_pedestal::CONFIG_VERSION);
+      configuration::Set(nullptr, kConfigSection, "NRPresentHdrPedestalConfigVersion", present_hdr_pedestal::CONFIG_VERSION);
     }
   }
-  reshade::set_config_value(nullptr, kConfigSection, "ConfigVersion", kConfigVersion);
+  configuration::Set(nullptr, kConfigSection, "ConfigVersion", kConfigVersion);
   for (const SettingGroup& section : kSettingSections) {
     for (const Setting* setting : section) {
       // The verified restore migration has already saved this policy and its version.
@@ -31289,17 +31291,17 @@ inline void PersistConfig(bool persist_present_restore = true) {
       setting->Persist();
     }
   }
-  reshade::set_config_value(nullptr, kConfigSection, "NRMaxWorksets", max_worksets.load());
-  reshade::set_config_value(
+  configuration::Set(nullptr, kConfigSection, "NRMaxWorksets", max_worksets.load());
+  configuration::Set(
       nullptr, kConfigSection, "NRWorksetFreePolicy",
       workset_free_policy.load(std::memory_order_relaxed));
-  reshade::set_config_value(
+  configuration::Set(
       nullptr, kConfigSection, "NRDisableRelease",
       disable_release_mode.load(std::memory_order_relaxed));
-  reshade::set_config_value(
+  configuration::Set(
       nullptr, kConfigSection, "NRShutdownQuiesce",
       shutdown_quiesce_enabled.load(std::memory_order_relaxed));
-  reshade::set_config_value(
+  configuration::Set(
       nullptr, kConfigSection, "UiMode",
       ui_classic_layout.load() ? "classic" : "modern");
   StoreUiLanguage(ui_language_choice.load());
@@ -31335,7 +31337,7 @@ inline void SetNrEnabledFromUi(bool on) {
     native_fg_result.store(fg::Result::PREPARED, std::memory_order_release);
   }
   enabled = on;
-  reshade::set_config_value(nullptr, kConfigSection, "NeuralUplift", on);
+  configuration::Set(nullptr, kConfigSection, "NeuralUplift", on);
   NotifyNrOperation(on);
   if (on) RecreateFeatures();
   fg::xefg::ReconcileNrService();
@@ -33416,8 +33418,8 @@ inline void DrawSectionDiagnosticsRaw() {
           ++present_restore_configuration.epoch;
           hdr_pedestal_policy_state.configuration = present_hdr_pedestal::LoadPolicy(
               static_cast<uint32_t>(selected), present_hdr_pedestal::CONFIG_VERSION);
-          reshade::set_config_value(nullptr, kConfigSection, "NRPresentHdrPedestalPolicy", static_cast<uint32_t>(selected));
-          reshade::set_config_value(nullptr, kConfigSection, "NRPresentHdrPedestalConfigVersion", present_hdr_pedestal::CONFIG_VERSION);
+          configuration::Set(nullptr, kConfigSection, "NRPresentHdrPedestalPolicy", static_cast<uint32_t>(selected));
+          configuration::Set(nullptr, kConfigSection, "NRPresentHdrPedestalConfigVersion", present_hdr_pedestal::CONFIG_VERSION);
         }
       }
       ImGui::EndDisabled();
@@ -33925,7 +33927,7 @@ inline void DrawSectionHotkeys(const ui::PanelText& text) {
               .enabled = (capture_target == 3 ? official_cycle_enabled.load() : custom_cycle_enabled.load())};
         }
         const char* config_keys[] = {"NRToggleKey", "NRScreenshotKey", "NROfficialCycleKey", "NRCustomCycleKey", "NRMonitorKey", "NRMonitorModeKey"};
-        reshade::set_config_value(
+        configuration::Set(
             nullptr, kConfigSection,
             config_keys[capture_target - 1], vk);
         Log(
@@ -34001,7 +34003,7 @@ inline void DrawSectionLayoutToggle() {
     if (ui::ActionButton(ui::Tr(ui::text::kDeveloperView), "developer_view")) {
       classic = !classic;
       ui_classic_layout = classic;
-      reshade::set_config_value(
+      configuration::Set(
           nullptr, kConfigSection, "UiMode", classic ? "classic" : "modern");
     }
   }
@@ -34098,7 +34100,7 @@ inline void DrawSectionIssueNotice(const ui::PanelText& text) {
       hud_toast_until_ns = 0;
       hud_pill = false;
     }
-    reshade::set_config_value(nullptr, kConfigSection, "UiIssueNotice", on);
+    configuration::Set(nullptr, kConfigSection, "UiIssueNotice", on);
   }
 }
 
@@ -34707,9 +34709,9 @@ inline void CycleMonitorMode() {
   ui::AdvanceMonitorMode(&state);
   ui_monitor_geometry_dirty = true;
   monitor_settings_epoch.fetch_add(1);
-  reshade::set_config_value(nullptr, kConfigSection, "UiMonitorDetailed", state.detailed);
-  reshade::set_config_value(nullptr, kConfigSection, "UiMonitorTrends", state.trends);
-  reshade::set_config_value(nullptr, kConfigSection, "UiMonitorAutoFit", state.auto_fit);
+  configuration::Set(nullptr, kConfigSection, "UiMonitorDetailed", state.detailed);
+  configuration::Set(nullptr, kConfigSection, "UiMonitorTrends", state.trends);
+  configuration::Set(nullptr, kConfigSection, "UiMonitorAutoFit", state.auto_fit);
 }
 
 // i18n: begin - display strings (tools/i18n/ui_strings.py catalog)
@@ -34903,7 +34905,7 @@ inline void DrawRuntimeStatus(const ui::StatusCard& card) {
                             .fix_count = std::size(ui::text::kWelcomeSteps),
                             .action = ui::CardAction::kDismiss})) {
       ui_welcomed = true;
-      reshade::set_config_value(nullptr, kConfigSection, "UiWelcomed", true);
+      configuration::Set(nullptr, kConfigSection, "UiWelcomed", true);
     }
     ImGui::PopID();
   }
@@ -34913,6 +34915,7 @@ inline void DrawAbout() {
   ui::SubCaption(ui::text::kAbout);
   ImGui::TextWrapped(ui::text::kFooter, kAddonVersion, NrRuntimeVersionText(), GameExeName().c_str());
   ImGui::TextWrapped("%s", NR_NEXUS_DESCRIPTION);
+  ui::DrawUpdatePanel();
 }
 
 // Developer view retains its flat settings and raw diagnostic controls.
@@ -35542,7 +35545,7 @@ inline void ReadIniRawValues() {
   const auto check = [](const char* key, IniKind kind) {
     char raw[128] = {};
     size_t size = sizeof(raw) - 1;
-    if (!reshade::get_config_value(nullptr, kConfigSection, key, raw, &size)) return;
+    if (!configuration::Get(nullptr, kConfigSection, key, raw, &size)) return;
     const health::IniValue read = health::ReadIniValue(raw, size, kind);
     if (read.read != health::IniRead::kRepaired && read.read != health::IniRead::kInvalid) {
       return;
@@ -35556,9 +35559,9 @@ inline void ReadIniRawValues() {
       return;
     }
     if (kind == IniKind::kFloat) {
-      reshade::set_config_value(nullptr, kConfigSection, key, static_cast<float>(read.value));
+      configuration::Set(nullptr, kConfigSection, key, static_cast<float>(read.value));
     } else {
-      reshade::set_config_value(nullptr, kConfigSection, key, read.value != 0.0);
+      configuration::Set(nullptr, kConfigSection, key, read.value != 0.0);
     }
     Log(reshade::log::level::info,
         std::string("ReShade.ini [RenoDX.DLSS5] ") + key + "=" + written + " read as "
@@ -35621,7 +35624,70 @@ inline uint32_t SanitizeEnumKey(
   return fallback;
 }
 
+inline constexpr char kUpdateConfigSection[] = "RenoDX.DLSS5.Update";
+inline std::shared_mutex update_config_mutex;
+
+inline void LoadUpdateConfiguration() {
+  const std::unique_lock lock(update_config_mutex);
+  const auto read = [](const char* key) {
+    size_t length = 0;
+    if (!configuration::Get(nullptr, kUpdateConfigSection, key, nullptr, &length)
+        || length > 32768) return std::string{};
+    std::string value(length + 1, '\0');
+    size_t capacity = value.size();
+    if (!configuration::Get(nullptr, kUpdateConfigSection, key, value.data(), &capacity)) return std::string{};
+    value.resize((std::min)(capacity, value.size()));
+    while (!value.empty() && value.back() == '\0') value.pop_back();
+    return value;
+  };
+  update::Settings settings;
+  settings.auto_check = read("AutoCheck") != "0";
+  auto directory = read("DownloadDirectory");
+  // ReShade exposes comma-separated INI values as a NUL-separated array.
+  std::replace(directory.begin(), directory.end(), '\0', ',');
+  if (!directory.empty()) {
+    try {
+      auto path = std::filesystem::path(std::u8string(directory.begin(), directory.end()));
+      if (path.is_absolute()) settings.download_directory = std::move(path);
+    } catch (const std::filesystem::filesystem_error&) {
+      settings.download_directory.clear();
+    }
+  }
+  const auto next = read("NextAutoCheckUtc");
+  int64_t utc = 0;
+  const auto parsed = std::from_chars(next.data(), next.data() + next.size(), utc);
+  if (parsed.ec == std::errc{} && parsed.ptr == next.data() + next.size() && utc >= 0) {
+    settings.next_auto_check_utc = utc;
+  }
+  update::Configure(settings, AddonDirectory());
+}
+
+inline void OnUpdateInit(reshade::api::effect_runtime*) {
+  update::OnStartup();
+}
+
+inline void OnUpdatePresent(reshade::api::effect_runtime* runtime) {
+  {
+    const std::unique_lock lock(overlay_listener_mutex);
+    if (!live_effect_runtimes.empty() && runtime != live_effect_runtimes.front()) return;
+  }
+  // Runtime callbacks can overlap; a newer snapshot must not be saved before an older one.
+  const std::unique_lock lock(update_config_mutex);
+  {
+    const std::shared_lock config_lock(present_restore_configuration.mutex);
+    if (!present_restore_configuration.global_writable) return;
+  }
+  const auto settings = update::TakeSettingsUpdate();
+  if (!settings) return;
+  const auto directory = settings->download_directory.u8string();
+  const std::string utf8_directory(directory.begin(), directory.end());
+  configuration::Set(nullptr, kUpdateConfigSection, "AutoCheck", settings->auto_check);
+  configuration::Set(nullptr, kUpdateConfigSection, "DownloadDirectory", utf8_directory.c_str());
+  configuration::Set(nullptr, kUpdateConfigSection, "NextAutoCheckUtc", settings->next_auto_check_utc);
+}
+
 inline void LoadConfiguration() {
+  LoadUpdateConfiguration();
   profile_reload_epoch.fetch_add(1, std::memory_order_relaxed);
   // Config schema marker (kConfigVersion at the top of this file).  v5.3
   // replaces the wholesale stale-config reset - the v5 failure mode that
@@ -35674,14 +35740,14 @@ inline void LoadConfiguration() {
   first_install_evidence = (section_known && !section_has_settings && !global_version_raw
       ? profile_ui::FirstInstallEvidence::PROVEN_EMPTY : profile_ui::FirstInstallEvidence::EXISTING);
   auto& monitor_geometry = ui_runtime_monitor_state.geometry;
-  monitor_geometry.valid = reshade::get_config_value(nullptr, kConfigSection, "UiMonitorWidth", monitor_geometry.size.x)
-      && reshade::get_config_value(nullptr, kConfigSection, "UiMonitorHeight", monitor_geometry.size.y)
-      && reshade::get_config_value(nullptr, kConfigSection, "UiMonitorX", monitor_geometry.position.x)
-      && reshade::get_config_value(nullptr, kConfigSection, "UiMonitorY", monitor_geometry.position.y);
-  reshade::get_config_value(nullptr, kConfigSection, "UiMonitorScale", monitor_geometry.ui_scale);
-  reshade::get_config_value(nullptr, kConfigSection, "UiMonitorPinned", ui_runtime_monitor_state.pin);
+  monitor_geometry.valid = configuration::Get(nullptr, kConfigSection, "UiMonitorWidth", monitor_geometry.size.x)
+      && configuration::Get(nullptr, kConfigSection, "UiMonitorHeight", monitor_geometry.size.y)
+      && configuration::Get(nullptr, kConfigSection, "UiMonitorX", monitor_geometry.position.x)
+      && configuration::Get(nullptr, kConfigSection, "UiMonitorY", monitor_geometry.position.y);
+  configuration::Get(nullptr, kConfigSection, "UiMonitorScale", monitor_geometry.ui_scale);
+  configuration::Get(nullptr, kConfigSection, "UiMonitorPinned", ui_runtime_monitor_state.pin);
   ui_runtime_monitor_state.detailed = false;
-  reshade::get_config_value(nullptr, kConfigSection, "UiMonitorDetailed", ui_runtime_monitor_state.detailed);
+  configuration::Get(nullptr, kConfigSection, "UiMonitorDetailed", ui_runtime_monitor_state.detailed);
   auto& monitor_state = ui_runtime_monitor_state;
   monitor_state.background_opacity = .8f;
   monitor_state.trends = false;
@@ -35689,13 +35755,13 @@ inline void LoadConfiguration() {
   monitor_state.trend_mask = 0x7f;
   monitor_state.anchor = -1;
   monitor_state.offset = {};
-  reshade::get_config_value(nullptr, kConfigSection, "UiMonitorOpacity", monitor_state.background_opacity);
-  reshade::get_config_value(nullptr, kConfigSection, "UiMonitorTrends", monitor_state.trends);
-  reshade::get_config_value(nullptr, kConfigSection, "UiMonitorHistorySeconds", monitor_state.history_seconds);
-  reshade::get_config_value(nullptr, kConfigSection, "UiMonitorTrendMask", monitor_state.trend_mask);
-  reshade::get_config_value(nullptr, kConfigSection, "UiMonitorAnchor", monitor_state.anchor);
-  reshade::get_config_value(nullptr, kConfigSection, "UiMonitorOffsetX", monitor_state.offset.x);
-  reshade::get_config_value(nullptr, kConfigSection, "UiMonitorOffsetY", monitor_state.offset.y);
+  configuration::Get(nullptr, kConfigSection, "UiMonitorOpacity", monitor_state.background_opacity);
+  configuration::Get(nullptr, kConfigSection, "UiMonitorTrends", monitor_state.trends);
+  configuration::Get(nullptr, kConfigSection, "UiMonitorHistorySeconds", monitor_state.history_seconds);
+  configuration::Get(nullptr, kConfigSection, "UiMonitorTrendMask", monitor_state.trend_mask);
+  configuration::Get(nullptr, kConfigSection, "UiMonitorAnchor", monitor_state.anchor);
+  configuration::Get(nullptr, kConfigSection, "UiMonitorOffsetX", monitor_state.offset.x);
+  configuration::Get(nullptr, kConfigSection, "UiMonitorOffsetY", monitor_state.offset.y);
   monitor_state.background_opacity = (std::isfinite(monitor_state.background_opacity)
       ? std::clamp(monitor_state.background_opacity, 0.f, 1.f) : .8f);
   if (monitor_state.history_seconds != 10 && monitor_state.history_seconds != 30 && monitor_state.history_seconds != 60) {
@@ -35707,7 +35773,7 @@ inline void LoadConfiguration() {
   monitor_state.offset.y = (std::isfinite(monitor_state.offset.y) ? std::clamp(monitor_state.offset.y, -16384.f, 16384.f) : 0.f);
   monitor_state.apply_geometry = monitor_state.anchor >= 0;
   monitor_state.auto_fit = !monitor_geometry.valid;
-  reshade::get_config_value(nullptr, kConfigSection, "UiMonitorAutoFit", monitor_state.auto_fit);
+  configuration::Get(nullptr, kConfigSection, "UiMonitorAutoFit", monitor_state.auto_fit);
   monitor_state.fit_content = monitor_state.auto_fit;
   monitor_state.layout_initialized = false;
   monitor_state.measured_height = 0.f;
@@ -35716,9 +35782,9 @@ inline void LoadConfiguration() {
   uint32_t saved_monitor_key = VK_F11;
   uint32_t saved_monitor_mode_key = VK_F8;
   bool saved_monitor_keep = true;
-  reshade::get_config_value(nullptr, kConfigSection, "NRMonitorKey", saved_monitor_key);
-  reshade::get_config_value(nullptr, kConfigSection, "NRMonitorModeKey", saved_monitor_mode_key);
-  reshade::get_config_value(nullptr, kConfigSection, "UiMonitorKeepVisible", saved_monitor_keep);
+  configuration::Get(nullptr, kConfigSection, "NRMonitorKey", saved_monitor_key);
+  configuration::Get(nullptr, kConfigSection, "NRMonitorModeKey", saved_monitor_mode_key);
+  configuration::Get(nullptr, kConfigSection, "UiMonitorKeepVisible", saved_monitor_keep);
   monitor_hotkey = (saved_monitor_key == 0 || (saved_monitor_key >= 0x08 && saved_monitor_key <= 0xFE)
       ? saved_monitor_key : 0);
   monitor_mode_key = (saved_monitor_mode_key == 0
@@ -35727,13 +35793,13 @@ inline void LoadConfiguration() {
   monitor_keep_visible = saved_monitor_keep;
   if (!monitor_visibility_initialized.exchange(true)) {
     bool saved_visible = false;
-    reshade::get_config_value(nullptr, kConfigSection, "UiMonitorVisible", saved_visible);
+    configuration::Get(nullptr, kConfigSection, "UiMonitorVisible", saved_visible);
     monitor_visible_preference = saved_visible;
     monitor_requested = saved_visible && saved_monitor_keep;
     monitor_visibility_dirty = false;
   }
   uint32_t overlay_key = VK_HOME;
-  reshade::get_config_value(nullptr, "INPUT", "KeyOverlay", overlay_key);
+  configuration::Get(nullptr, "INPUT", "KeyOverlay", overlay_key);
   host_overlay_hotkey = overlay_key >= 0x08 && overlay_key <= 0xFE ? overlay_key : VK_HOME;
   monitor_observation_epoch.fetch_add(1);
   uint32_t raw_global_version = 0;
@@ -35769,7 +35835,7 @@ inline void LoadConfiguration() {
   }
   if (global_writable) ReadIniRawValues();
   uint32_t stored_config_version = 0;
-  const bool version_present = reshade::get_config_value(
+  const bool version_present = configuration::Get(
       nullptr, kConfigSection, "ConfigVersion", stored_config_version);
   const bool future_config = !global_writable || (version_present && stored_config_version > kConfigVersion);
   const bool migrate_config = !future_config && stored_config_version != kConfigVersion;
@@ -35891,39 +35957,39 @@ inline void LoadConfiguration() {
 
   // Reads are unconditional (targeted migration, not reset): presence of the
   // first-party keys drives the migration decisions below.
-  const bool has_stored_uplift = reshade::get_config_value(
+  const bool has_stored_uplift = configuration::Get(
       nullptr, kConfigSection, "NeuralUplift", saved_enabled);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRPreUpscale", saved_pre_upscale);
   // NRHookPoint replaces NRPreUpscale; a config without it migrates from the
   // older key, which stays readable (and is no longer written).
   uint32_t saved_hook_point = saved_pre_upscale ? kHookRender : defaults::kHookPoint;
-  reshade::get_config_value(nullptr, kConfigSection, "NRHookPoint", saved_hook_point);
-  reshade::get_config_value(
+  configuration::Get(nullptr, kConfigSection, "NRHookPoint", saved_hook_point);
+  configuration::Get(
       nullptr, kConfigSection, "NRPresentGuides", saved_present_guides);
-  reshade::get_config_value(nullptr, kConfigSection, "NRDebugBypassSdrRestore", saved_debug_restore);
-  reshade::get_config_value(nullptr, kConfigSection, "NRDebugBypassHdrPedestal", saved_debug_hdr_pedestal);
-  reshade::get_config_value(nullptr, kConfigSection, "NRDebugBypassHostLook", saved_debug_look);
-  reshade::get_config_value(nullptr, kConfigSection, "NRPresentModelUI", saved_debug_ui);
-  reshade::get_config_value(nullptr, kConfigSection, "NRDebugGuideMode", saved_debug_guides);
-  reshade::get_config_value(nullptr, kConfigSection, "NRDebugCapturePlanes", saved_debug_planes);
-  reshade::get_config_value(
+  configuration::Get(nullptr, kConfigSection, "NRDebugBypassSdrRestore", saved_debug_restore);
+  configuration::Get(nullptr, kConfigSection, "NRDebugBypassHdrPedestal", saved_debug_hdr_pedestal);
+  configuration::Get(nullptr, kConfigSection, "NRDebugBypassHostLook", saved_debug_look);
+  configuration::Get(nullptr, kConfigSection, "NRPresentModelUI", saved_debug_ui);
+  configuration::Get(nullptr, kConfigSection, "NRDebugGuideMode", saved_debug_guides);
+  configuration::Get(nullptr, kConfigSection, "NRDebugCapturePlanes", saved_debug_planes);
+  configuration::Get(
       nullptr, kConfigSection, "NRPresentEncoding", saved_present_encoding);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRPresentWhiteNits", saved_present_white);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRPresentWhiteSource", saved_present_white_source);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRPresentUICorrection", saved_present_ui_correction);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRPresentFrames", saved_present_frames);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRPresentFgSource", saved_present_fg_source);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRPresentPreFg", saved_present_pre_fg);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRPresentPreFgContract", saved_present_pre_fg_contract);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRPresentBlockHudless", saved_present_block_hudless);
   // This setting predates its menu control and was persisted as false by old
   // presets. Adopt the new default once, then preserve explicit dual-color
@@ -35941,33 +36007,33 @@ inline void LoadConfiguration() {
       }
     }
   }
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRXeFGSdkDetours", saved_xefg_sdk_detours);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRExperimentalPresentChain", saved_experimental_present_chain);
   experimental_present_chain.store(saved_experimental_present_chain);
-  reshade::get_config_value(nullptr, kConfigSection, "NRExperimentalNativePreFgResolution",
+  configuration::Get(nullptr, kConfigSection, "NRExperimentalNativePreFgResolution",
                            saved_experimental_native_prefg_resolution);
   experimental_native_prefg_resolution.store(saved_experimental_native_prefg_resolution);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRPresentMVecUnits", saved_present_mvec_units);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRAutoFgFallback", saved_auto_fg_fallback);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRVkStateRestore", saved_vk_state_restore);
-  const bool has_stored_codec = reshade::get_config_value(
+  const bool has_stored_codec = configuration::Get(
       nullptr, kConfigSection, "NRCodecMode", saved_codec_mode);
-  reshade::get_config_value(nullptr, kConfigSection, "NRProxyAnchor", saved_anchor);
-  reshade::get_config_value(nullptr, kConfigSection, "NRPreset", saved_preset);
-  reshade::get_config_value(nullptr, kConfigSection, "NRStyle", saved_style);
-  reshade::get_config_value(nullptr, kConfigSection, "NRIntensity", saved_intensity);
-  reshade::get_config_value(nullptr, kConfigSection, "NRLocalTone", saved_local_tone);
+  configuration::Get(nullptr, kConfigSection, "NRProxyAnchor", saved_anchor);
+  configuration::Get(nullptr, kConfigSection, "NRPreset", saved_preset);
+  configuration::Get(nullptr, kConfigSection, "NRStyle", saved_style);
+  configuration::Get(nullptr, kConfigSection, "NRIntensity", saved_intensity);
+  configuration::Get(nullptr, kConfigSection, "NRLocalTone", saved_local_tone);
   // NRGlobalTone is retired (rc5: runtime 310.8 has no global tone key) but
   // still read.  The third-party Feeder detects this addon by the string and
   // writes the key (tools/field/check_feeder_contract.py), so a stored value
   // is named in the log instead of silently doing nothing.
   if (float retired_global_tone = 1.f;
-      reshade::get_config_value(
+      configuration::Get(
           nullptr, kConfigSection, "NRGlobalTone", retired_global_tone)
       && retired_global_tone != 1.f) {
     Log(reshade::log::level::info,
@@ -35975,252 +36041,252 @@ inline void LoadConfiguration() {
             + " is stored but has no effect: NR runtime 310.8 reads no global"
               " tone key, and the setting was removed in rc5");
   }
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRLocalStructure", saved_local_structure);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRSkinStructure", saved_skin_structure);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRSkinIndependent", saved_skin_independent);
-  reshade::get_config_value(nullptr, kConfigSection, "NRAutoMask", saved_auto_mask);
-  reshade::get_config_value(
+  configuration::Get(nullptr, kConfigSection, "NRAutoMask", saved_auto_mask);
+  configuration::Get(
       nullptr, kConfigSection, "NRUICorrection", saved_ui_correction);
-  reshade::get_config_value(nullptr, kConfigSection, "NRDepthMode", saved_depth_mode);
-  reshade::get_config_value(nullptr, kConfigSection, "NRMVecScaleX", saved_motion_x);
-  reshade::get_config_value(nullptr, kConfigSection, "NRMVecScaleY", saved_motion_y);
-  reshade::get_config_value(
+  configuration::Get(nullptr, kConfigSection, "NRDepthMode", saved_depth_mode);
+  configuration::Get(nullptr, kConfigSection, "NRMVecScaleX", saved_motion_x);
+  configuration::Get(nullptr, kConfigSection, "NRMVecScaleY", saved_motion_y);
+  configuration::Get(
       nullptr, kConfigSection, "NRPaperWhiteScale", saved_paper_white);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRDiffuseWhiteNits", saved_diffuse_white);
-  const bool has_stored_pq_calibration = reshade::get_config_value(
+  const bool has_stored_pq_calibration = configuration::Get(
       nullptr, kConfigSection, "NRPQCalibration", saved_pq_calibration);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRSourceEncoding", saved_source_encoding);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRSourcePrimaries", saved_source_primaries);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRLinearUnitNits", saved_linear_unit_nits);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRTransferStrength", saved_transfer);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRColorStrength", saved_color);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRChromaClamp", saved_chroma_clamp);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRTransferMode", saved_transfer_mode);
   float saved_style_guard = defaults::kStyleHighlightGuard;
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRStyleHighlightGuard", saved_style_guard);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRDisplayPedestal", saved_display_pedestal);
   uint32_t saved_sdr_black_restore = defaults::kSdrBlackRestore;
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRSdrBlackRestore", saved_sdr_black_restore);
   // The typed getter also returns false for a malformed value. Query presence separately
   // so an existing explicit legacy choice is never mistaken for an absent key.
   size_t restore_config_value_size = 0;
-  const bool legacy_restore_explicit = reshade::get_config_value(
+  const bool legacy_restore_explicit = configuration::Get(
       nullptr, kConfigSection, "NRSdrBlackRestore", nullptr, &restore_config_value_size);
   uint32_t saved_present_sdr_restore_policy = static_cast<uint32_t>(present_sdr_restore::DEFAULT_POLICY);
   uint32_t saved_present_sdr_restore_version = 0;
   restore_config_value_size = 0;
-  const bool present_restore_explicit = reshade::get_config_value(
+  const bool present_restore_explicit = configuration::Get(
       nullptr, kConfigSection, "NRPresentSdrRestorePolicy", nullptr, &restore_config_value_size);
-  if (!reshade::get_config_value(nullptr, kConfigSection, "NRPresentSdrRestorePolicy", saved_present_sdr_restore_policy)
+  if (!configuration::Get(nullptr, kConfigSection, "NRPresentSdrRestorePolicy", saved_present_sdr_restore_policy)
       && present_restore_explicit) {
     saved_present_sdr_restore_policy = static_cast<uint32_t>(present_sdr_restore::FALLBACK_POLICY);
   }
   size_t sdr_version_size = 0;
-  const bool sdr_version_present = reshade::get_config_value(
+  const bool sdr_version_present = configuration::Get(
       nullptr, kConfigSection, "NRPresentSdrRestoreConfigVersion", nullptr, &sdr_version_size);
-  if (!reshade::get_config_value(nullptr, kConfigSection, "NRPresentSdrRestoreConfigVersion", saved_present_sdr_restore_version)
+  if (!configuration::Get(nullptr, kConfigSection, "NRPresentSdrRestoreConfigVersion", saved_present_sdr_restore_version)
       && sdr_version_present) {
     saved_present_sdr_restore_version = UINT32_MAX;
   }
   uint32_t saved_hdr_pedestal_policy = 0;
   uint32_t saved_hdr_pedestal_version = 0;
   size_t hdr_policy_size = 0;
-  const bool hdr_policy_present = reshade::get_config_value(
+  const bool hdr_policy_present = configuration::Get(
       nullptr, kConfigSection, "NRPresentHdrPedestalPolicy", nullptr, &hdr_policy_size);
-  if (!reshade::get_config_value(nullptr, kConfigSection, "NRPresentHdrPedestalPolicy", saved_hdr_pedestal_policy)
+  if (!configuration::Get(nullptr, kConfigSection, "NRPresentHdrPedestalPolicy", saved_hdr_pedestal_policy)
       && hdr_policy_present) {
     saved_hdr_pedestal_policy = UINT32_MAX;
   }
   size_t hdr_version_size = 0;
-  const bool hdr_version_present = reshade::get_config_value(
+  const bool hdr_version_present = configuration::Get(
       nullptr, kConfigSection, "NRPresentHdrPedestalConfigVersion", nullptr, &hdr_version_size);
-  if (!reshade::get_config_value(nullptr, kConfigSection, "NRPresentHdrPedestalConfigVersion", saved_hdr_pedestal_version)
+  if (!configuration::Get(nullptr, kConfigSection, "NRPresentHdrPedestalConfigVersion", saved_hdr_pedestal_version)
       && hdr_version_present) {
     saved_hdr_pedestal_version = UINT32_MAX;
   }
   uint32_t saved_output_rect = defaults::kOutputRect;
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NROutputRect", saved_output_rect);
   uint32_t saved_dedupe_mode = defaults::kDedupeMode;
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "DedupeMode", saved_dedupe_mode);
   uint32_t saved_list_state_mode = defaults::kListStateMode;
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "ListStateMode", saved_list_state_mode);
-  reshade::get_config_value(nullptr, kConfigSection, "NRFeedMode", saved_feed_mode);
-  const bool has_stored_governor = reshade::get_config_value(
+  configuration::Get(nullptr, kConfigSection, "NRFeedMode", saved_feed_mode);
+  const bool has_stored_governor = configuration::Get(
       nullptr, kConfigSection, "NRNormGovernor", saved_norm_governor);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRNormSlewStops", saved_norm_slew);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRNormAttackStops", saved_norm_attack);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRNormReleaseStops", saved_norm_release);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRNormCutAware", saved_norm_cut_aware);
-  const bool has_stored_chained = reshade::get_config_value(
+  const bool has_stored_chained = configuration::Get(
       nullptr, kConfigSection, "NRChainedHistory", saved_chained_history);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRNeuralFloorGuard", saved_neural_floor_guard);
   // Hotkeys: persisted virtual-key codes.  Anything outside the defined range
   // (a corrupted or hand-edited line) falls back to the defaults.
-  reshade::get_config_value(nullptr, kConfigSection, "NRToggleKey", saved_toggle_key);
-  reshade::get_config_value(
+  configuration::Get(nullptr, kConfigSection, "NRToggleKey", saved_toggle_key);
+  configuration::Get(
       nullptr, kConfigSection, "NRScreenshotKey", saved_screenshot_key);
-  reshade::get_config_value(nullptr, kConfigSection, "NROfficialCycleKey", saved_official_cycle_key);
-  reshade::get_config_value(nullptr, kConfigSection, "NRCustomCycleKey", saved_custom_cycle_key);
-  reshade::get_config_value(nullptr, kConfigSection, "NROfficialCycleEnabled", saved_official_cycle_enabled);
-  reshade::get_config_value(nullptr, kConfigSection, "NRCustomCycleEnabled", saved_custom_cycle_enabled);
+  configuration::Get(nullptr, kConfigSection, "NROfficialCycleKey", saved_official_cycle_key);
+  configuration::Get(nullptr, kConfigSection, "NRCustomCycleKey", saved_custom_cycle_key);
+  configuration::Get(nullptr, kConfigSection, "NROfficialCycleEnabled", saved_official_cycle_enabled);
+  configuration::Get(nullptr, kConfigSection, "NRCustomCycleEnabled", saved_custom_cycle_enabled);
   uint32_t saved_worksets_read = saved_worksets;
-  reshade::get_config_value(nullptr, kConfigSection, "NRMaxWorksets", saved_worksets_read);
+  configuration::Get(nullptr, kConfigSection, "NRMaxWorksets", saved_worksets_read);
   saved_worksets = saved_worksets_read;
   // v8.0.1 stability keys (ini-only, like NRMaxWorksets): the NR memory
   // release policy and the game-is-leaving latch's kill switch.  Both are
   // applied in the sanitize block below, beside NRMaxWorksets.
   uint32_t saved_free_policy = kDefaultWorksetFreePolicy;
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRWorksetFreePolicy", saved_free_policy);
   uint32_t saved_disable_release = kDefaultDisableRelease;
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRDisableRelease", saved_disable_release);
   bool saved_shutdown_quiesce = true;
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRShutdownQuiesce", saved_shutdown_quiesce);
   shutdown_quiesce_enabled.store(
       saved_shutdown_quiesce, std::memory_order_relaxed);
   // v5 stacking + NR resolution.
   uint32_t saved_passes_read = saved_passes;
-  reshade::get_config_value(nullptr, kConfigSection, "NRPasses", saved_passes_read);
+  configuration::Get(nullptr, kConfigSection, "NRPasses", saved_passes_read);
   saved_passes = saved_passes_read;
   for (uint32_t pass = 1; pass < kMaxNrPasses; ++pass) {
     const std::string prefix = "NRPass" + std::to_string(pass + 1);
-    reshade::get_config_value(nullptr, kConfigSection, (prefix + "Preset").c_str(), saved_pass_presets[pass - 1]);
-    reshade::get_config_value(nullptr, kConfigSection, (prefix + "Stage").c_str(), saved_pass_stages[pass - 1]);
-    reshade::get_config_value(nullptr, kConfigSection, (prefix + "ResolutionMode").c_str(), saved_pass_resolution_modes[pass - 1]);
-    reshade::get_config_value(nullptr, kConfigSection, (prefix + "ResolutionScale").c_str(), saved_pass_resolution_scales[pass - 1]);
-    reshade::get_config_value(
+    configuration::Get(nullptr, kConfigSection, (prefix + "Preset").c_str(), saved_pass_presets[pass - 1]);
+    configuration::Get(nullptr, kConfigSection, (prefix + "Stage").c_str(), saved_pass_stages[pass - 1]);
+    configuration::Get(nullptr, kConfigSection, (prefix + "ResolutionMode").c_str(), saved_pass_resolution_modes[pass - 1]);
+    configuration::Get(nullptr, kConfigSection, (prefix + "ResolutionScale").c_str(), saved_pass_resolution_scales[pass - 1]);
+    configuration::Get(
         nullptr, kConfigSection, (prefix + "Intensity").c_str(),
         saved_pass_values[pass - 1][0]);
-    reshade::get_config_value(
+    configuration::Get(
         nullptr, kConfigSection, (prefix + "Transfer").c_str(),
         saved_pass_values[pass - 1][1]);
-    reshade::get_config_value(
+    configuration::Get(
         nullptr, kConfigSection, (prefix + "Color").c_str(),
         saved_pass_values[pass - 1][2]);
     SavedSteering& steering = saved_steering[pass - 1];
-    reshade::get_config_value(
+    configuration::Get(
         nullptr, kConfigSection, (prefix + "FollowPass1").c_str(), steering.follow);
-    reshade::get_config_value(
+    configuration::Get(
         nullptr, kConfigSection, (prefix + "Style").c_str(), steering.style);
-    reshade::get_config_value(
+    configuration::Get(
         nullptr, kConfigSection, (prefix + "LocalTone").c_str(), steering.local_tone);
-    reshade::get_config_value(
+    configuration::Get(
         nullptr, kConfigSection, (prefix + "Structure").c_str(), steering.structure);
-    reshade::get_config_value(
+    configuration::Get(
         nullptr, kConfigSection, (prefix + "Skin").c_str(), steering.skin);
-    reshade::get_config_value(
+    configuration::Get(
         nullptr, kConfigSection, (prefix + "AutoMask").c_str(), steering.auto_mask);
-    reshade::get_config_value(
+    configuration::Get(
         nullptr, kConfigSection, (prefix + "UICorrection").c_str(), steering.ui_correction);
     SavedControlMask& mask = saved_pass_control_mask[pass - 1];
-    reshade::get_config_value(nullptr, kConfigSection,
+    configuration::Get(nullptr, kConfigSection,
         (prefix + "ControlMaskFollowPass1").c_str(), mask.follow);
-    reshade::get_config_value(nullptr, kConfigSection,
+    configuration::Get(nullptr, kConfigSection,
         (prefix + "ControlMaskMode").c_str(), mask.mode);
-    reshade::get_config_value(nullptr, kConfigSection,
+    configuration::Get(nullptr, kConfigSection,
         (prefix + "ControlMaskBlendMode").c_str(), mask.blend_mode);
-    reshade::get_config_value(nullptr, kConfigSection,
+    configuration::Get(nullptr, kConfigSection,
         (prefix + "ControlMaskRed").c_str(), mask.red);
-    reshade::get_config_value(nullptr, kConfigSection,
+    configuration::Get(nullptr, kConfigSection,
         (prefix + "ControlMaskGreen").c_str(), mask.green);
-    reshade::get_config_value(nullptr, kConfigSection,
+    configuration::Get(nullptr, kConfigSection,
         (prefix + "ControlMaskBlue").c_str(), mask.blue);
-    reshade::get_config_value(nullptr, kConfigSection,
+    configuration::Get(nullptr, kConfigSection,
         (prefix + "ControlMaskDepthNear").c_str(), mask.depth_near);
-    reshade::get_config_value(nullptr, kConfigSection,
+    configuration::Get(nullptr, kConfigSection,
         (prefix + "ControlMaskDepthFar").c_str(), mask.depth_far);
-    reshade::get_config_value(nullptr, kConfigSection,
+    configuration::Get(nullptr, kConfigSection,
         (prefix + "ControlMaskMotionEnd").c_str(), mask.motion_end);
-    reshade::get_config_value(nullptr, kConfigSection,
+    configuration::Get(nullptr, kConfigSection,
         (prefix + "ControlMaskMotionStart").c_str(), mask.motion_start);
-    reshade::get_config_value(nullptr, kConfigSection,
+    configuration::Get(nullptr, kConfigSection,
         (prefix + "ControlMaskMotionEnabled").c_str(), mask.motion_enabled);
   }
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRFollowInputRes", saved_follow_input);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRResolutionScale", saved_res_scale);
-  reshade::get_config_value(nullptr, kConfigSection, "NRAdaptiveEnabled", saved_adaptive_enabled);
-  reshade::get_config_value(nullptr, kConfigSection, "NRAdaptiveTargetFPS", saved_adaptive_target_fps);
-  reshade::get_config_value(nullptr, kConfigSection, "NRAdaptiveMinScale", saved_adaptive_min_scale);
-  reshade::get_config_value(nullptr, kConfigSection, "NRAdaptiveLevelCount", saved_adaptive_selected_levels);
-  reshade::get_config_value(nullptr, kConfigSection, "NRAdaptiveLimitedResidency", saved_adaptive_limited_residency);
-  reshade::get_config_value(
+  configuration::Get(nullptr, kConfigSection, "NRAdaptiveEnabled", saved_adaptive_enabled);
+  configuration::Get(nullptr, kConfigSection, "NRAdaptiveTargetFPS", saved_adaptive_target_fps);
+  configuration::Get(nullptr, kConfigSection, "NRAdaptiveMinScale", saved_adaptive_min_scale);
+  configuration::Get(nullptr, kConfigSection, "NRAdaptiveLevelCount", saved_adaptive_selected_levels);
+  configuration::Get(nullptr, kConfigSection, "NRAdaptiveLimitedResidency", saved_adaptive_limited_residency);
+  configuration::Get(
       nullptr, kConfigSection, "NRGpuTimers", saved_gpu_timers);
-  reshade::get_config_value(nullptr, kConfigSection, "NRCrashDump", saved_crash_dump);
-  reshade::get_config_value(nullptr, kConfigSection, "NRCostMeter", saved_cost_meter);
-  reshade::get_config_value(nullptr, kConfigSection, "NREditTrace", saved_edit_trace);
-  reshade::get_config_value(nullptr, kConfigSection, "NRLookMode", saved_look_mode);
-  reshade::get_config_value(nullptr, kConfigSection, "NRLookStrength", saved_look.strength);
-  reshade::get_config_value(nullptr, kConfigSection, "NRLookBrighten", saved_look.brighten);
-  reshade::get_config_value(nullptr, kConfigSection, "NRLookDarken", saved_look.darken);
-  reshade::get_config_value(
+  configuration::Get(nullptr, kConfigSection, "NRCrashDump", saved_crash_dump);
+  configuration::Get(nullptr, kConfigSection, "NRCostMeter", saved_cost_meter);
+  configuration::Get(nullptr, kConfigSection, "NREditTrace", saved_edit_trace);
+  configuration::Get(nullptr, kConfigSection, "NRLookMode", saved_look_mode);
+  configuration::Get(nullptr, kConfigSection, "NRLookStrength", saved_look.strength);
+  configuration::Get(nullptr, kConfigSection, "NRLookBrighten", saved_look.brighten);
+  configuration::Get(nullptr, kConfigSection, "NRLookDarken", saved_look.darken);
+  configuration::Get(
       nullptr, kConfigSection, "NRLookMaxBrighten", saved_look.max_brighten);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRLookMaxDarken", saved_look.max_darken);
-  reshade::get_config_value(nullptr, kConfigSection, "NRLookColour", saved_look.colour);
-  reshade::get_config_value(nullptr, kConfigSection, "NRLookHue", saved_look.hue);
-  reshade::get_config_value(
+  configuration::Get(nullptr, kConfigSection, "NRLookColour", saved_look.colour);
+  configuration::Get(nullptr, kConfigSection, "NRLookHue", saved_look.hue);
+  configuration::Get(
       nullptr, kConfigSection, "NRLookMaxColour", saved_look.max_colour);
-  reshade::get_config_value(nullptr, kConfigSection, "NRLookShadows", saved_look.shadows);
-  reshade::get_config_value(nullptr, kConfigSection, "NRLookMidtones", saved_look.midtones);
-  reshade::get_config_value(
+  configuration::Get(nullptr, kConfigSection, "NRLookShadows", saved_look.shadows);
+  configuration::Get(nullptr, kConfigSection, "NRLookMidtones", saved_look.midtones);
+  configuration::Get(
       nullptr, kConfigSection, "NRLookHighlights", saved_look.highlights);
-  reshade::get_config_value(nullptr, kConfigSection, "NRLookTone", saved_look.tone);
-  reshade::get_config_value(nullptr, kConfigSection, "NRLookDetail", saved_look.detail);
-  reshade::get_config_value(
+  configuration::Get(nullptr, kConfigSection, "NRLookTone", saved_look.tone);
+  configuration::Get(nullptr, kConfigSection, "NRLookDetail", saved_look.detail);
+  configuration::Get(
       nullptr, kConfigSection, "NRLookDetailRadius", saved_look.detail_radius);
-  reshade::get_config_value(nullptr, kConfigSection, "NRLookHalo", saved_look.halo);
-  reshade::get_config_value(
+  configuration::Get(nullptr, kConfigSection, "NRLookHalo", saved_look.halo);
+  configuration::Get(
       nullptr, kConfigSection, "NRLookHaloBrightSide", saved_look.halo_bright);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRLookStabilize", saved_look.stabilize);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRLookStabilizeMs", saved_look.stabilize_ms);
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRLookStabilizeDetail", saved_look.stabilize_detail);
-  reshade::get_config_value(nullptr, kConfigSection, "NRLookUpsample", saved_look.upsample);
-  reshade::get_config_value(
+  configuration::Get(nullptr, kConfigSection, "NRLookUpsample", saved_look.upsample);
+  configuration::Get(
       nullptr, kConfigSection, "NRDetailStability", saved_detail_stability);
   bool saved_edit_reuse = defaults::kEditReuse;
-  reshade::get_config_value(nullptr, kConfigSection, "NREditReuse", saved_edit_reuse);
+  configuration::Get(nullptr, kConfigSection, "NREditReuse", saved_edit_reuse);
   edit_reuse_enabled = saved_edit_reuse;
   // Diagnostics, read-only from the ini (never persisted): the telemetry line
   // interval (0 = off) and the per-frame normalization trace.
   uint32_t saved_telemetry_seconds = telemetry_seconds.load();
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRTelemetrySeconds", saved_telemetry_seconds);
   telemetry_seconds = std::min(saved_telemetry_seconds, 3600u);
   bool saved_control_mask_motion_enabled = false;
-  reshade::get_config_value(nullptr, kConfigSection, "NRControlMaskMotionEnabled", saved_control_mask_motion_enabled);
+  configuration::Get(nullptr, kConfigSection, "NRControlMaskMotionEnabled", saved_control_mask_motion_enabled);
   float saved_control_mask_motion_start = kControlMaskMotionStartDefault;
-  reshade::get_config_value(nullptr, kConfigSection, "NRControlMaskMotionStart", saved_control_mask_motion_start);
+  configuration::Get(nullptr, kConfigSection, "NRControlMaskMotionStart", saved_control_mask_motion_start);
   float saved_control_mask_motion_end = kControlMaskMotionEndDefault;
-  reshade::get_config_value(nullptr, kConfigSection, "NRControlMaskMotionEnd", saved_control_mask_motion_end);
+  configuration::Get(nullptr, kConfigSection, "NRControlMaskMotionEnd", saved_control_mask_motion_end);
   bool saved_control_mask_enabled = false;
   uint32_t saved_control_mask_mode = kControlMaskRgb;
   uint32_t saved_control_mask_blend_mode = 0;
@@ -36229,9 +36295,9 @@ inline void LoadConfiguration() {
   float saved_control_mask_blue = 1.f;
   float saved_control_mask_depth_near = kControlMaskDepthNearDefault;
   float saved_control_mask_depth_far = kControlMaskDepthFarDefault;
-  reshade::get_config_value(nullptr, kConfigSection, "NRControlMaskEnabled", saved_control_mask_enabled);
+  configuration::Get(nullptr, kConfigSection, "NRControlMaskEnabled", saved_control_mask_enabled);
   bool saved_control_mask_use_core_context = false;
-  reshade::get_config_value(nullptr, kConfigSection, "NRControlMaskUseCoreContext", saved_control_mask_use_core_context);
+  configuration::Get(nullptr, kConfigSection, "NRControlMaskUseCoreContext", saved_control_mask_use_core_context);
   // The P0 backend is scoped to a successful Upscaled SR callback. Production
   // supports Render/Present and stage changes through its owned runtime.
   // Keep the old INI key intact; offline fixtures still select P0 directly.
@@ -36240,13 +36306,13 @@ inline void LoadConfiguration() {
     Log(reshade::log::level::warning,
         "NRControlMaskUseCoreContext is a retired P0 diagnostic setting; ignored, using the production runtime for all stages");
   }
-  reshade::get_config_value(nullptr, kConfigSection, "NRControlMaskMode", saved_control_mask_mode);
-  reshade::get_config_value(nullptr, kConfigSection, "NRControlMaskBlendMode", saved_control_mask_blend_mode);
-  reshade::get_config_value(nullptr, kConfigSection, "NRControlMaskRed", saved_control_mask_red);
-  reshade::get_config_value(nullptr, kConfigSection, "NRControlMaskGreen", saved_control_mask_green);
-  reshade::get_config_value(nullptr, kConfigSection, "NRControlMaskBlue", saved_control_mask_blue);
-  reshade::get_config_value(nullptr, kConfigSection, "NRControlMaskDepthNear", saved_control_mask_depth_near);
-  reshade::get_config_value(nullptr, kConfigSection, "NRControlMaskDepthFar", saved_control_mask_depth_far);
+  configuration::Get(nullptr, kConfigSection, "NRControlMaskMode", saved_control_mask_mode);
+  configuration::Get(nullptr, kConfigSection, "NRControlMaskBlendMode", saved_control_mask_blend_mode);
+  configuration::Get(nullptr, kConfigSection, "NRControlMaskRed", saved_control_mask_red);
+  configuration::Get(nullptr, kConfigSection, "NRControlMaskGreen", saved_control_mask_green);
+  configuration::Get(nullptr, kConfigSection, "NRControlMaskBlue", saved_control_mask_blue);
+  configuration::Get(nullptr, kConfigSection, "NRControlMaskDepthNear", saved_control_mask_depth_near);
+  configuration::Get(nullptr, kConfigSection, "NRControlMaskDepthFar", saved_control_mask_depth_far);
   control_mask_motion_enabled = saved_control_mask_motion_enabled;
   MigrateControlMaskMotionDefaults(&saved_control_mask_motion_start, &saved_control_mask_motion_end);
   control_mask_motion_start = SanitizeFloatKey(saved_control_mask_motion_start,
@@ -36274,11 +36340,11 @@ inline void LoadConfiguration() {
   }
   uint32_t capture_samples = 0, capture_seconds = 120, capture_warmup = 6;
   bool capture_xefg = false;
-  reshade::get_config_value(nullptr, kConfigSection, "NRXeFgGpuCapture", capture_xefg);
+  configuration::Get(nullptr, kConfigSection, "NRXeFgGpuCapture", capture_xefg);
   xefg_gpu_capture_enabled = capture_xefg;
-  reshade::get_config_value(nullptr, kConfigSection, "NRControlMaskGpuCaptureSamples", capture_samples);
-  reshade::get_config_value(nullptr, kConfigSection, "NRControlMaskGpuCaptureSeconds", capture_seconds);
-  reshade::get_config_value(nullptr, kConfigSection, "NRControlMaskGpuCaptureWarmupSeconds", capture_warmup);
+  configuration::Get(nullptr, kConfigSection, "NRControlMaskGpuCaptureSamples", capture_samples);
+  configuration::Get(nullptr, kConfigSection, "NRControlMaskGpuCaptureSeconds", capture_seconds);
+  configuration::Get(nullptr, kConfigSection, "NRControlMaskGpuCaptureWarmupSeconds", capture_warmup);
   capture_samples = SanitizeEnumKey(capture_samples, 0u, 0u, 4096u, "NRControlMaskGpuCaptureSamples");
   capture_seconds = SanitizeEnumKey(capture_seconds, 120u, 1u, 300u, "NRControlMaskGpuCaptureSeconds");
   capture_warmup = SanitizeEnumKey(capture_warmup, 6u, 0u, 60u, "NRControlMaskGpuCaptureWarmupSeconds");
@@ -36295,7 +36361,7 @@ inline void LoadConfiguration() {
     Log(reshade::log::level::warning, "ControlMask GPU capture configuration unavailable or busy; no capture was armed");
   }
   bool saved_norm_trace = false;
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRNormTrace", saved_norm_trace);
   norm_trace_enabled = saved_norm_trace;
   // Both trace CSVs go beside this game's ReShade.ini, never into a shared
@@ -36304,32 +36370,32 @@ inline void LoadConfiguration() {
     norm_trace::Configure(ReShadeBaseDirectory() / "RenoDX-DLSS5-normtrace.csv");
   }
   bool saved_screenshot_planes = false;
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRScreenshotPlanes", saved_screenshot_planes);
   screenshot::diagnostic_planes_enabled = saved_screenshot_planes;
   uint32_t saved_screenshot_source = 0;
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRScreenshotSource", saved_screenshot_source);
   screenshot::source_mode =
       SanitizeEnumKey(saved_screenshot_source, 0u, 0u, 2u, "NRScreenshotSource");
   // Screenshot files (screenshot.hpp): format, layout, JPEG quality, size cap.
   uint32_t saved_screenshot_format = 0;
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRScreenshotFormat", saved_screenshot_format);
   screenshot::file_format =
       SanitizeEnumKey(saved_screenshot_format, 0u, 0u, 2u, "NRScreenshotFormat");
   uint32_t saved_screenshot_layout = 0;
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRScreenshotLayout", saved_screenshot_layout);
   screenshot::layout =
       SanitizeEnumKey(saved_screenshot_layout, 0u, 0u, 1u, "NRScreenshotLayout");
   uint32_t saved_jpeg_quality = 95;
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRScreenshotJpegQuality", saved_jpeg_quality);
   screenshot::jpeg_quality =
       SanitizeEnumKey(saved_jpeg_quality, 95u, 80u, 100u, "NRScreenshotJpegQuality");
   uint32_t saved_max_megabytes = 10;
-  reshade::get_config_value(
+  configuration::Get(
       nullptr, kConfigSection, "NRScreenshotMaxMB", saved_max_megabytes);
   screenshot::max_megabytes =
       SanitizeEnumKey(saved_max_megabytes, 10u, 0u, 500u, "NRScreenshotMaxMB");
@@ -36345,7 +36411,7 @@ inline void LoadConfiguration() {
   // games whose DLSS/DLSSD is reached solely through a private Streamline
   // bridge that never touches the NGX exports.
   uint32_t saved_hook_mode = 2;
-  const bool hook_mode_stored = reshade::get_config_value(
+  const bool hook_mode_stored = configuration::Get(
       nullptr, kConfigSection, "EnableHooks", saved_hook_mode);
 
   hooks_enabled = saved_hook_mode != 0;
@@ -36363,28 +36429,28 @@ inline void LoadConfiguration() {
     char saved_ui_mode[16] = {};
     size_t saved_ui_mode_length = sizeof(saved_ui_mode) - 1;
     ui_classic_layout =
-        reshade::get_config_value(nullptr, kConfigSection, "UiMode", saved_ui_mode,
+        configuration::Get(nullptr, kConfigSection, "UiMode", saved_ui_mode,
                                   &saved_ui_mode_length)
         && _stricmp(saved_ui_mode, "classic") == 0;
   }
   {
     bool saved_welcomed = false;
-    reshade::get_config_value(nullptr, kConfigSection, "UiWelcomed", saved_welcomed);
+    configuration::Get(nullptr, kConfigSection, "UiWelcomed", saved_welcomed);
     ui_welcomed = saved_welcomed;
   }
   {
     bool saved_notice = true;
-    reshade::get_config_value(nullptr, kConfigSection, "UiIssueNotice", saved_notice);
+    configuration::Get(nullptr, kConfigSection, "UiIssueNotice", saved_notice);
     hud_enabled = saved_notice;
   }
   {
     ui::NoticePosition position;
-    reshade::get_config_value(nullptr, kConfigSection, "UiHudX", position.legacy_percent.x);
-    reshade::get_config_value(nullptr, kConfigSection, "UiHudY", position.legacy_percent.y);
+    configuration::Get(nullptr, kConfigSection, "UiHudX", position.legacy_percent.x);
+    configuration::Get(nullptr, kConfigSection, "UiHudY", position.legacy_percent.y);
     // Missing anchor retains the old percentages and pivot without migrating the file.
-    reshade::get_config_value(nullptr, kConfigSection, "UiHudAnchor", position.anchor);
-    reshade::get_config_value(nullptr, kConfigSection, "UiHudOffsetX", position.offset.x);
-    reshade::get_config_value(nullptr, kConfigSection, "UiHudOffsetY", position.offset.y);
+    configuration::Get(nullptr, kConfigSection, "UiHudAnchor", position.anchor);
+    configuration::Get(nullptr, kConfigSection, "UiHudOffsetX", position.offset.x);
+    configuration::Get(nullptr, kConfigSection, "UiHudOffsetY", position.offset.y);
     StoreHudPosition(position);
   }
   // NRReportHost (rc11, ini-only): the issue report's upload hosts, tried in
@@ -36394,7 +36460,7 @@ inline void LoadConfiguration() {
     char saved_hosts[128] = {};
     size_t saved_hosts_length = sizeof(saved_hosts) - 1;
     std::string hosts = report::kDefaultHosts;
-    if (reshade::get_config_value(nullptr, kConfigSection, "NRReportHost", saved_hosts,
+    if (configuration::Get(nullptr, kConfigSection, "NRReportHost", saved_hosts,
                                   &saved_hosts_length)) {
       hosts.assign(saved_hosts, (std::min)(saved_hosts_length, sizeof(saved_hosts) - 1));
     }
@@ -36412,7 +36478,7 @@ inline void LoadConfiguration() {
     char saved_language[16] = {};
     size_t saved_language_length = sizeof(saved_language) - 1;
     int language = 0;
-    if (reshade::get_config_value(nullptr, kConfigSection, "UiLanguage", saved_language,
+    if (configuration::Get(nullptr, kConfigSection, "UiLanguage", saved_language,
                                   &saved_language_length)) {
       for (int i = 0; i < ui::kLanguageCount; ++i) {
         if (_stricmp(saved_language, ui::kLanguages[i].code) == 0) language = i + 1;
@@ -36429,7 +36495,7 @@ inline void LoadConfiguration() {
   {
     char saved_dx11_source[32] = {};
     size_t saved_dx11_source_length = sizeof(saved_dx11_source) - 1;
-    const bool dx11_source_stored = reshade::get_config_value(
+    const bool dx11_source_stored = configuration::Get(
         nullptr, kConfigSection, "DX11Source", saved_dx11_source,
         &saved_dx11_source_length);
     static std::atomic_bool dx11_source_line_logged{false};
@@ -36499,7 +36565,7 @@ inline void LoadConfiguration() {
   {
     char saved_foreign_nr[16] = {};
     size_t saved_foreign_nr_length = sizeof(saved_foreign_nr) - 1;
-    foreign_nr_yield = !(reshade::get_config_value(
+    foreign_nr_yield = !(configuration::Get(
                              nullptr, kConfigSection, "ForeignNr",
                              saved_foreign_nr, &saved_foreign_nr_length)
                          && _stricmp(saved_foreign_nr, "observe") == 0);
@@ -36731,7 +36797,7 @@ inline void LoadConfiguration() {
   for (const Setting* setting : kPassLookResultSettings) {
     if (setting->f != nullptr) {
       float value = setting->fallback;
-      reshade::get_config_value(nullptr, kConfigSection, setting->key, value);
+      configuration::Get(nullptr, kConfigSection, setting->key, value);
       float minimum = 0.f;
       float maximum = 2.f;
       const std::string_view key(setting->key);
@@ -36745,11 +36811,11 @@ inline void LoadConfiguration() {
       setting->Store(SanitizeFloatKey(value, setting->fallback, minimum, maximum, setting->key));
     } else if (setting->u != nullptr) {
       uint32_t value = static_cast<uint32_t>(setting->fallback);
-      reshade::get_config_value(nullptr, kConfigSection, setting->key, value);
+      configuration::Get(nullptr, kConfigSection, setting->key, value);
       setting->Store(static_cast<float>(SanitizeEnumKey(value, static_cast<uint32_t>(setting->fallback), 0u, 2u, setting->key)));
     } else {
       bool value = setting->fallback != 0.f;
-      reshade::get_config_value(nullptr, kConfigSection, setting->key, value);
+      configuration::Get(nullptr, kConfigSection, setting->key, value);
       setting->Store(value ? 1.f : 0.f);
     }
   }
@@ -36950,7 +37016,7 @@ inline void LoadConfiguration() {
   if (migrate_config) {
     PersistConfig(false);
   } else {
-    reshade::set_config_value(nullptr, kConfigSection, "ConfigVersion", kConfigVersion);
+    configuration::Set(nullptr, kConfigSection, "ConfigVersion", kConfigVersion);
   }
 }
 
@@ -37729,6 +37795,8 @@ inline void Use(DWORD reason, HMODULE module, LPVOID reserved) {
       reshade::register_event<reshade::addon_event::finish_present>(internal::OnFinishPresent);
       reshade::register_event<reshade::addon_event::init_effect_runtime>(
           internal::OnInitEffectRuntime);
+      reshade::register_event<reshade::addon_event::init_effect_runtime>(internal::OnUpdateInit);
+      reshade::register_event<reshade::addon_event::reshade_present>(internal::OnUpdatePresent);
       reshade::register_event<reshade::addon_event::destroy_effect_runtime>(
           internal::OnDestroyEffectRuntime);
       reshade::register_event<reshade::addon_event::destroy_command_list>(
@@ -37760,6 +37828,9 @@ inline void Use(DWORD reason, HMODULE module, LPVOID reserved) {
       lastgasp::MarkOnce("ngx:hooks-installed");
       break;
     case DLL_PROCESS_DETACH:
+      update::Shutdown();
+      reshade::unregister_event<reshade::addon_event::init_effect_runtime>(internal::OnUpdateInit);
+      reshade::unregister_event<reshade::addon_event::reshade_present>(internal::OnUpdatePresent);
 #if defined(NR_NEXUS_DEV_CONTROL)
       dev_control_pipe::Stop();
 #endif

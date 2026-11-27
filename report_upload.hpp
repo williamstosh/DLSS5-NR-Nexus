@@ -49,13 +49,9 @@
 
 #include <windows.h>
 #include <bcrypt.h>
-#include <winhttp.h>
+#include "http_winhttp.hpp"
 
 #pragma comment(lib, "bcrypt.lib")
-#pragma comment(lib, "winhttp.lib")
-// Loaded on the first upload, not into every game at start.
-#pragma comment(lib, "delayimp.lib")
-#pragma comment(linker, "/DELAYLOAD:winhttp.dll")
 
 namespace renodx::addons::dlss5::report {
 
@@ -146,54 +142,12 @@ inline std::string MultipartBoundary() {
   return boundary;
 }
 
-struct ParsedReportUrl {
-  std::wstring host;
-  std::wstring path;
-  INTERNET_PORT port = 0;
-  bool secure = false;
-  bool loopback = false;
-};
+using ParsedReportUrl = http::Url;
 
-// Validate the components WinHTTP will actually use, not an authority prefix.
-// In particular localhost.evil, userinfo, alternate numeric IP spellings and
-// escaped hostnames must not acquire the HTTP loopback exception.
 inline bool ParseReportUrl(std::wstring_view url, ParsedReportUrl* parsed) {
-  if (parsed == nullptr || url.empty() || url.size() > 8192) return false;
-  for (wchar_t c : url) {
-    if (c <= L' ' || c == L'\\' || c == L'"' || c == L'<' || c == L'>' || c == L'#') return false;
-  }
-  URL_COMPONENTS parts{};
-  parts.dwStructSize = sizeof(parts);
-  parts.dwHostNameLength = parts.dwUrlPathLength = parts.dwExtraInfoLength = 1;
-  parts.dwUserNameLength = parts.dwPasswordLength = 1;
-  if (!WinHttpCrackUrl(url.data(), static_cast<DWORD>(url.size()), 0, &parts)
-      || parts.dwHostNameLength == 0 || parts.nPort == 0
-      || parts.dwUserNameLength != 0 || parts.dwPasswordLength != 0) return false;
-  if (parts.nScheme != INTERNET_SCHEME_HTTP && parts.nScheme != INTERNET_SCHEME_HTTPS) return false;
-  const size_t authority_at = url.find(L"://");
-  if (authority_at == std::wstring_view::npos) return false;
-  const auto authority = url.substr(authority_at + 3, url.find_first_of(L"/?", authority_at + 3) - (authority_at + 3));
-  if (authority.find(L'@') != std::wstring_view::npos) return false;
-  std::wstring host(parts.lpszHostName, parts.dwHostNameLength);
-  for (wchar_t& c : host) {
-    if (c >= L'A' && c <= L'Z') c += L'a' - L'A';
-  }
-  if (host.size() > 253) return false;
-  const bool ipv6 = host.front() == L'[' && host.back() == L']';
-  for (size_t i = 0; i < host.size(); ++i) {
-    const wchar_t c = host[i];
-    if ((c >= L'a' && c <= L'z') || (c >= L'0' && c <= L'9') || c == L'.' || c == L'-') continue;
-    if (ipv6 && (c == L':' || (i == 0 && c == L'[') || (i + 1 == host.size() && c == L']'))) continue;
-    return false;
-  }
-  const bool loopback = host == L"localhost" || host == L"127.0.0.1" || host == L"[::1]";
-  const bool secure = parts.nScheme == INTERNET_SCHEME_HTTPS;
-  if (!secure && !loopback) return false;
-  std::wstring path(parts.lpszUrlPath, parts.dwUrlPathLength);
-  if (path.empty()) path = L"/";
-  if (parts.dwExtraInfoLength != 0) path.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
-  *parsed = {.host = std::move(host), .path = std::move(path), .port = parts.nPort,
-             .secure = secure, .loopback = loopback};
+  http::Url parts;
+  if (parsed == nullptr || !http::ParseUrl(url, &parts) || (!parts.secure && !parts.loopback)) return false;
+  *parsed = std::move(parts);
   return true;
 }
 
@@ -296,42 +250,20 @@ inline UploadResult Upload(const Host& host, const std::wstring& url,
     result.error = DescribeWinHttpError(ERROR_WINHTTP_OPERATION_CANCELLED);
     return result;
   }
-  HINTERNET session = WinHttpOpen(user_agent.c_str(),
-                                  parts.loopback ? WINHTTP_ACCESS_TYPE_NO_PROXY : WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                                  WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-  if (session == nullptr && !parts.loopback) {
-    session = WinHttpOpen(user_agent.c_str(), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-  }
-  HINTERNET connection = nullptr;
-  HINTERNET request = nullptr;
   const auto fail = [&](DWORD code) {
     if (progress->cancel.load(std::memory_order_relaxed)) result.cancelled = true;
     result.error = DescribeWinHttpError(code);
-    if (request != nullptr) WinHttpCloseHandle(request);
-    if (connection != nullptr) WinHttpCloseHandle(connection);
-    if (session != nullptr) WinHttpCloseHandle(session);
     return result;
   };
-  if (session == nullptr) return fail(GetLastError());
-  DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
-  if (!WinHttpSetOption(session, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols,
-                        sizeof(protocols))) {
-    protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;  // before Windows 11: no TLS 1.3 flag
-    if (!WinHttpSetOption(session, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols))) {
-      return fail(GetLastError());
-    }
-  }
-  WinHttpSetTimeouts(session, 15'000, 15'000, 60'000, 60'000);
-  connection = WinHttpConnect(session, parts.host.c_str(), parts.port, 0);
-  if (connection == nullptr) return fail(GetLastError());
-  request = WinHttpOpenRequest(connection, L"POST", parts.path.c_str(), nullptr, WINHTTP_NO_REFERER,
-                               WINHTTP_DEFAULT_ACCEPT_TYPES, parts.secure ? WINHTTP_FLAG_SECURE : 0);
-  if (request == nullptr) return fail(GetLastError());
-  DWORD disabled = WINHTTP_DISABLE_REDIRECTS | WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_AUTHENTICATION;
-  if (!WinHttpSetOption(request, WINHTTP_OPTION_DISABLE_FEATURE, &disabled, sizeof(disabled))) {
-    return fail(GetLastError());
-  }
+  DWORD session_error = 0;
+  auto session = http::OpenSession(user_agent.c_str(), parts.loopback, &session_error);
+  if (!session) return fail(session_error);
+  WinHttpSetTimeouts(session.get(), 15'000, 15'000, 60'000, 60'000);
+  http::Handle connection(WinHttpConnect(session.get(), parts.host.c_str(), parts.port, 0));
+  if (!connection) return fail(GetLastError());
+  http::Handle request(WinHttpOpenRequest(connection.get(), L"POST", parts.path.c_str(), nullptr, WINHTTP_NO_REFERER,
+                                          WINHTTP_DEFAULT_ACCEPT_TYPES, parts.secure ? WINHTTP_FLAG_SECURE : 0));
+  if (!request || !http::DisableAmbientFeatures(request.get())) return fail(GetLastError());
 
   const std::string boundary = MultipartBoundary();
   const std::string head = MultipartHead(boundary, host, "renodx-dlss5-report.zip");
@@ -339,9 +271,6 @@ inline UploadResult Upload(const Host& host, const std::wstring& url,
   const uint64_t total = head.size() + file_bytes + tail.size();
   if (total > MAXDWORD) {
     result.error = "the upload is too large";
-    if (request != nullptr) WinHttpCloseHandle(request);
-    if (connection != nullptr) WinHttpCloseHandle(connection);
-    WinHttpCloseHandle(session);
     return result;
   }
   progress->total = total;
@@ -349,7 +278,7 @@ inline UploadResult Upload(const Host& host, const std::wstring& url,
   const std::wstring headers = L"Content-Type: multipart/form-data; boundary="
                                + std::wstring(boundary.begin(), boundary.end());
   if (progress->cancel.load(std::memory_order_relaxed)) return fail(ERROR_WINHTTP_OPERATION_CANCELLED);
-  if (!WinHttpSendRequest(request, headers.c_str(), static_cast<DWORD>(-1L),
+  if (!WinHttpSendRequest(request.get(), headers.c_str(), static_cast<DWORD>(-1L),
                           WINHTTP_NO_REQUEST_DATA, 0, static_cast<DWORD>(total), 0)) {
     return fail(GetLastError());
   }
@@ -359,7 +288,7 @@ inline UploadResult Upload(const Host& host, const std::wstring& url,
       return false;
     }
     DWORD written = 0;
-    if (!WinHttpWriteData(request, data, static_cast<DWORD>(size), &written) || written != size) {
+    if (!WinHttpWriteData(request.get(), data, static_cast<DWORD>(size), &written) || written != size) {
       return false;
     }
     progress->sent += written;
@@ -380,13 +309,10 @@ inline UploadResult Upload(const Host& host, const std::wstring& url,
   if (file.bad() || (file.fail() && !file.eof())) return fail(ERROR_READ_FAULT);
   if (!write(tail.data(), tail.size())) return fail(GetLastError());
   if (progress->cancel.load(std::memory_order_relaxed)) return fail(ERROR_WINHTTP_OPERATION_CANCELLED);
-  if (!WinHttpReceiveResponse(request, nullptr)) return fail(GetLastError());
+  if (!WinHttpReceiveResponse(request.get(), nullptr)) return fail(GetLastError());
 
   DWORD status = 0;
-  DWORD status_bytes = sizeof(status);
-  if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                      WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_bytes,
-                      WINHTTP_NO_HEADER_INDEX)) return fail(GetLastError());
+  if (!http::QueryStatus(request.get(), &status)) return fail(GetLastError());
   result.status = status;
   std::string body;
   bool oversized = false;
@@ -398,7 +324,7 @@ inline UploadResult Upload(const Host& host, const std::wstring& url,
     if (progress->cancel.load(std::memory_order_relaxed)) return fail(ERROR_WINHTTP_OPERATION_CANCELLED);
     DWORD read = 0;
     const DWORD capacity = static_cast<DWORD>((std::min)(response_chunk.size(), kMaxResponseBytes + 1 - body.size()));
-    if (!WinHttpReadData(request, response_chunk.data(), capacity, &read)) return fail(GetLastError());
+    if (!WinHttpReadData(request.get(), response_chunk.data(), capacity, &read)) return fail(GetLastError());
     if (read == 0) break;
     body.append(response_chunk.data(), read);
     if (body.size() > kMaxResponseBytes) {
@@ -407,9 +333,6 @@ inline UploadResult Upload(const Host& host, const std::wstring& url,
     }
   }
   if (progress->cancel.load(std::memory_order_relaxed)) return fail(ERROR_WINHTTP_OPERATION_CANCELLED);
-  WinHttpCloseHandle(request);
-  WinHttpCloseHandle(connection);
-  WinHttpCloseHandle(session);
 
   while (!body.empty() && (body.back() == '\n' || body.back() == '\r' || body.back() == ' ')) {
     body.pop_back();

@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('all','report','branding','ui','dev-control','presets','unicode-input','native','lastgasp','sdr-policy','hdr-policy','scope','config','constants','control-mask','control-mask-execution','vulkan-control-mask','fg-xefg','fg-native','lifecycle','bridge-motion','stage-plan','edit-reuse-policy','present-frame-policy','capability-policy','adaptive-resolution','copy-slots')]
+    [ValidateSet('all','update','report','branding','ui','dev-control','presets','unicode-input','native','lastgasp','sdr-policy','hdr-policy','scope','config','constants','control-mask','control-mask-execution','vulkan-control-mask','fg-xefg','fg-native','lifecycle','bridge-motion','stage-plan','edit-reuse-policy','present-frame-policy','capability-policy','adaptive-resolution','copy-slots')]
     [string[]]$Suite = @('all'),
     [string]$SourceRoot = (Split-Path $PSScriptRoot -Parent),
     [string]$HostRoot = (Join-Path (Split-Path $PSScriptRoot -Parent) '.local/renodx'),
@@ -43,6 +43,7 @@ if ($SourceRoot.TrimEnd('\','/') -ne $repositoryRoot.TrimEnd('\','/') -and $UiPr
 $HostRoot = [IO.Path]::GetFullPath($HostRoot)
 $ShaderIncludeDirectory = [IO.Path]::GetFullPath($ShaderIncludeDirectory)
 $sources = [ordered]@{
+    update='update_tests'
     report='report_flow_tests'; ui='ui_layout_tests'
     presets='preset_store_tests'
     'unicode-input'='unicode_input_tests'
@@ -65,11 +66,11 @@ $sources = [ordered]@{
 }
 $executionPolicySuites = @('edit-reuse-policy','present-frame-policy','capability-policy')
 $dependencyCheckedSuites = $executionPolicySuites + @('adaptive-resolution')
-$macroSuites = @('fg-native','bridge-motion','adaptive-resolution','vulkan-control-mask')
+$macroSuites = @('fg-native','bridge-motion','adaptive-resolution','vulkan-control-mask','update')
 if ($Suite -contains 'all') { $Suite = @($sources.Keys) }
 if ($DevControlMode -ne 'Auto') {
     if (-not @($Suite | Where-Object { $_ -in $macroSuites }).Count) {
-        throw '-DevControlMode Off/On requires fg-native, bridge-motion, adaptive-resolution or vulkan-control-mask.'
+        throw '-DevControlMode Off/On requires fg-native, bridge-motion, adaptive-resolution, vulkan-control-mask or update.'
     }
     if ($env:CL -match 'NR_NEXUS_DEV_CONTROL\b' -or $env:_CL_ -match 'NR_NEXUS_DEV_CONTROL\b') {
         throw 'Explicit DEV control mode cannot be combined with NR_NEXUS_DEV_CONTROL in CL or _CL_.'
@@ -157,6 +158,12 @@ $includes = @($SourceRoot, "$HostRoot/src", "$HostRoot/src/addons/dlss5",
 $libraries = @($DetoursLibrary,'uuid.lib','advapi32.lib','d3d11.lib','d3d12.lib','dxgi.lib','dxguid.lib')
 foreach ($item in $Suite) {
     $directory = Join-Path $OutputDirectory $item
+    if ($item -eq 'update') {
+        & (Join-Path $testRoot 'run-update-tests.ps1') -SourceRoot $SourceRoot -HostRoot $HostRoot `
+            -OutputDirectory $directory -VcVars64 $VcVars64 -PythonExecutable $PythonExecutable `
+            -DevControlMode $DevControlMode -BuildOnly:$BuildOnly
+        continue
+    }
     if ($item -eq 'unicode-input') {
         if ($BuildOnly) { throw '-BuildOnly is not supported for unicode-input.' }
         & (Join-Path $testRoot 'run-unicode-input-tests.ps1') -SourceRoot $SourceRoot -OutputDirectory $directory -VcVars64 $VcVars64

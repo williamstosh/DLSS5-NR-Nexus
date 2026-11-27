@@ -36,6 +36,8 @@ Smoke 必须每轮传 -Save 和当前存档文件名；游戏通过 ListSavedGam
 
 `reset-nr`（Python：`Client.reset_nr()`，协议：`reset_nr`）调用现有“Reset NR feature and clear failure latch”按钮使用的 `RecreateFeatures()`，不修改画质设置。需要包含此命令的 DEV 候选；旧候选的 `invalid_operation` 是未执行，不能用同值赋值、切换其他设置或按钮代替。回执表示业务入口已执行，后续模型创建、新锚点、刷新／复用和 GPU 完成仍须分别观察。结果未知时只查询原请求回执，不重复发送 Reset。
 
+在线更新使用 `Client.online_update(action, ...)` 或 `tools/dev_control.py ... online-update <action> [JSON值]`。`status` 读取更新快照，`check`、`download`、`choose_directory`、`open_directory`、`open_release` 调用玩家面板相同的正式业务入口；`auto_check` 接受布尔 `enabled`，`download_directory` 接受绝对目录 `directory`。命令请求受理与检查／下载完成分开查看，使用 `update.busy`、`check_state`、`download_state`、错误和 `completed_path` 跟踪结果。它不受 NR 开关或画质事务限制，设置由独立帧回调保存到 `[RenoDX.DLSS5.Update]`；DEV 只提供脚本通道，普通构建共用更新功能。
+
 Mafia 单 Pass Upscaled 的恢复诊断使用独立请求 `inline-restore-roi <绝对目录>`，协议操作为 `inline_restore_roi`，字段为 `output_directory`。它只布防一次求值，不提交画质设置或切换接入点。目标目录须为 D 盘本项目 `tmp/mafia-same-frame-roi/<capture_id>/` 下尚未创建的批次目录，`capture_id` 使用英文字母、数字、连字符或下划线，最长 96 个字符。请求接受时冻结目录；目录无效或写盘失败会报告失败，不使用游戏截图目录。
 
 这条诊断的状态、API、取样插点和热路径判断全部受 `NR_NEXUS_DEV_CONTROL` 编译条件保护。普通发布构建关闭该选项，保留原有结构、函数签名和调用路径；开发构建才包含采集能力。认领一次合格求值后新增四次 `CopyTextureRegion` 和八次复制前后的资源状态转换，净原码为 175,392 字节；READBACK 还包含行填充与堆分配对齐。它复用已有求值、提交与完成证明，不新增模型调用或渲染线程等待。实机 GPU 拷贝耗时及帧时影响尚未测量。
@@ -286,6 +288,8 @@ NR 编辑复用静态对照使用 PowerShell 入口的 `-NrEditReuse 0|1`（逐�
 `--restore-installation` 只透传 wrapper 原有的 `-RestoreInstallation`，使其在游戏退出后恢复原 DLL 和完整配置；原存档保护及恢复校验由既有 runner 承担。进程仍存活时保留 `restore_pending`，不能将该状态报告为已恢复。默认留装分支仍为旧逻辑，因此本轮禁止省略该开关。
 
 直接 wrapper 入口可省略 -Python；工具会优先使用仓库的 .local/game-compare-venv/Scripts/python.exe，并忽略 WindowsApps 占位符，也可显式用 -Python $pythonPath -TargetPath 指定目标配置。-OutputRoot 指定输出目录，-RestoreInstallation 控制完整恢复。普通 smoke／menu／calibrate 入口为 tools/run-game-test.ps1，继续接受原 -Game/-Platform/-Scenario/-Save/-CaptureHoldSeconds/-Retries/-Preflight 参数，需要自动采集时附加 -CaptureScript 指向 tools/ 或 tmp/ 下的 Python 脚本。-Preflight 解析目标并打印本地配置；默认脚本后端不构建 OCR，也不启动或安装游戏。
+
+在线更新偏好落盘验收使用 `tools/run-fg-acceptance.ps1 -UpdatePreferencesPath <本仓库 tmp/ 或 artifacts/ 下的 JSON> -RestoreInstallation`，并传入本轮正常游戏测试参数。JSON 包含 `AutoCheck`、`DownloadDirectory` 和 `NextAutoCheckUtc`。ReShade 在原路径保存本轮临时 `ReShade.ini`，原件备份、存档及其他受保护配置持只读共享锁。游戏和崩溃报告器退出后，`acceptance-*/receipt.json` 的 `update_preferences.test_configuration` 记录保存后的更新段和整份临时配置 SHA-256，随后 wrapper 恢复并校验原文件。
 
 `-IsolateOverlayKey` 将本轮 ReShade 叠加层热键临时切到 F7，并在结束后恢复。游戏菜单、存档和退出由脚本桥处理；采集脚本需要开关叠加层时使用对应热键，并在完成采集前确认面板已关闭。
 

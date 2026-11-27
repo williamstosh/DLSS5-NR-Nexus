@@ -55,6 +55,28 @@ class ClientTests(unittest.TestCase):
         self.assertNotEqual(*[r['id'] for r in self.transport.requests])
         self.assertEqual(dev.NamedPipeTransport(42).path, r'\\.\pipe\nr-nexus-dev-42')
 
+    def test_online_update_uses_production_commands_with_no_nr_setting_write(self):
+        client = self.client()
+        client.online_update()
+        client.online_update('auto_check', enabled=False)
+        client.online_update('download_directory', directory=r'D:\Downloads\更新')
+        client.online_update('check')
+        client.online_update('download')
+        self.assertEqual([r['op'] for r in self.transport.requests], ['online_update'] * 5)
+        self.assertIs(self.transport.requests[1]['enabled'], False)
+        self.assertEqual(self.transport.requests[2]['directory'], r'D:\Downloads\更新')
+        self.assertFalse(any('key' in r for r in self.transport.requests))
+
+    def test_online_update_rejects_conflicting_fields_before_transport(self):
+        client = self.client()
+        for action, options in (('auto_check', {}), ('check', {'enabled': True}),
+                                ('download_directory', {'directory': ''}),
+                                ('download_directory', {'directory': 'bad\0path'}),
+                                ('open_release', {'completed': True}), ('unknown', {})):
+            with self.subTest(action=action, options=options), self.assertRaises(ValueError):
+                client.online_update(action, **options)
+        self.assertEqual(self.transport.requests, [])
+
     def test_compact_marker_replies_preserve_the_native_process_identity_contract(self):
         for action, accepted, status in (('arm', True, 'armed'), ('stop', True, 'stopped'),
                                          ('status', True, 'observed'), ('invalid', False, 'rejected')):

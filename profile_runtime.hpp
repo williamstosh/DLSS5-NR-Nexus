@@ -394,7 +394,7 @@ inline void Schedule(bool urgent = false) {
   }
   // Persist the private identity only on an explicit profile edit/selection.
   if (reset.phase != ResetPhase::ROLLBACK) {
-    reshade::set_config_value(nullptr, kConfigSection, "ProfileGameId", game_id.c_str());
+    configuration::Set(nullptr, kConfigSection, "ProfileGameId", game_id.c_str());
     if (ReadPresentRestoreRaw("ProfileGameId") != game_id) {
       notice = "Could not save the game profile identity. Changes remain unsaved.";
       save_failed = true;
@@ -694,7 +694,7 @@ inline bool TryInitializeBalanced(FirstInstallEvidence evidence,
     notice = exception.what();
     return false;
   }
-  reshade::set_config_value(nullptr, kConfigSection, "ProfileBalancedInitialized", "1");
+  configuration::Set(nullptr, kConfigSection, "ProfileBalancedInitialized", "1");
   if (ReadPresentRestoreRaw("ProfileBalancedInitialized") != "1") {
     notice = "Could not save first-install marker. Current settings were kept.";
     return false;

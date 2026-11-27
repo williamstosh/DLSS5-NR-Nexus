@@ -171,12 +171,38 @@ inline BOOL WINAPI Foreground(HWND window) {
 
 namespace runtime = renodx::addons::dlss5::internal;
 namespace ui = renodx::addons::dlss5::ui;
+namespace update = renodx::addons::dlss5::update;
 using Json = nlohmann::json;
 #include "monitor_performance_cases.hpp"
 #define NR_NEXUS_TEST_OUTPUT_RUNTIME_ONLY
 #include "adaptive_ui_cases.hpp"
 #undef NR_NEXUS_TEST_OUTPUT_RUNTIME_ONLY
 #include "monitor_session_cases.hpp"
+
+static std::shared_ptr<update::Release> UpdateUiRelease() {
+  return std::make_shared<update::Release>(update::Release{
+      .version = "0.7.0",
+      .tag = "v0.7.0",
+      .published_at = "2026-11-26T10:42:50Z",
+      .body = "<a id=\"zh\"></a>\r\n"
+              "## 更新日志\r\n"
+              "可在游戏中检查正式版。\r\n"
+              "- 选择更新包的保存目录。\r\n"
+              "\r\n"
+              "<!-- Internal comment\r\n"
+              "also hidden -->\r\n"
+              "<a id=\"en\"></a>## Release notes\r\n"
+              "The progress bar reaches 100% when the package is saved.\r\n"
+              "1. Choose a folder.\r\n"
+              "2. Download the official package.\r\n"
+              "Keep a backup of the `renodx-dlss5.addon64` file. <!-- hidden inline -->\r\n",
+      .html_url = "https://example.invalid/releases/v0.7.0",
+      .asset = update::Asset{.name = "NR-Nexus-v0.7.0-0123abcd-windows-x64.zip",
+                             .size = 5242880,
+                             .url = "https://example.invalid/update.zip",
+                             .id = 100},
+  });
+}
 
 struct Item {
   ImGuiID id = 0;
@@ -504,6 +530,7 @@ int main() {
     bool preset_fixture = false;
     bool preset_latin_font = false;
     const ui::MonitorInputs* monitor_fixture = nullptr;
+    const update::Snapshot* update_fixture = nullptr;
     const ui::MonitorInputs* resolution_observed_fixture = nullptr;
     float resolution_observed_bottom = 0.f;
     bool adaptive_editor_fixture = false;
@@ -584,6 +611,13 @@ int main() {
         }
         runtime::preset_ui::DrawManager();
         if (preset_latin_font) ImGui::PopFont();
+      } else if (update_fixture != nullptr) {
+        runtime::RefreshUiLanguage();
+        ui::SetTheme(runtime::ui_theme_choice.load());
+        ui::StyleScope theme;
+        ui::PushPanelTheme(theme);
+        ui::DrawUpdatePanel(*update_fixture);
+        snapshot_regions.insert_or_assign("updates", ImRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax()));
       } else if (monitor_fixture != nullptr) {
         runtime::RefreshUiLanguage();
         ui::SetTheme(runtime::ui_theme_choice.load());
@@ -638,13 +672,14 @@ int main() {
         // Native multiline editors own an internal text scroller. The outer
         // input's item bounds, rather than that private cursor, define layout.
         if (std::strstr(window->Name, "##preset_description_") != nullptr) continue;
-        if (std::strstr(window->Name, "##issue_steps_") != nullptr) {
+        if (std::strstr(window->Name, "##issue_steps_") != nullptr
+            || std::strstr(window->Name, "##update_original_markdown_") != nullptr) {
           // InputTextMultiline reserves cursor scrolling space beyond its
           // text viewport. Validate the editor bounds, not that private cursor.
           if (window->Active && window->ParentWindow != nullptr) {
             check(window->Pos.x >= window->ParentWindow->InnerRect.Min.x - 1.f
                       && window->Pos.x + window->Size.x <= window->ParentWindow->InnerRect.Max.x + 1.f,
-                  "report multiline editor extends outside its parent");
+                  "multiline preview extends outside its parent");
           }
           continue;
         }
@@ -818,6 +853,7 @@ int main() {
     };
 
     if (std::getenv("NR_NEXUS_UI_SNAPSHOTS") != nullptr) {
+#include "update_ui_cases.hpp"
 #include "ui_snapshot_cases.hpp"
     }
     if (std::getenv("NR_NEXUS_MONITOR_PERFORMANCE") != nullptr) {
