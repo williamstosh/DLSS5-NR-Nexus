@@ -219,8 +219,8 @@ void RunMonitorSessionCases(const Check& check, const Frame& frame) {
       WritePrivateProfileStringA(nullptr, nullptr, nullptr, ini_path.string().c_str());
     }
   };
-  OutputRuntimeFixture runtime_a_fixture{false};
-  OutputRuntimeFixture runtime_b_fixture{false};
+  const auto runtime_a_fixture = std::make_unique<OutputRuntimeFixture>(false);
+  const auto runtime_b_fixture = std::make_unique<OutputRuntimeFixture>(false);
   struct Restore {
     const decltype(restore)* callback;
     ~Restore() noexcept(false) { (*callback)(); }
@@ -531,8 +531,8 @@ void RunMonitorSessionCases(const Check& check, const Frame& frame) {
   };
 
   // The real callback queries the first runtime's back buffers while electing the owner.
-  auto* runtime_a = &runtime_a_fixture;
-  auto* runtime_b = &runtime_b_fixture;
+  auto* runtime_a = runtime_a_fixture.get();
+  auto* runtime_b = runtime_b_fixture.get();
   r::live_effect_runtimes.clear();
   r::effect_runtime_generations.clear();
   r::monitor_runtime = nullptr;

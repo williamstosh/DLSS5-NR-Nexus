@@ -17,6 +17,7 @@
 #include <functional>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
