@@ -391,6 +391,7 @@ struct NrFeatureSlot {
   // off to the slow interval.
   uint32_t fail_count = 0;
   uint64_t configuration_generation = 0;
+  uint64_t original_nr_init_generation = 0;
   // Set at slot creation and consumed by the slot's first evaluate so a newly
   // created stacked pass starts from clean history without touching the
   // global reset epoch (a new slot must never reset older slots or another
@@ -1209,6 +1210,7 @@ struct PresentTarget {
   bool independent_resolution_pair = false;
   // The native pre-FG service owns its command list and must not borrow the
   // game's Core context, which may have been initialized through a proxy.
+  bool warm_neutral_guides = false;
   bool private_signed_runtime = false;
   bool original_signed_runtime = false;
   bool native_fg_inputs = false;
@@ -1422,6 +1424,9 @@ inline std::unordered_map<const NVSDK_NGX_Handle*,
 inline std::atomic_bool nr_retirement_pending{false};
 inline ID3D12Device* direct_device = nullptr;
 inline bool original_nr_face_verified = false;  // Guarded by runtime_mutex.
+// Distinguishes local original-runtime Init lifetimes even if its image and
+// recording face survive. Guarded by runtime_mutex.
+inline uint64_t original_nr_init_generation = 0;
 // The same device with ReShade's wrapper peeled off, for IDENTITY only.
 // NGX keeps the wrapper (it is evaluated with the game's wrapped command
 // list and the pair has to match - unwrapping just the device is an
@@ -6165,6 +6170,7 @@ inline void ReleaseNrSlot(
   slot.control_mask_bound = false;
   slot.jitter_bound = false;
   slot.via_core = false;
+  slot.original_nr_init_generation = 0;
   slot.tracked_since_create = false;
   slot.memory_failure = false;
   slot.create_input_width = slot.create_input_height = 0;
@@ -7074,6 +7080,9 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
   renodx::utils::directx::NativeFromReShadeProxy(&direct_device_native);
   last_nr_device_native = direct_device_native;
   direct_runtime_failed = false;
+  if (CurrentOriginalNrApi()) {
+    ++original_nr_init_generation;
+  }
   Log(reshade::log::level::info,
       "DLSSNR " + (direct_runtime_requirements.file_version.empty()
           ? std::string("unknown version") : direct_runtime_requirements.file_version)
@@ -9436,6 +9445,7 @@ inline bool EnsureNrFeature(
   submission::TrackUse(command_list, slot.handle, submission::UseKind::kProvider);
   submission::TrackUse(command_list, slot.parameters, submission::UseKind::kProvider);
   slot.creation_recording = submission::ObserveRecording(command_list);
+  slot.original_nr_init_generation = (!slot.via_core && CurrentOriginalNrApi() ? original_nr_init_generation : 0);
   if (control_mask_enabled.load(std::memory_order_relaxed) || state.control_mask_recording != nullptr) {
     slot.recording = submission::ObserveRecording(command_list);
   }

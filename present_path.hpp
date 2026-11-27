@@ -471,12 +471,52 @@ struct PresentRing {
   PresentSlot slots[kPresentRing];
 };
 
+// Model lifetime is tied to the registered application output, not a
+// transient XeFG delivery epoch. The routes keep independent recording worksets.
+struct WarmPresentColor {
+  output_framerate::OutputIdentity owner;
+  HMODULE image = nullptr;
+  ID3D12Device* face = nullptr;  // Compared only under runtime_mutex.
+  uint64_t context_generation = 0;
+  std::weak_ptr<const void> xefg_context;
+  uint64_t configuration = 0;
+  DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+  codec::SourceUnits units;
+  uint8_t hdr_mode = 0;
+  uint32_t width = 0, height = 0;
+  uint32_t guide_width = 0, guide_height = 0;
+  uint32_t motion_x = 0, motion_y = 0;
+  uint32_t depth_x = 0, depth_y = 0;
+  uint32_t flags = 0;
+  uint32_t depth_setting = 0;
+  bool xefg = false;
+  bool real_guides = false;
+  bool has_real_layout = false;
+  bool complete = false;
+  uint64_t delivery_frame = 0;
+  uint64_t delivery_epoch = 0;
+  uintptr_t delivery_context = 0;
+  uint8_t service_workset_key = 0;
+};
+
+struct WarmPresentNeutralGuides {
+  ID3D12Device* face = nullptr;  // Compared only.
+  ID3D12Resource* motion = nullptr;
+  ID3D12Resource* depth = nullptr;
+  ID3D12Resource* upload = nullptr;
+  std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 2> footprints{};
+  bool inverted = false;
+  bool initialized = false;
+};
+
 // One NR stream per swapchain: its temporal history is the NR feature
 // registered under Handle(), an address no NGX handle can have (the
 // Streamline path keys its synthetic streams the same way; never
 // dereferenced).
 struct PresentStream {
   output_framerate::OutputIdentity output;
+  WarmPresentColor warm_color;
+  WarmPresentNeutralGuides warm_neutral_guides;
   present_frame_policy::Clock base_frame_clock;
   bool base_history_unbound = false;
   PresentEditReuseMonitor edit_reuse_monitor;
@@ -1013,6 +1053,308 @@ inline void ResetPresentStreamHistory(PresentStream* stream, uint32_t reason = k
   }
 }
 
+inline bool WarmPresentBindingLive(ID3D12Device* face) {
+  return face != nullptr && face == direct_device && original_nr_init_generation != 0
+      && direct_load_state == DirectLoadState::Ready && parameter_runtime_ready
+      && !direct_runtime_failed && !control_mask_use_core_context.load() && CurrentOriginalNrApi();
+}
+
+inline bool WarmPresentModelOnBinding(const NrFeatureSlot& slot) {
+  const bool runtime_allocator = direct_api.allocate != nullptr && direct_api.destroy != nullptr;
+  const auto destroy = (runtime_allocator ? direct_api.destroy : bridge::DestroyOwnedParameters);
+  return !slot.via_core && slot.original_nr_init_generation == original_nr_init_generation
+      && slot.evaluate_feature == direct_api.evaluate && slot.release_feature == direct_api.release
+      && slot.destroy_parameters == destroy;
+}
+
+inline bool WarmPresentColorEligible(const PresentTarget& target) {
+  return hook_point.load() == kHookPresent && !target.d3d11_bridge
+      && target.stage_execution_plan == nullptr && !target.native_fg_inputs && !target.native_prefg_resolution_pair
+      && RequestedStagePlan().At(stage_plan::Stage::PRESENT).count == 2
+      && !nr_adaptive_enabled.load() && !control_mask_enabled.load() && !edit_reuse_enabled.load()
+      && WarmPresentBindingLive(direct_device);
+}
+
+inline bool WarmPresentColorCurrent(const WarmPresentColor& warm, const output_framerate::OutputIdentity& owner,
+                                    const PresentTarget& target, uint32_t width, uint32_t height) {
+  return warm.owner == owner && warm.image == direct_api.module && warm.face == direct_device
+      && warm.context_generation == original_nr_init_generation
+      && warm.configuration == configuration_generation.load()
+      && warm.format == target.swapchain_format && warm.hdr_mode == target.hdr_mode
+      && warm.units.encoding == target.units.encoding && warm.units.absolute == target.units.absolute
+      && warm.units.unit_nits == target.units.unit_nits && warm.units.bt2020 == target.units.bt2020
+      && warm.width == width && warm.height == height && warm.depth_setting == depth_mode.load();
+}
+
+inline bool SharesWarmPresentRuntime(const PresentTarget& target, ID3D12Resource* backbuffer) {
+  if (backbuffer == nullptr || target.adaptive_output.view == 0 || !WarmPresentColorEligible(target)) return false;
+  const auto back_identity = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(backbuffer));
+  const auto owner = output_framerate::MatchPresentColorOwner(target.adaptive_output, back_identity);
+  if (!owner || owner.swapchain != target.swapchain_identity) return false;
+  const auto entry = present_streams.find(reinterpret_cast<const void*>(owner.swapchain));
+  if (entry == present_streams.end()) return false;
+  const auto& warm = entry->second.warm_color;
+  const auto live_context = warm.xefg_context.lock();
+  if (live_context == nullptr || reinterpret_cast<uintptr_t>(live_context.get()) != target.adaptive_output.view) return false;
+  const auto extent = backbuffer->GetDesc();
+  return WarmPresentColorCurrent(warm, owner, target, static_cast<uint32_t>(extent.Width), extent.Height);
+}
+
+inline bool EnsureOrdinaryPresentRing(ID3D12Resource* backbuffer, IUnknown* game_device) {
+  if (backbuffer == nullptr) return false;
+  ID3D12Device* face = nullptr;
+  if (direct_device != nullptr && !direct_api.private_instance
+      && renodx::utils::directx::SameNativeObject(direct_device, game_device)) {
+    face = direct_device;
+    face->AddRef();
+  } else if (FAILED(backbuffer->GetDevice(IID_PPV_ARGS(&face)))) {
+    face = nullptr;
+  }
+  const bool ready = face != nullptr && EnsurePresentRing(face);
+  ReleaseCom(face);
+  return ready;
+}
+
+inline bool WarmPresentSlotsMatch(const PresentStream& owner, ID3D12GraphicsCommandList* list,
+                                  const FeatureState& guide, const PresentTarget& target,
+                                  uint32_t width, uint32_t height) {
+  const auto feature = features.find(owner.Handle());
+  if (feature == features.end()) return false;
+  const auto group = RequestedStagePlan().At(stage_plan::Stage::PRESENT);
+  const auto flags = NrCreateFlags(guide.create_flags, target.hdr_mode != 0);
+  const bool independent = PresentResolutionPairAllowed(target);
+  for (uint32_t pass = 0; pass < group.count; ++pass) {
+    auto& slot = feature->second.slots[pass];
+    const uint32_t logical_pass = group.begin + pass;
+    const auto override_preset = logical_pass == 0 ? 0u : pass_preset[logical_pass - 1].load();
+    const auto chosen = nr_model::ResolvePreset(override_preset == 0 ? preset.load() : override_preset, 0,
+                                                direct_runtime_requirements.dual_models);
+    uint32_t work_width = 0, work_height = 0;
+    ComputeNrWorkingResolution(width, height, guide.input_width, guide.input_height,
+        work_width, work_height, independent ? logical_pass : group.begin);
+    if (slot.handle == nullptr || slot.parameters == nullptr || slot.failed || !WarmPresentModelOnBinding(slot)
+        || slot.configuration_generation != configuration_generation.load() || slot.nr_hdr_mode != target.hdr_mode
+        || slot.nr_preset != chosen || slot.nr_create_flags != flags
+        || slot.create_input_width != work_width || slot.create_input_height != work_height
+        || slot.create_output_width != work_width || slot.create_output_height != work_height) return false;
+    if (slot.creation_completed) continue;
+
+    // XeFG's first mature group can predate ordinary Prepare. Latch completion
+    // of that exact Create, not of every later Evaluate using the same model.
+    // The shared writer still orders live work through ProveWarmPresentQueueOrder.
+    const auto& creation = slot.creation_recording;
+    if (creation != nullptr && (slot.preparation_recording == nullptr || slot.preparation_recording == creation)
+        && submission::ExactOwnedRecordingCompleted(*creation, std::array<const void*, 2>{slot.handle, slot.parameters})) {
+      slot.preparation_recording.reset();
+      slot.creation_completed = true;
+    } else if (!NrModelPreparationReady(&slot, list)) {
+      return false;
+    }
+  }
+  return group.count == 2;
+}
+
+using WarmPresentQueueWaits = std::vector<std::pair<FenceRef, uint64_t>>;
+
+// Only our own non-replayable recordings that touched this exact group may
+// opt into a dependency. In-flight, unrelated output writers remain conflicts.
+inline bool ProveWarmPresentQueueOrder(const PresentStream& owner, std::span<const submission::OutputUse> outputs,
+    const std::pair<uint64_t, uint64_t>& recording, ID3D12Fence* queue_fence, WarmPresentQueueWaits* waits) {
+  waits->clear();
+  const auto found = features.find(owner.Handle());
+  if (found == features.end()) return submission::OutputWriteOrdered(outputs, recording, queue_fence);
+  const auto& feature = found->second;
+  const auto& first = feature.slots[0];
+  const auto& second = feature.slots[1];
+  const auto belongs_to_group = [&](const submission::ResourceUse& use) {
+    return use.kind == submission::UseKind::kProvider && use.object != nullptr
+        && (use.object == first.handle || use.object == second.handle
+            || use.object == first.parameters || use.object == second.parameters);
+  };
+  const auto shared_gpu_objects = std::array<const void*, 7>{feature.norm.commit,
+      first.look_history.buffers[0], first.look_history.buffers[1],
+      second.look_history.buffers[0], second.look_history.buffers[1],
+      owner.warm_neutral_guides.motion, owner.warm_neutral_guides.depth};
+  std::vector<submission::RecordingBlocker> blockers;
+  const auto work = submission::InspectRecordedWork([&](uint64_t identity, uint64_t generation,
+      const submission::Generation& live) {
+    if (std::pair{identity, generation} == recording) return false;
+    return std::ranges::any_of(live.classified_uses, [&](const submission::ResourceUse& use) {
+      return belongs_to_group(use)
+          || (use.object != nullptr && std::ranges::find(shared_gpu_objects, use.object) != shared_gpu_objects.end())
+          || std::ranges::any_of(outputs, [&](const auto& output) { return submission::OutputUseConflicts(use, output); });
+    });
+  }, &blockers, queue_fence);
+  if (work == submission::RecordedWork::kComplete) return true;
+  if (queue_fence == nullptr || submission::list_identity_fallbacks.load(std::memory_order_relaxed) != 0) return false;
+  for (const auto& prior : blockers) {
+    if ((prior.owner != submission::RecordingOwner::kOrdinaryPresent && prior.owner != submission::RecordingOwner::kXeFg)
+        || prior.close_reason != submission::CloseReason::kOwnerDiscarded || prior.first_execute == 0
+        || prior.unreserved_submissions != 0 || prior.submissions.size() != 1
+        || !std::ranges::any_of(prior.uses, belongs_to_group)) return false;
+    const auto& proof = prior.submissions.front();
+    if (proof.state == submission::SubmissionProofState::kComplete) continue;
+    if (proof.state != submission::SubmissionProofState::kInFlight || proof.fence.empty() || proof.value == 0) return false;
+    if (proof.fence.fence == queue_fence) continue;
+    const auto existing = std::ranges::find_if(*waits, [&](const auto& wait) { return wait.first.fence == proof.fence.fence; });
+    if (existing == waits->end()) waits->emplace_back(proof.fence, proof.value);
+    else existing->second = std::max(existing->second, proof.value);
+  }
+  return true;
+}
+
+inline bool EnqueueWarmPresentQueueWaits(ID3D12CommandQueue* queue, const WarmPresentQueueWaits& waits) {
+  return std::ranges::all_of(waits, [&](const auto& wait) {
+    return SUCCEEDED(queue->Wait(wait.first.fence, wait.second));
+  });
+}
+
+inline void RememberWarmPresentColor(PresentStream* stream, const output_framerate::OutputIdentity& owner,
+    const PresentTarget& target, const FeatureState& guide, uint32_t width, uint32_t height,
+    bool xefg, bool real_guides, bool complete, const fg::FrameInput* delivery = nullptr,
+    const std::shared_ptr<const void>& context = {}) {
+  const bool has_layout = real_guides || (target.warm_neutral_guides && stream->warm_color.has_real_layout);
+  auto xefg_context = stream->warm_color.xefg_context;
+  if (delivery != nullptr) {
+    xefg_context = context;
+  }
+  stream->warm_color = {
+      .owner = owner, .image = direct_api.module, .face = direct_device,
+      .context_generation = original_nr_init_generation, .xefg_context = std::move(xefg_context),
+      .configuration = configuration_generation.load(),
+      .format = target.swapchain_format, .units = target.units, .hdr_mode = target.hdr_mode,
+      .width = width, .height = height, .guide_width = guide.input_width, .guide_height = guide.input_height,
+      .motion_x = guide.motion_x, .motion_y = guide.motion_y, .depth_x = guide.depth_x, .depth_y = guide.depth_y,
+      .flags = guide.create_flags, .depth_setting = depth_mode.load(), .xefg = xefg, .real_guides = real_guides,
+      .has_real_layout = has_layout, .complete = complete, .delivery_frame = delivery != nullptr ? delivery->application_frame : 0,
+      .delivery_epoch = delivery != nullptr ? delivery->epoch : 0,
+      .delivery_context = delivery != nullptr ? delivery->context : 0};
+}
+
+inline std::optional<FeatureState> WarmNeutralGuideContract(const WarmPresentColor& warm, uint32_t width, uint32_t height) {
+  constexpr uint32_t preserved_flags = NVSDK_NGX_DLSS_Feature_Flags_DepthInverted
+      | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
+  if (!warm.complete || !warm.has_real_layout || warm.guide_width == 0 || warm.guide_height == 0
+      || (warm.flags & ~preserved_flags) != 0 || warm.guide_width > width || warm.guide_height > height
+      || warm.guide_width > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION
+      || warm.guide_height > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION
+      || ((warm.flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) != 0) != (warm.guide_width < width)
+      || (warm.guide_width == width) != (warm.guide_height == height)
+      || warm.motion_x > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION - warm.guide_width
+      || warm.depth_x > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION - warm.guide_width
+      || warm.motion_y > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION - warm.guide_height
+      || warm.depth_y > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION - warm.guide_height) return {};
+  // We have no authoritative jitter while Optional guides are missing. Only
+  // a layout that does not require it can use this neutral contract.
+  FeatureState contract;
+  contract.input_width = warm.guide_width;
+  contract.input_height = warm.guide_height;
+  contract.motion_x = warm.motion_x;
+  contract.motion_y = warm.motion_y;
+  contract.depth_x = warm.depth_x;
+  contract.depth_y = warm.depth_y;
+  contract.create_flags = warm.flags;
+  contract.has_motion_scale_x = contract.has_motion_scale_y = true;
+  contract.motion_scale_x = static_cast<float>(warm.guide_width);
+  contract.motion_scale_y = static_cast<float>(warm.guide_height);
+  return contract;
+}
+
+inline bool EnsureWarmPresentNeutralGuides(PresentStream* stream, ID3D12Device* face, const FeatureState& contract) {
+  auto& neutral = stream->warm_neutral_guides;
+  const std::array<uint32_t, 2> widths{contract.motion_x + contract.input_width, contract.depth_x + contract.input_width};
+  const std::array<uint32_t, 2> heights{contract.motion_y + contract.input_height, contract.depth_y + contract.input_height};
+  const bool inverted = ResolveDepthInverted(contract.create_flags);
+  if (neutral.face == face && neutral.inverted == inverted && (neutral.initialized || neutral.upload != nullptr)
+      && neutral.motion->GetDesc().Width == widths[0] && neutral.motion->GetDesc().Height == heights[0]
+      && neutral.depth->GetDesc().Width == widths[1] && neutral.depth->GetDesc().Height == heights[1]) return true;
+  RetirePresentResource(&neutral.motion);
+  RetirePresentResource(&neutral.depth);
+  RetirePresentResource(&neutral.upload);
+  neutral = {};
+  if (!CreateScratchTexture(face, widths[0], heights[0], DXGI_FORMAT_R16G16_FLOAT,
+          D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+          &neutral.motion, L"NR Present neutral motion")
+      || !CreateScratchTexture(face, widths[1], heights[1], DXGI_FORMAT_R32_FLOAT,
+          D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+          &neutral.depth, L"NR Present neutral depth")) return false;
+  const auto motion_desc = neutral.motion->GetDesc();
+  const auto depth_desc = neutral.depth->GetDesc();
+  face->GetCopyableFootprints(&motion_desc, 0, 1, 0, &neutral.footprints[0], nullptr, nullptr, nullptr);
+  const uint64_t motion_bytes = uint64_t{neutral.footprints[0].Footprint.RowPitch} * heights[0];
+  const uint64_t depth_offset = (motion_bytes + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1)
+      & ~(uint64_t{D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT} - 1);
+  face->GetCopyableFootprints(&depth_desc, 0, 1, depth_offset, &neutral.footprints[1], nullptr, nullptr, nullptr);
+  const uint64_t bytes = depth_offset + uint64_t{neutral.footprints[1].Footprint.RowPitch} * heights[1];
+  const D3D12_HEAP_PROPERTIES heap{.Type = D3D12_HEAP_TYPE_UPLOAD};
+  const D3D12_RESOURCE_DESC upload{.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER, .Width = bytes, .Height = 1,
+      .DepthOrArraySize = 1, .MipLevels = 1, .Format = DXGI_FORMAT_UNKNOWN, .SampleDesc = {1, 0},
+      .Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+  if (FAILED(face->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &upload,
+          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&neutral.upload)))) return false;
+  void* mapped = nullptr;
+  const D3D12_RANGE no_read{};
+  if (FAILED(neutral.upload->Map(0, &no_read, &mapped)) || mapped == nullptr) {
+    RetirePresentResource(&neutral.upload);
+    return false;
+  }
+  auto* const data = static_cast<uint8_t*>(mapped);
+  std::memset(data, 0, static_cast<size_t>(bytes));
+  if (!inverted) {
+    for (uint32_t row = 0; row < heights[1]; ++row) {
+      std::fill_n(reinterpret_cast<float*>(data + depth_offset + uint64_t{row} * neutral.footprints[1].Footprint.RowPitch),
+                  widths[1], 1.f);
+    }
+  }
+  neutral.upload->Unmap(0, nullptr);
+  neutral.face = face;
+  neutral.inverted = inverted;
+  return true;
+}
+
+inline std::optional<FeatureState> SelectWarmPresentNeutralGuides(PresentStream* stream,
+    const PresentTarget& target, uintptr_t backbuffer, uintptr_t swapchain, uint32_t width, uint32_t height) {
+  if (target.guide_mode != kPresentGuidesOptional || !WarmPresentColorEligible(target)) return {};
+  const auto owner = output_framerate::MatchPresentColorOwner(target.adaptive_output, backbuffer);
+  if (owner.swapchain != swapchain || !WarmPresentColorCurrent(stream->warm_color, owner, target, width, height)) return {};
+  const auto neutral = WarmNeutralGuideContract(stream->warm_color, width, height);
+  if (!neutral || !WarmPresentSlotsMatch(*stream, nullptr, *neutral, target, width, height)
+      || !EnsureWarmPresentNeutralGuides(stream, direct_device, *neutral)) return {};
+  return neutral;
+}
+
+inline void WarmPresentNeutralGuidesSubmitted(WarmPresentNeutralGuides* neutral) {
+  neutral->initialized = true;
+  // The exact tracked list retains temporary upload storage until completion.
+  RetirePresentResource(&neutral->upload);
+}
+
+inline void RecordWarmPresentNeutralGuides(WarmPresentNeutralGuides* neutral, ID3D12GraphicsCommandList* list) {
+  if (neutral->initialized) return;
+  constexpr auto read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  submission::TrackUse(list, neutral->upload);
+  const std::array guides{neutral->motion, neutral->depth};
+  for (size_t i = 0; i < guides.size(); ++i) {
+    auto* const guide = guides[i];
+    submission::TrackUse(list, guide);
+    Transition(list, guide, read, D3D12_RESOURCE_STATE_COPY_DEST, 0);
+    const D3D12_TEXTURE_COPY_LOCATION from{.pResource = neutral->upload,
+        .Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, .PlacedFootprint = neutral->footprints[i]};
+    const D3D12_TEXTURE_COPY_LOCATION to{.pResource = guide,
+        .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = 0};
+    list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    Transition(list, guide, D3D12_RESOURCE_STATE_COPY_DEST, read, 0);
+  }
+}
+
+inline void InvalidateWarmPresentColor(PresentStream* stream) {
+  if (auto feature = features.find(stream->Handle()); feature != features.end()) {
+    ReleaseAllNrSlots(feature->second, true);
+  }
+  RetireWorkset({stream->Handle(), reinterpret_cast<const ID3D12Resource*>(&stream->warm_color.service_workset_key)});
+  stream->warm_color = {};
+}
+
 inline void PublishPresentBaseRejection(PresentStream* stream, const void* backbuffer,
                                         reshade::api::color_space color_space) {
   const auto reason = (color_space == reshade::api::color_space::hdr10_pq
@@ -1056,6 +1398,12 @@ inline void RetirePresentStream(const void* swapchain, bool keep_source_observat
     }
     RetireWorkset({stream.Handle(neutral), reinterpret_cast<const ID3D12Resource*>(&stream)});
   }
+  RetireWorkset({stream.Handle(), reinterpret_cast<const ID3D12Resource*>(&stream.warm_color.service_workset_key)});
+  stream.warm_color = {};
+  RetirePresentResource(&stream.warm_neutral_guides.motion);
+  RetirePresentResource(&stream.warm_neutral_guides.depth);
+  RetirePresentResource(&stream.warm_neutral_guides.upload);
+  stream.warm_neutral_guides = {};
   RetirePresentResource(&stream.neutral_motion);
   RetirePresentResource(&stream.neutral_depth);
   // Direct3D 11: the stream's bridge twins, and its neutral guides (the
@@ -1191,6 +1539,9 @@ inline bool ReleasePresentPath() {
     OnNativePresentStreamRetired(&stream);
     owner_resident_nr_handles.erase(stream.Handle());
     owner_resident_nr_handles.erase(stream.Handle(true));
+    ReleaseCom(stream.warm_neutral_guides.motion);
+    ReleaseCom(stream.warm_neutral_guides.depth);
+    ReleaseCom(stream.warm_neutral_guides.upload);
     ReleaseCom(stream.neutral_motion);
     ReleaseCom(stream.neutral_depth);
     ReleaseCom(stream.neutral_motion11);
@@ -1915,7 +2266,7 @@ inline bridge::OwnedParameters& FillPresentBlock(
     PresentStream* stream, void* frame, void* motion, void* depth,
     const FeatureState& contract, uint32_t width, uint32_t height,
     float motion_share, int reset, bool neutral_model = false,
-    const NVSDK_NGX_Handle* guide_source = nullptr) {
+    const NVSDK_NGX_Handle* guide_source = nullptr, const NVSDK_NGX_Handle* shared_model = nullptr) {
   const uint64_t source_generation = (guide_source != nullptr ? contract.source_generation : 0);
   if (stream->history_guide_source != guide_source
       || stream->history_guide_generation != source_generation) {
@@ -1971,11 +2322,12 @@ inline bridge::OwnedParameters& FillPresentBlock(
   // game feature created before the hooks (FindOrRegisterFeature's warning).
   // Read through a view with no resources: on Direct3D 11 the block holds
   // D3D11 pointers, which DeriveFeatureState would call as D3D12 ones.
-  if (features.find(stream->Handle(neutral_model)) == features.end()) {
+  const auto* handle = (shared_model != nullptr ? shared_model : stream->Handle(neutral_model));
+  if (features.find(handle) == features.end()) {
     const bridge::ParameterView view(&block, nullptr);
     FeatureState state = DeriveFeatureState(&view);
     state.source_feature = kFeatureDlss;
-    features.emplace(stream->Handle(neutral_model), state);
+    features.emplace(handle, state);
   }
   return block;
 }
@@ -3662,16 +4014,30 @@ inline void PublishOrdinaryPresentColour(const fg::xefg::OrdinaryPresentAccess& 
 }
 
 inline bool ResumeOrdinaryPresentLocked(ID3D12GraphicsCommandList* command_list = nullptr,
-    const output_framerate::OutputIdentity& output = {}, ID3D12Resource* backbuffer = nullptr) {
-  if (backbuffer != nullptr && !fg::xefg::QueryOrdinaryPresent(0,
-          reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(backbuffer)), output).allowed) return false;
-  if (!direct_api.private_instance) return true;
-  if (command_list != nullptr) {
+    PresentTarget* target = nullptr, ID3D12Resource* backbuffer = nullptr) {
+  if (target != nullptr) {
+    target->original_signed_runtime = false;
+  }
+  if (target != nullptr && backbuffer != nullptr && !fg::xefg::QueryOrdinaryPresent(0,
+          reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(backbuffer)), target->adaptive_output).allowed) {
+    return false;
+  }
+  if (direct_api.private_instance && command_list != nullptr) {
     auto decline = NrDeclineReason::kNrRuntimeUnavailable;
     if (!EnsureDirectRuntime(command_list, &decline, false)) {
       CountNrDecline(decline);
       return false;
     }
+  }
+  if (target != nullptr && SharesWarmPresentRuntime(*target, backbuffer)) {
+    ID3D12Device* face = nullptr;
+    const HRESULT got_face = (command_list != nullptr ? command_list->GetDevice(IID_PPV_ARGS(&face)) : E_INVALIDARG);
+    const bool same_face = SUCCEEDED(got_face) && face == direct_device;
+    ReleaseCom(face);
+    if (!same_face) return false;
+    // Only an already matched output can keep the original parameter family
+    // on the ordinary path; unrelated Present and Core admission are unchanged.
+    target->original_signed_runtime = true;
   }
   return true;
 }
@@ -3692,6 +4058,16 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     fg::xefg::ObserveOrdinaryPresentSubmission(write_access, {.reason = "output_write_permission_unavailable"});
     return false;
   }
+  const bool mixed = target.stage_execution_plan != nullptr;
+  const auto warm_owner = (!neutral_model && !mixed && target.domain == present_restore_scope::Domain::FINAL_PRESENT
+      ? output_framerate::MatchPresentColorOwner(target.adaptive_output, write_access.backbuffer)
+      : output_framerate::OutputIdentity{});
+  const auto warm_entry = present_streams.find(reinterpret_cast<const void*>(warm_owner.swapchain));
+  const bool track_warm_color = warm_owner && warm_entry != present_streams.end() && &stream == &warm_entry->second;
+  const auto extent = backbuffer != nullptr ? backbuffer->GetDesc() : D3D12_RESOURCE_DESC{};
+  const bool order_shared_group = track_warm_color && WarmPresentColorEligible(target) && stream.warm_color.complete
+      && WarmPresentColorCurrent(stream.warm_color, warm_owner, target, static_cast<uint32_t>(extent.Width), extent.Height);
+  WarmPresentQueueWaits handoff_waits;
   const auto output_write_ordered = [&](const std::pair<uint64_t, uint64_t>& recording) {
     FenceRef ordered_fence;
     {
@@ -3702,7 +4078,9 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     }
     const submission::OutputUse color{.resource = renodx::utils::directx::NativeIdentity(backbuffer),
         .subresource = 0, .version = target.base_frame.sequence};
-    if (submission::OutputWriteOrdered(color, recording, ordered_fence.fence)) return true;
+    if (order_shared_group
+        ? ProveWarmPresentQueueOrder(stream, std::span{&color, 1}, recording, ordered_fence.fence, &handoff_waits)
+        : submission::OutputWriteOrdered(color, recording, ordered_fence.fence)) return true;
     std::vector<submission::RecordingBlocker> blockers;
     submission::OutputWriteOrdered(color, recording, ordered_fence.fence, &blockers);
     LogRecordedWorkBlockers("ordinary Present output conflict", blockers);
@@ -3713,7 +4091,7 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     return false;
   };
   if (!output_write_ordered(submission::RecordingIdentity(slot->list))) return false;
-  if (!ResumeOrdinaryPresentLocked(slot->list, target.adaptive_output, backbuffer)) {
+  if (!ResumeOrdinaryPresentLocked(slot->list, &target, backbuffer)) {
     fg::xefg::ObserveOrdinaryPresentSubmission(write_access, {.reason = "runtime_unavailable"});
     return false;
   }
@@ -3725,13 +4103,21 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
   }
   auto* motion = GetD3D12Resource(&block, NVSDK_NGX_Parameter_MotionVectors);
   auto* depth = GetD3D12Resource(&block, NVSDK_NGX_Parameter_Depth);
-  const bool mixed = target.stage_execution_plan != nullptr;
   const bool base_frame = target.base_frame_epoch != 0;
   const bool identified_frame = present_frame_policy::Known(target.base_frame);
   target.independent_resolution_pair = target.independent_resolution_pair
       && stream.fg_multiplier == 1;
   const bool independent_pair = PresentResolutionPairAllowed(target);
   const auto* const handle = stream.Handle(neutral_model);
+  if (order_shared_group && stream.warm_color.xefg) {
+    ResetPresentStreamHistory(&stream, kResetSourceChange);
+  }
+  if (target.warm_neutral_guides) {
+    const auto desc = backbuffer->GetDesc();
+    const auto contract = DeriveFeatureState(&block);
+    if (!track_warm_color || !WarmPresentSlotsMatch(stream, slot->list, contract, target,
+            static_cast<uint32_t>(desc.Width), desc.Height)) return false;
+  }
   bool recording_started = false;
   bool recording_closed = false;
   bool submitted = false;
@@ -3898,6 +4284,9 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     const auto previous_capture_serial = screenshot::PendingModelCaptureSerial(slot->list);
     // From here ProcessInline names the terminal.
     terminal_named = true;
+    if (target.warm_neutral_guides) {
+      RecordWarmPresentNeutralGuides(&stream.warm_neutral_guides, slot->list);
+    }
     const bool accepted = ProcessInline(slot->list, handle, &block, &touched, &target, &recording);
     if (!mixed && !base_frame && !identified_frame && recording.output_ready) {
       PublishPresentRestoreOwner(target.domain, target.restore_decision.reason, target.restore_contract_compatible,
@@ -3999,17 +4388,24 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
         || owner->second.receipt.executed) return false;
   }
   submission::QueueOrderProof color_order;
+  bool handoff_wait_failed = false;
   const bool write_permitted = fg::xefg::WithOrdinaryPresentCommit(write_access, [&] {
+    if (!EnqueueWarmPresentQueueWaits(native_queue, handoff_waits)) {
+      handoff_wait_failed = true;
+      return false;
+    }
     // Our own Execute joins the existing tracker without reopening the
     // application's handoff or being counted as a later game submission.
     if (present_order.owns_lock() && base_order != nullptr && base_order->queue == native_queue) {
       color_order = {.domain = base_order->domain_id, .entry = base_order->entered.load(), .owned_after = true};
     }
     execute_owned(list);
+    return true;
   });
   if (!write_permitted) {
     fg::xefg::ObserveOrdinaryPresentSubmission(write_access,
-        {.reason = "write_permission_revoked", .recording = submission::RecordingIdentity(slot->list)});
+        {.reason = (handoff_wait_failed ? "handoff_queue_wait_failed" : "write_permission_revoked"),
+         .recording = submission::RecordingIdentity(slot->list)});
     CountNrDecline(NrDeclineReason::kPresentPreFg);
     return false;
   }
@@ -4026,6 +4422,16 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
       || history_reset_counts[static_cast<size_t>(HistoryResetSource::kGameReset)].load() != game_resets_before);
   PublishOrdinaryPresentColour(write_access, &stream, frame_ordered, backbuffer, target, recording,
                                submission_fact, reset_observed, color_order);
+  if (track_warm_color && WarmPresentColorEligible(target) && signaled && recording.output_ready
+      && recording.model_pass_mask == 3u && recording.model_evaluate_mask == 3u) {
+    const auto footprint = backbuffer->GetDesc();
+    const auto guide = DeriveFeatureState(&block);
+    if (target.warm_neutral_guides) {
+      WarmPresentNeutralGuidesSubmitted(&stream.warm_neutral_guides);
+    }
+    RememberWarmPresentColor(&stream, warm_owner, target, guide, static_cast<uint32_t>(footprint.Width),
+        footprint.Height, false, guides != nullptr, true);
+  }
   submission::DiscardOwnedRecording(slot->list, submission::RecordingOwner::kOrdinaryPresent);
 #if defined(NR_NEXUS_DEV_CONTROL)
   handoff_capture.Submitted(native_queue, present_ring.fence, slot->value, signaled);
@@ -5451,19 +5857,8 @@ inline void RunPresentPath(
   }
   DrainPresentRetired();
   if (!d3d11) {
-    // Reuse an existing local face of this actual device. On a cold path,
-    // obtain the face from the real backbuffer instead of the native queue.
-    ID3D12Device* face = nullptr;
-    if (direct_device != nullptr && !direct_api.private_instance
-        && renodx::utils::directx::SameNativeObject(
-            direct_device, reinterpret_cast<IUnknown*>(api_device->get_native()))) {
-      face = direct_device;
-      face->AddRef();
-    } else if (FAILED(back->GetDevice(IID_PPV_ARGS(&face)))) {
-      face = nullptr;
-    }
-    const bool ring_ready = face != nullptr && EnsurePresentRing(face);
-    ReleaseCom(face);
+    const bool ring_ready = EnsureOrdinaryPresentRing(back,
+        reinterpret_cast<IUnknown*>(api_device->get_native()));
     if (!ring_ready) {
       // A present without its ring cannot run NR, like one whose swapchain
       // cannot be served, and falls back the same way: the evaluates run the
@@ -5732,7 +6127,7 @@ inline void RunPresentPath(
   }
   // Required guides resume on the next source evaluate after adoption.
   // Waiting for them first would leave the private provider selected forever.
-  if (!d3d11 && !ResumeOrdinaryPresentLocked(present_ring.slots[0].list, target.adaptive_output, back)) {
+  if (!d3d11 && !ResumeOrdinaryPresentLocked(present_ring.slots[0].list, &target, back)) {
     fg::xefg::ObserveOrdinaryPresentSubmission(ordinary_access, {.reason = "runtime_unavailable"});
     return;
   }
@@ -6008,7 +6403,13 @@ inline void RunPresentPath(
       context->Release();
       view->Release();
     }
-  } else if (guides == nullptr) {
+  }
+  const auto warm_neutral_contract = (!d3d11 && guides == nullptr
+      ? SelectWarmPresentNeutralGuides(&stream, target, ordinary_access.backbuffer,
+          reinterpret_cast<uintptr_t>(swapchain), back_width, back_height)
+      : std::nullopt);
+  target.warm_neutral_guides = warm_neutral_contract.has_value();
+  if (!d3d11 && guides == nullptr && !target.warm_neutral_guides) {
     // Neutral guides at the back buffer's size: zero-initialized committed
     // textures (no render-target or depth flags), so zero motion and depth
     // 0, which DepthInverted below reads as the far plane.
@@ -6037,8 +6438,12 @@ inline void RunPresentPath(
     ResetPresentStreamHistory(&stream, kResetSourceChange);
   }
 
-  ID3D12Resource* const motion = guides != nullptr ? guides->motion : stream.neutral_motion;
-  ID3D12Resource* const depth = guides != nullptr ? guides->depth : stream.neutral_depth;
+  ID3D12Resource* motion = (guides != nullptr ? guides->motion : stream.neutral_motion);
+  ID3D12Resource* depth = (guides != nullptr ? guides->depth : stream.neutral_depth);
+  if (target.warm_neutral_guides) {
+    motion = stream.warm_neutral_guides.motion;
+    depth = stream.warm_neutral_guides.depth;
+  }
   ID3D11Texture2D* const motion11 =
       guides != nullptr ? guides->motion11 : stream.neutral_motion11;
   ID3D11Texture2D* const depth11 = guides != nullptr ? guides->depth11 : stream.neutral_depth11;
@@ -6053,11 +6458,12 @@ inline void RunPresentPath(
     contract.create_flags = NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
     return contract;
   }();
-  const FeatureState& contract = guides != nullptr ? guides->contract : neutral_contract;
+  const FeatureState& contract = (guides != nullptr ? guides->contract
+      : (warm_neutral_contract ? *warm_neutral_contract : neutral_contract));
   // Optional guides can alternate while a capture is in flight. Keep the two
   // incompatible model contracts resident instead of cold-creating on each
   // transition; their temporal histories still reset on source changes.
-  const bool neutral_model = !d3d11 && guides == nullptr;
+  const bool neutral_model = !d3d11 && guides == nullptr && !target.warm_neutral_guides;
   // Every present of a generated run moves 1/multiplier of a game frame.
   const float motion_share = guides != nullptr && present_frames.load() == 0
       ? 1.f / static_cast<float>(stream.fg_multiplier)

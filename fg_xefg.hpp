@@ -3285,11 +3285,21 @@ inline bool WithServiceWritePermission(const FrameInput& input, bool publishes_c
         }) || std::ranges::any_of(internal::state.retired_contexts, [&](const auto& other) {
           return conflicts(*other);
         })) return false;
+  }
+  const auto mark_published = [&] {
+    if (!publishes_color) return;
     context.color_submitted_epoch = input.epoch;
     context.color_submitted_frame = input.application_frame;
     present->color_executed = true;
+  };
+  if constexpr (std::is_void_v<std::invoke_result_t<Publish>>) {
+    mark_published();
+    std::forward<Publish>(publish)();
+  } else {
+    static_assert(std::is_same_v<std::invoke_result_t<Publish>, bool>);
+    if (!std::forward<Publish>(publish)()) return false;
+    mark_published();
   }
-  std::forward<Publish>(publish)();
   return true;
 }
 
@@ -3301,6 +3311,12 @@ inline bool ObservesServiceHandoff(const FrameInput& input) noexcept {
 inline uint64_t ServiceCall(const FrameInput& input) noexcept {
   const auto* present = internal::recording_service;
   return (present != nullptr && &present->input == &input ? present->serial : 0);
+}
+
+inline std::shared_ptr<const void> ServiceOutputOwner(const FrameInput& input) noexcept {
+  const auto* present = internal::recording_service;
+  if (present == nullptr || &present->input != &input) return {};
+  return present->context;
 }
 
 inline void ObserveServiceHandoff(const FrameInput& input, const PresentSubmissionFact& fact) noexcept {

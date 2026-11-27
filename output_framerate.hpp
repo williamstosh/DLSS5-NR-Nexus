@@ -516,6 +516,16 @@ inline OutputIdentity FindPresentOwner(uintptr_t device, uintptr_t back_buffer) 
   return (owner != nullptr ? owner->identity : OutputIdentity{});
 }
 
+// A view may change on each SDK enable. The underlying registered Present
+// owner survives only while the same application buffer is still mapped.
+inline OutputIdentity MatchPresentColorOwner(const OutputIdentity& route, uintptr_t back_buffer) {
+  if (!route || back_buffer == 0) return {};
+  std::shared_lock lock(internal::state.mutex);
+  const auto* owner = internal::FindPresentOwner(route.device, back_buffer);
+  if (owner == nullptr || internal::ResolvePresentOutput(*owner) != route) return {};
+  return owner->identity;
+}
+
 inline void BindSourceOutput(const SourceIdentity& source, const OutputIdentity& identity) {
   if (!internal::ValidSource(source)) return;
   std::unique_lock lock(internal::state.mutex);

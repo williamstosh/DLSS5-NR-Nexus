@@ -808,6 +808,32 @@ inline bool FirstHealthyUse(const RecordingStatus& status, const void* use) {
   return first.state == SubmissionProofState::kInFlight || first.state == SubmissionProofState::kComplete;
 }
 
+// This proves the historical recording alone. New work using the same objects
+// has its own ordering requirement and may still be in flight.
+inline bool ExactOwnedRecordingCompleted(const RecordingStatus& recording, std::span<const void* const> objects) {
+  const std::lock_guard lock(tracker_mutex);
+  if (recording.list == 0 || (recording.list >> 63) != 0 || !recording.closed.load()
+      || !recording.submitted.load() || recording.close_reason.load() != CloseReason::kOwnerDiscarded) return false;
+  const auto has_objects = [&](const std::vector<const void*>& uses) {
+    return std::ranges::all_of(objects, [&](const void* object) {
+      return object != nullptr && std::ranges::find(uses, object) != uses.end();
+    });
+  };
+  if (recording.completed_healthy) {
+    return recording.completed_submission_count == 1 && has_objects(recording.completed_uses);
+  }
+  const auto list = tracked_lists.find(recording.list);
+  if (list == tracked_lists.end()) return false;
+  const auto found = list->second.generations.find(recording.generation);
+  if (found == list->second.generations.end()) return false;
+  const auto& generation = found->second;
+  if (generation.status.get() != &recording || generation.open || generation.first_execute == 0
+      || generation.unreserved_submissions != 0 || generation.submissions.size() != 1
+      || !has_objects(generation.uses)) return false;
+  const auto proof = ReadSubmission(generation.submissions.front());
+  return proof.state == SubmissionProofState::kComplete && proof.value != 0;
+}
+
 // Pending takes precedence over replayable. When requested, keep every
 // blocker, including closed generations with outstanding executions.
 template <typename Includes>
@@ -885,6 +911,16 @@ inline RecordedWork ProviderTeardownWorkState(std::span<const void* const> objec
   }, blockers);
 }
 
+inline bool OutputUseConflicts(const ResourceUse& use, const OutputUse& output) {
+  if (use.kind == UseKind::kUnknown) return output.resource == nullptr || use.object == output.resource;
+  if (use.kind != UseKind::kOutputColor) return false;
+  return output.resource == nullptr || use.output.resource == nullptr
+      || (use.output.resource == output.resource
+          && (use.output.subresource == output.subresource
+              || use.output.subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES
+              || output.subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES));
+}
+
 inline RecordedWork OutputWorkState(std::span<const OutputUse> outputs,
                                     const std::pair<uint64_t, uint64_t>& current_recording = {},
                                     std::vector<RecordingBlocker>* blockers = nullptr,
@@ -892,17 +928,7 @@ inline RecordedWork OutputWorkState(std::span<const OutputUse> outputs,
   return InspectRecordedWork([&](uint64_t identity, uint64_t id, const Generation& generation) {
     if (std::pair{identity, id} == current_recording) return false;
     return std::ranges::any_of(generation.classified_uses, [&](const ResourceUse& use) {
-      return std::ranges::any_of(outputs, [&](const OutputUse& output) {
-        if (use.kind == UseKind::kUnknown) {
-          return output.resource == nullptr || use.object == output.resource;
-        }
-        if (use.kind != UseKind::kOutputColor) return false;
-        return output.resource == nullptr || use.output.resource == nullptr
-              || (use.output.resource == output.resource
-                  && (use.output.subresource == output.subresource
-                      || use.output.subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES
-                      || output.subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES));
-      });
+      return std::ranges::any_of(outputs, [&](const OutputUse& output) { return OutputUseConflicts(use, output); });
     });
   }, blockers, ordered_queue_fence);
 }

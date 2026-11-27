@@ -792,6 +792,7 @@ static std::filesystem::path present_fixture_ini;
 #include "present_handoff_capture_cases.hpp"
 #endif
 #include "nr_edit_reuse_xefg_cases.hpp"
+#include "present_original_handoff_cases.hpp"
 #include "control_mask_capture_cases.hpp"
 #include "adaptive_fg_service_cases.hpp"
 #include "adaptive_inline_cases.hpp"
@@ -948,8 +949,12 @@ int main(int argc, char** argv) {
   if (argc == 2 && std::strcmp(argv[1], "--bridge-xefg-original-fg-first") == 0) {
     return RunPresentGuideModelsTest(true, nullptr, false, false, false, true, false, true);
   }
+  if (argc == 3 && std::strcmp(argv[1], "--present-original-handoff") == 0) {
+    return present_original_handoff_cases::Run();
+  }
 #else
   if (argc >= 2 && (std::strncmp(argv[1], "--control-mask-native-ngx", 25) == 0
+                    || std::strcmp(argv[1], "--present-original-handoff") == 0
                     || std::strcmp(argv[1], "--bridge-xefg-private-provider") == 0
                     || std::strcmp(argv[1], "--bridge-xefg-original-warm") == 0
                     || std::strcmp(argv[1], "--bridge-xefg-original-fg-first") == 0
