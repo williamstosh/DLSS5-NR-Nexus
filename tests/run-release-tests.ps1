@@ -22,27 +22,9 @@ $releaseTestNotesPath = Join-Path $releaseTestDirectory 'reviewed-notes.md'
 $releaseTestNotes = @'
 # NR Nexus TAG
 
-[简体中文](#简体中文) · [English](#english)
+[English](#english) · [简体中文](#简体中文)
 
 <!-- Previous: none -->
-
-## 简体中文
-
-### 版本亮点
-
-支持独立模型。
-
-### 验证情况
-
-模拟发布通过。
-
-### 已知限制
-
-尚未验证实机。
-
-### 安装说明
-
-解压安装附件。
 
 ## English
 
@@ -61,12 +43,30 @@ Game visuals remain unverified.
 ### Installation
 
 Extract the release archive.
+
+## 简体中文
+
+### 版本亮点
+
+支持独立模型。
+
+### 验证情况
+
+模拟发布通过。
+
+### 已知限制
+
+尚未验证实机。
+
+### 安装说明
+
+解压安装附件。
 '@
 $releaseTestNotes = $releaseTestNotes.Replace('TAG', $releaseTestVersion.Tag)
 [IO.File]::WriteAllText($releaseTestNotesPath, $releaseTestNotes)
 function Assert-TestNotes([string]$Body) {
-    Assert-Test ($Body.StartsWith("[简体中文](#user-content-nr-nexus-$($releaseTestVersion.Tag)-zh) · [English](#user-content-nr-nexus-$($releaseTestVersion.Tag)-en)")) 'Reviewed navigation missing'
-    Assert-Test ($Body.IndexOf('## 简体中文') -lt $Body.IndexOf('## English')) 'Language blocks reordered'
+    Assert-Test ($Body.StartsWith("[English](#user-content-nr-nexus-$($releaseTestVersion.Tag)-en) · [简体中文](#user-content-nr-nexus-$($releaseTestVersion.Tag)-zh)")) 'Reviewed navigation missing'
+    Assert-Test ($Body.IndexOf('## English') -lt $Body.IndexOf('## 简体中文')) 'Language blocks reordered'
     Assert-Test ($Body.Contains('### 版本亮点') -and $Body.Contains('### Highlights') -and $Body.Contains('direct feature: add independent per-pass models')) 'Reviewed features or direct commits missing'
     foreach ($heading in @('Source / 源码', 'References / PR 与 Commit 记录')) {
         Assert-Test ([regex]::Matches($Body, '(?m)^## ' + [regex]::Escape($heading) + '$').Count -eq 1) "Generated section must occur once: $heading"

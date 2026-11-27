@@ -43,14 +43,14 @@ function Assert-DocumentLinks([string]$Name, [string]$Text, [hashtable]$Document
     $englishStart = $Text.IndexOf('## English', [StringComparison]::Ordinal)
     Assert-Test ([regex]::Matches($Text, '(?m)^## 简体中文\r?$').Count -eq 1 -and
         [regex]::Matches($Text, '(?m)^## English\r?$').Count -eq 1 -and
-        $chineseStart -lt $englishStart) "Expected one Chinese section followed by one English section in $Name"
-    Assert-Test ($Text.Substring(0, $chineseStart).Contains('[简体中文](#简体中文) · [English](#english)')) "Language navigation missing in $Name"
+        $englishStart -lt $chineseStart) "Expected one English section followed by one Chinese section in $Name"
+    Assert-Test ($Text.Substring(0, $englishStart).Contains('[English](#english) · [简体中文](#简体中文)')) "Language navigation missing in $Name"
     $englishImages = @()
     $chineseImages = @()
     foreach ($image in [regex]::Matches($Text, '!\[[^\]]*\]\(([^\s)]+)\)')) {
         $imageTarget = $image.Groups[1].Value
         $file = [IO.Path]::GetFileName($imageTarget)
-        $chinese = $image.Index -gt $chineseStart -and $image.Index -lt $englishStart
+        $chinese = $image.Index -gt $chineseStart
         # Game comparison images are language-neutral; both sections reuse the same asset.
         if ($imageTarget -cmatch '^(?:https://github\.com/williamstosh/RenoDX-DLSSNR-Nexus/blob/[a-f0-9]{40}/)?docs/compare/assets/[a-z0-9/-]+/(?:preview|readme)\.(?:webp|png|jpg)$') {
             if ($chinese) { $chineseImages += $imageTarget } else { $englishImages += $imageTarget }

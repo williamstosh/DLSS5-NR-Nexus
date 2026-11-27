@@ -142,18 +142,18 @@ foreach ($document in $taskDocuments.Keys) {
     })
     $zhStart = $html.IndexOf('<h2 id="' + $prefix + '简体中文">', [StringComparison]::Ordinal)
     $enStart = $html.IndexOf('<h2 id="' + $prefix + 'english">', [StringComparison]::Ordinal)
-    if ($zhStart -lt 0 -or $enStart -le $zhStart) { throw "Expected Chinese then English sections in $document" }
-    $taskRendered[$document] = @{ Preamble = $html.Substring(0, $zhStart); Zh = $html.Substring($zhStart, $enStart - $zhStart); En = $html.Substring($enStart) }
+    if ($enStart -lt 0 -or $zhStart -le $enStart) { throw "Expected English then Chinese sections in $document" }
+    $taskRendered[$document] = @{ Preamble = $html.Substring(0, $enStart); En = $html.Substring($enStart, $zhStart - $enStart); Zh = $html.Substring($zhStart) }
 }
 
 $taskArticles = [Collections.Generic.List[string]]::new()
 $taskNavigation = [Collections.Generic.List[string]]::new()
-foreach ($language in @('zh', 'en')) {
+foreach ($language in @('en', 'zh')) {
     foreach ($document in $taskDocuments.Keys) {
         $name = $taskDocuments[$document]
         $sectionId = if ($language -ceq 'zh') { $name } else { $name + '-en' }
         $title = if ($name -ceq 'readme') { 'README' } elseif ($language -ceq 'zh') { '玩家指南' } else { 'User Guide' }
-        $body = if ($language -ceq 'zh') { $taskRendered[$document].Preamble + $taskRendered[$document].Zh } else { $taskRendered[$document].En }
+        $body = if ($language -ceq 'en') { $taskRendered[$document].Preamble + $taskRendered[$document].En } else { $taskRendered[$document].Zh }
         if ($name -ceq 'readme') {
             $note = if ($language -ceq 'zh') { '离线版游戏图片为已审核原图的 SDR 静态预览。点击图片可联网打开 OFF／ON 交互对比；正文中的下载和外部参考链接也需要网络。' }
                 else { 'Game images in this offline edition are static SDR previews of approved originals. Click an image to open the online OFF/ON comparison; downloads and external references also require a connection.' }
@@ -172,21 +172,21 @@ foreach ($language in @('zh', 'en')) {
 $taskCss = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'offline-guide.css'), $taskUtf8)
 $taskHtml = @"
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
 <meta name="source-commit" content="$SourceCommit">
-<title>NR Nexus — 离线玩家手册 / Offline Player Guide</title>
+<title>NR Nexus — Offline Player Guide / 离线玩家手册</title>
 <style>$taskCss</style>
 </head>
 <body>
-<a class="skip-link" href="#readme">跳到正文 / Skip to content</a>
-<header class="masthead"><a class="brand" href="#readme">NR Nexus</a><span>离线玩家手册 / Offline Player Guide</span><nav aria-label="语言 / Language"><a href="#readme-简体中文">简体中文</a><a href="#readme-english">English</a></nav></header>
-<div class="layout"><nav class="contents" aria-label="目录 / Contents"><details open><summary>目录 / Contents</summary><ul>$($taskNavigation -join '')</ul></details></nav>
+<a class="skip-link" href="#readme-en">Skip to content / 跳到正文</a>
+<header class="masthead"><a class="brand" href="#readme-en">NR Nexus</a><span>Offline Player Guide / 离线玩家手册</span><nav aria-label="Language / 语言"><a href="#readme-english">English</a><a href="#readme-简体中文">简体中文</a></nav></header>
+<div class="layout"><nav class="contents" aria-label="Contents / 目录"><details open><summary>Contents / 目录</summary><ul>$($taskNavigation -join '')</ul></details></nav>
 <main>$($taskArticles -join [Environment]::NewLine)</main></div>
-<footer><a href="#readme">NR Nexus</a> · <a href="#guide">玩家指南</a> · <a href="#guide-en">User Guide</a></footer>
+<footer><a href="#readme-en">NR Nexus</a> · <a href="#guide-en">User Guide</a> · <a href="#guide">玩家指南</a></footer>
 </body></html>
 "@
 # Validate final IDs and internal links after namespacing and reordering.

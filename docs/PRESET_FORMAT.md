@@ -82,7 +82,7 @@ v0.6.1 adds the quality field `NRAdaptiveResourceStrategy`, accepting integers `
 | `ControlMaskRed`、`ControlMaskGreen`、`ControlMaskBlue`、`ControlMaskDepthNear`、`ControlMaskDepthFar` | 数值 `0..1`；Depth Far 必须大于 Depth Near |
 | `LookMode` 至 `DetailStability` 的结果字段 | 与上表对应基础层字段同类型、同范围；没有逐层 `LookUpsample` |
 
-## 工作分辨率覆盖 / Working-resolution overrides
+## Working-resolution overrides / 工作分辨率覆盖
 
 **简体中文：** 0.2.0 新增六个 `MULTIPASS` 键：`NRPass2ResolutionMode`、`NRPass3ResolutionMode`、`NRPass4ResolutionMode`，以及对应的 `NRPass{2,3,4}ResolutionScale`；不升级 schema，已发布 dev.8 不含此能力。模式 `0` 同时继承全局 `NRFollowInputRes` 和 `NRResolutionScale`，忽略本层保存的比例；模式 `1` 跟随有效游戏 Guide，沿用既有尺寸上限和无有效 Guide 时的比例回退规则；模式 `2` 使用本层固定比例。固定比例参考本层 Stage 的完整尺寸：Render 为 Color 有效区域，Upscaled 为游戏 DLSS 输出，而非上一层的缩小工作尺寸。第 1 层继续使用全局设置，不改变游戏 DLSS SR 的输入／输出分辨率。Stage、Model Preset、Look、Result 继承均独立于这些设置；`NRLookUpsample` 仍全链共享。
 

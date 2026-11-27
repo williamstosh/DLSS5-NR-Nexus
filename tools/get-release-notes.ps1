@@ -29,17 +29,17 @@ if ($notesReviewed -match '(?im)^\s*#{1,6}\s+(?:Source|源码|References|PR 与 
     $notesReviewed -match '(?im)^\s*Source:\s|\b(?:Full )?Changelog\b') {
     throw 'Release notes contain reserved generated Source/References/Changelog content.'
 }
-$notesNavigation = '[简体中文](#简体中文) · [English](#english)'
+$notesNavigation = '[English](#english) · [简体中文](#简体中文)'
 if (($notesReviewed.Substring($notesTitle.Length).TrimStart() -split "`n", 2)[0] -cne $notesNavigation -or
     [regex]::Matches($notesReviewed, [regex]::Escape($notesNavigation)).Count -ne 1) {
     throw "Release notes require top navigation: $notesNavigation"
 }
 $notesLanguages = [regex]::Matches($notesReviewed, '(?m)^## ([^\n]+)$')
-if ($notesLanguages.Count -ne 2 -or $notesLanguages[0].Groups[1].Value -cne '简体中文' -or
-    $notesLanguages[1].Groups[1].Value -cne 'English') {
-    throw 'Release notes require exactly one 简体中文 block followed by exactly one English block.'
+if ($notesLanguages.Count -ne 2 -or $notesLanguages[0].Groups[1].Value -cne 'English' -or
+    $notesLanguages[1].Groups[1].Value -cne '简体中文') {
+    throw 'Release notes require exactly one English block followed by exactly one 简体中文 block.'
 }
-$notesRequired = @(@('版本亮点', '验证情况', '已知限制', '安装说明'), @('Highlights', 'Validation', 'Known Limitations', 'Installation'))
+$notesRequired = @(@('Highlights', 'Validation', 'Known Limitations', 'Installation'), @('版本亮点', '验证情况', '已知限制', '安装说明'))
 for ($notesLanguageIndex = 0; $notesLanguageIndex -lt 2; $notesLanguageIndex++) {
     $notesStart = $notesLanguages[$notesLanguageIndex].Index + $notesLanguages[$notesLanguageIndex].Length
     $notesEnd = if ($notesLanguageIndex -eq 0) { $notesLanguages[1].Index } else { $notesReviewed.Length }
@@ -60,7 +60,7 @@ for ($notesLanguageIndex = 0; $notesLanguageIndex -lt 2; $notesLanguageIndex++) 
         # Count only prose, excluding headings, reference definitions and links (including labels).
         $notesContent = [regex]::Replace($notesSection.Groups[2].Value, '(?m)^\s*#{1,6}\s+.*$|^\s*\[[^\]]+\]:.*$', '')
         $notesContent = [regex]::Replace($notesContent, '!?\[[^\]]*\](?:\([^)]*\)|\[[^\]]*\])?|https?://\S+', '')
-        $notesMinimumLetters = if ($notesLanguageIndex -eq 0) { 4 } else { 20 }
+        $notesMinimumLetters = if ($notesLanguageIndex -eq 0) { 20 } else { 4 }
         if ([regex]::Replace($notesContent, '[^\p{L}]', '').Length -lt $notesMinimumLetters) {
             throw "Release notes $notesHeading needs substantive reviewed text, not only links or headings."
         }
@@ -98,7 +98,7 @@ foreach ($notesLine in $notesLog) {
 $notesBody = [regex]::Replace($notesText.Substring($notesTitle.Length), '(?m)^<!-- Previous: .*? -->\n?', '').Trim()
 # Release pages omit automatic heading IDs. GitHub prefixes explicit names with user-content-.
 $notesAnchor = 'nr-nexus-' + $Tag
-$notesBody = $notesBody.Replace($notesNavigation, "[简体中文](#user-content-$notesAnchor-zh) · [English](#user-content-$notesAnchor-en)")
+$notesBody = $notesBody.Replace($notesNavigation, "[English](#user-content-$notesAnchor-en) · [简体中文](#user-content-$notesAnchor-zh)")
 $notesBody = $notesBody.Replace('## 简体中文', "<a name=`"$notesAnchor-zh`"></a>`n`n## 简体中文")
 $notesBody = $notesBody.Replace('## English', "<a name=`"$notesAnchor-en`"></a>`n`n## English")
 $notesBody += "`n`n## Source / 源码`n`nTag: [$Tag](https://github.com/$Repository/tree/$Tag)`n`nSource: https://github.com/$Repository/commit/$notesSource"
