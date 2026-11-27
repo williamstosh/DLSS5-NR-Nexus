@@ -35,7 +35,7 @@ NR Nexus 通过 [ReShade](https://reshade.me/) 为兼容游戏提供 NVIDIA DLSS
 <a id="zh-features"></a>
 ### 核心特色
 
-本页介绍 v0.6.2 的功能；特殊组合的兼容性条件见指南。
+本页介绍 v0.6.3 的功能；特殊组合的兼容性条件见指南。
 
 | 能力 | 玩家用途 |
 | --- | --- |
@@ -63,7 +63,7 @@ NR Nexus 通过 [ReShade](https://reshade.me/) 为兼容游戏提供 NVIDIA DLSS
 <a id="zh-install"></a>
 ### 下载、安装与使用
 
-**v0.6.2**：[Windows x64 插件 ZIP、SHA-256 与 Release Notes](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.6.2)。在版本页面下载 ZIP 和对应的 `.zip.sha256`。GitHub 的 **Source code** ZIP 是源码，不是安装包。
+**v0.6.3**：[Windows x64 插件 ZIP、SHA-256 与 Release Notes](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.6.3)。在版本页面下载 ZIP 和对应的 `.zip.sha256`。GitHub 的 **Source code** ZIP 是源码，不是安装包。
 
 **需要：** Windows x64、兼容 **ReShade API 18** 的[完整 Add-on 支持版 ReShade](https://reshade.me/)、
 合法取得的兼容 NVIDIA **`nvngx_dlssnr.dll`**，以及该 Runtime 支持的显卡和驱动。
@@ -75,7 +75,7 @@ NR Nexus 通过 [ReShade](https://reshade.me/) 为兼容游戏提供 NVIDIA DLSS
 2. 选择游戏，在 **Game Overrides → ReShade Channel** 使用 **Stable**（完整 Add-on 支持），然后安装 **ReShade**。不要选 **No Addons**。
 3. 在 **DLSS / Streamline → Neural Rendering** 列选择合适的版本，例如当前社区 **`310.9.16 (20/30/40/50)`**，点 **Deploy DLL** 部署 NR Runtime。RHI 2.8.8 还会尝试部署最新 SR DLL（`nvngx_dlss.dll`），并备份已有文件；希望保留原 SR 版本、或找不到此栏时，按指南使用手动安装。
 4. 点游戏标题区或右键菜单中的 **Browse** 打开游戏目录，核对实际 EXE（可能在 `Binaries/Win64` 等子目录）。关闭游戏，备份现有插件及设置。
-5. 下载上方 **v0.6.2 ZIP**，将 **`renodx-dlss5.addon64`** 解压到 ReShade 实际加载的 Add-on 目录，通常是 EXE 旁；若 `ReShade.ini` 配置了 `AddonPath`，按该路径部署。保留许可文件。Runtime 可放插件旁或 EXE 旁，插件旁的 DLL 优先。
+5. 下载上方 **v0.6.3 ZIP**，将 **`renodx-dlss5.addon64`** 解压到 ReShade 实际加载的 Add-on 目录，通常是 EXE 旁；若 `ReShade.ini` 配置了 `AddonPath`，按该路径部署。保留许可文件。Runtime 可放插件旁或 EXE 旁，插件旁的 DLL 优先。
 6. 启动游戏，按 ReShade 已设置的菜单键（通常为 **Home**），在 **Add-ons → NR Nexus** 确认已加载版本，接着按下方快速上手体验。未出现插件时见[安装排查](docs/USER_GUIDE.md#zh-status)。
 
 **避免重复 NR 插件：** RHI 的 **Install Neural Rendering** 会安装 ShortFuse、DLSS5 Tool 等独立 NR 工具，与上面的 **Deploy DLL** 不同。使用 Nexus 时不要额外安装这些工具；已有安装应先按各自流程卸载，并将旧 Lecram／Nexus 副本移出生效的 Add-on 目录。RHI 可备份、更新或恢复它管理的文件；检查 `AddonPath` 与自动更新设置，避免旧副本重新生效。
@@ -264,7 +264,7 @@ The Witcher 3 — Velen · Crookback Bog
 <a id="en-features"></a>
 ### What makes Nexus different
 
-This page describes the features in v0.6.2. See the guide for compatibility conditions on specific combinations.
+This page describes the features in v0.6.3. See the guide for compatibility conditions on specific combinations.
 
 | Feature | What you can use it for |
 | --- | --- |
@@ -292,9 +292,9 @@ The interface offers **15 languages and seven themes**, with automatic ReShade l
 <a id="en-install"></a>
 ### Download, install and use
 
-**[Download v0.6.2 (Windows x64 ZIP)](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.6.2)** · **[View latest stable release](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/latest)**
+**[Download v0.6.3 (Windows x64 ZIP)](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.6.3)** · **[View latest stable release](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/latest)**
 
-This page covers **v0.6.2**. Download the ZIP and matching `.zip.sha256` from the [release page](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.6.2), which also contains the Release Notes. GitHub's **Source code** ZIP is source, not the add-on installation package.
+This page covers **v0.6.3**. Download the ZIP and matching `.zip.sha256` from the [release page](https://github.com/williamstosh/DLSS5-NR-Nexus/releases/tag/v0.6.3), which also contains the Release Notes. GitHub's **Source code** ZIP is source, not the add-on installation package.
 
 **Requirements:** Windows x64; [ReShade with full add-on support](https://reshade.me/), compatible with
 **ReShade API 18**; a legally obtained compatible NVIDIA **`nvngx_dlssnr.dll`**;
@@ -307,7 +307,7 @@ For a first installation, use the third-party **RHI** tool to prepare ReShade an
 2. Select the game, use **Game Overrides → ReShade Channel → Stable** (full add-on support), then install **ReShade**. Do not choose **No Addons**.
 3. Under **DLSS / Streamline → Neural Rendering**, choose a suitable version, such as the current community **`310.9.16 (20/30/40/50)`**, and click **Deploy DLL** to deploy the NR runtime. RHI 2.8.8 also attempts to deploy the latest SR DLL (`nvngx_dlss.dll`), backing up an existing file. To keep the original SR version, or if the column is missing, follow manual installation in the guide.
 4. Use **Browse** in the game header or right-click menu to open the game folder. Confirm the actual EXE location, which may be a subfolder such as `Binaries/Win64`. Close the game and back up existing add-ons/settings.
-5. Download the **v0.6.2 ZIP** above. Extract **`renodx-dlss5.addon64`** into ReShade's actual add-on directory, normally beside the EXE; follow `AddonPath` if configured in `ReShade.ini`. Keep the licenses. The runtime can sit beside the add-on or the EXE; the add-on-side DLL takes priority.
+5. Download the **v0.6.3 ZIP** above. Extract **`renodx-dlss5.addon64`** into ReShade's actual add-on directory, normally beside the EXE; follow `AddonPath` if configured in `ReShade.ini`. Keep the licenses. The runtime can sit beside the add-on or the EXE; the add-on-side DLL takes priority.
 6. Start the game, use ReShade's configured menu key (usually **Home**) and confirm the loaded version under **Add-ons → NR Nexus**, then follow Quick Start below. If the add-on is missing, see [installation troubleshooting](docs/USER_GUIDE.md#en-status).
 
 **Avoid duplicate NR add-ons:** RHI's **Install Neural Rendering** installs separate tools such as ShortFuse or DLSS5 Tool; it is different from **Deploy DLL** above. Do not install those alongside Nexus. Uninstall existing methods through their own procedures and move older Lecram/Nexus copies out of active add-on directories. RHI can back up, update or restore files it manages; check `AddonPath` and automatic-update settings so old copies do not become active again.
