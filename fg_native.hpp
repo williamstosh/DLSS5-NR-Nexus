@@ -1521,9 +1521,31 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
       observe("ordinary_recordings_in_flight");
       return fg::Result::NOT_SERVED;
     }
-    if (!RetireBridgeRecordings()) {
-      observe("bridge_recordings_in_flight");
-      return fg::Result::NOT_SERVED;
+    if (CanReuseActivePrivateRuntime(device) && bridge_pending_delivery_value == 0) {
+      ReclaimCompletedBridgeRecordings();
+    } else {
+      // No extra wait for an unsupported target, device/face change, or a
+      // failed/unordered Bridge operation. This is a real instance adoption.
+      if (replacing_provider && direct_device == device && !direct_api.private_instance
+          && direct_load_state == DirectLoadState::Ready && parameter_runtime_ready
+          && direct_api.module != nullptr && !direct_api.borrowed_core_context
+          && !control_mask_use_core_context.load() && !direct_runtime_failed) {
+        const auto& loader = NgxLoaderView();
+        if (loader.native_ready && loader.native_api.module != nullptr && loader.native_api.module != direct_api.module
+            && loader.native_api.module != native_runtime_failed_instance) {
+          WaitForAcceptedOrdinaryBridgeTail(device, [&] {
+            return fg::xefg::TryClaimProviderBridgeTailWait(input, direct_api.module, loader.native_api.module);
+          });
+          if (!Requested() || !fg::xefg::ServiceWriteCurrent(input)) {
+            observe("write_permission_revoked");
+            return fg::Result::NOT_SERVED;
+          }
+        }
+      }
+      if (!RetireBridgeRecordings()) {
+        observe("bridge_recordings_in_flight");
+        return fg::Result::NOT_SERVED;
+      }
     }
     const std::array<submission::OutputUse, 2> colors{{
         {.resource = backbuffer_identity, .subresource = 0, .version = input.application_frame},
@@ -1705,6 +1727,10 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     const std::unique_ptr<Slot, decltype(cancel_recording)> cancellation(slot, cancel_recording);
     // Switching providers requires closed, completed NR work. Adopt the
     // private runtime before this frame adds uses to its open recording.
+    if (replacing_provider && (!Requested() || !fg::xefg::ServiceWriteCurrent(input))) {
+      observe("write_permission_revoked");
+      return stream.result;
+    }
     auto decline = NrDeclineReason::kNrRuntimeUnavailable;
     if (!EnsureDirectRuntime(slot->list, &decline, true)) {
       present_prefg_attempts.fetch_add(1, std::memory_order_relaxed);
@@ -3381,8 +3407,10 @@ inline void RestoreNativePreFg(ID3D12GraphicsCommandList* list,
       const auto* marker = stream.cached->color[0];
       native_fg_marker.store(marker, std::memory_order_release);
       std::vector<std::pair<FenceRef, uint64_t>> receipts;
-      if (submission::UseSubmissionTokens(marker, &receipts) == submission::UseSubmission::kTokens && receipts.size() == 1
-          && receipts.front().first->GetCompletedValue() != UINT64_MAX) {
+      const auto proof = submission::UseSubmissionTokens(marker, &receipts, bindings->recording.get());
+      if ((proof == submission::UseSubmission::kTokens && receipts.size() == 1
+           && receipts.front().first->GetCompletedValue() != UINT64_MAX)
+          || proof == submission::UseSubmission::kRetiredOnce) {
         native_fg_result.store(fg::Result::SUBMITTED, std::memory_order_release);
         CountNativeFgSubmission(stream.native_serial);
         native_fg_last_submission_ns.store(SteadyNowNs(), std::memory_order_release);

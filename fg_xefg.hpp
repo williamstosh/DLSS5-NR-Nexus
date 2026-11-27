@@ -445,6 +445,13 @@ struct Context {
   std::map<uint32_t, std::shared_ptr<Frame>> frames;
   std::vector<std::shared_ptr<Surface>> surfaces;
   uint64_t epoch = 1;
+  // One short wait for the same Provider transition on this SDK owner epoch.
+  struct ProviderBridgeTailWait {
+    uint64_t epoch = 0;
+    HMODULE previous = nullptr;
+    HMODULE next = nullptr;
+    bool operator==(const ProviderBridgeTailWait&) const = default;
+  } provider_bridge_tail_wait;
 #if defined(NR_NEXUS_DEV_CONTROL)
   uint64_t fg_environment_generation = 0;
 #endif
@@ -3188,6 +3195,24 @@ inline bool AcceptOrdinaryPresentReceipt(const FrameInput& input, const Ordinary
   return true;
 }
 
+inline bool ServiceWriteCurrent(const FrameInput& input) {
+  const auto* const present = internal::recording_service;
+  if (present == nullptr || &present->input != &input) return false;
+  std::shared_lock lock(internal::state.mutex);
+  return internal::Requested() && internal::PresentWriteCurrentLocked(*present);
+}
+
+inline bool TryClaimProviderBridgeTailWait(const FrameInput& input, HMODULE previous, HMODULE next) {
+  const auto* const present = internal::recording_service;
+  if (present == nullptr || &present->input != &input) return false;
+  std::unique_lock lock(internal::state.mutex);
+  if (!internal::Requested() || !internal::PresentWriteCurrentLocked(*present)) return false;
+  const internal::Context::ProviderBridgeTailWait key{input.epoch, previous, next};
+  if (present->context->provider_bridge_tail_wait == key) return false;
+  present->context->provider_bridge_tail_wait = key;
+  return true;
+}
+
 // Runtime/NGX serialization precedes state.mutex. Publish only the already
 // recorded private list here. The original Present and owner notification
 // run after this lock is released.
@@ -3628,7 +3653,7 @@ enum class OrdinaryPresentRecordResult { kOwnerRejected, kRecordFailed, kRecorde
 // native commands for this handoff, without reentering the adapter or SDK.
 template <typename Record>
 inline OrdinaryPresentRecordResult TryRecordOrdinaryPresentDelivery(const OrdinaryPresentAccess& access, Record&& record,
-                                                                    bool require_sdk_inactive) {
+                                                                    bool require_sdk_inactive = false) {
   if (!access.allowed) return OrdinaryPresentRecordResult::kOwnerRejected;
   std::unique_lock lock(internal::state.mutex);
   if (internal::QueryOrdinaryPresentLocked(access.swapchain, access.backbuffer, access.output) != access

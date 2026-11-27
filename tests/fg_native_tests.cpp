@@ -3467,7 +3467,7 @@ int RunNativeOptionsResumeTest(bool delayed_options) {
     native::core_destroy_parameters = renodx::addons::dlss5::bridge::DestroyOwnedParameters;
     Check(native::InstallQueueCompletionHooks(gpu.queue.Get()), "options test real queue hooks");
     Check(native::InstallCommandListStateHooks(gpu.list.Get()), "options test real list hooks");
-    const auto submit = [&] {
+    const auto submit = [&](bool preserve_proofs = false) {
       Check(SUCCEEDED(gpu.list->Close()), "options test close");
       ID3D12CommandList* lists[]{gpu.list.Get()};
       gpu.queue->ExecuteCommandLists(1, lists);
@@ -3480,7 +3480,12 @@ int RunNativeOptionsResumeTest(bool delayed_options) {
       Check(wait == WAIT_OBJECT_0, "options test bounded GPU completion");
       Check(SUCCEEDED(gpu.allocator->Reset()), "options test allocator reset");
       Check(SUCCEEDED(gpu.list->Reset(gpu.allocator.Get(), nullptr)), "options test list reset");
-      submission::PruneCompletedGenerations();
+      if (preserve_proofs) {
+        const renodx::addons::dlss5::RuntimeLock lock(native::runtime_mutex);
+        native::PruneCompletedSubmissionUses();
+      } else {
+        submission::PruneCompletedGenerations();
+      }
       gpu.uploads.clear();
     };
     submit();
@@ -4242,6 +4247,53 @@ int RunNativeOptionsResumeTest(bool delayed_options) {
         check(recovered && model_resets.size() > previous_resets && model_resets[previous_resets] == 1,
               "the next deliverable base rebuilds temporal history after binding restoration failure");
         Check(recovered, "late SDK return test starts with a mature Native owner");
+        for (const bool early_submit : {false, true}) {
+          const uint8_t raw_color = (early_submit ? 200 : 184);
+          gpu.Transition(backbuffer.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
+          gpu.Write(backbuffer.Get(), raw_color);
+          gpu.Transition(backbuffer.Get(), D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
+          parameters.Set(NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID, (early_submit ? 10099ull : 10098ull));
+          native::native_sdk_present_input = {.identity = &opaque_output, .decision_id = ++sdk_decision_id};
+
+          const auto submitted_before = native::native_fg_submitted_frames.load();
+          const auto calls_before = consumer_calls;
+          if (early_submit) {
+            before_sdk_return = [&] {
+              Check(consumed_hudless.back().Get() != hudless.Get(), "the SDK consumed this base's private HUDLess");
+              const auto recorded = submission::ObserveRecording(gpu.list.Get());
+              const auto& stream = native::fg_service::streams.at({true, reinterpret_cast<uintptr_t>(&owner)});
+              auto* const marker = stream.cached == nullptr ? nullptr : stream.cached->color[0];
+              Check(recorded != nullptr && marker != nullptr && !recorded->submitted.load()
+                        && native::native_fg_owner == handle,
+                    "the current SDK owner holds an actual, still-unsubmitted color recording");
+              submit(true);
+              const std::lock_guard lock(submission::tracker_mutex);
+              const auto tracked = submission::tracked_lists.find(recorded->list);
+              Check(recorded->submitted.load() && recorded->closed.load() && recorded->commands_closed.load()
+                        && recorded->completed_healthy
+                        && std::ranges::find(recorded->completed_uses, marker) != recorded->completed_uses.end()
+                        && (tracked == submission::tracked_lists.end()
+                            || !tracked->second.generations.contains(recorded->generation)),
+                    "real Execute, completion and Reset let the production pruner erase the exact color generation");
+              Check(native::native_fg_submitted_frames.load() == submitted_before,
+                    "the pruned early recording is not counted while SDK acceptance is pending");
+            };
+          }
+          Check(NVSDK_NGX_SUCCEED(native::HookedEvaluateFeatureSlot<0>(gpu.list.Get(), handle, &parameters, nullptr)),
+                "the current SDK accepts the ordinary Native delivery through the wrapper");
+          before_sdk_return = {};
+          Check(consumer_calls == calls_before + 1 && native::native_fg_owner == handle
+                    && native::PreFgResource(&parameters, NVSDK_NGX_DLSSG_Parameter_HUDLess) == hudless.Get(),
+                "the same Native owner restores the borrowed binding after its one SDK invocation");
+          Check(native::native_fg_submitted_frames.load() == submitted_before + unsigned(early_submit),
+                "SDK return counts an already-pruned submission but never an unsubmitted recording");
+          submit();
+          Check(native::native_fg_submitted_frames.load() == submitted_before + 1,
+                "the late real Execute counts once; an empty Execute after early completion cannot count again");
+          Check(read_pixels(consumed_backbuffers.back().Get(), 0, raw_color, false)
+                    && read_pixels(backbuffer.Get(), 0, raw_color, false),
+                "the SDK snapshot and real color both hold this base's edited RGB and original alpha");
+        }
         gpu.Transition(backbuffer.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
         gpu.Write(backbuffer.Get(), 216);
         gpu.Transition(backbuffer.Get(), D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
@@ -4288,6 +4340,8 @@ int RunNativeOptionsResumeTest(bool delayed_options) {
               "the late failure restores A's parameters without clearing B's submission");
         Check(read_pixels(backbuffer.Get(), 232, 232, false),
               "a late SDK failure never writes the old snapshot into the new recording");
+        Check(native::native_fg_submitted_frames.load() == submissions_before_late_return,
+              "a late SDK failure and owner replacement never count the old submitted recording");
         native::native_fg_owner = handle;
         native::native_fg_marker.store(nullptr);
 
@@ -4885,6 +4939,9 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool
     adapter::modules[0].real[4] = reinterpret_cast<void*>(&FakeConstants);
     adapter::modules[0].real[5] = reinterpret_cast<void*>(&FakeId);
     adapter::modules[0].real[6] = reinterpret_cast<void*>(+[](void*, uint32_t) -> int32_t { return 0; });
+    funnel_accounting_tests::Restore sdk_destroy_restore;
+    sdk_destroy_restore.Value(&adapter::modules[0].real[8]);
+    adapter::modules[0].real[8] = reinterpret_cast<void*>(+[](void*) -> int32_t { return 0; });
     adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakePresent);
     adapter::proxies[0].real[1] = reinterpret_cast<void*>(&FakePresent1);
     xefg::Configure(&native::fg_service::Service, &Prepare, nullptr, &Requested);
@@ -5091,6 +5148,7 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool
         xefg_inline_handoff_cases::Run(gpu, xefg_session, backbuffer.Get(), guides[3].Get(), guides[2].Get(),
                                        submit, wait_present_fence, &native_handoff);
       }
+      xefg_session.CloseSdk();
     }
 #if defined(NR_NEXUS_TEST_NATIVE_NGX)
     if (native_ngx && bridge_shared_provider) {
@@ -5875,6 +5933,7 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool
                   && providers::runtime_initializations == initializations_before + 1 && ordinary_proxy.references == 1,
               "explicit private-provider handoff has no extra same-provider face-settling delay");
       }
+      session.CloseSdk();
     }
     xefg_present_handoff_cases::Run(gpu, submit, wait_present_fence);
     if (info != nullptr) {

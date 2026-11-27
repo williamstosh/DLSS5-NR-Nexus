@@ -128,6 +128,16 @@ std::vector<ModelObservation> model_observations;
 uint32_t fail_model_call = 0;
 std::array<unsigned short, 2> model_stamps{0x3400, 0x3800};
 std::optional<std::array<unsigned short, 4>> model_rgba;
+struct ModelGpuSnapshot {
+  ComPtr<ID3D12Resource> readback;
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+  uint32_t width;
+  uint32_t height;
+  uint16_t expected;
+};
+bool capture_model_pixels = false;
+std::vector<ModelGpuSnapshot> model_gpu_snapshots;
+xefg::internal::Context* revoke_ordinary_owner_after_model = nullptr;
 NVSDK_NGX_Handle* source_create_result = nullptr;
 NVSDK_NGX_Result NVSDK_CONV MotionCreateSource(ID3D11DeviceContext*, NVSDK_NGX_Feature,
     NVSDK_NGX_Parameter*, NVSDK_NGX_Handle** handle) {
@@ -303,7 +313,27 @@ NVSDK_NGX_Result NVSDK_CONV MotionEvaluateModel(ID3D12GraphicsCommandList* list,
       .Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, .PlacedFootprint = footprint};
   D3D12_TEXTURE_COPY_LOCATION to{.pResource = output, .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
   list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
-  native::Transition(list, output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  if (capture_model_pixels) {
+    D3D12_HEAP_PROPERTIES readback_heap{.Type = D3D12_HEAP_TYPE_READBACK};
+    ComPtr<ID3D12Resource> readback;
+    Check(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &buffer,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback))), "per-Pass GPU result readback");
+    native::Transition(list, output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION result_source{.pResource = output, .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    D3D12_TEXTURE_COPY_LOCATION result_target{.pResource = readback.Get(),
+        .Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, .PlacedFootprint = footprint};
+    list->CopyTextureRegion(&result_target, 0, 0, 0, &result_source, nullptr);
+    native::Transition(list, output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    model_gpu_snapshots.push_back({.readback = readback, .footprint = footprint,
+        .width = static_cast<uint32_t>(desc.Width), .height = desc.Height, .expected = model_pixel});
+  } else {
+    native::Transition(list, output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  }
+  if (revoke_ordinary_owner_after_model != nullptr && model->preset == 2) {
+    std::unique_lock lock(xefg::internal::state.mutex);
+    ++revoke_ordinary_owner_after_model->epoch;
+    revoke_ordinary_owner_after_model = nullptr;
+  }
   model_uploads.push_back(upload);
   return NVSDK_NGX_Result_Success;
 }
@@ -396,6 +426,8 @@ int main(int argc, char** argv) {
     bool render_stage_resolution = false;
     bool present_stage_resolution = false;
     bool ordinary_watchdog = false;
+    bool ordinary_present_watchdog = false;
+    bool ordinary_present_prequeue = false;
     bool edit_reuse_production = false;
     bool adaptive_case = false;
     bool adaptive_hardware = false;
@@ -409,6 +441,10 @@ int main(int argc, char** argv) {
         dlaa_only = true;
       } else if (std::strcmp(argv[arg], "--sr") == 0) {
         sr_only = true;
+      } else if (std::strcmp(argv[arg], "--ordinary-present-watchdog") == 0) {
+        ordinary_present_watchdog = true;
+      } else if (std::strcmp(argv[arg], "--ordinary-present-prequeue") == 0) {
+        ordinary_present_prequeue = true;
       } else if (std::strcmp(argv[arg], "--ordinary-watchdog") == 0) {
         ordinary_watchdog = true;
       } else if (std::strcmp(argv[arg], "--edit-reuse-production") == 0) {
@@ -447,8 +483,13 @@ int main(int argc, char** argv) {
 #if defined(NR_NEXUS_TEST_WARP_ONLY)
     Check(warp, "hardware adapter forbidden in WARP-only Bridge test build");
 #endif
-    const bool strict_debug = ordinary_watchdog || edit_reuse_production || adaptive_case || (warp && sr_only);
+    const bool strict_debug = ordinary_present_prequeue || ordinary_present_watchdog || ordinary_watchdog || edit_reuse_production || adaptive_case || (warp && sr_only);
     ComPtr<ID3D12Debug> adaptive_debug;
+    if (ordinary_present_prequeue) {
+      Check(!ordinary_present_watchdog && !ordinary_watchdog && !edit_reuse_production && !adaptive_case
+                && !stage_resolution && !present_stage_resolution && !dlaa_only && !sr_only,
+          "ordinary Present prequeue runs its own production route without other variants");
+    }
     if (ordinary_watchdog) {
       Check(!adaptive_case && !stage_resolution && !present_stage_resolution && !dlaa_only && !sr_only,
           "ordinary Bridge watchdog runs without other stage variants");
@@ -509,7 +550,8 @@ int main(int argc, char** argv) {
           && SUCCEEDED(native::bridge.device12->QueryInterface(IID_PPV_ARGS(&adaptive_info12))),
           "Bridge requires both real D3D11 and D3D12 InfoQueues");
       std::cout << (edit_reuse_production ? "BRIDGE_EDIT_REUSE_PRODUCTION"
-          : ordinary_watchdog ? "BRIDGE_ORDINARY_WATCHDOG" : adaptive_case ? "BRIDGE_ADAPTIVE" : "BRIDGE_SR")
+          : ordinary_present_prequeue ? "BRIDGE_ORDINARY_PRESENT_PREQUEUE"
+          : ordinary_present_watchdog ? "BRIDGE_ORDINARY_PRESENT_WATCHDOG" : ordinary_watchdog ? "BRIDGE_ORDINARY_WATCHDOG" : adaptive_case ? "BRIDGE_ADAPTIVE" : "BRIDGE_SR")
           << " debug11=1 debug12=1 info11=1 info12=1 adapter="
           << (warp ? "SOFTWARE" : "HARDWARE")
           << " runtime=" << (adaptive_native_snippet ? "PRODUCTION_SNIPPET_INIT"
@@ -647,6 +689,913 @@ int main(int argc, char** argv) {
         }
       }
     };
+    if (ordinary_present_watchdog || ordinary_present_prequeue) {
+      namespace host = bridge_adaptive_cases;
+      namespace rate = renodx::addons::dlss5::output_framerate;
+      const auto module = GetModuleHandleW(nullptr);
+      Check(DllMain(module, DLL_PROCESS_ATTACH, nullptr), "ordinary Present watchdog production registration");
+      const auto detach = [](HINSTANCE instance) { DllMain(instance, DLL_PROCESS_DETACH, nullptr); };
+      std::unique_ptr<std::remove_pointer_t<HINSTANCE>, decltype(detach)> attached(module, detach);
+      host::Swapchain application(factory.Get(), device.Get(), adaptive_output_width, adaptive_output_height);
+      host::Dispatch<reshade::addon_event::init_swapchain>(&application, false);
+      const auto owner = reinterpret_cast<uintptr_t>(&application);
+      auto* const backbuffer = application.buffers[0].Get();
+      const auto chain = xefg::internal::Identity(application.native.Get());
+      const auto buffer = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(backbuffer));
+      const auto identity = rate::MatchPresentOutput(owner, application.get_current_back_buffer().handle);
+      Check(identity && identity.view == 0, "ordinary Present has a registered native D3D11 backbuffer");
+      native::d3d11_swapchain_seen.store(true);
+      native::dx11_route.store(native::kDx11RouteNative);
+      native::enabled.store(true);
+      native::hook_point.store(native::kHookPresent);
+      native::present_pre_fg.store(1);
+      native::nr_follow_input_res.store(false);
+      native::nr_resolution_scale.store(1.f);
+      native::nr_adaptive_enabled.store(false);
+      native::edit_reuse_enabled.store(false);
+      native::feed_mode.store(1);
+      native::norm_governor.store(0);
+      native::use_auto_mask.store(false);
+      native::stack_passes.store(2);
+      native::pass_preset[0].store(2);
+      native::preset.store(1);
+      native::direct_runtime_requirements.dual_models = true;
+      if (ordinary_present_watchdog) {
+        native::native_fg_public_off.store(true);
+        native::native_fg_declaration.store(native::NativeFgDeclaration::kOff);
+      }
+      native::ngx_loader_staging.nr_ready = true;
+      native::ngx_loader_staging.core_ready = true;
+      native::PublishNgxLoaderSymbols();
+      for (size_t pixel = 0; pixel < output_pixels.size(); pixel += 4) {
+        output_pixels[pixel] = 0x3000;
+        output_pixels[pixel + 1] = 0x3400;
+        output_pixels[pixel + 2] = 0x3600;
+        output_pixels[pixel + 3] = 0x3c00;
+      }
+      const std::vector<uint8_t> original(reinterpret_cast<const uint8_t*>(output_pixels.data()),
+          reinterpret_cast<const uint8_t*>(output_pixels.data()) + output_pixels.size() * sizeof(uint16_t));
+      const std::vector<uint32_t> zeros(adaptive_output_width * adaptive_output_height, 0);
+      const auto present_motion = make_texture(adaptive_output_width, adaptive_output_height, DXGI_FORMAT_R16G16_FLOAT,
+          D3D11_BIND_SHADER_RESOURCE, zeros.data(), adaptive_output_width * sizeof(uint32_t));
+      const auto present_depth = make_texture(adaptive_output_width, adaptive_output_height, DXGI_FORMAT_R32_FLOAT,
+          D3D11_BIND_SHADER_RESOURCE, zeros.data(), adaptive_output_width * sizeof(uint32_t));
+      auto& stream = native::present_streams[&application];
+      native::FeatureState contract;
+      contract.input_width = adaptive_output_width;
+      contract.input_height = adaptive_output_height;
+      contract.has_motion_scale_x = contract.has_motion_scale_y = true;
+      contract.motion_scale_x = contract.motion_scale_y = 1.f;
+      native::PresentTarget target{
+          .domain = renodx::addons::dlss5::present_restore_scope::Domain::FINAL_PRESENT};
+      target.swapchain_identity = owner;
+      target.swapchain_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+      target.hdr_mode = 1;
+      target.hdr_color_space = reshade::api::color_space::scrgb;
+      target.units = {native::codec::Encoding::Linear, true, 80.f, false};
+      target.d3d11_bridge = true;
+      // The historical watchdog case retains the existing strict pair contract.
+      target.independent_resolution_pair = ordinary_present_watchdog;
+      target.capture_display = true;
+      target.workset_key = reinterpret_cast<const ID3D12Resource*>(&stream);
+      target.adaptive_output = identity;
+      native::SnapshotPresentRestoreConfiguration(&target);
+      auto* const raw_context = native::bridge.context11;
+      const auto consumer = make_texture(adaptive_output_width, adaptive_output_height,
+          DXGI_FORMAT_R16G16B16A16_FLOAT, 0, nullptr, 0);
+      ComPtr<ID3D11Device5> fence_device;
+      ComPtr<ID3D11Fence> consumer_done;
+      Check(SUCCEEDED(device.As(&fence_device))
+                && SUCCEEDED(fence_device->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(&consumer_done))),
+          "ordinary Present consumer owns an independent D3D11 completion fence");
+      uint64_t consumer_value = 0;
+      const auto consume = [&] {
+        raw_context->CopyResource(consumer.Get(), backbuffer);
+        Check(SUCCEEDED(raw_context->Signal(consumer_done.Get(), ++consumer_value)),
+            "ordinary Present signals after its real first consumer copy");
+        raw_context->Flush();
+        WaitForGpu(consumer_done.Get(), consumer_value);
+        return Read11(consumer.Get(), 8);
+      };
+      using CopyRegion = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext4*, ID3D11Resource*, UINT, UINT, UINT,
+          UINT, ID3D11Resource*, UINT, const D3D11_BOX*);
+      static CopyRegion original_copy = nullptr;
+      static ID3D11DeviceContext4* observed_context = raw_context;
+      static ID3D11Resource* observed_backbuffer = backbuffer;
+      static uint32_t copy_backs = 0;
+      renodx::utils::vtable::Slot<CopyRegion> copy_slot{
+          .object = raw_context, .index = 46, .original = &original_copy,
+          .replacement = [](ID3D11DeviceContext4* observed, ID3D11Resource* dst, UINT subresource, UINT x, UINT y,
+                             UINT z, ID3D11Resource* src, UINT source_subresource, const D3D11_BOX* box) {
+            original_copy(observed, dst, subresource, x, y, z, src, source_subresource, box);
+            if (observed == observed_context && dst == observed_backbuffer) {
+              ++copy_backs;
+            }
+          }};
+      renodx::utils::vtable::Install(&copy_slot);
+      struct RestoreCopySlot {
+        decltype(copy_slot)* slot;
+        ~RestoreCopySlot() { renodx::utils::vtable::Uninstall(slot); }
+      } restore_copy_slot{.slot = &copy_slot};
+      const auto run_present_bridge = [&](const auto& observe_begin) {
+        auto& block = native::FillPresentBlock(&stream, backbuffer, present_motion.Get(), present_depth.Get(),
+            contract, adaptive_output_width, adaptive_output_height, 1.f, 0);
+        const auto access = xefg::QueryOrdinaryPresent(chain, buffer, identity);
+        Check(access.allowed && target.independent_resolution_pair == ordinary_present_watchdog
+                  && target.stage_execution_plan == nullptr && !native::nr_adaptive_enabled.load(),
+            "fixture enters its actual ordinary or existing strict pair contract without adaptive control");
+        ++native::present_generation;
+        const renodx::addons::dlss5::EvaluateChainScope evaluation;
+        observe_begin();
+        return native::RunBridge(context.Get(), stream.Handle(), &block, nullptr, &target, nullptr, &access);
+      };
+      const auto frame = [&] {
+        raw_context->UpdateSubresource(backbuffer, 0, nullptr, output_pixels.data(), adaptive_output_width * 8, 0);
+        return run_present_bridge([] {});
+      };
+      const auto check_group = [&](size_t begin, int reset) {
+        Check(model_observations.size() == begin + 2 && model_presets[begin] == 1 && model_presets[begin + 1] == 2
+                  && model_observations[begin].id != model_observations[begin + 1].id,
+            "ordinary Present records each of its two distinct model slots exactly once");
+        for (size_t index = begin; index < begin + 2; ++index) {
+          Check((reset < 0 || model_observations[index].reset == reset)
+                    && model_observations[index].width == adaptive_output_width
+                    && model_observations[index].height == adaptive_output_height,
+              "both ordinary Present passes retain the current dimensions and expected Reset");
+        }
+      };
+      bool ready = false;
+      for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8 && !ready; ++attempt) {
+        const auto calls_before = model_observations.size();
+        const auto copies_before = copy_backs;
+        const bool copied = frame();
+        ready = copied && model_observations.size() == calls_before + 2;
+        std::cout << "BRIDGE_ORDINARY_PRESENT_WARM attempt=" << attempt << " passes="
+                  << model_observations.size() - calls_before << " copied=" << copied << '\n';
+        if (ready) {
+          check_group(calls_before, -1);
+          Check(copy_backs == copies_before + 1 && consume() != original,
+              "the healthy ordinary Present first reader consumes one completed dual-Pass edit");
+        }
+      }
+      Check(ready, "ordinary Present watchdog reaches its real production writeback");
+      const auto healthy_pixels = consume();
+      const auto steady_begin = model_observations.size();
+      const auto steady_copies = copy_backs;
+      const auto first_source = output_pixels;
+      model_stamps[1] = 0x3a00;
+      if (ordinary_present_prequeue) {
+        model_stamps[0] = 0x3600;
+        for (size_t pixel = 0; pixel < output_pixels.size(); pixel += 4) output_pixels[pixel] = 0x3200;
+      }
+      const auto second_source = output_pixels;
+      Check(frame(), "the next ordinary Present delivers without dropping its group");
+      check_group(steady_begin, 0);
+      const auto current_pixels = consume();
+      Check(copy_backs == steady_copies + 1 && current_pixels != healthy_pixels && current_pixels != original,
+          "healthy synchronous control has one write and reads this frame's distinct tail-model result");
+      model_stamps = {0x3400, 0x3800};
+      output_pixels = first_source;
+      if (ordinary_present_prequeue) {
+        using WaitCall = HRESULT(STDMETHODCALLTYPE*)(ID3D11DeviceContext4*, ID3D11Fence*, UINT64);
+        static WaitCall original_wait = nullptr;
+        static ID3D11DeviceContext4* wait_context = raw_context;
+        static uint32_t done_wait_calls = 0;
+        static bool fail_done_wait_once = false;
+        renodx::utils::vtable::Slot<WaitCall> wait_slot{
+            .object = raw_context, .index = 148, .original = &original_wait,
+            .replacement = [](ID3D11DeviceContext4* observed, ID3D11Fence* fence, UINT64 value) -> HRESULT {
+              if (observed == wait_context && fence == native::bridge.fence_done11) {
+                ++done_wait_calls;
+                if (fail_done_wait_once) {
+                  fail_done_wait_once = false;
+                  return E_FAIL;
+                }
+              }
+              return original_wait(observed, fence, value);
+            }};
+        renodx::utils::vtable::Install(&wait_slot);
+        struct RestoreWaitSlot {
+          decltype(wait_slot)* slot;
+          ~RestoreWaitSlot() { renodx::utils::vtable::Uninstall(slot); }
+        } restore_wait_slot{.slot = &wait_slot};
+        const auto calls_before = model_observations.size();
+        const auto copies_before = copy_backs;
+        const auto waits_before = done_wait_calls;
+        const auto cpu_waits_before = native::bridge_completion_waits;
+        const auto submits_before = native::bridge_submits.load();
+        const auto timeouts_before = native::bridge_timeouts.load();
+        // The application's next color write is GPU-ordered, not a CPU upload to an in-flight backbuffer.
+        const std::array<ComPtr<ID3D11Texture2D>, 2> source_colors{
+            make_texture(adaptive_output_width, adaptive_output_height, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                0, first_source.data(), adaptive_output_width * 8),
+            make_texture(adaptive_output_width, adaptive_output_height, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                0, second_source.data(), adaptive_output_width * 8)};
+        std::array<ComPtr<ID3D11Texture2D>, 2> readers{
+            make_texture(adaptive_output_width, adaptive_output_height, DXGI_FORMAT_R16G16B16A16_FLOAT, 0, nullptr, 0),
+            make_texture(adaptive_output_width, adaptive_output_height, DXGI_FORMAT_R16G16B16A16_FLOAT, 0, nullptr, 0)};
+        ComPtr<ID3D12Fence> gate;
+        Check(SUCCEEDED(native::bridge.device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)))
+                  && SUCCEEDED(native::bridge.queue->Wait(gate.Get(), 1)), "hold only the private NR queue briefly");
+        StallRelease release{.gate = gate.Get()};
+        const auto held_begin = std::chrono::steady_clock::now();
+        struct HeldTiming {
+          const char* phase;
+          int64_t elapsed_us;
+          uint64_t gate;
+          uint64_t done12;
+          uint64_t done11;
+          uint64_t out;
+          uint64_t reader;
+          uint64_t reader_target;
+          uint64_t submitted;
+        };
+        std::array<HeldTiming, 14> held_timings{};
+        size_t held_timing_count = 0;
+        const auto snapshot_held_timing = [&](const char* phase) {
+          held_timings[held_timing_count++] = {
+              .phase = phase,
+              .elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - held_begin).count(),
+              .gate = gate->GetCompletedValue(),
+              .done12 = native::bridge.fence_done12->GetCompletedValue(),
+              .done11 = native::bridge.fence_done11->GetCompletedValue(),
+              .out = native::bridge.fence_out12->GetCompletedValue(),
+              .reader = consumer_done->GetCompletedValue(),
+              .reader_target = consumer_value,
+              .submitted = native::bridge_submitted_value.load()};
+        };
+        const auto dump_held_timing = [&] {
+          int64_t previous_us = 0;
+          for (size_t index = 0; index < held_timing_count; ++index) {
+            const auto& row = held_timings[index];
+            std::cerr << "BRIDGE_ORDINARY_PREQUEUE_TIMING phase=" << row.phase
+                      << " elapsed_us=" << row.elapsed_us << " step_us=" << row.elapsed_us - previous_us
+                      << " gate=" << row.gate << " done12=" << row.done12 << " done11=" << row.done11
+                      << " out=" << row.out << " reader=" << row.reader << " reader_target=" << row.reader_target
+                      << " submitted=" << row.submitted << '\n';
+            previous_us = row.elapsed_us;
+          }
+        };
+        std::jthread bounded_release([gate](std::stop_token stop) {
+          const auto end = GetTickCount64() + 350;
+          while (!stop.stop_requested() && GetTickCount64() < end) Sleep(1);
+          gate->Signal(1);
+        });
+        capture_model_pixels = true;
+        snapshot_held_timing("before_n");
+        raw_context->CopyResource(backbuffer, source_colors[0].Get());
+        snapshot_held_timing("after_n_source_copy");
+        Check(run_present_bridge([&] { snapshot_held_timing("before_n_bridge"); }),
+            "N records its ordinary Wait and copy without a CPU completion wait");
+        snapshot_held_timing("after_n");
+        const auto first = native::bridge_submitted_value.load();
+        check_group(calls_before, 0);
+        raw_context->CopyResource(readers[0].Get(), backbuffer);
+        snapshot_held_timing("after_n_copy");
+        const auto first_read = ++consumer_value;
+        Check(SUCCEEDED(raw_context->Signal(consumer_done.Get(), first_read)), "record N first consumer signal");
+        snapshot_held_timing("after_n_signal");
+        raw_context->Flush();
+        snapshot_held_timing("after_n_flush");
+        model_stamps = {0x3600, 0x3a00};
+        snapshot_held_timing("before_n1");
+        raw_context->CopyResource(backbuffer, source_colors[1].Get());
+        snapshot_held_timing("after_n1_source_copy");
+        Check(run_present_bridge([&] { snapshot_held_timing("before_n1_bridge"); }),
+            "N+1 records while N true done is pending, without a skipped group");
+        snapshot_held_timing("after_n1");
+        const auto second = native::bridge_submitted_value.load();
+        check_group(calls_before + 2, 0);
+        raw_context->CopyResource(readers[1].Get(), backbuffer);
+        snapshot_held_timing("after_n1_copy");
+        const auto second_read = ++consumer_value;
+        Check(SUCCEEDED(raw_context->Signal(consumer_done.Get(), second_read)), "record N+1 first consumer signal");
+        snapshot_held_timing("after_n1_signal");
+        raw_context->Flush();
+        snapshot_held_timing("after_n1_flush");
+        capture_model_pixels = false;
+        const native::BridgeSlot* first_slot = nullptr;
+        const native::BridgeSlot* second_slot = nullptr;
+        for (const auto& slot : native::bridge.ring) {
+          if (slot.value == first) first_slot = &slot;
+          if (slot.value == second) second_slot = &slot;
+        }
+        Check(first_slot != nullptr && second_slot != nullptr && first_slot != second_slot
+                  && first_slot->allocator != second_slot->allocator && first_slot->list != second_slot->list,
+            "two pending frames retain different real allocator/list slots and finite submission values");
+        Check(second == first + 1 && native::bridge_submits.load() == submits_before + 2
+                  && native::bridge_completion_waits == cpu_waits_before && native::bridge_pending_delivery_value == 0
+                  && done_wait_calls == waits_before + 2 && copy_backs == copies_before + 2,
+            "both complete groups have one GPU dependency/copy, no CPU wait, and no false unqueued-delivery block");
+        // Freeze the assertion before emitting timings; logging must not consume the held interval.
+        const auto readers_held = [&] {
+          return gate->GetCompletedValue() == 0 && native::bridge.fence_done12->GetCompletedValue() < first
+              && consumer_done->GetCompletedValue() < first_read;
+        };
+        const bool held_before_rescue = readers_held();
+        if (!held_before_rescue) {
+          dump_held_timing();
+        }
+        Check(held_before_rescue, "neither real first reader has completed while true done is held");
+        Check(SUCCEEDED(native::bridge.fence_out12->Signal(first)), "advance only the legacy rescue fence");
+        const bool held_after_rescue = readers_held();
+        if (!held_after_rescue) {
+          dump_held_timing();
+        }
+        Check(held_after_rescue, "advancing out does not satisfy the true-done dependency or either consumer");
+        std::cout << "BRIDGE_ORDINARY_PREQUEUE_HELD first=" << first << " second=" << second
+                  << " out=" << native::bridge.fence_out12->GetCompletedValue()
+                  << " done=" << native::bridge.fence_done12->GetCompletedValue()
+                  << " consumers_done=" << consumer_done->GetCompletedValue()
+                  << " passes=2,2 copies=1,1 cpu_waits=0 distinct_slots=1\n";
+        Check(SUCCEEDED(gate->Signal(1)), "release the short ordinary prequeue gate");
+        release.gate = nullptr;
+        bounded_release.request_stop();
+        bounded_release.join();
+        dump_held_timing();
+        WaitForGpu(consumer_done.Get(), second_read);
+        Check(native::bridge.fence_done12->GetCompletedValue() >= second
+                  && native::bridge.fence_done12->GetCompletedValue() != UINT64_MAX,
+            "both finite private done values precede completed D11 consumer reads");
+        const auto first_pixels = Read11(readers[0].Get(), 8);
+        const auto second_pixels = Read11(readers[1].Get(), 8);
+        const std::vector<uint8_t> second_original(reinterpret_cast<const uint8_t*>(second_source.data()),
+            reinterpret_cast<const uint8_t*>(second_source.data()) + second_source.size() * sizeof(uint16_t));
+        Check(first_pixels == healthy_pixels && second_pixels == current_pixels && first_pixels != second_pixels
+                  && first_pixels != original && second_pixels != second_original,
+            "N and N+1 first readers get their own complete current-frame colors, not original or the other frame");
+        Check(model_gpu_snapshots.size() == 4, "both frames have one actual GPU result snapshot for each Pass");
+        const std::array<uint16_t, 4> expected_signatures{0x3400, 0x3800, 0x3600, 0x3a00};
+        for (size_t pass = 0; pass < model_gpu_snapshots.size(); ++pass) {
+          const auto& snapshot = model_gpu_snapshots[pass];
+          void* mapped = nullptr;
+          Check(snapshot.expected == expected_signatures[pass]
+                    && SUCCEEDED(snapshot.readback->Map(0, nullptr, &mapped)), "map the completed per-Pass GPU result");
+          for (UINT y = 0; y < snapshot.height; ++y) {
+            const auto* row = reinterpret_cast<const uint16_t*>(static_cast<const uint8_t*>(mapped)
+                + snapshot.footprint.Offset + size_t(y) * snapshot.footprint.Footprint.RowPitch);
+            for (UINT value = 0; value < snapshot.width * 4; ++value) {
+              Check(row[value] == expected_signatures[pass], "each Pass GPU texture contains this frame's full signature");
+            }
+          }
+          snapshot.readback->Unmap(0, nullptr);
+        }
+        model_gpu_snapshots.clear();
+        Check(native::bridge_timeouts.load() == timeouts_before, "short ordering gate never trips the watchdog");
+        std::cout << "BRIDGE_ORDINARY_PREQUEUE_READERS frames=2 passes=2,2 gpu_pass_signatures=4"
+                     " first_current=1 second_current=1 old_frame=0 originals=0\n";
+
+        const auto rejected_frame = [&](bool fail_wait) {
+          output_pixels = first_source;
+          model_stamps = {0x3400, 0x3800};
+          const auto context_handle = reinterpret_cast<void*>(uintptr_t{0xD3110} + unsigned(fail_wait));
+          auto owner_context = std::make_shared<xefg::internal::Context>();
+          owner_context->application_swapchain_identity = chain;
+          owner_context->output_identity = identity;
+          owner_context->backbuffers[0] = buffer;
+          owner_context->present_colors.emplace(1, xefg::internal::Context::PresentColors{.backbuffer = buffer});
+          {
+            std::unique_lock lock(xefg::internal::state.mutex);
+            xefg::internal::state.contexts.emplace(context_handle, owner_context);
+          }
+          const auto access = xefg::QueryOrdinaryPresent(chain, buffer, identity);
+          Check(access.allowed && access.context == reinterpret_cast<uintptr_t>(context_handle) && access.call == 1,
+              "negative case binds the real final-owner query and current call bookkeeping");
+          const auto group_begin = model_observations.size();
+          const auto copy_begin = copy_backs;
+          const auto wait_begin = done_wait_calls;
+          const auto success_wait_begin = native::bridge_waits11.load();
+          ComPtr<ID3D12Fence> failure_gate;
+          Check(SUCCEEDED(native::bridge.device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&failure_gate)))
+                    && SUCCEEDED(native::bridge.queue->Wait(failure_gate.Get(), 1)), "hold only the negative-case private queue briefly");
+          StallRelease failure_release{.gate = failure_gate.Get()};
+          std::jthread failure_bound([failure_gate](std::stop_token stop) {
+            const auto end = GetTickCount64() + 350;
+            while (!stop.stop_requested() && GetTickCount64() < end) Sleep(1);
+            failure_gate->Signal(1);
+          });
+          fail_done_wait_once = fail_wait;
+          revoke_ordinary_owner_after_model = (fail_wait ? nullptr : owner_context.get());
+          Check(!frame(), "known Wait failure or late owner revocation does not report an ordinary recording");
+          check_group(group_begin, 0);
+          const auto pending = native::bridge_submitted_value.load();
+          Check(copy_backs == copy_begin && native::bridge_waits11.load() == success_wait_begin
+                    && done_wait_calls == wait_begin + unsigned(fail_wait)
+                    && !owner_context->present_colors.at(1).ordinary_committed,
+              "owner rejection records no Wait; failed Wait records no copy or successful ordinary commit");
+          Check(consume() == original && failure_gate->GetCompletedValue() == 0
+                    && native::bridge.fence_done12->GetCompletedValue() < pending,
+              "rejected pre-recording delivery leaves the original first reader free while private work is pending");
+          Check(SUCCEEDED(failure_gate->Signal(1)), "release rejected group's private work");
+          failure_release.gate = nullptr;
+          failure_bound.request_stop();
+          failure_bound.join();
+          WaitForGpu(native::bridge.fence_done12, pending);
+          Check(consume() == original && copy_backs == copy_begin, "late rejected result cannot add a copy");
+          {
+            std::unique_lock lock(xefg::internal::state.mutex);
+            xefg::internal::state.contexts.erase(context_handle);
+          }
+          const auto recovery_begin = model_observations.size();
+          Check(frame(), "first legal ordinary group records after the known failed handoff");
+          check_group(recovery_begin, 1);
+          Check(copy_backs == copy_begin + 1 && consume() == healthy_pixels,
+              "first legal recovery resets both Passes and writes the current result once");
+          const auto next_begin = model_observations.size();
+          Check(frame(), "next legal ordinary group continues without replaying the rejected group");
+          check_group(next_begin, 0);
+          Check(copy_backs == copy_begin + 2 && consume() == healthy_pixels,
+              "next normal group clears recovery Reset and keeps one delivery");
+          std::cout << "BRIDGE_ORDINARY_PREQUEUE_REJECT kind=" << (fail_wait ? "wait_failure" : "owner_epoch")
+                    << " wait_calls=" << done_wait_calls - wait_begin - 2 << " rejected_copies=0 committed=0"
+                       " original_reader=1 first_reset=1,1 next_reset=0,0 recovered_copies=1,1\n";
+        };
+        rejected_frame(false);
+        rejected_frame(true);
+
+        {
+          // Keep the ordinary and SDK outputs distinct so the only shared owner is the exact NR Provider.
+          Gpu sdk_gpu(!warp, adaptive_output_width, adaptive_output_height);
+          Check(sdk_gpu.device.Get() == native::bridge.device12 && sdk_gpu.queue.Get() != native::bridge.queue,
+              "Bridge and SDK have the same raw device and independent real queues");
+          const auto sdk_swapchain = sdk_gpu.Swapchain(DXGI_FORMAT_R16G16B16A16_FLOAT);
+          ComPtr<ID3D12Resource> sdk_color;
+          Check(SUCCEEDED(sdk_swapchain->GetBuffer(0, IID_PPV_ARGS(&sdk_color))), "SDK real color target");
+          const auto sdk_depth = sdk_gpu.Texture(adaptive_output_width, adaptive_output_height, DXGI_FORMAT_R32_FLOAT);
+          const auto sdk_motion = sdk_gpu.Texture(adaptive_output_width, adaptive_output_height, DXGI_FORMAT_R16G16_FLOAT);
+          auto sdk_transfer = sdk_gpu.CreateTextureTransfer(sdk_color.Get());
+          const auto seed_sdk = [&] {
+            sdk_gpu.Transition(sdk_color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+            sdk_gpu.UploadTexture(sdk_color.Get(), sdk_transfer, reinterpret_cast<const uint8_t*>(second_source.data()),
+                second_source.size() * sizeof(uint16_t), adaptive_output_width * 8);
+            sdk_gpu.Transition(sdk_color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+            sdk_gpu.Submit();
+          };
+          sdk_gpu.Write(sdk_depth.Get(), 0);
+          sdk_gpu.Write(sdk_motion.Get(), 0);
+          seed_sdk();
+          static IDXGISwapChain3* sdk_proxy = nullptr;
+          struct SdkFirstRead {
+            Gpu* gpu;
+            ID3D12Resource* color;
+            d3d12_test::TextureTransfer* transfer;
+            bool armed = false;
+            uint64_t value = 0;
+          } sdk_first_read{.gpu = &sdk_gpu, .color = sdk_color.Get(), .transfer = &sdk_transfer};
+          static SdkFirstRead* sdk_first = nullptr;
+          sdk_proxy = sdk_swapchain.Get();
+          sdk_first = &sdk_first_read;
+          struct RestoreSdkFixture {
+            adapter::SdkSlot module = adapter::modules[0];
+            adapter::ProxySlot proxy = adapter::proxies[0];
+            void* handle = this;
+            bool registered = false;
+            ~RestoreSdkFixture() {
+              if (registered) Hooks::Destroy(handle);
+              adapter::proxies[0] = proxy;
+              adapter::modules[0] = module;
+              sdk_first = nullptr;
+              sdk_proxy = nullptr;
+            }
+          } sdk;
+          adapter::modules[0].complete = true;
+          adapter::modules[0].real[0] = reinterpret_cast<void*>(&FakeInit);
+          adapter::modules[0].real[2] = reinterpret_cast<void*>(+[](void*, REFIID iid, void** output) -> int32_t {
+            return sdk_proxy != nullptr && SUCCEEDED(sdk_proxy->QueryInterface(iid, output)) ? 0 : -1;
+          });
+          adapter::modules[0].real[3] = reinterpret_cast<void*>(&FakeResource);
+          adapter::modules[0].real[4] = reinterpret_cast<void*>(&FakeConstants);
+          adapter::modules[0].real[5] = reinterpret_cast<void*>(&FakeId);
+          adapter::modules[0].real[6] = reinterpret_cast<void*>(+[](void*, uint32_t) -> int32_t { return 0; });
+          adapter::modules[0].real[8] = reinterpret_cast<void*>(+[](void*) -> int32_t { return 0; });
+          adapter::proxies[0].installed = adapter::proxies[0].complete = true;
+          adapter::proxies[0].records[0].target = static_cast<uint8_t*>((*reinterpret_cast<void***>(sdk_proxy))[8]);
+          adapter::proxies[0].real[0] = reinterpret_cast<void*>(+[](IDXGISwapChain*, UINT, UINT) -> HRESULT {
+            if (!std::exchange(sdk_first->armed, false)) return S_OK;
+            auto& gpu = *sdk_first->gpu;
+            gpu.Transition(sdk_first->color, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            gpu.RecordTextureReadback(sdk_first->color, *sdk_first->transfer);
+            gpu.Transition(sdk_first->color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            const HRESULT closed = gpu.list->Close();
+            if (FAILED(closed)) return closed;
+            ID3D12CommandList* lists[]{gpu.list.Get()};
+            gpu.queue->ExecuteCommandLists(1, lists);
+            gpu.submission_pending = true;
+            sdk_first->value = ++gpu.serial;
+            return gpu.queue->Signal(gpu.fence.Get(), gpu.serial);
+          });
+          const auto open_sdk = [&] {
+            const xefg::abi::Init sdk_init{.application_swapchain = sdk_swapchain.Get(), .max_interpolated = 1, .ui_mode = 1};
+            Check(Hooks::Init(sdk.handle, sdk_gpu.queue.Get(), &sdk_init) == 0, "SDK public Init");
+            sdk.registered = true;
+            ComPtr<IDXGISwapChain3> proxy;
+            Check(Hooks::GetSwapchain(sdk.handle, IID_PPV_ARGS(&proxy)) == 0 && proxy.Get() == sdk_swapchain.Get()
+                      && Hooks::Enable(sdk.handle, 0) == 0, "SDK public GetSwapchain and initial Off");
+            const auto sdk_context = adapter::state.contexts.at(sdk.handle);
+            Check(sdk_context->queue.Get() == sdk_gpu.queue.Get() && sdk_context->output_identity
+                      && sdk_context->output_identity != identity, "SDK publishes its own real output identity");
+          };
+          const auto sdk_key = std::pair{false, reinterpret_cast<uintptr_t>(sdk.handle)};
+          uint32_t sdk_id = 0;
+          const auto present_sdk = [&](bool first_read) {
+            const auto id = ++sdk_id;
+            for (auto [type, resource] : {std::pair{DEPTH, sdk_depth.Get()}, std::pair{MOTION, sdk_motion.Get()}}) {
+              const xefg::abi::Resource tagged{.type = type, .validity = UNTIL_NEXT_PRESENT, .base = {0, 0},
+                  .size = {adaptive_output_width, adaptive_output_height}, .resource = resource,
+                  .state = D3D12_RESOURCE_STATE_COMMON};
+              Check(Hooks::Resource(sdk.handle, sdk_gpu.list.Get(), id, &tagged) == 0, "tag real SDK guide");
+            }
+            const xefg::abi::Constants constants{.motion_scale_x = 1.f, .motion_scale_y = 1.f, .frame_time_ms = 16.f};
+            Check(Hooks::Constants(sdk.handle, id, &constants) == 0 && Hooks::PresentId(sdk.handle, id) == 0,
+                "fresh SDK frame with real guide inputs");
+            sdk_first_read.armed = first_read;
+            Check(SUCCEEDED(adapter::ProxyHooks<0>::Present(sdk_swapchain.Get(), 0, 0)) && !sdk_first_read.armed,
+                "production SDK Proxy Present reaches its original first reader");
+            return xefg::CurrentResult();
+          };
+          const auto wait_sdk = [&] {
+            if (const auto it = native::fg_service::streams.find(sdk_key);
+                it != native::fg_service::streams.end() && it->second.submitted != 0) {
+              WaitForGpu(it->second.fence, it->second.submitted);
+            }
+          };
+          const auto read_sdk = [&] {
+            Check(sdk_gpu.submission_pending && sdk_first_read.value != 0, "SDK read was recorded in original Present");
+            WaitForGpu(sdk_gpu.fence.Get(), sdk_first_read.value);
+            sdk_gpu.submission_pending = false;
+            const auto result = sdk_gpu.ReadTexture(sdk_transfer);
+            Check(SUCCEEDED(sdk_gpu.allocator->Reset()) && SUCCEEDED(sdk_gpu.list->Reset(sdk_gpu.allocator.Get(), nullptr)),
+                "retire the completed SDK first-reader list");
+            submission::OnCommandListReset(sdk_gpu.list.Get());
+            sdk_gpu.retained_resources.clear();
+            return result;
+          };
+
+          // Only the provider API/model and public SDK returns are substituted. Ensure adopts two actual modules.
+          const auto fixture_path = native::AddonDirectory() / L"nexus-test-runtime-image.dll";
+          // The addon detach callback may still use this module: retain it for the test process lifetime.
+          static const HMODULE private_module = LoadLibraryW(fixture_path.c_str());
+          Check(private_module != nullptr && private_module != module
+                    && GetProcAddress(private_module, "FixtureModulePath") != nullptr, "distinct local test runtime module");
+          struct ProviderObservation {
+            uint32_t(WINAPI* init)(ID3D12Object*, uint32_t) = nullptr;
+            uint32_t(WINAPI* shutdown)(ID3D12Object*) = nullptr;
+            uint64_t old_tail = 0;
+            uint32_t old_releases = 0;
+            uint32_t old_destroys = 0;
+            uint32_t new_inits = 0;
+            uint32_t private_shutdowns = 0;
+            bool premature = false;
+
+            void RequireFiniteTail() {
+              if (old_tail == 0) return;
+              const auto done = native::bridge.fence_done12->GetCompletedValue();
+              premature |= (done == UINT64_MAX || done < old_tail);
+            }
+          };
+          static ProviderObservation provider;
+          provider.init = reinterpret_cast<decltype(provider.init)>(GetProcAddress(private_module, "FixtureInit"));
+          provider.shutdown = reinterpret_cast<decltype(provider.shutdown)>(GetProcAddress(private_module, "FixtureShutdown"));
+          Check(provider.init != nullptr && provider.shutdown != nullptr, "ordinary and private mock entry tables");
+          auto& symbols = native::ngx_loader_staging;
+          symbols.nr_module = module;
+          symbols.nr_requirements = native::direct_runtime_requirements;
+          symbols.allocate = params::AllocateOwnedParameters;
+          symbols.destroy = +[](NVSDK_NGX_Parameter* parameters) -> NVSDK_NGX_Result {
+            provider.RequireFiniteTail();
+            ++provider.old_destroys;
+            return params::DestroyOwnedParameters(parameters);
+          };
+          symbols.init = +[](unsigned long long, const wchar_t*, ID3D12Device*, NVSDK_NGX_Version,
+                              const NVSDK_NGX_Parameter*) -> NVSDK_NGX_Result { return NVSDK_NGX_Result_Success; };
+          symbols.create = MotionCreateModel;
+          symbols.evaluate = MotionEvaluateModel;
+          symbols.release = +[](NVSDK_NGX_Handle* model) -> NVSDK_NGX_Result {
+            provider.RequireFiniteTail();
+            ++provider.old_releases;
+            return MotionReleaseModel(model);
+          };
+          symbols.native_api = {
+              .private_instance = true,
+              .module = private_module,
+              .init = +[](unsigned long long, const wchar_t*, ID3D12Device* device, NVSDK_NGX_Version,
+                           const NVSDK_NGX_Parameter*) -> NVSDK_NGX_Result {
+                provider.RequireFiniteTail();
+                ++provider.new_inits;
+                return (provider.init(device, 1) == 1 ? NVSDK_NGX_Result_Success : NVSDK_NGX_Result_Fail);
+              },
+              .create = MotionCreateModel, .evaluate = MotionEvaluateModel, .release = MotionReleaseModel,
+              .shutdown = +[](ID3D12Device* device) -> NVSDK_NGX_Result {
+                provider.RequireFiniteTail();
+                ++provider.private_shutdowns;
+                return (provider.shutdown(device) != 0 ? NVSDK_NGX_Result_Success : NVSDK_NGX_Result_Fail);
+              }};
+          symbols.native_ready = true;
+          native::PublishNgxLoaderSymbols();
+          native::direct_api.release = symbols.release;
+          native::core_destroy_parameters = symbols.destroy;
+          const auto old_snippet = native::bridge_force_snippet.exchange(true);
+          open_sdk();
+
+          ComPtr<ID3D12Fence> sdk_color_ready12;
+          ComPtr<ID3D11Fence> sdk_color_ready11;
+          Check(SUCCEEDED(native::bridge.device12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&sdk_color_ready12))),
+              "SDK interop uses a shared color dependency");
+          HANDLE shared_color_ready = nullptr;
+          Check(SUCCEEDED(native::bridge.device12->CreateSharedHandle(sdk_color_ready12.Get(), nullptr, GENERIC_ALL,
+                    nullptr, &shared_color_ready)), "export SDK color dependency");
+          const auto opened_ready = fence_device->OpenSharedFence(shared_color_ready, IID_PPV_ARGS(&sdk_color_ready11));
+          CloseHandle(shared_color_ready);
+          Check(SUCCEEDED(opened_ready), "open real D11-D12 SDK dependency");
+          uint64_t ready_value = 0;
+          const auto record_ordinary = [&] {
+            raw_context->CopyResource(backbuffer, source_colors[0].Get());
+            const auto model_begin = model_observations.size();
+            const auto copy_begin = copy_backs;
+            const auto wait_begin = native::bridge_completion_waits;
+            Check(run_present_bridge([] {}), "ordinary legitimately prequeues its original Wait and color");
+            check_group(model_begin, -1);
+            Check(copy_backs == copy_begin + 1 && native::bridge_pending_delivery_value == 0
+                      && native::bridge_completion_waits == wait_begin, "ordinary retains both passes and no CPU wait");
+            raw_context->CopyResource(consumer.Get(), backbuffer);
+            Check(SUCCEEDED(raw_context->Signal(sdk_color_ready11.Get(), ++ready_value)),
+                "same immediate context signals after the first old color reader");
+            raw_context->Flush();
+            return native::bridge_submitted_value.load();
+          };
+          const auto warm_ordinary = [&] {
+            for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8; ++attempt) {
+              raw_context->CopyResource(backbuffer, source_colors[0].Get());
+              const auto marker = model_calls;
+              if (run_present_bridge([] {}) && model_calls == marker + 2) {
+                return consume();
+              }
+              const auto submitted = native::bridge_submitted_value.load();
+              if (submitted != 0) WaitForGpu(native::bridge.fence_done12, submitted);
+            }
+            throw std::runtime_error("ordinary handoff models did not warm");
+          };
+          const auto new_gate = [] {
+            ComPtr<ID3D12Fence> gate;
+            Check(SUCCEEDED(native::bridge.device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)))
+                      && SUCCEEDED(native::bridge.queue->Wait(gate.Get(), 1)), "put the old true GPU done behind a test gate");
+            return gate;
+          };
+          const auto check_pending = [](uint64_t target) {
+            const auto done = native::bridge.fence_done12->GetCompletedValue();
+            Check(target != 0 && done != UINT64_MAX && done < target, "pending ordinary tail has finite true done below target");
+          };
+          const auto provider_events = [&] {
+            return std::array{provider.old_releases, provider.old_destroys, provider.new_inits, provider.private_shutdowns};
+          };
+          const auto started_provider = [&](fg::Result result, const auto& before, uint64_t creates_before) {
+            Check(!provider.premature && provider.old_releases >= before[0] + 2
+                      && provider.old_destroys >= before[1] + 2 && provider.new_inits == before[2] + 1
+                      && provider.private_shutdowns == before[3] && native::direct_api.module == private_module
+                      && native::CanReuseActivePrivateRuntime(sdk_gpu.device.Get())
+                      && (result == fg::Result::PREPARED || result == fg::Result::SUBMITTED || model_created > creates_before)
+                      && native::fg_service::streams.contains(sdk_key),
+                "the same eligible SDK call starts actual provider-owned model preparation or color, after finite old done");
+          };
+          const auto return_to_ordinary = [&] {
+            Check(Hooks::Enable(sdk.handle, 0) == 0, "end current SDK ownership before selecting the ordinary provider");
+            const native::BridgeDeviceLock device_lock;
+            const renodx::addons::dlss5::ngx_serial::PresentTurn turn(true);
+            Check(turn.owns(), "isolated test provider reset owns NGX turn");
+            const renodx::addons::dlss5::RuntimeLock runtime_lock(native::runtime_mutex);
+            Check(native::RetireBridgeRecordings() && native::EnsureDirectRuntime(sdk_gpu.list.Get(), nullptr, false)
+                      && native::direct_api.module == module && !native::direct_api.private_instance,
+                "select the ordinary provider through the real lifecycle on a drained device");
+          };
+
+          {
+            const auto handoff_gate = new_gate();
+            StallRelease handoff_release{.gate = handoff_gate.Get()};
+            provider.old_tail = record_ordinary();
+            check_pending(provider.old_tail);
+            using RegisterFence = HRESULT(STDMETHODCALLTYPE*)(ID3D12Fence*, UINT64, HANDLE);
+            static RegisterFence original_register = nullptr;
+            static HANDLE wait_armed = nullptr;
+            wait_armed = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            const auto close_armed = [](void* value) { if (value != nullptr) CloseHandle(value); };
+            std::unique_ptr<void, decltype(close_armed)> armed(wait_armed, close_armed);
+            Check(wait_armed != nullptr, "observe registration of the exact production tail wait");
+            renodx::utils::vtable::Slot<RegisterFence> register_slot{
+                .object = native::bridge.fence_done12, .index = 9, .original = &original_register,
+                .replacement = [](ID3D12Fence* fence, UINT64 value, HANDLE event) -> HRESULT {
+                  const auto hr = original_register(fence, value, event);
+                  if (SUCCEEDED(hr) && fence == native::bridge.fence_done12 && value == provider.old_tail
+                      && event == native::bridge.completion_event) SetEvent(wait_armed);
+                  return hr;
+                }};
+            renodx::utils::vtable::Install(&register_slot);
+            const auto restore_register = [](auto* value) { renodx::utils::vtable::Uninstall(value); };
+            std::unique_ptr<decltype(register_slot), decltype(restore_register)> observed(&register_slot, restore_register);
+            bool armed_while_pending = false;
+            HRESULT release_result = E_FAIL;
+            std::jthread release_after_arm([&] {
+              const auto status = WaitForSingleObject(wait_armed, 300);
+              const auto done = native::bridge.fence_done12->GetCompletedValue();
+              armed_while_pending = status == WAIT_OBJECT_0 && done != UINT64_MAX && done < provider.old_tail;
+              release_result = handoff_gate->Signal(1);
+            });
+            const auto before = provider_events();
+            const auto waits = native::bridge_completion_waits;
+            const auto creates = model_created;
+            Check(Hooks::Enable(sdk.handle, 1) == 0, "cold SDK ownership enable");
+            const auto result = present_sdk(false);
+            release_after_arm.join();
+            observed.reset();
+            Check(armed_while_pending && SUCCEEDED(release_result) && native::bridge_completion_waits == waits + 1,
+                "first cold change waited once on genuine pending completion and unblocked inside this call");
+            handoff_release.gate = nullptr;
+            started_provider(result, before, creates);
+            provider.old_tail = 0;
+            WaitForGpu(sdk_color_ready12.Get(), ready_value);
+            wait_sdk();
+            std::cout << "BRIDGE_XEFG_PREQUEUE_HANDOFF phase=cold_ready waits=1 initialized=1 real_done=1 same_call=1\n";
+          }
+
+          const auto warm_sdk = [&] {
+            for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8; ++attempt) {
+              const auto marker = model_calls;
+              const auto result = present_sdk(true);
+              const auto color = read_sdk();
+              if (result == fg::Result::SUBMITTED && model_calls == marker + 2) return color;
+              Check(result != fg::Result::FAILED, "real SDK setup does not fail");
+              seed_sdk();
+            }
+            throw std::runtime_error("SDK handoff models did not warm");
+          };
+          constexpr std::array<uint16_t, 2> old_sdk_stamps{0x3200, 0x3a00};
+          constexpr std::array<uint16_t, 2> new_sdk_stamps{0x3600, 0x3b00};
+          constexpr std::array<uint16_t, 2> old_bridge_stamps{0x3400, 0x3800};
+          model_stamps = old_sdk_stamps;
+          const auto old_sdk_pixels = warm_sdk();
+          seed_sdk();
+          model_stamps = new_sdk_stamps;
+          const auto new_sdk_pixels = warm_sdk();
+          Check(old_sdk_pixels != second_original && new_sdk_pixels != second_original && old_sdk_pixels != new_sdk_pixels,
+              "old and new SDK colors have distinct edited byte signatures");
+          seed_sdk();
+          model_stamps = old_bridge_stamps;
+          const auto old_bridge_pixels = warm_ordinary();
+          {
+            const auto handoff_gate = new_gate();
+            StallRelease handoff_release{.gate = handoff_gate.Get()};
+            const auto ordinary_model = model_observations.size();
+            const auto tail = record_ordinary();
+            check_pending(tail);
+            const auto& old_slot = native::bridge.ring[tail % native::kBridgeRing];
+            const auto* old_allocator = old_slot.allocator;
+            const auto* old_list = old_slot.list;
+            const auto old_recording = submission::RecordingIdentity(old_slot.list);
+            Check(old_slot.value == tail && old_allocator != nullptr && old_list != nullptr
+                      && old_recording.first != 0 && SUCCEEDED(sdk_gpu.queue->Wait(sdk_color_ready12.Get(), ready_value)),
+                "SDK queue records the real interop dependency without dropping the original Bridge recording");
+            const auto before = provider_events();
+            const auto waits = native::bridge_completion_waits;
+            const auto prior_service = native::fg_service::streams.at(sdk_key).submitted;
+            model_stamps = new_sdk_stamps;
+            const auto new_model = model_observations.size();
+            Check(present_sdk(true) == fg::Result::SUBMITTED, "same provider submits an actual SDK group while old Bridge is pending");
+            check_group(new_model, -1);
+            check_pending(tail);
+            const auto& service = native::fg_service::streams.at(sdk_key);
+            Check(service.queue == sdk_gpu.queue.Get() && service.submitted == prior_service + 1
+                      && service.fence->GetCompletedValue() < service.submitted
+                      && sdk_gpu.fence->GetCompletedValue() < sdk_first_read.value
+                      && old_slot.value == tail && old_slot.list == old_list && old_slot.allocator == old_allocator
+                      && submission::RecordingIdentity(old_slot.list) == old_recording
+                      && model_observations[ordinary_model].id != model_observations[new_model].id
+                      && model_observations[ordinary_model + 1].id != model_observations[new_model + 1].id
+                      && provider_events() == before && native::bridge_completion_waits == waits,
+                "real SDK work was enqueued, not yet read; old recording and separate models are retained without a CPU wait");
+            Check(SUCCEEDED(handoff_gate->Signal(1)), "only release the held queue, never signal done");
+            handoff_release.gate = nullptr;
+            const auto first_sdk_pixels = read_sdk();
+            Check(native::bridge.fence_done12->GetCompletedValue() >= tail
+                      && native::bridge.fence_done12->GetCompletedValue() != UINT64_MAX
+                      && Read11(consumer.Get(), 8) == old_bridge_pixels
+                      && first_sdk_pixels == new_sdk_pixels && first_sdk_pixels != old_sdk_pixels,
+                "original SDK first read and ordinary first read see their own complete two-Pass colors");
+            std::cout << "BRIDGE_XEFG_PREQUEUE_HANDOFF phase=same_provider waits=0 old_pending=1 sdk_submitted=1 first_pixels=1 passes=2,2\n";
+          }
+
+          return_to_ordinary();
+          Check(Hooks::Destroy(sdk.handle) == 0, "new cold test starts from a fresh SDK epoch");
+          sdk.registered = false;
+          open_sdk();
+          model_stamps = old_bridge_stamps;
+          (void)warm_ordinary();
+          seed_sdk();
+          {
+            const auto handoff_gate = new_gate();
+            StallRelease handoff_release{.gate = handoff_gate.Get()};
+            provider.old_tail = record_ordinary();
+            check_pending(provider.old_tail);
+            const auto before = provider_events();
+            const auto waits = native::bridge_completion_waits;
+            const auto old_calls = model_calls;
+            const auto& old_slots = native::features.at(stream.Handle()).slots;
+            const std::array old_models{old_slots[0].handle, old_slots[1].handle};
+            const std::array old_parameters{old_slots[0].parameters, old_slots[1].parameters};
+            Check(Hooks::Enable(sdk.handle, 1) == 0 && present_sdk(false) == fg::Result::NOT_SERVED,
+                "timeout leaves independently valid SDK work unserved without replacing the provider");
+            check_pending(provider.old_tail);
+            Check(provider_events() == before && model_calls == old_calls && native::bridge_completion_waits == waits + 1,
+                "exactly one timeout retains all old provider objects without new Init");
+            const auto first_tail = provider.old_tail;
+            provider.old_tail = record_ordinary();
+            Check(provider.old_tail == first_tail + 1, "a later ordinary frame advanced the same outgoing tail");
+            const auto calls_after_ordinary = model_calls;
+            Check(present_sdk(false) == fg::Result::NOT_SERVED, "retry with the same SDK owner and a new tail polls");
+            check_pending(provider.old_tail);
+            Check(provider_events() == before && model_calls == calls_after_ordinary
+                      && native::bridge_completion_waits == waits + 1 && native::direct_api.module == module
+                      && old_slots[0].handle == old_models[0] && old_slots[0].parameters == old_parameters[0]
+                      && old_slots[1].handle == old_models[1] && old_slots[1].parameters == old_parameters[1],
+                "timeout retry never waits again, and retains both exact old handles");
+            Check(SUCCEEDED(handoff_gate->Signal(1)), "release the real timed-out queue");
+            handoff_release.gate = nullptr;
+            WaitForGpu(native::bridge.fence_done12, provider.old_tail);
+            WaitForGpu(sdk_color_ready12.Get(), ready_value);
+            const auto creates = model_created;
+            const auto result = present_sdk(false);
+            started_provider(result, before, creates);
+            Check(native::bridge_completion_waits == waits + 1, "finite completion switches once without another CPU wait");
+            provider.old_tail = 0;
+            wait_sdk();
+            std::cout << "BRIDGE_XEFG_PREQUEUE_HANDOFF phase=cold_timeout waits=1,1,1 old_lifetime=retained retry_tail=advanced initialized=1\n";
+          }
+          return_to_ordinary();
+          native::bridge_force_snippet.store(old_snippet);
+        }
+        Check(native::bridge_timeouts.load() == timeouts_before, "all short gates released before the watchdog");
+        native::RetirePresentStream(&application);
+        host::Dispatch<reshade::addon_event::destroy_swapchain>(&application, false);
+        native::ReleaseBridge();
+        check_debug_messages();
+        std::cout << "PASS case=ordinary-present-prequeue evidence=" << (warp ? "WARP" : "NATIVE_GPU")
+                  << "+MOCK dev=" << dev << " two_actual_first_readers=1 adjacent_pending=1 real_ngx=NOT_TESTED\n";
+        return 0;
+      }
+
+      const auto pending = native::bridge_submitted_value.load() + 1;
+      const auto calls_before = model_observations.size();
+      const auto copies_before = copy_backs;
+      const auto timeouts_before = native::bridge_timeouts.load();
+      ComPtr<ID3D12Fence> gate;
+      Check(SUCCEEDED(native::bridge.device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)))
+                && SUCCEEDED(native::bridge.queue->Wait(gate.Get(), 1)),
+          "ordinary Present stalls only the real private D3D12 queue");
+      StallRelease release{.gate = gate.Get()};
+      const bool delivered = frame();
+      check_group(calls_before, 0);
+      Check(!delivered && native::bridge_submitted_value.load() == pending,
+          "the timed-out ordinary Present recorded both passes without claiming delivery");
+      const auto deadline = GetTickCount64() + 10000;
+      while (native::bridge.fence_out12->GetCompletedValue() < pending && GetTickCount64() < deadline) Sleep(1);
+      const auto input = native::bridge.fence_in12->GetCompletedValue();
+      const auto out = native::bridge.fence_out12->GetCompletedValue();
+      const auto done = native::bridge.fence_done12->GetCompletedValue();
+      Check(gate->GetCompletedValue() == 0 && input == pending && out == pending && done < pending
+                && done != UINT64_MAX && native::bridge_timeouts.load() == timeouts_before + 1,
+          "watchdog rescue is not true completion and has not released the private test gate");
+      const auto consumed = consume();
+      const auto done_before_release = native::bridge.fence_done12->GetCompletedValue();
+      Check(gate->GetCompletedValue() == 0 && done_before_release < pending && done_before_release != UINT64_MAX
+                && consumer_done->GetCompletedValue() == consumer_value
+                && consumed == original && copy_backs == copies_before,
+          "while true done is pending, the healthy first D3D11 reader completes with original pixels and zero NR copybacks");
+      std::cout << "BRIDGE_ORDINARY_PRESENT_WATCHDOG input=" << input << " out=" << out
+                << " done=" << done_before_release << " consumer_done=" << consumer_done->GetCompletedValue()
+                << " gate_held=1 copy_backs=" << copy_backs - copies_before << " original=1 passes=2\n";
+      Check(SUCCEEDED(gate->Signal(1)), "release the ordinary Present private test gate after proving original consumption");
+      release.gate = nullptr;
+      WaitForGpu(native::bridge.fence_done12, pending);
+      Check(consume() == original && copy_backs == copies_before,
+          "late private completion never writes the rejected ordinary Present result");
+      const auto recovery_begin = model_observations.size();
+      Check(frame(), "the first legal ordinary Present recovers after actual private completion");
+      check_group(recovery_begin, 1);
+      Check(copy_backs == copies_before + 1 && consume() == healthy_pixels,
+          "the first recovered dual-Pass group delivers exactly once to the real first reader");
+      const auto recovered_begin = model_observations.size();
+      Check(frame(), "the next ordinary Present continues without replaying the failed group");
+      check_group(recovered_begin, 0);
+      Check(copy_backs == copies_before + 2 && consume() == healthy_pixels,
+          "the next healthy dual-Pass group consumes current pixels with Reset cleared");
+      std::cout << "BRIDGE_ORDINARY_PRESENT_RECOVERY first_reset=1,1 next_reset=0,0 copies=1,1 passes=2,2\n";
+      native::RetirePresentStream(&application);
+      host::Dispatch<reshade::addon_event::destroy_swapchain>(&application, false);
+      native::ReleaseBridge();
+      check_debug_messages();
+      std::cout << "PASS case=ordinary-present-watchdog evidence=" << (warp ? "WARP" : "NATIVE_GPU")
+                << "+MOCK dev=" << dev << " contract=strict_pair async_pending_next_frame=NOT_APPLICABLE\n";
+      return 0;
+    }
     if (ordinary_watchdog || edit_reuse_production) {
       native::d3d11_swapchain_seen.store(true);
       native::dx11_route.store(native::kDx11RouteNative);
@@ -2240,40 +3189,110 @@ int main(int argc, char** argv) {
           seed_backbuffer();
           const auto calls_before = model_calls;
           const auto timeouts_before = native::bridge_timeouts.load();
-          const auto next_submit = native::bridge_submitted_value.load() + 1;
+          static ID3D12CommandQueue* expected_queue = nullptr;
+          static ID3D12Fence* expected_done = nullptr;
+          static uint64_t expected_value = 0;
+          expected_queue = native::bridge.queue;
+          expected_done = native::bridge.fence_done12;
+          expected_value = native::bridge_submitted_value.load() + 1;
           ComPtr<ID3D12Fence> gate;
           Check(SUCCEEDED(native::bridge.device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)))
-                    && SUCCEEDED(native::bridge.queue->Wait(gate.Get(), 1)),
-              "hold real GPU completion after the ordinary model has recorded");
-          bool saw_submit = false;
-          HRESULT gate_result = E_FAIL;
-          int32_t enable_result = -1;
-          std::jthread enable_after_recording([&] {
-            const auto deadline = GetTickCount64() + 350;
-            while (native::bridge_submitted_value.load(std::memory_order_acquire) < next_submit
-                   && GetTickCount64() < deadline) {
-              Sleep(1);
-            }
-            saw_submit = native::bridge_submitted_value.load(std::memory_order_acquire) == next_submit
-                && native::bridge.fence_done12->GetCompletedValue() < next_submit;
-            if (saw_submit) {
-              enable_result = Hooks::Enable(receipt_cleanup.handle, 1);
-            }
-            gate_result = gate->Signal(1);
-          });
-          delivered = run_ordinary(initial);
-          enable_after_recording.join();
-          Check(saw_submit && enable_result == 0 && SUCCEEDED(gate_result)
-                    && model_calls == calls_before + 1 && native::bridge_submitted_value.load() == next_submit
-                    && native::bridge_timeouts.load() == timeouts_before,
-              "the public On declaration is accepted after real ordinary model submission, before GPU done");
-          WaitForGpu(native::bridge.fence_done12, next_submit);
+                    && SUCCEEDED(expected_queue->Wait(gate.Get(), 1)),
+              "hold real GPU completion while testing the last ordinary write permission");
+          StallRelease release_gate{.gate = gate.Get()};
+          const auto close_event = [](void* value) { if (value != nullptr) { CloseHandle(value); } };
+          std::unique_ptr<void, decltype(close_event)> submitted(CreateEventW(nullptr, TRUE, FALSE, nullptr), close_event);
+          std::unique_ptr<void, decltype(close_event)> revoked(CreateEventW(nullptr, TRUE, FALSE, nullptr), close_event);
+          Check(submitted != nullptr && revoked != nullptr, "the real submission and public revocation have separate acknowledgments");
+          static HANDLE submitted_event = nullptr;
+          static HANDLE revoked_event = nullptr;
+          static bool acknowledged_revocation = false;
+          submitted_event = submitted.get();
+          revoked_event = revoked.get();
+          acknowledged_revocation = false;
+          using SignalQueue = HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
+          static SignalQueue original_signal = nullptr;
+          {
+            renodx::utils::vtable::Slot<SignalQueue> signal_slot{
+                .object = expected_queue, .index = 14, .original = &original_signal,
+                .replacement = [](ID3D12CommandQueue* queue, ID3D12Fence* fence, UINT64 value) -> HRESULT {
+                  const auto hr = original_signal(queue, fence, value);
+                  if (SUCCEEDED(hr) && queue == expected_queue && fence == expected_done && value == expected_value) {
+                    // The private work is now genuinely submitted. Hold only this test's call before it returns
+                    // to the native immediate context's final ownership check; GPU completion alone cannot do that.
+                    acknowledged_revocation = SetEvent(submitted_event)
+                        && WaitForSingleObject(revoked_event, 350) == WAIT_OBJECT_0;
+                  }
+                  return hr;
+                }};
+            renodx::utils::vtable::Install(&signal_slot);
+            const auto restore_signal = [](auto* slot) { renodx::utils::vtable::Uninstall(slot); };
+            std::unique_ptr<decltype(signal_slot), decltype(restore_signal)> observed(&signal_slot, restore_signal);
+            bool saw_pending = false;
+            HRESULT gate_result = E_FAIL;
+            int32_t enable_result = -1;
+            std::jthread enable_after_submission([&] {
+              const auto status = WaitForSingleObject(submitted.get(), 350);
+              const auto done = expected_done->GetCompletedValue();
+              saw_pending = status == WAIT_OBJECT_0 && done != UINT64_MAX && done < expected_value;
+              if (saw_pending) {
+                enable_result = Hooks::Enable(receipt_cleanup.handle, 1);
+              }
+              SetEvent(revoked.get());
+              gate_result = gate->Signal(1);
+            });
+            delivered = run_ordinary(initial);
+            enable_after_submission.join();
+            Check(acknowledged_revocation && saw_pending && enable_result == 0 && SUCCEEDED(gate_result)
+                      && model_calls == calls_before + 1 && native::bridge_submitted_value.load() == expected_value
+                      && native::bridge_timeouts.load() == timeouts_before,
+                "public On has revoked permission after actual submission and before copy recording while real GPU work was pending");
+          }
+          release_gate.gate = nullptr;
+          WaitForGpu(expected_done, expected_value);
           Check(!query().allowed && !delivered && Read11(target_buffer, 8) == original,
-              "a completed Bridge submission cannot change DX11 pixels after its matching access was revoked");
+              "a completed Bridge submission cannot change DX11 pixels after its matching access was revoked before recording");
           Check(Hooks::Enable(receipt_cleanup.handle, 0) == 0 && query().allowed,
               "a new successful Off declaration restores ordinary access");
           Check(run_ordinary(query()) && Read11(target_buffer, 8) != original,
               "the fresh Off access restores actual ordinary color delivery");
+
+          seed_backbuffer();
+          const auto still_current = query();
+          const auto recorded_value = native::bridge_submitted_value.load() + 1;
+          ComPtr<ID3D12Fence> recorded_gate;
+          Check(SUCCEEDED(native::bridge.device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&recorded_gate)))
+                    && SUCCEEDED(expected_queue->Wait(recorded_gate.Get(), 1)),
+              "hold a separately authorized group's actual private GPU work");
+          StallRelease release_recorded{.gate = recorded_gate.Get()};
+          std::jthread release_at_deadline([recorded_gate](std::stop_token stop) {
+            const auto deadline = GetTickCount64() + 350;
+            while (!stop.stop_requested() && GetTickCount64() < deadline) Sleep(1);
+            if (!stop.stop_requested()) { recorded_gate->Signal(1); }
+          });
+          const bool recorded = run_ordinary(still_current);
+          const auto done_before_on = expected_done->GetCompletedValue();
+          const auto enabled = Hooks::Enable(receipt_cleanup.handle, 1);
+          const auto done_after_on = expected_done->GetCompletedValue();
+          const bool pending_on = recorded_gate->GetCompletedValue() == 0
+              && done_before_on != UINT64_MAX && done_before_on < recorded_value
+              && done_after_on != UINT64_MAX && done_after_on < recorded_value;
+          const bool stale_recorded = run_ordinary(still_current);
+          const auto release_status = recorded_gate->Signal(1);
+          release_recorded.gate = nullptr;
+          release_at_deadline.request_stop();
+          release_at_deadline.join();
+          Check(recorded && pending_on && enabled == 0 && !query().allowed
+                    && !stale_recorded && native::bridge_submitted_value.load() == recorded_value
+                    && SUCCEEDED(release_status),
+              "On after a legal Wait and copy recording revokes future attempts without changing pending GPU completion");
+          WaitForGpu(expected_done, recorded_value);
+          Check(Read11(target_buffer, 8) != original,
+              "the originally authorized copy still reaches the original DX11 pixels after a later On");
+          Check(Hooks::Enable(receipt_cleanup.handle, 0) == 0 && query().allowed,
+              "the test restores the actual Off state");
+          std::cout << "BRIDGE_ORDINARY_COMMIT_ORDER revoked_before_record=1 unchanged=1"
+                    << " revoked_after_record=1 prior_copy=1 stale_retry=0 fresh_off=1\n";
           native::RetirePresentStream(&ordinary_stream_key);
           receipt_adapter::prepare_runtime.store(saved_prepare);
           receipt_adapter::retire.store(saved_retire);

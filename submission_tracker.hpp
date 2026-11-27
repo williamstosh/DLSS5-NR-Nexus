@@ -125,6 +125,7 @@ struct RecordingStatus {
   // Protected by tracker_mutex. Survives pruning as positive evidence for
   // objects whose last recording is no longer in live_uses.
   bool completed_healthy = false;
+  size_t completed_submission_count = 0;
   std::vector<const void*> completed_uses;
 };
 
@@ -569,6 +570,7 @@ inline size_t PruneCompletedGenerations(
         }
         if (healthy) {
           generation.status->completed_healthy = true;
+          generation.status->completed_submission_count = generation.submissions.size();
         }
       }
       for (const void* use : generation.uses) {
@@ -921,12 +923,22 @@ inline bool OutputWriteOrdered(const OutputUse& output,
 //                  reservation (still recording, parked inside a submit, or
 //                  submitted without a proof): nothing can be ordered after
 //                  it yet.
-enum class UseSubmission : uint8_t { kComplete, kTokens, kUnsubmitted };
+//   kRetiredOnce - the specified recording carried this use and its single
+//                  submission completed healthily before being pruned.
+enum class UseSubmission : uint8_t { kComplete, kTokens, kUnsubmitted, kRetiredOnce };
 inline UseSubmission UseSubmissionTokens(
-    const void* use, std::vector<std::pair<FenceRef, uint64_t>>* tokens) {
+    const void* use, std::vector<std::pair<FenceRef, uint64_t>>* tokens,
+    const RecordingStatus* recording = nullptr) {
   tokens->clear();
   std::lock_guard<std::mutex> lock(tracker_mutex);
-  if (live_uses.find(use) == live_uses.end()) return UseSubmission::kComplete;
+  const auto no_live_use = [recording, use] {
+    if (recording != nullptr && recording->completed_healthy && recording->completed_submission_count == 1
+        && std::ranges::find(recording->completed_uses, use) != recording->completed_uses.end()) {
+      return UseSubmission::kRetiredOnce;
+    }
+    return UseSubmission::kComplete;
+  };
+  if (live_uses.find(use) == live_uses.end()) return no_live_use();
   for (const auto& [key, state] : tracked_lists) {
     for (const auto& [id, generation] : state.generations) {
       bool carries = false;
@@ -942,7 +954,7 @@ inline UseSubmission UseSubmissionTokens(
       }
     }
   }
-  return tokens->empty() ? UseSubmission::kComplete : UseSubmission::kTokens;
+  return (tokens->empty() ? no_live_use() : UseSubmission::kTokens);
 }
 
 // Telemetry snapshot of the bookkeeping itself (never a lifetime decision):

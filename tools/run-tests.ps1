@@ -20,7 +20,7 @@ param(
     [string]$NativeNgxSdkLibraryDirectory,
     [string]$NativeNgxRuntimePath = $(if ($env:NR_NEXUS_NGX_RUNTIME_DIR) { Join-Path $env:NR_NEXUS_NGX_RUNTIME_DIR 'nvngx_dlssnr.dll' }),
     [string]$NativeNgxSrRuntimePath,
-    [ValidateSet('dlaa','sr','stage-resolution','same-stage-resolution','render-stage-resolution','present-stage-resolution','ordinary-watchdog','edit-reuse-production','adaptive','adaptive-hardware','adaptive-native-ngx','adaptive-native-snippet')][string[]]$BridgeCase = @(),
+    [ValidateSet('dlaa','sr','stage-resolution','same-stage-resolution','render-stage-resolution','present-stage-resolution','ordinary-watchdog','ordinary-present-watchdog','ordinary-present-prequeue','edit-reuse-production','adaptive','adaptive-hardware','adaptive-native-ngx','adaptive-native-snippet')][string[]]$BridgeCase = @(),
     [switch]$BuildOnly,
     [ValidateSet('Standard','Full','Acceptance')][string]$RetentionMode = $(if ($env:NR_NEXUS_TEST_RETENTION) { $env:NR_NEXUS_TEST_RETENTION } else { 'Standard' }),
     [switch]$SoftwareOnly
@@ -242,6 +242,25 @@ foreach ($item in $Suite) {
     if ($explicitMode) { $executableHash = (Get-FileHash -LiteralPath $exe).Hash }
     $dependencyFile = Join-Path $directory 'dependencies.json'
     $inputPaths = @((Join-Path $testRoot "$name.cpp"), $PSCommandPath)
+    $providerFixture = $null
+    if ($item -eq 'bridge-motion' -and $BridgeCase -contains 'ordinary-present-prequeue') {
+        # Separate real loader identity for the two mocked model Providers.
+        # Its name is intentionally not a vendor runtime discovery name.
+        $fixtureSource = Join-Path $testRoot 'native_runtime_fixture.cpp'
+        $providerFixture = Join-Path $directory 'nexus-test-runtime-image.dll'
+        $fixtureObject = Join-Path $directory 'nexus-test-runtime-image.obj'
+        $fixtureDependencies = Join-Path $directory 'nexus-test-runtime-image.dependencies.json'
+        Register-TestCompilerOutput $directory -ObjectPath $fixtureObject -ExecutablePath $providerFixture
+        Register-TestDisposable -Directory $directory -Path $providerFixture -Kind 'synthetic-runtime-image'
+        $fixtureArguments = $common + @('/LD', $fixtureSource, "/Fo$fixtureObject", "/Fe$providerFixture",
+            '/sourceDependencies', $fixtureDependencies, '/link', '/INCREMENTAL:NO',
+            'd3d12.lib', 'dxgi.lib', 'dxguid.lib', 'uuid.lib')
+        & $compiler @fixtureArguments *> (Join-Path $directory 'nexus-test-runtime-image.compile.log')
+        if ($LASTEXITCODE -ne 0) { throw "Compile/link failed: $providerFixture" }
+        $providerFixtureHash = (Get-FileHash -LiteralPath $providerFixture).Hash
+        $inputPaths += $fixtureSource
+        $inputPaths += @((Get-Content -LiteralPath $fixtureDependencies -Raw | ConvertFrom-Json).Data.Includes)
+    }
     if ($explicitMode) {
         $inputPaths += @((Join-Path $repositoryRoot 'host/lock.json'), (Join-Path $repositoryRoot 'host/tools.lock.json'),
             (Join-Path $PSScriptRoot 'check-release-experiment-parity.ps1'), (Join-Path $testRoot 'test-support.ps1'))
@@ -483,6 +502,12 @@ foreach ($item in $Suite) {
         }
     }
     if ($item -in $dependencyCheckedSuites) { $result.dependency_policy = 'passed' }
+    if ($providerFixture) {
+        if ((Get-FileHash -LiteralPath $providerFixture).Hash -cne $providerFixtureHash) {
+            throw "Test fixture DLL changed: $providerFixture"
+        }
+        $result['providerFixture'] = @{ name = [IO.Path]::GetFileName($providerFixture); sha256 = $providerFixtureHash }
+    }
     if ($skipVulkanRun) { $result.skip_reason = 'software_only_native_gpu_required' }
     $result | ConvertTo-Json -Depth 9 | Set-Content -LiteralPath "$directory/result.json" -Encoding utf8
     if (-not $BuildOnly) { Complete-TestOutput $directory }
