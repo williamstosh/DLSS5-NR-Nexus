@@ -8,10 +8,12 @@ from pathlib import Path
 import struct
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from project_temp import project_temporary_directory
 
 
 SPEC = importlib.util.spec_from_file_location('dev_control', Path(__file__).resolve().parents[1] / 'tools/dev_control.py')
@@ -445,7 +447,7 @@ class JournalCliTests(unittest.TestCase):
             return original_client(pid, created, transport=transport,
                                    identity_probe=lambda _: '123', **kwargs)
 
-        with tempfile.TemporaryDirectory() as directory:
+        with project_temporary_directory() as directory:
             path = Path(directory) / 'journal.jsonl'
             argv = ['dev_control.py', '--pid', '42', '--process-created', '123',
                     '--timeout', '.05', '--journal', str(path), 'status']

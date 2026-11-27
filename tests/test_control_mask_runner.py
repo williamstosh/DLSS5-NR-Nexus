@@ -3,8 +3,10 @@ import importlib.util
 from pathlib import Path
 import subprocess
 import sys
-import tempfile
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from project_temp import project_temporary_directory
 from unittest.mock import patch
 
 OFFLINE = Path(__file__).resolve().parents[1] / "tools" / "offline"
@@ -19,7 +21,7 @@ spec.loader.exec_module(runner)
 
 class OfflineRunnerTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = project_temporary_directory()
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
         self.fixture = mask.validate_fixture({"schema": mask.FIXTURE_SCHEMA, "fixture_id": "runner-unit",

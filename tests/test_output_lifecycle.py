@@ -2,8 +2,10 @@ import json
 from pathlib import Path
 import sys
 import subprocess
-import tempfile
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from project_temp import project_temporary_directory
 from unittest.mock import patch
 
 
@@ -29,7 +31,7 @@ class OutputLifecycleTests(unittest.TestCase):
             process.wait(timeout=5)
 
     def test_tree_bytes_counts_files_and_markers(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with project_temporary_directory() as temp:
             root = Path(temp) / "tree"
             root.mkdir()
             nested = root / "nested"
@@ -42,7 +44,7 @@ class OutputLifecycleTests(unittest.TestCase):
             self.assertEqual(output_lifecycle._tree_bytes(root), 5 + len(b"excluded marker"))
 
     def test_tree_bytes_skips_directory_symlinks(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with project_temporary_directory() as temp:
             root = Path(temp) / "tree"
             root.mkdir()
             external = Path(temp) / "external"
@@ -57,7 +59,7 @@ class OutputLifecycleTests(unittest.TestCase):
 
     def test_every_retention_mode_cleans_registered_raw_data(self):
         for mode in ("Standard", "Full", "Acceptance"):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+            with self.subTest(mode=mode), project_temporary_directory() as temp:
                 previous_mode = output_lifecycle.os.environ.get("NR_NEXUS_TEST_RETENTION")
                 output_lifecycle.os.environ["NR_NEXUS_TEST_RETENTION"] = mode
                 try:
@@ -77,7 +79,7 @@ class OutputLifecycleTests(unittest.TestCase):
                         output_lifecycle.os.environ["NR_NEXUS_TEST_RETENTION"] = previous_mode
 
     def test_maintenance_protects_active_and_cleans_orphaned_runs(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with project_temporary_directory() as temp:
             root = Path(temp)
             active = root / "active"
             output_lifecycle.initialize(active)
@@ -111,7 +113,7 @@ class OutputLifecycleTests(unittest.TestCase):
             self.assertTrue(child_raw.exists())
 
     def test_explicit_raw_retention_keeps_registered_data(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with project_temporary_directory() as temp:
             root = Path(temp)
             with patch.dict(output_lifecycle.os.environ, {"NR_NEXUS_TEST_KEEP_RAW": "1",
                                                         "NR_NEXUS_TEST_RETENTION": "Acceptance"}):
@@ -126,7 +128,7 @@ class OutputLifecycleTests(unittest.TestCase):
     def test_budget_compacts_bulk_in_every_mode_and_protects_evidence(self):
         for mode in ("Standard", "Full", "Acceptance"):
             for status in ("Passed", "Failed"):
-                with self.subTest(mode=mode, status=status), tempfile.TemporaryDirectory() as temp:
+                with self.subTest(mode=mode, status=status), project_temporary_directory() as temp:
                     root = Path(temp)
                     with patch.dict(output_lifecycle.os.environ, {"NR_NEXUS_TEST_RETENTION": mode}):
                         run = root / "ended"
@@ -157,7 +159,7 @@ class OutputLifecycleTests(unittest.TestCase):
                     self.assertEqual(output_lifecycle._read(run)["status"], status)
 
     def test_budget_protects_active_descendants_pins_and_build_inputs(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with project_temporary_directory() as temp:
             root = Path(temp)
             parent = root / "parent"
             output_lifecycle.initialize(parent)
@@ -191,7 +193,7 @@ class OutputLifecycleTests(unittest.TestCase):
             self.assertEqual(output_lifecycle._read(child)["status"], "Running")
 
     def test_budget_keeps_failure_capture_with_shared_atlas(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with project_temporary_directory() as temp:
             root = Path(temp)
             run = root / "ui"
             output_lifecycle.initialize(run)
@@ -213,7 +215,7 @@ class OutputLifecycleTests(unittest.TestCase):
 
     def test_workspace_orphan_cleanup_does_not_require_a_capacity_limit(self):
         for limit in ('0', '100000'):
-            with self.subTest(limit=limit), tempfile.TemporaryDirectory() as temp:
+            with self.subTest(limit=limit), project_temporary_directory() as temp:
                 root = Path(temp)
                 run = root / 'artifacts/run'
                 output_lifecycle.initialize(run)
@@ -229,7 +231,7 @@ class OutputLifecycleTests(unittest.TestCase):
                 self.assertEqual(output_lifecycle._read(run)['status'], 'Failed')
 
     def test_maintenance_does_not_follow_a_directory_link_cycle(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with project_temporary_directory() as temp:
             root = Path(temp)
             cycle = root / 'cycle'
             if output_lifecycle.os.name == 'nt':
@@ -257,7 +259,7 @@ class OutputLifecycleTests(unittest.TestCase):
                     cycle.unlink()
 
     def test_workspace_budget_is_shared_across_tmp_and_artifacts(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with project_temporary_directory() as temp:
             root = Path(temp)
             for name in ('tmp', 'artifacts'):
                 run = root / name / 'run'

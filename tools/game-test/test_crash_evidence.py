@@ -1,11 +1,14 @@
 """Offline evidence tests; all inputs are synthetic."""
 import json
 import os
-import tempfile
+import sys
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
+from project_temp import project_temporary_directory
 
 import crash_evidence
 
@@ -27,7 +30,7 @@ class CrashEvidenceTests(unittest.TestCase):
         self.assertEqual(crash_evidence.owned_process_dumps([copied], None), [])
 
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = project_temporary_directory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.install = self.root / 'install'

@@ -4,8 +4,10 @@ from pathlib import Path
 import struct
 import sys
 import subprocess
-import tempfile
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from project_temp import project_temporary_directory
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "offline"))
 import contracts as c
@@ -107,7 +109,7 @@ class OfflineContractsTests(unittest.TestCase):
             c.compare_raw(b"a", b"aa", "u8")
 
     def test_sequence_is_reproducible_and_explicit(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with project_temporary_directory() as tmp:
             a = c.prepare_sequence(Path(tmp) / "a", 3, 2, 2, 7)
             b = c.prepare_sequence(Path(tmp) / "b", 3, 2, 2, 7)
             self.assertEqual(a, b)
@@ -124,7 +126,7 @@ class OfflineContractsTests(unittest.TestCase):
                 c.prepare_sequence(Path(tmp) / "a", 3, 2, 2)
 
     def test_resized_sequence_subrect_bounds_and_format_identity(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with project_temporary_directory() as tmp:
             directory = Path(tmp) / "resize"
             manifest = c.prepare_sequence(directory, 4, 3, 4, seed=2,
                 resolutions=[(4, 3), (6, 4), (6, 4), (2, 1)],
@@ -148,7 +150,7 @@ class OfflineContractsTests(unittest.TestCase):
             c.compare_raw(bad, bad, "f32le")
 
     def test_sequence_tamper_and_path_escape(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with project_temporary_directory() as tmp:
             directory = Path(tmp) / "sequence"
             manifest = c.prepare_sequence(directory, 2, 2, 1)
             path = directory / manifest["frames"][0]["resources"]["depth"]["file"]
@@ -160,14 +162,14 @@ class OfflineContractsTests(unittest.TestCase):
                     c.artifact_path(directory, name)
 
     def test_sequence_budget_before_writes(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with project_temporary_directory() as tmp:
             target = Path(tmp) / "large"
             with self.assertRaises(c.ContractError):
                 c.prepare_sequence(target, 8192, 8192, 2)
             self.assertFalse(target.exists())
 
     def test_json_duplicate_keys_nan_and_no_clobber(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with project_temporary_directory() as tmp:
             path = Path(tmp) / "fixture.json"
             path.write_text('{"a": 1, "a": 2}')
             with self.assertRaises(c.ContractError):

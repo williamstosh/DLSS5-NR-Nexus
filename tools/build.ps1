@@ -10,14 +10,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $taskRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'project-paths.ps1')
+$taskBuild = Resolve-NexusBuildDirectory -Root $taskRoot -Path $BuildDirectory -DevControl:$DevControl
 & (Join-Path $PSScriptRoot 'check-version.ps1') | Format-List
 & (Join-Path $PSScriptRoot 'check-branding.ps1')
 $taskSource = (Resolve-Path -LiteralPath $RenodxRoot).Path
+# The host is not read-only: nmake writes next to its Detours sources.
+$taskDetours = Resolve-NexusProjectPath -Root $taskRoot -Path (Join-Path $taskSource 'external/Detours/src')
 $taskTools = (Resolve-Path -LiteralPath $ToolRoot).Path
-$taskBuild = if ($BuildDirectory) { [IO.Path]::GetFullPath($BuildDirectory) } else { Join-Path $taskRoot 'build' }
-if ($DevControl -and (-not $BuildDirectory -or $taskBuild.TrimEnd('\','/') -ieq (Join-Path $taskRoot 'build').TrimEnd('\','/'))) {
-    throw 'Development control requires an explicit separate -BuildDirectory.'
-}
 $taskAddon = Join-Path $taskSource 'src/addons/dlss5'
 $taskLock = Get-Content -LiteralPath (Join-Path $taskRoot 'host/lock.json') -Raw | ConvertFrom-Json
 if ((& git --no-optional-locks -C $taskSource rev-parse HEAD) -cne $taskLock.host.commit) {
@@ -53,30 +53,40 @@ $taskVsRoot = & $taskVsWhere -latest -products '*' -requires Microsoft.VisualStu
 if ($LASTEXITCODE -ne 0 -or -not $taskVsRoot) { throw 'Visual Studio 2022 C++ BuildTools are required.' }
 $taskCmake = Join-Path $taskVsRoot 'Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe'
 $taskVcVars = Join-Path $taskVsRoot 'VC/Auxiliary/Build/vcvarsall.bat'
-# The host CMake target only tracks detours.cpp; rebuild the small static library
-# from all pinned inputs so an old generated include/library cannot be reused.
-Push-Location -LiteralPath (Join-Path $taskSource 'external/Detours/src')
+$taskTmp = Resolve-NexusBuildTemp -Root $taskRoot -Preferred $env:TMPDIR
+[void][IO.Directory]::CreateDirectory($taskTmp)
+$taskOldTemp = @($env:TEMP, $env:TMP, $env:TMPDIR)
 try {
-    & $env:ComSpec /d /c "call `"$taskVcVars`" amd64 10.0.26100.0 -vcvars_ver=14.44 >nul && nmake /nologo /A ARCH=X64"
-    if ($LASTEXITCODE -ne 0) { throw "Pinned Detours rebuild failed: $LASTEXITCODE" }
+    $env:TEMP = $env:TMP = $env:TMPDIR = $taskTmp
+    # The host CMake target only tracks detours.cpp; rebuild the small static library
+    # from all pinned inputs so an old generated include/library cannot be reused.
+    Push-Location -LiteralPath $taskDetours
+    try {
+        & $env:ComSpec /d /c "call `"$taskVcVars`" amd64 10.0.26100.0 -vcvars_ver=14.44 >nul && nmake /nologo /A ARCH=X64"
+        if ($LASTEXITCODE -ne 0) { throw "Pinned Detours rebuild failed: $LASTEXITCODE" }
+    } finally {
+        Pop-Location
+    }
+    $taskArguments = @(
+        '-S', $taskSource, '-B', $taskBuild, '-G', 'Visual Studio 17 2022', '-A', 'x64',
+        ('-DCMAKE_PROJECT_renodx_INCLUDE=' + (Join-Path $taskRoot 'cmake/nexus-version.cmake')),
+        ('-DRENODX_SHADER_SOURCE_ROOT_dlss5:PATH=' + (Join-Path $taskRoot 'shaders')),
+        ('-DFXC_BIN=' + (Join-Path $taskTools 'fxc.exe')),
+        ('-DDXC_BIN=' + (Join-Path $taskTools 'dxc.exe')),
+        ('-DSLANGC_BIN=' + (Join-Path $taskTools 'slangc.exe')),
+        '-DRENODX_BUILD_TESTS=OFF',
+        ('-DNR_NEXUS_IME_DIAGNOSTICS=' + $(if ($ImeDiagnostics) { 'ON' } else { 'OFF' })),
+        ('-DNR_NEXUS_DEV_CONTROL=' + $(if ($DevControl) { 'ON' } else { 'OFF' })),
+        '-DCMAKE_SYSTEM_VERSION=10.0.26100.0',
+        '-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /W3 /GR /EHsc /utf-8',
+        '-DCMAKE_MODULE_LINKER_FLAGS=/DELAYLOAD:winhttp.dll'
+    )
+    & $taskCmake @taskArguments
+    if ($LASTEXITCODE -ne 0) { throw "CMake configure failed: $LASTEXITCODE" }
+    & $taskCmake --build $taskBuild --config $Configuration --target dlss5 --parallel 2
+    if ($LASTEXITCODE -ne 0) { throw "dlss5 build failed: $LASTEXITCODE" }
 } finally {
-    Pop-Location
+    $env:TEMP = $taskOldTemp[0]
+    $env:TMP = $taskOldTemp[1]
+    $env:TMPDIR = $taskOldTemp[2]
 }
-$taskArguments = @(
-    '-S', $taskSource, '-B', $taskBuild, '-G', 'Visual Studio 17 2022', '-A', 'x64',
-    ('-DCMAKE_PROJECT_renodx_INCLUDE=' + (Join-Path $taskRoot 'cmake/nexus-version.cmake')),
-    ('-DRENODX_SHADER_SOURCE_ROOT_dlss5:PATH=' + (Join-Path $taskRoot 'shaders')),
-    ('-DFXC_BIN=' + (Join-Path $taskTools 'fxc.exe')),
-    ('-DDXC_BIN=' + (Join-Path $taskTools 'dxc.exe')),
-    ('-DSLANGC_BIN=' + (Join-Path $taskTools 'slangc.exe')),
-    '-DRENODX_BUILD_TESTS=OFF',
-    ('-DNR_NEXUS_IME_DIAGNOSTICS=' + $(if ($ImeDiagnostics) { 'ON' } else { 'OFF' })),
-    ('-DNR_NEXUS_DEV_CONTROL=' + $(if ($DevControl) { 'ON' } else { 'OFF' })),
-    '-DCMAKE_SYSTEM_VERSION=10.0.26100.0',
-    '-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /W3 /GR /EHsc /utf-8',
-    '-DCMAKE_MODULE_LINKER_FLAGS=/DELAYLOAD:winhttp.dll'
-)
-& $taskCmake @taskArguments
-if ($LASTEXITCODE -ne 0) { throw "CMake configure failed: $LASTEXITCODE" }
-& $taskCmake --build $taskBuild --config $Configuration --target dlss5 --parallel 2
-if ($LASTEXITCODE -ne 0) { throw "dlss5 build failed: $LASTEXITCODE" }

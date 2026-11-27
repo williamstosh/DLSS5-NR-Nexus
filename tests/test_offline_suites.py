@@ -1,8 +1,11 @@
 import importlib.util
 import json
 from pathlib import Path
-import tempfile
+import sys
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from project_temp import project_temporary_directory
 from unittest.mock import patch
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "tools" / "offline" / "suites.py"
@@ -17,7 +20,7 @@ def fixture(*cases):
 
 class OfflineSuitesFixtureTests(unittest.TestCase):
     def test_source_identity_preflight_failure_does_not_leave_output_directory(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with project_temporary_directory() as temp:
             root = Path(temp)
             (root / "tmp").mkdir()
             fixture_path = root / "fixture.json"
@@ -82,7 +85,7 @@ class OfflineSuitesFixtureTests(unittest.TestCase):
             {"id": "xefg", "suite": "fg-xefg", "case": "resource-lifecycle"},
             {"id": "lifecycle", "suite": "lifecycle", "case": "dll-lifecycle"},
         ))
-        with tempfile.TemporaryDirectory() as temp:
+        with project_temporary_directory() as temp:
             output = Path(temp)
             run_output = output / suites.RUN_OUTPUT_NAME
             for directory in ("fg-native", "fg-xefg"):
@@ -123,7 +126,7 @@ class OfflineSuitesFixtureTests(unittest.TestCase):
             def poll(self):
                 return self.returncode
 
-        with tempfile.TemporaryDirectory() as temp:
+        with project_temporary_directory() as temp:
             root = Path(temp)
             (root / "tmp").mkdir()
             fixture_path = root / "fixture.json"

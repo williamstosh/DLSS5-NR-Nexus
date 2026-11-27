@@ -3,6 +3,7 @@ param()
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'test-support.ps1')
+& (Join-Path $PSScriptRoot 'run-project-path-tests.ps1')
 Initialize-TestBuild
 $taskNames = @('PATH','INCLUDE','LIB','LIBPATH','VCToolsInstallDir','WindowsSDKVersion')
 $taskInitial = @{}

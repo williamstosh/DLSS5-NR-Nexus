@@ -1,6 +1,9 @@
 from pathlib import Path
-import tempfile
+import sys
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
+from project_temp import project_temporary_directory
 
 from temporary_mod import TemporaryScriptMod
 
@@ -13,7 +16,7 @@ class TemporaryScriptModTests(unittest.TestCase):
         return source.parents[2]
 
     def test_new_mod_is_removed_after_hash_verified_cleanup(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with project_temporary_directory() as directory:
             root = Path(directory)
             game = root / "game"
             game.mkdir()
@@ -26,7 +29,7 @@ class TemporaryScriptModTests(unittest.TestCase):
             self.assertFalse((game / "Mods").exists())
 
     def test_existing_identical_mod_is_used_but_not_removed(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with project_temporary_directory() as directory:
             root = Path(directory)
             game = root / "game"
             source = self.make_mod(root)
@@ -40,7 +43,7 @@ class TemporaryScriptModTests(unittest.TestCase):
             self.assertTrue((target / "Bridge.ws").is_file())
 
     def test_conflicting_mod_is_never_overwritten(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with project_temporary_directory() as directory:
             root = Path(directory)
             game = root / "game"
             source = self.make_mod(root)
@@ -53,7 +56,7 @@ class TemporaryScriptModTests(unittest.TestCase):
             self.assertEqual((target / "other.ws").read_text(encoding="utf-8"), "user file")
 
     def test_modified_or_unexpected_files_are_preserved_for_recovery(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with project_temporary_directory() as directory:
             root = Path(directory)
             game = root / "game"
             game.mkdir()

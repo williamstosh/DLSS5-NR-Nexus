@@ -273,7 +273,8 @@ function Initialize-TestOutput {
     param([string]$Path, [ValidateSet('Standard','Full','Acceptance')][string]$RetentionMode = $(if ($env:NR_NEXUS_TEST_RETENTION) { $env:NR_NEXUS_TEST_RETENTION } else { 'Standard' }))
     $RetentionMode = @('Standard','Full','Acceptance') | Where-Object { $_ -ieq $RetentionMode } | Select-Object -First 1
     $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-    $resolved = [IO.Path]::GetFullPath($Path)
+    . (Join-Path $root 'tools/project-paths.ps1')
+    $resolved = Resolve-NexusProjectPath -Root $root -Path $Path
     $allowed = @('tmp', 'artifacts') | Where-Object {
         $resolved.StartsWith((Join-Path $root $_) + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
     }

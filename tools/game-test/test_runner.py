@@ -4,12 +4,14 @@ import ctypes
 from ctypes import wintypes
 import json
 from pathlib import Path
-import tempfile
 import sys
 import threading
 import time
 import unittest
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
+from project_temp import project_temporary_directory
 from PIL import Image, ImageDraw
 import runner
 
@@ -17,7 +19,7 @@ import runner
 class DumpTests(unittest.TestCase):
     def setUp(self):
         (runner.ROOT / 'tmp').mkdir(exist_ok=True)
-        self.temp = tempfile.TemporaryDirectory(dir=runner.ROOT / 'tmp')
+        self.temp = project_temporary_directory()
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name) / 'progress.json'
         runner.dump(self.path, {'state': 'old'})
@@ -134,7 +136,7 @@ class DumpTests(unittest.TestCase):
 class MotionPreviewTests(unittest.TestCase):
     def setUp(self):
         (runner.ROOT / 'tmp').mkdir(exist_ok=True)
-        self.temp = tempfile.TemporaryDirectory(dir=runner.ROOT / 'tmp')
+        self.temp = project_temporary_directory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
@@ -197,7 +199,7 @@ class MotionPreviewTests(unittest.TestCase):
 class ExitTests(unittest.TestCase):
     def setUp(self):
         (runner.ROOT / 'tmp').mkdir(exist_ok=True)
-        self.temp = tempfile.TemporaryDirectory(dir=runner.ROOT / 'tmp')
+        self.temp = project_temporary_directory()
         self.addCleanup(self.temp.cleanup)
         self.out = Path(self.temp.name)
         self.session = runner.Session(dict(executable=str(self.out / 'game.exe'), logs=[]), self.out)
@@ -1037,7 +1039,7 @@ class ExitTests(unittest.TestCase):
 class RecoveryTests(unittest.TestCase):
     def setUp(self):
         (runner.ROOT / 'tmp').mkdir(exist_ok=True)
-        self.temp = tempfile.TemporaryDirectory(dir=runner.ROOT / 'tmp')
+        self.temp = project_temporary_directory()
         self.addCleanup(self.temp.cleanup)
         self.out = Path(self.temp.name)
         self.cfg = dict(executable=str(self.out / 'game.exe'), profile=str(self.out), logs=[],
@@ -1200,7 +1202,7 @@ class ScriptBackendTests(unittest.TestCase):
         resolve.assert_not_called()
 
     def test_script_backend_builds_ocr_for_title_and_intro_startup(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with project_temporary_directory() as directory:
             # build-ocr.ps1 creates this directory; the subprocess mock must model that output.
             (Path(directory) / 'ocr-tool').mkdir()
             build = mock.Mock(stdout='fixture-ocr.exe\n')
@@ -1215,7 +1217,7 @@ class ScriptBackendTests(unittest.TestCase):
                       '读 取 游 戏 退 出 游 戏 游 戏 模 组 更 新 亮 点',
                       '读取游戏 设置 游戏模组 制作人员 退出游戏',
                       '重制版v5，01C NR GPU不可用 设置 游戏模组 更新亮点 制作人员 退 出 游 戏 CD PROJEKT RED'):
-            with self.subTest(title=title), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(title=title), project_temporary_directory() as directory:
                 root = Path(directory)
                 session = runner.Session(dict(executable=str(root / 'game.exe'), logs=[],
                                               control_backend='script', startup_timeout=10), root)
@@ -1249,7 +1251,7 @@ class ScriptBackendTests(unittest.TestCase):
                 ('desktop', '设置 游戏模组 更新亮点 制作人员 退出游戏'),
                 ('desktop', '读取游戏 游戏模组 更新亮点 退出游戏'),
                 ('desktop', '读取游戏 游戏模组 制作人员 退出游戏')):
-            with self.subTest(backend=backend, text=text), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(backend=backend, text=text), project_temporary_directory() as directory:
                 root = Path(directory)
                 session = runner.Session(dict(executable=str(root / 'game.exe'), logs=[],
                                               control_backend=backend, startup_timeout=1), root)
@@ -1267,7 +1269,7 @@ class ScriptBackendTests(unittest.TestCase):
                 evidence.assert_not_called()
 
     def test_startup_script_compilation_error_fails_immediately(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with project_temporary_directory() as directory:
             root = Path(directory)
             session = runner.Session(dict(executable=str(root / 'game.exe'), logs=[],
                                           control_backend='script', startup_timeout=120), root)
@@ -1283,7 +1285,7 @@ class ScriptBackendTests(unittest.TestCase):
             event.assert_called_once_with('script_compilation_error', ocr_text=runner.compact(observation['text']))
 
     def test_startup_rebinds_recreated_window_with_same_process_identity(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with project_temporary_directory() as directory:
             root = Path(directory)
             session = runner.Session(dict(executable=str(root / 'game.exe'), logs=[],
                                           control_backend='script'), root)
@@ -1301,7 +1303,7 @@ class ScriptBackendTests(unittest.TestCase):
                                           hwnd=202, pid=123, created=456)
 
     def test_preflight_does_not_build_startup_ocr(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with project_temporary_directory() as directory:
             root = Path(directory)
             target = dict(executable=str(root / 'game.exe'), control_backend='script')
             with mock.patch.object(runner.sys, 'argv', ['runner.py', '--scenario', 'menu',
@@ -1318,7 +1320,7 @@ class ScriptBackendTests(unittest.TestCase):
             self.assertIsNone(cfg['ocr_executable'])
 
     def test_script_backend_rejects_desktop_observation_and_input(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with project_temporary_directory() as directory:
             session = runner.Session(dict(executable=str(Path(directory) / 'game.exe'), logs=[],
                                           control_backend='script'), Path(directory))
             for action in (session.observe, lambda: session.key('ESC'),
@@ -1328,7 +1330,7 @@ class ScriptBackendTests(unittest.TestCase):
                         action()
 
     def test_script_load_waits_for_explicit_game_save_initialization(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with project_temporary_directory() as directory:
             root = Path(directory)
             save = 'ManualSave_fixture.sav'
             save_path = root / 'profile' / 'gamesaves' / save
@@ -1354,7 +1356,7 @@ class ScriptBackendTests(unittest.TestCase):
             self.assertEqual(selected['game_filename'], game_filename)
 
     def test_deterministic_bridge_rejection_surfaces_without_startup_timeout(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with project_temporary_directory() as directory:
             session = runner.Session(dict(executable=str(Path(directory) / 'game.exe'), logs=[],
                                           control_backend='script', startup_timeout=120,
                                           load_timeout=120), Path(directory))
@@ -1370,7 +1372,7 @@ class ScriptBackendTests(unittest.TestCase):
                     sleep.assert_not_called()
 
     def test_script_bridge_transport_timeout_is_not_retried(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with project_temporary_directory() as directory:
             session = runner.Session(dict(executable=str(Path(directory) / 'game.exe'), logs=[],
                                           control_backend='script', startup_timeout=120), Path(directory))
             with mock.patch.object(session, 'wait_main_menu_ocr'):
@@ -1382,7 +1384,7 @@ class ScriptBackendTests(unittest.TestCase):
                 sleep.assert_not_called()
 
     def test_first_script_bridge_call_records_listener_pid_and_game_identity(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with project_temporary_directory() as directory:
             root = Path(directory)
             session = runner.Session(dict(executable=str(root / 'game.exe'), logs=[],
                                           control_backend='script'), root)
@@ -1399,7 +1401,7 @@ class ScriptBackendTests(unittest.TestCase):
             self.assertEqual(events[1]['kind'], 'script_bridge_receipt')
 
     def test_script_bridge_rejects_listener_not_owned_by_game(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with project_temporary_directory() as directory:
             root = Path(directory)
             session = runner.Session(dict(executable=str(root / 'game.exe'), logs=[],
                                           control_backend='script'), root)
@@ -1412,7 +1414,7 @@ class ScriptBackendTests(unittest.TestCase):
             exec_bridge.assert_not_called()
 
     def test_script_bridge_ready_precedes_menu_use_without_full_script_reload(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with project_temporary_directory() as directory:
             root = Path(directory)
             session = runner.Session(dict(executable=str(root / 'game.exe'), logs=[],
                                           control_backend='script', startup_timeout=120), root)
@@ -1427,7 +1429,7 @@ class ScriptBackendTests(unittest.TestCase):
             self.assertEqual(session.status['script_mod_reload'], 'not_requested_predeployed_mod')
 
     def test_script_exit_accepts_lost_cli_response_only_with_matching_game_log_receipt(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with project_temporary_directory() as directory:
             root = Path(directory)
             session = runner.Session(dict(executable=str(root / 'game.exe'), logs=[],
                                           control_backend='script'), root)
@@ -1444,7 +1446,7 @@ class ScriptBackendTests(unittest.TestCase):
             self.assertEqual(session.status['safe_exit'], 'script_exit_requested_process_exit_confirmed')
 
     def test_script_exit_response_loss_without_matching_game_log_receipt_fails(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with project_temporary_directory() as directory:
             root = Path(directory)
             session = runner.Session(dict(executable=str(root / 'game.exe'), logs=[],
                                           control_backend='script'), root)
@@ -1462,7 +1464,7 @@ class ScriptBackendTests(unittest.TestCase):
                              'unexpected_exit_before_script_exit_confirmation')
 
     def test_script_log_diagnostics_capture_appended_bytes_after_start_offset(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with project_temporary_directory() as directory:
             root = Path(directory)
             log = root / 'scriptslog.txt'
             log.write_bytes(b'old compiler output\n')
@@ -1478,7 +1480,7 @@ class ScriptBackendTests(unittest.TestCase):
             self.assertEqual(diagnostic['captured_bytes'], len(b'new compile result\n'))
 
     def test_script_log_diagnostics_capture_rewritten_file(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with project_temporary_directory() as directory:
             root = Path(directory)
             log = root / 'scriptslog.txt'
             log.write_bytes(b'old compiler output\n')
@@ -1492,7 +1494,7 @@ class ScriptBackendTests(unittest.TestCase):
             self.assertEqual(diagnostic['change'], 'rewritten')
 
     def test_script_log_capture_uses_the_game_documents_profile(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with project_temporary_directory() as directory:
             root = Path(directory)
             install = root / 'install' / 'bin'
             profile = root / 'documents' / 'The Witcher 3'

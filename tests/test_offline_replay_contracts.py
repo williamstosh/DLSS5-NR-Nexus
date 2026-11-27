@@ -4,8 +4,10 @@ import io
 import importlib.util
 from pathlib import Path
 import sys
-import tempfile
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from project_temp import project_temporary_directory
 from unittest.mock import patch
 
 OFFLINE = Path(__file__).resolve().parents[1] / "tools" / "offline"
@@ -19,7 +21,7 @@ spec.loader.exec_module(runner)
 
 class OfflineReplayContractsTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
+        self.temporary = project_temporary_directory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.source = self.root / "source"
