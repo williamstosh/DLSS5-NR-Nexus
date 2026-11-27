@@ -41,6 +41,7 @@ struct Slot {
   bool color_inputs_prepared = false;
   bool pipeline_pending = false;
   bool model_preparation_pending = false;
+  bool private_work_recorded = false;
   std::optional<bool> recorded_neutral_depth_inverted;
   uint64_t fence_value = 0;
   bool quarantined = false;
@@ -594,6 +595,7 @@ struct SharedPresentColor {
   std::shared_ptr<const void> context;
   std::optional<FeatureState> neutral;
   std::optional<WarmPresentColor> recorded;
+  uint64_t ordinary_layout_serial = 0;
   bool waits_for_outgoing_queue = false;
   bool model_changed = false;
 };
@@ -620,6 +622,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
   slot->color_inputs_prepared = false;
   slot->pipeline_pending = false;
   slot->model_preparation_pending = false;
+  slot->private_work_recorded = false;
   slot->recorded_neutral_depth_inverted.reset();
   const PipelinePreparationScope pipeline_scope;
   ResolveAdaptiveBorrowedDeliveries();
@@ -750,7 +753,10 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     PublishAdaptiveStatus(session.status);
     // Absence pauses only the same resource/composition contract. Real layout
     // changes below retain their normal invalidation and preparation path.
-    // PREPARED preserves the Service recording contract, not color readiness.
+    if (service_scope != nullptr) {
+      fg::xefg::ObserveServiceHandoff(*service_scope, {.reason = "adaptive_role_unavailable"});
+      return fg::Result::PENDING;
+    }
     return fg::Result::PREPARED;
   }
   if (missing_prepared_role) stream->adaptive_frame = freeze_adaptive(required_model_roles);
@@ -847,9 +853,14 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
   }
   const auto pipeline_wait = [&](PipelinePreparationResult result) {
     present_prefg_attempts.fetch_add(1, std::memory_order_relaxed);
-    CountNrDecline(result == PipelinePreparationResult::PENDING
-        ? NrDeclineReason::kSlotWarmupMaturation : NrDeclineReason::kFailureBackoff);
+    const bool failed = result == PipelinePreparationResult::FAILED;
+    CountNrDecline(failed ? NrDeclineReason::kFailureBackoff : NrDeclineReason::kSlotWarmupMaturation);
     slot->pipeline_pending = true;
+    if (service_scope != nullptr) {
+      fg::xefg::ObserveServiceHandoff(*service_scope,
+          {.reason = (failed ? "pipeline_preparation_failed" : "pipeline_preparation_pending")});
+      return (failed ? fg::Result::FAILED : fg::Result::PENDING);
+    }
     return fg::Result::PREPARED;
   };
   const auto pipeline_preparation = PrepareAdaptivePipelines(stream->device, stream->adaptive_frame, base.hdr_mode, mask_pipeline);
@@ -1102,7 +1113,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
         CountNrDecline(NrDeclineReason::kSlotWarmupMaturation);
         fg::xefg::ObserveServiceHandoff(*service_scope, {.reason = "shared_model_preparation_pending"});
         restore_guides();
-        return fg::Result::PREPARED;
+        return fg::Result::PENDING;
       }
       if (incompatible) {
         // The handles and parameter blocks must retire with their own family.
@@ -1117,14 +1128,19 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
         shared->model_changed |= preparation.created_mask != 0;
         recording.prepared = created;
         if (created) {
+          recording.model_created_mask = preparation.created_mask;
           shared->recorded = DescribeWarmPresentColor(*shared_color, shared->identity, target, contract,
               input.color_width, input.color_height, true, real_guides, false, &input, shared->context);
+          // The independent SR capture proves the layout. The prepared
+          // group still uses neutral resources until this SDK supplies guides.
+          shared->recorded->has_real_layout |= shared->ordinary_layout_serial != 0;
         } else if (preparation.state == NrModelPreparationState::PENDING) {
           slot->model_preparation_pending = true;
           fg::xefg::ObserveServiceHandoff(*service_scope, {.reason = "shared_model_preparation_pending"});
         }
         restore_guides();
-        if (created || slot->model_preparation_pending) return fg::Result::PREPARED;
+        if (created) return fg::Result::PREPARED;
+        if (slot->model_preparation_pending) return fg::Result::PENDING;
         return preparation.state == NrModelPreparationState::FAILED ? fg::Result::FAILED : fg::Result::NOT_SERVED;
       }
     }
@@ -1245,7 +1261,8 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
           slot->model_preparation_pending = true;
           fg::xefg::ObserveServiceHandoff(*service_scope, preparation_fact);
           restore_guides();
-          return (preparation_state == NrModelPreparationState::FAILED ? fg::Result::FAILED : fg::Result::PREPARED);
+          if (preparation_state == NrModelPreparationState::FAILED) return fg::Result::FAILED;
+          return preparation_fact.signaled ? fg::Result::PREPARED : fg::Result::PENDING;
         }
       }
     }
@@ -1266,6 +1283,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     present_prefg_attempts.fetch_add(1, std::memory_order_relaxed);
     const uint64_t previous_capture_serial = screenshot::PendingModelCaptureSerial(list);
     const bool accepted = ProcessInline(list, model, &role.parameters, &touched, &target, &recording);
+    slot->private_work_recorded |= shared_color == nullptr && accepted && touched;
     if (recording.adaptive_delivery.frame.delivery != nullptr) {
       stream->adaptive_frame.delivery = recording.adaptive_delivery.frame.delivery;
     }
@@ -1316,7 +1334,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     }
     prepared |= recording.prepared;
     if (shared_color != nullptr && i == 0) {
-      shared->model_changed |= recording.prepared || recording.model_invoked;
+      shared->model_changed |= recording.model_invoked || recording.model_created_mask != 0;
       if (accepted && recording.output_ready && recording.group_complete
           && recording.model_pass_mask == 3u && recording.model_evaluate_mask == 3u) {
         shared->recorded = DescribeWarmPresentColor(*shared_color, shared->identity, target, contract,
@@ -1331,7 +1349,17 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
       // Admission and History-order guards can defer a frame before any model
       // call. Actual Evaluate failures latch their own adaptive session.
       restore_guides();
-      return (accepted && prepared ? fg::Result::PREPARED : fg::Result::FAILED);
+      if (shared_color != nullptr && accepted && prepared) {
+        // Shared creates return from PrepareNrModels above. ProcessInline's
+        // prepared bit here means the workset was usable, with no new group.
+        fg::xefg::ObserveServiceHandoff(*service_scope, {.reason = "shared_model_color_pending"});
+        return fg::Result::PENDING;
+      }
+      if (!accepted || !prepared) return fg::Result::FAILED;
+      if (service_scope == nullptr || std::ranges::any_of(*recordings, [](const auto& role_recording) {
+            return role_recording.model_created_mask != 0;
+          })) return fg::Result::PREPARED;
+      return fg::Result::PENDING;
     }
     if (native_edit_reuse_frame) {
       // Native refresh records its anchor on the selected role's active slot.
@@ -1638,12 +1666,6 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     if (!InstallQueueCompletionHooks(queue)) return fg::Result::NOT_SERVED;
     Microsoft::WRL::ComPtr<ID3D12Device> submit_device;
     if (FAILED(queue->GetDevice(IID_PPV_ARGS(&submit_device)))) return fg::Result::FAILED;
-    Microsoft::WRL::ComPtr<ID3D12Device> queue_recording_device;
-    if (input.recording_device == nullptr && input.queue != queue
-        && FAILED(input.queue->GetDevice(IID_PPV_ARGS(&queue_recording_device)))) {
-      observe("original_runtime_recording_face_unavailable");
-      return fg::Result::NOT_SERVED;
-    }
     PrepareRuntime(submit_device.Get());
     const BridgeDeviceLock device_lock;
     const ngx_serial::PresentTurn turn(true);
@@ -1670,6 +1692,7 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
           reinterpret_cast<uintptr_t>(backbuffer_identity));
     }
     const bool managed_color = physical_owner && fg::xefg::ServiceWriteCurrent(input);
+    const bool shared_color_configured = managed_color && WarmPresentColorConfigured();
     const auto ordinary = present_streams.find(reinterpret_cast<const void*>(physical_owner.swapchain));
     if (device == nullptr && managed_color && ordinary != present_streams.end()) {
       auto& proof = ordinary->second.ordinary_recording_face;
@@ -1688,28 +1711,47 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
         proof = {};
       }
     }
-    if (device == nullptr && queue_recording_device != nullptr) {
-      device = queue_recording_device.Get();
-      face_source = "SDK queue GetDevice";
+    Microsoft::WRL::ComPtr<ID3D12Device> host_face;
+    if (device == nullptr && input.queue != queue) {
+      if (FAILED(input.queue->GetDevice(IID_PPV_ARGS(&host_face)))) {
+        observe("original_runtime_recording_face_unavailable");
+        return fg::Result::NOT_SERVED;
+      }
+      auto* native_face = host_face.Get();
+      if (!shared_color_configured || renodx::utils::directx::NativeFromReShadeProxy(&native_face)) {
+        device = host_face.Get();
+        face_source = "SDK queue GetDevice";
+      }
     }
     if (device == nullptr && input.native_tag_recording_device == submit_device.Get()
         && (direct_device == nullptr || direct_device == submit_device.Get())) {
       device = submit_device.Get();
       face_source = "current SDK native tag list";
     }
-    if (device == nullptr && managed_color && WarmPresentColorConfigured()) {
-      const bool single_native_face = ordinary != present_streams.end()
-          && ordinary->second.ordinary_observed_face_owner == physical_owner
-          && ordinary->second.ordinary_observed_face.Get() == submit_device.Get()
-          && (direct_device == nullptr || direct_device == submit_device.Get());
-      if (!single_native_face) {
-        // GetDevice on the native queue only proves submission ownership.
-        // A later current tag can supply the actual recording interface.
-        observe("original_runtime_recording_face_pending");
-        return fg::Result::PREPARED;
+    if (device == nullptr && shared_color_configured) {
+      // The live proxy can expose its ReShade device even when SDK init and
+      // this frame's tags only exposed native objects. A bare DXGI device or
+      // backbuffer GetDevice only proves native ownership.
+      if (ordinary != present_streams.end() && ordinary->second.ordinary_observed_face_owner == physical_owner) {
+        auto* const observed_face = ordinary->second.ordinary_observed_face.Get();
+        auto* native_face = observed_face;
+        if (renodx::utils::directx::NativeFromReShadeProxy(&native_face)) {
+          device = observed_face;
+          face_source = "same output ordinary host object";
+        }
       }
-      device = submit_device.Get();
-      face_source = "same output native recording interface";
+      if (device == nullptr && input.swapchain != nullptr
+          && SUCCEEDED(input.swapchain->GetDevice(IID_PPV_ARGS(host_face.ReleaseAndGetAddressOf())))) {
+        auto* native_face = host_face.Get();
+        if (renodx::utils::directx::NativeFromReShadeProxy(&native_face)) {
+          device = host_face.Get();
+          face_source = "current swapchain host object";
+        }
+      }
+      if (device == nullptr) {
+        observe("original_runtime_recording_face_pending");
+        return fg::Result::PENDING;
+      }
     }
     if (device == nullptr) {
       device = submit_device.Get();
@@ -1904,8 +1946,9 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
         if (shared.model_changed) {
           InvalidateWarmPresentColor(shared.owner);
         }
-        if (slot->model_preparation_pending) {
-          // The separate creation slot still owns its submitted model work.
+        if (slot->model_preparation_pending || slot->pipeline_pending || stream.adaptive_role_unavailable) {
+          // The abandoned color list has no model work. Keep the earlier
+          // preparation and the pipeline session's retry or failure state.
           stream.base_frame_clock.complete = false;
         } else {
           Invalidate(&stream);
@@ -1917,13 +1960,17 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     Microsoft::WRL::ComPtr<ID3D12Device> list_device;
     if (FAILED(slot->list->GetDevice(IID_PPV_ARGS(&list_device))) || list_device.Get() != recording_device) {
       observe("original_runtime_recording_face_mismatch");
-      return stream.result;
+      return fg::Result::FAILED;
     }
     auto decline = NrDeclineReason::kNrRuntimeUnavailable;
     if (!EnsureDirectRuntime(slot->list, &decline, false)) {
       present_prefg_attempts.fetch_add(1, std::memory_order_relaxed);
       CountNrDecline(decline);
-      observe(decline == NrDeclineReason::kRuntimeSwitchPending ? "runtime_switch_pending" : "runtime_unavailable");
+      if (decline == NrDeclineReason::kRuntimeSwitchPending) {
+        observe("runtime_switch_pending");
+        return fg::Result::PENDING;
+      }
+      observe("runtime_unavailable");
       return stream.result;
     }
     fg::FrameInput nr_input = input;
@@ -1991,10 +2038,46 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
           shared.owner = &present_streams[owner_key];
         } else if (!real_guides && guide_mode == kPresentGuidesOptional) {
           const auto entry = present_streams.find(owner_key);
-          const bool has_layout = entry != present_streams.end() && entry->second.warm_color.has_real_layout
+          const bool current_group = entry != present_streams.end()
               && WarmPresentColorCurrent(entry->second.warm_color, physical_owner, target, input.color_width, input.color_height);
+          const bool has_layout = current_group && entry->second.warm_color.has_real_layout;
           if (has_layout) {
             shared.neutral = WarmNeutralGuideContract(entry->second.warm_color, input.color_width, input.color_height);
+          }
+          if (!current_group && (input.init_flags & (1u << 4)) == 0) {
+            const auto now_ns = SteadyNowNs();
+            const auto configuration = configuration_generation.load();
+            const PresentGuideSet* latest = nullptr;
+            for (const auto& set : present_guide_sets) {
+              const auto& proof = set.cold_layout;
+              if (proof.owner != physical_owner || proof.configuration != configuration || proof.recording == nullptr
+                  || set.output_width != input.color_width || set.output_height != input.color_height
+                  || now_ns - set.captured_ns > kPresentGuideMaxAgeNs
+                  || (latest != nullptr && proof.serial <= latest->cold_layout.serial)) continue;
+              latest = &set;
+            }
+            if (latest != nullptr) {
+              const auto& guide = latest->contract;
+              constexpr uint32_t layout_flags = NVSDK_NGX_DLSS_Feature_Flags_DepthInverted
+                  | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_MVJittered;
+              const uint32_t flags = guide.create_flags & layout_flags;
+              const bool depth_inverted = (flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0;
+              std::vector<std::pair<FenceRef, uint64_t>> tokens;
+              const auto marker_proof = submission::UseSubmissionTokens(latest->marker, &tokens, latest->cold_layout.recording.get());
+              const bool completed = marker_proof == submission::UseSubmission::kRetiredOnce
+                  || (marker_proof == submission::UseSubmission::kTokens && std::ranges::all_of(tokens, [](const auto& token) {
+                       const auto value = token.first->GetCompletedValue();
+                       return value != UINT64_MAX && value >= token.second;
+                     }));
+              if (completed && depth_inverted == ((input.init_flags & 1u) != 0)) {
+                shared.neutral = WarmNeutralGuideContract({.guide_width = guide.input_width, .guide_height = guide.input_height,
+                    .motion_x = guide.motion_x, .motion_y = guide.motion_y, .depth_x = guide.depth_x, .depth_y = guide.depth_y,
+                    .flags = flags, .has_real_layout = true}, input.color_width, input.color_height);
+                if (shared.neutral) {
+                  shared.ordinary_layout_serial = latest->cold_layout.serial;
+                }
+              }
+            }
           }
           if (!has_layout || shared.neutral) {
             shared.owner = &present_streams[owner_key];
@@ -2081,6 +2164,14 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     };
     const auto remember_shared = [&] {
       if (shared.recorded) {
+        if (shared.ordinary_layout_serial != 0) {
+          std::ostringstream message;
+          message << "XeFG NR prepared with ordinary SR guide layout: capture=" << shared.ordinary_layout_serial
+                  << ", " << shared.neutral->input_width << 'x' << shared.neutral->input_height
+                  << ", flags=0x" << std::hex << shared.neutral->create_flags << std::dec
+                  << ", call=" << fg::xefg::ServiceCall(input);
+          LogPresent(reshade::log::level::info, message.str());
+        }
         shared.owner->warm_color = std::move(*shared.recorded);
         owner_resident_nr_handles.insert(shared.owner->Handle());
         stream.warm_color_owner = shared.identity;
@@ -2114,27 +2205,44 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
         exact_ui && hudless_processes != 0 && backbuffer_processes == 0 && output_ready);
     if (slot->model_preparation_pending) {
       finish_capture();
+      if (FAILED(close_recording())) {
+        observe("model_preparation_wait_close_failed");
+        slot->quarantined = true;
+        stream.result = fg::Result::FAILED;
+        return stream.result;
+      }
       stream.result = recorded;
       return stream.result;
     }
     if (!output_ready) {
-      observe(recorded == fg::Result::PREPARED ? "model_prepared_without_color" : "model_color_unavailable");
+      const bool recorded_create = recorded == fg::Result::PREPARED;
+      const bool submit_private_work = recorded == fg::Result::PENDING && slot->private_work_recorded;
+      if (recorded != fg::Result::PENDING && !recorded_create && !slot->pipeline_pending) {
+        observe("model_color_unavailable");
+      }
       for (const auto& recording : recordings) {
         ResolveAdaptiveDelivery(recording.adaptive_delivery, false);
       }
       finish_capture();
       const bool closed = SUCCEEDED(close_recording());
-      if (recorded == fg::Result::PREPARED && closed) {
-        // Feature creation/maturation is real GPU work, but no color is
-        // committed and the application frame is explicitly not served.
+      if (!closed && (slot->pipeline_pending || recorded == fg::Result::PENDING || recorded_create)) {
+        observe(slot->pipeline_pending ? "pipeline_wait_close_failed"
+            : recorded_create ? "model_preparation_close_failed" : "color_pending_close_failed");
+        slot->quarantined = true;
+        stream.result = fg::Result::FAILED;
+        return stream.result;
+      }
+      if (recorded_create || submit_private_work) {
+        // A partial role can record private GPU work while the application
+        // frame remains unserved. Only successful Create earns preparation.
         for (uint32_t i = 0; i < recordings.size(); ++i) {
           if (recordings[i].model_invoked) ResetPresentStreamHistory(&stream.roles[i]);
         }
+        const auto recording_id = submission::RecordingIdentity(slot->list);
         ID3D12CommandList* list = slot->list;
         renodx::utils::directx::NativeFromReShadeProxy(&list);
         submission::TrackUse(slot->list, slot->allocator);
         submission::TrackUse(slot->list, slot->list);
-        const auto recording_id = submission::RecordingIdentity(slot->list);
         if (shared.owner != nullptr && !color_ordered(recording_id, shared.owner)) return fg::Result::NOT_SERVED;
         if (!fg::xefg::WithServiceWritePermission(input, false, [&] {
               if (!shared_owner_current() || !EnqueueWarmPresentQueueWaits(queue, handoff_waits)) return false;
@@ -2147,8 +2255,10 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
         submitted = true;
         slot->fence_value = ++stream.submitted;
         const bool signaled = SUCCEEDED(queue->Signal(stream.fence, slot->fence_value));
-        submit_neutral_guides(signaled);
-        if (signaled) {
+        const auto completed_value = stream.fence->GetCompletedValue();
+        const bool submission_proven = signaled && completed_value != UINT64_MAX;
+        submit_neutral_guides(submission_proven);
+        if (submission_proven) {
           remember_shared();
         } else {
           if (shared.model_changed) {
@@ -2156,11 +2266,17 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
           }
           slot->quarantined = true;
         }
+        const char* reason = (recorded_create ? "model_preparation_submitted" : "private_work_submitted_without_color");
+        if (!signaled) {
+          reason = (recorded_create ? "model_preparation_signal_failed" : "private_work_signal_failed");
+        } else if (completed_value == UINT64_MAX) {
+          reason = (recorded_create ? "model_preparation_device_removed" : "private_work_device_removed");
+        }
         fg::xefg::ObserveServiceHandoff(input,
-            {.reason = (signaled ? "model_preparation_submitted" : "model_preparation_signal_failed"),
+            {.reason = reason,
              .recording = recording_id, .queue = reinterpret_cast<uintptr_t>(queue),
              .fence = reinterpret_cast<uintptr_t>(stream.fence), .fence_value = slot->fence_value,
-             .completed_value = stream.fence->GetCompletedValue(), .signaled = signaled});
+             .completed_value = completed_value, .signaled = signaled});
         submission::DiscardOwnedRecording(slot->list, submission::RecordingOwner::kXeFg);
       }
       stream.result = (slot->quarantined ? fg::Result::FAILED : recorded);

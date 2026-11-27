@@ -295,6 +295,11 @@ struct NrVerdict {
         && reason != nullptr && std::strcmp(reason, "fg_preparing") == 0;
   }
 
+  bool IsFgPending() const {
+    return state == NrState::kNotEngaged && std::strcmp(path, "present") == 0
+        && reason != nullptr && std::strcmp(reason, "fg_pending") == 0;
+  }
+
   bool IsFgHandoffProgress() const {
     return IsFgPreparing()
         || (state == NrState::kEngaged && std::strcmp(path, "present") == 0 && reason == nullptr);

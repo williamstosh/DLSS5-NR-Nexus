@@ -536,6 +536,20 @@ inline OutputIdentity MatchPresentColorOwner(const OutputIdentity& route, uintpt
   return owner->identity;
 }
 
+// A registered source can resolve to a proxy view without being a swapchain
+// buffer itself. Preserve its exact physical owner across SDK view changes.
+inline OutputIdentity FindPresentColorOwnerForRoute(const OutputIdentity& route) {
+  if (!route) return {};
+  std::shared_lock lock(internal::state.mutex);
+  OutputIdentity owner;
+  for (const auto& [_, output] : internal::state.present) {
+    if (output.identity.device != route.device || internal::ResolvePresentOutput(output) != route) continue;
+    if (owner) return {};
+    owner = output.identity;
+  }
+  return owner;
+}
+
 inline OutputIdentity ResolveRegisteredPresentOutput(const OutputIdentity& owner, bool* ambiguous = nullptr) {
   if (!owner || owner.view != 0) return {};
   std::shared_lock lock(internal::state.mutex);

@@ -463,8 +463,8 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
         {"continuing", in.fg_continuing_submission}, {"passed", matching}}.dump() << std::endl;
     Check(matching, phase);
   };
-  const auto check_gray = [&](const char* phase, const Session& target) {
-    check_status(phase, output_of(target), ui::CardTone::kIdle, ui::CardId::kFgPreparing, "fg_preparing", 0);
+  const auto check_waiting = [&](const char* phase, const Session& target) {
+    check_status(phase, output_of(target), ui::CardTone::kIdle, ui::CardId::kStarting, "fg_pending", 0);
   };
   const auto check_green = [&](const char* phase, const Session& target) {
     check_status(phase, output_of(target), ui::CardTone::kGood, ui::CardId::kActive, "", 1);
@@ -483,7 +483,7 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
             && session.context->enabled && rate::MatchPresentOutput(reinterpret_cast<uintptr_t>(&route),
                 reinterpret_cast<uintptr_t>(back.Get())) == output_of(session),
         "actual SDK enable is tied to the current Present output");
-  check_gray("first-enable-before-real-present", session);
+  check_waiting("first-enable-before-real-present", session);
   {
     funnel_accounting_tests::Restore test_present_restore;
     test_present_restore.Value(&nr_edit_reuse_xefg_cases::consume_sdk_present);
@@ -491,7 +491,7 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
     Check(adapter::ProxyHooks<0>::Present(session.proxy.Get(), 0, DXGI_PRESENT_TEST) == S_OK,
           "SDK test flag is forwarded without classifying an application frame");
   }
-  check_gray("test-present-does-not-classify-first-frame", session);
+  check_waiting("test-present-does-not-classify-first-frame", session);
   Check(model_calls == calls_before_first && xefg::SubmittedFrames() == submissions_before_first
             && session.context->application_frame == frames_before_first,
         "no real Present, model evaluation, or NR submission occurred before the first color");
@@ -1351,7 +1351,7 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
               && output_of(other_sdk) != output_of(session),
           "the second SDK owner has a separately registered output");
     check_green("first-output-retains-its-own-green", session);
-    check_gray("second-output-cannot-borrow-first-output-green", other_sdk);
+    check_waiting("second-output-cannot-borrow-first-output-green", other_sdk);
     {
       // Keep the actual published ordinary owner on A while B performs a
       // different, genuine SDK attempt and records its own refusal.
@@ -1420,13 +1420,13 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
       funnel_accounting_tests::Restore monitor_restore;
       monitor_restore.Value(&native::monitor_snapshot);
       native::InvalidateMonitorDisplay(recording);
-      Check(native::monitor_snapshot.verdict.IsFgPreparing()
-                && native::monitor_snapshot.card.id == ui::CardId::kFgPreparing
+      Check(native::monitor_snapshot.verdict.IsFgPending()
+                && native::monitor_snapshot.card.id == ui::CardId::kStarting
                 && native::monitor_snapshot.card.tone == ui::CardTone::kIdle,
             "a busy monitor must not manufacture selected delivery from an SDK status");
       const auto fresh = xefg::ReadStatus(output_of(other_sdk));
       native::InvalidateMonitorDisplay(fresh);
-      Check(native::monitor_snapshot.card.id == ui::CardId::kFgPreparing
+      Check(native::monitor_snapshot.card.id == ui::CardId::kStarting
                 && native::monitor_snapshot.card.tone == ui::CardTone::kIdle,
             "a new output with no result cannot use other generation's green");
       std::cout << "PASS xefg-monitor-busy no_unproven_green=1 new_scope_unknown=1" << std::endl;
@@ -1446,15 +1446,15 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
     Check(Hooks::Enable(session.handle, 1) == 0 && session.context->enabled
               && session.context->epoch != late.input.epoch && output_of(session) != late.input.output,
           "real re-enable creates a new selected generation on the primary output");
-    check_gray("primary-new-epoch-is-unjudged", session);
+    check_waiting("primary-new-epoch-is-unjudged", session);
     Check(ordinary_key && rate::ResolveRegisteredPresentOutput(ordinary_key) == output_of(session),
           "published ordinary identity resolves the newly accepted XeFG generation");
     adapter::EndPresent(&late, sdk_result);
     native::EndOrdinaryPresentAttempt(attempt, S_OK);
     Check(xefg::SubmittedFrames() == deliveries + 1,
           "reporting isolation does not change accounting for the genuinely submitted old color");
-    check_gray("late-old-epoch-success-cannot-color-primary", session);
-    check_gray("late-old-epoch-success-cannot-color-second-output", other_sdk);
+    check_waiting("late-old-epoch-success-cannot-color-primary", session);
+    check_waiting("late-old-epoch-success-cannot-color-second-output", other_sdk);
     other_sdk.CloseSdk();
   }
 
@@ -2023,13 +2023,14 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
   trace_blockers("both-closed", submission::RecordedWork::kComplete, 0);
   frame("first-legal-b-after-both-close", &route, scene_b, 1, true, true, true, 1);
 
-  const auto pending_model = [](Session* sdk_session, uint32_t creates, uint32_t evaluates, uint64_t deliveries) {
+  const auto pending_model = [](Session* sdk_session, uint32_t creates, uint32_t evaluates, uint64_t deliveries,
+                                fg::Result frame_result) {
     const auto& stream = native::fg_service::streams.at({false, reinterpret_cast<uintptr_t>(sdk_session->handle)});
     const auto& model = native::features.at(stream.roles[0].Handle()).slots[0];
     Check(model.handle != nullptr && model.preparation_recording != nullptr && !model.creation_completed
               && model.preparation_recording->closed.load() && model.preparation_recording->submitted.load(),
           "cold application Present retains its actual private creation generation");
-    Check(xefg::CurrentResult() == fg::Result::PREPARED && next_handle == creates && model_calls == evaluates
+    Check(xefg::CurrentResult() == frame_result && next_handle == creates && model_calls == evaluates
               && xefg::SubmittedFrames() == deliveries && stream.base_frame_clock.claims == 0
               && stream.base_frame_clock.outputs == 0 && stream.pending_xefg_game_reset
               && sdk_session->context->last_submission_frame == 0 && !submission::ResourceReleasable(model.handle),
@@ -2039,7 +2040,7 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
   {
     Check(Hooks::Enable(session.handle, 0) == 0 && Hooks::Enable(session.handle, 1) == 0,
           "public SDK cycle starts a cold model on the existing output");
-    check_gray("before-first-cold-model-present", session);
+    check_waiting("before-first-cold-model-present", session);
     produce(back.Get(), scene_b, 1, false);
     ComPtr<ID3D12Fence> gate;
     Check(SUCCEEDED(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate))), "creation GPU gate");
@@ -2054,13 +2055,14 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
     const auto started = std::chrono::steady_clock::now();
     Check(SUCCEEDED(gpu.queue->Wait(gate.Get(), 1)), "queue holds the actual private Create in flight");
     sdk_present(&session, 1, true);
-    const auto creation = pending_model(&session, creates, evaluates, deliveries);
-    check_gray("actual-first-preparation-remains-gray", session);
+    const auto creation = pending_model(&session, creates, evaluates, deliveries, fg::Result::PREPARED);
+    check_status("first-preparation-submitted", output_of(session), ui::CardTone::kIdle, ui::CardId::kFgPreparing,
+                 "fg_preparing", 0);
     const auto& [model, recording, fence, value] = creation;
     Check(value != 0 && fence->GetCompletedValue() < value, "the owner Prepare Fence is genuinely in flight");
     std::this_thread::sleep_until(started + std::chrono::milliseconds(120));
     sdk_present(&session, 1, false);
-    Check(pending_model(&session, creates, evaluates, deliveries) == creation && fence->GetCompletedValue() < value,
+    Check(pending_model(&session, creates, evaluates, deliveries, fg::Result::PENDING) == creation && fence->GetCompletedValue() < value,
           "the next SDK application frame keeps the same pending cold Create through the GPU stall");
     const auto waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
     Check(waited_ms >= 100, "the actual creation is blocked for more than 100 ms");
@@ -2118,7 +2120,7 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
     const auto evaluates = model_calls;
     const auto deliveries = xefg::SubmittedFrames();
     fail_first_tracker_signal([&] { sdk_present(&cold, 1, true); });
-    const auto creation = pending_model(&cold, creates, evaluates, deliveries);
+    const auto creation = pending_model(&cold, creates, evaluates, deliveries, fg::Result::PREPARED);
     const auto& [model, recording, fence, value] = creation;
     Check(value != 0 && fence->GetCompletedValue() >= value && fence->GetCompletedValue() != UINT64_MAX
               && consumed == expected_pixels(scene_b, false), "owner creation Fence completes but unproven NR leaves original RGBA");
@@ -2133,7 +2135,7 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
     const auto epoch = cold.context->epoch;
     const auto app_frame = cold.context->application_frame;
     sdk_present(&cold, 1, false);
-    Check(pending_model(&cold, creates, evaluates, deliveries) == creation && cold.context->epoch == epoch
+    Check(pending_model(&cold, creates, evaluates, deliveries, fg::Result::PENDING) == creation && cold.context->epoch == epoch
               && cold.context->application_frame == app_frame + 1 && consumed == expected_pixels(scene_b, false),
           "the next real SDK application Present preserves the same unproven model and never claims its version");
     std::cout << "XEFG_HANDOFF_CREATION_SIGNAL_LOST " << nlohmann::json{{"creates", 1}, {"claims", 0},

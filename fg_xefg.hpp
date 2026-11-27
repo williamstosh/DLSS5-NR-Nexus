@@ -2117,15 +2117,15 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags, PresentU
       present.handoff_reason = "write_permission_revoked";
       return present;
     }
-    display_result.store(present.continuing_submission ? Result::SUBMITTED : Result::PREPARED,
+    display_result.store(present.continuing_submission ? Result::SUBMITTED : Result::PENDING,
                          std::memory_order_release);
-    result.store(Result::PREPARED, std::memory_order_release);
+    result.store(Result::PENDING, std::memory_order_release);
   }
   const auto finish_service = [&] {
     {
       std::unique_lock lock(state.mutex);
       if (PresentWriteCurrentLocked(present)) {
-        PublishResult(present.service_result == Result::ORDINARY_SUBMITTED ? Result::PREPARED : present.service_result);
+        PublishResult(present.service_result == Result::ORDINARY_SUBMITTED ? Result::PENDING : present.service_result);
         // A clean refusal is final before ReShade's in-SDK overlay executes.
         // A recorded color still needs this SDK Present's actual result.
         auto& status = present.context->status;
@@ -4134,7 +4134,7 @@ struct StatusSnapshot {
   bool operator==(const StatusSnapshot&) const = default;
 
   Result DisplayOutcome() const {
-    return (recording ? Result::PREPARED : outcome.value_or(Result::PREPARED));
+    return recording ? Result::PENDING : outcome.value_or(Result::PENDING);
   }
 };
 

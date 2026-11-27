@@ -256,6 +256,8 @@ int Run() {
     adapter::modules[0].real[6] = reinterpret_cast<void*>(+[](void*, uint32_t) -> int32_t { return 0; });
     adapter::modules[0].real[8] = reinterpret_cast<void*>(+[](void*) -> int32_t { return 0; });
     adapter::proxies[0].installed = adapter::proxies[0].complete = true;
+    adapter::proxies[0].real[4] = reinterpret_cast<void*>(
+        +[](IDXGISwapChain3*, DXGI_COLOR_SPACE_TYPE) -> HRESULT { return S_OK; });
     xefg::Configure(&native::fg_service::Service, &Prepare, &native::fg_service::Retire,
                     &native::fg_service::Requested);
     const auto retire_owners = [&] {
@@ -281,13 +283,15 @@ int Run() {
     input.fg_enabled = true;
     input.color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
     uint32_t present_id = 0;
+    uint32_t model_preparation_receipts = 0;
+    xefg::PresentSubmissionFact service_submission;
     const auto service = [&] {
       const auto handle = reinterpret_cast<void*>(input.context);
       if (!sdk_owners.proxies.contains(input.context)) {
         auto& proxy = sdk_owners.proxies[input.context];
         proxy.Attach(new ReceiptSwapchain(nullptr));
         proxy->reported_device12 = gpu.device;
-        proxy->current_back_buffer = color;
+        proxy->current_back_buffer = input.backbuffer;
         sdk_owner_proxy = proxy.Get();
         adapter::proxies[0].records[0].target = static_cast<uint8_t*>((*reinterpret_cast<void***>(proxy.Get()))[8]);
         const xefg::abi::Init init{.application_swapchain = proxy.Get()};
@@ -295,6 +299,10 @@ int Run() {
         ComPtr<IDXGISwapChain3> observed_proxy;
         Check(Hooks::GetSwapchain(handle, IID_PPV_ARGS(&observed_proxy)) == 0 && observed_proxy.Get() == proxy.Get()
             && Hooks::Enable(handle, 1) == 0, "adaptive Service SDK owner GetSwapchain and Enable");
+        if (input.color_space != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) {
+          Check(SUCCEEDED(adapter::ProxyHooks<0>::Color(proxy.Get(), input.color_space)),
+              "adaptive Service SDK owner SetColorSpace");
+        }
       }
       input.epoch = adapter::state.contexts.at(handle)->epoch;
       Check(xefg::ServiceContextCurrent(input.context, input.epoch), "adaptive Service input names a live SDK owner epoch");
@@ -317,6 +325,7 @@ int Run() {
       Check(Hooks::Constants(handle, id, &constants) == 0 && Hooks::PresentId(handle, id) == 0,
             "adaptive Service SDK constants and application ID");
       const auto before_source = native::SourceSuccessfulEvaluations();
+      const auto before_creates = native::nr_features_created;
       observing_context = input.context;
       active_pass_masks = {};
       failed_pass_masks = {};
@@ -333,6 +342,13 @@ int Run() {
             "adaptive Service runs within the matching SDK call and output epoch");
       input.application_frame = present.input.application_frame;
       const auto result = present.service_result;
+      service_submission = present.service_submission;
+      if (std::string_view(service_submission.reason) == "model_preparation_submitted") {
+        Check(result == fg::Result::PREPARED && service_submission.signaled && service_submission.recording.first != 0
+            && native::nr_features_created > before_creates,
+            "a model-preparation submission has an actual successful Create on the current Service frame");
+        ++model_preparation_receipts;
+      }
       for (size_t index = before_list_calls; index < list_calls.size(); ++index) {
         const auto& call = list_calls[index];
         Check(call.identity != 0 && (call.identity & (uint64_t{1} << 63)) == 0,
@@ -393,6 +409,28 @@ int Run() {
       return result;
     };
     {
+      auto hdr_color = texture(DXGI_FORMAT_R16G16B16A16_FLOAT, present_state);
+      gpu.Submit();
+      input.context = 0xADAF4;
+      input.backbuffer = hdr_color.Get();
+      input.color_space = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+      native::transfer_strength = native::color_strength = 0.f;
+      native::pass_transfer_strength[0] = native::pass_color_strength[0] = 0.f;
+      const auto before_creates = native::nr_features_created;
+      const auto before_evaluates = model_calls;
+      Check(service() == fg::Result::PENDING && native::nr_features_created == before_creates
+          && model_calls == before_evaluates && service_submission.signaled && service_submission.recording.first != 0
+          && std::string_view(service_submission.reason) == "private_work_submitted_without_color",
+          "the actual zero-strength HDR copy can submit privately without a Create, Evaluate, or model-preparation receipt");
+      retire_owners();
+      native::DrainRetiredResources(true);
+      native::ReleaseCodecPipeline();
+      native::transfer_strength = native::color_strength = 1.f;
+      native::pass_transfer_strength[0] = native::pass_color_strength[0] = 1.f;
+      input.backbuffer = color.Get();
+      input.color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    }
+    {
       real_create_pipeline = reinterpret_cast<CreatePipelineFn>((*reinterpret_cast<void***>(gpu.device.Get()))[11]);
       Check(DetourTransactionBegin() == NO_ERROR && DetourUpdateThread(GetCurrentThread()) == NO_ERROR
           && DetourAttach(reinterpret_cast<PVOID*>(&real_create_pipeline), reinterpret_cast<PVOID>(ObserveCreatePipeline)) == NO_ERROR
@@ -414,12 +452,22 @@ int Run() {
           "runtime unavailability returns its original failure before any PSO creation");
       native::direct_device = runtime_device;
       native::direct_runtime_failed = false;
+      fail_next_pipeline = true;
+      Check(service() == fg::Result::FAILED && pipeline_calls == 1,
+          "a genuine PSO failure returns FAILED through the actual XeFG call");
+      const auto& failed_pipeline = native::fg_service::streams.at({false, input.context});
+      Check(failed_pipeline.submitted == 0 && failed_pipeline.adaptive_session->failed
+                && next_handle == models_before && model_calls == evaluates_before,
+            "a failed pipeline creates no submission or model and retains its failure state");
+      retire_owners();
+      native::ReleaseCodecPipeline();
+      pipeline_calls = 0;
       for (uint32_t source = 0; source < 10; ++source) {
         const auto before = pipeline_calls;
-        Check(service() == fg::Result::PREPARED && pipeline_calls == before + 1,
-            "one dual-color two-Pass application source creates one actual PSO and remains unserved");
+        Check(service() == fg::Result::PENDING && pipeline_calls == before + 1,
+            "one dual-color two-Pass application source creates one actual PSO and reports PENDING");
         const auto& cold = native::fg_service::streams.at({false, input.context});
-        Check(next_handle == models_before && model_calls == evaluates_before
+        Check(cold.submitted == 0 && next_handle == models_before && model_calls == evaluates_before
             && native::worksets_created == worksets_before && !cold.adaptive_session->prepared
             && cold.adaptive_model_roles == 0 && cold.adaptive_required_roles == 0
             && cold.last_model_frame[0] == 0 && cold.last_model_frame[1] == 0,
@@ -504,7 +552,8 @@ int Run() {
       input.hudless = nullptr;
     }
     for (uint32_t frame = 0; frame < 8; ++frame) service();
-    Check(service() == fg::Result::SUBMITTED, "manual two-Pass single Backbuffer matures");
+    Check(service() == fg::Result::SUBMITTED && model_preparation_receipts != 0,
+        "manual two-Pass single Backbuffer matures after an actual Create submission");
     const auto* occupied_owner = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xADAF7});
     Check(native::EnsureWorkset(gpu.device.Get(), occupied_owner, color.Get(), 16, 16, 16, 16,
         DXGI_FORMAT_R8G8B8A8_UNORM, 0, 1.f, 0, false) != nullptr,
@@ -702,9 +751,9 @@ int Run() {
     seed_paused_colors();
     input.hudless = nullptr;
     const auto before_missing_calls = model_calls;
+    const auto before_missing_submissions = dual.submitted;
     const auto missing = service();
-    // PREPARED is the Service recording contract; the selected color group is not ready.
-    Check(missing == fg::Result::PREPARED
+    Check(missing == fg::Result::PENDING && dual.submitted == before_missing_submissions
         && dual.adaptive_role_unavailable && !dual.adaptive_session->prepared
         && dual.adaptive_session->status.reason == addon::adaptive_resolution::Reason::UNSUPPORTED
         && !dual.adaptive_session->failed && model_calls == before_missing_calls
@@ -727,13 +776,14 @@ int Run() {
 
     seed_paused_colors();
     input.hudless = nullptr;
-    Check(service() == fg::Result::PREPARED, "a second role interruption begins a retained pause");
+    Check(service() == fg::Result::PENDING, "a second role interruption begins a retained pause");
     const auto paused_stable_ns = dual.adaptive_session->stable_after_ns;
+    const auto paused_submissions = dual.submitted;
     const auto paused_calls = model_calls;
     const auto paused_preparation_calls = preparation_calls;
     const auto paused_source_successes = native::SourceSuccessfulEvaluations();
     for (uint32_t frame = 0; frame <= native::kContractDebounceFrames * 8; ++frame) {
-      Check(service() == fg::Result::PREPARED && dual.adaptive_role_unavailable
+      Check(service() == fg::Result::PENDING && dual.submitted == paused_submissions && dual.adaptive_role_unavailable
           && !dual.adaptive_session->prepared && !dual.adaptive_session->failed && !dual.adaptive_session->trial
           && dual.adaptive_session->status.reason == addon::adaptive_resolution::Reason::UNSUPPORTED
           && dual.adaptive_session->status.ready_levels == 0
@@ -831,7 +881,7 @@ int Run() {
         "both colors rebuild clean model contracts after the explicit model-selection change");
     const auto previous_primary = native::features.at(dual.roles[0].Handle()).adaptive_cache;
     input.hudless = nullptr;
-    Check(service() == fg::Result::PREPARED && dual.adaptive_role_unavailable
+    Check(service() == fg::Result::PENDING && dual.adaptive_role_unavailable
         && dual.adaptive_session->status.reason == addon::adaptive_resolution::Reason::UNSUPPORTED,
         "a real contract transition starts while the old required role is unavailable");
     const auto previous_epoch = input.epoch;
@@ -942,7 +992,7 @@ int Run() {
         && native::nr_features_created == many_models && native::worksets_created == many_worksets,
         "five-to-Default reconciles both role selections before budget adjudication and reuses the retained endpoints");
     input.hudless = nullptr;
-    Check(service() == fg::Result::PREPARED && many.adaptive_role_unavailable,
+    Check(service() == fg::Result::PENDING && many.adaptive_role_unavailable,
         "the selected collection is paused for missing input before Off");
     native::nr_adaptive_enabled.store(false);
     Check(service() == fg::Result::SUBMITTED && !many.adaptive_role_unavailable

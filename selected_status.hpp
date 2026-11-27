@@ -70,8 +70,8 @@ inline ui::CardInputs ProjectSelectedCardInputs(ui::CardInputs in, bool has_pres
     const bool selected_delivery = xefg->owned && receipt.consumer == MonitorConsumer::XE_FG
         && receipt.output == xefg->output && receipt.frame.generation == xefg->epoch;
     const bool rejected = outcome == fg::Result::NOT_SERVED || outcome == fg::Result::FAILED;
-    const bool preparing = outcome == fg::Result::PREPARED;
-    if (rejected || (preparing && (!selected_delivery || !xefg->continuing_submission))) {
+    const bool waiting = outcome == fg::Result::PENDING || outcome == fg::Result::PREPARED;
+    if (rejected || (waiting && (!selected_delivery || !xefg->continuing_submission))) {
       in.verdict = observed;
       return in;
     }

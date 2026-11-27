@@ -4,6 +4,7 @@
 namespace present_original_handoff_cases {
 
 namespace guard = renodx::addons::dlss5::detour_guard;
+namespace ui = renodx::addons::dlss5::ui;
 
 static native::DirectInitFn real_init = nullptr;
 static native::DirectShutdownFn real_shutdown = nullptr;
@@ -13,6 +14,7 @@ static native::DirectEvaluateFn real_evaluate = nullptr;
 static ID3D12Device* expected_recording_face = nullptr;
 static thread_local bool inside_nr = false;
 static uint64_t real_creates = 0;
+static bool fail_cold_create = false;
 static uint64_t exact_create_lists = 0;
 static uint64_t nr_native_heap_bindings = 0;
 static uint64_t nr_bad_heap_bindings = 0;
@@ -25,6 +27,20 @@ using BackbufferGetDeviceFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Resource*, REFII
 static BackbufferGetDeviceFn real_backbuffer_get_device = nullptr;
 static thread_local ID3D12Resource* backbuffer_without_face = nullptr;
 static thread_local uint32_t unavailable_face_queries = 0;
+using SwapchainGetDeviceFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain3*, REFIID, void**);
+static SwapchainGetDeviceFn real_swapchain_get_device = nullptr;
+static thread_local IDXGISwapChain3* swapchain_without_host_face = nullptr;
+static thread_local ID3D12Device* native_swapchain_face = nullptr;
+
+static HRESULT STDMETHODCALLTYPE UnavailableSwapchainHostFace(IDXGISwapChain3* swapchain, REFIID iid, void** output) {
+  if (swapchain == swapchain_without_host_face && iid == __uuidof(ID3D12Device)) {
+    if (native_swapchain_face != nullptr) return native_swapchain_face->QueryInterface(iid, output);
+    if (output == nullptr) return E_POINTER;
+    *output = nullptr;
+    return E_NOINTERFACE;
+  }
+  return real_swapchain_get_device(swapchain, iid, output);
+}
 
 static HRESULT STDMETHODCALLTYPE UnavailableBackbufferFace(ID3D12Resource* resource, REFIID iid, void** output) {
   if (resource == backbuffer_without_face && iid == __uuidof(ID3D12Device)) {
@@ -63,6 +79,9 @@ static NVSDK_NGX_Result NVSDK_CONV ObserveCreate(ID3D12GraphicsCommandList* list
   ComPtr<ID3D12Device> face;
   if (list != nullptr && SUCCEEDED(list->GetDevice(IID_PPV_ARGS(&face))) && face.Get() == expected_recording_face) {
     ++exact_create_lists;
+  }
+  if (fail_cold_create) {
+    return NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
   }
   const bool previous = inside_nr;
   inside_nr = true;
@@ -108,9 +127,9 @@ inline int Run(const char* project_id_path, const char* variant) {
     if (variant != nullptr) {
       case_name = variant;
       Check(case_name == "hot" || case_name == "cold" || case_name == "cold-recording-face"
-                || case_name == "cold-native-sdk-tag"
+                || case_name == "cold-native-sdk-tag" || case_name == "cold-unbound-sr-layout"
                 || case_name == "core-live" || case_name == "core-idle",
-            "present-original-handoff variant must be hot, cold, cold-recording-face, cold-native-sdk-tag, core-live or core-idle");
+            "unknown present-original-handoff variant");
     } else {
       const bool legacy_cold = GetEnvironmentVariableW(L"NR_NEXUS_TEST_LAD_COLD_EPOCH", nullptr, 0) != 0;
       wchar_t core_first_mode[16]{};
@@ -122,7 +141,8 @@ inline int Run(const char* project_id_path, const char* variant) {
                                     : (core_mode == L"idle" ? "core-idle" : "core-live"));
     }
     const bool cold_epoch = case_name == "cold";
-    const bool cold_recording_face = case_name == "cold-recording-face";
+    const bool cold_unbound_layout = case_name == "cold-unbound-sr-layout";
+    const bool cold_recording_face = case_name == "cold-recording-face" || cold_unbound_layout;
     const bool cold_native_sdk_tag = case_name == "cold-native-sdk-tag";
     const bool cold_face_start = cold_recording_face || cold_native_sdk_tag;
     const UINT width = cold_face_start ? 3840 : 960;
@@ -286,6 +306,11 @@ inline int Run(const char* project_id_path, const char* variant) {
       real_addon.reset(module);
       register_event(module, reshade::addon_event::init_effect_runtime, reinterpret_cast<void*>(
           +[](reshade::api::effect_runtime* runtime) { observed_effects_runtime = runtime; }));
+    }
+    if (cold_recording_face) {
+      const auto create_factory = reinterpret_cast<decltype(&CreateDXGIFactory1)>(GetProcAddress(host, "CreateDXGIFactory1"));
+      Check(create_factory != nullptr && SUCCEEDED(create_factory(IID_PPV_ARGS(gpu.factory.ReleaseAndGetAddressOf()))),
+            "cold recording uses the real ReShade DXGI factory for its wrapped output");
     }
     Session session(&gpu, 0, 1, DXGI_FORMAT_R8G8B8A8_UNORM, (core_first || cold_face_start) ? queue : nullptr);
     real_addon.reset();
@@ -486,8 +511,8 @@ inline int Run(const char* project_id_path, const char* variant) {
             Check(!tagged_frame.rejected && guide.resource != nullptr
                       && guide.recording_device.Get() == (cold_native_sdk_tag ? nullptr : expected_recording_face)
                       && guide.native_recording_device.Get() == (cold_native_sdk_tag ? expected_recording_face : nullptr)
-                      && guide.data.size.x == guide_width && guide.data.size.y == guide_height,
-                  "the current 1440p SDK tag retains the exact command-list device for this frame");
+                      && guide.data.size.x == session.extent_width && guide.data.size.y == session.extent_height,
+                  "the current SDK tag retains its declared extent and exact command-list device");
           }
         }
         session.extent_width = width;
@@ -782,6 +807,23 @@ inline int Run(const char* project_id_path, const char* variant) {
                 && session.context->bridge_proxy_ready && color->GetDesc().Width == width && color->GetDesc().Height == height
                 && SUCCEEDED(color->GetDevice(IID_PPV_ARGS(&ordinary_color_face))),
             "the registered 4K output initially reaches XeFG through only its native SDK queue");
+      if (cold_recording_face) {
+        ComPtr<ID3D12Device> swapchain_face;
+        Check(SUCCEEDED(session.proxy->GetDevice(IID_PPV_ARGS(&swapchain_face)))
+                  && swapchain_face.Get() == expected_recording_face,
+              "the actual ReShade output exposes its wrapped device interface");
+      }
+      native::d3d12_swapchain_seen = true;
+      const auto check_status = [&](fg::Result result, const char* reason, ui::CardId id, ui::CardTone tone) {
+        const auto output = session.context->output_identity;
+        const auto status = xefg::ReadStatus(output);
+        const auto inputs = native::CollectCardInputs(output);
+        const auto card = ui::ComputeStatusCard(inputs);
+        Check(status && status->outcome == result && xefg::CurrentResult() == result
+                  && std::string_view(inputs.verdict.ReasonName()) == reason && card.id == id && card.tone == tone
+                  && inputs.fg_submitted_frames.has_value() == fg::Submitted(result),
+              "the selected output HUD reflects the settled cold-start result");
+      };
       const auto ordinary_writes = native::present_ring.submitted;
       const auto expect_unedited = [&](uint8_t seed) {
         return consumed.size() == static_cast<size_t>(width) * height * 4
@@ -825,8 +867,22 @@ inline int Run(const char* project_id_path, const char* variant) {
       Check(Hooks::Enable(session.handle, 1) == 0 && session.context->enabled && !session.context->fresh_id,
             "the game enables the actual SDK before publishing any Present ID or tags");
       const DXGI_PRESENT_PARAMETERS full_present{};
-      Check(adapter::ProxyHooks<0>::Present1(session.proxy.Get(), 0, 0, &full_present) == S_OK,
-            "the first full SDK call goes through the adapter and the current original consumer");
+      {
+        renodx::utils::vtable::Slot<SwapchainGetDeviceFn> host_observation{.object = session.proxy.Get(), .index = 7,
+            .original = &real_swapchain_get_device, .replacement = &UnavailableSwapchainHostFace};
+        renodx::utils::vtable::Install(&host_observation);
+        const auto restore_host = [](auto* slot) {
+          swapchain_without_host_face = nullptr;
+          native_swapchain_face = nullptr;
+          renodx::utils::vtable::Uninstall(slot);
+        };
+        const std::unique_ptr<decltype(host_observation), decltype(restore_host)> restore(&host_observation, restore_host);
+        swapchain_without_host_face = session.proxy.Get();
+        // Model the 6A7E boundary: DXGI reports only the real native device.
+        native_swapchain_face = (cold_native_sdk_tag ? native_device.Get() : nullptr);
+        Check(adapter::ProxyHooks<0>::Present1(session.proxy.Get(), 0, 0, &full_present) == S_OK,
+              "the original consumer runs before a recording face can be established");
+      }
       const auto untagged_result = xefg::CurrentResult();
       const auto untagged_call = session.context->present_serial;
       const auto untagged_inits = real_inits;
@@ -841,63 +897,144 @@ inline int Run(const char* project_id_path, const char* variant) {
       Check(untagged_inits == 0 && untagged_creates == 0 && untagged_evaluates == 0 && consumer_reads == 1 && expect_unedited(47)
                 && (cold_native_sdk_tag || unavailable_face_queries != 0) && native::present_ring.submitted == ordinary_writes
                 && session.context->proxy_recording_device == nullptr
-                && untagged_result == fg::Result::PREPARED,
+                && untagged_result == fg::Result::PENDING,
             "the first complete but untagged SDK call leaves current color and defers model work until the recording face is known");
+      check_status(fg::Result::PENDING, "fg_pending", ui::CardId::kStarting, ui::CardTone::kIdle);
 
-      const auto first_tagged_reads = consumer_reads;
-      const auto first_tagged_delivered = run_xefg(53);
-      const auto first_tagged_result = xefg::CurrentResult();
-      const auto first_tagged_call = session.context->present_serial;
-      std::cout << "COLD_RECORDING_FACE phase=first-tagged sdk_call=" << first_tagged_call
-                << " creates=" << real_creates << " evaluates=" << native_runtime_evaluations.size()
-                << " signed_creates_on_expected_face=" << exact_create_lists << " native_tag=" << cold_native_sdk_tag
-                << " result=" << static_cast<int>(first_tagged_result) << std::endl;
-      const auto& service = native::fg_service::streams.at(stream_key);
-      Check(real_creates == passes && exact_create_lists == passes && stream_contract()
-                && service.submitted != 0 && service.fence != nullptr && service.fence->GetCompletedValue() >= service.submitted
-                && service.fence->GetCompletedValue() != UINT64_MAX && consumer_reads == first_tagged_reads + 1,
-            "the first recorded SDK tags prove the recording interface and submit the two-pass group on that frame");
-      const bool first_tagged_prepared = first_tagged_result == fg::Result::PREPARED
-          && native_runtime_evaluations.empty() && expect_unedited(53);
-      Check(first_tagged_prepared || (first_tagged_delivered && edited(53) > 0),
-            "the first eligible tagged frame prepares without editing or delivers its own complete color");
-      const auto& feature = native::features.at(ordinary.Handle());
-      const std::array models{feature.slots[0].handle, feature.slots[1].handle};
-      Check(models[0] != nullptr && models[1] != nullptr && models[0] != models[1],
-            "the first completed preparation belongs to one distinct two-pass pair");
-      const auto first_delivery_before = native_runtime_evaluations.size();
-      const auto recovery_reads = consumer_reads;
-      Check(run_xefg(59) && edited(59) > 0 && consumer_reads == recovery_reads + 1
-                && native_runtime_evaluations[first_delivery_before].model == models[0]
-                && native_runtime_evaluations[first_delivery_before + 1].model == models[1]
-                && real_creates == passes && native::present_ring.submitted == ordinary_writes,
-            "the next tagged frame uses the same two models and delivers once to the current SDK consumer");
-      for (const auto& evaluated : std::span{native_runtime_evaluations}.subspan(first_delivery_before, passes)) {
-        Check(evaluated.depth != nullptr && evaluated.motion != nullptr
-                  && evaluated.depth->GetDesc().Width == guide_width && evaluated.depth->GetDesc().Height == guide_height
-                  && evaluated.motion->GetDesc().Width == guide_width && evaluated.motion->GetDesc().Height == guide_height,
-              "the first recovered evaluations use current 1440p depth and motion");
-      }
-      const auto recovered_pixels = edited(59);
-      const auto ordinary_callbacks = native::presents_observed.load();
-      Check(!cold_native_sdk_tag || (ordinary_callbacks == 0 && ordinary.ordinary_observed_face == nullptr
-                && session.context->proxy_recording_device == nullptr),
-            "the native SDK tags supply the recording interface without any ordinary callback or SDK wrapper device");
-      std::cout << "COLD_RECORDING_FACE phase=recovered sdk_call=" << session.context->present_serial
-                << " first_read_edited_pixels=" << recovered_pixels << " same_models=" << true << std::endl;
-      auto& cold_receipt = receipt[cold_native_sdk_tag ? "cold_native_sdk_tag" : "cold_recording_face"];
-      cold_receipt = {{"output_extent", {width, height}}, {"guide_extent", {guide_width, guide_height}},
-          {"untagged_call", untagged_call}, {"untagged_inits", untagged_inits},
-          {"untagged_creates", untagged_creates}, {"untagged_evaluates", untagged_evaluates},
-          {"unavailable_ordinary_face_queries", unavailable_face_queries},
-          {"untagged_first_read_unedited", true}, {"first_tagged_call", first_tagged_call},
-          {"first_tagged_prepared_only", first_tagged_prepared},
-          {"first_tagged_current_read", true}, {"recovery_same_pair", true}, {"recovery_first_read_edited_pixels", recovered_pixels}};
-      if (cold_native_sdk_tag) {
+      if (cold_recording_face) {
+        Check(Hooks::Enable(session.handle, 0) == 0, "earlier ordinary SR records while the SDK is Off");
+        const auto offscreen = (cold_unbound_layout ? gpu.Texture(width, height, DXGI_FORMAT_R16G16B16A16_FLOAT)
+                                                     : ComPtr<ID3D12Resource>{});
+        auto* const sr_output = (offscreen != nullptr ? offscreen.Get() : color.Get());
+        prepare_seed(49);
+        const auto before_capture = native::present_capture_serial;
+        {
+          const renodx::addons::dlss5::ngx_serial::PresentTurn turn(true);
+          Check(turn.owns(), "the ordinary SR capture owns the NGX turn");
+          const renodx::addons::dlss5::RuntimeLock lock(native::runtime_mutex);
+          const renodx::addons::dlss5::EvaluateChainScope chain;
+          auto& block = native::FillPresentBlock(&ordinary, sr_output, motion.Get(), depth.Get(), contract,
+                                                  width, height, 1.f, 0);
+          native::CapturePresentGuides(gpu.list.Get(), ordinary.Handle(), &block,
+              D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON, false, true);
+        }
+        submit();
+        const auto capture = std::ranges::find_if(native::present_guide_sets, [&](const auto& set) {
+          return set.serial > before_capture;
+        });
+        Check(capture != std::end(native::present_guide_sets) && capture->serial != 0
+                  && capture->contract.input_width == guide_width && capture->contract.input_height == guide_height,
+              "the real submitted ordinary capture records its actual 1440p layout");
+        Check(cold_unbound_layout ? !capture->cold_layout.owner : capture->cold_layout.owner == ordinary.output,
+              "only the physical output binding can assign the capture's guide layout");
+        Check(Hooks::Enable(session.handle, 1) == 0, "the same physical output moves to a new SDK epoch");
+        output_framerate_registration_cases::Dispatch<reshade::addon_event::present>(
+            &route->queue, &*route, static_cast<const reshade::api::rect*>(nullptr),
+            static_cast<const reshade::api::rect*>(nullptr), 0u, static_cast<const reshade::api::rect*>(nullptr));
+        native::OnFinishPresent(&route->queue, &*route);
+        Check(capture->serial == 0 && (capture->cold_layout.serial > before_capture) != cold_unbound_layout,
+              "XeFG takeover withdraws guide images and retains only a bound creation layout");
+        Check(!session.context->fresh_id && adapter::ProxyHooks<0>::Present1(session.proxy.Get(), 0, 0, &full_present) == S_OK
+                  && real_creates == passes && exact_create_lists == passes && consumer_reads == 2
+                  && native_runtime_evaluations.empty() && expect_unedited(49) && stream_contract(),
+              "the current ReShade output starts real Optional-guide preparation without a Present ID or tags");
+        check_status(fg::Result::PREPARED, "fg_preparing", ui::CardId::kFgPreparing, ui::CardTone::kIdle);
+        const auto& prepared = native::features.at(ordinary.Handle());
+        const std::array models{prepared.slots[0].handle, prepared.slots[1].handle};
+        const auto& preparation = native::fg_service::streams.at(stream_key);
+        const uint32_t expected_flags = (cold_unbound_layout ? NVSDK_NGX_DLSS_Feature_Flags_DepthInverted : contract.create_flags);
+        Check(models[0] != nullptr && models[1] != nullptr && models[0] != models[1] && preparation.submitted == 1
+                  && preparation.fence->GetCompletedValue() >= preparation.submitted
+                  && ordinary.warm_color.has_real_layout != cold_unbound_layout
+                  && ordinary.warm_color.guide_width == (cold_unbound_layout ? width : guide_width)
+                  && ordinary.warm_color.guide_height == (cold_unbound_layout ? height : guide_height)
+                  && std::ranges::all_of(std::span{prepared.slots}.first(passes), [&](const auto& model) {
+                       return model.nr_create_flags == expected_flags;
+                     }),
+              "the first wrapped-face preparation uses the verified layout or the normal Optional fallback");
+        Check(run_xefg(51, false) && edited(51) > 0 && real_creates == passes && native_runtime_evaluations.size() == passes
+                  && native_runtime_evaluations[0].model == models[0] && native_runtime_evaluations[1].model == models[1],
+              "the first usable pair delivers its current color on the original SDK first read");
+        check_status(fg::Result::SUBMITTED, "-", ui::CardId::kActive, ui::CardTone::kGood);
+        const auto recovered_pixels = edited(51);
+        if (cold_unbound_layout) {
+          Check(!run_xefg(53) && xefg::CurrentResult() == fg::Result::PREPARED && real_creates == 2 * passes
+                    && native_runtime_evaluations.size() == passes && expect_unedited(53),
+                "the first actual SDK guide contract prepares its own group when prior SR was unbound");
+          Check(run_xefg(55) && edited(55) > 0 && real_creates == 2 * passes,
+                "the new guide contract matures and delivers without another rebuild");
+          receipt["cold_unbound_sr_layout"] = {{"offscreen_guide_extent", {guide_width, guide_height}},
+              {"initial_flags", expected_flags}, {"initial_creates", passes}, {"first_tagged_create_delta", passes}};
+        } else {
+          Check(run_xefg(53) && edited(53) > 0 && real_creates == passes && native_runtime_evaluations.size() == 2 * passes
+                    && native_runtime_evaluations[passes].model == models[0] && native_runtime_evaluations[passes + 1].model == models[1],
+                "the first matching real SDK guides deliver with the same two slots and zero new Create calls");
+          {
+            funnel_accounting_tests::Restore restore;
+            restore.Value(&fail_cold_create);
+            fail_cold_create = true;
+            Check(!run_xefg(55, true, true) && real_creates > passes && native_runtime_evaluations.size() == 2 * passes && expect_unedited(55),
+                  "a Create failure when real guides change the contract leaves the original input untouched");
+          }
+          check_status(fg::Result::FAILED, "fg_handoff_failed", ui::CardId::kNotRunning, ui::CardTone::kWarn);
+          receipt["cold_recording_face"] = {{"untagged_pending", true}, {"untagged_inits", untagged_inits},
+              {"untagged_call", untagged_call}, {"untagged_creates", untagged_creates},
+              {"prepared_on_verified_host_face", true}, {"prepared_passes", passes}, {"ordinary_layout", {guide_width, guide_height}},
+              {"matching_tagged_create_delta", 0},
+              {"first_ready_same_pair", true}, {"first_read_edited_pixels", recovered_pixels}, {"injected_create_failure_warned", true}};
+        }
+      } else {
+        const auto first_tagged_reads = consumer_reads;
+        const auto first_tagged_delivered = run_xefg(53);
+        const auto first_tagged_result = xefg::CurrentResult();
+        const auto first_tagged_call = session.context->present_serial;
+        std::cout << "COLD_RECORDING_FACE phase=first-tagged sdk_call=" << first_tagged_call
+                  << " creates=" << real_creates << " evaluates=" << native_runtime_evaluations.size()
+                  << " signed_creates_on_expected_face=" << exact_create_lists << " native_tag=" << cold_native_sdk_tag
+                  << " result=" << static_cast<int>(first_tagged_result) << std::endl;
+        const auto& service = native::fg_service::streams.at(stream_key);
+        Check(real_creates == passes && exact_create_lists == passes && stream_contract()
+                  && service.submitted != 0 && service.fence != nullptr && service.fence->GetCompletedValue() >= service.submitted
+                  && service.fence->GetCompletedValue() != UINT64_MAX && consumer_reads == first_tagged_reads + 1,
+              "the first recorded SDK tags prove the recording interface and submit the two-pass group on that frame");
+        const bool first_tagged_prepared = first_tagged_result == fg::Result::PREPARED
+            && native_runtime_evaluations.empty() && expect_unedited(53);
+        Check(first_tagged_prepared || (first_tagged_delivered && edited(53) > 0),
+              "the first eligible tagged frame prepares without editing or delivers its own complete color");
+        const auto& feature = native::features.at(ordinary.Handle());
+        const std::array models{feature.slots[0].handle, feature.slots[1].handle};
+        Check(models[0] != nullptr && models[1] != nullptr && models[0] != models[1],
+              "the first completed preparation belongs to one distinct two-pass pair");
+        const auto first_delivery_before = native_runtime_evaluations.size();
+        const auto recovery_reads = consumer_reads;
+        Check(run_xefg(59) && edited(59) > 0 && consumer_reads == recovery_reads + 1
+                  && native_runtime_evaluations[first_delivery_before].model == models[0]
+                  && native_runtime_evaluations[first_delivery_before + 1].model == models[1]
+                  && real_creates == passes && native::present_ring.submitted == ordinary_writes,
+              "the next tagged frame uses the same two models and delivers once to the current SDK consumer");
+        for (const auto& evaluated : std::span{native_runtime_evaluations}.subspan(first_delivery_before, passes)) {
+          Check(evaluated.depth != nullptr && evaluated.motion != nullptr
+                    && evaluated.depth->GetDesc().Width == guide_width && evaluated.depth->GetDesc().Height == guide_height
+                    && evaluated.motion->GetDesc().Width == guide_width && evaluated.motion->GetDesc().Height == guide_height,
+                "the first recovered evaluations use current 1440p depth and motion");
+        }
+        const auto recovered_pixels = edited(59);
+        const auto ordinary_callbacks = native::presents_observed.load();
+        Check(!cold_native_sdk_tag || (ordinary_callbacks == 0 && ordinary.ordinary_observed_face == nullptr
+                  && session.context->proxy_recording_device == nullptr),
+              "the native SDK tags supply the recording interface without any ordinary callback or SDK wrapper device");
+        std::cout << "COLD_RECORDING_FACE phase=recovered sdk_call=" << session.context->present_serial
+                  << " first_read_edited_pixels=" << recovered_pixels << " same_models=" << true << std::endl;
+        auto& cold_receipt = receipt["cold_native_sdk_tag"];
+        cold_receipt = {{"output_extent", {width, height}}, {"guide_extent", {guide_width, guide_height}},
+            {"untagged_call", untagged_call}, {"untagged_inits", untagged_inits},
+            {"untagged_creates", untagged_creates}, {"untagged_evaluates", untagged_evaluates},
+            {"unavailable_ordinary_face_queries", unavailable_face_queries},
+            {"untagged_first_read_unedited", true}, {"first_tagged_call", first_tagged_call},
+            {"first_tagged_prepared_only", first_tagged_prepared},
+            {"first_tagged_current_read", true}, {"recovery_same_pair", true}, {"recovery_first_read_edited_pixels", recovered_pixels}};
         cold_receipt["first_tagged_creates_on_native_face"] = exact_create_lists;
         cold_receipt["ordinary_callbacks"] = ordinary_callbacks;
-      } else {
-        cold_receipt["first_tagged_creates_on_reshade_face"] = exact_create_lists;
       }
     } else if (cold_epoch) {
       ComPtr<ID3D12Fence> gate;
@@ -934,9 +1071,12 @@ inline int Run(const char* project_id_path, const char* variant) {
       std::cout << "cold_epoch_held creates=" << real_creates << " evals=" << native_runtime_evaluations.size()
                 << " result=" << static_cast<int>(xefg::CurrentResult()) << " old_fence="
                 << outgoing_fence->GetCompletedValue() << '/' << outgoing_value << std::endl;
-      Check(real_creates == passes && native_runtime_evaluations.empty() && xefg::CurrentResult() != fg::Result::SUBMITTED
+      const auto pending_status = xefg::ReadStatus(session.context->output_identity);
+      Check(real_creates == passes && native_runtime_evaluations.empty() && xefg::CurrentResult() == fg::Result::PENDING
+                && pending_status && pending_status->outcome == fg::Result::PENDING
+                && native::fg_service::streams.at(stream_key).submitted == 0
                 && !ordinary.warm_color.complete && outgoing_fence->GetCompletedValue() < outgoing_value,
-            "a new epoch cannot duplicate, mature or use the still-in-flight pair");
+            "a new epoch reports PENDING with zero submissions while an earlier pair is still in flight");
       Check(SUCCEEDED(gate->Signal(1)), "release the old model preparation only after checking the new epoch");
       wait_fence(outgoing_fence.fence, outgoing_value);
       const auto reads_before = consumer_reads;
@@ -955,6 +1095,7 @@ inline int Run(const char* project_id_path, const char* variant) {
           {"held_original_fence_value", outgoing_value}, {"creates_before_old_gpu_completed", passes},
           {"total_creates", real_creates}, {"first_pass_retained", true}, {"both_passes_retained", true}, {"first_ready_frame", frame_id},
           {"first_mature_current_color", true}, {"evals_before_ready", 0}, {"create_second_published_color", false},
+          {"wait_without_submission_pending", true},
           {"both_recorded_models_at_first_sdk_read", true}};
     } else {
       Check(Hooks::Enable(session.handle, 1) == 0, "SDK really enables XeFG");
@@ -1126,10 +1267,26 @@ inline int Run(const char* project_id_path, const char* variant) {
             effects, static_cast<reshade::api::command_list*>(nullptr),
             reshade::api::resource_view{}, reshade::api::resource_view{});
       };
-      constexpr uint8_t fx_marker = 239;
-      auto marker = gpu.Texture(1, 1, color->GetDesc().Format);
-      gpu.Write(marker.Get(), fx_marker);
+      constexpr uint8_t ui_marker = 239;
+      constexpr uint8_t scene_marker = 61;
+      constexpr UINT marker_width = 32, marker_height = 16;
+      const UINT fx_width = width / 2, fx_height = height / 2;
+      const UINT scene_x = fx_width + marker_width, scene_y = fx_height + marker_height;
+      auto marker = gpu.Texture(marker_width, marker_height, color->GetDesc().Format);
+      auto scene = gpu.Texture(marker_width, marker_height, color->GetDesc().Format);
+      auto fx_source = gpu.Texture(fx_width, fx_height, color->GetDesc().Format);
+      const auto pre_fx_readback = gpu.CreateTextureTransfer(color.Get());
+      const auto pre_sdk_readback = gpu.CreateTextureTransfer(color.Get());
+      gpu.Write(marker.Get(), ui_marker);
+      gpu.Write(scene.Get(), scene_marker);
       submit();
+      const auto copy_region = [&](ID3D12Resource* dst, UINT x, UINT y, ID3D12Resource* src, const D3D12_BOX* box) {
+        const D3D12_TEXTURE_COPY_LOCATION source{.pResource = src,
+            .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = 0};
+        const D3D12_TEXTURE_COPY_LOCATION destination{.pResource = dst,
+            .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = 0};
+        gpu.list->CopyTextureRegion(&destination, x, y, 0, &source, box);
+      };
       const auto warm_optional = [&] {
         for (const auto seed : std::array<uint8_t, 3>{161, 163, 167}) {
           const auto before = native_runtime_evaluations.size();
@@ -1265,15 +1422,17 @@ inline int Run(const char* project_id_path, const char* variant) {
       auto alternate_route_queue = route->queue;
       alternate_route_queue.native = alternate_queue.Get();
       enum class OrdinaryEvent { NESTED, STANDALONE, FX_STARTED, COMPOSITION, ALTERNATE_QUEUE };
-      enum class SdkMethod { PRESENT, FULL_PRESENT1, SCROLL_PRESENT1 };
+      enum class SdkMethod { PRESENT, FULL_PRESENT1, SCROLL_PRESENT1, LOCAL_PRESENT1 };
       enum class SdkState { DISABLE, KEEP_ENABLED };
       const auto hot_present = [&](const char* phase, uint8_t seed, OrdinaryEvent event, SdkMethod method,
                                    SdkState sdk_state = SdkState::DISABLE) {
-        const bool expect_edit = event == OrdinaryEvent::NESTED;
         const bool standalone = event == OrdinaryEvent::STANDALONE;
         const bool effects_already_started = event == OrdinaryEvent::FX_STARTED;
         const bool scroll = method == SdkMethod::SCROLL_PRESENT1;
+        const bool local = method == SdkMethod::LOCAL_PRESENT1;
         const bool sdk_enabled = sdk_state == SdkState::KEEP_ENABLED;
+        const bool expect_late_edit = standalone && !sdk_enabled && !scroll && !local;
+        const bool expect_early_edit = event == OrdinaryEvent::NESTED;
         const auto before_warmup = native_runtime_evaluations.size();
         Check(run_xefg(159) && edited(159) > 0 && with_same_models(before_warmup),
               "the current SDK declaration first publishes the two real-guide passes");
@@ -1283,6 +1442,12 @@ inline int Run(const char* project_id_path, const char* variant) {
         } else {
           prepare_seed(seed);
         }
+        gpu.Transition(scene.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        gpu.Transition(color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        copy_region(color.Get(), scene_x, scene_y, scene.Get(), nullptr);
+        gpu.Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        gpu.Transition(scene.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        submit();
         const auto evaluations = native_runtime_evaluations.size();
         const auto writes = native::present_ring.submitted;
         const auto service_writes = sdk_enabled ? native::fg_service::streams.at(stream_key).submitted : 0;
@@ -1311,19 +1476,29 @@ inline int Run(const char* project_id_path, const char* variant) {
                   ? reinterpret_cast<const reshade::api::rect*>(observed_sdk_parameters->pDirtyRects) : nullptr);
           pre_fx_writes = native::present_ring.submitted - writes;
           pre_fx_evaluates = native_runtime_evaluations.size() - evaluations;
+          if (standalone) {
+            gpu.Transition(color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            gpu.RecordTextureReadback(color.Get(), pre_fx_readback);
+            gpu.Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            submit();
+          }
           if (!effects_already_started) {
             observe_fx_begin();
           }
           if (pre_fx_writes != 0) {
             wait_fence(native::present_ring.fence, native::present_ring.submitted);
           }
+          // The FX result depends on scene color. The opaque UI covers part of that result.
+          const D3D12_BOX fx_input{fx_width, fx_height, 0, 2 * fx_width, 2 * fx_height, 1};
+          gpu.Transition(color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+          gpu.Transition(fx_source.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+          copy_region(fx_source.Get(), 0, 0, color.Get(), &fx_input);
+          gpu.Transition(fx_source.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+          gpu.Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+          copy_region(color.Get(), 0, 0, fx_source.Get(), nullptr);
+          gpu.Transition(fx_source.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
           gpu.Transition(marker.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-          gpu.Transition(color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-          const D3D12_TEXTURE_COPY_LOCATION marker_src{.pResource = marker.Get(),
-              .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = 0};
-          const D3D12_TEXTURE_COPY_LOCATION marker_dst{.pResource = color.Get(),
-              .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, .SubresourceIndex = 0};
-          gpu.list->CopyTextureRegion(&marker_dst, 0, 0, 0, &marker_src, nullptr);
+          copy_region(color.Get(), 0, 0, marker.Get(), nullptr);
           gpu.Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
           gpu.Transition(marker.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
           submit();
@@ -1341,6 +1516,12 @@ inline int Run(const char* project_id_path, const char* variant) {
         } else {
           Check(Hooks::Enable(session.handle, 0) == 0 && !session.context->enabled,
                 "the actual Disable returns before the SDK call");
+        }
+        if (standalone) {
+          gpu.Transition(color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+          gpu.RecordTextureReadback(color.Get(), pre_sdk_readback);
+          gpu.Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+          submit();
         }
         funnel_accounting_tests::Restore callbacks;
         callbacks.Value(&before_first_consumer);
@@ -1367,15 +1548,15 @@ inline int Run(const char* project_id_path, const char* variant) {
         HRESULT status = E_FAIL;
         if (method != SdkMethod::PRESENT) {
           // In the standalone phases this argument first exists after the ordinary callback and FX.
-          RECT full_rect{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+          RECT dirty_rect{0, 0, static_cast<LONG>(local ? fx_width : width), static_cast<LONG>(height)};
           RECT scroll_rect{0, 0, static_cast<LONG>(width - 1), static_cast<LONG>(height)};
           POINT offset{1, 0};
           const DXGI_PRESENT_PARAMETERS parameters{
-              .DirtyRectsCount = scroll ? 0u : 1u, .pDirtyRects = scroll ? nullptr : &full_rect,
+              .DirtyRectsCount = scroll ? 0u : 1u, .pDirtyRects = scroll ? nullptr : &dirty_rect,
               .pScrollRect = scroll ? &scroll_rect : nullptr, .pScrollOffset = scroll ? &offset : nullptr};
           uint32_t forwarded = 0;
           inspect_original_present1 = [&](const DXGI_PRESENT_PARAMETERS* actual) {
-            Check(actual == &parameters && actual->pDirtyRects == (scroll ? nullptr : &full_rect)
+            Check(actual == &parameters && actual->pDirtyRects == (scroll ? nullptr : &dirty_rect)
                       && actual->pScrollRect == (scroll ? &scroll_rect : nullptr)
                       && actual->pScrollOffset == (scroll ? &offset : nullptr) && effects_finished == standalone,
                   "the original receives the exact SDK Present1 arguments before a nested callback or after standalone FX");
@@ -1391,37 +1572,82 @@ inline int Run(const char* project_id_path, const char* variant) {
         }
         Check(status == S_OK && consumer_reads == reads + 1,
               "the exact outer call forwards to one original first read");
-        Check(sdk_enabled || !scroll || (sdk_input_rejection != nullptr
+        Check(sdk_enabled || (!scroll && !local) || (sdk_input_rejection != nullptr
                   && std::string_view(sdk_input_rejection) == "off_full_color_region_unconfirmed"),
-              "the Off SDK consumer rejects the actual scroll geometry");
-        Check(consumed.size() == static_cast<size_t>(width) * height * 4
-                  && std::ranges::all_of(std::span{consumed}.first(4), [](uint8_t channel) { return channel == fx_marker; }),
-              "the first original SDK GPU read preserves the composed FX/UI marker");
+              "the Off SDK consumer refuses a scrolling or partial-region edit");
+        const auto before_fx = (standalone ? gpu.ReadTexture(pre_fx_readback) : std::vector<uint8_t>{});
+        const auto before_sdk = (standalone ? gpu.ReadTexture(pre_sdk_readback) : std::vector<uint8_t>{});
+        Check(consumed.size() == static_cast<size_t>(width) * height * 4, "the SDK first reads a complete surface");
         size_t edited_pixels = 0;
-        for (size_t offset = 4; offset < consumed.size(); offset += 4) {
-          Check(consumed[offset + 3] == seed, "the first original SDK GPU read uses the current frame's alpha");
-          edited_pixels += consumed[offset] != seed || consumed[offset + 1] != seed || consumed[offset + 2] != seed;
+        size_t fx_edited_pixels = 0;
+        for (UINT y = 0; y < height; ++y) {
+          for (UINT x = 0; x < width; ++x) {
+            const auto offset = (static_cast<size_t>(y) * width + x) * 4;
+            const auto pixel = std::span{consumed}.subspan(offset, 4);
+            const bool ui = x < marker_width && y < marker_height;
+            const bool fx = x < fx_width && y < fx_height;
+            const bool scene_stamp = x >= scene_x && x < scene_x + marker_width
+                && y >= scene_y && y < scene_y + marker_height;
+            const bool fx_stamp = fx && x >= marker_width && x < 2 * marker_width
+                && y >= marker_height && y < 2 * marker_height;
+            const uint8_t raw = (scene_stamp ? scene_marker : seed);
+            const uint8_t composed = (ui ? ui_marker : (fx_stamp ? scene_marker : raw));
+            if (standalone) {
+              Check(std::ranges::all_of(std::span{before_fx}.subspan(offset, 4), [raw](auto byte) { return byte == raw; }),
+                    "standalone pre-FX does not publish speculative NR to the swapchain");
+              Check(std::ranges::all_of(std::span{before_sdk}.subspan(offset, 4),
+                          [composed](auto byte) { return byte == composed; }),
+                    "the public buffer still contains the unmodified FX/UI composition before SDK geometry arrives");
+            }
+            Check(pixel[3] == composed, "first SDK read preserves the current composed alpha");
+            if (ui) {
+              Check(std::ranges::all_of(pixel, [](auto byte) { return byte == ui_marker; }), "first SDK read preserves every UI pixel");
+            } else if (fx) {
+              const auto source_offset = ((static_cast<size_t>(y) + fx_height) * width + x + fx_width) * 4;
+              Check(std::ranges::equal(pixel, std::span{consumed}.subspan(source_offset, 4)),
+                    "first SDK read contains FX composed from the matching scene pixels");
+            }
+            const bool changed = pixel[0] != composed || pixel[1] != composed || pixel[2] != composed;
+            edited_pixels += !ui && !fx && changed;
+            fx_edited_pixels += !ui && fx && changed;
+          }
         }
+        const auto evaluations_delta = native_runtime_evaluations.size() - evaluations;
+        const auto writes_delta = native::present_ring.submitted - writes;
+        const auto& handoff = session.context->last_handoff_write;
+        const bool claimed = handoff.call == session.context->present_serial && handoff.ordinary_executed;
         const auto* input_outcome = sdk_enabled ? "n/a" : (sdk_input_rejection != nullptr ? sdk_input_rejection : "none");
         std::cout << "HOT_PRESENT phase=" << phase << " ordinary_writes=" << pre_fx_writes
                   << " pre_fx_evaluates=" << pre_fx_evaluates << " first_read_edited_pixels=" << edited_pixels
+                  << " fx_edited_pixels=" << fx_edited_pixels << " evaluations=" << evaluations_delta
+                  << " ordinary_writes_total=" << writes_delta << " off_color_claim=" << claimed
                   << " pre_effects_outcome=" << (pre_fx_writes != 0 ? "submitted" : "no_write")
                   << " sdk_enabled=" << sdk_enabled << " sdk_call=" << session.context->present_serial
                   << " sdk_input_rejection=" << input_outcome << std::endl;
-        Check(native::present_ring.submitted == writes + pre_fx_writes
-                  && (!sdk_enabled || native::fg_service::streams.at(stream_key).submitted == service_writes)
-                  && native_runtime_evaluations.size() == evaluations + pre_fx_evaluates && context_counts() == context_before,
-              "no model work or color submission is added after FX through the first Original read");
-        Check(expect_edit ? (pre_fx_writes == 1 && with_same_models(evaluations) && edited_pixels > 0)
-                          : (pre_fx_writes == 0 && pre_fx_evaluates == 0 && edited_pixels == 0),
-              expect_edit ? "the active SDK call authorizes a single complete pre-FX edit"
-                          : "unproven ordinary input preserves the entire current backbuffer including FX/UI");
-        if (expect_edit) {
+        Check((!sdk_enabled || native::fg_service::streams.at(stream_key).submitted == service_writes)
+                  && context_counts() == context_before && real_creates == warmed_creates,
+              "the SDK service adds no competing write and the same Runtime remains warm");
+        Check(pre_fx_writes == (expect_early_edit ? 1 : 0), "public pre-FX writes require an active, legal SDK call");
+        const bool delivered = claimed && handoff.ordinary_submission.signaled
+            && handoff.backbuffer == color_identity(color.Get()) && handoff.sdk_result == S_OK;
+        const bool late_delivered = delivered && evaluations_delta == passes && with_same_models(evaluations)
+            && edited_pixels > 0 && fx_edited_pixels > 0;
+        if (expect_early_edit) {
+          Check(writes_delta == 1 && evaluations_delta == pre_fx_evaluates && with_same_models(evaluations)
+                    && edited_pixels > 0 && fx_edited_pixels > 0,
+                "the active SDK call authorizes a single complete pre-FX edit");
           Check(native_runtime_evaluations[evaluations].list == native_runtime_evaluations[evaluations + 1].list,
                 "the exact two models share the one pre-FX recording");
+        } else if (!expect_late_edit) {
+          Check(writes_delta == 0 && !claimed && edited_pixels == 0 && fx_edited_pixels == 0
+                    && (standalone || evaluations_delta == 0)
+                    && (!standalone || consumed == before_sdk),
+                "unproven input preserves every composed RGBA byte at the first SDK read");
         }
         nlohmann::json observation{{"phase", phase}, {"pre_fx_writes", pre_fx_writes},
             {"pre_fx_evaluates", pre_fx_evaluates}, {"first_read_edited_pixels", edited_pixels},
+            {"first_read_fx_edited_pixels", fx_edited_pixels}, {"evaluates_total", evaluations_delta},
+            {"ordinary_writes_total", writes_delta}, {"off_color_claim", delivered},
             {"first_read_count", consumer_reads - reads}, {"fx_marker_preserved", true},
             {"sdk_call", session.context->present_serial}, {"sdk_writes", 0}};
         if (sdk_enabled) {
@@ -1435,16 +1661,22 @@ inline int Run(const char* project_id_path, const char* variant) {
         if (!sdk_enabled) {
           Check(Hooks::Enable(session.handle, 1) == 0, "the next independent frame begins with XeFG On");
         }
+        return !expect_late_edit || late_delivered;
       };
       hot_present("nested-present", 169, OrdinaryEvent::NESTED, SdkMethod::PRESENT);
       hot_present("nested-full-present1", 173, OrdinaryEvent::NESTED, SdkMethod::FULL_PRESENT1);
       hot_present("effects-already-started", 175, OrdinaryEvent::FX_STARTED, SdkMethod::PRESENT);
       hot_present("composition-unconfirmed", 177, OrdinaryEvent::COMPOSITION, SdkMethod::PRESENT);
       hot_present("different-submit-queue", 179, OrdinaryEvent::ALTERNATE_QUEUE, SdkMethod::PRESENT);
-      hot_present("standalone-before-full-present1", 181, OrdinaryEvent::STANDALONE, SdkMethod::FULL_PRESENT1);
       hot_present("standalone-before-scroll-present1", 183, OrdinaryEvent::STANDALONE, SdkMethod::SCROLL_PRESENT1);
+      hot_present("standalone-before-local-present1", 187, OrdinaryEvent::STANDALONE, SdkMethod::LOCAL_PRESENT1);
       hot_present("standalone-before-scroll-present1-sdk-on", 185, OrdinaryEvent::STANDALONE, SdkMethod::SCROLL_PRESENT1,
                   SdkState::KEEP_ENABLED);
+      const bool first_off_present = hot_present("standalone-before-present", 189, OrdinaryEvent::STANDALONE, SdkMethod::PRESENT);
+      const bool first_off_present1 = hot_present("standalone-before-full-present1", 181, OrdinaryEvent::STANDALONE,
+                                                  SdkMethod::FULL_PRESENT1);
+      Check(first_off_present && first_off_present1,
+            "the first legal standalone Off Present and full Present1 deliver current NR with FX and UI at the first SDK read");
       Check(NVSDK_NGX_SUCCEED(native::HookedReleaseFeatureSlot<0>(sr)), "release the game SR substitute through the production hook");
 
       bool changed_ready = false;

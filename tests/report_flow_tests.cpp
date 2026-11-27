@@ -426,8 +426,8 @@ void TestSelectedXefgReportDiagnostics() {
               && default_status->DisplayOutcome() == fg::Result::FAILED,
           "default monitor B holds a true SDK failure");
   const auto a_pending = runtime::CaptureReportDiagnostics(&request);
-  Require(a_pending.output.selected && a_pending.card.verdict.IsFgPreparing()
-              && runtime::SelectedReportCardJson(a_pending)["id"] == "fg_preparing",
+  Require(a_pending.output.selected && a_pending.card.verdict.IsFgPending()
+              && runtime::SelectedReportCardJson(a_pending)["id"] == "starting",
           "first owned A without a result stays grey even when default B failed");
 
   adapter::service = +[](const fg::FrameInput&) noexcept { return fg::Result::NOT_SERVED; };
@@ -470,7 +470,7 @@ void TestSelectedXefgReportDiagnostics() {
     adapter::RegisterOutput(b.get());
   }
   const auto b_pending = runtime::CaptureReportDiagnostics(&request);
-  Require(old_b != b->output_identity && b_pending.card.verdict.IsFgPreparing()
+  Require(old_b != b->output_identity && b_pending.card.verdict.IsFgPending()
               && runtime::SelectedReportCardJson(b_pending)["tone"] == "idle",
           "a new B generation cannot inherit B's old yellow");
   flow::skip_capture = true;

@@ -377,7 +377,7 @@ foreach ($item in $Suite) {
                         $nativeArgument = "--$case"
                         if ($case -eq 'present-original-handoff') {
                             $variantFailures = [Collections.Generic.List[string]]::new()
-                            foreach ($variant in @('hot','cold','core-live','core-idle','cold-recording-face','cold-native-sdk-tag')) {
+                            foreach ($variant in @('hot','cold','core-live','core-idle','cold-recording-face','cold-native-sdk-tag','cold-unbound-sr-layout')) {
                                 $name = if ($variant -eq 'hot') { $case } else { "$case-$variant" }
                                 $variantDirectory = Join-Path $directory "$case-variants/$variant"
                                 $variantExe = Join-Path $variantDirectory ([IO.Path]::GetFileName($exe))

@@ -24,7 +24,7 @@ inline bool PinRuntimeCallback() noexcept {
   return true;
 }
 
-enum class Result : uint8_t { NOT_SERVED, PREPARED, SUBMITTED, FAILED, ORDINARY_SUBMITTED };
+enum class Result : uint8_t { NOT_SERVED, PREPARED, SUBMITTED, FAILED, ORDINARY_SUBMITTED, PENDING };
 
 constexpr bool Submitted(Result result) {
   return result == Result::SUBMITTED || result == Result::ORDINARY_SUBMITTED;

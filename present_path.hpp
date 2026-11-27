@@ -445,6 +445,14 @@ struct PresentGuideSet {
   FeatureState contract;
   uint32_t output_width = 0;
   uint32_t output_height = 0;
+  // The ordinary route may withdraw the guide images when XeFG takes over.
+  // A completed SR recording can still prove their shape for this owner.
+  struct ColdLayout {
+    output_framerate::OutputIdentity owner;
+    uint64_t configuration = 0;
+    uint64_t serial = 0;
+    std::shared_ptr<submission::RecordingStatus> recording;
+  } cold_layout;
   // A Direct3D 11 capture (CapturePresentGuides11) fills these instead of
   // the D3D12 clones, and only a present of its own API reads it.
   ID3D11Texture2D* motion11 = nullptr;
@@ -1888,6 +1896,7 @@ inline void StampPresentCapture(PresentGuideSet* set, const FeatureState& contra
   set->completed_fence = {};
   set->completed_value = 0;
   set->completed_multiple_queues = false;
+  set->cold_layout = {};
   ClearPresentSource(set);
   present_captures.fetch_add(1, std::memory_order_relaxed);
   // Global capture totals include other devices and viewports. Only this
@@ -2093,6 +2102,7 @@ inline void CapturePresentGuides(
   // recorded and StampPresentCapture publishes them, this slot is not a
   // readable capture, even if it previously held a completed older frame.
   target->serial = 0;
+  target->cold_layout = {};
   // Same shape as the game's guide, mip 0 only, resting in the evaluate's
   // read state. A shape or native-device change retires the old clone;
   // matching descriptions do not make resources cross-device copyable.
@@ -2168,6 +2178,15 @@ inline void CapturePresentGuides(
   submission::TrackUse(command_list, target->motion, submission::UseKind::kIndependentGuide);
   submission::TrackUse(command_list, target->depth, submission::UseKind::kIndependentGuide);
   submission::TrackUse(command_list, target->marker, submission::UseKind::kIndependentGuide);
+  if (successful_dlss_sr && !mixed_predecessor && capture_output && WarmPresentColorConfigured()) {
+    const auto owner = output_framerate::FindPresentColorOwnerForRoute(capture_output);
+    if (owner && owner.device == reinterpret_cast<uintptr_t>(device_identity)
+        && SubrectFits(contract.motion_x, contract.motion_y, contract.input_width, contract.input_height, motion_desc)
+        && SubrectFits(contract.depth_x, contract.depth_y, contract.input_width, contract.input_height, depth_desc)) {
+      target->cold_layout = {.owner = owner, .configuration = configuration_generation.load(),
+          .serial = target->serial, .recording = submission::ObserveRecording(command_list)};
+    }
+  }
   if (target->base_frame.source != nullptr) {
     present_source_lists[target - present_guide_sets].store(base_frame.native_list, std::memory_order_release);
     present_base_capture_active.store(true, std::memory_order_relaxed);

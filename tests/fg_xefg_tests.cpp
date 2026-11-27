@@ -82,13 +82,13 @@ std::vector<SdkCall> sdk_calls;
 std::vector<fg::FrameInput> service_calls;
 int32_t sdk_status = 0;
 bool policy = true;
-bool service_observed_preparing = true;
+bool service_observed_pending = true;
 fg::Result service_outcome = fg::Result::SUBMITTED;
 std::vector<fg::Result> observed_display_results;
 bool Requested() noexcept { return policy; }
 bool Prepare(ID3D12GraphicsCommandList*) noexcept { return true; }
 fg::Result Service(const fg::FrameInput& input) noexcept {
-  service_observed_preparing &= xefg::CurrentResult() == fg::Result::PREPARED;
+  service_observed_pending &= xefg::CurrentResult() == fg::Result::PENDING;
   observed_display_results.push_back(xefg::DisplayResult());
   service_calls.push_back(input);
   return (input.depth != nullptr && input.motion != nullptr && input.has_constants
@@ -1808,7 +1808,7 @@ int main(int argc, char** argv) {
     first.Present(10);
     Check(service_calls.size() == 1 && xefg::CurrentResult() == fg::Result::SUBMITTED, "valid frame not served");
     Check(xefg::SubmittedFrames() == submitted_before + 1, "real service submission not counted once");
-    Check(service_observed_preparing, "active recording is exposed as unserved to concurrent UI");
+    Check(service_observed_pending, "the current call remains pending while the service records");
     Check(service_calls.back().hudless == forwarded.resource.resource
         && service_calls.back().depth == captured_depth.Get() && service_calls.back().motion == captured_motion.Get(),
           "service received original resources instead of ONLY_NOW snapshots");
@@ -2037,7 +2037,7 @@ int main(int argc, char** argv) {
         continuous.Present(id);
       };
       submit(900, fg::Result::SUBMITTED);
-      Check(observed_display_results.back() == fg::Result::PREPARED, "new context inherited active service");
+      Check(observed_display_results.back() == fg::Result::PENDING, "a new context waits for its first outcome");
       submit(901, fg::Result::SUBMITTED);
       Check(observed_display_results.back() == fg::Result::SUBMITTED
                 && xefg::CurrentResult() == fg::Result::SUBMITTED,
@@ -2045,27 +2045,27 @@ int main(int argc, char** argv) {
       continuous.Present(902);
       Check(xefg::DisplayResult() == fg::Result::NOT_SERVED, "declined return retained an active display");
       submit(903, fg::Result::SUBMITTED);
-      Check(observed_display_results.back() == fg::Result::PREPARED, "submission gap retained active recording");
+      Check(observed_display_results.back() == fg::Result::PENDING, "a submission gap ends display continuity");
       const auto count = xefg::SubmittedFrames();
       submit(904, fg::Result::PREPARED);
       Check(observed_display_results.back() == fg::Result::SUBMITTED
                 && xefg::DisplayResult() == fg::Result::PREPARED && xefg::SubmittedFrames() == count,
             "completed preparation fabricated a successful submission");
       submit(905, fg::Result::FAILED);
-      Check(observed_display_results.back() == fg::Result::PREPARED
+      Check(observed_display_results.back() == fg::Result::PENDING
                 && xefg::DisplayResult() == fg::Result::FAILED,
             "actual failure was hidden by service activity");
       submit(906, fg::Result::SUBMITTED);
       adapter::BeforeResize(continuous.proxy.Get());
       submit(907, fg::Result::SUBMITTED);
-      Check(observed_display_results.back() == fg::Result::PREPARED, "new epoch inherited active recording");
+      Check(observed_display_results.back() == fg::Result::PENDING, "a new epoch waits for its own first result");
       policy = false;
       Check(xefg::DisplayResult() == fg::Result::NOT_SERVED, "NR Off retained active display");
       continuous.Present(908);
       policy = true;
       submit(909, fg::Result::SUBMITTED);
-      Check(observed_display_results.back() == fg::Result::PREPARED, "NR Off gap inherited active recording");
-      Check(service_observed_preparing, "display service state changed exact frame handoff truth");
+      Check(observed_display_results.back() == fg::Result::PENDING, "reenabling NR starts a new observation");
+      Check(service_observed_pending, "the current frame stays pending until the service records its result");
       std::cout << "PASS continuous UI service with exact phase, gap, pending, failure, epoch and Off truth\n";
     }
     gpu.Submit();

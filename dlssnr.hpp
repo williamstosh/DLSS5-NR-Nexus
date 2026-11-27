@@ -14723,6 +14723,7 @@ struct NrRecording {
   // Ordinary Present publishes edit counters after its separate submission.
   edit_reuse::State* reused_edit = nullptr;
   uint32_t edit_reuse_encoding = 0;
+  uint32_t model_created_mask = 0;
   // Set immediately before each NGX model call, including a call that later
   // returns failure. This keeps service diagnostics distinct from successful
   // pass completion.
@@ -17084,7 +17085,7 @@ inline bool RecordInline(
       // produces garbage frames and GPU hangs (field evidence from the
       // public forks).  Create it now; it starts evaluating next frame, and
       // the write-back below serves the already-matured passes' result.
-      if (!EnsureNrFeature(
+      const bool created = EnsureNrFeature(
               command_list,
               feature,
               pass,
@@ -17093,8 +17094,11 @@ inline bool RecordInline(
               nr_input_height,
               feature_out_width,
               feature_out_height,
-              present != nullptr && present->original_signed_runtime)
-          && feature.slots[pass].fallback_recording == nullptr) {
+              present != nullptr && present->original_signed_runtime);
+      if (created && recording != nullptr) {
+        recording->model_created_mask |= 1u << pass;
+      }
+      if (!created && feature.slots[pass].fallback_recording == nullptr) {
         stack_failure = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
         failed_pass = pass;
       }
@@ -26973,7 +26977,8 @@ inline FunnelInputs CollectFunnelInputs(const std::optional<fg::xefg::StatusSnap
     in.injected = fg::Submitted(current) ? 1 : 0;
     in.submitted_ok = in.injected;
     in.unaccounted = 0;
-    in.top_decline_tag = (current == fg::Result::PREPARED ? "fg_preparing"
+    in.top_decline_tag = (current == fg::Result::PENDING ? "fg_pending"
+        : current == fg::Result::PREPARED ? "fg_preparing"
         : current == fg::Result::FAILED ? "fg_handoff_failed"
         : fg::Submitted(current) ? nullptr : "fg_unserved");
     in.top_decline_count = (in.eligible != 0 && in.injected == 0 ? 1 : 0);
@@ -27016,7 +27021,7 @@ inline void EmitNrVerdict(const char* trigger, const NrVerdict& verdict, bool ob
       intercepted_creates.load(std::memory_order_relaxed) > 0
       && verdict.seen > 0;
   Log(
-      verdict.state == NrState::kNotEngaged && had_its_chance && !verdict.IsFgPreparing()
+      verdict.state == NrState::kNotEngaged && had_its_chance && !verdict.IsFgPreparing() && !verdict.IsFgPending()
           ? reshade::log::level::warning
           : reshade::log::level::info,
       line);
@@ -27053,7 +27058,7 @@ inline NrVerdict MaybeEmitNrVerdict(const std::optional<fg::xefg::StatusSnapshot
   // coalesce their change lines; UI and periodic/settled snapshots keep the
   // current truth, including a recording that never reaches submission.
   const bool normal_fg_cycle = observed_fg && (!xefg || xefg->continuing_submission)
-      && verdict.IsFgPreparing()
+      && (verdict.IsFgPreparing() || (xefg && xefg->recording && verdict.IsFgPending()))
       && last_emitted_fg_progress.load(std::memory_order_relaxed)
       && last_emitted_state.load(std::memory_order_relaxed) == NrState::kEngaged;
   // The reason strings are static literals, so comparing pointers is

@@ -609,6 +609,11 @@ inline StatusCard ComputeStatusCard(const CardInputs& in) {
     }
 
     case NrState::kNotEngaged:
+      if (in.verdict.IsFgPending()) {
+        Set(card, CardId::kStarting, CardTone::kIdle, CardGlyph::kWaiting,
+            "Starting...", "Waiting for first valid frame");
+        return card;
+      }
       if (in.verdict.IsFgPreparing()) {
         Set(card, CardId::kFgPreparing, CardTone::kIdle, CardGlyph::kWaiting,
             "Preparing Neural Rendering",
