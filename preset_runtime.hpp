@@ -463,10 +463,11 @@ inline bool Apply(const presets::Document& document, bool compatibility, bool re
   bool restart = false;
   bool restore_configuration_changed = false;
   const auto previous_model_requests = ActiveNrModelRequests();
+  const auto previous_model_steering = ActiveNrModelSteering();
   for (auto& row : changes) {
     const auto* setting = FindSetting(row.key);
     writes[row.key] = row.after;
-    if (setting == nullptr || !setting->IsModelSelection()) {
+    if (setting == nullptr || (!setting->IsModelSelection() && !setting->IsModelSteering())) {
       restore_configuration_changed |= setting != &kSetEditReuse;
       if (setting != nullptr) effect = (std::max)(effect, setting->effect);
     }
@@ -622,7 +623,11 @@ inline bool Apply(const presets::Document& document, bool compatibility, bool re
     }
   }
   const bool model_requests_changed = previous_model_requests != ActiveNrModelRequests();
-  if (restore_configuration_changed || model_requests_changed) {
+  const bool model_steering_changed = previous_model_steering != ActiveNrModelSteering();
+  if (model_steering_changed) {
+    effect = (std::max)(effect, SettingEffect::kHistory);
+  }
+  if (restore_configuration_changed || model_requests_changed || model_steering_changed) {
     ++present_restore_configuration.epoch;
   }
   policy_lock.unlock();

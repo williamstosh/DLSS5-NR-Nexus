@@ -9657,6 +9657,32 @@ inline bool ResolveDepthInverted(uint32_t create_flags) {
   return (create_flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0;
 }
 
+struct EffectiveModelSteering {
+  float intensity;
+  uint32_t style;
+  float local_tone;
+  float structure;
+  float skin;
+  bool auto_mask;
+  bool ui_correction;
+  bool operator==(const EffectiveModelSteering&) const = default;
+};
+
+inline EffectiveModelSteering ReadModelSteering(uint32_t pass, SkinSteering* requested = nullptr) {
+  const bool auto_mask = PassModel(pass, use_auto_mask, pass_auto_mask);
+  const SkinSteering stored{
+      .structure = PassModel(pass, local_structure_strength, pass_local_structure),
+      .skin = PassModel(pass, skin_structure_strength, pass_skin_structure)};
+  if (requested != nullptr) {
+    *requested = stored;
+  }
+  const auto sent = SentSkinSteering(stored.structure, stored.skin, auto_mask);
+  return {.intensity = PassIntensity(pass), .style = PassModel(pass, style, pass_style),
+      .local_tone = PassModel(pass, local_tone_strength, pass_local_tone),
+      .structure = sent.structure, .skin = sent.skin, .auto_mask = auto_mask,
+      .ui_correction = PassModel(pass, ui_correction, pass_ui_correction)};
+}
+
 inline void SetModelParameters(NrFeatureSlot& slot, uint32_t slot_index,
                                uint64_t chain_reset_epoch, uint32_t create_flags,
                                int32_t frame_reset, bool frame_ui_correction,
@@ -9715,25 +9741,20 @@ inline void SetModelParameters(NrFeatureSlot& slot, uint32_t slot_index,
   slot.acknowledged_reset_epoch = chain_reset_epoch;
   NVSDK_NGX_Parameter_SetI(parameters, "DLSSNR.Reset", do_reset ? 1 : 0);
   slot.model_reset = do_reset;
-  slot.model_intensity_sent = PassIntensity(slot_index);
+  SkinSteering requested{};
+  const auto steering = ReadModelSteering(slot_index, &requested);
+  slot.model_intensity_sent = steering.intensity;
   NVSDK_NGX_Parameter_SetF(
       parameters, "DLSSNR.Intensity", slot.model_intensity_sent);
-  // The model steering: the Look section's values, or a stack pass's own
-  // once its "Same as pass 1" is off (group G).  Each is read once, so the
-  // log line below names exactly what this evaluate sent.
-  const uint32_t model_style = PassModel(slot_index, style, pass_style);
-  const float model_local_tone =
-      PassModel(slot_index, local_tone_strength, pass_local_tone);
-  const float model_structure =
-      PassModel(slot_index, local_structure_strength, pass_local_structure);
-  const float model_skin =
-      PassModel(slot_index, skin_structure_strength, pass_skin_structure);
-  const bool model_auto_mask = PassModel(slot_index, use_auto_mask, pass_auto_mask);
+  const uint32_t model_style = steering.style;
+  const float model_local_tone = steering.local_tone;
+  const float model_structure = requested.structure;
+  const float model_skin = requested.skin;
+  const bool model_auto_mask = steering.auto_mask;
   const bool model_ui_correction =
-      diagnostics::ModelUi(diagnostic_model_ui, frame_ui_correction,
-                           PassModel(slot_index, ui_correction, pass_ui_correction));
+      diagnostics::ModelUi(diagnostic_model_ui, frame_ui_correction, steering.ui_correction);
   slot.model_ui_sent = model_ui_correction;
-  const SkinSteering sent = SentSkinSteering(model_structure, model_skin, model_auto_mask);
+  const SkinSteering sent{.structure = steering.structure, .skin = steering.skin};
   // There is no global tone key: runtime 310.8 names none (string probe), its
   // output was bit-identical at the old slider's 0, 1 and 2, and the owner
   // confirmed it dead in the field.  The slider and NRGlobalTone were
@@ -30004,6 +30025,17 @@ inline std::array<uint32_t, kMaxNrPasses> ActiveNrModelRequests() {
   return requests;
 }
 
+// Compare the active parameter values, not the stored choices that may only
+// be consumed when a pass is enabled or stops inheriting pass 1.
+inline std::array<EffectiveModelSteering, kMaxNrPasses> ActiveNrModelSteering() {
+  std::array<EffectiveModelSteering, kMaxNrPasses> values{};
+  const auto pass_count = std::min(stack_passes.load(), kMaxNrPasses);
+  for (uint32_t pass = 0; pass < pass_count; ++pass) {
+    values[pass] = ReadModelSteering(pass);
+  }
+  return values;
+}
+
 inline void ApplySettingEffect(SettingEffect effect) {
   if (effect == SettingEffect::kRecreate) {
     RecreateFeatures();
@@ -30047,6 +30079,22 @@ struct Setting {
   }
   bool IsModelSelection() const {
     return u == &preset || u == &pass_preset[0] || u == &pass_preset[1] || u == &pass_preset[2];
+  }
+  bool IsModelSteering() const {
+    if (f == &intensity || u == &style || f == &local_tone_strength || f == &local_structure_strength
+        || f == &skin_structure_strength || b == &skin_independent || b == &use_auto_mask
+        || b == &ui_correction) {
+      return true;
+    }
+    for (uint32_t index = 0; index < kMaxNrPasses - 1; ++index) {
+      if (b == &pass_follow[index] || f == &pass_intensity[index] || u == &pass_style[index]
+          || f == &pass_local_tone[index] || f == &pass_local_structure[index]
+          || f == &pass_skin_structure[index] || b == &pass_auto_mask[index]
+          || b == &pass_ui_correction[index]) {
+        return true;
+      }
+    }
+    return false;
   }
   // The value alone; the committing control owns persistence and side effects.
   void Store(float value) const {
@@ -30105,6 +30153,8 @@ struct Setting {
     if (u == &present_sdr_restore_policy
         && !present_sdr_restore_config_writable.load(std::memory_order_relaxed)) return;
     const bool model_selection = IsModelSelection();
+    const bool model_steering = IsModelSteering();
+    bool steering_changed = false;
     if (model_selection) {
       RuntimeLock lock(runtime_mutex);
       const auto before = ActiveNrModelRequests();
@@ -30116,13 +30166,25 @@ struct Setting {
         if (requests_changed) ++present_restore_configuration.epoch;
       }
       if (requests_changed) RecreateFeaturesLocked();
+    } else if (model_steering) {
+      std::unique_lock config_lock(present_restore_configuration.mutex);
+      const auto before = ActiveNrModelSteering();
+      StoreLocked(value);
+      steering_changed = before != ActiveNrModelSteering();
+      if (steering_changed) {
+        ++present_restore_configuration.epoch;
+      }
     } else {
       Store(value);
     }
     Persist();
     DropIniIssue(key);
-    if (!model_selection) ApplySettingEffect(effect);
-    fg::xefg::ReconcileNrService();
+    if (!model_selection && (!model_steering || steering_changed)) {
+      ApplySettingEffect(effect);
+    }
+    if (!model_steering || steering_changed) {
+      fg::xefg::ReconcileNrService();
+    }
   }
 
   const char* key;

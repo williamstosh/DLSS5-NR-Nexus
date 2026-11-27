@@ -1335,6 +1335,50 @@ int main(int argc, char** argv) {
       runtime::kSetPassPreset[0].Commit(1.f);
       Check(runtime::configuration_generation.load() == generation + 2,
             "main and per-pass model changes each trigger production feature recreation");
+      if (test_case == "nr-model-explicit") {
+        namespace presets = renodx::addons::dlss5::presets;
+        runtime::kSetStackPasses.Commit(2.f);
+        runtime::kSetPassFollow[0].Commit(1.f);
+        const auto epoch = [] { return runtime::history_reset_epoch.load(); };
+        const auto generation = runtime::configuration_generation.load();
+        const auto configuration = runtime::present_restore_configuration.epoch;
+        const auto history = epoch();
+        runtime::kSetPassIntensity[2].Commit(0.5f);
+        runtime::kSetPassLocalTone[0].Commit(0.5f);
+        Check(epoch() == history && runtime::present_restore_configuration.epoch == configuration
+                  && std::stof(Read("NRPass4Intensity")) == 0.5f
+                  && std::stof(Read("NRPass2LocalTone")) == 0.5f,
+              "settings store dormant and inherited values without changing active history or configuration");
+
+        std::string steering_error;
+        const auto apply_tone = [&](float value) {
+          return runtime::preset_ui::Apply(
+              {.scope = presets::Scope::FULL, .settings = {{"NRPass2LocalTone", value}}},
+              true, false, &steering_error);
+        };
+        Check(apply_tone(0.25f) && std::stof(Read("NRPass2LocalTone")) == 0.25f
+                  && epoch() == history && runtime::present_restore_configuration.epoch == configuration,
+              "preset stores an inherited value without claiming an active change");
+        runtime::kSetLocalTone.Commit(0.75f);
+        const auto changed = epoch();
+        Check(changed == history + 1 && runtime::ReadModelSteering(1).local_tone == 0.75f,
+              "a real change to actively inherited model steering resets once");
+        runtime::kSetPassFollow[0].Commit(0.f);
+        Check(epoch() == changed + 1 && runtime::ReadModelSteering(1).local_tone == 0.25f,
+              "forcing a different previously stored steering value resets once");
+        const auto explicit_history = epoch();
+        Check(apply_tone(0.5f) && epoch() == explicit_history + 1
+                  && runtime::configuration_generation.load() == generation,
+              "active preset steering resets history without recreating model handles");
+
+        renodx::addons::dlss5::bridge::OwnedParameters model_parameters;
+        runtime::NrFeatureSlot slot{.parameters = &model_parameters};
+        runtime::SetModelParameters(slot, 1, epoch(), 0, 0, false, 0);
+        float sent_tone = 0.f;
+        Check(NVSDK_NGX_SUCCEED(model_parameters.Get("DLSSNR.LocalToneStrength", &sent_tone))
+                  && sent_tone == 0.5f,
+              "the model receives the effective value resolved by the same production reader");
+      }
       runtime::kSetPassPreset[0].Commit(0.f);
       Check(runtime::pass_preset[0] == 0 && Read("NRPass2Preset") == "0", "inherit reset is persisted");
       const auto equivalent_generation = runtime::configuration_generation.load();
