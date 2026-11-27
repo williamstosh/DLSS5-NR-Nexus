@@ -9,48 +9,36 @@ on:
 
 permissions:
   contents: read
-  actions: read
 
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  evidence:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      run_core: ${{ steps.evidence.outputs.run_core }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Resolve exact-tree core evidence
-        id: evidence
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: ./tools/ci-evidence.ps1 -Mode Branch
-  windows:
-    needs: evidence
-    if: ${{ needs.evidence.outputs.run_core == 'true' }}
-    uses: ./.github/workflows/build-windows.yml
-    with:
-      run_core: true
   required:
     name: CI required
-    needs: [evidence, windows]
-    if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
-      - name: Require successful core or exact-tree evidence
+      - name: Check source form
         shell: pwsh
         env:
-          CI_EVIDENCE_RESULT: ${{ needs.evidence.result }}
-          CI_RUN_CORE: ${{ needs.evidence.outputs.run_core }}
-          CI_WINDOWS_RESULT: ${{ needs.windows.result }}
-        run: ./tools/ci-evidence.ps1 -Mode Gate
+          DIFF_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          ./tools/check-version.ps1 | Out-Null
+          $base = $env:DIFF_BASE
+          if (-not $base -or $base -cmatch '\A0{40}\z') {
+            # New refs and manual runs have no before SHA.
+            $base = git rev-parse --verify --quiet 'HEAD^1'
+          }
+          if ($base) {
+            if ($base -cnotmatch '\A[0-9a-f]{40}\z') { throw 'Invalid source diff base.' }
+            git diff --check $base HEAD --
+          } else {
+            git diff-tree --root --check -r HEAD
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Source diff format check failed.' }

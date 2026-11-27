@@ -544,7 +544,7 @@ Create／Evaluate 耗时，嵌套值不能重复加总。源调用计时不含�
 单独记录 Init／Shutdown 结果，并在完成和退休后核验 caller identity 恢复。
 这可隔离生产初始化路径；来源 Hook 安装时机和 FG Off 在夹具中仍是明确前提，需另取游戏证据。
 
-默认 `-Suite fg-native` 会复用同一编译产物，分别在独立进程执行这两个自适应用例；默认 `-Suite ui` 也会复用菜单二进制，在独立进程执行自适应真实 ImGui 交互，包括三种介入点连续往返与配置保存。本地完整发布预检保留这些入口；远端核心回归保留 FG 默认组，UI 全量检查由本地初审承担。`NR_NEXUS_ADAPTIVE_UI_ONLY=1` 仍可单独运行自适应 UI，快照模式不额外运行回归。
+默认 `-Suite fg-native` 会复用同一编译产物，分别在独立进程执行这两个自适应用例；默认 `-Suite ui` 也会复用菜单二进制，在独立进程执行自适应真实 ImGui 交互，包括三种介入点连续往返与配置保存。本地软件发布预检保留 FG 默认组和 UI 全量检查。`NR_NEXUS_ADAPTIVE_UI_ONLY=1` 仍可单独运行自适应 UI，快照模式不额外运行回归。
 
 真实 NR 尺寸往返复用公开 SDK 预初始化入口：
 
@@ -732,9 +732,9 @@ Feature18 Create／Evaluate 并发安全；结束后恢复环境变量。
 
 ## 自动回归与证据保存
 
-GitHub 分支 CI 使用 [`ci-core.ps1`](../ci-core.ps1)：保留核心 CPU／配置／生命周期检查、默认 FG 组，以及复用同一 EXE、在独立进程执行的 pre-FG 异尺寸与复制链回归。完整本地发布初审继续使用 `run-release-preflight.ps1`，不因远端精简删减。远端产物为 `core-regression-<attempt>`（检查结果与失败日志）和 `windows-x64-<attempt>`（安装包及 SHA-256）。
+GitHub 分支／PR 的 `CI required` 只做源码版本和实际差分格式检查，不构建或上传测试产物。完整本地发布预检仍使用 `run-release-preflight.ps1 -Mode Software`。既有核心 CPU／WARP 与普通／DEV 对照由本地验证承担，复用相同源码和输入的已有合格结果。
 
-`main` 的 [`ci-evidence.ps1`](../ci-evidence.ps1) 仅复用完整 Git 根 tree 相同的成功核心记录，依赖锁、工具锁和 workflow 均包含在 tree 中；找不到或状态不符则执行核心验证。Tag 必须先取得同身份成功核心证据，再重新构建 Publishing 并通过 [`check-publishing.ps1`](../check-publishing.ps1) 核对 DEV-OFF 编译命令、诊断标记、版本、包白名单与哈希，不重跑完整测试。原始 run／源码／tree 及复用来源显示在 Actions summary。
+Tag 用 [`ci-evidence.ps1`](../ci-evidence.ps1) 确认同一完整 Git 根树的分支形式检查确实成功，优先取目标提交的最新尝试，再干净构建 Publishing。[`check-publishing.ps1`](../check-publishing.ps1) 核对 DEV-OFF 编译命令、诊断标记、版本、包白名单及 DLL／ZIP SHA-256；`windows-x64-<attempt>` 保存该 Tag 的安装包与校验文件。Actions summary 记录分支检查的 run／attempt／提交与 tree；这不是本地软件预检回执。
 
 ~~~powershell
 python -m unittest discover -s tests -p 'test_offline_*.py' -v

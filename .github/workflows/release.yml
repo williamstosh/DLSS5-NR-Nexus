@@ -20,11 +20,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Require exact-tree branch core evidence
+      - name: Require exact-tree branch source-form CI
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: ./tools/ci-evidence.ps1 -Mode Release
+        run: ./tools/ci-evidence.ps1
   build:
     needs: evidence
     uses: ./.github/workflows/build-windows.yml

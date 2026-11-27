@@ -8,34 +8,42 @@ $OutputDirectory = Initialize-TestOutput $OutputDirectory
 $tree = 'a' * 40
 $sha = 'b' * 40
 $checks = [Collections.Generic.List[string]]::new()
-$steps = @('Check version and release tag','Prepare pinned shader compilers',
-    'Prepare pinned RenoDX host and dependencies','Build clean Publishing Release x64',
-    'Run independent core regression','Verify Publishing isolation and package','Upload installable archive and checksum')
+$steps = @('Check out source','Check source form')
 function New-FixtureRun([long]$Id = 1, [string]$Commit = $sha) {
     @{ id=$Id;workflow_id=7;path='.github/workflows/ci.yml';event='push';head_branch='dev'
         head_repository=@{full_name='fixture/repository'};head_sha=$Commit;run_attempt=1
         head_commit=@{id=$Commit;tree_id=$tree}
         status='completed';conclusion='success';updated_at="2026-11-15T00:00:0${Id}Z" }
 }
-function New-FixtureJob($Run, [string[]]$Names = $steps) {
-    @{run_id=$Run.id;head_sha=$Run.head_sha;status='completed';conclusion='success'
+function New-FixtureJob($Run, [string[]]$Names = $steps, [string]$Name = 'CI required') {
+    @{name=$Name;run_id=$Run.id;head_sha=$Run.head_sha;status='completed';conclusion='success'
         steps=@($Names | ForEach-Object { @{name=$_;status='completed';conclusion='success'} })}
 }
-function Resolve-Fixture([object[]]$Runs, [hashtable]$Jobs, [long]$CurrentRunId = 0, [switch]$ApiError, [switch]$Overflow) {
+function Resolve-Fixture([object[]]$Runs, [hashtable]$Jobs, [long]$CurrentRunId = 0, [switch]$ApiError, [switch]$Overflow, [string]$TargetCommit = $sha) {
     $request = {
         param($path)
         if ($ApiError) { throw 'Synthetic API failure.' }
         if ($path -ceq '/repos/fixture/repository/actions/workflows/ci.yml') { return @{id=7;path='.github/workflows/ci.yml'} }
-        if ($path -match '/runs\?per_page=100&page=([0-9]+)$') {
-            return @{total_count=$(if ($Overflow) {501} else {$Runs.Count});workflow_runs=$Runs}
+        if ($path -cmatch '/runs\?branch=(dev|main)&event=push(?:&head_sha=([a-f0-9]{40}))?&per_page=100&page=([0-9]+)$') {
+            $branch = $Matches[1]
+            $requestedSha = $Matches[2]
+            $filtered = @($Runs | Where-Object {
+                $_.head_branch -ceq $branch -and $_.event -ceq 'push' -and
+                (-not $requestedSha -or $_.head_sha -ceq $requestedSha)
+            })
+            return @{total_count=$(if ($Overflow -and -not $requestedSha) {501} else {$filtered.Count});workflow_runs=$filtered}
         }
         if ($path -match '/runs/([0-9]+)/attempts/([0-9]+)/jobs\?per_page=100$') {
-            $items = @($Jobs[[long]$Matches[1]])
+            $id = [long]$Matches[1]
+            $attempt = [long]$Matches[2]
+            $matching = @($Runs | Where-Object id -EQ $id)
+            if ($matching.Count -ne 1 -or $matching[0].run_attempt -ne $attempt) { throw 'Unexpected run attempt.' }
+            $items = @($Jobs[$id])
             return @{total_count=$items.Count;jobs=$items}
         }
         throw "Unexpected mock API request: $path"
     }.GetNewClosure()
-    Get-CiCoreEvidence -Repository fixture/repository -Tree $tree -CurrentRunId $CurrentRunId -Request $request
+    Get-CiBranchEvidence -Repository fixture/repository -Tree $tree -Commit $TargetCommit -CurrentRunId $CurrentRunId -Request $request
 }
 function Assert-Accepted([string]$Name, [hashtable]$Arguments, [long]$ExpectedRun = 1) {
     $result = Resolve-Fixture @Arguments
@@ -52,39 +60,19 @@ function Assert-Rejected([string]$Name, [hashtable]$Arguments, [string]$Pattern)
     throw "Evidence accepted incorrectly: $Name"
 }
 
-function Assert-GateCase {
-    param(
-        [string]$Name,
-        [string]$RefName = '42/merge',
-        [string]$EventName = 'pull_request',
-        [string]$EvidenceResult = 'success',
-        [string]$RunCore = 'true',
-        [string]$WindowsResult = 'success',
-        [string]$Rejection
-    )
-
-    try {
-        Assert-CiGate -RefName $RefName -EventName $EventName -EvidenceResult $EvidenceResult `
-            -RunCore $RunCore -WindowsResult $WindowsResult
-    } catch {
-        if (-not $Rejection -or $_.Exception.Message -notlike "$Rejection*") { throw }
-        $checks.Add("gate: $Name")
-        return
-    }
-    if ($Rejection) { throw "Gate accepted incorrectly: $Name" }
-    $checks.Add("gate: $Name")
-}
-
 $outcome = 'Failed'
 try {
     $first = New-FixtureRun
     $job = New-FixtureJob $first
-    Assert-Accepted 'same tree direct core' @{Runs=@($first);Jobs=@{[long]1=$job}}
+    Assert-Accepted 'same tree with checked source form' @{Runs=@($first);Jobs=@{[long]1=$job}}
     $other = New-FixtureRun 2 ('c' * 40)
     Assert-Accepted 'different commit identical root tree' @{Runs=@($other);Jobs=@{[long]2=(New-FixtureJob $other)}} 2
-    $different = New-FixtureRun
+    $different = New-FixtureRun 1 ('d' * 40)
     $different.head_commit.tree_id='d' * 40
     Assert-Rejected 'different root tree' @{Runs=@($different);Jobs=@{[long]1=$job}} 'No successful'
+    $impossible = New-FixtureRun
+    $impossible.head_commit.tree_id='d' * 40
+    Assert-Rejected 'wrong root for exact target' @{Runs=@($impossible);Jobs=@{[long]1=$job}} 'different root tree'
     $qualified = New-FixtureRun
     $qualified.path += '@refs/heads/dev'
     Assert-Accepted 'workflow path with ref suffix' @{Runs=@($qualified);Jobs=@{[long]1=$job}}
@@ -108,45 +96,44 @@ try {
         }
         Assert-Rejected "wrong source $field" @{Runs=@($wrong);Jobs=@{[long]1=$job}} 'No successful'
     }
-    $missingCore = New-FixtureJob $first @($steps | Where-Object { $_ -cne 'Run independent core regression' })
-    Assert-Rejected 'missing core step' @{Runs=@($first);Jobs=@{[long]1=$missingCore}} 'no successful core'
-    $skippedCore = New-FixtureJob $first
-    ($skippedCore.steps | Where-Object name -CEQ 'Run independent core regression').conclusion='skipped'
-    Assert-Rejected 'skipped core step' @{Runs=@($first);Jobs=@{[long]1=$skippedCore}} 'no successful core'
-    $wrongJob = New-FixtureJob $first
-    $wrongJob.head_sha='e' * 40
-    Assert-Rejected 'wrong job commit' @{Runs=@($first);Jobs=@{[long]1=$wrongJob}} 'no successful core'
+    $old = New-FixtureJob $first @('Resolve exact-tree core evidence','Require successful core or exact-tree evidence')
+    Assert-Rejected 'old same-name build gate is not source-form evidence' @{Runs=@($first);Jobs=@{[long]1=$old}} 'no successful source-form'
+    $duplicate = New-FixtureJob $first @('Check source form','Check source form')
+    Assert-Rejected 'ambiguous source-form step' @{Runs=@($first);Jobs=@{[long]1=$duplicate}} 'no successful source-form'
+    $skipped = New-FixtureJob $first
+    ($skipped.steps | Where-Object name -CEQ 'Check source form').conclusion='skipped'
+    Assert-Rejected 'skipped source-form step' @{Runs=@($first);Jobs=@{[long]1=$skipped}} 'no successful source-form'
+    $failedJob = New-FixtureJob $first
+    $failedJob.conclusion='failure'
+    Assert-Rejected 'failed required job despite green run' @{Runs=@($first);Jobs=@{[long]1=$failedJob}} 'no successful CI required'
+    $wrongName = New-FixtureJob $first -Name 'Unrelated check'
+    Assert-Rejected 'wrong check name despite correct step' @{Runs=@($first);Jobs=@{[long]1=$wrongName}} 'no successful CI required'
+    $wrongCommit = New-FixtureJob $first
+    $wrongCommit.head_sha='e' * 40
+    Assert-Rejected 'wrong checked commit' @{Runs=@($first);Jobs=@{[long]1=$wrongCommit}} 'no successful CI required'
     $main = New-FixtureRun 2 ('c' * 40)
     $main.head_branch='main'
-    $mainJob = New-FixtureJob $main @('Resolve exact-tree core evidence')
-    Assert-Accepted 'main reuse traces actual older core' @{Runs=@($main,$first);Jobs=@{[long]1=$job;[long]2=$mainJob}}
-    Assert-Rejected 'main reuse is not actual core' @{Runs=@($main);Jobs=@{[long]2=$mainJob}} 'No successful'
-    Assert-Accepted 'current pending main run excluded' @{Runs=@($oldRerun,$other);Jobs=@{[long]2=(New-FixtureJob $other)};CurrentRunId=1} 2
+    $main.run_attempt=3
+    $mainJob = New-FixtureJob $main
+    Assert-Accepted 'main check on a different SHA with identical tree' @{Runs=@($main,$first);Jobs=@{[long]1=$job;[long]2=$mainJob};TargetCommit=('f' * 40)} 2
+    $accepted = Resolve-Fixture -Runs @($main) -Jobs @{[long]2=$mainJob}
+    if ($accepted.Attempt -ne 3 -or $accepted.SourceCommit -cne $main.head_sha) {
+        throw 'Attempt and branch source commit must bind the accepted run.'
+    }
+    $checks.Add('records the accepted attempt and commit')
+    Assert-Accepted 'current run excluded' @{Runs=@($oldRerun,$other);Jobs=@{[long]2=(New-FixtureJob $other)};CurrentRunId=1} 2
     Assert-Rejected 'API failure does not pass' @{Runs=@($first);Jobs=@{[long]1=$job};ApiError=$true} 'Synthetic API failure'
-    Assert-Rejected 'bounded incomplete history does not pass' @{Runs=@($first);Jobs=@{[long]1=$job};Overflow=$true} 'bounded evidence search'
+    $unrelated = New-FixtureRun 2 ('c' * 40)
+    $unrelated.conclusion = 'failure'
+    Assert-Accepted 'exact SHA wins over a later identical tree failure and a large history' @{
+        Runs=@($unrelated,$first);Jobs=@{[long]1=$job};Overflow=$true}
+    $pendingTarget = New-FixtureRun
+    $pendingTarget.status='in_progress';$pendingTarget.conclusion=$null
+    Assert-Rejected 'incomplete exact SHA cannot borrow a successful identical tree' @{
+        Runs=@($pendingTarget,$main);Jobs=@{[long]2=$mainJob};Overflow=$true} 'latest matching'
+    Assert-Rejected 'bounded incomplete history cannot grant tree-only reuse' @{
+        Runs=@($first);Jobs=@{[long]1=$job};Overflow=$true;TargetCommit=('f' * 40)} 'bounded evidence search'
 
-    $mainReuse = @{RefName='main';EventName='push';RunCore='false';WindowsResult='skipped'}
-    $manualReuse = @{RefName='main';EventName='workflow_dispatch';RunCore='false';WindowsResult='skipped'}
-    Assert-GateCase 'PR ran independent core'
-    Assert-GateCase 'main fallback ran independent core' -RefName main -EventName push
-    Assert-GateCase 'dev ran independent core' -RefName dev -EventName push
-    Assert-GateCase 'main push reused exact-tree evidence' @mainReuse
-    Assert-GateCase 'main dispatch reused exact-tree evidence' @manualReuse
-    Assert-GateCase 'PR cannot reuse even with main ref' -RefName main -RunCore false -WindowsResult skipped -Rejection 'Invalid core'
-    Assert-GateCase 'dev cannot reuse' -RefName dev -EventName push -RunCore false -WindowsResult skipped -Rejection 'Invalid core'
-    foreach ($state in @('failure','cancelled','skipped','')) {
-        Assert-GateCase "main reuse with evidence result '$state'" @mainReuse -EvidenceResult $state -Rejection 'Expected successful evidence'
-        Assert-GateCase "PR with Windows result '$state'" -WindowsResult $state -Rejection 'Invalid core'
-    }
-    foreach ($state in @('failure','cancelled','success')) {
-        Assert-GateCase "main reuse with Windows result '$state'" -RefName main -EventName push -RunCore false `
-            -WindowsResult $state -Rejection 'Invalid core'
-    }
-    foreach ($decision in @('false','unknown','')) {
-        Assert-GateCase "PR with run_core '$decision' despite green Windows" -RunCore $decision -Rejection 'Invalid core'
-    }
-    Assert-GateCase 'main with missing reuse output' -RefName main -EventName push -RunCore '' `
-        -WindowsResult skipped -Rejection 'Invalid core'
     $outcome='Passed'
 } finally {
     @{status=$outcome;checks=@($checks)} | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'result.json') -Encoding utf8
