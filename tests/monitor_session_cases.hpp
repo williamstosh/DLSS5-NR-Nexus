@@ -219,6 +219,8 @@ void RunMonitorSessionCases(const Check& check, const Frame& frame) {
       WritePrivateProfileStringA(nullptr, nullptr, nullptr, ini_path.string().c_str());
     }
   };
+  OutputRuntimeFixture runtime_a_fixture{false};
+  OutputRuntimeFixture runtime_b_fixture{false};
   struct Restore {
     const decltype(restore)* callback;
     ~Restore() noexcept(false) { (*callback)(); }
@@ -267,6 +269,9 @@ void RunMonitorSessionCases(const Check& check, const Frame& frame) {
   preserve(r::monitor_key_edge);
   preserve(r::monitor_mode_key_edge);
   preserve(r::live_effect_runtimes);
+  preserve(r::effect_runtime_generations);
+  preserve(r::effect_runtime_generation_serial);
+  preserve(r::monitor_status_output);
   preserve(r::monitor_snapshot);
   preserve(r::monitor_cadence);
   preserve(ImGui::GetIO().Framerate);
@@ -525,17 +530,19 @@ void RunMonitorSessionCases(const Check& check, const Frame& frame) {
     return !current && snapshot.card.nr_gpu_ms == 0.f && !snapshot.complete;
   };
 
-  // Opaque census identities only: no virtual methods, desktop, device or GPU.
-  std::array<std::byte, 2> runtime_tokens{};
-  auto* runtime_a = reinterpret_cast<reshade::api::effect_runtime*>(&runtime_tokens[0]);
-  auto* runtime_b = reinterpret_cast<reshade::api::effect_runtime*>(&runtime_tokens[1]);
+  // The real callback queries the first runtime's back buffers while electing the owner.
+  auto* runtime_a = &runtime_a_fixture;
+  auto* runtime_b = &runtime_b_fixture;
   r::live_effect_runtimes.clear();
+  r::effect_runtime_generations.clear();
   r::monitor_runtime = nullptr;
   const auto initial_epoch = r::monitor_observation_epoch.load();
   r::OnInitEffectRuntime(runtime_a);
   check(r::monitor_runtime.load() == runtime_a && r::live_effect_runtimes.size() == 1
             && r::monitor_observation_epoch.load() == initial_epoch + 1,
         "first runtime becomes monitor owner and advances the epoch");
+  check(!r::monitor_status_output.owner && !r::monitor_status_output.ambiguous,
+        "an owner with no back buffers does not select a different output");
   r::OnInitEffectRuntime(runtime_b);
   check(r::monitor_runtime.load() == runtime_a && r::live_effect_runtimes.size() == 2
             && r::monitor_observation_epoch.load() == initial_epoch + 2,
@@ -564,8 +571,7 @@ void RunMonitorSessionCases(const Check& check, const Frame& frame) {
         "recreating a runtime establishes a fresh owner epoch");
   check(no_old_gpu(refresh_while_locked()), "runtime recreation cannot reuse old cached GPU evidence");
 
-  // Opaque census tokens have no runtime vtable. Source selection and warming
-  // are exercised with deterministic timestamps in RunFrameMetricsCases.
+  // Source selection and warming use deterministic timestamps in RunFrameMetricsCases.
   r::monitor_cadence = {};
   ImGui::GetIO().Framerate = 144.f;
   r::UpdateMonitorCadence(nullptr);

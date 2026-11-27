@@ -1,5 +1,7 @@
-// CPU ReShade interfaces for owner matching. The DEV fixture includes only these
-// declarations with NR_NEXUS_TEST_OUTPUT_RUNTIME_ONLY.
+#if !defined(NR_NEXUS_TEST_OUTPUT_RUNTIME_FIXTURE_DEFINED)
+#define NR_NEXUS_TEST_OUTPUT_RUNTIME_FIXTURE_DEFINED
+
+// CPU ReShade interfaces for owner matching.
 namespace fixture_rate = renodx::addons::dlss5::output_framerate;
 namespace fixture_runtime = renodx::addons::dlss5::internal;
 struct OutputRuntimeFixture final : reshade::api::effect_runtime {
@@ -70,7 +72,10 @@ struct OutputRuntimeFixture final : reshade::api::effect_runtime {
   decltype(fixture_rate::internal::state.xefg) saved_xefg;
   decltype(fixture_rate::internal::state.native_options) saved_options;
 
-  OutputRuntimeFixture() {
+  const bool has_output;
+
+  explicit OutputRuntimeFixture(bool register_output = true) : has_output(register_output) {
+    if (!has_output) return;
     {
       std::unique_lock lock(fixture_rate::internal::state.mutex);
       saved_present.swap(fixture_rate::internal::state.present);
@@ -90,6 +95,7 @@ struct OutputRuntimeFixture final : reshade::api::effect_runtime {
   }
 
   ~OutputRuntimeFixture() {
+    if (!has_output) return;
     fixture_runtime::monitor_runtime = saved_owner;
     fixture_runtime::monitor_cadence = std::move(saved_cadence);
     fixture_runtime::monitor_snapshot = std::move(saved_snapshot);
@@ -104,7 +110,9 @@ struct OutputRuntimeFixture final : reshade::api::effect_runtime {
   reshade::api::device *get_device() override { return &device; }
   void *get_hwnd() const override { return nullptr; }
   reshade::api::resource get_back_buffer(uint32_t index) override { return buffers.at(index); }
-  uint32_t get_back_buffer_count() const override { return static_cast<uint32_t>(buffers.size()); }
+  uint32_t get_back_buffer_count() const override {
+    return (has_output ? static_cast<uint32_t>(buffers.size()) : 0);
+  }
   uint32_t get_current_back_buffer_index() const override { return current_buffer; }
   reshade::api::command_queue *get_command_queue() override { return nullptr; }
   void render_effects(reshade::api::command_list *cmd_list, reshade::api::resource_view rtv, reshade::api::resource_view rtv_srgb) override { throw std::logic_error("unsupported output fixture operation"); }
@@ -179,6 +187,8 @@ struct OutputRuntimeFixture final : reshade::api::effect_runtime {
   void export_current_preset(const char *path) const override { throw std::logic_error("unsupported output fixture operation"); }
   void save_screenshot(const char *postfix = nullptr) override { throw std::logic_error("unsupported output fixture operation"); }
 };
+
+#endif
 
 #if !defined(NR_NEXUS_TEST_OUTPUT_RUNTIME_ONLY)
 {

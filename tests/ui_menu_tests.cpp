@@ -172,6 +172,9 @@ namespace runtime = renodx::addons::dlss5::internal;
 namespace ui = renodx::addons::dlss5::ui;
 using Json = nlohmann::json;
 #include "monitor_performance_cases.hpp"
+#define NR_NEXUS_TEST_OUTPUT_RUNTIME_ONLY
+#include "adaptive_ui_cases.hpp"
+#undef NR_NEXUS_TEST_OUTPUT_RUNTIME_ONLY
 #include "monitor_session_cases.hpp"
 
 struct Item {
