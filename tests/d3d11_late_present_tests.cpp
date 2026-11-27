@@ -411,7 +411,7 @@ int wmain(int argc, wchar_t** argv) {
     }
   }
   nx::CancelLateBridgePresent(owner);
-  if (nx::late_bridge_overlay_listening) reshade::unregister_event<reshade::addon_event::reshade_overlay>(nx::OnLateBridgeOverlay);
+  if (nx::overlay_listeners.late_bridge) reshade::unregister_event<reshade::addon_event::reshade_overlay>(nx::OnLateBridgeOverlay);
   if (observer_registered) reshade::unregister_event<reshade::addon_event::reshade_overlay>(ObserveOverlay);
   nx::OnDestroyEffectRuntime(runtime);
   if (nx::DrainBridgeQueue() && official_initialized) {

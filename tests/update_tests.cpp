@@ -33,19 +33,6 @@ extern "C" __declspec(dllexport) bool StartPinnedUpdate(INTERNET_PORT port) {
   return pinned_service->Start(backend::TaskKind::CHECK, update::UtcNow(), true);
 }
 
-extern "C" __declspec(dllexport) void DrainPinnedUpdate() {
-  pinned_service->StopForHostUnload();
-}
-
-extern "C" __declspec(dllexport) bool ResumePinnedUpdate() {
-  return !pinned_service->Start(backend::TaskKind::CHECK, update::UtcNow(), true)
-      && pinned_service->Start(backend::TaskKind::CHECK);
-}
-
-extern "C" __declspec(dllexport) bool PinnedUpdateBusy() {
-  return pinned_service->GetSnapshot().busy;
-}
-
 #else
 
 namespace {
@@ -494,9 +481,50 @@ void Loopback(INTERNET_PORT port) {
   };
   Require(fixture.service.Start(TaskKind::CHOOSE_DIRECTORY), "open modal fixture");
   WaitFor([] { return picker_ready.load(); });
-  fixture.service.StopForHostUnload();
-  Require(picker_closed && !fixture.service.GetSnapshot().busy && !fixture.service.TakeSettingsUpdate(),
-          "host unload must close and drain the active picker");
+  fixture.service.OnHostUnload();
+  WaitFor([&] { return !fixture.service.GetSnapshot().busy; });
+  Require(picker_closed && !fixture.service.TakeSettingsUpdate(),
+          "host unload must request closing only the active picker");
+  static std::atomic_bool picker_show_entered = false;
+  static std::atomic_bool picker_show_release = false;
+  picker_ready = false;
+  picker_closed = false;
+  dialogs::internal::show_dialog = +[](IFileDialog*, HWND) -> HRESULT {
+    picker_show_entered = true;
+    WaitFor([] { return picker_show_release.load(); });
+    const HWND popup = CreateWindowExW(WS_EX_TOOLWINDOW, L"STATIC", L"Late update picker",
+                                      WS_OVERLAPPED | WS_VISIBLE, -32000, -32000, 1, 1,
+                                      nullptr, nullptr, nullptr, nullptr);
+    if (popup == nullptr) return E_FAIL;
+    picker_ready = true;
+    MSG message{};
+    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+      if (message.hwnd == popup && message.message == WM_CLOSE) {
+        picker_closed = true;
+        break;
+      }
+      DispatchMessageW(&message);
+    }
+    DestroyWindow(popup);
+    return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+  };
+  Require(fixture.service.Start(TaskKind::CHOOSE_DIRECTORY), "start picker before its window exists");
+  WaitFor([] { return picker_show_entered.load(); });
+  fixture.service.OnHostUnload();
+  Require(fixture.service.GetSnapshot().busy && !picker_ready, "unload waited for the gated picker");
+  picker_show_release = true;
+  WaitFor([&] { return !fixture.service.GetSnapshot().busy; });
+  Require(picker_ready && picker_closed && !fixture.service.TakeSettingsUpdate()
+              && fixture.service.GetSnapshot().action_error.code == Error::NONE,
+          "picker cancellation was lost before window creation");
+  picker_show_entered = false;
+  dialogs::internal::show_dialog = +[](IFileDialog*, HWND) -> HRESULT {
+    picker_show_entered = true;
+    return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+  };
+  Require(fixture.service.Start(TaskKind::CHOOSE_DIRECTORY), "new picker after canceled generation");
+  Require(fixture.Done().action_error.code == Error::NONE && picker_show_entered,
+          "old picker cancellation affected a new task");
   Parity("chooser_fallback_cancel_background_shell=passed");
 
   const auto module = LoadLibraryW(L"update_worker_fixture.dll");
@@ -508,38 +536,6 @@ void Loopback(INTERNET_PORT port) {
   Require(FreeLibrary(module) != FALSE, "could not release external DLL reference");
   Require(GetModuleHandleW(L"update_worker_fixture.dll") != nullptr, "running worker did not pin DLL");
   WaitFor([] { return GetModuleHandleW(L"update_worker_fixture.dll") == nullptr; });
-  const auto requests = [](int expected) {
-    WaitFor([=] {
-      std::ifstream log("loopback-requests.jsonl");
-      int pinned = 0;
-      for (std::string row; std::getline(log, row);) {
-        if (row.find(R"("/check/pinned")") != row.npos) {
-          ++pinned;
-        }
-      }
-      return pinned >= expected;
-    });
-  };
-  for (const int generation : {2, 4}) {
-    const auto current = LoadLibraryW(L"update_worker_fixture.dll");
-    Require(current != nullptr, "could not initialize the next DLL generation");
-    const auto init = std::bit_cast<StartPinned>(GetProcAddress(current, "StartPinnedUpdate"));
-    const auto drain = std::bit_cast<void (*)()>(GetProcAddress(current, "DrainPinnedUpdate"));
-    const auto busy = std::bit_cast<bool (*)()>(GetProcAddress(current, "PinnedUpdateBusy"));
-    Require(init != nullptr && drain != nullptr && busy != nullptr && init(port), "DLL generation did not start");
-    requests(generation);
-    Require(busy(), "host-unload fixture must be draining an active worker");
-    drain();
-    Require(!busy(), "host-unload fixture returned before worker exit");
-    if (generation == 2) {
-      const auto resume = std::bit_cast<bool (*)()>(GetProcAddress(current, "ResumePinnedUpdate"));
-      Require(resume != nullptr && resume(), "still-loaded DLL did not resume manual tasks after host restart");
-      requests(3);
-      drain();
-    }
-    Require(FreeLibrary(current) != FALSE && GetModuleHandleW(L"update_worker_fixture.dll") == nullptr,
-            "drained DLL retained an update reference");
-  }
   Parity("module_pin_and_release=passed");
 }
 

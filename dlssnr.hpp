@@ -2475,7 +2475,13 @@ inline std::mutex overlay_listener_mutex;
 inline std::vector<reshade::api::effect_runtime*> live_effect_runtimes;
 inline std::unordered_map<reshade::api::effect_runtime*, uint64_t> effect_runtime_generations;
 inline uint64_t effect_runtime_generation_serial = 0;
-inline bool late_bridge_overlay_listening = false;
+struct OverlayListeners {
+  bool hud = false;
+  bool hotkeys = false;
+  bool dock = false;
+  bool late_bridge = false;
+};
+inline OverlayListeners overlay_listeners;
 struct MonitorStatusOutput {
   output_framerate::OutputIdentity owner;
   bool ambiguous = false;
@@ -29687,19 +29693,18 @@ inline void OnPresent(
              || (swapchain != nullptr
                  && live_effect_runtimes.front()->get_hwnd()
                         == swapchain->get_hwnd())) {
-    const auto listen = [](std::atomic_bool* listening, bool due,
+    const auto listen = [](bool* listening, bool due,
                            void (*callback)(reshade::api::effect_runtime*)) {
-      if (listening->exchange(due, std::memory_order_relaxed) == due) return;
+      if (*listening == due) return;
+      *listening = due;
       if (due) {
         reshade::register_event<reshade::addon_event::reshade_overlay>(callback);
       } else {
         reshade::unregister_event<reshade::addon_event::reshade_overlay>(callback);
       }
     };
-    static std::atomic_bool hud_listening{false};
-    static std::atomic_bool hotkeys_listening{false};
     const bool overlay_open = hud_overlay_open.load(std::memory_order_relaxed);
-    listen(&hud_listening,
+    listen(&overlay_listeners.hud,
            monitor_requested.load(std::memory_order_relaxed)
            || (hud_enabled.load(std::memory_order_relaxed)
                && ((!overlay_open && (hud_pill.load(std::memory_order_relaxed)
@@ -29707,15 +29712,14 @@ inline void OnPresent(
                    || present_ns < health_notice_until_ns.load(std::memory_order_relaxed)))
                    || present_ns < profile_feedback_until_ns.load(std::memory_order_relaxed))),
            OnHudOverlay);
-    listen(&hotkeys_listening, overlay_open, OnOverlayHotkeys);
+    listen(&overlay_listeners.hotkeys, overlay_open, OnOverlayHotkeys);
     // A dock whose tab-select frame never came (the overlay closed first)
     // is done: the next open must not pull this tab to the front.
     if (!overlay_open) {
       uint32_t selecting = 1;
       overlay_dock_step.compare_exchange_strong(selecting, 2, std::memory_order_relaxed);
     }
-    static std::atomic_bool dock_listening{false};
-    listen(&dock_listening,
+    listen(&overlay_listeners.dock,
            overlay_open
                && (overlay_window_stranded.load(std::memory_order_relaxed) >= 0
                    || overlay_dock_step.load(std::memory_order_relaxed) == 1),
@@ -29847,8 +29851,8 @@ inline void OnPresent(
       const bool due = std::ranges::any_of(late_bridge_presents, [&](const auto& pending) {
         return pending.swapchain == swapchain;
       });
-      if (late_bridge_overlay_listening != due) {
-        late_bridge_overlay_listening = due;
+      if (overlay_listeners.late_bridge != due) {
+        overlay_listeners.late_bridge = due;
         if (due) {
           reshade::register_event<reshade::addon_event::reshade_overlay>(OnLateBridgeOverlay);
         } else {
@@ -37728,6 +37732,39 @@ inline bool Shutdown(bool proof_gated) {
 
 }  // namespace internal
 
+inline void RegisterReShadeCallbacks() {
+  // Each registration starts before ReShade creates any effect runtimes.
+  // The previous generation's listeners were removed with its add-on entry.
+  internal::overlay_listeners = {};
+  internal::hud_overlay_open.store(false, std::memory_order_relaxed);
+
+  reshade::register_event<reshade::addon_event::init_device>(internal::OnInitDevice);
+  reshade::register_event<reshade::addon_event::destroy_device>(internal::OnDestroyDevice);
+  reshade::register_event<reshade::addon_event::init_swapchain>(internal::OnInitSwapchain);
+  reshade::register_event<reshade::addon_event::destroy_swapchain>(internal::OnDestroySwapchain);
+  reshade::register_event<reshade::addon_event::present>(internal::OnPresent);
+  reshade::register_event<reshade::addon_event::finish_present>(internal::OnFinishPresent);
+  reshade::register_event<reshade::addon_event::init_effect_runtime>(internal::OnInitEffectRuntime);
+  reshade::register_event<reshade::addon_event::init_effect_runtime>(internal::OnUpdateInit);
+  reshade::register_event<reshade::addon_event::reshade_present>(internal::OnUpdatePresent);
+  reshade::register_event<reshade::addon_event::destroy_effect_runtime>(internal::OnDestroyEffectRuntime);
+  reshade::register_event<reshade::addon_event::destroy_command_list>(internal::OnDestroyCommandListEvent);
+#if defined(NR_NEXUS_DEV_CONTROL)
+  reshade::register_event<reshade::addon_event::destroy_resource>(internal::OnPremiseResourceDestroyed);
+#endif
+  reshade::register_event<reshade::addon_event::destroy_command_queue>(internal::OnDestroyCommandQueueEvent);
+  reshade::register_overlay(internal::kOverlayTitle, internal::OnOverlay);
+  reshade::register_event<reshade::addon_event::reshade_present>(internal::OnProfilePresent);
+  reshade::register_event<reshade::addon_event::reshade_open_overlay>(internal::OnReshadeOpenOverlay);
+  if (!internal::ui_capture_dir.empty()) {
+    reshade::register_event<reshade::addon_event::reshade_overlay>(internal::OnUiCaptureOverlay);
+    reshade::register_event<reshade::addon_event::reshade_present>(internal::OnUiCapturePresent);
+  }
+  if (!internal::issue_report::test_reason.empty()) {
+    reshade::register_event<reshade::addon_event::reshade_present>(internal::OnIssueReportTestPresent);
+  }
+}
+
 inline void Use(DWORD reason, HMODULE module, LPVOID reserved) {
   // Windows runs every one of these arms holding the loader lock.  See
   // runtime_lock.hpp for which calls that makes illegal and which it does
@@ -37787,39 +37824,9 @@ inline void Use(DWORD reason, HMODULE module, LPVOID reserved) {
           " overlay status text. If the game itself crashes, also share"
           " RenoDX-DLSS5-crash.log next to the game's exe: it names the"
           " module that faulted.");
-      reshade::register_event<reshade::addon_event::init_device>(internal::OnInitDevice);
-      reshade::register_event<reshade::addon_event::destroy_device>(internal::OnDestroyDevice);
-      reshade::register_event<reshade::addon_event::init_swapchain>(internal::OnInitSwapchain);
-      reshade::register_event<reshade::addon_event::destroy_swapchain>(internal::OnDestroySwapchain);
-      reshade::register_event<reshade::addon_event::present>(internal::OnPresent);
-      reshade::register_event<reshade::addon_event::finish_present>(internal::OnFinishPresent);
-      reshade::register_event<reshade::addon_event::init_effect_runtime>(
-          internal::OnInitEffectRuntime);
-      reshade::register_event<reshade::addon_event::init_effect_runtime>(internal::OnUpdateInit);
-      reshade::register_event<reshade::addon_event::reshade_present>(internal::OnUpdatePresent);
-      reshade::register_event<reshade::addon_event::destroy_effect_runtime>(
-          internal::OnDestroyEffectRuntime);
-      reshade::register_event<reshade::addon_event::destroy_command_list>(
-          internal::OnDestroyCommandListEvent);
-#if defined(NR_NEXUS_DEV_CONTROL)
-      reshade::register_event<reshade::addon_event::destroy_resource>(internal::OnPremiseResourceDestroyed);
-#endif
-      reshade::register_event<reshade::addon_event::destroy_command_queue>(
-          internal::OnDestroyCommandQueueEvent);
-      reshade::register_overlay(internal::kOverlayTitle, internal::OnOverlay);
-      reshade::register_event<reshade::addon_event::reshade_present>(internal::OnProfilePresent);
-      reshade::register_event<reshade::addon_event::reshade_open_overlay>(
-          internal::OnReshadeOpenOverlay);
-      if (internal::InitUiCapture()) {
-        reshade::register_event<reshade::addon_event::reshade_overlay>(
-            internal::OnUiCaptureOverlay);
-        reshade::register_event<reshade::addon_event::reshade_present>(
-            internal::OnUiCapturePresent);
-      }
-      if (internal::InitIssueReportTest()) {
-        reshade::register_event<reshade::addon_event::reshade_present>(
-            internal::OnIssueReportTestPresent);
-      }
+      internal::InitUiCapture();
+      internal::InitIssueReportTest();
+      RegisterReShadeCallbacks();
       // ReShade loads this add-on inside vkCreateInstance. Observe its Vulkan
       // device creation before NGX can initialize, even if NGX loads later.
       internal::vk::InstallContextHooks();
@@ -37829,8 +37836,6 @@ inline void Use(DWORD reason, HMODULE module, LPVOID reserved) {
       break;
     case DLL_PROCESS_DETACH:
       update::Shutdown();
-      reshade::unregister_event<reshade::addon_event::init_effect_runtime>(internal::OnUpdateInit);
-      reshade::unregister_event<reshade::addon_event::reshade_present>(internal::OnUpdatePresent);
 #if defined(NR_NEXUS_DEV_CONTROL)
       dev_control_pipe::Stop();
 #endif
@@ -37838,56 +37843,13 @@ inline void Use(DWORD reason, HMODULE module, LPVOID reserved) {
       gpu_timers::monitor_events.enabled = false;
       internal::monitor_runtime = nullptr;
       internal::monitor_observation_epoch.fetch_add(1);
-      reshade::unregister_event<reshade::addon_event::reshade_present>(internal::OnProfilePresent);
       fg::xefg::Stop();
       fg::native_options::Stop();
       debug::Mark("detach:begin");
       lastgasp::Phase("detach:begin", true);
       internal::PublishAddonCopy(false);
       debug::Shutdown();
-      reshade::unregister_event<reshade::addon_event::init_device>(internal::OnInitDevice);
-      reshade::unregister_event<reshade::addon_event::destroy_device>(internal::OnDestroyDevice);
-      reshade::unregister_event<reshade::addon_event::init_swapchain>(internal::OnInitSwapchain);
-      reshade::unregister_event<reshade::addon_event::destroy_swapchain>(internal::OnDestroySwapchain);
-      reshade::unregister_event<reshade::addon_event::present>(internal::OnPresent);
-      reshade::unregister_event<reshade::addon_event::finish_present>(internal::OnFinishPresent);
-      reshade::unregister_event<reshade::addon_event::init_effect_runtime>(
-          internal::OnInitEffectRuntime);
-      reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(
-          internal::OnDestroyEffectRuntime);
-      reshade::unregister_event<reshade::addon_event::reset_command_list>(
-          internal::vk::OnResetCommandList);
-      internal::vk::UnregisterStateEvents();
-      reshade::unregister_event<reshade::addon_event::destroy_command_list>(
-          internal::OnDestroyCommandListEvent);
-#if defined(NR_NEXUS_DEV_CONTROL)
-      reshade::unregister_event<reshade::addon_event::destroy_resource>(internal::OnPremiseResourceDestroyed);
-#endif
-      reshade::unregister_event<reshade::addon_event::destroy_command_queue>(
-          internal::OnDestroyCommandQueueEvent);
-      reshade::unregister_overlay(internal::kOverlayTitle, internal::OnOverlay);
-      reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(
-          internal::OnReshadeOpenOverlay);
-      reshade::unregister_event<reshade::addon_event::reshade_overlay>(internal::OnLateBridgeOverlay);
-      // The HUD's, the overlay hotkeys' and the window dock's listeners, if a
-      // pill or toast was due or the overlay open at unload; removing one
-      // that is not there does nothing.
-      reshade::unregister_event<reshade::addon_event::reshade_overlay>(
-          internal::OnHudOverlay);
-      reshade::unregister_event<reshade::addon_event::reshade_overlay>(
-          internal::OnOverlayHotkeys);
-      reshade::unregister_event<reshade::addon_event::reshade_overlay>(
-          internal::OnDockOverlayWindow);
-      if (!internal::ui_capture_dir.empty()) {
-        reshade::unregister_event<reshade::addon_event::reshade_overlay>(
-            internal::OnUiCaptureOverlay);
-        reshade::unregister_event<reshade::addon_event::reshade_present>(
-            internal::OnUiCapturePresent);
-      }
-      if (!internal::issue_report::test_reason.empty()) {
-        reshade::unregister_event<reshade::addon_event::reshade_present>(
-            internal::OnIssueReportTestPresent);
-      }
+      internal::vk::UnregisterDeviceEvents();
       // Both detach flavors (FreeLibrary unload and process termination) run
       // under the loader lock; see DetachLite for why the full teardown must
       // never run here.  Device rebuilds go through OnDestroyDevice, which

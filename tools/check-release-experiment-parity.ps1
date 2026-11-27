@@ -99,6 +99,27 @@ function Assert-ReleaseParityBuildPair([string]$Suite, [string]$OffDirectory, [s
         foreach ($file in @($closure.Source) + @($closure.Includes)) {
             if (-not $currentInputs.ContainsKey($file)) { throw "Compiler input has no hash: $file" }
         }
+        if ($Suite -ceq 'update-lifecycle') {
+            $harness = $identity.harness
+            if (-not $harness) { throw 'Update lifecycle evidence requires its actual loader harness.' }
+            foreach ($file in @{
+                    $harness.executable=$harness.sha256; 'harness-inputs.json'=$harness.inputsSha256;
+                    'harness-arguments.json'=$harness.argumentsSha256; 'harness-dependencies.json'=$harness.dependenciesSha256
+                }.GetEnumerator()) {
+                if ((Get-FileHash -LiteralPath (Join-Path $directory $file.Key)).Hash -cne $file.Value) {
+                    throw "$Suite $mode harness evidence changed: $($file.Key)"
+                }
+            }
+            $harnessInputs = @{}
+            foreach ($input in @(Get-Content -LiteralPath (Join-Path $directory 'harness-inputs.json') -Raw | ConvertFrom-Json)) {
+                if ((Get-FileHash -LiteralPath $input.path).Hash -cne $input.sha256) { throw "Harness input changed: $($input.path)" }
+                $harnessInputs[$input.path] = $input.sha256
+            }
+            $harnessClosure = (Get-Content -LiteralPath (Join-Path $directory 'harness-dependencies.json') -Raw | ConvertFrom-Json).Data
+            foreach ($file in @($harnessClosure.Source) + @($harnessClosure.Includes)) {
+                if (-not $harnessInputs.ContainsKey($file)) { throw "Harness compiler input has no hash: $file" }
+            }
+        }
         if ((Get-FileHash -LiteralPath $identity.compiler).Hash -cne $identity.compilerSha256 -or
             ($identity.source | ConvertTo-Json -Depth 5 -Compress) -cne ($BuildContext | ConvertTo-Json -Depth 5 -Compress)) {
             throw "$Suite $mode does not identify the core commit and locked dependencies."
@@ -284,7 +305,7 @@ function Get-ReleaseParityRegistration([string]$SourceRoot, [switch]$AllowPendin
         }
         $caseNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         foreach ($case in $row.cases) {
-            if ($case.suite -cnotin @('fg-native','bridge-motion','adaptive-resolution','update') -or
+            if ($case.suite -cnotin @('fg-native','bridge-motion','adaptive-resolution','update','update-lifecycle') -or
                 -not $caseNames.Add("$($case.suite)/$($case.name)") -or $case.log -cnotmatch '^[a-z0-9-]+$' -or
                 -not $case.receipt.StartsWith('^') -or @($case.scenarios).Count -eq 0 -or
                 @($case.scenarios | Sort-Object -Unique).Count -ne $case.scenarios.Count -or

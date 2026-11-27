@@ -5,12 +5,13 @@
       "state": "ready",
       "intent": [],
       "commands": [],
-      "producer": "An independent startup callback or player command starts the same module-pinned worker in ordinary and DEV builds; host unload drains it before releasing the host reference.",
+      "producer": "An independent startup callback or player command starts the same module-pinned worker in ordinary and DEV builds; host unload retires only its registration without waiting for or cancelling network work, and a rebuilt host owns its own module reference.",
       "consumer": "The shared About panel reads coherent release and download snapshots; the frame callback persists the independent update preferences.",
       "success": "A valid official release is compared numerically; a unique ZIP is published only after exact-size streaming and successful final rename, or matching existing-file reuse.",
       "refusal": "Invalid releases, unsafe redirects, rate limits, incomplete transfers and conflicting files remain retryable failures without changing NR or image presets.",
       "fallback": "A failed recheck retains stale release information; a failed download removes only its owned temporary file and never replaces a conflicting completed ZIP.",
       "sources": [
+        ["addon.cpp", "bool AddonInit("],
         ["addon.cpp", "void AddonUninit("],
         ["update.hpp", "inline bool StartCheck("],
         ["update.hpp", "inline bool StartDownload("],
@@ -41,6 +42,14 @@
             "progress-cancel-deadline": "^NR_RELEASE_PARITY online-update progress_frozen_directory_cancel_deadline=passed$",
             "folder-actions": "^NR_RELEASE_PARITY online-update chooser_fallback_cancel_background_shell=passed$",
             "module-lifetime": "^NR_RELEASE_PARITY online-update module_pin_and_release=passed$"
+          }
+        },
+        {
+          "suite": "update-lifecycle", "name": "host-lifecycle", "log": "host-lifecycle", "existingTrace": true,
+          "receipt": "^NR_RELEASE_PARITY online-update host_unload_nonblocking_rebuild_state=passed$",
+          "scenarios": ["host-unload-rebuild"],
+          "expect": {
+            "host-unload-rebuild": "^NR_RELEASE_PARITY online-update host_unload_nonblocking_rebuild_state=passed$"
           }
         }
       ]
@@ -156,7 +165,7 @@
         ["dlssnr.hpp", "fg::xefg::RegisterBridgeSourceSwapchain("],
         ["dlssnr.hpp", "fg::xefg::ForgetBridgeSourceSwapchain("],
         ["dlssnr.hpp", "reshade::register_event<reshade::addon_event::init_swapchain>(internal::OnInitSwapchain)"],
-        ["dlssnr.hpp", "reshade::unregister_event<reshade::addon_event::destroy_swapchain>(internal::OnDestroySwapchain)"],
+        ["addon.cpp", "reshade::unregister_addon(module, reshade_module)"],
         ["dlssnr.hpp", "BridgeAdaptiveEligible(*bridge_source"],
         ["d3d11_bridge.hpp", "ResolveAdaptiveDelivery("]
       ],
@@ -352,7 +361,7 @@
         ["fg_native_options.hpp", "output_framerate::ObserveNativeState("],
         ["fg_native_options.hpp", "detour_guard::AttachAll(internal::PRESENT_HOOKS,"],
         ["addon.cpp", "reshade::register_event<reshade::addon_event::present>(ObserveOutputPresent)"],
-        ["addon.cpp", "reshade::unregister_event<reshade::addon_event::present>(ObserveOutputPresent)"]
+        ["addon.cpp", "reshade::unregister_addon(module, reshade_module)"]
       ],
       "cases": [
         { "suite": "fg-native", "name": "output-framerate-registration", "log": "output-framerate-registration", "receipt": "^PASS case=output-framerate-registration evidence=WARP\\+MOCK dev={dev}$",
@@ -543,7 +552,6 @@
     "dlssnr.hpp ObserveSrBenchmarkRenderInput": "diagnostic",
     "dlssnr.hpp ObserveSrBenchmarkResult": "diagnostic",
     "dlssnr.hpp reshade::register_event<reshade::addon_event::destroy_resource>(internal::OnPremiseResourceDestroyed)": "diagnostic",
-    "dlssnr.hpp reshade::unregister_event<reshade::addon_event::destroy_resource>(internal::OnPremiseResourceDestroyed)": "diagnostic",
     "fg_native.hpp fg::native_options::ObservesPresentDecisions": "diagnostic",
     "fg_xefg.hpp edit_fg_observation::ObserveRecording": "diagnostic",
     "fg_xefg.hpp edit_fg_observation::ObserveResource": "diagnostic",

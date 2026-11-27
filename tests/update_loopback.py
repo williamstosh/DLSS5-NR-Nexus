@@ -107,6 +107,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                               ("Set-Cookie", "fixture=secret")))
         if self.path == "/download/redirected":
             return self.respond(200, ZIP)
+        if self.path in ("/download/gate-headers", "/download/gate-body", "/download/gate-cold"):
+            if self.server.gate_directory is None:
+                return self.respond(404)
+            case = self.path.removeprefix("/download/")
+            prefix = 0
+            if case != "gate-headers":
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(ZIP)))
+                self.end_headers()
+                prefix = 96 * 1024
+                self.wfile.write(ZIP[:prefix])
+                self.wfile.flush()
+            (self.server.gate_directory / (case + ".entered")).touch()
+            release = self.server.gate_directory / (case + ".release")
+            deadline = time.monotonic() + 25
+            while not release.is_file():
+                if time.monotonic() >= deadline:
+                    self.close_connection = True
+                    return None
+                time.sleep(0.01)
+            if case == "gate-headers":
+                return self.respond(200, ZIP)
+            self.wfile.write(ZIP[prefix:])
+            return None
         if self.path == "/download/outside-host":
             return self.respond(302, headers=(("Location", f"http://localhost:{self.server.server_port}/should-not-reach"),))
         if self.path == "/download/outside-port":
@@ -147,9 +171,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ready", type=pathlib.Path, required=True)
     parser.add_argument("--log", type=pathlib.Path, required=True)
+    parser.add_argument("--gate-directory", type=pathlib.Path)
     args = parser.parse_args()
     with http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
         server.log = args.log
+        server.gate_directory = args.gate_directory
         server.recovery = False
         server.revisions = {}
         ready = args.ready.with_suffix(".part")

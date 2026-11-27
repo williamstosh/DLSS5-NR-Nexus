@@ -23,12 +23,15 @@
 #include "output_framerate.hpp"
 
 namespace {
+namespace nr = renodx::addons::dlss5;
+
+bool addon_registered = false;
+
 void ObserveOutputInit(reshade::api::swapchain* swapchain, bool) {
   if (swapchain == nullptr) return;
   auto* device = swapchain->get_device();
   if (device == nullptr || (device->get_api() != reshade::api::device_api::d3d12
       && device->get_api() != reshade::api::device_api::d3d11)) return;
-  namespace nr = renodx::addons::dlss5;
   nr::internal::GuardHook([&] {
     std::vector<uintptr_t> back_buffers;
     const auto count = swapchain->get_back_buffer_count();
@@ -53,7 +56,6 @@ void ObserveOutputInit(reshade::api::swapchain* swapchain, bool) {
 
 void ObserveOutputPresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain,
     const reshade::api::rect*, const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
-  namespace nr = renodx::addons::dlss5;
   if (queue == nullptr || swapchain == nullptr || queue->get_device() != swapchain->get_device()
       || swapchain->get_back_buffer_count() == 0 || nr::fg::xefg::InProxyPresent()) return;
   const auto identity = nr::output_framerate::MatchPresentOutput(reinterpret_cast<uintptr_t>(swapchain),
@@ -64,19 +66,20 @@ void ObserveOutputPresent(reshade::api::command_queue* queue, reshade::api::swap
 }
 
 void ObserveOutputDestroy(reshade::api::swapchain* swapchain, bool) {
-  renodx::addons::dlss5::output_framerate::DestroyPresentOutput(reinterpret_cast<uintptr_t>(swapchain));
+  nr::output_framerate::DestroyPresentOutput(reinterpret_cast<uintptr_t>(swapchain));
 }
 
-void RegisterOutputSampling() {
+bool RegisterAddon(HMODULE module, HMODULE reshade_module = nullptr) {
+  if (!reshade::register_addon(module, reshade_module)) {
+    // The SDK can fail ImGui setup after ReShade has accepted the registration.
+    reshade::unregister_addon(module, reshade_module);
+    return false;
+  }
   reshade::register_event<reshade::addon_event::init_swapchain>(ObserveOutputInit);
   reshade::register_event<reshade::addon_event::present>(ObserveOutputPresent);
   reshade::register_event<reshade::addon_event::destroy_swapchain>(ObserveOutputDestroy);
-}
-
-void UnregisterOutputSampling() {
-  reshade::unregister_event<reshade::addon_event::init_swapchain>(ObserveOutputInit);
-  reshade::unregister_event<reshade::addon_event::present>(ObserveOutputPresent);
-  reshade::unregister_event<reshade::addon_event::destroy_swapchain>(ObserveOutputDestroy);
+  addon_registered = true;
+  return true;
 }
 }  // namespace
 
@@ -87,46 +90,60 @@ void UnregisterOutputSampling() {
 extern "C" __declspec(dllexport) constexpr const char* NAME = NR_NEXUS_ADDON_NAME;
 extern "C" __declspec(dllexport) constexpr const char* DESCRIPTION = NR_NEXUS_DESCRIPTION;
 
-// ReShade calls this before releasing its module reference, outside the loader lock.
-// Finish our worker here so a delayed reference cannot unload a newly created device's add-on.
-extern "C" __declspec(dllexport) void AddonUninit(HMODULE, HMODULE) {
-  renodx::addons::dlss5::update::StopForHostUnload();
+extern "C" __declspec(dllexport) bool AddonInit(HMODULE module, HMODULE reshade_module) {
+  if (addon_registered) return true;  // DllMain already registered the first load.
+  if (!RegisterAddon(module, reshade_module)) return false;
+  nr::RegisterReShadeCallbacks();
+  // Device teardown can remove these hooks before the next Vulkan device is created.
+  nr::internal::vk::InstallContextHooks();
+#if defined(NR_NEXUS_IME_DIAGNOSTICS)
+  reshade::register_overlay(NR_NEXUS_NAME " IME diagnostics", nr_ime_trace::Draw);
+#endif
+  return true;
+}
+
+extern "C" __declspec(dllexport) void AddonUninit(HMODULE module, HMODULE reshade_module) {
+  if (!addon_registered) return;
+  nr::update::OnHostUnload();
+  nr::internal::vk::UnregisterDeviceEvents();
+  // Removing the entry makes the next device load acquire its own DLL reference.
+  reshade::unregister_addon(module, reshade_module);
+  addon_registered = false;
 }
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
   if (reason == DLL_PROCESS_ATTACH) {
     // Before register_addon: the last-gasp reporter covers even a death in
     // the registration path.  The CRT and static initializers are already up.
-    renodx::addons::dlss5::lastgasp::Install(
-        module, renodx::addons::dlss5::internal::kAddonVersion);
-    if (!reshade::register_addon(module)) {
+    nr::lastgasp::Install(module, nr::internal::kAddonVersion);
+    if (!RegisterAddon(module)) {
       // No ReShade to register with: the loader unmaps this image next, and
       // the reporter's handlers must not outlive it.
-      renodx::addons::dlss5::lastgasp::Exit(false);
-      renodx::addons::dlss5::lastgasp::Uninstall();
+      nr::lastgasp::Exit(false);
+      nr::lastgasp::Uninstall();
       return FALSE;
     }
-    RegisterOutputSampling();
   }
 
-  renodx::addons::dlss5::Use(reason, module, reserved);
+  nr::Use(reason, module, reserved);
 
 #if defined(NR_NEXUS_IME_DIAGNOSTICS)
   if (reason == DLL_PROCESS_ATTACH) {
     reshade::register_overlay(NR_NEXUS_NAME " IME diagnostics", nr_ime_trace::Draw);
   } else if (reason == DLL_PROCESS_DETACH) {
     nr_ime_trace::Stop();
-    reshade::unregister_overlay(NR_NEXUS_NAME " IME diagnostics", nr_ime_trace::Draw);
   }
 #endif
 
   if (reason == DLL_PROCESS_DETACH) {
-    UnregisterOutputSampling();
-    reshade::unregister_addon(module);
+    if (addon_registered) {
+      reshade::unregister_addon(module);
+      addon_registered = false;
+    }
     // `reserved` is null for FreeLibrary and non-null at process exit.
     // [exit] (lastgasp.hpp): the session ended here, not in a silent death.
-    renodx::addons::dlss5::lastgasp::Exit(reserved != nullptr);
-    if (reserved == nullptr) renodx::addons::dlss5::lastgasp::Uninstall();
+    nr::lastgasp::Exit(reserved != nullptr);
+    if (reserved == nullptr) nr::lastgasp::Uninstall();
   }
   return TRUE;
 }

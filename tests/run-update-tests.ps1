@@ -163,7 +163,7 @@ try {
         foreach ($entry in @{
             '/download/reuse'=1; '/download/redirected'=1; '/download/race'=2;
             '/download/redirect-loop'=6; '/download/recover'=2; '/check/retry429'=1;
-            '/check/reset403'=1; '/check/pinned'=4
+            '/check/reset403'=1; '/check/pinned'=1
         }.GetEnumerator()) {
             if (@($requests | Where-Object path -eq $entry.Key).Count -ne $entry.Value) {
                 throw "Unexpected loopback request count: $($entry.Key)"

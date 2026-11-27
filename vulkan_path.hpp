@@ -3805,7 +3805,10 @@ inline void OnInitDevice(reshade::api::device* device) {
   }
 }
 
-inline void UnregisterStateEvents() {
+inline void UnregisterDeviceEvents() {
+  if (command_lists_registered.exchange(false)) {
+    reshade::unregister_event<reshade::addon_event::reset_command_list>(OnResetCommandList);
+  }
   if (image_events_registered.exchange(false)) {
     reshade::unregister_event<reshade::addon_event::begin_render_pass>(OnBeginTrackedRenderPass);
     reshade::unregister_event<reshade::addon_event::end_render_pass>(OnEndTrackedRenderPass);

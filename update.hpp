@@ -22,6 +22,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 
 #include <nlohmann/json.hpp>
@@ -120,7 +121,8 @@ constexpr int64_t DAY = 24 * HOUR;
 constexpr size_t MAX_RELEASE_BYTES = 1024 * 1024;
 using TransferClock = std::chrono::steady_clock;
 
-enum class StopReason { NONE, HOST_UNLOAD, DETACH };
+enum class StopReason { NONE, DETACH };
+static thread_local const std::atomic_bool* active_picker_cancel = nullptr;
 
 inline bool IsStopping(const std::atomic<StopReason>& stop) {
   return stop.load(std::memory_order_relaxed) != StopReason::NONE;
@@ -518,9 +520,10 @@ class Service {
     }
   }
 
-  bool SetDownloadDirectory(const std::filesystem::path& path) {
+  bool SetDownloadDirectory(const std::filesystem::path& path, const std::atomic_bool* cancelled = nullptr) {
     if (!path.empty() && !ValidDirectoryPath(path)) return false;
     const std::unique_lock lock(state_.mutex);
+    if (cancelled != nullptr && cancelled->load()) return false;
     if (state_.snapshot.settings.download_directory != path) {
       state_.snapshot.settings.download_directory = path;
       state_.settings_dirty = true;
@@ -530,51 +533,34 @@ class Service {
 
   void Shutdown() noexcept { stop_.store(StopReason::DETACH, std::memory_order_relaxed); }
 
-  void StopForHostUnload() {
-    const std::unique_lock drain_lock(host_unload_mutex_);
+  void OnHostUnload() {
     HANDLE worker = nullptr;
-    bool close_picker = false;
     {
       const std::unique_lock lock(state_.mutex);
-      auto expected = StopReason::NONE;
-      stop_.compare_exchange_strong(expected, StopReason::HOST_UNLOAD, std::memory_order_relaxed);
       ReapWorker();
-      state_.host_draining = true;
-      worker = state_.worker;
-      close_picker = state_.worker_kind == TaskKind::CHOOSE_DIRECTORY;
+      if (state_.worker == nullptr || state_.worker_kind != TaskKind::CHOOSE_DIRECTORY) return;
+      state_.picker_cancel->store(true);
+      // Retain this thread's identity while posting the close request. Reaping
+      // the original handle or a later task must not redirect it to another picker.
+      if (!DuplicateHandle(GetCurrentProcess(), state_.worker, GetCurrentProcess(), &worker,
+                           0, FALSE, DUPLICATE_SAME_ACCESS)) return;
     }
-
-    if (worker != nullptr) {
-      const DWORD interval = (close_picker ? 50 : INFINITE);
-      while (WaitForSingleObject(worker, interval) != WAIT_OBJECT_0) {
-        if (close_picker) {
-          EnumThreadWindows(GetThreadId(worker), +[](HWND window, LPARAM param) -> BOOL {
-            const auto thread = reinterpret_cast<HANDLE>(param);
-            if (WaitForSingleObject(thread, 0) != WAIT_TIMEOUT
-                || GetWindowThreadProcessId(window, nullptr) != GetThreadId(thread)) return FALSE;
-            PostMessageW(window, WM_CLOSE, 0, 0);
-            return TRUE;
-          }, reinterpret_cast<LPARAM>(worker));
-        }
+    EnumThreadWindows(GetThreadId(worker), +[](HWND window, LPARAM param) -> BOOL {
+      const auto thread = reinterpret_cast<HANDLE>(param);
+      if (WaitForSingleObject(thread, 0) != WAIT_TIMEOUT) return FALSE;
+      if (GetWindowThreadProcessId(window, nullptr) == GetThreadId(thread)) {
+        PostMessageW(window, WM_CLOSE, 0, 0);
       }
-    }
-
-    const std::unique_lock lock(state_.mutex);
-    state_.host_draining = false;
-    ReapWorker();
+      return TRUE;
+    }, reinterpret_cast<LPARAM>(worker));
+    CloseHandle(worker);
   }
 
   bool Start(TaskKind kind, int64_t now_utc = UtcNow(), bool automatic = false, bool completed = false) {
     const std::unique_lock lock(state_.mutex);
     auto& snapshot = state_.snapshot;
-    if (!state_.host_draining) {
-      ReapWorker();
-    }
-    if (IsStopping(stop_)) {
-      if (!automatic || state_.host_draining || state_.worker != nullptr) return false;
-      auto expected = StopReason::HOST_UNLOAD;
-      if (!stop_.compare_exchange_strong(expected, StopReason::NONE, std::memory_order_relaxed)) return false;
-    }
+    ReapWorker();
+    if (IsStopping(stop_)) return false;
     auto& next_auto_check = snapshot.settings.next_auto_check_utc;
     if (automatic) {
       if (state_.startup_seen) return false;
@@ -605,6 +591,7 @@ class Service {
       case TaskKind::CHOOSE_DIRECTORY:
         task->directory = directory;
         task->fallback_directory = snapshot.addon_directory;
+        task->picker_cancel = std::make_shared<std::atomic_bool>(false);
         break;
       case TaskKind::OPEN_DIRECTORY:
         if (completed && snapshot.completed_path.empty()) return false;
@@ -621,6 +608,7 @@ class Service {
       os_code = GetLastError();
     } else {
       if (const HANDLE thread = create_thread(nullptr, 0, &Worker, task.get(), 0, nullptr)) {
+        state_.picker_cancel = task->picker_cancel;
         task.release();
         state_.worker = thread;
         state_.worker_kind = kind;
@@ -665,7 +653,7 @@ class Service {
     std::wstring etag;
     HANDLE worker = nullptr;
     TaskKind worker_kind = TaskKind::CHECK;
-    bool host_draining = false;
+    std::shared_ptr<std::atomic_bool> picker_cancel;
     bool settings_dirty = false;
     bool startup_seen = false;
   };
@@ -678,6 +666,7 @@ class Service {
     std::wstring etag;
     std::filesystem::path directory;
     std::filesystem::path fallback_directory;
+    std::shared_ptr<std::atomic_bool> picker_cancel;
     int64_t retry_after_utc = 0;
     HMODULE module = nullptr;
     TransferClock::time_point started_at = TransferClock::now();
@@ -693,12 +682,12 @@ class Service {
   const Origin origin_;
   const TransferTimeouts timeouts_;
   std::atomic<StopReason> stop_{StopReason::NONE};
-  std::shared_mutex host_unload_mutex_;
 
-  // The caller owns the state lock. Keep the watched handle stable during the drain.
+  // The caller owns the state lock. Completion includes release of the worker's DLL reference.
   void ReapWorker() {
-    if (!state_.host_draining && state_.worker != nullptr && WaitForSingleObject(state_.worker, 0) == WAIT_OBJECT_0) {
+    if (state_.worker != nullptr && WaitForSingleObject(state_.worker, 0) == WAIT_OBJECT_0) {
       CloseHandle(std::exchange(state_.worker, nullptr));
+      state_.picker_cancel.reset();
     }
   }
 
@@ -889,6 +878,32 @@ class Service {
                 }
               }
               case TaskKind::CHOOSE_DIRECTORY: {
+                if (task->picker_cancel->load()) return {};
+                active_picker_cancel = task->picker_cancel.get();
+                const auto release_hook = +[](HHOOK hook) {
+                  UnhookWindowsHookEx(hook);
+                  active_picker_cancel = nullptr;
+                };
+                // Cancellation belongs to this task, including the interval before
+                // Show creates a window. The hook is limited to this pinned worker.
+                std::unique_ptr<std::remove_pointer_t<HHOOK>, decltype(release_hook)> picker_hook(
+                    SetWindowsHookExW(WH_CBT, +[](int code, WPARAM window, LPARAM data) -> LRESULT {
+                      if (code >= 0 && active_picker_cancel != nullptr && active_picker_cancel->load()) {
+                        bool close = code == HCBT_ACTIVATE;
+                        if (code == HCBT_CREATEWND) {
+                          const auto* created = reinterpret_cast<const CBT_CREATEWNDW*>(data);
+                          close = (created->lpcs->style & (WS_CHILD | WS_VISIBLE)) == WS_VISIBLE;
+                        }
+                        if (close) {
+                          PostMessageW(reinterpret_cast<HWND>(window), WM_CLOSE, 0, 0);
+                        }
+                      }
+                      return CallNextHookEx(nullptr, code, window, data);
+                    }, nullptr, GetCurrentThreadId()), release_hook);
+                if (!picker_hook) {
+                  active_picker_cancel = nullptr;
+                  return {.error = {.code = Error::DIALOG, .os_code = GetLastError()}};
+                }
                 const auto available = [](const std::filesystem::path& path) {
                   std::error_code error;
                   return !path.empty() && std::filesystem::is_directory(path, error);
@@ -900,8 +915,9 @@ class Service {
                     initial.clear();
                   }
                 }
+                if (task->picker_cancel->load()) return {};
                 auto chosen = dialogs::Choose(dialogs::Kind::FOLDER, initial);
-                if (chosen.cancelled) return {};
+                if (chosen.cancelled || task->picker_cancel->load()) return {};
                 if (!chosen.error.empty() || chosen.path.empty()) return {.error = {.code = Error::DIALOG}};
                 return {.path = std::move(chosen.path)};
               }
@@ -934,8 +950,10 @@ class Service {
         }
         if (task->kind == TaskKind::CHOOSE_DIRECTORY && !result.path.empty()
             && !IsStopping(service.stop_)
-            && !service.SetDownloadDirectory(result.path)) {
-          result.error.code = Error::DIALOG;
+            && !service.SetDownloadDirectory(result.path, task->picker_cancel.get())) {
+          if (!task->picker_cancel->load()) {
+            result.error.code = Error::DIALOG;
+          }
         }
       } catch (...) {
         result.error.code = Error::INTERNAL;
@@ -988,7 +1006,7 @@ inline bool StartDownload() { return internal::service.Start(internal::TaskKind:
 inline bool ChooseDirectory() { return internal::service.Start(internal::TaskKind::CHOOSE_DIRECTORY); }
 inline bool OpenDirectory(bool completed) { return internal::service.Start(internal::TaskKind::OPEN_DIRECTORY, UtcNow(), false, completed); }
 inline bool OpenRelease() { return internal::service.Start(internal::TaskKind::OPEN_RELEASE); }
-inline void StopForHostUnload() { internal::service.StopForHostUnload(); }
+inline void OnHostUnload() { internal::service.OnHostUnload(); }
 inline void Shutdown() noexcept { internal::service.Shutdown(); }
 
 }  // namespace renodx::addons::dlss5::update
