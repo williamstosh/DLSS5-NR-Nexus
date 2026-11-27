@@ -111,7 +111,8 @@ int Run() {
     native::direct_api.private_instance = true;
     native::direct_api.module = GetModuleHandleW(nullptr);
     native::direct_api.create = CreateModel;
-    native::direct_api.evaluate = nr_edit_reuse_gpu_cases::NeutralModel;
+    edit_model_behavior = nr_edit_reuse_gpu_cases::NeutralModel;
+    native::direct_api.evaluate = EvaluateEditModelFixture;
     native::direct_api.release = ReleaseModel;
     native::direct_load_state = native::DirectLoadState::Ready;
     native::direct_device = gpu.device.Get();
@@ -1394,7 +1395,7 @@ int Run() {
               && upper_role.slots[0].edit_reuse == upper_anchor,
           "the session's active equivalent upper workset delivers zero-model reuse");
       stream.adaptive_session->Request(1, native::SteadyNowNs());
-      native::direct_api.evaluate = +[](ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* model,
+      edit_model_behavior = +[](ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* model,
                                           const NVSDK_NGX_Parameter* model_parameters, PFN_NVSDK_NGX_ProgressCallback callback) {
         const auto desc = native::GetD3D12Resource(model_parameters, "DLSSNR.Output")->GetDesc();
         nr_edit_reuse_xefg_cases::model_pixels.assign(desc.Width * desc.Height * 4,
@@ -1402,7 +1403,7 @@ int Run() {
         return nr_edit_reuse_xefg_cases::EditedModel(list, model, model_parameters, callback);
       };
       const auto switched = record({.token = ++token, .sdk_wrapper = true, .check_pending_mfg = true});
-      native::direct_api.evaluate = nr_edit_reuse_gpu_cases::NeutralModel;
+      edit_model_behavior = nr_edit_reuse_gpu_cases::NeutralModel;
       const auto& switched_role = native::features.at(role_handle);
       const auto switched_size = stream.adaptive_session->ladder.sizes[1][0];
       Check(switched.replaced && switched.evaluates > 0 && switched.reuses == 0
@@ -1493,7 +1494,7 @@ int Run() {
           "the recovered fixed producer retains its exact pruned receipt for repeated MFG");
     }
 
-    native::direct_api.evaluate = nr_edit_reuse_xefg_cases::EditedModel;
+    edit_model_behavior = nr_edit_reuse_xefg_cases::EditedModel;
     nr_edit_reuse_xefg_cases::model_pixels.resize(width * height * 4);
     for (uint32_t pixel = 0; pixel < width * height; ++pixel) {
       for (uint32_t channel = 0; channel < 3; ++channel) {
@@ -1602,7 +1603,7 @@ int Run() {
               && matches(partial.consumed_back, source_back) && matches(partial.consumed_hudless, source_hudless),
           "a failed necessary role leaves both original SDK inputs and publishes no partial output or submission");
     }
-    native::direct_api.evaluate = nr_edit_reuse_gpu_cases::NeutralModel;
+    edit_model_behavior = nr_edit_reuse_gpu_cases::NeutralModel;
     Check(recover(TagCopy::NONE, false).reset == 1,
         "a complete Native group recovers with a model Reset after the previous second-role failure");
     const auto before_scope_loss = read_progress();

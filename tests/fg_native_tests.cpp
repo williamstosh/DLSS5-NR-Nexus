@@ -784,6 +784,16 @@ int RunNativeRequiredMenuTest() {
 #include "gpu_timer_cases.hpp"
 #include "control_mask_gpu_cases.hpp"
 static std::filesystem::path present_fixture_ini;
+// A live feature retains its Evaluate function. Switch model behavior inside
+// the same mock export, not by replacing the provider beneath the feature.
+static native::DirectEvaluateFn edit_model_behavior = nullptr;
+
+static NVSDK_NGX_Result NVSDK_CONV EvaluateEditModelFixture(
+    ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* model,
+    const NVSDK_NGX_Parameter* parameters, PFN_NVSDK_NGX_ProgressCallback callback) {
+  return edit_model_behavior(list, model, parameters, callback);
+}
+
 #include "nr_edit_reuse_gpu_cases.hpp"
 #include "nr_edit_reuse_render_cases.hpp"
 #if defined(NR_NEXUS_DEV_CONTROL)
@@ -791,6 +801,22 @@ static std::filesystem::path present_fixture_ini;
 #include "fg_consumer_capture_cases.hpp"
 #include "present_handoff_capture_cases.hpp"
 #endif
+void PublishOriginalFgRuntimeMock() {
+  Check(!native::direct_api.private_instance && native::direct_api.module != nullptr,
+        "the XeFG model substitute occupies the original provider slot");
+  auto& symbols = native::ngx_loader_staging;
+  symbols = {};
+  symbols.nr_ready = true;
+  symbols.nr_module = native::direct_api.module;
+  symbols.init = native::direct_api.init;
+  symbols.create = native::direct_api.create;
+  symbols.evaluate = native::direct_api.evaluate;
+  symbols.release = native::direct_api.release;
+  symbols.shutdown = native::direct_api.shutdown;
+  symbols.nr_requirements = native::direct_runtime_requirements;
+  native::PublishNgxLoaderSymbols();
+}
+
 #include "nr_edit_reuse_xefg_cases.hpp"
 #include "present_original_handoff_cases.hpp"
 #include "control_mask_capture_cases.hpp"

@@ -190,10 +190,11 @@ int Run() {
     native::intensity = 1.f;
     native::preset = 2;
     native::edit_reuse_enabled = true;
-    native::direct_api.private_instance = true;
+    native::direct_api = {};
     native::direct_api.module = GetModuleHandleW(nullptr);
     native::direct_api.create = CreateModel;
-    native::direct_api.evaluate = nr_edit_reuse_gpu_cases::NeutralModel;
+    edit_model_behavior = nr_edit_reuse_gpu_cases::NeutralModel;
+    native::direct_api.evaluate = EvaluateEditModelFixture;
     native::direct_api.release = ReleaseModel;
     native::direct_load_state = native::DirectLoadState::Ready;
     native::direct_device = gpu.device.Get();
@@ -201,14 +202,7 @@ int Run() {
     native::direct_device_native = gpu.device.Get();
     native::direct_runtime_requirements.dual_models = true;
     native::direct_runtime_requirements.file_version = "310.9.16.0";
-    // Supply the existing model substitute as the explicitly private pre-FG
-    // provider. The real loader and NVIDIA runtime are outside this fixture.
-    native::ngx_loader_staging = {};
-    native::ngx_loader_staging.nr_ready = true;
-    native::ngx_loader_staging.native_ready = true;
-    native::ngx_loader_staging.native_api = native::direct_api;
-    native::ngx_loader_staging.nr_requirements = native::direct_runtime_requirements;
-    native::PublishNgxLoaderSymbols();
+    PublishOriginalFgRuntimeMock();
     native::parameter_runtime_ready = true;
     native::parameter_runtime_via_core = false;
     native::core_allocate_parameters = addon::bridge::AllocateOwnedParameters;
@@ -244,7 +238,7 @@ int Run() {
     bool sdk_failure_recovered = false;
     bool composed_group_published = false;
     for (const bool pq : {false, true}) {
-      native::direct_api.evaluate = (pq ? EditedModel : nr_edit_reuse_gpu_cases::NeutralModel);
+      edit_model_behavior = (pq ? EditedModel : nr_edit_reuse_gpu_cases::NeutralModel);
       native::codec_mode = (pq ? 3u : 0u);
       native::present_white_nits = (pq ? 0.f : 200.f);
       native::transfer_mode = 0;
@@ -476,7 +470,7 @@ int Run() {
       auto& stream = native::fg_service::streams.at({false, context});
       const auto owner = stream.roles[0].Handle();
       if (!pq) {
-        native::direct_api.evaluate = EvaluatePresentEdit;
+        edit_model_behavior = EvaluatePresentEdit;
         std::array<PresentTraceFrame, 4> baseline;
         for (const auto variant : {PresentTrace::BASELINE, PresentTrace::GENERATED_OUTPUT,
                                    PresentTrace::REPEATED_CONSUMPTION}) {
@@ -580,7 +574,7 @@ int Run() {
                     << " downstream_outputs=" << downstream_outputs << '\n';
         }
         trace_color = nullptr;
-        native::direct_api.evaluate = nr_edit_reuse_gpu_cases::NeutralModel;
+        edit_model_behavior = nr_edit_reuse_gpu_cases::NeutralModel;
       }
       const auto reference_source_frame = source_frame;
       std::array<Observation, 5> reference;
@@ -721,12 +715,12 @@ int Run() {
                     && source_matches(rejected.pixels),
                 "motion bounds, depth and color rejection each preserve exact current packed PQ source");
         }
-        native::direct_api.evaluate = nr_edit_reuse_gpu_cases::NeutralModel;
+        edit_model_behavior = nr_edit_reuse_gpu_cases::NeutralModel;
         Check(frame(true).evaluates == 1, "refresh neutral PQ anchor");
         const auto neutral = frame(false);
         Check(neutral.evaluates == 0 && neutral.reuses == 1 && source_matches(neutral.pixels),
               "neutral PQ reuse preserves current packed RGB and all alpha codes exactly");
-        native::direct_api.evaluate = EditedModel;
+        edit_model_behavior = EditedModel;
         Check(frame(true).evaluates == 1, "refresh edited PQ anchor before white change");
         const auto old_contract = native::features.at(owner).slots[0].edit_reuse->contract;
         native::diffuse_white_nits = 240.f;
@@ -799,7 +793,7 @@ int Run() {
               "unordered XeFG capture does not publish a group and leaves the current source untouched");
         recover(true);
 
-        native::direct_api.evaluate = EvaluatePresentEdit;
+        edit_model_behavior = EvaluatePresentEdit;
         const auto before_sdk_failure = stream.submitted;
         const auto before_sdk_submissions = xefg::SubmittedFrames();
         const auto before_sdk_history = native::game_window.frames;
@@ -986,7 +980,7 @@ int Run() {
         recover();
         std::cout << "ADAPTIVE_DELIVERY_XEFG evidence=WARP+MOCK rejected_proxy=1 restored_anchor=1 late_receipt=ignored\n";
 
-        native::direct_api.evaluate = nr_edit_reuse_gpu_cases::NeutralModel;
+        edit_model_behavior = nr_edit_reuse_gpu_cases::NeutralModel;
 
         const auto single_role = native::fg_service::streams.at({false, context}).base_frame_clock.frame;
         Check(Hooks::UiState(session.handle, 1) == 0 && session.context->epoch != single_role.generation,
@@ -1044,7 +1038,7 @@ int Run() {
         const auto before_compose_submit = dual_stream.submitted;
         const auto before_compose_history = native::game_window.frames;
         const auto before_composed_frames = session.context->interval_nr_composed_frames.load();
-        native::direct_api.evaluate = EvaluatePresentEdit;
+        edit_model_behavior = EvaluatePresentEdit;
         std::vector<uint8_t> sdk_bb, sdk_hudless;
         consume_sdk_present = [&](IDXGISwapChain*) {
           ComPtr<ID3D12Resource> backbuffer;
@@ -1072,7 +1066,7 @@ int Run() {
         std::cout << "XEFG_COMPOSED_GROUP complete=" << composed_group_published << " calls=" << composed.evaluates
                   << " bb_crc32=" << renodx::utils::hash::ComputeCRC32(sdk_bb.data(), sdk_bb.size())
                   << " hudless_crc32=" << renodx::utils::hash::ComputeCRC32(sdk_hudless.data(), sdk_hudless.size()) << '\n';
-        native::direct_api.evaluate = nr_edit_reuse_gpu_cases::NeutralModel;
+        edit_model_behavior = nr_edit_reuse_gpu_cases::NeutralModel;
         Check(Hooks::UiState(session.handle, 0) == 0, "return to the original XeFG single BB role");
         recover();
       }

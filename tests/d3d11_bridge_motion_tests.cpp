@@ -4507,13 +4507,8 @@ int main(int argc, char** argv) {
             .color_space = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, .fg_enabled = true};
         input.epoch = service_adapter::state.contexts.at(sdk_owner.handle)->epoch;
         Check(xefg::ServiceContextCurrent(input.context, input.epoch), "Bridge handoff starts with a live SDK owner epoch");
-        // Isolate the Bridge retirement from provider initialization by reusing
-        // the ready fixture model on the same WARP device as a private provider.
-        auto& symbols = native::ngx_loader_staging;
-        native::direct_api.private_instance = true;
-        symbols.native_api = native::direct_api;
-        symbols.native_ready = true;
-        native::PublishNgxLoaderSymbols();
+        Check(!native::direct_api.private_instance && native::direct_device == bridge_device,
+            "Bridge handoff reuses the ready original model on the WARP device");
         const auto saved_hooks = native::hooks_enabled.exchange(true);
         const auto saved_hook_point = native::hook_point.exchange(native::kHookPresent);
         Check(native::fg_service::Requested(), "XeFG Service is selected for the Bridge handoff");
@@ -4558,10 +4553,6 @@ int main(int argc, char** argv) {
         native::DrainPresentRetired();
         native::hooks_enabled.store(saved_hooks);
         native::hook_point.store(saved_hook_point);
-        native::direct_api.private_instance = false;
-        symbols.native_api = {};
-        symbols.native_ready = false;
-        native::PublishNgxLoaderSymbols();
         std::printf("PASS Bridge Service handoff WARP+MOCK watchdog out / GPU done / SUBMITTED with completed fence\n");
       } else {
         finish_stall();

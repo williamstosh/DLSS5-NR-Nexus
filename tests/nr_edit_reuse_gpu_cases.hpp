@@ -684,7 +684,8 @@ int Run() {
 #endif
     native::direct_api.module = GetModuleHandleW(nullptr);
     native::direct_api.create = CreateModel;
-    native::direct_api.evaluate = NeutralModel;
+    edit_model_behavior = NeutralModel;
+    native::direct_api.evaluate = EvaluateEditModelFixture;
     native::direct_api.release = ReleaseModel;
     native::direct_load_state = native::DirectLoadState::Ready;
     native::direct_device = gpu.device.Get();
@@ -728,7 +729,7 @@ int Run() {
     {
       funnel_accounting_tests::Restore restore;
       restore.Value(&native::ngx_slot_real[0]);
-      restore.Value(&native::direct_api.evaluate);
+      restore.Value(&edit_model_behavior);
       restore.Atomic(&native::d3d11_swapchain_seen);
       restore.Atomic(&native::d3d11_present_seen);
       restore.Atomic(&native::d3d12_swapchain_seen);
@@ -736,7 +737,7 @@ int Run() {
       restore.Atomic(&native::dx11_route);
       restore.Atomic(&native::control_mask_use_core_context);
       restore.Atomic(&native::foreign_teardown_due_ns);
-      native::direct_api.evaluate = ConstantModel;
+      edit_model_behavior = ConstantModel;
       native::ngx_slot_real[0].create = reinterpret_cast<void*>(+[](ID3D12GraphicsCommandList* list,
           NVSDK_NGX_Feature feature, NVSDK_NGX_Parameter*, NVSDK_NGX_Handle** handle) {
         Check(list == model_gpu->list.Get() && feature == native::kFeatureDlss,
@@ -1332,7 +1333,7 @@ int Run() {
             "successful SetOptions updates only the native declaration interval without acquiring ownership");
     };
     {
-      native::direct_api.evaluate = ConstantModel;
+      edit_model_behavior = ConstantModel;
       auto& feature = native::features.at(owner);
       const auto source_generation = feature.source_generation;
       const auto configuration = native::configuration_generation.load();
@@ -1433,7 +1434,7 @@ int Run() {
             "native On declaration alone preserves fixed Upscaled reuse alongside the direct SR writer");
       native::native_fg_public_off = true;
       native::native_fg_declaration = native::NativeFgDeclaration::kOff;
-      native::direct_api.evaluate = NeutralModel;
+      edit_model_behavior = NeutralModel;
       Check(frame(1) == 1, "restore the neutral model with an explicit source Reset after the declaration contrast");
       std::cout << "PASS single-Pass Upscaled Off/Unknown/Off and owner-free SetOptions Off/On/Off:"
                    " model_calls=1/0/1/0/1 per contrast, stable history, nonzero RGB, exact alpha; evidence=WARP+MOCK\n";
@@ -1463,7 +1464,7 @@ int Run() {
       native::skin_independent = true;
       native::mixed_present_fg_seen = true;
       native::configuration_generation.fetch_add(1);
-      native::direct_api.evaluate = ConstantModel;
+      edit_model_behavior = ConstantModel;
       const ID3D12Resource* model_motion = nullptr;
       model_parameter_observer = [&](const NVSDK_NGX_Handle* model, const NVSDK_NGX_Parameter* block) {
         Check(model == slot.handle && slot.nr_preset == 1 && native::GetInt(block, "DLSSNR.UseAutoMask") == 1
@@ -1530,7 +1531,7 @@ int Run() {
             "a current source Reset restarts Look and forces a model refresh");
 
       model_parameter_observer = {};
-      native::direct_api.evaluate = NeutralModel;
+      edit_model_behavior = NeutralModel;
       native::direct_runtime_requirements = saved_runtime;
       native::preset = 2;
       native::detail_stability = 1;
@@ -1555,7 +1556,7 @@ int Run() {
       funnel_accounting_tests::Restore restore;
       restore.Value(&present_fixture_ini);
       restore.Value(&model_parameter_observer);
-      restore.Value(&native::direct_api.evaluate);
+      restore.Value(&edit_model_behavior);
       restore.Atomic(&native::detail_stability);
       restore.Atomic(&native::control_mask_enabled);
       restore.Atomic(&native::control_mask_red);
@@ -1564,7 +1565,7 @@ int Run() {
       native::detail_stability = 2;
       native::control_mask_red = 0.5f;
       native::monitor_requested = true;
-      native::direct_api.evaluate = ConstantModel;
+      edit_model_behavior = ConstantModel;
       native::kSetEditReuse.Commit(0.f);
 
       const auto* masked = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xED179});
@@ -1827,7 +1828,7 @@ int Run() {
         }
         Check(false, "fixed Upscaled refresh reaches the committed edit grid");
       };
-      native::direct_api.evaluate = ConstantModel;
+      edit_model_behavior = ConstantModel;
       native::look_upsample = addon::look::kUpsampleClassic;
       native::nr_resolution_scale = .75f;
       ++native::nr_resolution_commit_epochs[0];
@@ -1873,7 +1874,7 @@ int Run() {
       native::look_upsample = saved_upsample;
       native::nr_resolution_scale = 1.f;
       ++native::nr_resolution_commit_epochs[0];
-      native::direct_api.evaluate = NeutralModel;
+      edit_model_behavior = NeutralModel;
       upload(wrapper_depth.Get(), std::vector<float>(16 * 16, .5f), NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 4);
       submit_commands("restore fixed wrapper depth");
       refresh_at_size(16);
@@ -1887,7 +1888,7 @@ int Run() {
       native::kSetAdaptiveLevelCount.Store(2.f);
       native::kSetAdaptiveMinScale.Store(.75f);
       native::kSetAdaptiveEnabled.Store(1.f);
-      native::direct_api.evaluate = ConstantModel;
+      edit_model_behavior = ConstantModel;
       native::intensity = 1.f;
       for (size_t pixel = 0; pixel < source_values.size() / 4; ++pixel) {
         source_values[pixel * 4] = DirectX::PackedVector::XMConvertFloatToHalf(.25f);
@@ -2010,7 +2011,7 @@ int Run() {
       native::kSetAdaptiveEnabled.Store(0.f);
       native::kSetAdaptiveLevelCount.Store(saved_levels);
       native::kSetAdaptiveMinScale.Store(saved_minimum);
-      native::direct_api.evaluate = NeutralModel;
+      edit_model_behavior = NeutralModel;
       parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, 0.f);
       parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, 0.f);
       upload(wrapper_depth.Get(), std::vector<float>(16 * 16, .5f), NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 4);
@@ -2053,7 +2054,7 @@ int Run() {
       const AdaptivePresentRegistration registration;
       const auto* sr = reinterpret_cast<const NVSDK_NGX_Handle*>(uintptr_t{0xED190});
       native::RegisterCreatedFeatureLocked(sr, native::kFeatureDlss, &parameters);
-      native::direct_api.evaluate = ConstantModel;
+      edit_model_behavior = ConstantModel;
       native::look_upsample = addon::look::kUpsampleClassic;
       native::kSetAdaptiveEnabled.Store(1.f);
       native::kSetAdaptiveLevelCount.Store(2.f);
@@ -2412,7 +2413,7 @@ int Run() {
       native::kSetAdaptiveTargetFps.Store(100.f);
       Check(!native::gpu_timers_enabled.load() && !native::cost_meter_enabled.load(),
             "the production adaptive route schedules its own measurements with profiling disabled");
-      native::direct_api.evaluate = ConstantModel;
+      edit_model_behavior = ConstantModel;
       native::RegisterCreatedFeatureLocked(trial_source, native::kFeatureDlss, &parameters);
       auto& feature = native::features.at(trial_source);
 
@@ -2730,7 +2731,7 @@ int Run() {
     native::native_fg_public_off = true;
     native::native_fg_declaration = native::NativeFgDeclaration::kOff;
     native::mixed_present_fg_seen = false;
-    native::direct_api.evaluate = NeutralModel;
+    edit_model_behavior = NeutralModel;
     fail_call = 0;
     native::RegisterCreatedFeatureLocked(owner, native::kFeatureDlss, &parameters);
     for (uint32_t prefix = 0; prefix < native::kContractDebounceFrames + 8; ++prefix) frame(1);
@@ -2871,7 +2872,7 @@ int Run() {
         auto other_output = uav_texture(16, 16, DXGI_FORMAT_R16G16B16A16_FLOAT);
         gpu.Transition(other_output.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         submit_commands("DEV On alternate output upload");
-        native::direct_api.evaluate = ConstantModel;
+        edit_model_behavior = ConstantModel;
         Check(frame(1) == 1, "establish a nonzero edit before rotating the SR Output");
         const auto edited_first = stage_execution_cases::Capture(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         submit_commands("DEV On first edited output readback");
@@ -2904,7 +2905,7 @@ int Run() {
         Check(frame(0) == 1 && anchor->anchor_generation == anchor_generation + 1,
             "return to the first Output follows the same logical source's normal refresh cadence");
         std::cout << "OBS DEV On rotating Output: nonzero_reuse=1 return_refresh_reset=" << model_resets.back() << '\n';
-        native::direct_api.evaluate = NeutralModel;
+        edit_model_behavior = NeutralModel;
         Check(frame(1) == 1, "restore the neutral model with an explicit source Reset");
       }
 
@@ -2934,7 +2935,7 @@ int Run() {
         return pixels;
       };
       {
-        native::direct_api.evaluate = ConstantModel;
+        edit_model_behavior = ConstantModel;
         Check(frame(1) == 1, "establish a nonzero anchor before changing only diagnostic metadata");
         auto& feature = native::features.at(owner);
         const auto anchor = feature.slots[0].edit_reuse;
@@ -3035,7 +3036,7 @@ int Run() {
         std::cout << "PASS DEV diagnostic-only changes: missing/ambiguous/recreated native and XeFG metadata,"
                      " stable SR history, nonzero RGB, exact alpha, immutable reuse anchor and no model/workset recreation; evidence=WARP+MOCK\n";
       }
-      native::direct_api.evaluate = NeutralModel;
+      edit_model_behavior = NeutralModel;
       Check(frame(1) == 1, "restore the neutral model before source and ownership rejection checks");
       native::RegisterCreatedFeatureLocked(second_source, native::kFeatureDlss, &parameters);
       native::create_contracts.at(second_source).source_device12_identity =
@@ -3088,7 +3089,7 @@ int Run() {
         };
         options::internal::stopped = false;
         options::Configure(native::OnNativeFgOptions);
-        native::direct_api.evaluate = ConstantModel;
+        edit_model_behavior = ConstantModel;
         for (const bool hooked : {false, true}) {
           native::OnNativeFgOptions(false);
           Check(frame(1) == 1, "start an Options contrast from the same confirmed Off source");
@@ -3154,7 +3155,7 @@ int Run() {
           std::cout << "PASS DEV owner-free " << (hooked ? "HookedSetOptions" : "OnNativeFgOptions")
                     << " Off/On/Off: model_calls=1/0/1/0/1, stable history, nonzero RGB, exact alpha; evidence=WARP+MOCK\n";
         }
-        native::direct_api.evaluate = NeutralModel;
+        edit_model_behavior = NeutralModel;
         Check(frame(1) == 1, "restore the neutral model after actual Options callback contrasts");
       }
       native::edit_reuse_fg_experiment = false;
@@ -3188,7 +3189,7 @@ int Run() {
     native::pass_look_result[0].detail_stability = 0;
     native::detail_stability = 0;
     native::direct_api.create = stage_execution_cases::Create;
-    native::direct_api.evaluate = same_stage_resolution_cases::Evaluate;
+    edit_model_behavior = same_stage_resolution_cases::Evaluate;
     auto& pair_calls = same_stage_resolution_cases::evaluations;
     same_stage_resolution_cases::stamps = {0x3900, 0x3b00};
     parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, 0.f);
@@ -3359,7 +3360,7 @@ int Run() {
     // the only edit. Depth and color rejection still win at the final output.
     bool neutral_compositions_match = true;
     for (uint32_t neutral_model = 1; neutral_model <= 2; ++neutral_model) {
-      native::direct_api.evaluate = (neutral_model == 1 ? OneEditedLayer<1> : OneEditedLayer<2>);
+      edit_model_behavior = (neutral_model == 1 ? OneEditedLayer<1> : OneEditedLayer<2>);
       const std::vector<float> stable_depth(16 * 16, .5f);
       upload(source.Get(), source_values, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 8);
       upload(wrapper_depth.Get(), stable_depth, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 4);
@@ -3397,7 +3398,7 @@ int Run() {
       }
     }
     Check(neutral_compositions_match, "a valid neutral edit in either layer preserves the other layer's edit");
-    native::direct_api.evaluate = same_stage_resolution_cases::Evaluate;
+    edit_model_behavior = same_stage_resolution_cases::Evaluate;
     upload(source.Get(), current_source, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 8);
     upload(wrapper_depth.Get(), reveal, NATIVE_INPUT_STATE, NATIVE_INPUT_STATE, 16 * 4);
 

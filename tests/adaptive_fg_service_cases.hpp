@@ -121,7 +121,7 @@ int Run() {
     native::max_worksets.store(4);
     native::adaptive_configuration_settings = native::comparison_ui::CaptureAdaptiveSettings;
     addon::gpu_timers::comparison_settings = native::comparison_ui::CaptureSettings;
-    native::direct_api.private_instance = true;
+    native::direct_api = {};
     native::direct_api.module = GetModuleHandleW(nullptr);
     native::direct_api.init = control_mask_gpu_cases::InitializeRuntime;
     native::direct_api.create = CreateModel;
@@ -134,14 +134,7 @@ int Run() {
     native::direct_device_native = gpu.device.Get();
     native::direct_runtime_requirements.dual_models = true;
     native::direct_runtime_requirements.file_version = "310.9.16.0";
-    // This fixture supplies a model substitute, not a loader-owned DLL. The
-    // real pre-FG service must still select an explicitly private API.
-    native::ngx_loader_staging = {};
-    native::ngx_loader_staging.nr_ready = true;
-    native::ngx_loader_staging.native_ready = true;
-    native::ngx_loader_staging.native_api = native::direct_api;
-    native::ngx_loader_staging.nr_requirements = native::direct_runtime_requirements;
-    native::PublishNgxLoaderSymbols();
+    PublishOriginalFgRuntimeMock();
     native::parameter_runtime_ready = true;
     native::core_allocate_parameters = addon::bridge::AllocateOwnedParameters;
     native::core_destroy_parameters = addon::bridge::DestroyOwnedParameters;
@@ -156,8 +149,10 @@ int Run() {
     bool verify_limited_commit = false;
     addon::adaptive_resolution::Sizes before_limited_commit;
     model_parameter_observer = [&](const NVSDK_NGX_Handle* model, const NVSDK_NGX_Parameter* parameters) {
-      Check(!native::parameter_runtime_via_core.load(),
-          "both native pre-FG color roles retain the private signed provider through preparation and evaluation");
+      const auto& provider = native::NgxLoaderView();
+      Check(!native::parameter_runtime_via_core.load() && !native::direct_api.private_instance
+                && native::direct_api.module == provider.nr_module && !provider.native_ready,
+            "both XeFG color roles use the same original mock without a private or Core provider");
       Check(native::GetD3D12Resource(parameters, "DLSSNR.ControlMask") != nullptr,
           "every model call receives the production GPU ControlMask");
       ++masked_calls;
@@ -463,7 +458,6 @@ int Run() {
         addon::bridge::OwnedParameters composition;
         composition.Set(NVSDK_NGX_DLSSG_Parameter_UI, ui.Get());
         native::PresentTarget target;
-        target.private_signed_runtime = true;
         bool output_ready = false;
         std::array<native::NrRecording, 2> recordings;
         fail_next_pipeline = true;
