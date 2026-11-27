@@ -4926,9 +4926,37 @@ inline bool RunPresentBaseFrame(ID3D12CommandQueue* native_queue, reshade::api::
   return SubmitPresentGroup(native_queue, queue, slot, stream, block, guides, target, false, {}, identified.order.get());
 }
 
+// Borrowed only until this outer Present finishes; no retained backbuffer or
+// command list. A runtime/output generation change revokes the delayed turn.
+struct LateBridgePresent {
+  reshade::api::command_queue* queue = nullptr;
+  reshade::api::swapchain* swapchain = nullptr;
+  reshade::api::effect_runtime* runtime = nullptr;
+  uint64_t runtime_generation = 0;
+  uint64_t configuration = 0;
+  uint64_t native_swapchain = 0;
+  reshade::api::resource backbuffer;
+  uint32_t buffer_index = 0;
+  reshade::api::color_space color_space = reshade::api::color_space::unknown;
+  output_framerate::OutputIdentity output;
+  fg::xefg::OrdinaryPresentAccess access;
+  bool had_nr = false;
+};
+inline thread_local std::vector<LateBridgePresent> late_bridge_presents;
+
+inline void CancelLateBridgePresent(reshade::api::swapchain* swapchain,
+                                    reshade::api::effect_runtime* runtime = nullptr) {
+  std::erase_if(late_bridge_presents, [&](const auto& pending) {
+    if (pending.swapchain != swapchain && (runtime == nullptr || pending.runtime != runtime)) return false;
+    if (pending.had_nr) present_gaps.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  });
+}
+
 inline void RunPresentPath(
     reshade::api::command_queue* queue, reshade::api::swapchain* swapchain,
-    bool auto_fallback = false, bool deferred = false) {
+    bool auto_fallback = false, bool deferred = false,
+    bool late_bridge = false, bool* late_gap_named = nullptr) {
   const auto owner_attempt = CurrentOrdinaryPresentAttempt(swapchain);
   const auto backbuffer = (swapchain != nullptr ? swapchain->get_current_back_buffer() : reshade::api::resource{});
   const auto output = (swapchain != nullptr
@@ -5276,6 +5304,7 @@ inline void RunPresentPath(
   target.swapchain_format = back_format;
   target.hdr_color_space = color_space;
   target.d3d11_bridge = d3d11;
+  target.late_composed_bridge = late_bridge;
   if (encoding == 2) {
     target.hdr_mode = 2;
     target.units = {codec::Encoding::Pq, true, 10000.f, true};
@@ -5592,6 +5621,7 @@ inline void RunPresentPath(
       if (!ran && had_nr) present_gaps.fetch_add(1, std::memory_order_relaxed);
     }
   } gap{stream.nr_presents != 0};
+  if (late_gap_named != nullptr) *late_gap_named = true;
   uint32_t matching_streams = 0;
   uint32_t matching_cadence_streams = 0;
   for (const auto& entry : present_streams) {
@@ -5624,11 +5654,14 @@ inline void RunPresentPath(
     changed = stream.fg_multiplier != 1;
     stream.fg_cadence = {};
   } else {
-    changed = stream.fg_cadence.Observe(
-        now_ns, stream.cadence_captures,
-        matching_cadence_streams == 1 && now_ns >= stream.cadence_ambiguous_until_ns
-            && std::ranges::any_of(present_guide_sets, fresh), declared_multiplier,
-        static_cast<::renodx::dlss5::PresentFgSource>(present_fg_source.load(std::memory_order_relaxed)));
+    if (!late_bridge) {
+      changed = stream.fg_cadence.Observe(
+          now_ns, stream.cadence_captures,
+          matching_cadence_streams == 1 && now_ns >= stream.cadence_ambiguous_until_ns
+              && std::ranges::any_of(present_guide_sets, fresh),
+          declared_multiplier,
+          static_cast<::renodx::dlss5::PresentFgSource>(present_fg_source.load(std::memory_order_relaxed)));
+    }
   }
   present_cadence.store(stream.fg_cadence.cadence, std::memory_order_relaxed);
   if (changed) {
@@ -5912,6 +5945,32 @@ inline void RunPresentPath(
     }
   }
 
+  if (late_bridge && (!d3d11 || guides != nullptr || guides_mode != kPresentGuidesOptional || !fg::xefg::OrdinarySdkInactive(ordinary_access) || auto_fallback)) {
+    CountNrDecline(NrDeclineReason::kPresentBusy);
+    return;
+  }
+  if (!late_bridge && !deferred && d3d11 && guides == nullptr
+      && guides_mode == kPresentGuidesOptional && !auto_fallback
+      && hook_point.load(std::memory_order_relaxed) == kHookPresent
+      && fg::xefg::OrdinarySdkInactive(ordinary_access) && output && !screenshot::HasPending()) {
+    std::scoped_lock phase_lock(overlay_listener_mutex);
+    // Only the actual outer runtime can promise a pre-Overlay turn. A
+    // control/hidden swapchain on the same device does not establish it.
+    if (live_effect_runtimes.size() == 1) {
+      auto* runtime = live_effect_runtimes.front();
+      const auto generation = effect_runtime_generations.find(runtime);
+      if (generation != effect_runtime_generations.end()
+          && runtime->get_device() == api_device && runtime->get_command_queue() == queue
+          && runtime->get_native() == swapchain->get_native()
+          && runtime->get_current_back_buffer_index() == swapchain->get_current_back_buffer_index()
+          && runtime->get_current_back_buffer() == backbuffer
+          && output_framerate::IsCurrentOutput(output)) {
+        late_bridge_presents.push_back({.queue = queue, .swapchain = swapchain, .runtime = runtime, .runtime_generation = generation->second, .configuration = configuration_generation.load(), .native_swapchain = swapchain->get_native(), .backbuffer = backbuffer, .buffer_index = swapchain->get_current_back_buffer_index(), .color_space = color_space, .output = output, .access = ordinary_access, .had_nr = stream.nr_presents != 0});
+        gap.ran = true;
+        return;
+      }
+    }
+  }
   if (guides == nullptr && d3d11) {
     // The same neutral guides on the swapchain's native D3D11 device,
     // cleared to zero once (D3D11 leaves a texture created without data
@@ -6059,6 +6118,44 @@ inline void RunPresentPath(
 
   gap.ran = SubmitPresentGroup(native_queue, queue, slot, stream, block,
                                guides, target, neutral_model, waits, identified.order.get());
+}
+
+inline void OnLateBridgeOverlay(reshade::api::effect_runtime* runtime) {
+  const auto found = std::find_if(late_bridge_presents.rbegin(), late_bridge_presents.rend(),
+                                  [&](const auto& pending) { return pending.runtime == runtime; });
+  if (found == late_bridge_presents.rend()) return;
+  const auto pending = *found;
+  late_bridge_presents.erase(std::next(found).base());
+  bool valid = !shutting_down.load(std::memory_order_acquire)
+               && configuration_generation.load() == pending.configuration
+               && output_framerate::IsCurrentOutput(pending.output);
+  {
+    std::scoped_lock lock(overlay_listener_mutex);
+    const auto generation = effect_runtime_generations.find(runtime);
+    valid = valid && generation != effect_runtime_generations.end()
+            && generation->second == pending.runtime_generation;
+  }
+  if (valid) {
+    valid = runtime->get_native() == pending.native_swapchain
+            && runtime->get_device() == pending.queue->get_device()
+            && runtime->get_command_queue() == pending.queue
+            && runtime->get_current_back_buffer_index() == pending.buffer_index
+            && runtime->get_current_back_buffer() == pending.backbuffer
+            && pending.swapchain->get_native() == pending.native_swapchain
+            && pending.swapchain->get_current_back_buffer() == pending.backbuffer
+            && pending.swapchain->get_color_space() == pending.color_space
+            && fg::xefg::QueryOrdinaryPresent(pending.access.swapchain,
+                                              pending.access.backbuffer, pending.output)
+                   == pending.access
+            && fg::xefg::OrdinarySdkInactive(pending.access);
+  }
+  bool gap_named = false;
+  if (valid) {
+    // This callback precedes ImGui's GPU draw, including when Techniques is
+    // empty. Re-enter only the NR transaction, not the Present lifecycle.
+    GuardHook([&] { RunPresentPath(pending.queue, pending.swapchain, false, true, true, &gap_named); });
+  }
+  if (!gap_named && pending.had_nr) present_gaps.fetch_add(1, std::memory_order_relaxed);
 }
 
 inline void OnNativePresentObserved(IDXGISwapChain* swapchain, UINT flags,

@@ -1,6 +1,58 @@
 {
   "rows": [
     {
+      "id": "d3d11-late-neutral-present",
+      "state": "ready",
+      "intent": [],
+      "commands": [],
+      "producer": "The ordinary D3D11 Present selects actual Optional neutral input and records the sole matched runtime, current BB and completed SDK Off ownership.",
+      "consumer": "OnLateBridgeOverlay consumes the same Present ticket before overlay GPU drawing and reuses RunPresentPath and the existing bridge.",
+      "success": "The current composed color reaches every requested pass, is copied back once only after the full group, and remains before overlay rendering.",
+      "refusal": "Real guides, Required, FG On/unknown, other runtimes/outputs and revoked generations retain their existing paths.",
+      "fallback": "A revoked late ticket is cancelled once; it is never replayed on a later Present.",
+      "sources": [
+        [
+          "present_path.hpp",
+          "inline void OnLateBridgeOverlay("
+        ],
+        [
+          "present_path.hpp",
+          "inline void CancelLateBridgePresent("
+        ],
+        [
+          "dlssnr.hpp",
+          "effect_runtime_generations"
+        ],
+        [
+          "fg_xefg.hpp",
+          "inline bool OrdinarySdkInactive("
+        ],
+        [
+          "d3d11_bridge.hpp",
+          "present->late_composed_bridge"
+        ]
+      ],
+      "cases": [
+        {
+          "suite": "fg-native",
+          "name": "late-bridge-ownership",
+          "existingTrace": true,
+          "log": "late-bridge-ownership",
+          "receipt": "^PASS case=late-bridge-ownership evidence=CPU dev={dev}$",
+          "scenarios": [
+            "sdk-ownership",
+            "ticket-lifecycle",
+            "no-source-off"
+          ],
+          "expect": {
+            "sdk-ownership": "^LATE_BRIDGE_CONTRACT sdk=no-context\\+matched-off unrelated=not-off inflight=revoked stale-epoch=revoked enabled=revoked final-commit=revalidated$",
+            "no-source-off": "^LATE_BRIDGE_NO_SOURCE actual-disable=success adaptive-source=absent unknown=rejected failed-disable=rejected resize=rejected unrelated-ordinary=preserved$",
+            "ticket-lifecycle": "^LATE_BRIDGE_CONTRACT lifecycle=wrong-runtime\\+generation\\+finish\\+destroy duplicate=once owners=isolated evidence=CPU$"
+          }
+        }
+      ]
+    },
+    {
       "id": "bridge-adaptive",
       "state": "ready",
       "intent": ["NRAdaptiveEnabled", "NRAdaptiveTargetFPS", "NRAdaptiveMinScale", "NRAdaptiveLevelCount", "NRAdaptiveLimitedResidency"],

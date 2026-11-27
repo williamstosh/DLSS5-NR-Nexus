@@ -469,6 +469,7 @@ struct Context {
   uint32_t bridge_enable_inflight = 0;
   uint64_t bridge_declaration = 0;
   uint64_t bridge_off_epoch = 0;
+  uint64_t ordinary_off_epoch = 0;
   uint64_t bridge_write_epoch = 0;
   output_framerate::OutputIdentity bridge_off_output;
   BridgeSourceIdentity bridge_off_source;
@@ -900,6 +901,7 @@ inline uint64_t InvalidateBridgeOff(void* handle, const char* reason,
     context.bridge_off_reason = reason;
     context.bridge_declaration = ++state.bridge_declaration;
     if (invalidate_context || invalidate_proxy) {
+      context.ordinary_off_epoch = 0;
       ClearBridgeSourceObservationsLocked(&context, reason);
     }
     if (invalidate_context) {
@@ -2826,6 +2828,7 @@ struct SdkHooks {
       if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
         attempt = it->second;
         attempt->bridge_off_observed = false;
+        attempt->ordinary_off_epoch = 0;
         attempt->bridge_before_observation = {};
         attempt->bridge_after_observation = {};
         attempt->bridge_off_reason = "set_enabled_in_flight";
@@ -2917,6 +2920,10 @@ struct SdkHooks {
         if (ordered) {
           attempt->bridge_enable_ambiguous = false;
           attempt->bridge_present_fg_on = false;
+        }
+        if (ordered && enabled == 0 && attempt->bridge_context_ready && attempt->bridge_proxy_ready && !stopped.load()) {
+          // This output's successful SDK Disable is independent of any SR source.
+          attempt->ordinary_off_epoch = attempt->epoch;
         }
         RegisterOutput(attempt.get());
         if (ordered && changed && service_requested) {
@@ -3587,7 +3594,27 @@ inline OrdinaryPresentAccess QueryOrdinaryPresentLocked(uintptr_t swapchain, uin
   return access;
 }
 
+// Extra ownership fact only for the late neutral path. It must not change
+// the existing ordinary access equality or revoke unrelated outputs.
+inline bool OrdinarySdkInactiveLocked(const OrdinaryPresentAccess& access) {
+  if (!access.allowed || stopped.load(std::memory_order_acquire)) return false;
+  if (state.contexts.empty() && state.retired_contexts.empty()) return true;
+  const auto found = state.contexts.find(reinterpret_cast<void*>(access.context));
+  if (found == state.contexts.end()) return false;
+  const auto& context = *found->second;
+  return reinterpret_cast<uintptr_t>(&context) == access.owner && context.epoch == access.epoch
+         && context.ordinary_off_epoch == context.epoch && context.bridge_context_ready && context.bridge_proxy_ready
+         && !context.enabled && !context.bridge_present_fg_on && context.bridge_enable_inflight == 0
+         && !context.bridge_enable_ambiguous;
+}
+
 }  // namespace internal
+
+inline bool OrdinarySdkInactive(const OrdinaryPresentAccess& access) {
+  std::shared_lock lock(internal::state.mutex);
+  return internal::QueryOrdinaryPresentLocked(access.swapchain, access.backbuffer, access.output) == access
+         && internal::OrdinarySdkInactiveLocked(access);
+}
 
 inline OrdinaryPresentAccess QueryOrdinaryPresent(uintptr_t swapchain, uintptr_t backbuffer,
                                                    const output_framerate::OutputIdentity& output) {
@@ -3595,19 +3622,42 @@ inline OrdinaryPresentAccess QueryOrdinaryPresent(uintptr_t swapchain, uintptr_t
   return internal::QueryOrdinaryPresentLocked(swapchain, backbuffer, output);
 }
 
-// Same order as XeFG's final commit. The callback issues only the owned
-// queue submission and cannot reenter the adapter or call the SDK.
-template <typename Publish>
-inline bool WithOrdinaryPresentCommit(const OrdinaryPresentAccess& access, Publish&& publish) {
-  if (!access.allowed) return false;
+enum class OrdinaryPresentRecordResult { kOwnerRejected, kRecordFailed, kRecorded };
+
+// Same lock and order as XeFG's final commit. Record must only issue the
+// native commands for this handoff, without reentering the adapter or SDK.
+template <typename Record>
+inline OrdinaryPresentRecordResult TryRecordOrdinaryPresentDelivery(const OrdinaryPresentAccess& access, Record&& record,
+                                                                    bool require_sdk_inactive) {
+  if (!access.allowed) return OrdinaryPresentRecordResult::kOwnerRejected;
   std::unique_lock lock(internal::state.mutex);
-  if (internal::QueryOrdinaryPresentLocked(access.swapchain, access.backbuffer, access.output) != access) return false;
-  if (access.call != 0) {
-    auto& context = *internal::state.contexts.at(reinterpret_cast<void*>(access.context));
-    context.present_colors.at(access.call).ordinary_committed = true;
+  if (internal::QueryOrdinaryPresentLocked(access.swapchain, access.backbuffer, access.output) != access
+      || (require_sdk_inactive && !internal::OrdinarySdkInactiveLocked(access))) {
+    return OrdinaryPresentRecordResult::kOwnerRejected;
   }
-  std::forward<Publish>(publish)();
-  return true;
+
+  const auto mark_recorded = [&] {
+    if (access.call != 0) {
+      auto& context = *internal::state.contexts.at(reinterpret_cast<void*>(access.context));
+      context.present_colors.at(access.call).ordinary_committed = true;
+    }
+  };
+  if constexpr (std::is_void_v<std::invoke_result_t<Record>>) {
+    // The existing infallible recorder retains its pre-callback commit order.
+    mark_recorded();
+    std::forward<Record>(record)();
+  } else {
+    static_assert(std::is_same_v<std::invoke_result_t<Record>, bool>);
+    if (!std::forward<Record>(record)()) return OrdinaryPresentRecordResult::kRecordFailed;
+    mark_recorded();
+  }
+  return OrdinaryPresentRecordResult::kRecorded;
+}
+
+template <typename Publish>
+inline bool WithOrdinaryPresentCommit(const OrdinaryPresentAccess& access, Publish&& publish, bool require_sdk_inactive = false) {
+  return TryRecordOrdinaryPresentDelivery(access, std::forward<Publish>(publish), require_sdk_inactive)
+         == OrdinaryPresentRecordResult::kRecorded;
 }
 
 // Diagnostics only. The reason must have static lifetime, including when a

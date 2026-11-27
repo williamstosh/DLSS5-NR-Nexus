@@ -1195,6 +1195,7 @@ struct PresentTarget {
   fg::xefg::OrdinaryPresentAttempt ordinary_attempt;
   DXGI_FORMAT swapchain_format = DXGI_FORMAT_UNKNOWN;
   bool d3d11_bridge = false;
+  bool late_composed_bridge = false;
   // Granted only by the ordinary Present caller, never by pre-FG/B1.
   bool independent_resolution_pair = false;
   // The native pre-FG service owns its command list and must not borrow the
@@ -2450,6 +2451,9 @@ inline void PollProfileKeys(bool official_down, bool custom_down, bool permitted
 // Guarded by overlay_listener_mutex, which is also held while they change.
 inline std::mutex overlay_listener_mutex;
 inline std::vector<reshade::api::effect_runtime*> live_effect_runtimes;
+inline std::unordered_map<reshade::api::effect_runtime*, uint64_t> effect_runtime_generations;
+inline uint64_t effect_runtime_generation_serial = 0;
+inline bool late_bridge_overlay_listening = false;
 inline std::atomic_bool logged_overlay_frozen{false};
 // The ImGui frame in which OnOverlay found this addon's window floating at a
 // size no one would pick, or -1 (OnDockOverlayWindow docks it; see there).
@@ -29131,6 +29135,7 @@ inline void OnInitEffectRuntime(reshade::api::effect_runtime* runtime) {
   std::scoped_lock lock(overlay_listener_mutex);
   if (std::find(live_effect_runtimes.begin(), live_effect_runtimes.end(), runtime) == live_effect_runtimes.end()) {
     live_effect_runtimes.push_back(runtime);
+    effect_runtime_generations[runtime] = ++effect_runtime_generation_serial;
   }
   if (monitor_runtime.load() == nullptr) {
     monitor_runtime = runtime;
@@ -29142,6 +29147,8 @@ inline void OnInitEffectRuntime(reshade::api::effect_runtime* runtime) {
 inline void OnDestroyEffectRuntime(reshade::api::effect_runtime* runtime) {
   std::scoped_lock lock(overlay_listener_mutex);
   std::erase(live_effect_runtimes, runtime);
+  effect_runtime_generations.erase(runtime);
+  CancelLateBridgePresent(nullptr, runtime);
 #if defined(NR_NEXUS_DEV_CONTROL)
   if (live_effect_runtimes.empty()) dev_control_pipe::Stop();
 #endif
@@ -29235,6 +29242,7 @@ inline void ServiceDisabledNr() {
 }
 
 inline void OnFinishPresent(reshade::api::command_queue*, reshade::api::swapchain* swapchain) {
+  CancelLateBridgePresent(swapchain);
   const auto found = std::find_if(ordinary_present_event_attempts.rbegin(), ordinary_present_event_attempts.rend(),
       [&](const auto& attempt) { return attempt.owner == reinterpret_cast<uintptr_t>(swapchain); });
   if (found == ordinary_present_event_attempts.rend()) return;
@@ -29251,6 +29259,7 @@ inline void OnPresent(
     uint32_t,
     const reshade::api::rect*) {
   if (shutting_down.load(std::memory_order_acquire)) return;
+  CancelLateBridgePresent(swapchain);
   GuardHook([&] {
     BeginOrdinaryPresentAttempt(queue, swapchain);
   });
@@ -29534,6 +29543,26 @@ inline void OnPresent(
   // either saw it armed and locked, or is counted and drained.
   ngx_serial::armed.store(PresentHookServes() || experimental_present_chain.load());
   GuardHook([&] { RunPresentPath(queue, swapchain, fg_fallback); });
+  {
+    std::scoped_lock lock(overlay_listener_mutex);
+    // The event vector can only be changed before its sole runtime starts
+    // walking it. Multiple runtimes retain the existing registration.
+    if (queue != nullptr && swapchain != nullptr && live_effect_runtimes.size() == 1
+        && live_effect_runtimes.front()->get_command_queue() == queue
+        && live_effect_runtimes.front()->get_hwnd() == swapchain->get_hwnd()) {
+      const bool due = std::ranges::any_of(late_bridge_presents, [&](const auto& pending) {
+        return pending.swapchain == swapchain;
+      });
+      if (late_bridge_overlay_listening != due) {
+        late_bridge_overlay_listening = due;
+        if (due) {
+          reshade::register_event<reshade::addon_event::reshade_overlay>(OnLateBridgeOverlay);
+        } else {
+          reshade::unregister_event<reshade::addon_event::reshade_overlay>(OnLateBridgeOverlay);
+        }
+      }
+    }
+  }
   // And the present ends here: its own NR work (an NR feature create runs
   // 250-600 ms) is not a gap in presents.  Stamped at entry only, the first
   // NRPresentGuides=Required run tripped the 250 ms starvation fallback on
@@ -34222,6 +34251,7 @@ inline profile_ui::FirstInstallEvidence first_install_evidence = profile_ui::Fir
 // ReShade's frame callback owns profile transactions even with the add-on panel
 // closed. Key readers only queue an action; no JSON/file work is added to hooks.
 inline void OnProfilePresent(reshade::api::effect_runtime* runtime) {
+  CancelLateBridgePresent(nullptr, runtime);
   if (shutting_down.load()) return;
   {
     std::unique_lock lock(overlay_listener_mutex);
@@ -36630,6 +36660,7 @@ inline void OnDestroyDevice(reshade::api::device* device) {
 // A surviving D3D12 Present stream with an active output keeps its device
 // state. The destroyed swapchain's own recordings still retire locally.
 inline void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) {
+  CancelLateBridgePresent(swapchain);
 #if defined(NR_NEXUS_DEV_CONTROL)
   native_ui_alpha_observation::EndScope("swapchain_lifecycle_changed");
 #endif
@@ -37257,6 +37288,7 @@ inline void Use(DWORD reason, HMODULE module, LPVOID reserved) {
       reshade::unregister_overlay(internal::kOverlayTitle, internal::OnOverlay);
       reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(
           internal::OnReshadeOpenOverlay);
+      reshade::unregister_event<reshade::addon_event::reshade_overlay>(internal::OnLateBridgeOverlay);
       // The HUD's, the overlay hotkeys' and the window dock's listeners, if a
       // pill or toast was due or the overlay open at unload; removing one
       // that is not there does nothing.

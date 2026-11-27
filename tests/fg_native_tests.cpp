@@ -778,6 +778,8 @@ static std::filesystem::path present_fixture_ini;
 #include "nr_xefg_present_probe_cases.hpp"
 #endif
 
+#include "late_bridge_present_cases.hpp"
+
 int main(int argc, char** argv) {
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-status") == 0) return adaptive_status_cases::Run();
   const auto run_edit_reuse_case = [argv](auto run, const char* evidence = "WARP+MOCK") {
@@ -792,6 +794,9 @@ int main(int argc, char** argv) {
     }
     return result;
   };
+  if (argc == 2 && std::strcmp(argv[1], "--late-bridge-ownership") == 0) {
+    return run_edit_reuse_case(late_bridge_present_cases::Run, "CPU");
+  }
   if (argc == 2 && std::strcmp(argv[1], "--output-framerate-sdk") == 0) {
     return run_edit_reuse_case([] {
       try {

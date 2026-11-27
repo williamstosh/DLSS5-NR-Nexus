@@ -1545,6 +1545,7 @@ inline bool RunBridge(ID3D11DeviceContext* context,
   }
   if (!StagePlanAdmitted(plan)) return false;
   const bool pre = redirect != nullptr;
+  const bool late_composed = present != nullptr && present->late_composed_bridge;
   bool named = false;
   bool delivered = false;
   bool completed = false;
@@ -1943,13 +1944,13 @@ inline bool RunBridge(ID3D11DeviceContext* context,
             && screenshot::internal::inline_restore_active.load(std::memory_order_acquire);
         completed = ProcessInline(slot.list, handle, &view, &touched,
                                   present != nullptr ? &at_present : nullptr,
-                                  (adaptive_bridge || trusted_sr || capture_inline_restore ? &bridge_recording : nullptr),
+                                  (adaptive_bridge || trusted_sr || late_composed || capture_inline_restore ? &bridge_recording : nullptr),
                                   false, capture_inline_restore,
                                   present == nullptr ? &bridge_source : nullptr);
 #else
         completed = ProcessInline(slot.list, handle, &view, &touched,
                                   present != nullptr ? &at_present : nullptr,
-                                  (adaptive_bridge || trusted_sr ? &bridge_recording : nullptr), false,
+                                  (adaptive_bridge || trusted_sr || late_composed ? &bridge_recording : nullptr), false,
                                   present == nullptr ? &bridge_source : nullptr);
 #endif
       }
@@ -2091,6 +2092,51 @@ inline bool RunBridge(ID3D11DeviceContext* context,
       if (plan.mixed) decline(NrDeclineReason::kBridgeLost, "the D3D12 stage submission failed");
       return;
     }
+    if (late_composed && (!completed || !PresentGroupResult(std::span{&bridge_recording, 1}, 1, true).complete)) {
+      // Submit preparation normally, but it has no complete current image to
+      // copy back. Its real done fence still owns all recorded resources.
+      return;
+    }
+    if (late_composed && ordinary_access != nullptr && !pre && !strict_delivery) {
+      if (measure_cpu) {
+        cpu_start = SteadyNowNs();
+      }
+      bool removed = false;
+      bool timed_out = false;
+      using fg::xefg::OrdinaryPresentRecordResult;
+      const auto record_result = fg::xefg::TryRecordOrdinaryPresentDelivery(*ordinary_access, [&] {
+        removed = bridge_device_removed.load(std::memory_order_acquire)
+            || bridge.fence_done12->GetCompletedValue() == UINT64_MAX;
+        timed_out = bridge_timeouts.load(std::memory_order_acquire) != timeouts_before;
+        if (removed || timed_out || FAILED(ctx->Wait(bridge.fence_done11, value))) return false;
+        ctx->CopySubresourceRegion(output, 0, 0, 0, 0, set->output11, 0, nullptr);
+        return true;
+      }, true);
+      if (record_result != OrdinaryPresentRecordResult::kRecorded) {
+        ordinary_delivery_failed = true;
+        if (record_result == OrdinaryPresentRecordResult::kOwnerRejected) {
+          name(NrDeclineReason::kPresentPreFg);
+        } else if (removed || timed_out) {
+          ++bridge_completion_failures;
+          if (removed) {
+            MarkBridgeLost("the private device was removed before ordinary delivery");
+          }
+        } else {
+          bridge_skew.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+      }
+      bridge_waits11.fetch_add(1, std::memory_order_relaxed);
+      // Only the unrecorded handoff is settled. The next immediate-context
+      // input follows this Wait/Copy; ring and surface retirement still use done.
+      bridge_pending_delivery_value = 0;
+      screenshot::RecordNativeHdrReceiverCopy(ctx, output);
+      delivered = true;
+      if (measure_cpu) {
+        cpu.return_ns += SteadyNowNs() - cpu_start;
+      }
+      return;
+    }
     // The D3D11 context cannot cancel a queued copy or SR read when the
     // watchdog signals `out`. Keep delivery on the CPU side until `done`.
     uint64_t completed_value = bridge.fence_done12->GetCompletedValue();
@@ -2225,7 +2271,7 @@ inline bool RunBridge(ID3D11DeviceContext* context,
       // color commits the ordinary write. An intervening revocation wins.
       const auto copy_to_output = [&] { ctx->CopySubresourceRegion(output, 0, 0, 0, 0, set->output11, 0, nullptr); };
       if (ordinary_access != nullptr) {
-        if (!fg::xefg::WithOrdinaryPresentCommit(*ordinary_access, copy_to_output)) {
+        if (!fg::xefg::WithOrdinaryPresentCommit(*ordinary_access, copy_to_output, late_composed)) {
           ordinary_delivery_failed = true;
           name(NrDeclineReason::kPresentPreFg);
           return;
