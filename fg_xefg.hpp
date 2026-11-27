@@ -343,6 +343,7 @@ struct TaggedResource {
   abi::Resource data{};
   ComPtr<ID3D12Resource> resource;
   std::shared_ptr<Surface> copy;
+  ComPtr<ID3D12Device> recording_device;
 };
 struct Frame {
   std::array<TaggedResource, 4> resources;
@@ -438,6 +439,7 @@ struct Context {
   ComPtr<ID3D12CommandQueue> queue;
   ComPtr<ID3D12Device> device;
   ComPtr<IUnknown> device_identity;
+  ComPtr<ID3D12Device> proxy_recording_device;
   ComPtr<ID3D12Fence> fence;
   uintptr_t proxy_identity = 0;
   abi::Init init{};
@@ -1087,6 +1089,19 @@ inline void Initialize(void* handle, ID3D12CommandQueue* queue, const abi::Init*
   }
   if (FAILED(queue->GetDevice(IID_PPV_ARGS(&context->device)))
       || FAILED(context->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&context->fence)))) return;
+  auto* queue_device_native = context->device.Get();
+  if (renodx::utils::directx::NativeFromReShadeProxy(&queue_device_native)) {
+    context->proxy_recording_device = context->device;
+  } else if (parameters->application_swapchain != nullptr) {
+    ComPtr<ID3D12Device> application_device;
+    if (SUCCEEDED(parameters->application_swapchain->GetDevice(IID_PPV_ARGS(&application_device)))) {
+      auto* native_device = application_device.Get();
+      if (renodx::utils::directx::NativeFromReShadeProxy(&native_device)
+          && renodx::utils::directx::SameNativeObject(application_device.Get(), context->device.Get())) {
+        context->proxy_recording_device = std::move(application_device);
+      }
+    }
+  }
   context->device_identity = renodx::utils::directx::NativeIdentity(context->device.Get());
   std::unique_lock lock(state.mutex);
   context->bridge_context_ready = BridgeDeviceCaptureReady(
@@ -1843,6 +1858,7 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
           .ui_composition = context->ui_composition,
           .diagnostic_context = reinterpret_cast<uintptr_t>(context.get())};
       present.input.output = context->output_identity;
+      present.input.recording_device = context->proxy_recording_device.Get();
       present.service_eligible = present.service_owned && !repeated;
       context->present_colors.emplace(present.serial, Context::PresentColors{.xefg_owned = present.service_owned});
       present.continuing_submission = context->last_submission_frame != 0
@@ -1964,6 +1980,14 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
       present.input.motion_y = motion.data.base.y;
       present.input.guide_width = motion.data.size.x;
       present.input.guide_height = motion.data.size.y;
+    }
+    if (present.input.recording_device == nullptr) {
+      for (const auto& tagged : frame.resources) {
+        if (tagged.recording_device != nullptr) {
+          present.input.recording_device = tagged.recording_device.Get();
+          break;
+        }
+      }
     }
     present.input.has_constants = frame.has_constants;
     present.input.motion_scale_x = frame.constants.motion_scale_x;
@@ -2566,6 +2590,7 @@ struct SdkHooks {
     abi::Resource replacement{};
     const abi::Resource* forwarded = data;
     bool omitted = false;
+    bool need_tag_device = false;
     try {
       // Only AUTO without UI composition may omit the optional color. NR Off
       // always forwards it; a frame tagged before NR resumes must remain
@@ -2600,6 +2625,7 @@ struct SdkHooks {
           std::unique_lock lock(state.mutex);
           if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
             context = it->second;
+            need_tag_device = context->proxy_recording_device == nullptr;
             frame = GetFrame(context.get(), id);
             if (frame != nullptr && !Requested()) frame->rejected = true;
           }
@@ -2670,6 +2696,16 @@ struct SdkHooks {
             } else {
               tagged.resource.Reset();
             }
+          }
+        }
+      }
+      if (tagged.resource != nullptr && need_tag_device && list != nullptr) {
+        ComPtr<ID3D12Device> face;
+        if (SUCCEEDED(list->GetDevice(IID_PPV_ARGS(&face)))) {
+          auto* native_face = face.Get();
+          if (renodx::utils::directx::NativeFromReShadeProxy(&native_face)
+              && renodx::utils::directx::SameNativeObject(face.Get(), context->device.Get())) {
+            tagged.recording_device = std::move(face);
           }
         }
       }

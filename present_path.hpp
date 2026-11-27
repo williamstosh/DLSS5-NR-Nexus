@@ -5451,8 +5451,8 @@ inline void RunPresentPath(
   }
   DrainPresentRetired();
   if (!d3d11) {
-    // Ordinary Present uses the game's device face. The private service's
-    // native face cannot select a list for Core's proxy-backed context.
+    // Reuse an existing local face of this actual device. On a cold path,
+    // obtain the face from the real backbuffer instead of the native queue.
     ID3D12Device* face = nullptr;
     if (direct_device != nullptr && !direct_api.private_instance
         && renodx::utils::directx::SameNativeObject(

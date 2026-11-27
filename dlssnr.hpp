@@ -304,6 +304,7 @@ struct DirectApi {
   DirectEvaluateFn evaluate = nullptr;
   DirectReleaseFn release = nullptr;
   DirectShutdownFn shutdown = nullptr;
+  uint64_t original_image_generation = 0;
 };
 
 enum class DirectLoadState : uint8_t {
@@ -366,8 +367,14 @@ enum HistoryResetReason : uint32_t {
 // while NR stacking is enabled.
 struct NrFeatureSlot {
   NVSDK_NGX_Handle* handle = nullptr;
-  NVSDK_NGX_Parameter* parameters = nullptr;  // Owned through the initialized NGX core.
+  NVSDK_NGX_Parameter* parameters = nullptr;
+  DestroyParametersFn destroy_parameters = nullptr;
+  DirectEvaluateFn evaluate_feature = nullptr;
+  DirectReleaseFn release_feature = nullptr;
   bool via_core = false;
+  bool direct_fallback = false;
+  const void* fallback_parameters = nullptr;
+  std::shared_ptr<submission::RecordingStatus> fallback_recording;
   bool control_mask_bound = false;
   bool jitter_bound = false;
   uint8_t nr_hdr_mode = 0;  // hdr_mode the NR feature was created with
@@ -740,6 +747,8 @@ struct StreamlineCapture {
 struct RetiredNrFeature {
   NVSDK_NGX_Handle* handle = nullptr;
   NVSDK_NGX_Parameter* parameters = nullptr;
+  DestroyParametersFn destroy_parameters = nullptr;
+  DirectReleaseFn release_feature = nullptr;
   bool via_core = false;
   // Retirement age is diagnostic only. GPU completion is proven by `lease`;
   // an empty lease is intentionally retained until teardown.
@@ -1201,6 +1210,7 @@ struct PresentTarget {
   // The native pre-FG service owns its command list and must not borrow the
   // game's Core context, which may have been initialized through a proxy.
   bool private_signed_runtime = false;
+  bool original_signed_runtime = false;
   bool native_fg_inputs = false;
   // Granted only to the validated native single-plane FG transaction.
   bool native_prefg_resolution_pair = false;
@@ -1411,6 +1421,7 @@ inline std::unordered_map<const NVSDK_NGX_Handle*,
 // retirement has actual work. The vector itself stays under runtime_mutex.
 inline std::atomic_bool nr_retirement_pending{false};
 inline ID3D12Device* direct_device = nullptr;
+inline bool original_nr_face_verified = false;  // Guarded by runtime_mutex.
 // The same device with ReShade's wrapper peeled off, for IDENTITY only.
 // NGX keeps the wrapper (it is evaluated with the game's wrapped command
 // list and the pair has to match - unwrapping just the device is an
@@ -4806,6 +4817,9 @@ struct NgxLoaderSymbols {
   bool core_ready = false;
   // The signed NR runtime, nvngx_dlssnr.dll.
   HMODULE nr_module = nullptr;
+  uint64_t nr_image_generation = 0;
+  std::filesystem::path nr_loaded_path;
+  bool original_nr_exports = false;
   DirectInitFn init = nullptr;
   AllocateParametersFn allocate = nullptr;
   DestroyParametersFn destroy = nullptr;
@@ -4836,6 +4850,11 @@ inline std::atomic<const NgxLoaderSymbols*> ngx_loader_published{nullptr};
 // mutex, which no holder of runtime_mutex ever takes.
 inline NgxLoaderSymbols ngx_loader_staging;
 inline std::mutex ngx_loader_prime_mutex;
+inline uint64_t next_nr_image_generation = 0;  // Under ngx_loader_prime_mutex.
+// The original image can be shared with the game. Preserve one loader reference
+// across local device teardown instead of accumulating one per re-arm.
+inline HMODULE owned_original_nr_module = nullptr;
+inline std::filesystem::path owned_original_nr_path;
 
 // The runtime's declarations as LoadDirectApi adopted them, and the ENV-05
 // verdict the status card reads.
@@ -4888,6 +4907,51 @@ inline const NgxLoaderSymbols& NgxLoaderView() noexcept {
   const NgxLoaderSymbols* published =
       ngx_loader_published.load(std::memory_order_acquire);
   return published != nullptr ? *published : kNone;
+}
+
+// Under runtime_mutex. This ties the local SDK binding to the actual
+// selected image, not to the caller's estimate of who's initialized NGX.
+inline bool CurrentOriginalNrApi() noexcept {
+  const auto& image = NgxLoaderView();
+  return !direct_api.private_instance && !direct_api.borrowed_core_context
+      && image.nr_ready && image.original_nr_exports && image.nr_module == direct_api.module
+      && image.nr_image_generation != 0 && image.nr_image_generation == direct_api.original_image_generation
+      && image.init == direct_api.init && image.create == direct_api.create
+      && image.evaluate == direct_api.evaluate && image.release == direct_api.release
+      && image.allocate == direct_api.allocate && image.destroy == direct_api.destroy
+      && image.shutdown == direct_api.shutdown;
+}
+
+inline ID3D12Device* BoundOriginalNrRecordingFace(ID3D12Device* device) {
+  if (device == nullptr || direct_device == nullptr || !original_nr_face_verified
+      || !parameter_runtime_ready || direct_runtime_failed
+      || direct_load_state != DirectLoadState::Ready || !CurrentOriginalNrApi()) {
+    return nullptr;
+  }
+  if (device != direct_device_native && !renodx::utils::directx::SameNativeObject(direct_device, device)) {
+    return nullptr;
+  }
+  return direct_device;
+}
+
+inline void ObserveOriginalNrContextFailure(bool via_core, NVSDK_NGX_Result result) noexcept {
+  if (!via_core && result == NVSDK_NGX_Result_FAIL_NotInitialized && CurrentOriginalNrApi()) {
+    // A genuine vendor failure withdraws the local binding, but does not grant
+    // the addon permission to shut down or unload the shared SDK.
+    direct_runtime_failed = true;
+    original_nr_face_verified = false;
+  }
+}
+
+inline void ObserveOriginalNrEvaluation(ID3D12GraphicsCommandList* list, bool via_core,
+                                        DirectEvaluateFn evaluate, NVSDK_NGX_Result result) {
+  ObserveOriginalNrContextFailure(via_core, result);
+  if (via_core || original_nr_face_verified || NVSDK_NGX_FAILED(result) || evaluate != direct_api.evaluate
+      || direct_runtime_failed || !CurrentOriginalNrApi()) return;
+  Microsoft::WRL::ComPtr<ID3D12Device> recording_device;
+  if (SUCCEEDED(list->GetDevice(IID_PPV_ARGS(&recording_device))) && recording_device.Get() == direct_device) {
+    original_nr_face_verified = true;
+  }
 }
 
 // Copy the staging block into a fresh snapshot and publish it.  Caller holds
@@ -5215,7 +5279,15 @@ inline void PrimeNgxLoaderSymbols(ID3D12Device* device, bool prepare_native = fa
     NoteLoaderCall("PrimeNgxLoaderSymbols/LoadLibraryW",
                    LoaderCallSafety::kUnsafeUnderLoaderLock);
     DWORD load_exception = 0;
-    HMODULE module = LoadLibraryWSeh(symbols.nr_path.c_str(), &load_exception);
+    HMODULE module = nullptr;
+    if (owned_original_nr_module != nullptr && symbols.nr_path == owned_original_nr_path) {
+      module = owned_original_nr_module;
+    } else if (symbols.nr_path.is_absolute()) {
+      GetModuleHandleExW(0, symbols.nr_path.c_str(), &module);
+    }
+    if (module == nullptr) {
+      module = LoadLibraryWSeh(symbols.nr_path.c_str(), &load_exception);
+    }
     if (module == nullptr && load_exception != 0) {
       // The fault the SEH wrap exists for (see the boundary block above).
       // The unloadable-runtime line below prints the exception code as its
@@ -5292,7 +5364,9 @@ inline void PrimeNgxLoaderSymbols(ID3D12Device* device, bool prepare_native = fa
                   " NVIDIA build and restart");
         NoteLoaderCall("PrimeNgxLoaderSymbols/FreeLibrary",
                        LoaderCallSafety::kUnsafeUnderLoaderLock);
-        FreeLibrary(module);
+        if (module != owned_original_nr_module) {
+          FreeLibrary(module);
+        }
         symbols = {};
         symbols.nr_failed = true;
         nr_runtime_fault.store(static_cast<uint8_t>(ui::RuntimeFault::kUnusable),
@@ -5306,6 +5380,30 @@ inline void PrimeNgxLoaderSymbols(ID3D12Device* device, bool prepare_native = fa
         symbols.nr_sha256 = ComputeRuntimeSha256(symbols.nr_path);
         symbols.nr_requirements = ReadNrRuntimeRequirements(symbols.nr_path, device);
         symbols.nr_module = module;
+        if (owned_original_nr_module == nullptr) {
+          owned_original_nr_path = symbols.nr_path;
+          owned_original_nr_module = module;
+        }
+        symbols.nr_image_generation = ++next_nr_image_generation;
+        wchar_t loaded_path[32768]{};
+        const DWORD loaded_length = GetModuleFileNameW(module, loaded_path, static_cast<DWORD>(std::size(loaded_path)));
+        if (loaded_length != 0 && loaded_length < std::size(loaded_path)) {
+          symbols.nr_loaded_path = loaded_path;
+        }
+        symbols.original_nr_exports = true;
+        for (const auto address : std::array{reinterpret_cast<const void*>(symbols.init),
+                                             reinterpret_cast<const void*>(symbols.create),
+                                             reinterpret_cast<const void*>(symbols.evaluate),
+                                             reinterpret_cast<const void*>(symbols.release),
+                                             reinterpret_cast<const void*>(symbols.allocate),
+                                             reinterpret_cast<const void*>(symbols.destroy),
+                                             reinterpret_cast<const void*>(symbols.shutdown)}) {
+          if (address == nullptr) continue;
+          HMODULE owner = nullptr;
+          symbols.original_nr_exports &= GetModuleHandleExW(
+              GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+              reinterpret_cast<LPCWSTR>(address), &owner) && owner == module;
+        }
         symbols.nr_ready = true;
         PublishNgxLoaderSymbols();
       }
@@ -5339,6 +5437,8 @@ inline void PrimeNgxLoaderSymbols(ID3D12Device* device, bool prepare_native = fa
       }
     }
   }
+#if defined(NR_NEXUS_TEST_NATIVE_NGX)
+  // Only the legacy test case can construct a separate image.
   if (prepare_native && !symbols.native_ready && !symbols.native_failed) {
     if (!symbols.nr_ready || symbols.nr_sha256.empty()) {
       symbols.native_failed = true;
@@ -5424,6 +5524,7 @@ inline void PrimeNgxLoaderSymbols(ID3D12Device* device, bool prepare_native = fa
     }
     PublishNgxLoaderSymbols();
   }
+#endif
 }
 
 // Give the loader back what it gave us.  Called with NO addon lock held, for
@@ -5509,6 +5610,7 @@ inline bool LoadDirectApi(std::optional<bool> private_runtime = std::nullopt) {
       .evaluate = symbols.evaluate,
       .release = symbols.release,
       .shutdown = symbols.shutdown,
+      .original_image_generation = symbols.nr_image_generation,
   });
   if (borrow_core) {
     direct_api.init = nullptr;
@@ -6030,6 +6132,8 @@ inline void ReleaseNrSlot(
     retired.handle = slot.handle;
     retired.parameters = slot.parameters;
     retired.via_core = slot.via_core;
+    retired.destroy_parameters = slot.destroy_parameters;
+    retired.release_feature = slot.release_feature;
     if (!retired.tracker_proof && slot.handle != nullptr) {
       ++nr_features_retired_on_lease;
     }
@@ -6039,18 +6143,25 @@ inline void ReleaseNrSlot(
     for (ID3D12Resource*& buffer : slot.look_history.buffers) ReleaseCom(buffer);
     if (slot.handle != nullptr) {
       DirectCallScope ngx_direct_call;
-      if (slot.via_core && core_release_feature != nullptr) {
+      if (slot.release_feature != nullptr) {
+        slot.release_feature(slot.handle);
+      } else if (slot.via_core && core_release_feature != nullptr) {
         core_release_feature(slot.handle);
       } else if (direct_api.release != nullptr) {
         direct_api.release(slot.handle);
       }
     }
-    if (slot.parameters != nullptr && core_destroy_parameters != nullptr) {
+    if (slot.parameters != nullptr && slot.destroy_parameters != nullptr) {
+      slot.destroy_parameters(slot.parameters);
+    } else if (slot.parameters != nullptr && core_destroy_parameters != nullptr) {
       core_destroy_parameters(slot.parameters);
     }
   }
   slot.handle = nullptr;
   slot.parameters = nullptr;
+  slot.destroy_parameters = nullptr;
+  slot.evaluate_feature = nullptr;
+  slot.release_feature = nullptr;
   slot.control_mask_bound = false;
   slot.jitter_bound = false;
   slot.via_core = false;
@@ -6135,13 +6246,17 @@ inline bool FeatureFailureExpired(const NrFeatureSlot& slot) {
 inline void ReleaseRetiredNrFeature(const RetiredNrFeature& retired) {
   if (retired.handle != nullptr) {
     DirectCallScope ngx_direct_call;
-    if (retired.via_core && core_release_feature != nullptr) {
+    if (retired.release_feature != nullptr) {
+      retired.release_feature(retired.handle);
+    } else if (retired.via_core && core_release_feature != nullptr) {
       core_release_feature(retired.handle);
     } else if (direct_api.release != nullptr) {
       direct_api.release(retired.handle);
     }
   }
-  if (retired.parameters != nullptr && core_destroy_parameters != nullptr) {
+  if (retired.parameters != nullptr && retired.destroy_parameters != nullptr) {
+    retired.destroy_parameters(retired.parameters);
+  } else if (retired.parameters != nullptr && core_destroy_parameters != nullptr) {
     core_destroy_parameters(retired.parameters);
   }
   for (ID3D12Resource* buffer : retired.look_history) {
@@ -6566,7 +6681,7 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
   const bool provider_matches = same_instance && (!private_signed_runtime
       || (parameter_runtime_ready && !parameter_runtime_via_core.load()));
   if (exact_device && provider_matches && parameter_runtime_ready) {
-    if (FAILED(device->GetDeviceRemovedReason())) {
+    if (FAILED(device->GetDeviceRemovedReason()) || (direct_runtime_failed && CurrentOriginalNrApi())) {
       device->Release();
       return false;
     }
@@ -6615,6 +6730,16 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
         : !same_device ? "a different D3D12 device"
         : proxy_face ? "ReShade's proxy of its D3D12 device"
                      : "the native face of its D3D12 device";
+    // NVIDIA can retain its existing object face when the same device is
+    // passed to Init again. A known shared binding is not a license to submit
+    // a list from the other interface after waiting a few frames.
+    if (same_device && !exact_device && CurrentOriginalNrApi()) {
+      if (decline != nullptr) {
+        *decline = NrDeclineReason::kRuntimeFaceAlternation;
+      }
+      device->Release();
+      return false;
+    }
     // An explicit provider handoff selects its required face. The settling
     // window is for competing faces within one provider; both still need
     // the closed-and-completed proof below.
@@ -6806,6 +6931,7 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
     direct_device->Release();
     direct_device = nullptr;
     direct_device_native = nullptr;
+    original_nr_face_verified = false;
     direct_runtime_failed = false;
     parameter_runtime_ready = false;
     parameter_runtime_via_core = false;
@@ -6944,6 +7070,7 @@ inline bool EnsureDirectRuntime(ID3D12GraphicsCommandList* command_list,
   }
   direct_device = device;
   direct_device_native = device;
+  original_nr_face_verified = false;
   renodx::utils::directx::NativeFromReShadeProxy(&direct_device_native);
   last_nr_device_native = direct_device_native;
   direct_runtime_failed = false;
@@ -9097,7 +9224,8 @@ inline bool EnsureNrFeature(
     uint32_t input_width,
     uint32_t input_height,
     uint32_t output_width,
-    uint32_t output_height) {
+    uint32_t output_height,
+    bool original_signed_runtime = false) {
 #if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
   const ColdCpuTraceScope cold_trace("EnsureNrFeature");
 #endif
@@ -9108,16 +9236,31 @@ inline bool EnsureNrFeature(
     }
     return true;
   }
-  if (command_list == nullptr || slot.failed) return false;
-  if (!EnsureDirectRuntime(command_list)) return false;
+  if (command_list == nullptr) return false;
+  if (slot.fallback_recording != nullptr) {
+    const auto current = submission::RecordingIdentity(command_list);
+    const auto& failed = slot.fallback_recording;
+    if (current == std::pair{failed->list, failed->generation} || !failed->closed.load()
+        || !submission::CanReuseRecordingObjects({slot.fallback_parameters}, current, failed)) return false;
+    slot.fallback_recording.reset();
+    slot.fallback_parameters = nullptr;
+    slot.preparation_recording.reset();
+  }
+  if (slot.failed || !EnsureDirectRuntime(command_list)) return false;
   slot.memory_failure = false;
 
   if (slot.parameters == nullptr) {
 #if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
     ColdCpuTraceScope allocation_trace("SDK.CoreAllocateParameters");
 #endif
-    const NVSDK_NGX_Result allocate_result =
-        core_allocate_parameters(&slot.parameters);
+    const bool runtime_allocator = direct_api.allocate != nullptr && direct_api.destroy != nullptr;
+    const auto allocate = slot.direct_fallback || original_signed_runtime
+                              ? (runtime_allocator ? direct_api.allocate : bridge::AllocateOwnedParameters)
+                              : core_allocate_parameters;
+    slot.destroy_parameters = slot.direct_fallback || original_signed_runtime
+                                  ? (runtime_allocator ? direct_api.destroy : bridge::DestroyOwnedParameters)
+                                  : core_destroy_parameters;
+    const NVSDK_NGX_Result allocate_result = allocate(&slot.parameters);
 #if defined(NR_NEXUS_TEST_NATIVE_NGX) && defined(NR_NEXUS_TEST_COLD_CPU_TRACE)
     allocation_trace.End();
 #endif
@@ -9171,13 +9314,19 @@ inline bool EnsureNrFeature(
 
   // Create may record opaque SDK work even before returning a handle.
   submission::TrackUse(command_list, &direct_api, submission::UseKind::kProvider);
+  submission::TrackUse(command_list, slot.parameters, submission::UseKind::kProvider);
+  const auto create_recording = submission::ObserveRecording(command_list);
+  const bool try_core = !original_signed_runtime && !slot.direct_fallback && parameter_runtime_via_core.load()
+                        && core_create_feature != nullptr;
   const auto create_started_ns = SteadyNowNs();
   NVSDK_NGX_Result result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
   {
     DirectCallScope ngx_direct_call;
     const lastgasp::InsideCall inside("nr-create");
     try {
-      if (parameter_runtime_via_core.load() && core_create_feature != nullptr) {
+      if (try_core) {
+        slot.evaluate_feature = core_evaluate_feature;
+        slot.release_feature = core_release_feature;
         result = core_create_feature(
             command_list,
             kFeatureDlssNr,
@@ -9189,8 +9338,10 @@ inline bool EnsureNrFeature(
         slot.memory_failure = true;
         ObserveAdaptiveAllocationFailure(E_OUTOFMEMORY);
       }
-      if (!slot.via_core && !direct_api.borrowed_core_context && !slot.memory_failure) {
+      if (!try_core && !direct_api.borrowed_core_context && !slot.memory_failure) {
         slot.handle = nullptr;
+        slot.evaluate_feature = direct_api.evaluate;
+        slot.release_feature = direct_api.release;
         result = direct_api.create(
             command_list,
             kFeatureDlssNr,
@@ -9228,7 +9379,21 @@ inline bool EnsureNrFeature(
     slot.memory_failure = true;
     ObserveAdaptiveAllocationFailure(E_OUTOFMEMORY);
   }
+  ObserveOriginalNrContextFailure(try_core, result);
   last_result = static_cast<uint32_t>(result);
+  if (try_core && !slot.via_core && !direct_api.borrowed_core_context && !slot.memory_failure) {
+    // Failed Core Create may still have recorded commands. Keep its parameter
+    // family alive, then retry the signed family on a different legal recording.
+    const auto* failed_parameters = slot.parameters;
+    slot.tracked_since_create = queue_tracking_active.load(std::memory_order_relaxed);
+    slot.via_core = true;
+    ReleaseNrSlot(state, slot_index, true);
+    slot.direct_fallback = true;
+    slot.fallback_parameters = failed_parameters;
+    slot.fallback_recording = create_recording;
+    slot.preparation_recording = create_recording;
+    return false;
+  }
   if (NVSDK_NGX_FAILED(result) || slot.handle == nullptr) {
     slot.failed = true;
     slot.failed_ns = SteadyNowNs();
@@ -9237,8 +9402,10 @@ inline bool EnsureNrFeature(
     }
     slot.handle = nullptr;
     if (slot.parameters != nullptr) {
-      core_destroy_parameters(slot.parameters);
-      slot.parameters = nullptr;
+      const bool memory_failure = slot.memory_failure;
+      slot.tracked_since_create = queue_tracking_active.load(std::memory_order_relaxed);
+      ReleaseNrSlot(state, slot_index, true);
+      slot.memory_failure = memory_failure;
     }
     slot.control_mask_bound = false;
     slot.jitter_bound = false;
@@ -15959,6 +16126,7 @@ inline bool RecordInline(
   if (prepare_models_only) {
     bool prepared = true;
     bool ready = true;
+    bool fallback_pending = false;
     for (uint32_t pass = 0; pass < requested_stack && prepared; ++pass) {
       auto& slot = feature.slots[pass];
       if (model_preparation != nullptr && !slot.creation_completed && slot.preparation_recording == nullptr) {
@@ -15973,8 +16141,10 @@ inline bool RecordInline(
         model_preparation->recording = submission::ObserveRecording(command_list);
       }
       prepared = EnsureNrFeature(command_list, feature, pass,
-                                  FinalResources{.hdr_mode = hdr_mode},
-                                  pass_widths[pass], pass_heights[pass], pass_widths[pass], pass_heights[pass]);
+                                 FinalResources{.hdr_mode = hdr_mode},
+                                 pass_widths[pass], pass_heights[pass], pass_widths[pass], pass_heights[pass],
+                                 present != nullptr && present->original_signed_runtime);
+      fallback_pending |= slot.fallback_recording != nullptr;
       if (model_preparation != nullptr) {
         if (creating && prepared) {
           slot.preparation_recording = model_preparation->recording;
@@ -15992,9 +16162,11 @@ inline bool RecordInline(
       recording->prepared = prepared;
     }
     if (model_preparation != nullptr) {
-      model_preparation->state = (!prepared ? NrModelPreparationState::FAILED
-          : model_preparation->created_mask != 0 ? NrModelPreparationState::RECORDED
-          : ready ? NrModelPreparationState::READY : NrModelPreparationState::PENDING);
+      model_preparation->state = (fallback_pending                       ? NrModelPreparationState::PENDING
+                                  : !prepared                            ? NrModelPreparationState::FAILED
+                                  : model_preparation->created_mask != 0 ? NrModelPreparationState::RECORDED
+                                  : ready                                ? NrModelPreparationState::READY
+                                                                         : NrModelPreparationState::PENDING);
     }
     device->Release();
     return prepared;
@@ -16804,7 +16976,9 @@ inline bool RecordInline(
               nr_input_width,
               nr_input_height,
               feature_out_width,
-              feature_out_height)) {
+              feature_out_height,
+              present != nullptr && present->original_signed_runtime)
+          && feature.slots[pass].fallback_recording == nullptr) {
         stack_failure = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
         failed_pass = pass;
       }
@@ -17075,18 +17249,12 @@ inline bool RecordInline(
       {
         DirectCallScope ngx_direct_call;
         try {
-          nr_result = feature.slots[pass].via_core
-              ? core_evaluate_feature(
-                    command_list,
-                    feature.slots[pass].handle,
-                    feature.slots[pass].parameters,
-                    nullptr)
-              : direct_api.evaluate(
-                    command_list,
-                    feature.slots[pass].handle,
-                    feature.slots[pass].parameters,
-                    nullptr);
+          const auto evaluate = feature.slots[pass].evaluate_feature != nullptr
+                                    ? feature.slots[pass].evaluate_feature
+                                    : (feature.slots[pass].via_core ? core_evaluate_feature : direct_api.evaluate);
+          nr_result = evaluate(command_list, feature.slots[pass].handle, feature.slots[pass].parameters, nullptr);
           nr_returned = true;
+          ObserveOriginalNrEvaluation(command_list, feature.slots[pass].via_core, evaluate, nr_result);
         } catch (...) {
           // The shared failure path below retains the game DLSS output,
           // releases the handle, and arms the correct retry policy; the
@@ -19528,7 +19696,8 @@ inline bool RecordInlinePreSR(
               nr_input_width,
               nr_input_height,
               nr_input_width,
-              nr_input_height)) {
+              nr_input_height)
+          && feature.slots[pass].fallback_recording == nullptr) {
         stack_failure = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
         failed_pass = pass;
       }
@@ -19740,18 +19909,12 @@ inline bool RecordInlinePreSR(
       {
         DirectCallScope ngx_direct_call;
         try {
-          nr_result = feature.slots[pass].via_core
-              ? core_evaluate_feature(
-                    command_list,
-                    feature.slots[pass].handle,
-                    feature.slots[pass].parameters,
-                    nullptr)
-              : direct_api.evaluate(
-                    command_list,
-                    feature.slots[pass].handle,
-                    feature.slots[pass].parameters,
-                    nullptr);
+          const auto evaluate = feature.slots[pass].evaluate_feature != nullptr
+                                    ? feature.slots[pass].evaluate_feature
+                                    : (feature.slots[pass].via_core ? core_evaluate_feature : direct_api.evaluate);
+          nr_result = evaluate(command_list, feature.slots[pass].handle, feature.slots[pass].parameters, nullptr);
           nr_returned = true;
+          ObserveOriginalNrEvaluation(command_list, feature.slots[pass].via_core, evaluate, nr_result);
         } catch (...) {
           Log(reshade::log::level::error, "pre-SR feature 18 evaluate raised an exception");
           nr_result = NVSDK_NGX_Result_FAIL_UnableToInitializeFeature;
@@ -36478,6 +36641,8 @@ inline void OnDestroyDevice(reshade::api::device* device) {
     is_vk_session = vk::api_devices.size() == 1 && vk::api_devices.contains(vk_native);
   }
   if (is_d3d12) {
+    // This callback exposes the wrapper's underlying COM object, not the
+    // recording face. End borrow authority at actual local teardown below.
     destroy_device_d3d12_events.fetch_add(1, std::memory_order_relaxed);
   }
   // The counters above ride the telemetry line, which is emitted on a
@@ -37028,6 +37193,8 @@ inline bool Shutdown(bool proof_gated) {
       shutting_down.store(false, std::memory_order_release);
       return false;
     }
+    // This is the actual end of the addon's local binding, after proof-gated
+    // teardown has committed; an early unsuccessful teardown kept it live.
     UnhookInstalledDetours();
     // The queue detour stays installed; tracking is off while the state it
     // proves is released here, and re-arms at the end of this function.
@@ -37067,6 +37234,7 @@ inline bool Shutdown(bool proof_gated) {
       direct_device->Release();
       direct_device = nullptr;
       direct_device_native = nullptr;
+      original_nr_face_verified = false;
     }
     bool identity_restored = true;
     if (!direct_api.borrowed_core_context) {

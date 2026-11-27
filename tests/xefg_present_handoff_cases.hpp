@@ -641,6 +641,8 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
   Check(Hooks::Enable(session.handle, 0) == 0, "release SDK ownership before the independent guide capture");
   warm("guide-ordinary-prefix", &route, false);
   Check(!native::direct_api.private_instance, "guide departure starts on the ordinary provider");
+  const auto guide_provider = native::direct_api.module;
+  const auto guide_provider_inits = control_mask_gpu_cases::runtime_initializations;
   auto guide = create_list();
   ++native::present_generation;
   const auto prior_capture = native::present_captures.load();
@@ -753,7 +755,10 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
   const bool guide_retained = !guide.recording->submitted.load() && !guide.recording->closed.load()
       && !submission::ResourceReleasable(retained_depth) && !submission::ResourceReleasable(retained_motion)
       && !submission::ResourceReleasable(retained_marker);
-  accepted &= guide_handoff && guide_retained && native::direct_api.private_instance;
+  Check(guide_handoff && guide_retained && !native::direct_api.private_instance
+            && native::direct_api.module == guide_provider
+            && control_mask_gpu_cases::runtime_initializations == guide_provider_inits,
+        "the same original provider accepts the independent guides without replacing or reinitializing it");
 #if defined(NR_NEXUS_DEV_CONTROL)
   Check(benchmark::active.load() && benchmark_recording == guide.recording && guide_handoff,
         "the real provider handoff accepts the same retained guides while benchmark remains active");

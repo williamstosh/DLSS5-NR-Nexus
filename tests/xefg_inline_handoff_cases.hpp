@@ -51,9 +51,14 @@ inline void Run(Gpu& gpu, Session& session, ID3D12Resource* back,
   const auto fg_held = [&] {
     return xefg::Enabled() && session.context->enabled && session.context->epoch == epoch;
   };
+  const auto starting_module = native::direct_api.module;
+  const bool legacy_private = native::direct_api.private_instance;
+  const auto same_service_runtime = [&] {
+    return native::direct_api.module == starting_module && native::direct_api.private_instance == legacy_private;
+  };
   Check(fg_held() && xefg::CurrentResult() == fg::Result::SUBMITTED
-            && native::direct_api.private_instance && native::TeardownProof() == Work::kComplete,
-        "inline handoff starts with completed and closed private XeFG work with SDK FG on");
+            && starting_module != nullptr && native::TeardownProof() == Work::kComplete,
+        "inline handoff starts with completed, non-replayable XeFG work with SDK FG on");
 
   PresentRingFaceProbe route(&gpu, back, session.proxy.Get(), PresentRingFaceProbe::Mode::NATIVE_ROUTE);
   native::present_pre_fg = 1;
@@ -378,8 +383,8 @@ inline void Run(Gpu& gpu, Session& session, ID3D12Resource* back,
         continue;
       }
       Check(xefg::DisplayResult() == fg::Result::SUBMITTED && xefg::SubmittedFrames() == service_before + 1
-                && nr_calls() == calls_before + 1 && previous_nr_succeeded() && native::direct_api.private_instance,
-            "XeFG Present uses its private provider and submits one actual NR pass again");
+                && nr_calls() == calls_before + 1 && previous_nr_succeeded() && same_service_runtime(),
+            "XeFG Present retains the validated runtime and submits one actual NR pass again");
       const auto readback = Capture(gpu, back, D3D12_RESOURCE_STATE_COMMON);
       Snapshot private_color;
       if (native_ngx) {
@@ -676,7 +681,7 @@ inline void Run(Gpu& gpu, Session& session, ID3D12Resource* back,
       native::disable_release_mode = 0;
       native::kSetEnabled.Commit(0.f);
       Check(!native::enabled.load() && fg_held() && submission::ResourceReleasable(retained_list.Get())
-                && native::direct_api.private_instance && native::features.contains(role)
+                && same_service_runtime() && native::features.contains(role)
                 && native::features.at(role).slots[0].handle == model
                 && native::fg_service::streams.contains(key)
                 && std::ranges::any_of(native::fg_service::streams.at(key).slots,
@@ -810,11 +815,17 @@ inline void Run(Gpu& gpu, Session& session, ID3D12Resource* back,
                       << " result=" << static_cast<unsigned>(xefg::CurrentResult())
                       << " display=" << static_cast<unsigned>(xefg::DisplayResult()) << '\n';
           }
-          Check(xefg::CurrentResult() == fg::Result::NOT_SERVED && xefg::DisplayResult() == fg::Result::NOT_SERVED
-                    && xefg::SubmittedFrames() == service_before_switch && pending_count() == declines + 1
-                    && nr_calls() == calls_before + 1 && recording_retained && provider_retained
-                    && retired_pair && model_retained,
-                "pending or replayable game work blocks XeFG without fake activity or provider release");
+          Check(recording_retained && provider_retained && retired_pair && model_retained,
+                "the exact pending or replayable game recording keeps its original model, parameters and runtime");
+          if (legacy_private) {
+            Check(xefg::CurrentResult() == fg::Result::NOT_SERVED && xefg::DisplayResult() == fg::Result::NOT_SERVED
+                      && xefg::SubmittedFrames() == service_before_switch && pending_count() == declines + 1
+                      && nr_calls() == calls_before + 1,
+                  "the legacy fixture still distinguishes a blocked provider change");
+          } else {
+            Check(pending_count() == declines && xefg::CurrentResult() != fg::Result::FAILED,
+                  "a same-runtime SDK call does not manufacture a provider-switch wait");
+          }
           if (native_ngx) {
             external_blocks.push_back({{"proof", proof == Work::kPending ? "Pending" : "Replayable"},
                 {"application_frame", session.context->application_frame}, {"sdk_fg_enabled", session.context->enabled},

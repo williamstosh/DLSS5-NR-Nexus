@@ -45,7 +45,8 @@ struct Gpu {
   UINT swapchain_height = 8;
   uint64_t serial = 0;
   bool submission_pending = false;
-  explicit Gpu(bool hardware = false, UINT width = 8, UINT height = 8)
+  explicit Gpu(bool hardware = false, UINT width = 8, UINT height = 8,
+               decltype(&D3D12CreateDevice) create_device = &D3D12CreateDevice)
       : swapchain_width(width), swapchain_height(height) {
 #if defined(NR_NEXUS_TEST_WARP_ONLY)
     Check(!hardware, "hardware adapter forbidden in WARP-only test build");
@@ -76,7 +77,7 @@ struct Gpu {
             "WARP fixture requires a software adapter before device creation");
       std::wcout << L"GPU fixture: " << adapter_desc.Description << L" software=1\n";
     }
-    Check(SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device))), "D3D12 device");
+    Check(SUCCEEDED(create_device(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device))), "D3D12 device");
     D3D12_COMMAND_QUEUE_DESC desc{};
     Check(SUCCEEDED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue))), "queue");
     Check(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))), "allocator");

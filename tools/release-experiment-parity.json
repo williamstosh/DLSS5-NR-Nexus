@@ -316,20 +316,19 @@
         { "suite": "bridge-motion", "name": "ordinary-present-prequeue", "log": "warp-ordinary-present-prequeue",
           "receipt": "^PASS case=ordinary-present-prequeue evidence=WARP\\+MOCK dev={dev} two_actual_first_readers=1 adjacent_pending=1 real_ngx=NOT_TESTED$",
           "existingTrace": true,
-          "scenarios": ["held-two-frames", "actual-first-readers", "late-owner-rejected", "wait-failed", "cold-provider-ready", "same-provider", "cold-provider-timeout"],
+          "scenarios": ["held-two-frames", "actual-first-readers", "late-owner-rejected", "wait-failed", "cold-original-provider", "same-provider"],
           "expect": {
             "held-two-frames": "^BRIDGE_ORDINARY_PREQUEUE_HELD first=[0-9]+ second=[0-9]+ out=[0-9]+ done=[0-9]+ consumers_done=[0-9]+ (?<trace>passes=2,2 copies=1,1 cpu_waits=0 distinct_slots=1)$",
             "actual-first-readers": "^BRIDGE_ORDINARY_PREQUEUE_READERS frames=2 passes=2,2 gpu_pass_signatures=4 first_current=1 second_current=1 old_frame=0 originals=0$",
             "late-owner-rejected": "^BRIDGE_ORDINARY_PREQUEUE_REJECT kind=owner_epoch wait_calls=0 rejected_copies=0 committed=0 original_reader=1 first_reset=1,1 next_reset=0,0 recovered_copies=1,1$",
             "wait-failed": "^BRIDGE_ORDINARY_PREQUEUE_REJECT kind=wait_failure wait_calls=1 rejected_copies=0 committed=0 original_reader=1 first_reset=1,1 next_reset=0,0 recovered_copies=1,1$",
-            "cold-provider-ready": "^BRIDGE_XEFG_PREQUEUE_HANDOFF phase=cold_ready waits=1 initialized=1 real_done=1 same_call=1$",
-            "same-provider": "^BRIDGE_XEFG_PREQUEUE_HANDOFF phase=same_provider waits=0 old_pending=1 sdk_submitted=1 first_pixels=1 passes=2,2$",
-            "cold-provider-timeout": "^BRIDGE_XEFG_PREQUEUE_HANDOFF phase=cold_timeout waits=1,1,1 old_lifetime=retained retry_tail=advanced initialized=1$"
+            "cold-original-provider": "^BRIDGE_XEFG_PREQUEUE_HANDOFF phase=cold_original waits=0 new_init=0 old_pending=1 handles_retained=1 true_done=1$",
+            "same-provider": "^BRIDGE_XEFG_PREQUEUE_HANDOFF phase=same_provider waits=0 old_pending=1 sdk_submitted=1 first_pixels=1 passes=2,2$"
           } },
         { "suite": "fg-native", "name": "present-guide-models", "log": "present-guide-models",
-          "receipt": "^PASS XeFG Present handoff providers=ordinary-image\\+Core real_guides\\+Optional-no-ID passes=2 Service_owned_pending\\+external_replayable public_disable_restore evidence=WARP\\+MOCK real_NGX=NOT_RUN$",
+          "receipt": "^PASS present-guide-models evidence=WARP\\+MOCK real_neutral=warm slots=3 model_recording=actual_warp real_Service_submission=actual_warp original_provider=mock$",
           "existingTrace": true,
-          "scenarios": ["upscaled", "render", "upscaled-empty-pool", "render-empty-pool", "upscaled-off-hold", "render-off-hold", "upscaled-reclaim", "render-reclaim", "upscaled-owner-exit", "render-owner-exit", "owner-isolation", "owner-pending", "nested-delivery", "nested-failed-sr", "nested-source-first", "nested-source-next", "nested-recovery", "present-handoff", "ordinary-present-receipt", "ordinary-receipt-game-reset"],
+          "scenarios": ["upscaled", "render", "upscaled-empty-pool", "render-empty-pool", "upscaled-off-hold", "render-off-hold", "upscaled-reclaim", "render-reclaim", "upscaled-owner-exit", "render-owner-exit", "owner-isolation", "owner-pending", "nested-delivery", "nested-failed-sr", "nested-source-first", "nested-source-next", "nested-recovery"],
           "expect": {
             "upscaled": "^XEFG_INLINE_HANDOFF stage=Upscaled fg=held_on sr=MOCK sr_wrapper=actual inline_nr_evals=2 inline_delivery_readback=2 xefg_nr_evals=2 xefg_delivery_readback=2 game_pending_and_replayable=1 evidence=WARP\\+MOCK$",
             "render": "^XEFG_INLINE_HANDOFF stage=Render fg=held_on sr=MOCK sr_wrapper=actual inline_nr_evals=2 inline_delivery_readback=2 xefg_nr_evals=2 xefg_delivery_readback=2 game_pending_and_replayable=0 evidence=WARP\\+MOCK$",
@@ -347,7 +346,13 @@
             "nested-failed-sr": "^XEFG_INLINE_NESTED_SR_FAILURE stage=Upscaled sr_calls=1 nr_evals=0 source_owners=1 new_completed=0 full_readback=unchanged evidence=WARP\\+MOCK$",
             "nested-source-first": "^XEFG_INLINE_NESTED_SOURCE_OUTPUT frame=1 outer_enhanced=matched same_list_copy=1 output_registered=1 source_bound=1$",
             "nested-source-next": "^XEFG_INLINE_NESTED_SOURCE_OUTPUT frame=2 outer_enhanced=matched same_list_copy=1 output_registered=1 source_bound=1$",
-            "nested-recovery": "^XEFG_INLINE_NESTED_RECOVERY stage=Upscaled failed_inner_sr=1 recovered_own_sequence=1$",
+            "nested-recovery": "^XEFG_INLINE_NESTED_RECOVERY stage=Upscaled failed_inner_sr=1 recovered_own_sequence=1$"
+          } },
+        { "suite": "fg-native", "name": "xefg-present-handoff", "log": "xefg-present-handoff",
+          "receipt": "^PASS xefg-present-handoff evidence=WARP\\+MOCK passes=1 same_backbuffer=1 full_rgba=1$",
+          "existingTrace": true,
+          "scenarios": ["present-handoff", "ordinary-present-receipt", "ordinary-receipt-game-reset"],
+          "expect": {
             "present-handoff": "^PASS xefg-present-handoff evidence=WARP\\+MOCK passes=1 same_backbuffer=1 full_rgba=1$",
             "ordinary-present-receipt": "^PASS xefg-ordinary-present-receipt evidence=WARP\\+MOCK same_version=1 next_version=1 sdk_failure=1 late_end=1 distinct_output=1 hudless_conflict=1 no_sdk_finish=1$",
             "ordinary-receipt-game-reset": "^PASS xefg-ordinary-receipt-game-reset evidence=WARP\\+MOCK game_reset_delta=1 same_version_write=1 sdk_writes=0 next_version_reset=1$"

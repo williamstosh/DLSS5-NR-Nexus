@@ -199,7 +199,7 @@ inline void PrepareRuntime(ID3D12Device* device) noexcept {
   if (device == nullptr || HoldingRuntimeLock() || !Requested()) return;
   GuardHook([&] {
     renodx::utils::directx::NativeFromReShadeProxy(&device);
-    PrimeNgxLoaderSymbols(device, true);
+    PrimeNgxLoaderSymbols(device);
   });
 }
 
@@ -1498,11 +1498,15 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     ID3D12CommandQueue* queue = input.queue;
     renodx::utils::directx::NativeFromReShadeProxy(&queue);
     if (!InstallQueueCompletionHooks(queue)) return fg::Result::NOT_SERVED;
-    ID3D12Device* device = nullptr;
-    if (FAILED(queue->GetDevice(IID_PPV_ARGS(&device)))) return fg::Result::FAILED;
-    PrepareRuntime(device);
-    auto device_release = std::unique_ptr<ID3D12Device, void (*)(ID3D12Device*)>(device,
-        [](ID3D12Device* value) { value->Release(); });
+    Microsoft::WRL::ComPtr<ID3D12Device> submit_device;
+    if (FAILED(queue->GetDevice(IID_PPV_ARGS(&submit_device)))) return fg::Result::FAILED;
+    Microsoft::WRL::ComPtr<ID3D12Device> queue_recording_device;
+    if (input.recording_device == nullptr && input.queue != queue
+        && FAILED(input.queue->GetDevice(IID_PPV_ARGS(&queue_recording_device)))) {
+      observe("original_runtime_recording_face_unavailable");
+      return fg::Result::NOT_SERVED;
+    }
+    PrepareRuntime(submit_device.Get());
     const BridgeDeviceLock device_lock;
     const ngx_serial::PresentTurn turn(true);
     observe("ngx_turn_unavailable");
@@ -1513,39 +1517,32 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
       Retire();
       return fg::Result::NOT_SERVED;
     }
-    // The ordinary pool is shared by outputs. Close it only when the
-    // current Provider or device face must be replaced.
-    const bool replacing_provider = direct_device != nullptr && (direct_device != device || !direct_api.private_instance
-        || !parameter_runtime_ready || parameter_runtime_via_core.load(std::memory_order_relaxed));
-    if (replacing_provider && present_ring.device != nullptr && !ReleasePresentRing(true)) {
-      observe("ordinary_recordings_in_flight");
+    // The SDK submission queue can already have been unwrapped by its
+    // caller. Use the actual current recording object independently of it.
+    auto* device = BoundOriginalNrRecordingFace(submit_device.Get());
+    const char* face_source = "bound original runtime";
+    if (device == nullptr && input.recording_device != nullptr) {
+      device = input.recording_device;
+      face_source = "current SDK host object";
+    }
+    if (device == nullptr && queue_recording_device != nullptr) {
+      device = queue_recording_device.Get();
+      face_source = "SDK queue GetDevice";
+    }
+    if (device == nullptr) {
+      device = submit_device.Get();
+      face_source = "native SDK queue";
+    }
+    if (device != submit_device.Get() && !renodx::utils::directx::SameNativeObject(device, submit_device.Get())) {
+      observe("original_runtime_recording_face_mismatch");
       return fg::Result::NOT_SERVED;
     }
-    if (CanReuseActivePrivateRuntime(device) && bridge_pending_delivery_value == 0) {
+    auto* const recording_device = device;
+    if (bridge_pending_delivery_value == 0) {
       ReclaimCompletedBridgeRecordings();
-    } else {
-      // No extra wait for an unsupported target, device/face change, or a
-      // failed/unordered Bridge operation. This is a real instance adoption.
-      if (replacing_provider && direct_device == device && !direct_api.private_instance
-          && direct_load_state == DirectLoadState::Ready && parameter_runtime_ready
-          && direct_api.module != nullptr && !direct_api.borrowed_core_context
-          && !control_mask_use_core_context.load() && !direct_runtime_failed) {
-        const auto& loader = NgxLoaderView();
-        if (loader.native_ready && loader.native_api.module != nullptr && loader.native_api.module != direct_api.module
-            && loader.native_api.module != native_runtime_failed_instance) {
-          WaitForAcceptedOrdinaryBridgeTail(device, [&] {
-            return fg::xefg::TryClaimProviderBridgeTailWait(input, direct_api.module, loader.native_api.module);
-          });
-          if (!Requested() || !fg::xefg::ServiceWriteCurrent(input)) {
-            observe("write_permission_revoked");
-            return fg::Result::NOT_SERVED;
-          }
-        }
-      }
-      if (!RetireBridgeRecordings()) {
-        observe("bridge_recordings_in_flight");
-        return fg::Result::NOT_SERVED;
-      }
+    } else if (!RetireBridgeRecordings()) {
+      observe("bridge_recordings_in_flight");
+      return fg::Result::NOT_SERVED;
     }
     const std::array<submission::OutputUse, 2> colors{{
         {.resource = backbuffer_identity, .subresource = 0, .version = input.application_frame},
@@ -1595,6 +1592,11 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
       stream = {};
     }
     if (stream.device == nullptr) {
+      std::ostringstream message;
+      message << "XeFG NR recording device: source=" << face_source << ", face=" << device
+              << ", native submit device=" << submit_device.Get() << ", queue=" << queue
+              << ", context=" << input.context << ", epoch=" << input.epoch;
+      Log(reshade::log::level::info, message.str());
       stream.device = device;
       device->AddRef();
       stream.queue = queue;
@@ -1725,14 +1727,13 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
       }
     };
     const std::unique_ptr<Slot, decltype(cancel_recording)> cancellation(slot, cancel_recording);
-    // Switching providers requires closed, completed NR work. Adopt the
-    // private runtime before this frame adds uses to its open recording.
-    if (replacing_provider && (!Requested() || !fg::xefg::ServiceWriteCurrent(input))) {
-      observe("write_permission_revoked");
+    Microsoft::WRL::ComPtr<ID3D12Device> list_device;
+    if (FAILED(slot->list->GetDevice(IID_PPV_ARGS(&list_device))) || list_device.Get() != recording_device) {
+      observe("original_runtime_recording_face_mismatch");
       return stream.result;
     }
     auto decline = NrDeclineReason::kNrRuntimeUnavailable;
-    if (!EnsureDirectRuntime(slot->list, &decline, true)) {
+    if (!EnsureDirectRuntime(slot->list, &decline, false)) {
       present_prefg_attempts.fetch_add(1, std::memory_order_relaxed);
       CountNrDecline(decline);
       observe(decline == NrDeclineReason::kRuntimeSwitchPending ? "runtime_switch_pending" : "runtime_unavailable");
@@ -1753,7 +1754,7 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
       return stream.result;
     }
     PresentTarget target;
-    target.private_signed_runtime = true;
+    target.original_signed_runtime = true;
     SnapshotPresentRestoreConfiguration(&target);
     target.swapchain_identity = reinterpret_cast<uintptr_t>(input.swapchain);
     target.swapchain_format = input.backbuffer->GetDesc().Format;

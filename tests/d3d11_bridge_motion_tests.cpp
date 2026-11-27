@@ -1232,7 +1232,7 @@ int main(int argc, char** argv) {
             return result;
           };
 
-          // Only the provider API/model and public SDK returns are substituted. Ensure adopts two actual modules.
+          // An available second mock module must never be selected by the real Service.
           const auto fixture_path = native::AddonDirectory() / L"nexus-test-runtime-image.dll";
           // The addon detach callback may still use this module: retain it for the test process lifetime.
           static const HMODULE private_module = LoadLibraryW(fixture_path.c_str());
@@ -1244,6 +1244,7 @@ int main(int argc, char** argv) {
             uint64_t old_tail = 0;
             uint32_t old_releases = 0;
             uint32_t old_destroys = 0;
+            uint32_t original_inits = 0;
             uint32_t new_inits = 0;
             uint32_t private_shutdowns = 0;
             bool premature = false;
@@ -1268,7 +1269,10 @@ int main(int argc, char** argv) {
             return params::DestroyOwnedParameters(parameters);
           };
           symbols.init = +[](unsigned long long, const wchar_t*, ID3D12Device*, NVSDK_NGX_Version,
-                              const NVSDK_NGX_Parameter*) -> NVSDK_NGX_Result { return NVSDK_NGX_Result_Success; };
+                              const NVSDK_NGX_Parameter*) -> NVSDK_NGX_Result {
+            ++provider.original_inits;
+            return NVSDK_NGX_Result_Success;
+          };
           symbols.create = MotionCreateModel;
           symbols.evaluate = MotionEvaluateModel;
           symbols.release = +[](NVSDK_NGX_Handle* model) -> NVSDK_NGX_Result {
@@ -1347,26 +1351,11 @@ int main(int argc, char** argv) {
             Check(target != 0 && done != UINT64_MAX && done < target, "pending ordinary tail has finite true done below target");
           };
           const auto provider_events = [&] {
-            return std::array{provider.old_releases, provider.old_destroys, provider.new_inits, provider.private_shutdowns};
+            return std::array{provider.old_releases, provider.old_destroys, provider.original_inits, provider.new_inits, provider.private_shutdowns};
           };
-          const auto started_provider = [&](fg::Result result, const auto& before, uint64_t creates_before) {
-            Check(!provider.premature && provider.old_releases >= before[0] + 2
-                      && provider.old_destroys >= before[1] + 2 && provider.new_inits == before[2] + 1
-                      && provider.private_shutdowns == before[3] && native::direct_api.module == private_module
-                      && native::CanReuseActivePrivateRuntime(sdk_gpu.device.Get())
-                      && (result == fg::Result::PREPARED || result == fg::Result::SUBMITTED || model_created > creates_before)
-                      && native::fg_service::streams.contains(sdk_key),
-                "the same eligible SDK call starts actual provider-owned model preparation or color, after finite old done");
-          };
-          const auto return_to_ordinary = [&] {
-            Check(Hooks::Enable(sdk.handle, 0) == 0, "end current SDK ownership before selecting the ordinary provider");
-            const native::BridgeDeviceLock device_lock;
-            const renodx::addons::dlss5::ngx_serial::PresentTurn turn(true);
-            Check(turn.owns(), "isolated test provider reset owns NGX turn");
-            const renodx::addons::dlss5::RuntimeLock runtime_lock(native::runtime_mutex);
-            Check(native::RetireBridgeRecordings() && native::EnsureDirectRuntime(sdk_gpu.list.Get(), nullptr, false)
-                      && native::direct_api.module == module && !native::direct_api.private_instance,
-                "select the ordinary provider through the real lifecycle on a drained device");
+          const auto kept_original = [&] {
+            return !native::direct_api.private_instance && native::direct_api.module == module
+                && native::direct_device == sdk_gpu.device.Get();
           };
 
           {
@@ -1374,47 +1363,34 @@ int main(int argc, char** argv) {
             StallRelease handoff_release{.gate = handoff_gate.Get()};
             provider.old_tail = record_ordinary();
             check_pending(provider.old_tail);
-            using RegisterFence = HRESULT(STDMETHODCALLTYPE*)(ID3D12Fence*, UINT64, HANDLE);
-            static RegisterFence original_register = nullptr;
-            static HANDLE wait_armed = nullptr;
-            wait_armed = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            const auto close_armed = [](void* value) { if (value != nullptr) CloseHandle(value); };
-            std::unique_ptr<void, decltype(close_armed)> armed(wait_armed, close_armed);
-            Check(wait_armed != nullptr, "observe registration of the exact production tail wait");
-            renodx::utils::vtable::Slot<RegisterFence> register_slot{
-                .object = native::bridge.fence_done12, .index = 9, .original = &original_register,
-                .replacement = [](ID3D12Fence* fence, UINT64 value, HANDLE event) -> HRESULT {
-                  const auto hr = original_register(fence, value, event);
-                  if (SUCCEEDED(hr) && fence == native::bridge.fence_done12 && value == provider.old_tail
-                      && event == native::bridge.completion_event) SetEvent(wait_armed);
-                  return hr;
-                }};
-            renodx::utils::vtable::Install(&register_slot);
-            const auto restore_register = [](auto* value) { renodx::utils::vtable::Uninstall(value); };
-            std::unique_ptr<decltype(register_slot), decltype(restore_register)> observed(&register_slot, restore_register);
-            bool armed_while_pending = false;
-            HRESULT release_result = E_FAIL;
-            std::jthread release_after_arm([&] {
-              const auto status = WaitForSingleObject(wait_armed, 300);
-              const auto done = native::bridge.fence_done12->GetCompletedValue();
-              armed_while_pending = status == WAIT_OBJECT_0 && done != UINT64_MAX && done < provider.old_tail;
-              release_result = handoff_gate->Signal(1);
-            });
+            const auto& slot = native::bridge.ring[provider.old_tail % native::kBridgeRing];
+            const auto recording = submission::RecordingIdentity(slot.list);
+            const auto& old_feature = native::features.at(stream.Handle()).slots;
+            const std::array handles{old_feature[0].handle, old_feature[1].handle};
+            const std::array blocks{old_feature[0].parameters, old_feature[1].parameters};
             const auto before = provider_events();
             const auto waits = native::bridge_completion_waits;
-            const auto creates = model_created;
             Check(Hooks::Enable(sdk.handle, 1) == 0, "cold SDK ownership enable");
             const auto result = present_sdk(false);
-            release_after_arm.join();
-            observed.reset();
-            Check(armed_while_pending && SUCCEEDED(release_result) && native::bridge_completion_waits == waits + 1,
-                "first cold change waited once on genuine pending completion and unblocked inside this call");
+            check_pending(provider.old_tail);
+            Check((result == fg::Result::PREPARED || result == fg::Result::SUBMITTED)
+                      && native::fg_service::streams.contains(sdk_key)
+                      && kept_original() && !provider.premature && provider_events() == before
+                      && native::bridge_completion_waits == waits && slot.value == provider.old_tail
+                      && submission::RecordingIdentity(slot.list) == recording
+                      && old_feature[0].handle == handles[0] && old_feature[0].parameters == blocks[0]
+                      && old_feature[1].handle == handles[1] && old_feature[1].parameters == blocks[1],
+                "a cold SDK call uses the original provider with no wait and retains both pending Bridge models");
+            Check(SUCCEEDED(handoff_gate->Signal(1)), "only unblock the held originating queue");
             handoff_release.gate = nullptr;
-            started_provider(result, before, creates);
-            provider.old_tail = 0;
+            WaitForGpu(native::bridge.fence_done12, provider.old_tail);
             WaitForGpu(sdk_color_ready12.Get(), ready_value);
             wait_sdk();
-            std::cout << "BRIDGE_XEFG_PREQUEUE_HANDOFF phase=cold_ready waits=1 initialized=1 real_done=1 same_call=1\n";
+            Check(kept_original() && !provider.premature && provider_events() == before,
+                "finite original completion neither initializes nor shuts down another provider");
+            provider.old_tail = 0;
+            std::cout << "BRIDGE_XEFG_PREQUEUE_HANDOFF phase=cold_original waits=0 new_init=0 old_pending=1"
+                         " handles_retained=1 true_done=1\n";
           }
 
           const auto warm_sdk = [&] {
@@ -1470,8 +1446,8 @@ int main(int argc, char** argv) {
                       && submission::RecordingIdentity(old_slot.list) == old_recording
                       && model_observations[ordinary_model].id != model_observations[new_model].id
                       && model_observations[ordinary_model + 1].id != model_observations[new_model + 1].id
-                      && provider_events() == before && native::bridge_completion_waits == waits,
-                "real SDK work was enqueued, not yet read; old recording and separate models are retained without a CPU wait");
+                      && kept_original() && provider_events() == before && native::bridge_completion_waits == waits,
+                 "real SDK work was enqueued, not yet read; old recording and separate models are retained without a CPU wait");
             Check(SUCCEEDED(handoff_gate->Signal(1)), "only release the held queue, never signal done");
             handoff_release.gate = nullptr;
             const auto first_sdk_pixels = read_sdk();
@@ -1483,53 +1459,8 @@ int main(int argc, char** argv) {
             std::cout << "BRIDGE_XEFG_PREQUEUE_HANDOFF phase=same_provider waits=0 old_pending=1 sdk_submitted=1 first_pixels=1 passes=2,2\n";
           }
 
-          return_to_ordinary();
-          Check(Hooks::Destroy(sdk.handle) == 0, "new cold test starts from a fresh SDK epoch");
-          sdk.registered = false;
-          open_sdk();
-          model_stamps = old_bridge_stamps;
-          (void)warm_ordinary();
-          seed_sdk();
-          {
-            const auto handoff_gate = new_gate();
-            StallRelease handoff_release{.gate = handoff_gate.Get()};
-            provider.old_tail = record_ordinary();
-            check_pending(provider.old_tail);
-            const auto before = provider_events();
-            const auto waits = native::bridge_completion_waits;
-            const auto old_calls = model_calls;
-            const auto& old_slots = native::features.at(stream.Handle()).slots;
-            const std::array old_models{old_slots[0].handle, old_slots[1].handle};
-            const std::array old_parameters{old_slots[0].parameters, old_slots[1].parameters};
-            Check(Hooks::Enable(sdk.handle, 1) == 0 && present_sdk(false) == fg::Result::NOT_SERVED,
-                "timeout leaves independently valid SDK work unserved without replacing the provider");
-            check_pending(provider.old_tail);
-            Check(provider_events() == before && model_calls == old_calls && native::bridge_completion_waits == waits + 1,
-                "exactly one timeout retains all old provider objects without new Init");
-            const auto first_tail = provider.old_tail;
-            provider.old_tail = record_ordinary();
-            Check(provider.old_tail == first_tail + 1, "a later ordinary frame advanced the same outgoing tail");
-            const auto calls_after_ordinary = model_calls;
-            Check(present_sdk(false) == fg::Result::NOT_SERVED, "retry with the same SDK owner and a new tail polls");
-            check_pending(provider.old_tail);
-            Check(provider_events() == before && model_calls == calls_after_ordinary
-                      && native::bridge_completion_waits == waits + 1 && native::direct_api.module == module
-                      && old_slots[0].handle == old_models[0] && old_slots[0].parameters == old_parameters[0]
-                      && old_slots[1].handle == old_models[1] && old_slots[1].parameters == old_parameters[1],
-                "timeout retry never waits again, and retains both exact old handles");
-            Check(SUCCEEDED(handoff_gate->Signal(1)), "release the real timed-out queue");
-            handoff_release.gate = nullptr;
-            WaitForGpu(native::bridge.fence_done12, provider.old_tail);
-            WaitForGpu(sdk_color_ready12.Get(), ready_value);
-            const auto creates = model_created;
-            const auto result = present_sdk(false);
-            started_provider(result, before, creates);
-            Check(native::bridge_completion_waits == waits + 1, "finite completion switches once without another CPU wait");
-            provider.old_tail = 0;
-            wait_sdk();
-            std::cout << "BRIDGE_XEFG_PREQUEUE_HANDOFF phase=cold_timeout waits=1,1,1 old_lifetime=retained retry_tail=advanced initialized=1\n";
-          }
-          return_to_ordinary();
+          Check(Hooks::Enable(sdk.handle, 0) == 0 && kept_original(),
+              "end SDK ownership without adopting another runtime");
           native::bridge_force_snippet.store(old_snippet);
         }
         Check(native::bridge_timeouts.load() == timeouts_before, "all short gates released before the watchdog");

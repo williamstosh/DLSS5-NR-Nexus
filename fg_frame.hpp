@@ -77,6 +77,9 @@ struct FrameInput {
   // PresentFrame; it is never exposed to the SDK or used for routing.
   uintptr_t diagnostic_context = 0;
   output_framerate::OutputIdentity output;
+  // Borrowed from this SDK context or its accepted current tag while Service
+  // runs. This is the face for recording resources, not for queue submission.
+  ID3D12Device* recording_device = nullptr;
 };
 
 using Service = Result (*)(const FrameInput&) noexcept;

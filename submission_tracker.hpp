@@ -626,13 +626,16 @@ inline std::pair<uint64_t, uint64_t> RecordingIdentity(ID3D12CommandList* list) 
   return {identity, state.current};
 }
 
-inline std::shared_ptr<RecordingStatus> ObserveRecording(ID3D12CommandList* list) {
+inline std::shared_ptr<RecordingStatus> ObserveRecording(ID3D12CommandList* list, RecordingOwner* owner = nullptr) {
   if (list == nullptr) return {};
   std::lock_guard lock(tracker_mutex);
   const auto identity = ListIdentity(list, true);
   auto& state = tracked_lists[identity];
   state.current_observed = true;
   auto& generation = state.generations[state.current];
+  if (owner != nullptr) {
+    *owner = generation.owner;
+  }
   if (generation.status == nullptr) {
     generation.status = std::make_shared<RecordingStatus>();
     generation.status->list = identity;
@@ -784,6 +787,25 @@ inline SubmissionFact ReadSubmission(const GenerationSubmission& submission) {
                       : completed >= submission.value ? SubmissionProofState::kComplete
                                                       : SubmissionProofState::kInFlight);
   return {.state = state, .fence = submission.fence, .value = submission.value, .completed_value = completed};
+}
+
+// The exact observed generation, not a later replay or another frame, is
+// sufficient evidence of submission. Do not wait for its fence here.
+inline bool FirstHealthyUse(const RecordingStatus& status, const void* use) {
+  std::lock_guard lock(tracker_mutex);
+  if (!status.submitted.load() || !status.commands_closed.load()) return false;
+  if (status.completed_healthy && status.completed_submission_count == 1
+      && std::ranges::find(status.completed_uses, use) != status.completed_uses.end()) return true;
+  const auto list = tracked_lists.find(status.list);
+  if (list == tracked_lists.end()) return false;
+  const auto recording = list->second.generations.find(status.generation);
+  if (recording == list->second.generations.end()) return false;
+  const auto& data = recording->second;
+  if (data.first_execute == 0 || data.unreserved_submissions != 0
+      || data.first_submission_index >= data.submissions.size()
+      || std::ranges::find(data.uses, use) == data.uses.end()) return false;
+  const auto first = ReadSubmission(data.submissions[data.first_submission_index]);
+  return first.state == SubmissionProofState::kInFlight || first.state == SubmissionProofState::kComplete;
 }
 
 // Pending takes precedence over replayable. When requested, keep every

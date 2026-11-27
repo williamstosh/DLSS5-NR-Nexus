@@ -70,6 +70,28 @@ native::DirectEvaluateFn native_runtime_evaluate = nullptr;
 native::DirectEvaluateFn native_runtime_private_evaluate = nullptr;
 std::vector<NativeRuntimeEvaluation> native_runtime_evaluations;
 std::vector<NVSDK_NGX_Result> native_runtime_evaluation_results;
+
+#if defined(NR_NEXUS_TEST_NATIVE_NGX)
+// The contract is mature only after both real model creations were submitted.
+// A delivery status alone can also describe the released partial-stack path.
+uint32_t LiveWarmFixturePassMask(const NVSDK_NGX_Handle* handle) {
+  const renodx::addons::dlss5::RuntimeLock lock(native::runtime_mutex);
+  const auto feature = native::features.find(handle);
+  if (feature == native::features.end()) return 0;
+  uint32_t mask = 0;
+  for (size_t pass = 0; pass < native::kMaxNrPasses; ++pass) {
+    const auto& slot = feature->second.slots[pass];
+    if (slot.handle != nullptr && !slot.failed
+        && (slot.creation_completed
+            || (slot.creation_recording != nullptr
+                && submission::FirstHealthyUse(*slot.creation_recording, slot.handle)))) {
+      mask |= 1u << pass;
+    }
+  }
+  return mask;
+}
+#endif
+
 constexpr auto NATIVE_INPUT_STATE = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 using BarrierFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
 BarrierFn real_barrier = nullptr;
@@ -207,8 +229,14 @@ int RunNativeOptionsResumeTest(bool delayed_options = false);
 void ResizeNativeTestOutput(Gpu& gpu, IDXGISwapChain3* output, ID3D12Resource* old_input);
 int RunNativeGuideContractTest();
 int RunPresentGuideModelsTest(bool native_ngx = false, const char* project_id_path = nullptr, bool handoff_only = false,
-                              bool ordinary_signal_loss_only = false, bool bridge_shared_provider = false);
+                              bool ordinary_signal_loss_only = false, bool bridge_shared_provider = false,
+                              bool bridge_original_warm = false, bool legacy_private_checks = false,
+                              bool bridge_fg_first = false);
 int RunNativePresentDecisionTest();
+#if defined(NR_NEXUS_TEST_NATIVE_NGX)
+// The case needs the real helper bodies that follow the test main.
+namespace original_warm_proxy_cases { int Run(const char* project_id_path, bool completion_only = false); }
+#endif
 int RunNrEditReusePresentContracts(const char* project_id_path, bool diagnostic_only = false);
 // Case bodies follow the Present fixture that supplies their shared Runtime.
 namespace adaptive_resource_strategy_cases {
@@ -780,7 +808,10 @@ static std::filesystem::path present_fixture_ini;
 
 #include "late_bridge_present_cases.hpp"
 
+namespace core_parameter_family_cases { int Run(); }
+
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--core-parameter-family") == 0) return core_parameter_family_cases::Run();
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-status") == 0) return adaptive_status_cases::Run();
   const auto run_edit_reuse_case = [argv](auto run, const char* evidence = "WARP+MOCK") {
     const int result = run();
@@ -905,9 +936,25 @@ int main(int argc, char** argv) {
   if (argc == 3 && std::strcmp(argv[1], "--bridge-xefg-private-provider") == 0) {
     return RunPresentGuideModelsTest(true, argv[2], false, false, true);
   }
+  if (argc == 3 && std::strcmp(argv[1], "--original-proxy-warm") == 0) {
+    return original_warm_proxy_cases::Run(argv[2]);
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--original-proxy-present-guide-completion") == 0) {
+    return original_warm_proxy_cases::Run(argv[2], true);
+  }
+  if ((argc == 2 || argc == 3) && std::strcmp(argv[1], "--bridge-xefg-original-warm") == 0) {
+    return RunPresentGuideModelsTest(true, nullptr, false, false, false, true);
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bridge-xefg-original-fg-first") == 0) {
+    return RunPresentGuideModelsTest(true, nullptr, false, false, false, true, false, true);
+  }
 #else
   if (argc >= 2 && (std::strncmp(argv[1], "--control-mask-native-ngx", 25) == 0
                     || std::strcmp(argv[1], "--bridge-xefg-private-provider") == 0
+                    || std::strcmp(argv[1], "--bridge-xefg-original-warm") == 0
+                    || std::strcmp(argv[1], "--bridge-xefg-original-fg-first") == 0
+                    || std::strcmp(argv[1], "--original-proxy-warm") == 0
+                    || std::strcmp(argv[1], "--original-proxy-present-guide-completion") == 0
                     || std::strcmp(argv[1], "--nr-edit-reuse-history") == 0
                     || std::strcmp(argv[1], "--nr-edit-reuse-jitter") == 0
                     || std::strcmp(argv[1], "--nr-edit-reuse-cache") == 0
@@ -1128,6 +1175,9 @@ int main(int argc, char** argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--native-guide-contract") == 0) return RunNativeGuideContractTest();
   if (argc == 2 && std::strcmp(argv[1], "--present-guide-models") == 0) return RunPresentGuideModelsTest();
+  if (argc == 2 && std::strcmp(argv[1], "--present-guide-models-legacy-private") == 0) {
+    return RunPresentGuideModelsTest(false, nullptr, false, false, false, false, true);
+  }
   if (argc == 2 && std::strcmp(argv[1], "--xefg-present-handoff") == 0) {
     return run_edit_reuse_case([] { return RunPresentGuideModelsTest(false, nullptr, true); });
   }
@@ -4629,9 +4679,16 @@ void ResizeNativeTestOutput(Gpu& gpu, IDXGISwapChain3* output, ID3D12Resource* o
 #include "xefg_inline_handoff_cases.hpp"
 #include "xefg_present_handoff_cases.hpp"
 #include "bridge_xefg_provider_cases.hpp"
+#include "bridge_xefg_warm_cases.hpp"
 
-int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool handoff_only, bool ordinary_signal_loss_only, bool bridge_shared_provider) {
+int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool handoff_only,
+                              bool ordinary_signal_loss_only, bool bridge_shared_provider,
+                              bool bridge_original_warm, bool legacy_private_checks, bool bridge_fg_first) {
   try {
+#if !defined(NR_NEXUS_TEST_NATIVE_NGX)
+    (void)bridge_fg_first;
+#endif
+    const bool r3_warp = !native_ngx && !handoff_only && !legacy_private_checks;
     const HMODULE test_module = GetModuleHandleW(nullptr);
     reshade::internal::get_reshade_module_handle(test_module);
     native::addon_module = test_module;
@@ -4642,7 +4699,7 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool
       RunPresentHandoffCaptureCases();
     }
 #endif
-    if (native_ngx) {
+    if (native_ngx && !bridge_original_warm) {
       Check(project_id_path != nullptr, "native FG ProjectID path");
     }
     Gpu gpu(native_ngx, native_ngx ? 960u : 8u, native_ngx ? 540u : 8u);
@@ -4660,7 +4717,7 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool
     native::codec_mode.store(0);
     native::transfer_strength.store(1.f);
     native::color_strength.store(1.f);
-    if (native_ngx) {
+    if (native_ngx && !bridge_original_warm) {
 #if defined(NR_NEXUS_TEST_NATIVE_NGX)
       native::PrimeNgxLoaderSymbols(gpu.device.Get());
       std::ifstream project_id_file(project_id_path);
@@ -4693,7 +4750,7 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool
 #else
       throw std::runtime_error("native NGX support was not compiled; provide -NativeNgxSdkLibraryDirectory");
 #endif
-    } else {
+    } else if (!native_ngx) {
       native::direct_api.module = GetModuleHandleW(nullptr);
       native::direct_api.create = CreateModel;
       native::direct_api.evaluate = EvaluateModel;
@@ -4796,6 +4853,29 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool
       gpu.Write(guides[i].Get(), 0);
       gpu.Transition(guides[i].Get(), D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
     }
+#if defined(NR_NEXUS_TEST_NATIVE_NGX)
+    if (native_ngx && bridge_original_warm) {
+      for (auto& guide : guides) {
+        gpu.Transition(guide.Get(), NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
+      }
+      submit();
+      adapter::modules[0].complete = true;
+      adapter::modules[0].real[0] = reinterpret_cast<void*>(&FakeInit);
+      adapter::modules[0].real[3] = reinterpret_cast<void*>(&FakeResource);
+      adapter::modules[0].real[4] = reinterpret_cast<void*>(&FakeConstants);
+      adapter::modules[0].real[5] = reinterpret_cast<void*>(&FakeId);
+      adapter::modules[0].real[6] = reinterpret_cast<void*>(+[](void*, uint32_t) -> int32_t { return 0; });
+      adapter::modules[0].real[8] = reinterpret_cast<void*>(+[](void*) -> int32_t { return 0; });
+      adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakePresent);
+      adapter::proxies[0].real[1] = reinterpret_cast<void*>(&FakePresent1);
+      xefg::Configure(&native::fg_service::Service, &native::fg_service::PrepareCapture,
+                      &native::fg_service::Retire, &native::fg_service::Requested,
+                      false, true, &native::fg_service::PrepareRuntime);
+      native::stack_passes.store(2);
+      bridge_xefg_warm_cases::Run(gpu, guides[3].Get(), guides[2].Get(), submit, wait_present_fence, bridge_fg_first);
+      return 0;
+    }
+#endif
     const bool saved_control_mask_enabled = native::control_mask_enabled.exchange(true);
     const uint32_t saved_control_mask_mode = native::control_mask_mode.exchange(native::kControlMaskDepthFar);
     const bool saved_control_mask_motion = native::control_mask_motion_enabled.exchange(true);
@@ -4887,374 +4967,533 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool
     native::RestoreNativePreFg(gpu.list.Get(), &fg_parameters, original_with_mask, true, fg_handle);
     submit();
 
-    if (!native_ngx) {
-      native::direct_api = {};
-      native::direct_api.private_instance = true;
-      native::direct_api.module = test_module;
-      native::direct_api.init = control_mask_gpu_cases::InitializeRuntime;
-      native::direct_api.create = CreateModel;
-      native::direct_api.evaluate = EvaluateModel;
-      native::direct_api.release = ReleaseModel;
-      native::direct_api.shutdown = control_mask_gpu_cases::ShutdownRuntime;
-      native::direct_load_state = native::DirectLoadState::Ready;
-      if (native::direct_device == nullptr) {
-        native::direct_device = gpu.device.Get();
-        native::direct_device->AddRef();
-      } else {
-        Check(native::direct_device == gpu.device.Get(), "XeFG mock runtime retains the test D3D12 device");
-      }
-      native::direct_device_native = gpu.device.Get();
-      native::parameter_runtime_ready = true;
-      native::parameter_runtime_via_core = false;
-      native::core_allocate_parameters = renodx::addons::dlss5::bridge::AllocateOwnedParameters;
-      native::core_destroy_parameters = renodx::addons::dlss5::bridge::DestroyOwnedParameters;
-      native::direct_runtime_requirements.file_version = "310.9.16.0";
-      native::ngx_loader_staging = {};
-      native::ngx_loader_staging.nr_ready = true;
-      native::ngx_loader_staging.nr_module = test_module;
-      native::ngx_loader_staging.init = native::direct_api.init;
-      native::ngx_loader_staging.create = CreateModel;
-      native::ngx_loader_staging.evaluate = EvaluateModel;
-      native::ngx_loader_staging.release = ReleaseModel;
-      native::ngx_loader_staging.shutdown = native::direct_api.shutdown;
-      native::ngx_loader_staging.native_ready = true;
-      native::ngx_loader_staging.native_api = native::direct_api;
-      native::ngx_loader_staging.nr_requirements = native::direct_runtime_requirements;
-      native::PublishNgxLoaderSymbols();
-    } else {
-      native::PrimeNgxLoaderSymbols(gpu.device.Get(), true);
-      const auto& symbols = native::NgxLoaderView();
-      Check(symbols.native_ready && symbols.native_api.private_instance
-                && symbols.native_api.module != symbols.nr_module && symbols.native_api.evaluate != nullptr,
-          "real XeFG service requires the actual isolated runtime image, without a model substitute");
-      native_runtime_private_evaluate = symbols.native_api.evaluate;
-      // Observe the real private call separately from the earlier Core calls.
-      native::ngx_loader_staging.native_api.evaluate = ObserveNativeRuntimeEvaluation;
-      native::PublishNgxLoaderSymbols();
-    }
-
-    adapter::modules[0].complete = true;
-    adapter::modules[0].real[0] = reinterpret_cast<void*>(&FakeInit);
-    adapter::modules[0].real[3] = reinterpret_cast<void*>(&FakeResource);
-    adapter::modules[0].real[4] = reinterpret_cast<void*>(&FakeConstants);
-    adapter::modules[0].real[5] = reinterpret_cast<void*>(&FakeId);
-    adapter::modules[0].real[6] = reinterpret_cast<void*>(+[](void*, uint32_t) -> int32_t { return 0; });
-    funnel_accounting_tests::Restore sdk_destroy_restore;
-    sdk_destroy_restore.Value(&adapter::modules[0].real[8]);
-    adapter::modules[0].real[8] = reinterpret_cast<void*>(+[](void*) -> int32_t { return 0; });
-    adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakePresent);
-    adapter::proxies[0].real[1] = reinterpret_cast<void*>(&FakePresent1);
-    xefg::Configure(&native::fg_service::Service, &Prepare, nullptr, &Requested);
-    if (handoff_only) {
-      native::RetirePresentStream(nullptr);
-      native::ForgetSourceHandleLocked(fg_handle);
-      native::DrainRetiredResources(true);
-      native::nr_adaptive_enabled = false;
-      native::codec_pipeline.incremental_preparation = false;
-      native::edit_reuse_enabled = false;
-      native::control_mask_enabled = false;
-      xefg_present_handoff_cases::Run(gpu, submit, wait_present_fence, ordinary_signal_loss_only);
-      return 0;
-    }
-    // Session::Tag declares COMMON. Finish these transitions before its
-    // private queue consumes the same guide and HUDless resources.
-    for (auto* resource : {hudless.Get(), guides[2].Get(), guides[3].Get()}) {
-      gpu.Transition(resource, NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
-    }
-    submit();
-    uintptr_t xefg_context = 0;
-    fg::Result xefg_result = fg::Result::NOT_SERVED;
-    nlohmann::json native_handoff;
-    {
-      Session xefg_session(&gpu);
-      xefg_session.context->ui_composition = false;
-      if (native_ngx) {
-        xefg_session.extent_left = 0;
-        xefg_session.extent_top = 0;
-        xefg_session.extent_width = width;
-        xefg_session.extent_height = height;
-        Check(Hooks::Enable(xefg_session.handle, 1) == 0 && xefg::Enabled(), "native handoff starts with SDK FG enabled");
-      }
-      xefg_context = reinterpret_cast<uintptr_t>(xefg_session.handle);
-      native::control_mask_enabled.store(false);
+    if (r3_warp) {
+      // Exercise the three real recording slots without borrowing a signed
+      // runtime or installing a stream in Service's authoritative map.
+      namespace service = native::fg_service;
+      service::Stream scratch{.device = gpu.device.Get(), .queue = gpu.queue.Get()};
+      scratch.device->AddRef();
+      scratch.queue->AddRef();
+      const auto release = [](service::Stream* stream) { service::Release(stream); };
+      const std::unique_ptr<service::Stream, decltype(release)> scratch_owner(&scratch, release);
+      const fg::FrameInput input{
+          .queue = gpu.queue.Get(), .backbuffer = color.Get(), .hudless = hudless.Get(), .depth = guides[3].Get(), .motion = guides[2].Get(), .backbuffer_state = NATIVE_INPUT_STATE, .hudless_state = NATIVE_INPUT_STATE, .depth_state = NATIVE_INPUT_STATE, .motion_state = NATIVE_INPUT_STATE, .color_width = width, .color_height = height, .guide_width = width, .guide_height = height, .init_flags = NVSDK_NGX_DLSS_Feature_Flags_DepthInverted, .fg_enabled = true};
+      native::PresentTarget target;
+      native::SnapshotPresentRestoreConfiguration(&target);
+      const auto record_slot = [&](service::Slot* slot, bool masked) {
+        native::control_mask_enabled.store(masked);
+        const renodx::addons::dlss5::ngx_serial::PresentTurn turn;
+        Check(turn.owns(), "WARP recording has the NR serial turn");
+        const renodx::addons::dlss5::RuntimeLock lock(native::runtime_mutex);
+        Check(service::BeginServiceRecording(&scratch, slot), "real XeFG recording-slot Begin/Reset on WARP");
+        Check(service::PrepareSurfaces(&scratch, slot, input, false, false), "real XeFG color-slot allocation on WARP");
+        for (auto* surface : slot->color) {
+          const auto desc = surface->GetDesc();
+          Check(desc.Width == width && desc.Height == height && desc.Format == color_format,
+                "both XeFG recording surfaces retain the actual input size and format");
+        }
+        std::array<native::NrRecording, 2> role_recordings;
+        bool ready = false;
+        {
+          const renodx::addons::dlss5::EvaluateChainScope chain;
+          service::Record(&scratch, slot, slot->list, input, target, &ready, &role_recordings, nullptr, false);
+        }
+        // Record does not publish either color or confer Service permission.
+        const auto status = submission::ObserveRecording(slot->list);
+        Check(status != nullptr && SUCCEEDED(slot->list->Close()) && status->commands_closed.load()
+                  && !status->closed.load() && !status->submitted.load(),
+              "WARP XeFG recording close is not submission and does not end replay eligibility");
+        ID3D12CommandList* lists[]{slot->list};
+        gpu.queue->ExecuteCommandLists(1, lists);
+        Check(SUCCEEDED(gpu.queue->Signal(gpu.fence.Get(), ++gpu.serial)), "WARP recording-slot actual queue Signal");
+        wait_present_fence(gpu.fence.Get(), gpu.serial);
+        Check(status->submitted.load() && !status->closed.load()
+                  && submission::DiscardOwnedRecording(slot->list, submission::RecordingOwner::kXeFg)
+                  && status->closed.load() && status->close_reason.load() == submission::CloseReason::kOwnerDiscarded,
+              "WARP queue completion and ending owned replay are separate facts");
+        native::PruneCompletedSubmissionUses();
+        return ready;
+      };
       native::control_mask_motion_enabled.store(false);
-      // Populate every private recording slot without a mask. A fast GPU
-      // otherwise keeps selecting slot 0 and misses the off -> on migration.
-      uint32_t warm_frame = 0;
-      for (uint32_t slot_index = 0; slot_index < 3; ++slot_index) {
-        bool warm = false;
-        for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8 && !warm; ++attempt) {
-          if (auto stream = native::fg_service::streams.find({false, xefg_context});
-              stream != native::fg_service::streams.end()) {
-            for (uint32_t skipped = 0; skipped < slot_index; ++skipped) {
-              stream->second.slots[skipped].quarantined = true;
-            }
-          }
-          const uint32_t present_id = 90u + warm_frame++;
-          xefg_session.Guides(present_id, guides[3].Get(), guides[2].Get());
-          xefg_session.Tag(present_id, HUDLESS, hudless.Get());
-          xefg_session.Present(present_id);
-          warm = xefg::CurrentResult() == fg::Result::SUBMITTED;
-          auto& stream = native::fg_service::streams.at({false, xefg_context});
-          wait_service_fence(stream);
-          for (auto& slot : stream.slots) {
-            slot.quarantined = false;
-          }
-          submit();
+      for (auto& slot : scratch.slots) {
+        bool ready = false;
+        for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8 && !ready; ++attempt) {
+          ready = record_slot(&slot, false);
         }
-        Check(warm, "XeFG mask-off frame populates each private recording slot");
+        Check(ready, "each of the three WARP recording slots warms both mask-off models");
       }
-      if (!native_ngx) {
-        namespace timers = renodx::addons::dlss5::gpu_timers;
-        const bool saved_timing = native::gpu_timers_enabled.load();
-        const bool saved_cost = native::cost_meter_enabled.load();
-        const auto saved_capture = timers::comparison_settings;
-        native::gpu_timers_enabled = false;
-        native::cost_meter_enabled = false;
-        timers::comparison_settings = native::comparison_ui::CaptureSettings;
-        timers::Poll(true, false);
-        const auto first_sequence = timers::internal::next_sequence + 1;
-        for (uint32_t frame = 0; frame < 2; ++frame) {
-          // Deterministically schedule the existing completion-only sampler;
-          // the real Service owns recording, submission, Reset and pruning.
-          native::stage_cost_sample_due_ns[2] = 0;
-          const uint32_t present_id = 10000u + frame;
-          xefg_session.Guides(present_id, guides[3].Get(), guides[2].Get());
-          xefg_session.Tag(present_id, HUDLESS, hudless.Get());
-          xefg_session.Present(present_id);
-          Check(xefg::CurrentResult() == fg::Result::SUBMITTED,
-                "completion-only XeFG fixture reaches the actual Service submission");
-          wait_service_fence(native::fg_service::streams.at({false, xefg_context}));
-          timers::Poll(true, false);
-          if (frame == 0) {
-            Check(!timers::execution_stats[2].valid || timers::execution_stats[2].sequence < first_sequence,
-                  "GPU completion alone cannot publish a still-replayable Service recording");
-          }
-        }
-        const auto& completed = timers::execution_stats[2];
-        std::cout << "XEFG_COMPLETION_PROOF timing=off source=Service/reset/prune state="
-                  << static_cast<unsigned>(completed.state) << " valid=" << completed.valid
-                  << " sequence=" << completed.sequence << " expected_at_least=" << first_sequence
-                  << " stage=" << completed.width << 'x' << completed.height
-                  << " pass=" << completed.passes[0].width << 'x' << completed.passes[0].height << '\n';
-        Check(completed.valid && completed.state == timers::SampleState::VALID
-                  && completed.sequence >= first_sequence
-                  && completed.width == width && completed.height == height
-                  && completed.passes[0].width == width && completed.passes[0].height == height
-                  && completed.total_us == 0 && completed.passes[0].total_us == 0
-                  && native::CurrentGpuSample(completed, timers::NowNs()),
-              "XeFG completed-list recycling preserves actual execution dimensions with both timing options off");
-        native::gpu_timers_enabled = saved_timing;
-        native::cost_meter_enabled = saved_cost;
-        timers::comparison_settings = saved_capture;
-      }
-      native::control_mask_enabled.store(true);
-      for (uint32_t frame = 0; frame < native::kContractDebounceFrames + 3
-           && xefg_result != fg::Result::SUBMITTED; ++frame) {
-        consumed_masks = {};
-        consumed_mask_count = 0;
-        native_runtime_evaluations.clear();
-        native_runtime_evaluation_results.clear();
-        const auto calls_before = model_calls;
-        if (!native_ngx) {
+      Check(scratch.slots.size() == 3 && scratch.slots[0].list != scratch.slots[1].list
+                && scratch.slots[0].list != scratch.slots[2].list
+                && scratch.slots[1].list != scratch.slots[2].list,
+            "all three slots actually use distinct GPU recording objects");
+      auto& reused = scratch.slots.front();
+      auto* const previous_list = reused.list;
+      for (const bool masked : {true, false}) {
+        uint32_t consecutive = 0;
+        for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 12 && consecutive < 6; ++attempt) {
+          consumed_mask_count = 0;
           model_parameter_observer = [&](const NVSDK_NGX_Handle* model, const NVSDK_NGX_Parameter* block) {
             if (consumed_mask_count >= consumed_masks.size()) return;
             consumed_masks[consumed_mask_count++] = {
-                .model = model,
-                .depth = native::GetD3D12Resource(block, "DLSSNR.Depth"),
-                .motion = native::GetD3D12Resource(block, "DLSSNR.MVec"),
-                .mask = native::GetD3D12Resource(block, "DLSSNR.ControlMask")};
+                .model = model, .depth = native::GetD3D12Resource(block, "DLSSNR.Depth"), .motion = native::GetD3D12Resource(block, "DLSSNR.MVec"), .mask = native::GetD3D12Resource(block, "DLSSNR.ControlMask")};
           };
-        }
-        const uint32_t present_id = 120u + frame;
-        xefg_session.Guides(present_id, guides[3].Get(), guides[2].Get());
-        xefg_session.Tag(present_id, HUDLESS, hudless.Get());
-        xefg_session.Present(present_id);
-        xefg_result = xefg::CurrentResult();
-        submit();
-        if (xefg_result != fg::Result::SUBMITTED) continue;
-
-        if (native_ngx) {
-          Check(native_runtime_evaluations.size() == 2
-                    && native_runtime_evaluation_results.size() == native_runtime_evaluations.size()
-                    && std::all_of(native_runtime_evaluation_results.begin(), native_runtime_evaluation_results.end(),
-                        [](NVSDK_NGX_Result result) { return NVSDK_NGX_SUCCEED(result); }),
-                "real NGX Core successfully evaluates both XeFG color roles");
-        } else {
-          Check(model_calls == calls_before + 2 && consumed_mask_count == consumed_masks.size(),
-              "mock NGX evaluates both XeFG color roles");
-        }
-        const auto& stream = native::fg_service::streams.at({false, xefg_context});
-        if (native_ngx) wait_service_fence(stream);
-        for (const auto& role : stream.roles) {
-          const auto model = native::features.at(role.Handle()).slots[0].handle;
-          if (native_ngx) {
-            const auto observed = std::find_if(native_runtime_evaluations.begin(), native_runtime_evaluations.end(),
-                [model](const NativeRuntimeEvaluation& entry) { return entry.model == model; });
-            Check(model != nullptr && observed != native_runtime_evaluations.end()
-                      && observed->depth == guides[3].Get() && observed->motion == guides[2].Get()
-                      && observed->mask != nullptr,
-                "real NGX XeFG Backbuffer/HUDLess role consumes paired guides and its ControlMask");
-          } else {
-            const auto observed = std::find_if(consumed_masks.begin(), consumed_masks.end(),
-                [model](const ConsumedMask& entry) { return entry.model == model; });
-            Check(model != nullptr && observed != consumed_masks.end()
-                      && observed->depth == guides[3].Get() && observed->motion == guides[2].Get()
-                      && observed->mask != nullptr,
-                "mock NGX XeFG Backbuffer/HUDLess role consumes paired guides and its ControlMask");
+          const auto calls = model_calls;
+          const bool ready = record_slot(&reused, masked);
+          model_parameter_observer = {};
+          if (!ready) {
+            consecutive = 0;
+            continue;
           }
+          Check(model_calls == calls + 2 && consumed_mask_count == consumed_masks.size()
+                    && consumed_masks[0].model != consumed_masks[1].model
+                    && std::ranges::all_of(consumed_masks, [&](const auto& call) {
+                         return call.depth == input.depth && call.motion == input.motion
+                                && (call.mask != nullptr) == masked;
+                       })
+                    && (!masked || consumed_masks[0].mask != consumed_masks[1].mask),
+                "WARP records the two role models with actual paired guides and distinct enabled masks");
+          ++consecutive;
         }
-        if (native_ngx) {
-          Check(native_runtime_evaluations[0].mask != native_runtime_evaluations[1].mask,
-                "XeFG real NGX roles receive distinct ControlMask images");
-        } else {
-          Check(consumed_masks[0].mask != consumed_masks[1].mask,
-                "XeFG mock NGX roles receive distinct ControlMask images");
-        }
+        Check(consecutive == 6 && reused.list == previous_list,
+              "mask-on and restored mask-off each record six consecutive frames in the same completed slot");
       }
-      model_parameter_observer = {};
-      Check(xefg_result == fg::Result::SUBMITTED,
-          "XeFG adapter reaches a submitted ControlMask frame with both colors");
-      for (const bool masked : {true, false}) {
-        native::control_mask_enabled.store(masked);
-        uint32_t consecutive = 0;
-        for (uint32_t frame = 0; frame < native::kContractDebounceFrames + 12 && consecutive < 6; ++frame) {
-          const uint32_t present_id = (masked ? 180u : 220u) + frame;
+      std::cout << "PRESENT_GUIDE_WARP_SLOTS slots=3 sizes=exact roles=2 mask_on_off=6,6 recording=owned_submit_close_reuse\n";
+    }
+    if (r3_warp) {
+      // The scratch and mock native-FG recording tests have completed. Keep
+      // their unrelated worksets out of the two-owner SDK capacity check.
+      {
+        const renodx::addons::dlss5::RuntimeLock lock(native::runtime_mutex);
+        native::RetireAllWorksets();
+        native::FlushRetiredResources();
+      }
+      adapter::modules[0].complete = true;
+      adapter::modules[0].real[0] = reinterpret_cast<void*>(&FakeInit);
+      adapter::modules[0].real[3] = reinterpret_cast<void*>(&FakeResource);
+      adapter::modules[0].real[4] = reinterpret_cast<void*>(&FakeConstants);
+      adapter::modules[0].real[5] = reinterpret_cast<void*>(&FakeId);
+      adapter::modules[0].real[6] = reinterpret_cast<void*>(+[](void*, uint32_t) -> int32_t { return 0; });
+      adapter::modules[0].real[8] = reinterpret_cast<void*>(+[](void*) -> int32_t { return 0; });
+      adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakePresent);
+      adapter::proxies[0].real[1] = reinterpret_cast<void*>(&FakePresent1);
+      xefg::Configure(&native::fg_service::Service, &native::fg_service::PrepareCapture,
+                      &native::fg_service::Retire, &native::fg_service::Requested,
+                      false, true, &native::fg_service::PrepareRuntime);
+      for (auto* resource : {hudless.Get(), guides[2].Get(), guides[3].Get()}) {
+        gpu.Transition(resource, NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
+      }
+      submit();
+      Session session(&gpu);
+      session.context->ui_composition = false;
+      session.extent_left = session.extent_top = 0;
+      session.extent_width = width;
+      session.extent_height = height;
+      const auto stream_key = std::pair{false, reinterpret_cast<uintptr_t>(session.handle)};
+      const auto snapshot_calls = model_calls;
+      Check(Hooks::Enable(session.handle, 0) == 0 && !xefg::OwnsStream(),
+            "the production Service is reached through the public Off to On transition");
+      Check(!native::fg_service::streams.contains(stream_key)
+                && Hooks::Enable(session.handle, 1) == 0 && xefg::OwnsStream(),
+            "the valid SDK context does not require a separate lifetime owner");
+      bool submitted = false;
+      for (uint32_t id = 90; id < 90 + native::kContractDebounceFrames + 8 && !submitted; ++id) {
+        session.Guides(id, guides[3].Get(), guides[2].Get());
+        session.Tag(id, HUDLESS, hudless.Get());
+        const auto before = model_calls;
+        session.Present(id);
+        const auto found = native::fg_service::streams.find(stream_key);
+        if (found != native::fg_service::streams.end()) {
+          wait_present_fence(found->second.fence, found->second.submitted);
+        }
+        submitted = xefg::CurrentResult() == fg::Result::SUBMITTED && model_calls > before;
+      }
+      Check(submitted && model_calls > snapshot_calls && native::fg_service::streams.contains(stream_key)
+                && !native::direct_api.private_instance && !native::NgxLoaderView().native_ready,
+            "Proxy/Service submits deterministic model work on WARP without adopting a private image");
+      {
+        ComPtr<ID3D12Resource> backbuffer;
+        Check(SUCCEEDED(session.proxy->GetBuffer(session.proxy->GetCurrentBackBufferIndex(),
+                                                 IID_PPV_ARGS(&backbuffer))), "same-runtime inline handoff backbuffer");
+        xefg_inline_handoff_cases::Run(gpu, session, backbuffer.Get(), guides[3].Get(), guides[2].Get(),
+                                       submit, wait_present_fence);
+      }
+      Check(Hooks::Enable(session.handle, 0) == 0 && !xefg::OwnsStream(),
+            "ordinary Present can own delivery again after public XeFG Disable");
+      session.CloseSdk();
+      for (auto* resource : {hudless.Get(), guides[2].Get(), guides[3].Get()}) {
+        gpu.Transition(resource, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
+      }
+      submit();
+      std::cout << "PRESENT_GUIDE_SERVICE_WARP valid_guides=1 result=SUBMITTED model=MOCK owner_gate=none private_image=0\n";
+    } else {
+      if (!native_ngx) {
+        native::direct_api = {};
+        native::direct_api.private_instance = true;
+        native::direct_api.module = test_module;
+        native::direct_api.init = control_mask_gpu_cases::InitializeRuntime;
+        native::direct_api.create = CreateModel;
+        native::direct_api.evaluate = EvaluateModel;
+        native::direct_api.release = ReleaseModel;
+        native::direct_api.shutdown = control_mask_gpu_cases::ShutdownRuntime;
+        native::direct_load_state = native::DirectLoadState::Ready;
+        if (native::direct_device == nullptr) {
+          native::direct_device = gpu.device.Get();
+          native::direct_device->AddRef();
+        } else {
+          Check(native::direct_device == gpu.device.Get(), "XeFG mock runtime retains the test D3D12 device");
+        }
+        native::direct_device_native = gpu.device.Get();
+        native::parameter_runtime_ready = true;
+        native::parameter_runtime_via_core = false;
+        native::core_allocate_parameters = renodx::addons::dlss5::bridge::AllocateOwnedParameters;
+        native::core_destroy_parameters = renodx::addons::dlss5::bridge::DestroyOwnedParameters;
+        native::direct_runtime_requirements.file_version = "310.9.16.0";
+        native::ngx_loader_staging = {};
+        native::ngx_loader_staging.nr_ready = true;
+        native::ngx_loader_staging.nr_module = test_module;
+        native::ngx_loader_staging.init = native::direct_api.init;
+        native::ngx_loader_staging.create = CreateModel;
+        native::ngx_loader_staging.evaluate = EvaluateModel;
+        native::ngx_loader_staging.release = ReleaseModel;
+        native::ngx_loader_staging.shutdown = native::direct_api.shutdown;
+        native::ngx_loader_staging.native_ready = true;
+        native::ngx_loader_staging.native_api = native::direct_api;
+        native::ngx_loader_staging.nr_requirements = native::direct_runtime_requirements;
+        native::PublishNgxLoaderSymbols();
+      } else {
+        native::PrimeNgxLoaderSymbols(gpu.device.Get(), true);
+        const auto& symbols = native::NgxLoaderView();
+        Check(symbols.native_ready && symbols.native_api.private_instance
+                  && symbols.native_api.module != symbols.nr_module && symbols.native_api.evaluate != nullptr,
+            "real XeFG service requires the actual isolated runtime image, without a model substitute");
+        native_runtime_private_evaluate = symbols.native_api.evaluate;
+        // Observe the real private call separately from the earlier Core calls.
+        native::ngx_loader_staging.native_api.evaluate = ObserveNativeRuntimeEvaluation;
+        native::PublishNgxLoaderSymbols();
+      }
+
+      adapter::modules[0].complete = true;
+      adapter::modules[0].real[0] = reinterpret_cast<void*>(&FakeInit);
+      adapter::modules[0].real[3] = reinterpret_cast<void*>(&FakeResource);
+      adapter::modules[0].real[4] = reinterpret_cast<void*>(&FakeConstants);
+      adapter::modules[0].real[5] = reinterpret_cast<void*>(&FakeId);
+      adapter::modules[0].real[6] = reinterpret_cast<void*>(+[](void*, uint32_t) -> int32_t { return 0; });
+      funnel_accounting_tests::Restore sdk_destroy_restore;
+      sdk_destroy_restore.Value(&adapter::modules[0].real[8]);
+      adapter::modules[0].real[8] = reinterpret_cast<void*>(+[](void*) -> int32_t { return 0; });
+      adapter::proxies[0].real[0] = reinterpret_cast<void*>(&FakePresent);
+      adapter::proxies[0].real[1] = reinterpret_cast<void*>(&FakePresent1);
+      xefg::Configure(&native::fg_service::Service, &Prepare, nullptr, &Requested);
+      if (handoff_only) {
+        native::RetirePresentStream(nullptr);
+        native::ForgetSourceHandleLocked(fg_handle);
+        native::DrainRetiredResources(true);
+        native::nr_adaptive_enabled = false;
+        native::codec_pipeline.incremental_preparation = false;
+        native::edit_reuse_enabled = false;
+        native::control_mask_enabled = false;
+        xefg_present_handoff_cases::Run(gpu, submit, wait_present_fence, ordinary_signal_loss_only);
+        return 0;
+      }
+      // Session::Tag declares COMMON. Finish these transitions before its
+      // private queue consumes the same guide and HUDless resources.
+      for (auto* resource : {hudless.Get(), guides[2].Get(), guides[3].Get()}) {
+        gpu.Transition(resource, NATIVE_INPUT_STATE, D3D12_RESOURCE_STATE_COMMON);
+      }
+      submit();
+      uintptr_t xefg_context = 0;
+      fg::Result xefg_result = fg::Result::NOT_SERVED;
+      nlohmann::json native_handoff;
+      {
+        Session xefg_session(&gpu);
+        xefg_session.context->ui_composition = false;
+        if (native_ngx) {
+          xefg_session.extent_left = 0;
+          xefg_session.extent_top = 0;
+          xefg_session.extent_width = width;
+          xefg_session.extent_height = height;
+          Check(Hooks::Enable(xefg_session.handle, 1) == 0 && xefg::Enabled(), "native handoff starts with SDK FG enabled");
+        }
+        xefg_context = reinterpret_cast<uintptr_t>(xefg_session.handle);
+        native::control_mask_enabled.store(false);
+        native::control_mask_motion_enabled.store(false);
+        // Populate every private recording slot without a mask. A fast GPU
+        // otherwise keeps selecting slot 0 and misses the off -> on migration.
+        uint32_t warm_frame = 0;
+        for (uint32_t slot_index = 0; slot_index < 3; ++slot_index) {
+          bool warm = false;
+          for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8 && !warm; ++attempt) {
+            if (auto stream = native::fg_service::streams.find({false, xefg_context});
+                stream != native::fg_service::streams.end()) {
+              for (uint32_t skipped = 0; skipped < slot_index; ++skipped) {
+                stream->second.slots[skipped].quarantined = true;
+              }
+            }
+            const uint32_t present_id = 90u + warm_frame++;
+            xefg_session.Guides(present_id, guides[3].Get(), guides[2].Get());
+            xefg_session.Tag(present_id, HUDLESS, hudless.Get());
+            xefg_session.Present(present_id);
+            warm = xefg::CurrentResult() == fg::Result::SUBMITTED;
+            auto& stream = native::fg_service::streams.at({false, xefg_context});
+            wait_service_fence(stream);
+            for (auto& slot : stream.slots) {
+              slot.quarantined = false;
+            }
+            submit();
+          }
+          Check(warm, "XeFG mask-off frame populates each private recording slot");
+        }
+        if (!native_ngx) {
+          namespace timers = renodx::addons::dlss5::gpu_timers;
+          const bool saved_timing = native::gpu_timers_enabled.load();
+          const bool saved_cost = native::cost_meter_enabled.load();
+          const auto saved_capture = timers::comparison_settings;
+          native::gpu_timers_enabled = false;
+          native::cost_meter_enabled = false;
+          timers::comparison_settings = native::comparison_ui::CaptureSettings;
+          timers::Poll(true, false);
+          const auto first_sequence = timers::internal::next_sequence + 1;
+          for (uint32_t frame = 0; frame < 2; ++frame) {
+            // Deterministically schedule the existing completion-only sampler;
+            // the real Service owns recording, submission, Reset and pruning.
+            native::stage_cost_sample_due_ns[2] = 0;
+            const uint32_t present_id = 10000u + frame;
+            xefg_session.Guides(present_id, guides[3].Get(), guides[2].Get());
+            xefg_session.Tag(present_id, HUDLESS, hudless.Get());
+            xefg_session.Present(present_id);
+            Check(xefg::CurrentResult() == fg::Result::SUBMITTED,
+                  "completion-only XeFG fixture reaches the actual Service submission");
+            wait_service_fence(native::fg_service::streams.at({false, xefg_context}));
+            timers::Poll(true, false);
+            if (frame == 0) {
+              Check(!timers::execution_stats[2].valid || timers::execution_stats[2].sequence < first_sequence,
+                    "GPU completion alone cannot publish a still-replayable Service recording");
+            }
+          }
+          const auto& completed = timers::execution_stats[2];
+          std::cout << "XEFG_COMPLETION_PROOF timing=off source=Service/reset/prune state="
+                    << static_cast<unsigned>(completed.state) << " valid=" << completed.valid
+                    << " sequence=" << completed.sequence << " expected_at_least=" << first_sequence
+                    << " stage=" << completed.width << 'x' << completed.height
+                    << " pass=" << completed.passes[0].width << 'x' << completed.passes[0].height << '\n';
+          Check(completed.valid && completed.state == timers::SampleState::VALID
+                    && completed.sequence >= first_sequence
+                    && completed.width == width && completed.height == height
+                    && completed.passes[0].width == width && completed.passes[0].height == height
+                    && completed.total_us == 0 && completed.passes[0].total_us == 0
+                    && native::CurrentGpuSample(completed, timers::NowNs()),
+                "XeFG completed-list recycling preserves actual execution dimensions with both timing options off");
+          native::gpu_timers_enabled = saved_timing;
+          native::cost_meter_enabled = saved_cost;
+          timers::comparison_settings = saved_capture;
+        }
+        native::control_mask_enabled.store(true);
+        for (uint32_t frame = 0; frame < native::kContractDebounceFrames + 3
+             && xefg_result != fg::Result::SUBMITTED; ++frame) {
+          consumed_masks = {};
+          consumed_mask_count = 0;
+          native_runtime_evaluations.clear();
+          native_runtime_evaluation_results.clear();
+          const auto calls_before = model_calls;
+          if (!native_ngx) {
+            model_parameter_observer = [&](const NVSDK_NGX_Handle* model, const NVSDK_NGX_Parameter* block) {
+              if (consumed_mask_count >= consumed_masks.size()) return;
+              consumed_masks[consumed_mask_count++] = {
+                  .model = model,
+                  .depth = native::GetD3D12Resource(block, "DLSSNR.Depth"),
+                  .motion = native::GetD3D12Resource(block, "DLSSNR.MVec"),
+                  .mask = native::GetD3D12Resource(block, "DLSSNR.ControlMask")};
+            };
+          }
+          const uint32_t present_id = 120u + frame;
           xefg_session.Guides(present_id, guides[3].Get(), guides[2].Get());
           xefg_session.Tag(present_id, HUDLESS, hudless.Get());
           xefg_session.Present(present_id);
-          consecutive = (xefg::CurrentResult() == fg::Result::SUBMITTED ? consecutive + 1 : 0);
-          wait_service_fence(native::fg_service::streams.at({false, xefg_context}));
+          xefg_result = xefg::CurrentResult();
           submit();
+          if (xefg_result != fg::Result::SUBMITTED) continue;
+
+          if (native_ngx) {
+            Check(native_runtime_evaluations.size() == 2
+                      && native_runtime_evaluation_results.size() == native_runtime_evaluations.size()
+                      && std::all_of(native_runtime_evaluation_results.begin(), native_runtime_evaluation_results.end(),
+                          [](NVSDK_NGX_Result result) { return NVSDK_NGX_SUCCEED(result); }),
+                  "real NGX Core successfully evaluates both XeFG color roles");
+          } else {
+            Check(model_calls == calls_before + 2 && consumed_mask_count == consumed_masks.size(),
+                "mock NGX evaluates both XeFG color roles");
+          }
+          const auto& stream = native::fg_service::streams.at({false, xefg_context});
+          if (native_ngx) wait_service_fence(stream);
+          for (const auto& role : stream.roles) {
+            const auto model = native::features.at(role.Handle()).slots[0].handle;
+            if (native_ngx) {
+              const auto observed = std::find_if(native_runtime_evaluations.begin(), native_runtime_evaluations.end(),
+                  [model](const NativeRuntimeEvaluation& entry) { return entry.model == model; });
+              Check(model != nullptr && observed != native_runtime_evaluations.end()
+                        && observed->depth == guides[3].Get() && observed->motion == guides[2].Get()
+                        && observed->mask != nullptr,
+                  "real NGX XeFG Backbuffer/HUDLess role consumes paired guides and its ControlMask");
+            } else {
+              const auto observed = std::find_if(consumed_masks.begin(), consumed_masks.end(),
+                  [model](const ConsumedMask& entry) { return entry.model == model; });
+              Check(model != nullptr && observed != consumed_masks.end()
+                        && observed->depth == guides[3].Get() && observed->motion == guides[2].Get()
+                        && observed->mask != nullptr,
+                  "mock NGX XeFG Backbuffer/HUDLess role consumes paired guides and its ControlMask");
+            }
+          }
+          if (native_ngx) {
+            Check(native_runtime_evaluations[0].mask != native_runtime_evaluations[1].mask,
+                  "XeFG real NGX roles receive distinct ControlMask images");
+          } else {
+            Check(consumed_masks[0].mask != consumed_masks[1].mask,
+                  "XeFG mock NGX roles receive distinct ControlMask images");
+          }
         }
-        Check(consecutive == 6, "XeFG mask-on and restored mask-off each sustain six submitted frames");
+        model_parameter_observer = {};
+        Check(xefg_result == fg::Result::SUBMITTED,
+            "XeFG adapter reaches a submitted ControlMask frame with both colors");
+        for (const bool masked : {true, false}) {
+          native::control_mask_enabled.store(masked);
+          uint32_t consecutive = 0;
+          for (uint32_t frame = 0; frame < native::kContractDebounceFrames + 12 && consecutive < 6; ++frame) {
+            const uint32_t present_id = (masked ? 180u : 220u) + frame;
+            xefg_session.Guides(present_id, guides[3].Get(), guides[2].Get());
+            xefg_session.Tag(present_id, HUDLESS, hudless.Get());
+            xefg_session.Present(present_id);
+            consecutive = (xefg::CurrentResult() == fg::Result::SUBMITTED ? consecutive + 1 : 0);
+            wait_service_fence(native::fg_service::streams.at({false, xefg_context}));
+            submit();
+          }
+          Check(consecutive == 6, "XeFG mask-on and restored mask-off each sustain six submitted frames");
+        }
+        std::cout << "CASE path=XeFG-service hot_toggle=off-on-off private_slots=3 motion=off"
+                     " sustained_submissions=6+6 completion=Fence\n";
+        if (native_ngx) {
+          xefg::Configure(&native::fg_service::Service, &Prepare, &native::fg_service::Retire,
+                          &native::fg_service::Requested);
+          funnel_accounting_tests::Restore symbol_restore;
+          symbol_restore.Value(&native::ngx_loader_staging.core_evaluate);
+          symbol_restore.Atomic(&native::ngx_loader_published);
+          native::ngx_loader_staging.core_evaluate = ObserveNativeRuntimeEvaluation;
+          native::PublishNgxLoaderSymbols();
+          Check(native::NgxLoaderView().core_evaluate == ObserveNativeRuntimeEvaluation
+                    && native::NgxLoaderView().native_api.evaluate == ObserveNativeRuntimeEvaluation,
+                "both published native providers retain their real Evaluate observers across adoption");
+          ComPtr<ID3D12Resource> backbuffer;
+          Check(SUCCEEDED(xefg_session.proxy->GetBuffer(xefg_session.proxy->GetCurrentBackBufferIndex(),
+                                                       IID_PPV_ARGS(&backbuffer))), "native handoff DXGI backbuffer");
+          xefg_inline_handoff_cases::Run(gpu, xefg_session, backbuffer.Get(), guides[3].Get(), guides[2].Get(),
+                                         submit, wait_present_fence, &native_handoff);
+        }
+        xefg_session.CloseSdk();
       }
-      std::cout << "CASE path=XeFG-service hot_toggle=off-on-off private_slots=3 motion=off"
-                   " sustained_submissions=6+6 completion=Fence\n";
-      if (native_ngx) {
-        xefg::Configure(&native::fg_service::Service, &Prepare, &native::fg_service::Retire,
-                        &native::fg_service::Requested);
-        funnel_accounting_tests::Restore symbol_restore;
-        symbol_restore.Value(&native::ngx_loader_staging.core_evaluate);
-        symbol_restore.Atomic(&native::ngx_loader_published);
-        native::ngx_loader_staging.core_evaluate = ObserveNativeRuntimeEvaluation;
-        native::PublishNgxLoaderSymbols();
-        Check(native::NgxLoaderView().core_evaluate == ObserveNativeRuntimeEvaluation
-                  && native::NgxLoaderView().native_api.evaluate == ObserveNativeRuntimeEvaluation,
-              "both published native providers retain their real Evaluate observers across adoption");
-        ComPtr<ID3D12Resource> backbuffer;
-        Check(SUCCEEDED(xefg_session.proxy->GetBuffer(xefg_session.proxy->GetCurrentBackBufferIndex(),
-                                                     IID_PPV_ARGS(&backbuffer))), "native handoff DXGI backbuffer");
-        xefg_inline_handoff_cases::Run(gpu, xefg_session, backbuffer.Get(), guides[3].Get(), guides[2].Get(),
-                                       submit, wait_present_fence, &native_handoff);
-      }
-      xefg_session.CloseSdk();
-    }
 #if defined(NR_NEXUS_TEST_NATIVE_NGX)
-    if (native_ngx && bridge_shared_provider) {
-      native::stack_passes.store(2);
-      bridge_xefg_provider_cases::Run(gpu, guides[3].Get(), guides[2].Get(), submit, wait_present_fence);
-      native::stack_passes.store(1);
-    }
+      if (native_ngx && bridge_shared_provider) {
+        native::stack_passes.store(2);
+        bridge_xefg_provider_cases::Run(gpu, guides[3].Get(), guides[2].Get(), submit, wait_present_fence);
+        native::stack_passes.store(1);
+      }
 #else
-    (void)bridge_shared_provider;
+      (void)bridge_shared_provider;
 #endif
-    xefg::Configure(&Service, &Prepare, nullptr, &Requested);
-    if (auto stream = native::fg_service::streams.find({false, xefg_context});
-        stream != native::fg_service::streams.end()) {
-      native::fg_service::Release(&stream->second);
-      native::fg_service::streams.erase(stream);
-    }
-    for (auto* resource : {hudless.Get(), guides[2].Get(), guides[3].Get()}) {
-      gpu.Transition(resource, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
-    }
-    submit();
-    std::cout << "CASE path=XeFG-service roles=Backbuffer+HUDLess evidence="
-              << (native_ngx ? "NATIVE_GPU+NATIVE_NGX+MOCK_XeFG" : "WARP+MOCK")
-              << " mask=bound+distinct" << std::endl;
-    if (native_ngx) {
-      native::core_evaluate_feature = native_runtime_evaluate;
-      native_runtime_evaluations.clear();
-      native_runtime_evaluation_results.clear();
-      native::RetirePresentStream(nullptr);
-      native::DrainRetiredResources(true);
-      Check(gpu.fence->GetCompletedValue() >= gpu.serial
-                && SUCCEEDED(gpu.device->GetDeviceRemovedReason()),
-            "native FG and XeFG ControlMask submissions complete on the GPU fence");
-      {
-        std::scoped_lock runtime_lock(native::runtime_mutex);
-        native::ReleaseFeatureStates();
-        native::RetireAllWorksets();
-        native::FlushRetiredResources();
-        Check(native::direct_device != nullptr && native::direct_api.shutdown != nullptr,
-              "native FG Runtime owns an initialized device and shutdown entry point");
-        renodx::addons::dlss5::DirectCallScope direct_call;
-        const auto shutdown = native::direct_api.shutdown(native::direct_device);
-        Check(NVSDK_NGX_SUCCEED(shutdown), "native FG Runtime shutdown");
-        native::direct_device->Release();
-        native::direct_device = nullptr;
-        native::direct_device_native = nullptr;
-        native::direct_api = {};
-        native::direct_load_state = native::DirectLoadState::Unknown;
-        native::parameter_runtime_ready = false;
-        native::parameter_runtime_via_core = false;
-        native::core_allocate_parameters = nullptr;
-        native::core_destroy_parameters = nullptr;
-        native::core_create_feature = nullptr;
-        native::core_evaluate_feature = nullptr;
-        native::core_release_feature = nullptr;
+      xefg::Configure(&Service, &Prepare, nullptr, &Requested);
+      if (auto stream = native::fg_service::streams.find({false, xefg_context});
+          stream != native::fg_service::streams.end()) {
+        native::fg_service::Release(&stream->second);
+        native::fg_service::streams.erase(stream);
       }
-      native::control_mask_enabled.store(saved_control_mask_enabled);
-      native::control_mask_mode.store(saved_control_mask_mode);
-      native::control_mask_motion_enabled.store(saved_control_mask_motion);
-      native::direct_runtime_requirements.file_version = saved_control_mask_runtime_version;
-      ComPtr<IDXGIAdapter3> memory_adapter;
-      DXGI_QUERY_VIDEO_MEMORY_INFO local_memory{};
-      auto memory_result = gpu.factory->EnumAdapterByLuid(gpu.device->GetAdapterLuid(), IID_PPV_ARGS(&memory_adapter));
-      if (SUCCEEDED(memory_result)) {
-        memory_result = memory_adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_memory);
+      for (auto* resource : {hudless.Get(), guides[2].Get(), guides[3].Get()}) {
+        gpu.Transition(resource, D3D12_RESOURCE_STATE_COMMON, NATIVE_INPUT_STATE);
       }
-      auto& memory_receipt = native_handoff["gpu_memory"];
-      memory_receipt["after_shutdown_query_hresult"] = static_cast<uint32_t>(memory_result);
-      memory_receipt["after_shutdown_local_bytes"] = nullptr;
-      if (SUCCEEDED(memory_result)) {
-        memory_receipt["after_shutdown_local_bytes"] = local_memory.CurrentUsage;
+      submit();
+      std::cout << "CASE path=XeFG-service roles=Backbuffer+HUDLess evidence="
+                << (native_ngx ? "NATIVE_GPU+NATIVE_NGX+MOCK_XeFG" : "WARP+MOCK")
+                << " mask=bound+distinct" << std::endl;
+      if (native_ngx) {
+        native::core_evaluate_feature = native_runtime_evaluate;
+        native_runtime_evaluations.clear();
+        native_runtime_evaluation_results.clear();
+        native::RetirePresentStream(nullptr);
+        native::DrainRetiredResources(true);
+        Check(gpu.fence->GetCompletedValue() >= gpu.serial
+                  && SUCCEEDED(gpu.device->GetDeviceRemovedReason()),
+              "native FG and XeFG ControlMask submissions complete on the GPU fence");
+        {
+          std::scoped_lock runtime_lock(native::runtime_mutex);
+          native::ReleaseFeatureStates();
+          native::RetireAllWorksets();
+          native::FlushRetiredResources();
+          Check(native::direct_device != nullptr && native::direct_api.shutdown != nullptr,
+                "native FG Runtime owns an initialized device and shutdown entry point");
+          renodx::addons::dlss5::DirectCallScope direct_call;
+          const auto shutdown = native::direct_api.shutdown(native::direct_device);
+          Check(NVSDK_NGX_SUCCEED(shutdown), "native FG Runtime shutdown");
+          native::direct_device->Release();
+          native::direct_device = nullptr;
+          native::direct_device_native = nullptr;
+          native::direct_api = {};
+          native::direct_load_state = native::DirectLoadState::Unknown;
+          native::parameter_runtime_ready = false;
+          native::parameter_runtime_via_core = false;
+          native::core_allocate_parameters = nullptr;
+          native::core_destroy_parameters = nullptr;
+          native::core_create_feature = nullptr;
+          native::core_evaluate_feature = nullptr;
+          native::core_release_feature = nullptr;
+        }
+        native::control_mask_enabled.store(saved_control_mask_enabled);
+        native::control_mask_mode.store(saved_control_mask_mode);
+        native::control_mask_motion_enabled.store(saved_control_mask_motion);
+        native::direct_runtime_requirements.file_version = saved_control_mask_runtime_version;
+        ComPtr<IDXGIAdapter3> memory_adapter;
+        DXGI_QUERY_VIDEO_MEMORY_INFO local_memory{};
+        auto memory_result = gpu.factory->EnumAdapterByLuid(gpu.device->GetAdapterLuid(), IID_PPV_ARGS(&memory_adapter));
+        if (SUCCEEDED(memory_result)) {
+          memory_result = memory_adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_memory);
+        }
+        auto& memory_receipt = native_handoff["gpu_memory"];
+        memory_receipt["after_shutdown_query_hresult"] = static_cast<uint32_t>(memory_result);
+        memory_receipt["after_shutdown_local_bytes"] = nullptr;
+        if (SUCCEEDED(memory_result)) {
+          memory_receipt["after_shutdown_local_bytes"] = local_memory.CurrentUsage;
+        }
+        size_t live_features = 0;
+        for (const auto& [_, feature] : native::features) {
+          live_features += std::ranges::count_if(feature.slots, [](const auto& slot) { return slot.handle != nullptr; });
+        }
+        memory_receipt["features_after_shutdown"] = {{"created", native::nr_features_created},
+            {"released", native::nr_features_released}, {"live", live_features}, {"retired", native::retired_nr_features.size()}};
+        uint64_t remaining_workset_bytes = 0;
+        for (const auto& [_, workset] : native::worksets) {
+          remaining_workset_bytes += workset.allocated_bytes;
+        }
+        for (const auto& retired : native::retired_final_resources) {
+          remaining_workset_bytes += retired.resources.allocated_bytes;
+        }
+        memory_receipt["worksets_after_shutdown"] = {{"created", native::worksets_created},
+            {"released", native::worksets_released}, {"live", native::worksets.size()},
+            {"retired", native::retired_final_resources.size()}, {"remaining_allocated_bytes", remaining_workset_bytes}};
+        std::ofstream receipt("xefg-inline-handoff-native.json");
+        receipt << native_handoff.dump(2) << '\n';
+        receipt.close();
+        Check(!receipt.fail(), "write the native XeFG inline handoff receipt");
+        std::cout << "PASS xefg-held-inline-handoff evidence=NATIVE_GPU+NATIVE_NGX+MOCK_XeFG"
+                     " stages=Present,Render,Present,Upscaled,Present\n";
+        std::cout << "PASS native FG ControlMask roles=Backbuffer+HUDLess "
+                     "evidence=NATIVE_GPU+NATIVE_NGX+MOCK_XeFG runtime=310.9.16.0" << std::endl;
+        model_gpu = nullptr;
+        return 0;
       }
-      size_t live_features = 0;
-      for (const auto& [_, feature] : native::features) {
-        live_features += std::ranges::count_if(feature.slots, [](const auto& slot) { return slot.handle != nullptr; });
-      }
-      memory_receipt["features_after_shutdown"] = {{"created", native::nr_features_created},
-          {"released", native::nr_features_released}, {"live", live_features}, {"retired", native::retired_nr_features.size()}};
-      uint64_t remaining_workset_bytes = 0;
-      for (const auto& [_, workset] : native::worksets) {
-        remaining_workset_bytes += workset.allocated_bytes;
-      }
-      for (const auto& retired : native::retired_final_resources) {
-        remaining_workset_bytes += retired.resources.allocated_bytes;
-      }
-      memory_receipt["worksets_after_shutdown"] = {{"created", native::worksets_created},
-          {"released", native::worksets_released}, {"live", native::worksets.size()},
-          {"retired", native::retired_final_resources.size()}, {"remaining_allocated_bytes", remaining_workset_bytes}};
-      std::ofstream receipt("xefg-inline-handoff-native.json");
-      receipt << native_handoff.dump(2) << '\n';
-      receipt.close();
-      Check(!receipt.fail(), "write the native XeFG inline handoff receipt");
-      std::cout << "PASS xefg-held-inline-handoff evidence=NATIVE_GPU+NATIVE_NGX+MOCK_XeFG"
-                   " stages=Present,Render,Present,Upscaled,Present\n";
-      std::cout << "PASS native FG ControlMask roles=Backbuffer+HUDLess "
-                   "evidence=NATIVE_GPU+NATIVE_NGX+MOCK_XeFG runtime=310.9.16.0" << std::endl;
-      model_gpu = nullptr;
-      return 0;
     }
     native::control_mask_enabled.store(saved_control_mask_enabled);
     native::control_mask_mode.store(saved_control_mask_mode);
     native::control_mask_motion_enabled.store(saved_control_mask_motion);
     native::direct_runtime_requirements.file_version = saved_control_mask_runtime_version;
     Check(native::EnsureDirectRuntime(gpu.list.Get(), nullptr, false),
-        "ordinary Present resumes after the completed private XeFG service retires its provider");
-    // The provider switch releases older models whose allocator addresses can
-    // be reused. Start this lifetime's release interval before creating models.
+          "ordinary Present can continue with its admitted runtime");
+    // Count only this lifetime: allocators can reuse older model addresses.
     const auto releases_before_final_models = model_released_handles.size();
     std::array<native::FeatureState, 2> contracts;
     for (size_t i = 0; i < contracts.size(); ++i) {
@@ -5442,6 +5681,24 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool
     native::ForgetSourceHandleLocked(fg_handle);
     std::cout << "PASS Present guide models: warm real/neutral contracts, 24 fresh GPU outputs, stable creates, "
                  "independent Reset and exact tracker retirement\n";
+    const auto check_d3d_errors = [&] {
+      if (info == nullptr) return;
+      for (UINT64 i = 0; i < info->GetNumStoredMessages(); ++i) {
+        SIZE_T bytes = 0;
+        info->GetMessage(i, nullptr, &bytes);
+        std::vector<uint8_t> storage(bytes);
+        auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+        Check(SUCCEEDED(info->GetMessage(i, message, &bytes)), "Present models debug message");
+        Check(message->Severity != D3D12_MESSAGE_SEVERITY_ERROR
+                  && message->Severity != D3D12_MESSAGE_SEVERITY_CORRUPTION, message->pDescription);
+      }
+    };
+    if (r3_warp) {
+      check_d3d_errors();
+      std::cout << "PASS present-guide-models evidence=WARP+MOCK real_neutral=warm slots=3 model_recording=actual_warp"
+                   " real_Service_submission=actual_warp original_provider=mock\n";
+      return 0;
+    }
     for (const bool via_core : {false, true}) {
       namespace addon = renodx::addons::dlss5;
       namespace providers = control_mask_gpu_cases;
@@ -5936,17 +6193,7 @@ int RunPresentGuideModelsTest(bool native_ngx, const char* project_id_path, bool
       session.CloseSdk();
     }
     xefg_present_handoff_cases::Run(gpu, submit, wait_present_fence);
-    if (info != nullptr) {
-      for (UINT64 i = 0; i < info->GetNumStoredMessages(); ++i) {
-        SIZE_T bytes = 0;
-        info->GetMessage(i, nullptr, &bytes);
-        std::vector<uint8_t> storage(bytes);
-        auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
-        Check(SUCCEEDED(info->GetMessage(i, message, &bytes)), "Present models debug message");
-        Check(message->Severity != D3D12_MESSAGE_SEVERITY_ERROR
-                  && message->Severity != D3D12_MESSAGE_SEVERITY_CORRUPTION, message->pDescription);
-      }
-    }
+    check_d3d_errors();
     std::cout << "PASS XeFG Present handoff providers=ordinary-image+Core real_guides+Optional-no-ID"
                  " passes=2 Service_owned_pending+external_replayable public_disable_restore"
                  " evidence=WARP+MOCK real_NGX=NOT_RUN\n";
@@ -6423,3 +6670,7 @@ int RunNativePresentDecisionTest() {
     return 1;
   }
 }
+
+#include "core_parameter_family_cases.hpp"
+
+#include "original_warm_proxy_cases.hpp"

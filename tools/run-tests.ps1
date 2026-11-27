@@ -13,11 +13,12 @@ param(
     [string]$PythonExecutable,
     [ValidateSet('Auto','Quick','Full','None')][string]$UiPreview = 'Auto',
     [ValidateSet('Auto','Off','On')][string]$DevControlMode = 'Auto',
-    [ValidateSet('inline-restore-roi','control-mask','control-mask-safety','control-mask-safety-hardware','control-mask-capture','control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','control-mask-native-ngx-fg','bridge-xefg-private-provider','gpu-pass-diagnostics','native-required-menu','native-owner-idle','native-options-resume','native-options-delayed','native-guide-contract','present-guide-models','late-bridge-ownership','xefg-ordinary-receipt-first-signal','adaptive-fg-service','adaptive-inline','adaptive-resource-strategy','adaptive-resource-strategy-native','adaptive-status','output-framerate-registration','output-framerate-sdk','vulkan-recorded-use-contract','native-present-decision','native-mfg-ordering','trace-metadata','stage-chain','stage-resolution','stage-resolution-hardware','same-stage-resolution','same-stage-resolution-hardware','render-stage-resolution','render-stage-resolution-hardware','present-stage-resolution','present-stage-resolution-hardware','native-prefg-resolution','native-prefg-resolution-hardware','native-frame-identity','same-stage-model-pair','same-stage-mixed-pair','source-lifecycle','feature-switch','feature-switch-hardware','f5-mixed','present-chain','present-chain-hardware','present-chain-scrgb','present-chain-hdr10','native-full','native-full-hardware','nr-edit-reuse-contracts','nr-edit-reuse-contracts-public','nr-edit-reuse-render-contracts','nr-edit-reuse-present-contracts','nr-edit-reuse-present-diagnostic','nr-edit-reuse-present-native','nr-edit-reuse-xefg-contracts','nr-edit-reuse-native-contracts','native-frame-source','nr-fg-output-marker','fg-consumer-capture','xefg-present-probe')]
+    [ValidateSet('inline-restore-roi','control-mask','control-mask-safety','control-mask-safety-hardware','control-mask-capture','control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb','control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','control-mask-native-ngx-fg','bridge-xefg-private-provider','bridge-xefg-original-warm','original-proxy-warm','gpu-pass-diagnostics','native-required-menu','native-owner-idle','native-options-resume','native-options-delayed','native-guide-contract','present-guide-models','late-bridge-ownership','core-parameter-family','xefg-present-handoff','xefg-ordinary-receipt-first-signal','adaptive-fg-service','adaptive-inline','adaptive-resource-strategy','adaptive-resource-strategy-native','adaptive-status','output-framerate-registration','output-framerate-sdk','vulkan-recorded-use-contract','native-present-decision','native-mfg-ordering','trace-metadata','stage-chain','stage-resolution','stage-resolution-hardware','same-stage-resolution','same-stage-resolution-hardware','render-stage-resolution','render-stage-resolution-hardware','present-stage-resolution','present-stage-resolution-hardware','native-prefg-resolution','native-prefg-resolution-hardware','native-frame-identity','same-stage-model-pair','same-stage-mixed-pair','source-lifecycle','feature-switch','feature-switch-hardware','f5-mixed','present-chain','present-chain-hardware','present-chain-scrgb','present-chain-hdr10','native-full','native-full-hardware','nr-edit-reuse-contracts','nr-edit-reuse-contracts-public','nr-edit-reuse-render-contracts','nr-edit-reuse-present-contracts','nr-edit-reuse-present-diagnostic','nr-edit-reuse-present-native','nr-edit-reuse-xefg-contracts','nr-edit-reuse-native-contracts','native-frame-source','nr-fg-output-marker','fg-consumer-capture','xefg-present-probe')]
     [string[]]$NativeCase = @(),
     [switch]$VulkanNativeNgx,
     [string]$NativeNgxProjectIdPath,
     [string]$NativeNgxSdkLibraryDirectory,
+    [string]$NativeXeFgSdkRoot,
     [string]$NativeNgxRuntimePath = $(if ($env:NR_NEXUS_NGX_RUNTIME_DIR) { Join-Path $env:NR_NEXUS_NGX_RUNTIME_DIR 'nvngx_dlssnr.dll' }),
     [string]$NativeNgxSrRuntimePath,
     [ValidateSet('dlaa','sr','stage-resolution','same-stage-resolution','render-stage-resolution','present-stage-resolution','ordinary-watchdog','ordinary-present-watchdog','ordinary-present-prequeue','edit-reuse-production','adaptive','adaptive-hardware','adaptive-native-ngx','adaptive-native-snippet')][string[]]$BridgeCase = @(),
@@ -97,7 +98,7 @@ if ($SoftwareOnly -and @($BridgeCase | Where-Object { $_ -in @('adaptive-hardwar
     throw 'Explicit Bridge hardware cases conflict with -SoftwareOnly; no hardware or WARP fallback is permitted.'
 }
 $nativeNgxCases = @('control-mask-native-ngx','control-mask-native-ngx-toggle','control-mask-native-ngx-toggle-rgb',
-    'control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','control-mask-native-ngx-fg','bridge-xefg-private-provider',
+    'control-mask-native-ngx-cost','control-mask-native-ngx-motion','control-mask-native-ngx-resize','control-mask-native-ngx-fg','bridge-xefg-private-provider','bridge-xefg-original-warm','original-proxy-warm',
     'nr-edit-reuse-history','nr-edit-reuse-cache','nr-edit-reuse-cost','nr-edit-reuse-jitter','nr-edit-reuse-present-native',
     'adaptive-resource-strategy-native')
 $usesNativeNgx = $bridgeNativeNgx -or $VulkanNativeNgx -or (@($NativeCase | Where-Object { $_ -in $nativeNgxCases }).Count -gt 0)
@@ -227,6 +228,15 @@ foreach ($item in $Suite) {
         if (($item -in @('fg-native','vulkan-control-mask') -or ($item -eq 'bridge-motion' -and $bridgeNativeNgx)) -and $NativeNgxSdkLibraryDirectory) {
             $arguments += '/DNR_NEXUS_TEST_NATIVE_NGX'
             $link += (Join-Path $NativeNgxSdkLibraryDirectory 'nvsdk_ngx_s.lib')
+        }
+        if ($item -eq 'fg-native' -and $NativeXeFgSdkRoot) {
+            $sdkRoot = (Resolve-Path -LiteralPath $NativeXeFgSdkRoot).Path
+            foreach ($header in @('inc/xell/xell_d3d12.h','inc/xess_fg/xefg_swapchain_d3d12.h')) {
+                if (-not (Test-Path -LiteralPath (Join-Path $sdkRoot $header))) {
+                    throw "Missing official XeFG SDK header: $header"
+                }
+            }
+            $arguments += @('/DNR_NEXUS_TEST_INTEL_SDK', "/I$sdkRoot/inc/xell", "/I$sdkRoot/inc/xess_fg")
         }
         if ($item -eq 'bridge-motion') { $link += 'd3dcompiler.lib' }
     }
