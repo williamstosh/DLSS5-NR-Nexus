@@ -107,6 +107,7 @@ inline uint32_t ticks = 0;  // one bit per kTicks entry
 inline std::string capture_result;
 inline std::vector<Item> items;
 inline std::string summary;  // valid redacted JSON; send appends left_out structurally
+inline ReportDiagnosticsSnapshot diagnostics_snapshot;
 inline std::filesystem::path stage;
 inline std::filesystem::path zip;
 inline std::filesystem::path preview_file;
@@ -175,6 +176,7 @@ inline bool BeginIssueReport(const char* reason_slug) {
     issue_report::zip.clear();
     issue_report::stage.clear();
     issue_report::summary.clear();
+    issue_report::diagnostics_snapshot = {};
     issue_report::public_summary.clear();
     issue_report::issue_body.clear();
     issue_report::issue_notice.clear();
@@ -254,9 +256,54 @@ inline std::string FormatBytes(uint64_t bytes) {
   return text;
 }
 
+inline nlohmann::json SelectedReportCardJson(const ReportDiagnosticsSnapshot& snapshot) {
+  const auto card = ui::ComputeStatusCard(snapshot.card);
+  return {{"id", ui::CardSlug(card.id)}, {"tone", ui::CardToneName(card.tone)}, {"basis", ReportCardBasis(snapshot.output.selected)}, {"present_before_fg", card.present_before_fg}};
+}
+
+inline void AppendSelectedReportDiagnostics(nlohmann::json& diagnostics, const ReportOutputObservation& output) {
+  diagnostics["selected_output"] = output.selected ? "frozen_at_collection_request" : "unknown";
+  auto& colour = diagnostics["colour"];
+  colour["effective_basis"] = "selected_output_observation_unavailable";
+  colour["sdr_policy_eligible"] = nullptr;
+  colour["hdr_active"] = nullptr;
+  colour["effective_domain"] = nullptr;
+  colour["effective_status"] = "unavailable";
+
+  nlohmann::json groups = nlohmann::json::array();
+  for (uint32_t i = 0; i < output.plan.group_count; ++i) {
+    const auto& timing = output.timings[i];
+    nlohmann::json group = {{"stage", stage_plan::Name(timing.group.stage)}, {"pass_begin", timing.group.begin + 1}, {"pass_count", timing.group.count}, {"status", timing.sequence != 0 ? "collected" : "unavailable"}};
+    if (timing.sequence != 0) {
+      group["sample_sequence"] = timing.sequence;
+      group["total_us"] = timing.total_us;
+      auto& passes = group["passes"] = nlohmann::json::array();
+      for (uint32_t pass = 0; pass < timing.group.count; ++pass) {
+        const auto& sample = timing.passes[pass];
+        passes.push_back({{"pass", sample.id + 1}, {"total_us", sample.total_us}, {"evaluate_us", sample.eval_us}});
+      }
+    }
+    groups.push_back(std::move(group));
+  }
+  const bool single_measured_group = output.plan.group_count == 1 && output.timings[0].sequence != 0;
+  const bool measured_groups = std::ranges::any_of(output.timings, [](const auto& timing) { return timing.sequence != 0; });
+  diagnostics["performance"] = {{"gpu_chain_ms", {{"status", single_measured_group ? "collected" : measured_groups ? "per_stage_only"
+                                                                                                                   : "unavailable"},
+                                                  {"value", single_measured_group ? nlohmann::json(output.timings[0].total_us / 1000.0) : nlohmann::json(nullptr)},
+                                                  {"basis", "selected_output_single_gpu_submission_not_whole_game_gpu_time"}}},
+                                {"gpu_groups_us", std::move(groups)},
+                                {"displayed_fps", {{"status", output.fps_available ? output.fps_source == output_framerate::Source::PRESENT ? "application_present_estimate" : "estimated" : "unavailable"}, {"value", output.fps_available ? nlohmann::json(output.fps) : nlohmann::json(nullptr)}, {"basis", output.fps_available ? output_framerate::SourceText(output.fps_source) : output_framerate::ReasonText(output.fps_reason)}, {"comparable", output.fps_comparable}}},
+                                {"counters", "cumulative_session_counts_not_rates"}};
+}
+
 // The worker's first job: the F5 capture, then everything the review lists.
 inline void RunReportCaptureJob() {
   using issue_report::Step;
+  ReportDiagnosticsSnapshot snapshot;
+  {
+    std::lock_guard lock(issue_report::mutex);
+    snapshot = issue_report::diagnostics_snapshot;
+  }
   const int64_t started_ns = SteadyNowNs();
   issue_report::capture_started_ns = started_ns;
   screenshot::internal::FinishedCapture capture;
@@ -338,7 +385,7 @@ inline void RunReportCaptureJob() {
     if (!out.good()) throw std::runtime_error("A report text file could not be written.");
     items.push_back({label, entry, file, redacted.size(), true, false, redacted.substr(0, 65536)});
   };
-  const std::string support = BuildSupportReport();
+  const std::string support = BuildSupportReport(snapshot);
   // i18n: begin - the review step's file labels, drawn through ui::Tr
   add_text("Support report",
            "support-report.txt", support);  // i18n: skip
@@ -394,9 +441,9 @@ inline void RunReportCaptureJob() {
 
   // report.json: what support needs first, as data.  Closed by the send
   // job, which appends what the player left out.
-  const auto inputs = CollectCardInputs();
+  const auto& inputs = snapshot.card;
   const auto& verdict = inputs.verdict;
-  const ui::StatusCard card = ui::ComputeStatusCard(inputs);
+
   std::string json = "{\n  \"schema\": \"renodx-dlss5-report/1\"";
   const auto field = [&json](const char* key, const std::string& value) {
     json += ",\n  " + report::JsonString(key) + ": " + value;
@@ -426,13 +473,12 @@ inline void RunReportCaptureJob() {
   field("game", "{\"exe\": " + report::JsonString(GameExeName()) + ", \"api\": "
                     + report::JsonString(verdict.api) + ", \"path\": "
                     + report::JsonString(verdict.path) + "}");
+  // Frame totals are not an observation of the selected output.
   field("verdict", "{\"state\": " + report::JsonString(NrStateName(verdict.state))
                        + ", \"stage\": " + report::JsonString(verdict.StageName())
                        + ", \"reason\": " + report::JsonString(verdict.ReasonName())
-                       + ", \"injected\": " + std::to_string(verdict.injected)
-                       + ", \"eligible\": " + std::to_string(verdict.eligible) + "}");
-  field("card", "{\"id\": " + report::JsonString(ui::CardSlug(card.id)) + ", \"tone\": "
-                    + report::JsonString(ui::CardToneName(card.tone)) + "}");
+                       + ", \"injected\": null, \"eligible\": null}");
+  field("card", SelectedReportCardJson(snapshot).dump());
   // The health ledger's active rows, log-tone ones included: the panel
   // hides those, support wants them.
   std::string ledger = "[";
@@ -548,17 +594,22 @@ inline void RunReportCaptureJob() {
       {"driver", driver.empty() ? "unavailable" : "collected"}, {"os", os.empty() ? "unavailable" : "collected"},
       {"reshade", reshade_version.empty() ? "unavailable" : "collected"}};
   diagnostics["gpu_source"] = "first_hardware_adapter_not_verified_render_device";
-  diagnostics["snapshot"] = "on_demand_independent_counters_not_a_frame_capture";
-  diagnostics["nr"] = {{"status", NrStateName(verdict.state)}, {"hook", verdict.path},
-      {"passes", stack_passes.load()}, {"input_width", last_input_width.load()},
-      {"input_height", last_input_height.load()}, {"output_width", last_output_width.load()},
-      {"output_height", last_output_height.load()}, {"resource_details", "unavailable_not_traced"}};
+  diagnostics["snapshot"] = "selected_output_frozen_at_request_process_counters_independent_not_a_frame_capture";
+  diagnostics["card_basis"] = ReportCardBasis(snapshot.output.selected);
+  diagnostics["nr"] = {{"status", NrStateName(verdict.state)}, {"hook", verdict.path}, {"sizes_basis", "selected_complete_gpu_group_or_unknown"}, {"passes", snapshot.output.plan.pass_count}, {"input_width", inputs.input_width}, {"input_height", inputs.input_height}, {"output_width", inputs.output_width}, {"output_height", inputs.output_height}, {"resource_details", "unavailable_not_traced"}};
+  diagnostics["process_status"] = {{"basis", "session_diagnostics_not_selected_output"},
+                                   {"card", ui::CardSlug(ui::ComputeStatusCard(snapshot.session).id)},
+                                   {"state", NrStateName(snapshot.session.verdict.state)},
+                                   {"hook", snapshot.session.verdict.path},
+                                   {"injected", snapshot.session.verdict.injected},
+                                   {"eligible", snapshot.session.verdict.eligible}};
   {
     std::unique_lock lock(runtime_mutex, std::try_to_lock);
     if (lock.owns_lock()) {
       diagnostics["nr"]["resource_details"] = {{"status", "collected"},
-          {"live_worksets", worksets.size()}, {"retired_worksets", retired_final_resources.size()},
-          {"basis", "metadata_only_no_GPU_reads"}};
+                                               {"live_worksets", worksets.size()},
+                                               {"retired_worksets", retired_final_resources.size()},
+                                               {"basis", "process_metadata_only_no_GPU_reads"}};
     } else {
       diagnostics["nr"]["resource_details"] = {{"status", "unavailable_busy"}};
     }
@@ -592,23 +643,11 @@ inline void RunReportCaptureJob() {
       {"hdr_pedestal", display_pedestal.load()}};
   diagnostics["colour"]["basis"] = "configured_values_effective_state_separate";
   diagnostics["colour"]["sdr_policy"] = present_sdr_restore_policy.load();
-  diagnostics["colour"]["sdr_active"] = present_sdr_restore_active.load();
-  diagnostics["colour"]["hdr_active"] = present_hdr_pedestal_active.load();
   {
     std::shared_lock lock(present_restore_configuration.mutex);
     diagnostics["colour"]["restore_scope"] = static_cast<uint32_t>(present_restore_configuration.scope.scope);
   }
-  {
-    std::shared_lock lock(present_restore_effective.mutex);
-    diagnostics["colour"]["effective_domain"] = static_cast<uint32_t>(present_restore_effective.domain);
-    diagnostics["colour"]["effective_status"] = present_restore_effective.status;
-  }
-  const float gpu_ms = nr_cost_gpu_ms.load();
-  diagnostics["performance"] = {{"gpu_chain_ms", {{"status", gpu_ms > 0 ? "collected" : "unavailable"},
-      {"value", gpu_ms > 0 ? nlohmann::json(gpu_ms) : nlohmann::json(nullptr)},
-      {"basis", "existing_sampled_NR_chain_mean_not_whole_game_GPU_time"}}},
-      {"displayed_fps", {{"status", "unavailable_not_measured"}}},
-      {"counters", "cumulative_session_counts_not_rates"}};
+  AppendSelectedReportDiagnostics(diagnostics, snapshot.output);
   diagnostics["permissions"] = {{"screenshots", issue_report::capture_requested ? "authorized" : "not_authorized"},
       {"hardware_diagnostics", "authorized_local_collection"}, {"network_upload", "not_authorized"},
       {"public_report_link", "not_authorized"}};
@@ -946,10 +985,12 @@ inline bool StartReportThread(LPTHREAD_START_ROUTINE main) {
 }
 
 // Step 1 -> 2: keeps what the player typed and starts the capture.
-inline void ContinueIssueReport(bool collect_diagnostics = true) {
+inline void ContinueIssueReport(bool collect_diagnostics = true, reshade::api::effect_runtime* runtime = nullptr) {
   if (issue_report::step.load() != issue_report::Step::kDescribe || issue_report::worker_active.load()) return;
+  const auto snapshot = collect_diagnostics ? CaptureReportDiagnostics(runtime) : ReportDiagnosticsSnapshot{};
   {
     std::lock_guard lock(issue_report::mutex);
+    issue_report::diagnostics_snapshot = snapshot;
     issue_report::description = issue_report::typed;
     issue_report::ticks = issue_report::typed_ticks;
     issue_report::reproduction = issue_report::typed_steps;
@@ -1022,7 +1063,7 @@ inline const char* CaptureNote(const std::string& result) {
 // The report, drawn under the status card and the health ledger's issue
 // list: the button while closed, the current step otherwise.  The capture is
 // named by the key that takes it (NRScreenshotKey), not a fixed F5.
-inline void DrawIssueReport() {
+inline void DrawIssueReport(reshade::api::effect_runtime* runtime) {
   using issue_report::Step;
   const Step at = issue_report::step.load();
   const std::string capture_key = VirtualKeyName(screenshot_hotkey.load());
@@ -1079,7 +1120,7 @@ inline void DrawIssueReport() {
         }
         ImGui::TextDisabled("%s", ui::Tr(ui::text::kReportLocalSaved));
         ui::Checkbox(ui::Tr(ui::text::kReportCapture), &issue_report::typed_capture);
-        if (ui::ActionButton(ui::Tr(ui::text::kReportCollect))) ContinueIssueReport();
+        if (ui::ActionButton(ui::Tr(ui::text::kReportCollect))) ContinueIssueReport(true, runtime);
         if (ui::ActionButton(ui::Tr(ui::text::kReportWithoutDiagnostics))) ContinueIssueReport(false);
         ui::SameLineIfFits(ImGui::GetFontSize() * 12.f);
         if (ui::ActionButton(ui::Tr("Cancel"))) CloseIssueReport();
@@ -1325,7 +1366,7 @@ inline bool InitIssueReportTest() {
   return true;
 }
 
-inline void OnIssueReportTestPresent(reshade::api::effect_runtime* /*runtime*/) {
+inline void OnIssueReportTestPresent(reshade::api::effect_runtime* runtime) {
   using issue_report::Step;
   static uint32_t presents = 0;
   static bool sent = false;
@@ -1339,7 +1380,7 @@ inline void OnIssueReportTestPresent(reshade::api::effect_runtime* /*runtime*/) 
     std::snprintf(issue_report::typed, sizeof(issue_report::typed),
                   "test report, saved under %s\\Documents", profile);
     issue_report::typed_ticks = 0b10001;
-    ContinueIssueReport();
+    ContinueIssueReport(true, runtime);
   }
   if (at == Step::kReview && !sent) {
     sent = true;

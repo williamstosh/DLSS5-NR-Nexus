@@ -34210,22 +34210,135 @@ inline const char* NrRuntimeVersionText() {
 // log_verdict.py scores a report like a log), the card's title, the settings
 // that change behaviour, the counters and the latest telemetry line.
 // Redacted by construction - the game's file name, no path, no hardware id.
-// Copies status under runtime_mutex, then formats it and the cached telemetry
-// without holding that lock. No loader call.
-inline std::string BuildSupportReport() {
+inline ui::MonitorState ui_runtime_monitor_state;
+inline bool ui_monitor_geometry_dirty = false;
+inline bool ui_monitor_saved_pin = false;
+#include "monitor_runtime.hpp"
+
+struct ReportGpuGroup {
+  stage_plan::Group group;
+  uint64_t sequence = 0;
+  uint32_t total_us = 0;
+  std::array<gpu_timers::PassStats, kMaxNrPasses> passes{};
+};
+
+struct ReportOutputObservation {
+  stage_plan::Plan plan{.pass_count = 0, .valid = false};
+  bool selected = false;
+  std::array<ReportGpuGroup, 3> timings{};
+  bool adaptive_enabled = false;
+  std::array<adaptive_resolution::Status, kMaxNrPasses> adaptive{};
+  bool fps_available = false;
+  double fps = 0.;
+  output_framerate::Source fps_source = output_framerate::Source::NONE;
+  output_framerate::Reason fps_reason = output_framerate::Reason::kAMBIGUOUS;
+  bool fps_comparable = false;
+};
+
+struct ReportDiagnosticsSnapshot {
+  ReportOutputObservation output;
+  ui::CardInputs card{.starting = true};
+  ui::CardInputs session;
+};
+
+inline constexpr const char* ReportCardBasis(bool selected) {
+  return selected ? "selected_output_at_request" : "selected_output_unknown";
+}
+
+// Called under runtime_mutex. Own only values: the worker may wait for a
+// screenshot while the requesting runtime is replaced or destroyed.
+inline ReportDiagnosticsSnapshot CopyReportDiagnostics(const output_framerate::OutputIdentity& output,
+                                                       const stage_plan::Plan& plan, int64_t now, const gpu_comparison::Identity& settings, const ui::CardInputs& session) {
+  ReportDiagnosticsSnapshot snapshot;
+  snapshot.session = session;
+  snapshot.card = ProjectSelectedCardInputs(session, plan.At(stage_plan::Stage::PRESENT).count != 0, nullptr);
+  if (!output_framerate::IsCurrentOutput(output)) return snapshot;
+  auto& observed = snapshot.output;
+  observed.selected = true;
+  observed.plan = plan;
+  std::array<gpu_timers::Stats, 3> completions;
+  {
+    std::shared_lock observation_lock(card_observation.mutex);
+    completions = card_observation.completions;
+  }
+  const gpu_timers::Stats* first_execution = nullptr;
+  bool all_groups_executed = plan.valid && plan.group_count != 0;
+  for (uint32_t i = 0; i < plan.group_count; ++i) {
+    const auto& group = plan.groups[i];
+    const auto stage = static_cast<size_t>(group.stage);
+    auto& timing = observed.timings[i];
+    timing.group = group;
+    const auto& timed = gpu_timers::stage_stats[stage];
+    const auto& proof = gpu_timers::execution_stats[stage];
+    bool timed_current = CurrentSelectedMonitorSample(timed, group, output, now, settings);
+    const bool proof_current = CurrentSelectedMonitorSample(proof, group, output, now, settings);
+    if (timed_current && proof_current && proof.sequence > timed.sequence) {
+      // A newer working contract cannot borrow an older measurement's cost.
+      for (size_t pass = 0; pass < timed.passes.size(); ++pass) {
+        const auto& a = timed.passes[pass];
+        const auto& b = proof.passes[pass];
+        timed_current &= a.id == b.id && a.model == b.model && a.width == b.width && a.height == b.height
+                         && a.output_width == b.output_width && a.output_height == b.output_height
+                         && a.state == b.state && a.look_measured == b.look_measured;
+      }
+    }
+    if (timed_current) {
+      timing.sequence = timed.sequence;
+      timing.total_us = timed.total_us;
+      timing.passes = timed.passes;
+    }
+    const auto* execution = proof_current ? &proof : timed_current                                                                ? &timed
+                                                 : CurrentSelectedMonitorSample(completions[stage], group, output, now, settings) ? &completions[stage]
+                                                                                                                                  : nullptr;
+    all_groups_executed &= execution != nullptr;
+    if (first_execution == nullptr) {
+      first_execution = execution;
+    }
+  }
+  const auto rate = output_framerate::Read(output, now);
+  observed.fps_available = rate.available;
+  observed.fps_source = rate.source;
+  observed.fps_reason = rate.reason;
+  observed.fps = rate.fps;
+  observed.fps_comparable = rate.available && rate.rate_comparable;
+  const auto present_group = plan.At(stage_plan::Stage::PRESENT);
+  const auto delivery = ReadSelectedMonitorDelivery(output, present_group, now);
+  snapshot.card = ProjectSelectedCardInputs(session, present_group.count != 0,
+                                            all_groups_executed || present_group.count != 0 ? first_execution : nullptr, delivery, rate);
+  observed.adaptive_enabled = nr_adaptive_enabled.load();
+  if (observed.adaptive_enabled) {
+    for (uint32_t pass = 0; pass < plan.pass_count; ++pass) {
+      observed.adaptive[pass] = CopyAdaptiveStatus(output, plan.effective[pass], now);
+    }
+  }
+  return snapshot;
+}
+
+inline ReportDiagnosticsSnapshot CaptureReportDiagnostics(reshade::api::effect_runtime* runtime) {
+  std::optional<RuntimeLock> lock;
+  if (!runtime_lock::State::HeldByThisThread()) {
+    lock.emplace(runtime_mutex);
+  }
+  gpu_comparison::Identity settings;
+  if (gpu_timers::comparison_settings != nullptr) {
+    gpu_timers::comparison_settings(&settings);
+  }
+  return CopyReportDiagnostics(MatchRuntimeOutput(runtime), RequestedStagePlan(), SteadyNowNs(), settings, CollectCardInputs());
+}
+
+inline std::string BuildSupportReport(const ReportDiagnosticsSnapshot& snapshot) {
   const auto& loader = NgxLoaderView();
-  const auto inputs = CollectCardInputs();
+  const auto& inputs = snapshot.card;
   const auto& verdict = inputs.verdict;
   char verdict_line[512];
   FormatNrVerdictLine(
-      verdict_line, sizeof(verdict_line), verdict,
+      verdict_line, sizeof(verdict_line), snapshot.session.verdict,
       submitted_injections.load(std::memory_order_relaxed),
       presents_observed.load(std::memory_order_relaxed), kAddonVersion,
       "report");
-  const ui::StatusCard card =
-      ui::ComputeStatusCard(inputs);
+  const ui::StatusCard card = ui::ComputeStatusCard(inputs);
   char card_line[128];
-  ui::FormatCardLine(card_line, sizeof(card_line), card, "report");
+  ui::FormatCardLine(card_line, sizeof(card_line), ui::ComputeStatusCard(snapshot.session), "report");
   // English, like the rest of the report; the issue count is the one title
   // with a number in it.
   char card_title[160];
@@ -34252,6 +34365,10 @@ inline std::string BuildSupportReport() {
          << "version: " << kAddonVersion << "\n"
          << "game: " << GameExeName() << "\n"
          << "card: " << card_title << "\n"
+         << "card_basis: " << ReportCardBasis(snapshot.output.selected) << "\n"
+         << "selected_verdict: " << NrStateName(verdict.state)
+         << " present_before_fg=" << inputs.present_before_fg << "\n"
+         << "log_lines_basis: process session diagnostics, not selected-output status\n"
          << verdict_line << "\n"
          << card_line << "\n"
          << warn_line << "\n"
@@ -34260,7 +34377,7 @@ inline std::string BuildSupportReport() {
          << (!loader.nr_sha256.empty()
                  ? "sha256 " + loader.nr_sha256
                        + ((loader.nr_sha256 == kExpectedNrSha256) ? " (reference match)"
-                                                         : " (custom build)")
+                                                                  : " (custom build)")
              : loader.nr_ready
                  ? std::string("sha256 unreadable (build unknown)")
                  : std::string("not loaded"))
@@ -34286,7 +34403,8 @@ inline std::string BuildSupportReport() {
          << " NRFollowInputRes=" << nr_follow_input_res.load()
          << " NRResolutionScale=" << nr_resolution_scale.load()
          << " EnableHooks="
-         << (!hooks_enabled.load() ? 0 : streamline_hooks_enabled.load() ? 1 : 2)
+         << (!hooks_enabled.load() ? 0 : streamline_hooks_enabled.load() ? 1
+                                                                         : 2)
          << " DX11Source="
          << (source == kDx11SourceForeign  ? "foreign"
              : source == kDx11SourceNative ? "native"
@@ -34298,6 +34416,7 @@ inline std::string BuildSupportReport() {
                  ? "auto"
                  : ui::kLanguages[ui_language_choice.load() - 1].code)
          << "\n"
+         << "counters_basis: process history, not attributed to the selected output\n"
          << "counters: enhanced="
          << SourceSuccessfulEvaluations()
          << " fg_submitted=" << TotalFgSubmittedFrames()
@@ -34316,7 +34435,23 @@ inline std::string BuildSupportReport() {
            << " stabilize=" << result.stabilize.load() << " stabilize_ms=" << result.stabilize_ms.load()
            << " detail_stability=" << result.detail_stability.load() << "\n";
   }
-  const auto plan = RequestedStagePlan();
+  const auto& output = snapshot.output;
+  const auto& plan = output.plan;
+  report << "selected_output: " << (output.selected ? "observed at collection request" : "unknown") << '\n';
+  if (output.selected) {
+    report << "colour.effective: unavailable (no selected-output observation)\n";
+    for (uint32_t i = 0; i < plan.group_count; ++i) {
+      const auto& timing = output.timings[i];
+      report << "gpu_group: stage=" << stage_plan::Name(timing.group.stage) << " passes="
+             << timing.group.begin + 1 << '-' << timing.group.begin + timing.group.count;
+      if (timing.sequence != 0) {
+        report << " us=" << timing.total_us << " sample=" << timing.sequence << " (single submission)";
+      } else {
+        report << " unavailable";
+      }
+      report << '\n';
+    }
+  }
   report << "stage_plan: valid=" << plan.valid << " groups=" << plan.group_count
          << " reason=" << stage_plan::ReasonText(plan.reason) << " (route only, execution unconfirmed)\n";
   for (uint32_t pass = 0; pass < plan.pass_count; ++pass) {
@@ -34327,8 +34462,38 @@ inline std::string BuildSupportReport() {
            << " resolved_model=" << nr_model::ResolvePreset(preset.load(), requested_model, loader.nr_requirements.dual_models)
            << " (configuration only; internal network unconfirmed)\n";
   }
-  if (!telemetry.empty()) report << "telemetry: " << telemetry << "\n";
+  if (output.adaptive_enabled) {
+    report << "adaptive.output: " << (output.fps_available ? output_framerate::SourceText(output.fps_source) : output_framerate::ReasonText(output.fps_reason));
+    if (output.fps_available) {
+      report << " fps=" << output.fps << " comparable=" << output.fps_comparable;
+    }
+    report << "\n";
+    for (uint32_t pass = 0; pass < plan.pass_count; ++pass) {
+      const auto& status = output.adaptive[pass];
+      report << "pass[" << pass + 1 << "].adaptive: ";
+      if (status.display_source_generation == 0) {
+        report << "no scoped observation\n";
+        continue;
+      }
+      const auto requested = status.requested[pass];
+      const auto delivered = status.applied[pass];
+      report << "observed_stage=" << stage_plan::Name(static_cast<stage_plan::Stage>(status.display_stage))
+             << " output_generation=" << status.display_output_generation
+             << " source_generation=" << status.display_source_generation
+             << " requested=" << requested.width << 'x' << requested.height
+             << " ready_levels=" << status.ready_levels
+             << " applied=" << delivered.width << 'x' << delivered.height
+             << " generation=" << status.generation;
+      report << " reason=" << adaptive_resolution::ReasonText(status.reason) << '\n';
+    }
+  }
+  if (!telemetry.empty()) report << "telemetry_basis: process history, not attributed to the selected output\n"
+                                 << "telemetry: " << telemetry << "\n";
   return report::RedactText(report.str(), report::SystemRedaction());
+}
+
+inline std::string BuildSupportReport(reshade::api::effect_runtime* runtime = nullptr) {
+  return BuildSupportReport(CaptureReportDiagnostics(runtime));
 }
 
 // Open log folder: ShellExecute loads shell extensions into the game, so it
@@ -34349,7 +34514,7 @@ inline DWORD WINAPI OpenLogFolderMain(void* module) {
 // i18n: begin - display strings (tools/i18n/ui_strings.py catalog)
 // Diagnostics, translated (U3): what the counters mean, one row each, then
 // the report buttons; the alpha44 counters stay one click down.
-inline void DrawDiagnostics(const NrVerdict& verdict) {
+inline void DrawDiagnostics(const NrVerdict& verdict, reshade::api::effect_runtime* runtime) {
   ui::SectionCaption(ui::text::kResources, nullptr, false);
   bool reset_history = false;
   if (ui::SectionHeader("Working resolution history", nullptr, nullptr, false, &reset_history)) {
@@ -34485,7 +34650,7 @@ inline void DrawDiagnostics(const NrVerdict& verdict) {
     ImGui::TextWrapped("%s", ui::Tr(ui::text::kModelNote));
     static int64_t copied_ns = 0;
     if (ui::ActionButton(ui::Tr(ui::text::kCopySupportReport))) {
-      ImGui::SetClipboardText(BuildSupportReport().c_str());
+      ImGui::SetClipboardText(BuildSupportReport(runtime).c_str());
       copied_ns = SteadyNowNs();
     }
     ui::ItemTooltip("%s", ui::Tr(ui::text::kReportTip));
@@ -34516,11 +34681,6 @@ inline void DrawDiagnostics(const NrVerdict& verdict) {
 #include "preset_runtime.hpp"
 #include "stage_edit.hpp"
 #include "resolution_edit.hpp"
-
-inline ui::MonitorState ui_runtime_monitor_state;
-inline bool ui_monitor_geometry_dirty = false;
-inline bool ui_monitor_saved_pin = false;
-#include "monitor_runtime.hpp"
 
 #if defined(NR_NEXUS_DEV_CONTROL)
 #include "dev_control.hpp"
@@ -34768,7 +34928,7 @@ inline void DrawClassicLayout(reshade::api::effect_runtime* runtime, const ui::S
   }
   if (DiagnosticsHeader(text)) {
     DrawRuntimeStatus(card);
-    DrawIssueReport();
+    DrawIssueReport(runtime);
     DrawSectionGuideOverrides(text);
     ImGui::Separator();
     DrawSectionDiagnosticsRaw();
@@ -34903,8 +35063,8 @@ inline void DrawModernLayout(reshade::api::effect_runtime* runtime,
       }
       ui::SectionCaption(ui::text::kRuntimeStatus, nullptr, false);
       DrawRuntimeStatus(card);
-      DrawDiagnostics(verdict);
-      DrawIssueReport();
+      DrawDiagnostics(verdict, runtime);
+      DrawIssueReport(runtime);
     } else {
       char hotkeys[128];
       std::snprintf(hotkeys, sizeof(hotkeys), ui::Tr(ui::text::kHotkeysHint),
@@ -35252,7 +35412,7 @@ inline void OnUiCapturePresent(reshade::api::effect_runtime* runtime) {
   // for redaction and hands it to log_verdict.py as a fixture).
   {
     std::ofstream report(ui_capture_dir / "support-report.txt", std::ios::binary);
-    report << BuildSupportReport();
+    report << BuildSupportReport(runtime);
   }
   char line[384];
   std::snprintf(

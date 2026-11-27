@@ -22,6 +22,10 @@
 
 #include <dlssnr.hpp>
 
+#define NR_NEXUS_TEST_OUTPUT_RUNTIME_ONLY
+#include "adaptive_ui_cases.hpp"
+#undef NR_NEXUS_TEST_OUTPUT_RUNTIME_ONLY
+
 namespace runtime = renodx::addons::dlss5::internal;
 namespace flow = runtime::issue_report;
 namespace capture = renodx::addons::dlss5::screenshot;
@@ -223,6 +227,152 @@ void Save(const std::string& mode) {
   Require(std::filesystem::exists(reports), "closing done retains reports");
 }
 
+void TestSelectedReportDiagnostics() {
+  namespace addon = renodx::addons::dlss5;
+  namespace rate = addon::output_framerate;
+  namespace timers = addon::gpu_timers;
+  OutputRuntimeFixture runtime_a;
+  const auto a = runtime_a.output;
+  constexpr std::array<uintptr_t, 1> buffers_b{0xB100};
+  rate::RegisterPresentOutput(0xB000, a.device, 0xB010, buffers_b);
+  const auto b = rate::MatchPresentOutput(0xB000, buffers_b[0]);
+  runtime::enabled = true;
+  runtime::stack_passes = 1;
+  runtime::hook_point = 2;
+  timers::comparison_settings = runtime::comparison_ui::CaptureSettings;
+  const int64_t now = runtime::SteadyNowNs();
+  const int64_t start = now - 2'000'000'000;
+  constexpr auto present = addon::stage_plan::Stage::PRESENT;
+  constexpr auto upscaled = addon::stage_plan::Stage::UPSCALED;
+  constexpr size_t present_index = static_cast<size_t>(present);
+  constexpr size_t upscaled_index = static_cast<size_t>(upscaled);
+  const addon::stage_plan::Plan plan{.pass_count = 1, .effective = {present}, .groups = {addon::stage_plan::Group{.stage = present, .count = 1}}, .group_count = 1};
+  addon::gpu_comparison::Identity settings;
+  runtime::comparison_ui::CaptureSettings(&settings);
+  const auto make_sample = [&](const rate::OutputIdentity& output, uint64_t sequence,
+                               uint32_t us, const char* path, uint32_t pass) {
+    timers::Stats sample;
+    sample.total_us = us;
+    sample.sequence = sequence;
+    sample.valid = true;
+    sample.samples = 1;
+    sample.state = timers::SampleState::VALID;
+    sample.recorded_ns = now - 2;
+    sample.measured_ns = now - 1;
+    sample.identity = settings;
+    sample.identity.device_session = timers::device_session;
+    sample.identity.display_output_generation = output.generation;
+    sample.identity.stable_epoch = runtime::comparison_stable_epochs[timers::StageIndex(path)];
+    sample.passes[0] = {.id = pass, .width = 1920, .height = 1080, .output_width = 3840, .output_height = 2160, .eval_us = us / 2, .total_us = us, .state = timers::SampleState::VALID};
+    strcpy_s(sample.path, path);
+    return sample;
+  };
+  const auto render = [](const runtime::ReportOutputObservation& frozen) {
+    Json diagnostics;
+    runtime::AppendSelectedReportDiagnostics(diagnostics, frozen);
+    return diagnostics;
+  };
+  addon::ui::CardInputs session;
+  session.verdict.state = addon::NrState::kEngaged;
+  session.verdict.injected = session.verdict.eligible = 120;
+  session.active_features = 1;
+  session.fg_submitted_frames = 7;
+  {
+    const addon::RuntimeLock lock(runtime::runtime_mutex);
+    for (int64_t i = 0; i <= 200; ++i) {
+      rate::ObservePresent(b, start + i * 10'000'000);
+    }
+    timers::stage_stats[present_index] = make_sample(b, 22, 9000, "present", 0);
+    runtime::nr_cost_gpu_ms = 99.f;
+    const auto pending = runtime::CopyReportDiagnostics(a, plan, now, settings, session);
+    const auto card = runtime::SelectedReportCardJson(pending);
+    Require(card["id"] == addon::ui::CardSlug(addon::ui::CardId::kStarting)
+                && card["basis"] == "selected_output_at_request" && !card["present_before_fg"].get<bool>(),
+            "A pending primary status cannot borrow process B engagement or FG delivery");
+    const auto other = render(pending.output);
+    Require(other["performance"]["gpu_chain_ms"]["value"].is_null()
+                && other["performance"]["displayed_fps"]["value"].is_null()
+                && other["colour"]["effective_domain"].is_null(),
+            "A missing scoped diagnostics stay unset despite B timing and process colour/cost");
+    const auto unknown = runtime::CopyReportDiagnostics({}, plan, now, settings, session);
+    Require(render(unknown.output)["selected_output"] == "unknown"
+                && runtime::SelectedReportCardJson(unknown)["basis"] == "selected_output_unknown",
+            "unknown runtime does not acquire selected-output facts");
+    timers::stage_stats[present_index] = make_sample(a, 11, 2500, "present", 0);
+    for (int64_t i = 0; i <= 200; ++i) {
+      rate::ObservePresent(a, start + i * 10'000'000);
+    }
+    auto mixed = plan;
+    mixed.pass_count = 2;
+    mixed.effective[1] = upscaled;
+    mixed.groups[1] = {.stage = upscaled, .begin = 1, .count = 1};
+    mixed.group_count = 2;
+    timers::stage_stats[upscaled_index] = make_sample(a, 33, 1700, "postSR", 1);
+    const auto groups = render(runtime::CopyReportDiagnostics(a, mixed, now, settings, session).output)["performance"];
+    Require(groups["gpu_chain_ms"]["status"] == "per_stage_only"
+                && groups["gpu_chain_ms"]["value"].is_null()
+                && groups["gpu_groups_us"][0]["total_us"] == 2500
+                && groups["gpu_groups_us"][0]["pass_begin"] == 1
+                && groups["gpu_groups_us"][1]["total_us"] == 1700
+                && groups["gpu_groups_us"][1]["pass_begin"] == 2,
+            "independent stage measurements retain Pass and microseconds, never a fictitious sum");
+    const auto frozen = runtime::CopyReportDiagnostics(a, plan, now, settings, session);
+    const auto support = runtime::BuildSupportReport(frozen);
+    Require(support.find("gpu_group: stage=Present passes=1-1 us=2500 sample=11") != std::string::npos
+                && support.find("log_lines_basis: process session diagnostics") != std::string::npos,
+            "text support report uses selected measurements and labels process log observations");
+  }
+  // The actual Collect action freezes before starting its real worker. Hold its
+  // existing screenshot wait, replace the selected output, then release the wait.
+  flow::typed_capture = true;
+  flow::test_timeout_ms = 2000;
+  runtime::ContinueIssueReport(true, &runtime_a);
+  Require(flow::worker_active, "Collect action launched the production worker");
+  const auto armed_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!capture::IsArmed() && flow::worker_active && std::chrono::steady_clock::now() < armed_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  Require(capture::IsArmed(), "request is waiting for its capture before worker serialization");
+  {
+    const addon::RuntimeLock lock(runtime::runtime_mutex);
+    runtime::monitor_runtime = nullptr;
+    rate::DestroyPresentOutput(a.swapchain);
+    timers::stage_stats[present_index] = make_sample(b, 44, 9000, "present", 0);
+    Require(!runtime::CaptureReportDiagnostics(&runtime_a).output.selected,
+            "new request to destroyed output is unknown, not the reused pointer or B");
+    runtime_a.buffers[0] = {buffers_b[0]};
+    runtime::monitor_runtime = &runtime_a;
+    Require(runtime::MatchRuntimeOutput(&runtime_a) == b,
+            "the same live runtime now selects B without reviving destroyed output A");
+  }
+  flow::skip_capture = true;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (flow::worker_active && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  Require(!flow::worker_active && flow::step == flow::Step::kReview, "production worker finished without upload");
+  const auto summary = Json::parse(flow::summary);
+  const auto& performance = summary["diagnostics"]["performance"];
+  Require(performance["gpu_chain_ms"]["value"] == 2.5
+              && performance["gpu_groups_us"][0]["sample_sequence"] == 11
+              && performance["displayed_fps"]["status"] == "application_present_estimate"
+              && performance["displayed_fps"]["value"] == 100,
+          "worker keeps request A timing and FPS after A destruction and a different B sample");
+  Require(summary["diagnostics"]["colour"]["effective_domain"].is_null(),
+          "no output-colour ownership cannot be filled from the global colour cache");
+  Require(summary["card"]["basis"] == "selected_output_at_request", "JSON primary card preserves request scope");
+  for (const auto& item : flow::items) {
+    if (item.entry == "support-report.txt") {
+      const auto support = Read(item.file);
+      Require(support.find("us=2500 sample=11") != std::string::npos
+                  && support.find("us=9000 sample=44") == std::string::npos,
+              "worker text retains the same frozen A sample as JSON");
+    }
+  }
+  CheckPrivacy(flow::summary);
+  Save("no-capture");
+}
+
 void TestIssueJob(const std::string& mode) {
   flow::test_reason.clear();
   std::strcpy(flow::typed, "中文 title ghp_SYNTHETIC123");
@@ -348,6 +498,8 @@ int main(int argc, char** argv) {
       runtime::CloseIssueReport();
       Require(runtime::BeginIssueReport("again"), "begin after close");
       runtime::CloseIssueReport();
+    } else if (mode == "selected-output") {
+      TestSelectedReportDiagnostics();
     } else if (mode == "test-environment") {
       Require(_putenv_s("RENODX_NR_TEST_REPORT", "fixture") == 0, "set test reason environment");
       for (const auto* url : {"https://example.invalid/upload", "http://127.0.0.1:1@evil.invalid/upload",
