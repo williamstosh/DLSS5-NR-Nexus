@@ -58,6 +58,8 @@ enum class NativeInputObservation { NONE, WATCHING, OVERWRITTEN };
 
 struct Stream {
   present_frame_policy::Clock base_frame_clock;
+  MonitorDelivery monitor_delivery;
+  MonitorDelivery pending_monitor_delivery;
   std::shared_ptr<adaptive_resolution::Session> adaptive_session;
   adaptive_resolution::Frame adaptive_frame;
   AdaptiveDelivery pending_xefg_delivery;
@@ -1432,6 +1434,13 @@ inline void OnXeFGPresentDelivery(const fg::FrameInput& input, bool succeeded) n
     auto& stream = *pending;
     stream.awaiting_xefg_delivery = false;
     const auto delivery = std::exchange(stream.pending_xefg_delivery, {});
+    auto monitor_delivery = std::exchange(stream.pending_monitor_delivery, {});
+    if (succeeded && monitor_delivery.output == input.output && stream.base_frame_clock.complete
+        && monitor_delivery.frame.sequence == input.application_frame) {
+      AcceptMonitorDelivery(&stream.monitor_delivery, monitor_delivery, SteadyNowNs());
+    } else {
+      stream.monitor_delivery = {};
+    }
     ResolveAdaptiveDelivery(delivery, succeeded);
     if (succeeded) {
       Retire();
@@ -1955,6 +1964,8 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     stream.result = fg::Result::SUBMITTED;
     stream.pending_xefg_delivery = std::exchange(slot->adaptive_delivery, {});
     present_frame_policy::Publish(&stream.base_frame_clock, slot->base_frame, true, slot->base_frame_group.complete);
+    stream.pending_monitor_delivery = {.output = input.output, .configuration = configuration_generation.load(),
+        .reset_epoch = history_reset_epoch.load(), .frame = slot->base_frame, .consumer = MonitorConsumer::XE_FG};
     if (recordings[0].edit_monitor_delivery != EditReuseDelivery::NONE && nr_input.hudless == nullptr) {
       const auto surface = renodx::utils::directx::NativeIdentity(input.backbuffer);
       StoreEditReuseMonitorFrame(&stream.edit_reuse_monitor, {
@@ -3383,6 +3394,13 @@ inline void RestoreNativePreFg(ID3D12GraphicsCommandList* list,
       present_frame_policy::Publish(&stream.base_frame_clock, stream.cached->base_frame, ordered,
           stream.cached->base_frame_group.complete);
       if (stream.base_frame_clock.complete && current_display) {
+        if (context != 0 && stream.native_configuration == configuration_generation.load()) {
+          const auto& owner = *reinterpret_cast<const PresentStream*>(context);
+          AcceptMonitorDelivery(&stream.monitor_delivery,
+              {.output = owner.output, .configuration = stream.native_configuration,
+               .reset_epoch = stream.native_display_epoch, .frame = stream.cached->base_frame,
+               .consumer = MonitorConsumer::NATIVE_FG}, SteadyNowNs());
+        }
         native_fg_marker.store(stream.cached->color[0], std::memory_order_release);
         // An SDK may submit its borrowed list before returning acceptance.
         // Count that submission only when the producer has an actual receipt.

@@ -1001,6 +1001,9 @@ struct OutputRuntimeFixture final : reshade::api::effect_runtime {
     runtime::comparison_ui::CaptureSettings(&proof.identity);
     proof.identity.device_session = timers::device_session;
     proof.identity.stable_epoch = runtime::comparison_stable_epochs[1];
+    proof.identity.display_output_generation = runtime::MatchRuntimeOutput(&output_runtime).generation;
+    check(proof.identity.display_output_generation != 0,
+        "the interleaving proof is bound to the selected registered output");
     check(ui::ComputeStatusCard(runtime::CollectCardInputs(
         ComputeNrVerdict(runtime::CollectFunnelInputs()), runtime::SteadyNowNs())).id == ui::CardId::kActive,
         "the interleaving fixture starts Active with one current completed GPU proof");
@@ -1014,6 +1017,9 @@ struct OutputRuntimeFixture final : reshade::api::effect_runtime {
       addon::RuntimeLock lock(runtime::runtime_mutex);
       runtime::intercepted_evaluations = 200;
       runtime::successful_evaluations = 200;
+      proof.recorded_ns = proof.measured_ns = runtime::SteadyNowNs();
+      check(proof.recorded_ns > runtime::monitor_snapshot.attempted_ns,
+          "the selected completion is newer than the monitor's pre-lock sample");
       const auto newer = runtime::CollectCardInputs(ComputeNrVerdict(runtime::CollectFunnelInputs()), runtime::SteadyNowNs());
       check(ui::ComputeStatusCard(newer).id == ui::CardId::kActive,
           "a lifecycle-style observation advances the same health window before the monitor locks");
@@ -1022,11 +1028,16 @@ struct OutputRuntimeFixture final : reshade::api::effect_runtime {
     runtime::monitor_snapshot_before_lock = [] { interleave_card_snapshot(); };
     runtime::monitor_snapshot = {};
     const auto snapshot = refresh_monitor();
-    check(interleaved && proof.sequence == sequence && snapshot.inputs.recent.has_value()
-        && snapshot.inputs.recent->gpu_completed && snapshot.card.id == ui::CardId::kActive,
-        "a monitor arriving after the newer lifecycle observation cannot clear Active using its older outer timestamp");
-    check(snapshot.inputs.verdict.eligible == 200 && snapshot.inputs.verdict.injected == 200,
-        "the monitor observes the current counters instead of clamping an older counter snapshot's time");
+    check(interleaved && proof.sequence == sequence && snapshot.sampled_ns >= proof.recorded_ns
+        && snapshot.output.generation == proof.identity.display_output_generation
+        && snapshot.inputs.input_width == proof.passes[0].width && snapshot.card.id == ui::CardId::kActive,
+        "a monitor arriving after the newer selected completion cannot clear Active using its older outer timestamp");
+    check(!snapshot.inputs.recent && snapshot.inputs.verdict.eligible == 0 && snapshot.inputs.verdict.injected == 0,
+        "the selected card must not inherit unrelated process-wide proof or counters");
+    const auto live_session = runtime::CollectCardInputs();
+    check(live_session.recent && live_session.recent->gpu_completed && live_session.verdict.eligible == 200
+        && live_session.verdict.injected == 200 && ui::ComputeStatusCard(live_session).id == ui::CardId::kActive,
+        "the global session still observes current counters and keeps the same current GPU proof");
     interleave_card_snapshot = {};
     const auto before_mirror = runtime::CollectFunnelInputs();
     {

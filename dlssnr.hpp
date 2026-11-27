@@ -2368,7 +2368,7 @@ inline std::mutex monitor_key_mutex;
 inline ui::ProfileKeyEdge monitor_key_edge;
 inline ui::ProfileKeyEdge monitor_mode_key_edge;
 inline void DrawIndependentMonitor(reshade::api::effect_runtime* runtime, bool menu = false);
-inline ui::StatusCard MonitorDisplayCard();
+inline ui::StatusCard CurrentOutputCard(reshade::api::effect_runtime* runtime);
 
 inline bool MonitorKeyConflict(uint32_t key) {
   if (key == 0) return false;
@@ -24962,6 +24962,7 @@ inline bool ProcessModuleSetChanged() {
 
 // Path B: the D3D11 NGX detours and the Direct3D 11 bridge.
 #include "d3d11_bridge.hpp"
+#include "selected_status.hpp"
 #include "present_path.hpp"
 // The NGX Vulkan detours (second inclusion: the body, v8.1).
 #include "vulkan_path.hpp"
@@ -27884,8 +27885,7 @@ inline void OnHudOverlay(reshade::api::effect_runtime* runtime) {
   if (hud_overlay_open.load(std::memory_order_relaxed)) return;
   if (!hud_pill.load() && now_ns >= hud_toast_until_ns.load()
       && now_ns >= health_notice_until_ns.load() && now_ns >= profile_feedback_until_ns.load()) return;
-  const ui::StatusCard card = monitor_requested.load() ? MonitorDisplayCard() : ui::ComputeStatusCard(
-      CollectCardInputs());
+  const ui::StatusCard card = CurrentOutputCard(runtime);
   const bool pill = ui::ShowsOnHud(card);
   const int64_t toast_ns =
       hud_toast_until_ns.load(std::memory_order_relaxed) - now_ns;

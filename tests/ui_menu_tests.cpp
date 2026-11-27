@@ -589,7 +589,8 @@ int main() {
         const ui::StatusSummaryFields fields{
             .resolution = monitor_fixture->passes[0].actual_size,
             .stage = monitor_fixture->passes[0].execution_proof,
-            .gpu = monitor_fixture->passes[0].gpu_cost};
+            .gpu = monitor_fixture->passes[0].gpu_cost,
+            .fg = monitor_fixture->summary.fg};
         if (ui::DrawStatusSummary(monitor_fixture->card, monitor_fixture->recent.partial ? 1u : 0u, fields)) {
           synthetic_monitor_state.open = !synthetic_monitor_state.open;
         }
@@ -1315,6 +1316,13 @@ int main() {
       synthetic_monitor_state.detailed = true;
       try {
         frame();
+        if (inputs.card.fg_submitted_frames && inputs.card.frame_gen_multiplier > 1) {
+          check(std::ranges::any_of(rendered_text, [](const auto& item) {
+            return item.text == ui::Tr("NR submitted before FG");
+          }) && std::ranges::any_of(rendered_text, [&](const auto& item) {
+            return item.text.find(std::to_string(inputs.card.frame_gen_multiplier) + "x") != std::string::npos;
+          }), "real status/monitor widgets preserve selected before-FG title and multiplier");
+        }
       } catch (...) {
         monitor_fixture = saved_fixture;
         synthetic_monitor_state = saved_state;
@@ -1505,11 +1513,25 @@ int main() {
       sample.recorded_ns = sample.measured_ns;
       sample.identity.device_session = timers::device_session;
       runtime::comparison_ui::CaptureSettings(&sample.identity);
+      constexpr std::array<uintptr_t, 1> buffers{0xFC971};
+      namespace rates = renodx::addons::dlss5::output_framerate;
+      rates::RegisterPresentOutput(0xFC970, 0xFC999, 0xFC970, buffers);
+      const auto observed_output = rates::MatchPresentOutput(0xFC970, buffers[0]);
+      const auto saved_cadence = runtime::monitor_cadence;
+      const auto saved_synthetic = synthetic_monitor_state;
+      const auto* saved_fixture = monitor_fixture;
+      runtime::monitor_cadence.owner = runtime::monitor_runtime.load();
+      runtime::monitor_cadence.output = observed_output;
+      runtime::monitor_cadence.epoch = runtime::monitor_history_epoch.load();
+      sample.identity.display_output_generation = observed_output.generation;
       sample.samples = 1;
       sample.passes[0] = {.id = 0, .model = 1, .width = 640, .height = 360,
           .output_width = 640, .output_height = 360, .eval_us = 100,
           .state = timers::SampleState::VALID};
       runtime::monitor_snapshot.attempted_ns = 0;
+      synthetic_monitor_state.open = true;
+      synthetic_monitor_state.detailed = true;
+      monitor_fixture = &runtime::RefreshMonitorSnapshot(true).monitor;
       frame(); frame();
       const auto measured_pass = [](const TextItem& item) {
         return item.text.find("640x360") != std::string::npos
@@ -1518,10 +1540,16 @@ int main() {
       check(std::ranges::any_of(rendered_text, measured_pass), "details expose dimensions from a GPU-complete pass sample");
       sample.measured_ns -= 3'000'000'000;
       runtime::monitor_snapshot.attempted_ns = 0;
+      monitor_fixture = &runtime::RefreshMonitorSnapshot(true).monitor;
       frame(); frame();
       check(std::ranges::none_of(rendered_text, measured_pass), "details reject stale pass dimensions instead of showing configured values as actual");
       sample = original;
       runtime::enabled = was_enabled;
+      runtime::monitor_cadence = saved_cadence;
+      synthetic_monitor_state = saved_synthetic;
+      monitor_fixture = saved_fixture;
+      rates::DestroyPresentOutput(0xFC970);
+      frame();
     }
     click(find("status_open_diagnostics"));
     check(runtime::ui_menu_page == 2, "status details did not navigate to Diagnostics");

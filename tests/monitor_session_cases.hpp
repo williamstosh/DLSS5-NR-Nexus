@@ -576,6 +576,83 @@ void RunMonitorSessionCases(const Check& check, const Frame& frame) {
   check(r::live_effect_runtimes.size() == runtime_count && r::monitor_visible_preference.load() == visible_intent,
         "repeated runtime initialization keeps a single owner and cannot overwrite player intent");
 
+  // No graphics API: two normally registered output identities on the same
+  // fake device. A DXGI colour receipt is supplied only at the UI boundary,
+  // since this baseline does not publish ordinary matching consumer evidence.
+  constexpr std::array<uintptr_t, 1> buffer_a{0xFC901};
+  constexpr std::array<uintptr_t, 1> buffer_b{0xFC902};
+  addon::output_framerate::RegisterPresentOutput(0xFC801, 0xFC100, 0xFC801, buffer_a);
+  addon::output_framerate::RegisterPresentOutput(0xFC802, 0xFC100, 0xFC802, buffer_b);
+  const auto output_a = addon::output_framerate::MatchPresentOutput(0xFC801, buffer_a[0]);
+  const auto output_b = addon::output_framerate::MatchPresentOutput(0xFC802, buffer_b[0]);
+  restore_values.emplace_back([] {
+    addon::output_framerate::DestroyPresentOutput(0xFC801);
+    addon::output_framerate::DestroyPresentOutput(0xFC802);
+  });
+  check(output_a && output_b && output_a != output_b, "same-device windows have distinct output identities");
+  {
+    const auto now = r::SteadyNowNs();
+    const auto configuration = r::configuration_generation.load();
+    const auto reset = r::history_reset_epoch.load();
+    const r::present_frame_policy::Frame frame_a{.source = 31, .generation = 1, .sequence = 1};
+    const r::present_frame_policy::Frame frame_b{.source = 32, .generation = 1, .sequence = 1};
+    r::MonitorDelivery receipt{.output = output_a, .configuration = configuration, .reset_epoch = reset,
+        .frame = frame_a, .accepted_ns = now, .consumer = r::MonitorConsumer::DXGI};
+    ui::CardInputs session;
+    session.verdict.state = addon::NrState::kEngaged;
+    session.active_features = 16;  // Other outputs must not leak.
+    session.output_width = 9999;
+    timers::Stats b_execution;
+    b_execution.width = 1920;
+    b_execution.height = 1080;
+    b_execution.passes[0].width = 1280;
+    b_execution.passes[0].height = 720;
+    addon::output_framerate::Snapshot rate{.available = true, .observed_multiplier = 3., .output = output_b};
+    const auto render = [&](const addon::output_framerate::OutputIdentity& selected, uint64_t config,
+        const r::present_frame_policy::Frame& identity, const timers::Stats* execution) {
+      const auto matched = (r::CurrentMonitorDelivery(receipt, selected, config, reset, identity, now)
+          ? receipt : r::MonitorDelivery{});
+      return ui::ComputeStatusCard(r::ProjectSelectedCardInputs(session, true, execution, matched, rate));
+    };
+    check(render(output_a, configuration, frame_a, nullptr).id == ui::CardId::kActive,
+          "A confirmed DXGI colour is active");
+    const auto gpu_only = render(output_b, configuration, frame_b, &b_execution);
+    check(gpu_only.id != ui::CardId::kActive && gpu_only.input_width == 1280 && gpu_only.output_width == 1920,
+          "B GPU metadata is visible without borrowing A delivery or global dimensions");
+    receipt.output = output_b;
+    receipt.frame = frame_b;
+    check(render(output_b, configuration, frame_b, &b_execution).id == ui::CardId::kActive,
+          "matching B DXGI colour is active");
+    const auto reconfigured = render(output_b, configuration + 1, frame_b, nullptr);
+    check(reconfigured.id != ui::CardId::kActive && reconfigured.output_width == 0,
+          "B reconfigure withdraws old delivery and GPU sizes");
+    r::AcceptMonitorDelivery(&receipt, {.output = output_b, .configuration = configuration,
+        .reset_epoch = reset, .frame = frame_b, .consumer = r::MonitorConsumer::NATIVE_FG}, now);
+    const auto native = render(output_b, configuration, frame_b, &b_execution);
+    check(native.id == ui::CardId::kActive && native.present_before_fg && native.fg_submitted_frames == 1
+              && native.frame_gen_multiplier == 3 && std::string_view(native.title) == "NR submitted before FG",
+          "matching native return retains the real before-FG title and selected output multiplier");
+    r::AcceptMonitorDelivery(&receipt, {.output = output_b, .configuration = configuration,
+        .reset_epoch = reset, .frame = frame_b, .consumer = r::MonitorConsumer::XE_FG}, now);
+    const auto xefg = render(output_b, configuration, frame_b, &b_execution);
+    check(xefg.id == ui::CardId::kActive && xefg.present_before_fg && xefg.fg_submitted_frames == 1
+              && xefg.frame_gen_multiplier == 3 && std::string_view(xefg.title) == "NR submitted before FG",
+          "matching XeFG return retains the real title and multiplier without borrowing native counts");
+    rate.output = output_a;
+    check(render(output_b, configuration, frame_b, &b_execution).frame_gen_multiplier == 0,
+          "wrong-output FG rate cannot appear on the card");
+    ui::MonitorInputs fg_ui{.card = xefg, .now_ns = now};
+    fg_ui.summary.fg = "3x";
+    frame(fg_ui);
+    check(!r::CurrentMonitorDelivery(receipt, output_b, configuration, reset, frame_a, now)
+              && !r::CurrentMonitorDelivery(receipt, output_b, configuration, reset, frame_b,
+                  now + timers::internal::kSampleAgeNs + 1),
+          "consumer cannot cross source or age");
+  }
+  r::monitor_cadence.owner = r::monitor_runtime.load();
+  r::monitor_cadence.output = output_b;
+  r::monitor_cadence.epoch = r::monitor_history_epoch.load();
+
   // Synthetic published metadata, never a model invocation or measured GPU cost.
   static thread_local addon::gpu_comparison::Identity identity;
   static thread_local std::uint64_t identity_reads = 0;
@@ -584,6 +661,7 @@ void RunMonitorSessionCases(const Check& check, const Frame& frame) {
   identity = {.configuration_generation = r::configuration_generation.load(),
               .settings_hash = 17, .resolution_hash = 23};
   identity.device_session = timers::device_session;
+  identity.display_output_generation = output_b.generation;
   identity_reads = 0;
   timers::comparison_settings = +[](addon::gpu_comparison::Identity* output) {
     ++identity_reads;
@@ -606,6 +684,7 @@ void RunMonitorSessionCases(const Check& check, const Frame& frame) {
   check(plan.valid && plan.pass_count == 1, "fixture has a valid single-pass production stage plan");
   const auto stage = static_cast<std::size_t>(plan.effective[0]);
   auto& measured = timers::stage_stats[stage];
+  std::strcpy(measured.path, "postSR");
   measured.valid = true;
   measured.state = timers::SampleState::VALID;
   measured.measured_ns = r::SteadyNowNs();
@@ -622,6 +701,29 @@ void RunMonitorSessionCases(const Check& check, const Frame& frame) {
             && current.monitor.passes[0].gpu_state == ui::MonitorGpuState::CURRENT
             && current.monitor.passes[0].gpu_cost == "1.250 ms" && identity_reads != 0,
         "fresh production snapshot displays the exact current synthetic timestamp sample");
+  {
+    constexpr uint64_t source_generation = 372;
+    auto scoped = measured;
+    scoped.identity.source_generation = source_generation;
+    scoped.width = 3840;
+    scoped.height = 2160;
+    const r::AdaptiveCompletionKey scoped_key{output_b.generation, source_generation};
+    r::adaptive_completion_scopes[stage][scoped_key].retained = scoped;
+    r::PublishAdaptiveStatus({.display_output_generation = output_b.generation,
+        .display_source_generation = source_generation, .display_stage = static_cast<uint32_t>(stage)});
+    const auto saved_adaptive = r::nr_adaptive_enabled.exchange(true);
+    r::monitor_snapshot.attempted_ns = 0;
+    const auto compact = r::RefreshMonitorSnapshot(false);
+    check(!compact.complete && compact.adaptive_sources[stage] == source_generation
+              && compact.execution == addon::stage_plan::Name(plan.effective[0]),
+          "without F11 the real compact snapshot takes the selected adaptive completion");
+    r::nr_adaptive_enabled = saved_adaptive;
+    r::adaptive_completion_scopes[stage].erase(scoped_key);
+    {
+      std::unique_lock lock(r::adaptive_status.mutex);
+      r::adaptive_status.outputs.erase(output_b.generation);
+    }
+  }
   r::nr_cost_gpu_ms = 99.f;
   r::nr_cost_present_ms = 88.f;
   r::monitor_snapshot.attempted_ns = 0;
@@ -897,6 +999,8 @@ void RunMonitorSessionCases(const Check& check, const Frame& frame) {
     history.active = false;
   }
   render = {};
+  // F11 changed the synthetic census epoch; no runtime callback established it.
+  r::monitor_cadence.epoch = r::monitor_history_epoch.load();
   measured = saved_measured;
   r::stack_passes = 1;
   r::hook_point = r::kHookUpscaled;
@@ -945,6 +1049,7 @@ void RunMonitorSessionCases(const Check& check, const Frame& frame) {
   r::cost_meter_enabled = false;
   measured = {};
   auto& proof = timers::execution_stats[stage];
+  std::strcpy(proof.path, "postSR");
   proof.valid = true;
   proof.state = timers::SampleState::VALID;
   proof.measured_ns = r::SteadyNowNs();

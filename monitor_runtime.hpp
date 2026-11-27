@@ -173,7 +173,7 @@ inline void UpdateMonitorCadence(reshade::api::effect_runtime* runtime) {
   }
 }
 
-inline uint64_t MonitorSnapshotKey() {
+inline uint64_t MonitorSnapshotKey(const output_framerate::OutputIdentity& output = {}) {
   uint64_t key = 1469598103934665603ULL;
   const auto mix = [&](uint64_t value) { key = (key ^ value) * 1099511628211ULL; };
   mix(monitor_observation_epoch.load());
@@ -190,7 +190,13 @@ inline uint64_t MonitorSnapshotKey() {
   mix(stage_source_rr.load());
   mix(health_active_mask.load());
   mix(nr_runtime_fault.load());
-  mix(active_features.load());
+  mix(history_reset_epoch.load());
+  if (output.view != 0) {
+    mix(fg::xefg::Enabled(output));
+  } else if (output) {
+    mix(output_framerate::NativeBindingGeneration(output));
+    mix(output_framerate::NativeMode(output).value_or(UINT32_MAX));
+  }
   mix(ui_language_choice.load());
   return key;
 }
@@ -278,11 +284,59 @@ inline MonitorEditReuseResult ReadMonitorPresentEditReuse(const void* device, co
       stage_plan::Stage::PRESENT, now, generation, attempt_current ? attempt.rejected_ns : 0);
 }
 
+// Called only with runtime_mutex held; no submission or session rate is a
+// substitute for the corresponding SDK consumer's success.
+inline MonitorDelivery ReadSelectedMonitorDelivery(const output_framerate::OutputIdentity& output,
+    const stage_plan::Group& group, int64_t now) {
+  if (group.count == 0 || !output_framerate::IsCurrentOutput(output)) return {};
+  const auto configuration = configuration_generation.load();
+  const auto reset_epoch = history_reset_epoch.load();
+  const auto fence_done = [](ID3D12Fence* fence, uint64_t value) {
+    if (fence == nullptr || value == 0) return false;
+    const auto completed = fence->GetCompletedValue();
+    return completed != UINT64_MAX && completed >= value;
+  };
+  MonitorDelivery result;
+  for (const auto& [key, stream] : fg_service::streams) {
+    const auto& receipt = stream.monitor_delivery;
+    const auto& frame = stream.base_frame_clock.frame;
+    if (!stream.base_frame_clock.complete || frame.pass_begin != group.begin || frame.pass_count != group.count
+        || !CurrentMonitorDelivery(receipt, output, configuration, reset_epoch, frame, now)) continue;
+    if (key.first) {
+      const auto owner = present_streams.find(reinterpret_cast<const void*>(output.swapchain));
+      if (owner == present_streams.end() || owner->second.output != output
+          || receipt.consumer != MonitorConsumer::NATIVE_FG || output.view != 0 || output_framerate::NativeMode(output) == 0
+          || stream.native_options_generation != owner->second.native_options_revision
+          || stream.native_pending_parameters != nullptr || stream.native_pair_discarded || stream.native_pair_replayed
+          || !fence_done(stream.native_pair_completion.fence, stream.native_pair_completion_value)) continue;
+    } else {
+      if (receipt.consumer != MonitorConsumer::XE_FG || output.view == 0 || stream.service_stopped
+          || stream.awaiting_xefg_delivery || stream.application_frame != frame.sequence
+          || !fg::xefg::ServiceContextCurrent(key.second, stream.epoch) || !fg::xefg::Enabled(output)
+          || !std::ranges::any_of(stream.slots, [&](const auto& slot) {
+               return !slot.quarantined && slot.base_frame_group.complete
+                   && present_frame_policy::SameSource(frame, slot.base_frame) && frame.sequence == slot.base_frame.sequence
+                   && fence_done(stream.fence, slot.fence_value);
+             })) continue;
+    }
+    if (result.consumer != MonitorConsumer::NONE) return {};
+    result = receipt;
+  }
+  return result;
+}
+
+inline bool CurrentSelectedMonitorSample(const gpu_timers::Stats& sample, const stage_plan::Group& group,
+    const output_framerate::OutputIdentity& output, int64_t now, const gpu_comparison::Identity& settings) {
+  return output && sample.identity.display_output_generation == output.generation
+      && CurrentCompletedGroup(sample, group, now, &settings);
+}
+
 inline void InvalidateMonitorDisplay() {
   auto& cached = monitor_snapshot;
-  cached.verdict = ComputeNrVerdict(CollectFunnelInputs());
-  ui::CardInputs pending{.verdict = cached.verdict, .active_features = active_features.load()};
-  pending.recent = ui::RecentHealth{};
+  auto pending = ProjectSelectedCardInputs(
+      {.verdict = ComputeNrVerdict(CollectFunnelInputs())}, false, nullptr);
+  cached.verdict = pending.verdict;
+  cached.inputs = pending;
   pending.runtime_fault = static_cast<ui::RuntimeFault>(nr_runtime_fault.load());
   cached.card = ui::ComputeStatusCard(pending);
   if (cached.card.tone == ui::CardTone::kGood || cached.card.title[0] == 0) {
@@ -347,7 +401,7 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
   const auto& output = output_rate.output;
   const bool adaptive_sizing = nr_adaptive_enabled.load();
   std::array<uint64_t, 3> adaptive_sources{};
-  if (need_monitor && adaptive_sizing && output) {
+  if (adaptive_sizing && output) {
     for (size_t stage = 0; stage < adaptive_sources.size(); ++stage) {
       adaptive_sources[stage] = CopyAdaptiveStatus(output, static_cast<stage_plan::Stage>(stage), now)
           .display_source_generation;
@@ -364,7 +418,7 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
   cached.monitor.summary.fps = monitor_cadence.text;
   cached.summary.fps_tip = cached.monitor.summary.fps_tip = monitor_cadence.fps_tip;
   cached.card.frame_ms = cached.monitor.card.frame_ms = (frame_current ? frame.interval_ms : 0.f);
-  const auto key = MonitorSnapshotKey();
+  const auto key = MonitorSnapshotKey(output);
   const bool changed = key != cached.key || cached.output != output || cached.adaptive_sources != adaptive_sources;
   const bool edit_reuse_changed = need_monitor && cached.edit_reuse_revision
       != present_edit_reuse_monitor_revision.load(std::memory_order_acquire);
@@ -374,6 +428,14 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
   if (changed || now > cached.valid_until_ns
       || (cached.sampled_ns != 0 && now - cached.sampled_ns > ui::RecentHealthWindow::kStaleNs)) {
     InvalidateMonitorDisplay();
+    if (cached.output != output) {
+      monitor_history.latest = {};
+      monitor_history.contracts = {};
+      monitor_history.summed = {};
+      monitor_history.reset_cursor = true;
+      monitor_history.values.ClearCadence();
+      monitor_history.values.ClearGpu();
+    }
     cached.summary.fps = cached.monitor.summary.fps = monitor_cadence.text;
     cached.summary.fps_tip = cached.monitor.summary.fps_tip = monitor_cadence.fps_tip;
     cached.card.frame_ms = cached.monitor.card.frame_ms = (frame_current ? frame.interval_ms : 0.f);
@@ -406,9 +468,7 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
     monitor_history.consumed = gpu_timers::monitor_events.published;
     monitor_history.reset_cursor = false;
   }
-  const auto inputs = CollectCardInputs();
-  const auto& verdict = inputs.verdict;
-  auto card = ui::ComputeStatusCard(inputs);
+  const auto session_inputs = CollectCardInputs();
   const auto health_mask = health_active_mask.load();
   const auto plan = RequestedStagePlan();
   const auto queried = need_monitor ? QueryConfigurationCapability() : capability::Result{};
@@ -425,8 +485,8 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
   std::array<const gpu_timers::Stats*, 3> adaptive_completions{};
   for (size_t stage = 0; stage < timings.size(); ++stage) {
     const auto group = plan.At(static_cast<stage_plan::Stage>(stage));
-    timing_current[stage] = CurrentCompletedGroup(timings[stage], group, now, &current_identity);
-    proof_current[stage] = CurrentCompletedGroup(proofs[stage], group, now, &current_identity);
+    timing_current[stage] = CurrentSelectedMonitorSample(timings[stage], group, output, now, current_identity);
+    proof_current[stage] = CurrentSelectedMonitorSample(proofs[stage], group, output, now, current_identity);
     // A newer completion can prove a different working contract while an
     // older timed recording is still fresh. Do not attach its cost to that size.
     if (timing_current[stage] && proof_current[stage] && proofs[stage].sequence > timings[stage].sequence) {
@@ -440,8 +500,8 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
       }
     }
     completion_fallback[stage] = !timing_current[stage] && !proof_current[stage]
-        && CurrentCompletedGroup(completions[stage], group, now, &current_identity);
-    if (!need_monitor || !adaptive_sizing || !output) continue;
+        && CurrentSelectedMonitorSample(completions[stage], group, output, now, current_identity);
+    if (!adaptive_sizing || !output || group.count == 0) continue;
     // The publisher can change while the monitor waits for the runtime lock.
     cached.adaptive_sources[stage] = CopyAdaptiveStatus(output, group.stage, now).display_source_generation;
     const AdaptiveCompletionKey scope_key{output.generation, cached.adaptive_sources[stage]};
@@ -487,7 +547,8 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
       const size_t stage = gpu_timers::StageIndex(event.path);
       const auto group = plan.At(static_cast<stage_plan::Stage>(stage));
       if (group.count == 0) continue;
-      const bool current = CurrentGpuSample(event, now, &current_identity);
+      const bool current = output && event.identity.display_output_generation == output.generation
+            && CurrentGpuSample(event, now, &current_identity);
       const auto& previous = history.contracts[stage];
       bool same_contract = previous.sequence == 0 || (previous.identity == event.identity
           && previous.queue == event.queue && previous.width == event.width && previous.height == event.height);
@@ -519,7 +580,8 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
       bool all_new = true;
       for (uint32_t index = 0; index < plan.group_count; ++index) {
         const auto required = static_cast<size_t>(plan.groups[index].stage);
-        raw_current[required] = CurrentGpuSample(history.latest[required], now, &current_identity);
+        raw_current[required] = output && history.latest[required].identity.display_output_generation == output.generation
+            && CurrentGpuSample(history.latest[required], now, &current_identity);
         all_new &= history.latest[required].sequence > history.summed[required];
       }
       const auto raw_total = SummarizeMonitorGpu(plan, history.latest, raw_current, resolved_models);
@@ -539,18 +601,40 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
       }
     }
   }
+  const auto current_execution = [&](size_t stage) -> const gpu_timers::Stats* {
+    if (adaptive_sizing && adaptive_completions[stage] != nullptr) return adaptive_completions[stage];
+    if (proof_current[stage] && (!timing_current[stage] || proofs[stage].sequence > timings[stage].sequence)) {
+      return &proofs[stage];
+    }
+    if (timing_current[stage]) return &timings[stage];
+    if (completion_fallback[stage]) return &completions[stage];
+    return nullptr;
+  };
+  const auto& present_group = plan.At(stage_plan::Stage::PRESENT);
+  const auto delivery = (plan.valid ? ReadSelectedMonitorDelivery(output, present_group, now) : MonitorDelivery{});
+  const gpu_timers::Stats* first_execution = nullptr;
+  bool all_groups_executed = plan.valid && plan.group_count != 0;
+  for (uint32_t index = 0; index < plan.group_count; ++index) {
+    const auto& group = plan.groups[index];
+    const auto* found = current_execution(static_cast<size_t>(group.stage));
+    if (index == 0) first_execution = found;
+    all_groups_executed &= (found != nullptr);
+  }
+  const auto inputs = ProjectSelectedCardInputs(session_inputs, present_group.count != 0,
+      (all_groups_executed || present_group.count != 0 ? first_execution : nullptr), delivery, output_rate);
+  const auto& verdict = inputs.verdict;
+  auto card = ui::ComputeStatusCard(inputs);
+  if (present_group.count != 0 && current_execution(static_cast<size_t>(stage_plan::Stage::PRESENT)) != nullptr
+      && delivery.consumer == MonitorConsumer::NONE && inputs.verdict.state == NrState::kNotEngaged) {
+    ui::card_internal::Set(card, ui::CardId::kStarting, ui::CardTone::kIdle, ui::CardGlyph::kWaiting,
+        "GPU complete: single submission", "Pending confirmation");
+  }
   lock.unlock();
 
-  ui_fg_route.Update({.enabled = enabled.load(), .present = hook_point.load() == kHookPresent,
-      .prefg_active = present_prefg_active.load(), .upscaled_active = present_prefg_upscaled_active.load(),
-      .submitted_before_fg = inputs.fg_continuing_submission, .multiplier = inputs.frame_gen_multiplier,
-      .prefg_policy = present_pre_fg.load(), .frame_policy = present_frames.load(),
-      .prefg_frames = present_prefg_frames.load(), .prefg_evaluates = present_prefg_evaluates.load(),
-      .fallbacks = present_prefg_fallbacks.load(), .upscaled_frames = present_prefg_upscaled.load(),
-      .captures = present_captures.load(), .nr_successes = successful_evaluations.load() + successful_pre_sr_evaluations.load(),
-      .fg_submitted = TotalFgSubmittedFrames()}, now);
-  card.observed_fg_route = ui_fg_route.route;
-  card.fg_declared = fg::xefg::OwnsStream() || native_fg_declaration.load() == NativeFgDeclaration::kOn;
+  card.observed_fg_route = (inputs.present_before_fg ? ui::FgRoute::kBeforeFg : ui::FgRoute::kUnknown);
+  ui_fg_route.route = card.observed_fg_route;
+  card.fg_declared = output_framerate::IsCurrentOutput(output)
+      && (fg::xefg::Enabled(output) || output_framerate::NativeMode(output).value_or(0) != 0);
   unsigned warnings = card.tone == ui::CardTone::kWarn || card.tone == ui::CardTone::kBad ? 1u : 0u;
   for (size_t issue = 0; issue < health::kRowCount; ++issue) {
     warnings += ((health_mask >> issue) & 1u) != 0 && health::kRows[issue].tone == health::Tone::kWarn;
@@ -559,7 +643,7 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
   warnings += card.present_gaps != 0;
   std::string execution;
   for (size_t stage = 0; stage < timings.size(); ++stage) {
-    if (!timing_current[stage] && !proof_current[stage] && !completion_fallback[stage]) continue;
+    if (current_execution(stage) == nullptr) continue;
     if (!execution.empty()) execution += " + ";
     execution += ui::StageDisplayName(static_cast<stage_plan::Stage>(stage));
   }
@@ -785,6 +869,9 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
           row.model_adjustment_reason = ui::Tr(ModelRequestAdjustmentReason(models[pass], sample.model));
           row.execution_proof = ui::Tr("GPU complete: single submission");
           row.execution_confirmed = true;
+          if (plan.effective[pass] == stage_plan::Stage::PRESENT && delivery.consumer == MonitorConsumer::NONE) {
+            row.execution_proof += std::string("; ") + ui::Tr("Final presentation") + ": " + ui::Tr("Pending confirmation");
+          }
           row.actual_size = std::to_string(sample.width) + " x " + std::to_string(sample.height);
           if (completed->width != 0 && completed->height != 0) {
             row.actual_scale = static_cast<float>(sample.width) / completed->width;
@@ -846,13 +933,22 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
     if (adaptive_completions[stage] != nullptr) cached.valid_until_ns = (std::min)(cached.valid_until_ns,
         adaptive_completions[stage]->recorded_ns + gpu_timers::internal::kSampleAgeNs);
   }
+  if (delivery.consumer != MonitorConsumer::NONE) {
+    cached.valid_until_ns = (std::min)(cached.valid_until_ns, delivery.accepted_ns + gpu_timers::internal::kSampleAgeNs);
+  }
   cached.complete = need_monitor;
   ++cached.refreshes;
   return cached;
 }
 
-inline ui::StatusCard MonitorDisplayCard() {
-  return RefreshMonitorSnapshot(true).card;
+inline ui::StatusCard CurrentOutputCard(reshade::api::effect_runtime* runtime) {
+  // Never borrow another effect runtime's HUD, even on the same device.
+  if (runtime == nullptr || runtime != monitor_runtime.load()) {
+    return ui::ComputeStatusCard(ProjectSelectedCardInputs(
+        {.verdict = ComputeNrVerdict(CollectFunnelInputs())}, false, nullptr));
+  }
+  UpdateMonitorCadence(runtime);
+  return RefreshMonitorSnapshot(monitor_requested.load()).card;
 }
 
 inline void SaveMonitorVisibility() {
