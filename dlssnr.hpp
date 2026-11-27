@@ -2004,7 +2004,7 @@ inline constexpr uint32_t kPresentFrames = 0;
 // Auto reads DLSS-G's declared count, then falls back to stable timing.
 // 1 forces stable timing; 2 keeps the pre-hardening cadence rule.
 inline constexpr uint32_t kPresentFgSource = 0;
-// With DLSS-G (present_path.hpp, RunPresentPreFg): 1 = Auto, NR once per
+// With DLSS-G: 1 = Auto, NR once per
 // game frame on DLSS-G's input before it interpolates, whenever a DLSS-G
 // evaluate can be served (with a HUD-less frame: NR on it, the real frame
 // recomposed from it with the HUD kept, and a frame whose mask is not a HUD
@@ -5931,7 +5931,7 @@ inline constexpr int64_t kWorksetIdleRetireNs = 5'000'000'000;
 inline uint32_t worksets_idle_retired_logged = 0;
 inline uint64_t worksets_idle_retired = 0;
 // Exempt: the Present path's pre-FG back-buffer stream (present_path.hpp,
-// RunPresentPreFg) while the pre-FG path served a game frame within the last
+// native pre-FG recording) while the pre-FG path served a game frame within the last
 // second.  With a HUD-less frame the HUD composite keeps that stream idle
 // for as long as the composite is trusted; retired, the first two-pass frame
 // back would be its fresh stream's warm-up, and that real frame would reach
@@ -20956,9 +20956,7 @@ inline bool NativeEvaluateCanOwnPresent(const output_framerate::OutputIdentity& 
   return output ? output_framerate::NativeMode(output) != 0u : !native_fg_public_off.load(std::memory_order_acquire);
 }
 
-// present_path.hpp: NR on DLSS-G's input before its evaluate (NRPresentPreFg).
-// Returns the game's DLSSG.HUDLess when NR's stand-in replaced it in the block,
-// which RestorePresentPreFg puts back after the real evaluate.
+// Native pre-FG bindings retain the original inputs until the SDK evaluate returns.
 struct NativePreFgBindings {
   struct ColorBinding {
     Microsoft::WRL::ComPtr<ID3D12Resource> original;
@@ -20991,11 +20989,8 @@ inline void OnNativeFgFeatureReleased(const NVSDK_NGX_Handle* handle);
 inline bool RecoverNativePreFgParameters(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Parameter* parameters);
 inline uint64_t NativePreFgParameterBorrowSerial(const NVSDK_NGX_Parameter* parameters);
 inline void RetireNativePreFgParameters(const NVSDK_NGX_Parameter* parameters, uint64_t serial);
-inline ID3D12Resource* RunPresentPreFg(ID3D12GraphicsCommandList* command_list,
-                                       const NVSDK_NGX_Parameter* parameters);
 inline void ObservePresentFrameGeneration(const NVSDK_NGX_Parameter* parameters);
 inline void ObservePresentDlssEvaluate(const NVSDK_NGX_Parameter* parameters);
-inline void RestorePresentPreFg(const NVSDK_NGX_Parameter* parameters, ID3D12Resource* hudless);
 
 // `parameters` null: a Direct3D 11 block (no DLSS-G there), by handle only.
 inline bool RegisteredDlssEvaluate(const NVSDK_NGX_Handle* handle,
