@@ -1150,6 +1150,7 @@ struct EvaluationContract {
   // correction whatever the pass's own steering says.
   bool ui_correction = false;
   uint32_t diagnostic_model_ui = 0;
+  std::optional<bool> synthetic_depth_inverted;
 };
 
 // What the Present hook point changes in the after path (ProcessInline's
@@ -1191,6 +1192,8 @@ struct PresentTarget {
   // Ordinary source tracking distinguishes compatible NR guides from depth
   // matching this color. Other adapters retain their existing guide contract.
   std::optional<bool> depth_matches_color;
+  // XeFG's private fill and its Evaluate share one depth convention.
+  std::optional<bool> synthetic_depth_inverted;
   // Borrowed from the Present slot through submission completion. Its first
   // uint is finalized under the queue's submit lock before ExecuteCommandLists.
   ID3D12Resource* control_mask_depth_proof = nullptr;
@@ -9552,7 +9555,8 @@ inline void ClearControlMaskBinding(NrFeatureSlot& slot) {
 inline void SetModelParameters(NrFeatureSlot& slot, uint32_t slot_index,
                                uint64_t chain_reset_epoch, uint32_t create_flags,
                                int32_t frame_reset, bool frame_ui_correction,
-                               uint32_t diagnostic_model_ui = 0);
+                               uint32_t diagnostic_model_ui = 0,
+                               std::optional<bool> synthetic_depth_inverted = std::nullopt);
 inline void SetEvaluationParameters(
     FeatureState& state,
     NrFeatureSlot& slot,
@@ -9643,7 +9647,7 @@ inline void SetEvaluationParameters(
     slot.jitter_bound = frame.has_jitter;
   }
   SetModelParameters(slot, slot_index, chain_reset_epoch, frame.create_flags,
-                     frame.frame_reset, frame.ui_correction, frame.diagnostic_model_ui);
+                     frame.frame_reset, frame.ui_correction, frame.diagnostic_model_ui, frame.synthetic_depth_inverted);
 }
 
 // The depth convention, the reset and the model steering of one evaluate:
@@ -9686,12 +9690,11 @@ inline EffectiveModelSteering ReadModelSteering(uint32_t pass, SkinSteering* req
 inline void SetModelParameters(NrFeatureSlot& slot, uint32_t slot_index,
                                uint64_t chain_reset_epoch, uint32_t create_flags,
                                int32_t frame_reset, bool frame_ui_correction,
-                               uint32_t diagnostic_model_ui) {
+                               uint32_t diagnostic_model_ui, std::optional<bool> synthetic_depth_inverted) {
   NVSDK_NGX_Parameter* parameters = slot.parameters;
-  NVSDK_NGX_Parameter_SetI(
-      parameters,
-      "DLSSNR.DepthInverted",
-      ResolveDepthInverted(create_flags) ? 1 : 0);
+  const bool depth_inverted = (synthetic_depth_inverted.has_value()
+      ? *synthetic_depth_inverted : ResolveDepthInverted(create_flags));
+  NVSDK_NGX_Parameter_SetI(parameters, "DLSSNR.DepthInverted", (depth_inverted ? 1 : 0));
   NVSDK_NGX_Parameter_SetI(parameters, "DLSSNR.Enabled", 1);
   // Reset semantics with stacking (v5.3 epoch model; see reset_epoch.hpp):
   // the chain's reset epoch is resolved once before the pass loop and every
@@ -10718,7 +10721,7 @@ inline bool DispatchControlMask(
       width, height, parameters.mode, width / 2, height / 2,
       parameters.rgb[0], parameters.rgb[1], parameters.rgb[2],
       frame.depth_x, frame.depth_y, depth_usable ? frame.input_width : 0u, depth_usable ? frame.input_height : 0u,
-      ResolveDepthInverted(frame.create_flags) ? 1u : 0u,
+      (frame.synthetic_depth_inverted.has_value() ? *frame.synthetic_depth_inverted : ResolveDepthInverted(frame.create_flags)) ? 1u : 0u,
       parameters.depth_near, parameters.depth_far, motion_usable ? 1u : 0u,
       frame.motion_x, frame.motion_y, frame.motion_width, frame.motion_height,
       motion_usable ? motion_scale_x : 0.f, motion_usable ? motion_scale_y : 0.f,
@@ -16677,6 +16680,9 @@ inline bool RecordInline(
   frame.depth_x = current.depth_x;
   frame.depth_y = current.depth_y;
   frame.create_flags = feature.create_flags;
+  if (present != nullptr) {
+    frame.synthetic_depth_inverted = present->synthetic_depth_inverted;
+  }
   // The display grid of the after path is the DLSS output rect.
   const MotionWindow motion_window = ResolveMotionWindow(
       frame.create_flags, frame.motion_x, frame.motion_y, frame.input_width,

@@ -397,11 +397,12 @@
         { "suite": "fg-native", "name": "xefg-present-handoff", "log": "xefg-present-handoff",
           "receipt": "^PASS xefg-present-handoff evidence=WARP\\+MOCK passes=1 same_backbuffer=1 full_rgba=1$",
           "existingTrace": true,
-          "scenarios": ["present-handoff", "ordinary-present-receipt", "ordinary-receipt-game-reset"],
+          "scenarios": ["present-handoff", "ordinary-present-receipt", "ordinary-receipt-game-reset", "load-neutral-continuity"],
           "expect": {
             "present-handoff": "^PASS xefg-present-handoff evidence=WARP\\+MOCK passes=1 same_backbuffer=1 full_rgba=1$",
             "ordinary-present-receipt": "^PASS xefg-ordinary-present-receipt evidence=WARP\\+MOCK same_version=1 next_version=1 sdk_failure=1 late_end=1 distinct_output=1 hudless_conflict=1 no_sdk_finish=1$",
-            "ordinary-receipt-game-reset": "^PASS xefg-ordinary-receipt-game-reset evidence=WARP\\+MOCK game_reset_delta=1 same_version_write=1 sdk_writes=0 next_version_reset=1$"
+            "ordinary-receipt-game-reset": "^PASS xefg-ordinary-receipt-game-reset evidence=WARP\\+MOCK game_reset_delta=1 same_version_write=1 sdk_writes=0 next_version_reset=1$",
+            "load-neutral-continuity": "^PASS xefg-load-neutral-guides evidence=WARP\\+MOCK continuity=1 two_pass=1 actual_pixels=1 depth_modes=1 game_reset=1 true_rebuild=1$"
           } },
         { "suite": "fg-native", "name": "xefg-ordinary-receipt-first-signal", "log": "xefg-ordinary-receipt-first-signal",
           "receipt": "^PASS xefg-ordinary-receipt-first-signal evidence=WARP\\+MOCK first_proof=failed owner_fence=complete claim=conflict single_write=1$",

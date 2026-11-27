@@ -807,6 +807,268 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
     other_sdk.CloseSdk();
   }
 
+  {
+    Check(Hooks::Enable(session.handle, 0) == 0, "release the earlier SDK fixture before the load contract");
+    funnel_accounting_tests::Restore load_restore;
+    load_restore.Atomic(&native::stack_passes);
+    load_restore.Atomic(&native::pass_stage[0]);
+    load_restore.Atomic(&native::depth_mode);
+    load_restore.Value(&model_parameter_observer);
+    load_restore.Value(&nr_edit_reuse_xefg_cases::consume_sdk_present);
+    native::stack_passes = 2;
+    native::pass_stage[0] = 0;
+
+    constexpr uint32_t inverted_flag = NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
+    constexpr uint32_t low_motion_flag = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
+    constexpr uint32_t guide_flags = inverted_flag | low_motion_flag | NVSDK_NGX_DLSS_Feature_Flags_MVJittered;
+    const auto low_depth = gpu.Texture(size / 2, size / 2, DXGI_FORMAT_R32_FLOAT);
+    const auto low_motion = gpu.Texture(size / 2, size / 2, DXGI_FORMAT_R16G16_FLOAT);
+    struct GuideReceipt {
+      ComPtr<ID3D12Resource> depth;
+      ComPtr<ID3D12Resource> motion;
+      uint32_t create_flags = 0;
+      uint32_t model_creation = 0;
+      int depth_inverted = -1;
+      int reset = -1;
+      std::vector<uint8_t> depth_bytes;
+      std::vector<uint8_t> motion_bytes;
+    };
+    struct LoadReceipt {
+      fg::Result result = fg::Result::NOT_SERVED;
+      uint64_t deliveries = 0;
+      uint32_t creates = 0;
+      uint32_t evaluates = 0;
+      uint64_t game_resets = 0;
+      std::vector<uint8_t> pixels;
+      std::vector<GuideReceipt> guides;
+    };
+    const auto uniform = [](const std::vector<uint8_t>& bytes, const auto& expected, size_t samples) {
+      const auto* value = reinterpret_cast<const uint8_t*>(&expected);
+      if (bytes.size() != sizeof(expected) * samples) return false;
+      for (size_t offset = 0; offset < bytes.size(); offset += sizeof(expected)) {
+        if (!std::equal(value, value + sizeof(expected), bytes.begin() + offset)) return false;
+      }
+      return true;
+    };
+    auto& game_resets = native::history_reset_counts[static_cast<size_t>(native::HistoryResetSource::kGameReset)];
+    for (const bool sdk_inverted : {false, true}) {
+      native::depth_mode = 0;
+      Session load(&gpu, 0, sdk_inverted ? 1u : 0u);
+      load.context->ui_composition = false;
+      load.extent_top = load.extent_left = 0;
+      load.extent_height = load.extent_width = size;
+      ComPtr<ID3D12Resource> load_back;
+      Check(SUCCEEDED(load.proxy->GetBuffer(load.proxy->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&load_back)))
+                && load_back.Get() != back.Get(), "load contract owns a real, independent DXGI backbuffer");
+      Check(Hooks::Enable(load.handle, 0) == 0 && Hooks::Enable(load.handle, 1) == 0,
+            "new load contract is enabled through the actual SDK hook");
+      const auto epoch = load.context->epoch;
+      const auto output = load.context->output_identity;
+      Check(static_cast<bool>(output), "load fixture has a registered XeFG output");
+      const auto native_back = renodx::utils::directx::NativeIdentity(load_back.Get());
+      Check(!addon::output_framerate::MatchPresentColorOwner(output, reinterpret_cast<uintptr_t>(native_back)),
+            "load contract exercises the private XeFG guide path without an ordinary warm group");
+      const auto sdk_flags = (sdk_inverted ? inverted_flag : 0u);
+      std::vector<GuideReceipt> evaluated;
+      std::vector<uint8_t> sdk_pixels;
+      bool read_guides = false;
+      model_parameter_observer = [&](const NVSDK_NGX_Handle* model, const NVSDK_NGX_Parameter* block) {
+        GuideReceipt binding;
+        binding.depth = native::GetD3D12Resource(block, "DLSSNR.Depth");
+        binding.motion = native::GetD3D12Resource(block, "DLSSNR.MVec");
+        binding.create_flags = model_create_flags.at(model);
+        binding.model_creation = *reinterpret_cast<const uint32_t*>(model);
+        binding.depth_inverted = native::GetInt(block, "DLSSNR.DepthInverted", -1);
+        binding.reset = native::GetInt(block, "DLSSNR.Reset", -1);
+        evaluated.push_back(std::move(binding));
+      };
+      nr_edit_reuse_xefg_cases::consume_sdk_present = [&](IDXGISwapChain* sdk_output) {
+        ComPtr<ID3D12Resource> current;
+        Check(sdk_output == load.proxy.Get()
+                  && SUCCEEDED(load.proxy->GetBuffer(load.proxy->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&current)))
+                  && current.Get() == load_back.Get(), "SDK consumes the same freshly produced load color");
+        const auto color_snapshot = Capture(gpu, current.Get(), present_state);
+        std::vector<std::pair<d3d12_test::TextureTransfer, d3d12_test::TextureTransfer>> guide_copies;
+        if (read_guides) {
+          for (const auto& binding : evaluated) {
+            Check(binding.depth != nullptr && binding.motion != nullptr
+                      && binding.depth->GetDesc().Format == DXGI_FORMAT_R32_FLOAT
+                      && binding.motion->GetDesc().Format == DXGI_FORMAT_R16G16_FLOAT,
+                  "the actual model bindings carry the expected scalar depth and two-lane motion formats");
+            auto& [depth_copy, motion_copy] = guide_copies.emplace_back(
+                gpu.CreateTextureTransfer(binding.depth.Get()), gpu.CreateTextureTransfer(binding.motion.Get()));
+            const bool real = binding.depth.Get() == depths[1].Get();
+            const auto resting = (real ? present_state : NATIVE_INPUT_STATE);
+            for (const auto& [texture, copy] : {std::pair{binding.depth.Get(), &depth_copy},
+                                               std::pair{binding.motion.Get(), &motion_copy}}) {
+              gpu.Transition(texture, resting, D3D12_RESOURCE_STATE_COPY_SOURCE);
+              gpu.RecordTextureReadback(texture, *copy);
+              gpu.Transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, resting);
+            }
+          }
+        }
+        submit();
+        sdk_pixels = color_snapshot.Pixels();
+        for (size_t pass = 0; pass < guide_copies.size(); ++pass) {
+          evaluated[pass].depth_bytes = gpu.ReadTexture(guide_copies[pass].first);
+          evaluated[pass].motion_bytes = gpu.ReadTexture(guide_copies[pass].second);
+        }
+      };
+      const auto present_load = [&](const char* phase, Pixel pixel, int guides, bool game_reset, bool inspect) {
+        produce(load_back.Get(), pixel, -1, false);
+        evaluated.clear();
+        sdk_pixels.clear();
+        read_guides = inspect;
+        const auto creates = next_handle;
+        const auto calls = model_calls;
+        const auto deliveries = xefg::SubmittedFrames();
+        const auto resets = game_resets.load();
+        const auto frame_before = load.context->application_frame;
+        if (guides == 2) {
+          ++present_id;
+          load.Tag(present_id, DEPTH, low_depth.Get());
+          load.Tag(present_id, MOTION, low_motion.Get());
+          const xefg::abi::Constants constants{.motion_scale_x = 1.f, .motion_scale_y = 1.f, .frame_time_ms = 16.5f};
+          Check(Hooks::Constants(load.handle, present_id, &constants) == 0, "fresh smaller-guide constants");
+          load.Present(present_id);
+        } else {
+          sdk_present(&load, guides, game_reset);
+        }
+        LoadReceipt receipt{.result = xefg::CurrentResult(), .deliveries = xefg::SubmittedFrames() - deliveries,
+            .creates = next_handle - creates, .evaluates = model_calls - calls, .game_resets = game_resets.load() - resets,
+            .pixels = std::move(sdk_pixels), .guides = std::move(evaluated)};
+        Check(load.context->enabled && load.context->epoch == epoch && load.context->output_identity == output
+                  && load.context->application_frame == frame_before + 1 && !receipt.pixels.empty(),
+              "one real SDK input and consumption on the same live output/context/epoch");
+        std::cout << "XEFG_LOAD_NEUTRAL_GUIDES " << nlohmann::json{
+            {"phase", phase}, {"sdk_inverted", sdk_inverted}, {"output_generation", output.generation},
+            {"epoch", epoch}, {"application_frame", load.context->application_frame}, {"guides", guides},
+            {"creates", receipt.creates}, {"evaluates", receipt.evaluates}, {"sdk_deliveries", receipt.deliveries},
+            {"result", static_cast<unsigned>(receipt.result)}, {"game_resets", receipt.game_resets},
+            {"first_consumed_rgba", std::array{receipt.pixels[0], receipt.pixels[1], receipt.pixels[2], receipt.pixels[3]}},
+            {"full_rgba_nr", receipt.pixels == expected_pixels(pixel, true)}}.dump() << std::endl;
+        return receipt;
+      };
+      const auto delivered = [&](const LoadReceipt& current, Pixel pixel) {
+        return current.result == fg::Result::SUBMITTED && current.deliveries == 1 && current.evaluates == 2
+            && current.guides.size() == 2 && current.pixels == expected_pixels(pixel, true);
+      };
+      const auto stable = [&](const LoadReceipt& current, Pixel pixel, int reset, uint64_t game_reset) {
+        Check(delivered(current, pixel) && current.creates == 0 && current.game_resets == game_reset
+                  && std::ranges::all_of(current.guides, [&](const auto& binding) { return binding.reset == reset; }),
+              "mature two-pass XeFG keeps both models, resets only as expected, and delivers exact current RGBA");
+      };
+      const auto verify_guides = [&](const LoadReceipt& use, bool real, bool interpreted_inverted) {
+        Check(use.guides.size() == 2, "both model evaluations expose their actual consumed guides");
+        for (const auto& binding : use.guides) {
+          const float expected_depth = (real ? .75f : (interpreted_inverted ? 0.f : 1.f));
+          const std::array<uint16_t, 2> expected_motion{static_cast<uint16_t>(real ? 0x3c00u : 0u), 0};
+          Check((binding.create_flags & guide_flags) == sdk_flags
+                    && binding.depth_inverted == static_cast<int>(interpreted_inverted),
+                "model creation keeps SDK depth and excludes inferred motion bits; Evaluate honors DepthMode");
+          Check((binding.depth.Get() == depths[1].Get()) == real && (binding.motion.Get() == motions[1].Get()) == real
+                    && uniform(binding.depth_bytes, expected_depth, size * size)
+                    && uniform(binding.motion_bytes, expected_motion, size * size),
+                "WARP readback at SDK consumption proves the bound far-plane depth/zero motion or unchanged real guides");
+          std::cout << "XEFG_LOAD_BOUND_GUIDE " << nlohmann::json{
+              {"real", real}, {"depth", expected_depth}, {"motion_bits", expected_motion},
+              {"create_flags", binding.create_flags}, {"depth_inverted", binding.depth_inverted},
+              {"reset", binding.reset}, {"samples_proven", size * size}}.dump() << std::endl;
+        }
+      };
+      bool warmed = false;
+      for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8u && !warmed; ++attempt) {
+        warmed = delivered(present_load("load-neutral-warm", scene_a, -1, false, false), scene_a);
+      }
+      Check(warmed, "two-pass load fixture completes cold preparation before the continuity measurement");
+
+      const auto no_guides = present_load("no-guides", menu, -1, false, true);
+      stable(no_guides, menu, 0, 0);
+      const auto fresh_guides = present_load("fresh-guides", scene_b, 1, false, true);
+      stable(fresh_guides, scene_b, 1, 0);
+      const auto no_guides_again = present_load("no-guides-again", scene_a, -1, false, true);
+      stable(no_guides_again, scene_a, 1, 0);
+      const auto guides_return = present_load("fresh-guides-return", menu, 1, false, true);
+      stable(guides_return, menu, 1, 0);
+      verify_guides(no_guides, false, sdk_inverted);
+      verify_guides(fresh_guides, true, sdk_inverted);
+      verify_guides(no_guides_again, false, sdk_inverted);
+      verify_guides(guides_return, true, sdk_inverted);
+      const auto explicit_reset = present_load("explicit-game-reset", scene_b, 1, true, false);
+      stable(explicit_reset, scene_b, 1, 1);
+
+      native::depth_mode = (sdk_inverted ? 1u : 2u);
+      const auto forced = present_load("opposite-depth-mode-neutral", scene_a, -1, false, true);
+      stable(forced, scene_a, 1, 0);
+      verify_guides(forced, false, !sdk_inverted);
+      const auto forced_repeat = present_load("same-forced-depth-neutral-reuse", scene_b, -1, false, true);
+      stable(forced_repeat, scene_b, 0, 0);
+      verify_guides(forced_repeat, false, !sdk_inverted);
+      const auto forced_real = present_load("opposite-depth-mode-real-unchanged", menu, 1, false, true);
+      stable(forced_real, menu, 1, 0);
+      verify_guides(forced_real, true, !sdk_inverted);
+      native::depth_mode = 0;
+      const auto automatic = present_load("restore-auto-depth-on-same-neutral-pair", scene_b, -1, false, true);
+      stable(automatic, scene_b, 1, 0);
+      verify_guides(automatic, false, sdk_inverted);
+
+      if (!sdk_inverted) {
+        const auto game_pixel = expected_pixels(scene_a, false);
+        load.extent_height = load.extent_width = size / 2;
+        auto seed_low = [&](ID3D12Resource* target, const auto& pixel) {
+          const std::vector values((size / 2) * (size / 2), pixel);
+          auto transfer = gpu.CreateTextureTransfer(target);
+          gpu.Transition(target, present_state, D3D12_RESOURCE_STATE_COPY_DEST);
+          gpu.UploadTexture(target, transfer, reinterpret_cast<const uint8_t*>(values.data()),
+                            values.size() * sizeof(pixel), (size / 2) * sizeof(pixel));
+          gpu.Transition(target, D3D12_RESOURCE_STATE_COPY_DEST, present_state);
+        };
+        seed_low(low_depth.Get(), .25f);
+        seed_low(low_motion.Get(), std::array<uint16_t, 2>{0, 0});
+        submit();
+        bool new_mature = false;
+        const uint32_t previous_models = next_handle;
+        std::array<bool, 2> first_eval_with_reset{};
+        for (uint32_t attempt = 0; attempt < native::kContractDebounceFrames + 8u && !new_mature; ++attempt) {
+          const uint32_t ready_models = next_handle;
+          const auto changed = present_load("genuinely-smaller-guide-contract", scene_a, 2, false, false);
+          for (const auto& binding : changed.guides) {
+            Check(binding.model_creation > previous_models && binding.model_creation <= previous_models + 2
+                      && binding.model_creation <= ready_models
+                      && (binding.create_flags & guide_flags) == low_motion_flag,
+                  "only a newly contracted model created on a previous recording can evaluate");
+            const uint32_t idx = binding.model_creation - previous_models - 1;
+            if (!first_eval_with_reset[idx]) {
+              Check(binding.reset == 1, "each rebuilt model resets on its own first evaluation");
+              first_eval_with_reset[idx] = true;
+            }
+          }
+          if (changed.evaluates == 0) {
+            Check(changed.deliveries == 0 && changed.pixels == game_pixel
+                      && (changed.creates == 0 || changed.result == fg::Result::PREPARED),
+                  "with no mature pass the SDK consumes the exact original frame");
+          } else {
+            // An already mature first pass may serve the current frame while
+            // the second slot is created. It must never evaluate the new slot.
+            Check(changed.deliveries == 1 && changed.result == fg::Result::SUBMITTED
+                      && changed.pixels == expected_pixels(scene_a, true),
+                  "the SDK consumes the exact current mature result, never a just-created slot");
+          }
+          if (delivered(changed, scene_a)) {
+            Check(next_handle == previous_models + 2 && changed.creates == 0
+                      && std::ranges::all_of(first_eval_with_reset, [](bool seen) { return seen; }),
+                  "a true contract change rebuilds both models and recovers mature two-pass delivery");
+            new_mature = true;
+          }
+        }
+        Check(new_mature, "the changed creation contract achieves real two-pass delivery");
+      }
+      load.CloseSdk();
+    }
+    std::cout << "PASS xefg-load-neutral-guides evidence=WARP+MOCK continuity=1 two_pass=1 actual_pixels=1"
+                 " depth_modes=1 game_reset=1 true_rebuild=1" << std::endl;
+  }
+
   const auto create_list = [&] {
     ExternalList external;
     Check(SUCCEEDED(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,

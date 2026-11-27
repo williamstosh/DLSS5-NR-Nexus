@@ -41,6 +41,7 @@ struct Slot {
   bool color_inputs_prepared = false;
   bool pipeline_pending = false;
   bool model_preparation_pending = false;
+  std::optional<bool> recorded_neutral_depth_inverted;
   uint64_t fence_value = 0;
   bool quarantined = false;
 };
@@ -114,6 +115,7 @@ struct Stream {
   bool has_frame = false;
   fg::Result result = fg::Result::NOT_SERVED;
   PresentStream roles[2];
+  std::optional<bool> submitted_neutral_depth_inverted;
   // Native inputs live as long as the game's replayable list generations,
   // which need not fit the private XeFG queue's three-slot ring. Appending
   // must preserve cached MFG slot addresses.
@@ -599,6 +601,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
   slot->color_inputs_prepared = false;
   slot->pipeline_pending = false;
   slot->model_preparation_pending = false;
+  slot->recorded_neutral_depth_inverted.reset();
   const PipelinePreparationScope pipeline_scope;
   ResolveAdaptiveBorrowedDeliveries();
   if (!enabled.load(std::memory_order_relaxed)) return fg::Result::NOT_SERVED;
@@ -651,7 +654,10 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
   contract.has_motion_scale_y = true;
   contract.motion_scale_x = (real_guides ? input.motion_scale_x : static_cast<float>(input.color_width));
   contract.motion_scale_y = (real_guides ? input.motion_scale_y : static_cast<float>(input.color_height));
-  contract.create_flags = (real_guides ? input.init_flags : NVSDK_NGX_DLSS_Feature_Flags_DepthInverted);
+  constexpr uint32_t kDepthInverted = NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
+  // Missing XeFG guide extents do not imply low-resolution or jittered motion.
+  contract.create_flags = (real_guides ? input.init_flags
+      : (service_scope != nullptr ? (input.init_flags & kDepthInverted) : kDepthInverted));
   PresentStream* shared_color = nullptr;
   bool prepare_shared_color = false;
   bool warm_neutral = false;
@@ -971,14 +977,22 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     stream->adaptive_frame.slot = static_cast<uint32_t>(slot);
     stream->adaptive_frame.sizes = stream->adaptive_session->ladder.sizes[slot];
   }
+  const bool private_xefg_neutral = (!real_guides && !warm_neutral && service_scope != nullptr);
+  const std::optional<bool> synthetic_depth_inverted = (private_xefg_neutral
+      ? std::optional{ResolveDepthInverted(contract.create_flags)} : std::nullopt);
   if (!real_guides && !warm_neutral) {
     auto& role = stream->roles[0];
+    const auto flags = (private_xefg_neutral ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_NONE);
     for (auto [surface, format] : {std::pair{&role.neutral_motion, DXGI_FORMAT_R16G16_FLOAT},
-                                 std::pair{&role.neutral_depth, DXGI_FORMAT_R32_FLOAT}}) {
+                                  std::pair{&role.neutral_depth, DXGI_FORMAT_R32_FLOAT}}) {
       if (*surface != nullptr && ((*surface)->GetDesc().Width != input.color_width
-          || (*surface)->GetDesc().Height != input.color_height)) RetirePresentResource(surface);
-      if (*surface == nullptr && !CreateScratchTexture(stream->device, input.color_width, input.color_height,
-          format, D3D12_RESOURCE_FLAG_NONE, kRead, surface, L"DLSS5 FG neutral NR guides")) {
+          || (*surface)->GetDesc().Height != input.color_height)) {
+        RetirePresentResource(surface);
+      }
+      if (*surface != nullptr) continue;
+      stream->submitted_neutral_depth_inverted.reset();
+      if (!CreateScratchTexture(stream->device, input.color_width, input.color_height,
+                                format, flags, kRead, surface, L"DLSS5 FG neutral NR guides")) {
         return fg::Result::FAILED;
       }
     }
@@ -996,6 +1010,24 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
       || motion == input.hudless || depth == input.hudless) return fg::Result::NOT_SERVED;
   submission::TrackUse(list, motion);
   submission::TrackUse(list, depth);
+  if (synthetic_depth_inverted.has_value() && synthetic_depth_inverted != stream->submitted_neutral_depth_inverted) {
+    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV, .NumDescriptors = 1};
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;
+    if (FAILED(stream->device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)))) {
+      return fg::Result::FAILED;
+    }
+    // CPU-only RTVs are consumed by the recording; the tracked textures outlive the queue use.
+    const auto rtv = heap->GetCPUDescriptorHandleForHeapStart();
+    const float depth_far = (*synthetic_depth_inverted ? 0.f : 1.f);
+    for (const auto& [resource, value] : {std::pair{motion, 0.f}, std::pair{depth, depth_far}}) {
+      const float clear[4]{value};
+      stream->device->CreateRenderTargetView(resource, nullptr, rtv);
+      Transition(list, resource, kRead, D3D12_RESOURCE_STATE_RENDER_TARGET, 0u);
+      list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+      Transition(list, resource, D3D12_RESOURCE_STATE_RENDER_TARGET, kRead, 0u);
+    }
+    slot->recorded_neutral_depth_inverted = synthetic_depth_inverted;
+  }
   Transition(list, motion, motion_state, kRead, 0u);
   Transition(list, depth, depth_state, kRead, 0u);
   const auto restore_guides = [&] {
@@ -1066,6 +1098,7 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
     role.parameters.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, warm_neutral ? 0.f : input.jitter_y);
     PresentTarget target = base;
     target.base_frame = base_frame;
+    target.synthetic_depth_inverted = synthetic_depth_inverted;
     target.adaptive_output = input.output;
     target.native_fg_inputs = native_parameters != nullptr;
     auto adaptive_role = stream->adaptive_frame;
@@ -1980,6 +2013,12 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     stream.warm_color_owner = {};
     const auto recorded = Record(&stream, slot, slot->list, nr_input, target,
                                  &output_ready, &recordings, exact_ui ? &composition : nullptr, true, &input, &warm_owner);
+    const auto submit_neutral_guides = [&](bool signaled) {
+      // The next recording uses the same queue; a cancelled or unproven fill cannot prime it.
+      if (slot->recorded_neutral_depth_inverted.has_value()) {
+        stream.submitted_neutral_depth_inverted = (signaled ? slot->recorded_neutral_depth_inverted : std::nullopt);
+      }
+    };
     uint32_t process_calls = 0;
     uint32_t evaluates = 0;
     uint32_t hudless_processes = 0;
@@ -2034,7 +2073,11 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
         }
         submitted = true;
         slot->fence_value = ++stream.submitted;
-        if (FAILED(queue->Signal(stream.fence, slot->fence_value))) slot->quarantined = true;
+        const bool signaled = SUCCEEDED(queue->Signal(stream.fence, slot->fence_value));
+        submit_neutral_guides(signaled);
+        if (!signaled) {
+          slot->quarantined = true;
+        }
         submission::DiscardOwnedRecording(slot->list, submission::RecordingOwner::kXeFg);
       }
       stream.result = (slot->quarantined ? fg::Result::FAILED : recorded);
@@ -2107,6 +2150,7 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     submitted = true;
     slot->fence_value = ++stream.submitted;
     const bool signaled = SUCCEEDED(queue->Signal(stream.fence, slot->fence_value));
+    submit_neutral_guides(signaled);
     fg::xefg::ObserveServiceHandoff(input,
         {.reason = (signaled ? "color_submitted" : "color_signal_failed"),
          .recording = recording_id, .queue = reinterpret_cast<uintptr_t>(queue),
