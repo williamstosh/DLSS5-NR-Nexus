@@ -25,6 +25,7 @@
 #define NR_NEXUS_TEST_OUTPUT_RUNTIME_ONLY
 #include "adaptive_ui_cases.hpp"
 #undef NR_NEXUS_TEST_OUTPUT_RUNTIME_ONLY
+#include "d3d12_test_gpu.hpp"
 
 namespace runtime = renodx::addons::dlss5::internal;
 namespace flow = runtime::issue_report;
@@ -373,6 +374,137 @@ void TestSelectedReportDiagnostics() {
   Save("no-capture");
 }
 
+void TestSelectedXefgReportDiagnostics() {
+  namespace addon = renodx::addons::dlss5;
+  namespace rate = addon::output_framerate;
+  namespace fg = addon::fg;
+  namespace xefg = fg::xefg;
+  namespace adapter = xefg::internal;
+  OutputRuntimeFixture request;
+  const auto a_owner = request.output;
+  constexpr std::array<uintptr_t, 1> buffers_b{0xB100};
+  rate::RegisterPresentOutput(0xB000, a_owner.device, 0xB010, buffers_b);
+  const auto b_owner = rate::FindPresentOwner(a_owner.device, buffers_b[0]);
+  d3d12_test::Gpu gpu;
+  const auto proxy_a = gpu.Swapchain();
+  const auto proxy_b = gpu.Swapchain();
+
+  // ReShade output matching and the SDK return are substituted boundaries.
+  // Use real WARP backbuffers and the actual Begin/End status publication.
+  const auto register_context = [&](IDXGISwapChain3* proxy, uintptr_t application) {
+    const auto context = std::make_shared<adapter::Context>();
+    context->queue = gpu.queue;
+    context->device = gpu.device;
+    context->device_identity = renodx::utils::directx::NativeIdentity(gpu.device.Get());
+    context->proxy_identity = adapter::Identity(proxy);
+    context->application_swapchain_identity = application;
+    context->enabled = true;
+    std::unique_lock lock(adapter::state.mutex);
+    adapter::state.contexts.emplace(context.get(), context);
+    adapter::RegisterOutput(context.get());
+    return context;
+  };
+  const auto a = register_context(proxy_a.Get(), a_owner.swapchain);
+  const auto b = register_context(proxy_b.Get(), 0xB010);
+  runtime::enabled = true;
+  runtime::d3d12_swapchain_seen = true;
+  runtime::stack_passes = 1;
+  runtime::hook_point = runtime::kHookPresent;
+  runtime::monitor_status_output = {.owner = b_owner};
+  runtime::intercepted_evaluations = 17;
+  runtime::successful_evaluations = 5;
+  runtime::submitted_injections = 5;
+  adapter::requested = +[]() noexcept { return true; };
+  Require(runtime::MatchRuntimeOutput(&request) == a->output_identity, "report runtime resolves to XeFG A, not the monitor default B");
+
+  adapter::service = +[](const fg::FrameInput&) noexcept { return fg::Result::SUBMITTED; };
+  auto b_frame = adapter::BeginPresent(proxy_b.Get(), 0);
+  Require(b_frame.service_eligible && b_frame.service_result == fg::Result::SUBMITTED, "B reaches the production SDK return classification");
+  adapter::EndPresent(&b_frame, E_FAIL);
+  const auto default_status = runtime::ReadSelectedXefgStatus();
+  Require(default_status && default_status->output == b->output_identity
+              && default_status->DisplayOutcome() == fg::Result::FAILED,
+          "default monitor B holds a true SDK failure");
+  const auto a_pending = runtime::CaptureReportDiagnostics(&request);
+  Require(a_pending.output.selected && a_pending.card.verdict.IsFgPreparing()
+              && runtime::SelectedReportCardJson(a_pending)["id"] == "fg_preparing",
+          "first owned A without a result stays grey even when default B failed");
+
+  adapter::service = +[](const fg::FrameInput&) noexcept { return fg::Result::NOT_SERVED; };
+  auto a_frame = adapter::BeginPresent(proxy_a.Get(), 0);
+  Require(a_frame.service_eligible && a_frame.service_result == fg::Result::NOT_SERVED, "A has made its first real service attempt");
+  adapter::EndPresent(&a_frame, S_OK);
+  const auto a_refusal = xefg::ReadStatus(a->output_identity);
+  Require(a_refusal && a_refusal->outcome == fg::Result::NOT_SERVED, "the actual A publication is a terminal refusal");
+
+  flow::typed_capture = true;
+  flow::test_timeout_ms = 2000;
+  runtime::ContinueIssueReport(true, &request);
+  const auto armed_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!capture::IsArmed() && flow::worker_active && std::chrono::steady_clock::now() < armed_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  Require(capture::IsArmed(), "worker holds a frozen A request while waiting for its screenshot");
+  runtime::intercepted_evaluations = 29;
+  runtime::successful_evaluations = 9;
+  runtime::submitted_injections = 9;
+  const auto a_output = a->output_identity;
+  {
+    std::unique_lock lock(adapter::state.mutex);
+    adapter::ReleaseFrames(a.get());
+    adapter::state.contexts.erase(a.get());
+  }
+  rate::DestroyPresentOutput(a_owner.swapchain);
+  request.buffers[0] = {buffers_b[0]};
+  Require(!rate::IsCurrentOutput(a_output) && runtime::MatchRuntimeOutput(&request) == b->output_identity,
+          "request runtime now resolves to B after destroying A");
+  const auto b_failed = runtime::CaptureReportDiagnostics(&request);
+  Require(b_failed.card.verdict.reason != nullptr
+              && std::string_view(b_failed.card.verdict.reason) == "fg_handoff_failed"
+              && runtime::SelectedReportCardJson(b_failed)["tone"] == "warn",
+          "a new B report retains the actual SDK failure as yellow, not the previous output's rejection");
+  const auto old_b = b->output_identity;
+  {
+    std::unique_lock lock(adapter::state.mutex);
+    adapter::ReleaseFrames(b.get());
+    adapter::RegisterOutput(b.get());
+  }
+  const auto b_pending = runtime::CaptureReportDiagnostics(&request);
+  Require(old_b != b->output_identity && b_pending.card.verdict.IsFgPreparing()
+              && runtime::SelectedReportCardJson(b_pending)["tone"] == "idle",
+          "a new B generation cannot inherit B's old yellow");
+  flow::skip_capture = true;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (flow::worker_active && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  Require(!flow::worker_active && flow::step == flow::Step::kReview, "frozen A report completes its real worker");
+  const auto summary = Json::parse(flow::summary);
+  Require(summary["card"]["basis"] == "selected_output_at_request" && summary["card"]["id"] == "not_running"
+              && summary["card"]["tone"] == "warn" && !summary["card"]["present_before_fg"].get<bool>(),
+          "first real A refusal stays yellow without a fabricated delivery in the exported report");
+  const auto& process = summary["diagnostics"]["process_status"];
+  Require(process["basis"] == "session_diagnostics_not_selected_output"
+              && process["injected"] == 5 && process["eligible"] == 17,
+          "process diagnostics keep the request's independent session counters, not A's single-frame result or later counts");
+  const auto support = std::ranges::find_if(flow::items, [](const auto& item) { return item.entry == "support-report.txt"; });
+  Require(support != flow::items.end(), "worker writes the text report for the same snapshot");
+  const auto support_text = Read(support->file);
+  Require(support_text.find("card: Neural Rendering did not serve this frame") != std::string::npos
+              && support_text.find("card: Neural Rendering submission failed") == std::string::npos,
+          "support text retains A's exact refusal, never B's different failure or fresh state");
+  CheckPrivacy(flow::summary);
+  Save("no-capture");
+  {
+    std::unique_lock lock(adapter::state.mutex);
+    adapter::ReleaseFrames(b.get());
+    adapter::state.contexts.erase(b.get());
+  }
+  adapter::service = nullptr;
+  adapter::requested = nullptr;
+  runtime::monitor_status_output = {};
+}
+
 void TestIssueJob(const std::string& mode) {
   flow::test_reason.clear();
   std::strcpy(flow::typed, "中文 title ghp_SYNTHETIC123");
@@ -500,6 +632,8 @@ int main(int argc, char** argv) {
       runtime::CloseIssueReport();
     } else if (mode == "selected-output") {
       TestSelectedReportDiagnostics();
+    } else if (mode == "selected-xefg-output") {
+      TestSelectedXefgReportDiagnostics();
     } else if (mode == "test-environment") {
       Require(_putenv_s("RENODX_NR_TEST_REPORT", "fixture") == 0, "set test reason environment");
       for (const auto* url : {"https://example.invalid/upload", "http://127.0.0.1:1@evil.invalid/upload",

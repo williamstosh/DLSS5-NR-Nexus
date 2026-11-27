@@ -34254,7 +34254,8 @@ inline constexpr const char* ReportCardBasis(bool selected) {
 // Called under runtime_mutex. Own only values: the worker may wait for a
 // screenshot while the requesting runtime is replaced or destroyed.
 inline ReportDiagnosticsSnapshot CopyReportDiagnostics(const output_framerate::OutputIdentity& output,
-                                                       const stage_plan::Plan& plan, int64_t now, const gpu_comparison::Identity& settings, const ui::CardInputs& session) {
+    const stage_plan::Plan& plan, int64_t now, const gpu_comparison::Identity& settings, const ui::CardInputs& session,
+    const std::optional<fg::xefg::StatusSnapshot>& xefg = {}) {
   ReportDiagnosticsSnapshot snapshot;
   snapshot.session = session;
   snapshot.card = ProjectSelectedCardInputs(session, plan.At(stage_plan::Stage::PRESENT).count != 0, nullptr);
@@ -34309,8 +34310,12 @@ inline ReportDiagnosticsSnapshot CopyReportDiagnostics(const output_framerate::O
   observed.fps_comparable = rate.available && rate.rate_comparable;
   const auto present_group = plan.At(stage_plan::Stage::PRESENT);
   const auto delivery = ReadSelectedMonitorDelivery(output, present_group, now);
-  snapshot.card = ProjectSelectedCardInputs(session, present_group.count != 0,
-                                            all_groups_executed || present_group.count != 0 ? first_execution : nullptr, delivery, rate);
+  auto selected_inputs = session;
+  if (xefg) {
+    selected_inputs.verdict = ComputeNrVerdict(CollectFunnelInputs(xefg));
+  }
+  snapshot.card = ProjectSelectedCardInputs(std::move(selected_inputs), present_group.count != 0,
+                                            all_groups_executed || present_group.count != 0 ? first_execution : nullptr, delivery, rate, xefg);
   observed.adaptive_enabled = nr_adaptive_enabled.load();
   if (observed.adaptive_enabled) {
     for (uint32_t pass = 0; pass < plan.pass_count; ++pass) {
@@ -34329,7 +34334,12 @@ inline ReportDiagnosticsSnapshot CaptureReportDiagnostics(reshade::api::effect_r
   if (gpu_timers::comparison_settings != nullptr) {
     gpu_timers::comparison_settings(&settings);
   }
-  return CopyReportDiagnostics(MatchRuntimeOutput(runtime), RequestedStagePlan(), SteadyNowNs(), settings, CollectCardInputs());
+  auto selected = MatchRuntimePresentOwner(runtime);
+  const auto output = output_framerate::ResolveRegisteredPresentOutput(selected.owner, &selected.ambiguous);
+  const auto xefg = fg::xefg::ReadStatus(output, selected.ambiguous);
+  const auto now = SteadyNowNs();
+  const auto session = CollectCardInputs(ComputeNrVerdict(CollectSessionFunnelInputs()), now);
+  return CopyReportDiagnostics(output, RequestedStagePlan(), now, settings, session, xefg);
 }
 
 inline std::string BuildSupportReport(const ReportDiagnosticsSnapshot& snapshot) {

@@ -68,7 +68,7 @@ if (-not $PythonExecutable) {
 Invoke-TestProcess "$OutputDirectory/report_issue_tests/report_issue_tests.exe" $OutputDirectory 'issue'
 $privacyData = New-Item -ItemType Directory -Path "$OutputDirectory/privacy-data"
 Invoke-TestProcess "$OutputDirectory/report_privacy_tests/report_privacy_tests.exe" $OutputDirectory 'privacy' @($privacyData.FullName)
-$cases = @('selected-output','no-capture','no-nr-frame','timeout','written','selection','retention','json-privacy',
+$cases = @('selected-output','selected-xefg-output','no-capture','no-nr-frame','timeout','written','selection','retention','json-privacy',
     'cancel-describe','cancel-review','cancel-capture','repeat','collect-failure','pack-failure','upload-consent',
     'issue-default','issue-consent','issue-feature','issue-fallback','staged-edit','test-environment','test-empty-url',
     'boundary-browser-failure','boundary-clipboard-failure','boundary-both-failure','boundary-success','boundary-manual-fallback')
