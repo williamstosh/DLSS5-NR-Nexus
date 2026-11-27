@@ -37,7 +37,8 @@ function Get-ReleaseParityBuildContext([string]$SourceRoot, [string]$HostRoot) {
         }
         $dependencies[$dependency.path] = $commit
     }
-    $patterns = @('*.hpp','*.h','*.cpp','tools/*.ps1','tools/release-experiment-parity.json','host/*.json','host/*.patch')
+    $patterns = @('*.hpp','*.h','*.cpp','shaders/*.hlsl','shaders/*.hlsli','shaders/*.slang',
+        'tools/*.ps1','tools/release-experiment-parity.json','host/*.json','host/*.patch')
     $changedFiles = @(& git --no-optional-locks -C $SourceRoot -c core.quotePath=false diff --name-only HEAD -- @patterns)
     if ($LASTEXITCODE -ne 0) { throw 'Cannot enumerate changed test inputs.' }
     $changedFiles += @(& git --no-optional-locks -C $SourceRoot -c core.quotePath=false ls-files --others --exclude-standard -- @patterns)
