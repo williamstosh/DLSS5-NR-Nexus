@@ -34,27 +34,9 @@ $notesTestPath = Join-Path $notesTestDirectory 'notes.md'
 $notesTestTemplate = @'
 # NR Nexus TAG — User-facing update
 
-[简体中文](#简体中文) · [English](#english)
+[English](#english) · [简体中文](#简体中文)
 
 <!-- Previous: v1.2.2 -->
-
-## 简体中文
-
-### 版本亮点
-
-支持独立模型。
-
-### 验证情况
-
-定向测试通过。
-
-### 已知限制
-
-实机画质未测。
-
-### 安装说明
-
-解压安装附件。
 
 ## English
 
@@ -73,6 +55,24 @@ Cross-game image quality and long-duration stability have not yet been verified.
 ### Installation
 
 Install the release ZIP with compatible ReShade and a separately obtained NVIDIA runtime.
+
+## 简体中文
+
+### 版本亮点
+
+支持独立模型。
+
+### 验证情况
+
+定向测试通过。
+
+### 已知限制
+
+实机画质未测。
+
+### 安装说明
+
+解压安装附件。
 '@
 foreach ($notesTestTag in @('v1.2.3-dev.1', 'v1.2.3-rc.1', 'v1.2.3')) {
     [IO.File]::WriteAllText($notesTestPath, $notesTestTemplate.Replace('TAG', $notesTestTag))
@@ -81,13 +81,13 @@ foreach ($notesTestTag in @('v1.2.3-dev.1', 'v1.2.3-rc.1', 'v1.2.3')) {
     Assert-NotesTest ($notesTestResult.Body.Contains('independent models without a pull request')) 'Direct feature commit was omitted'
     Assert-NotesTest ($notesTestResult.Body.Contains("/commit/$notesTestDirect")) 'Direct commit link missing'
     Assert-NotesTest ([regex]::Matches($notesTestResult.Body, '/pull/7\)').Count -eq 1) 'Duplicate pull request reference'
-    Assert-NotesTest ($notesTestResult.Body.StartsWith("[简体中文](#user-content-nr-nexus-$notesTestTag-zh) · [English](#user-content-nr-nexus-$notesTestTag-en)")) 'Top navigation missing'
+    Assert-NotesTest ($notesTestResult.Body.StartsWith("[English](#user-content-nr-nexus-$notesTestTag-en) · [简体中文](#user-content-nr-nexus-$notesTestTag-zh)")) 'Top navigation missing'
     foreach ($language in @('zh', 'en')) {
         $anchor = "nr-nexus-$notesTestTag-$language"
         Assert-NotesTest ([regex]::Matches($notesTestResult.Body, [regex]::Escape("<a name=`"$anchor`"></a>")).Count -eq 1) 'Explicit language anchor must occur once'
         Assert-NotesTest ($notesTestResult.Body.Contains("(#user-content-$anchor)")) 'Link must target the GitHub-prefixed anchor'
     }
-    Assert-NotesTest ($notesTestResult.Body.IndexOf('## 简体中文') -lt $notesTestResult.Body.IndexOf('## English')) 'Language order changed'
+    Assert-NotesTest ($notesTestResult.Body.IndexOf('## English') -lt $notesTestResult.Body.IndexOf('## 简体中文')) 'Language order changed'
     Assert-NotesTest ($notesTestResult.Body.IndexOf('### Installation') -lt $notesTestResult.Body.IndexOf('## Source / 源码')) 'Generated content displaced language blocks'
     Assert-NotesTest ([regex]::Matches($notesTestResult.Body, '(?m)^## Source / 源码$').Count -eq 1) 'Source section must occur once'
     Assert-NotesTest ([regex]::Matches($notesTestResult.Body, '(?m)^## References / PR 与 Commit 记录$').Count -eq 1) 'References section must occur once'
@@ -109,20 +109,20 @@ $notesTestFailures = @(
     @{name='wrong version';text=$notesTestValid.Replace('v1.2.3', 'v9.9.9');error='title'},
     @{name='duplicate generated source';text=$notesTestValid + "`n`n## Source`nExisting source";error='reserved'}
 )
-$notesTestNavigation = '[简体中文](#简体中文) · [English](#english)'
+$notesTestNavigation = '[English](#english) · [简体中文](#简体中文)'
 $notesTestChineseStart = $notesTestValid.IndexOf('## 简体中文')
 $notesTestEnglishStart = $notesTestValid.IndexOf('## English')
-$notesTestChinese = $notesTestValid.Substring($notesTestChineseStart, $notesTestEnglishStart - $notesTestChineseStart)
-$notesTestEnglish = $notesTestValid.Substring($notesTestEnglishStart)
-$notesTestPrefix = $notesTestValid.Substring(0, $notesTestChineseStart)
+$notesTestChinese = $notesTestValid.Substring($notesTestChineseStart)
+$notesTestEnglish = $notesTestValid.Substring($notesTestEnglishStart, $notesTestChineseStart - $notesTestEnglishStart)
+$notesTestPrefix = $notesTestValid.Substring(0, $notesTestEnglishStart)
 $notesTestFailures += @(
     @{name='missing Chinese';text=$notesTestPrefix + $notesTestEnglish;error='block'},
     @{name='missing English';text=$notesTestPrefix + $notesTestChinese;error='block'},
-    @{name='English first';text=$notesTestPrefix + $notesTestEnglish + "`n`n" + $notesTestChinese;error='block'},
+    @{name='Chinese first';text=$notesTestPrefix + $notesTestChinese + "`n`n" + $notesTestEnglish;error='block'},
     @{name='duplicate Chinese';text=$notesTestValid + "`n`n" + $notesTestChinese;error='block'},
     @{name='duplicate English';text=$notesTestValid + "`n`n" + $notesTestEnglish;error='block'},
     @{name='missing navigation';text=$notesTestValid.Replace($notesTestNavigation, '');error='navigation'},
-    @{name='wrong navigation order';text=$notesTestValid.Replace($notesTestNavigation, '[English](#english) · [简体中文](#简体中文)');error='navigation'},
+    @{name='wrong navigation order';text=$notesTestValid.Replace($notesTestNavigation, '[简体中文](#简体中文) · [English](#english)');error='navigation'},
     @{name='wrong navigation anchor';text=$notesTestValid.Replace('](#english)', '](#English)');error='navigation'},
     @{name='duplicate navigation';text=$notesTestValid + "`n`n$notesTestNavigation";error='navigation'},
     @{name='navigation below prose';text=$notesTestValid.Replace($notesTestNavigation, "Reviewed introductory prose.`n`n$notesTestNavigation");error='navigation'}
@@ -163,7 +163,7 @@ $notesTestFailures += @{name='manual source line';text=$notesTestValid + "`n`nSo
 $notesTestFailures += @{name='missing Previous';text=$notesTestValid.Replace('<!-- Previous: v1.2.2 -->', '');error='Previous'}
 $notesTestFailures += @{name='duplicate Previous';text=$notesTestValid + "`n<!-- Previous: v1.2.2 -->";error='Previous'}
 foreach ($optional in @('新增功能与改进', '修复内容', 'Features & Improvements', 'Fixes')) {
-    $insertBefore = if ($optional -match '[\p{IsCJKUnifiedIdeographs}]') { '## English' } else { '### Installation' }
+    $insertBefore = if ($optional -match '[\p{IsCJKUnifiedIdeographs}]') { '### 安装说明' } else { '### Installation' }
     $optionalBody = if ($optional -match '[\p{IsCJKUnifiedIdeographs}]') { '修复切换问题。' } else { 'Fixed model switching for independent passes.' }
     $withOptional = $notesTestValid.Replace($insertBefore, "### $optional`n`n$optionalBody`n`n$insertBefore")
     [IO.File]::WriteAllText($notesTestPath, $withOptional)
@@ -173,7 +173,7 @@ foreach ($optional in @('新增功能与改进', '修复内容', 'Features & Imp
     $notesTestFailures += @{name="empty optional $optional";text=$withOptional.Replace($optionalBody, '');error='substantive'}
 }
 foreach ($extra in @(
-    @{heading='迁移说明';body='无需迁移配置。';before='## English'},
+    @{heading='迁移说明';body='无需迁移配置。';before='### 安装说明'},
     @{heading='Compatibility';body='Existing configuration remains compatible.';before='### Installation'}
 )) {
     $withExtra = $notesTestValid.Replace($extra.before, "### $($extra.heading)`n`n$($extra.body)`n`n$($extra.before)")
@@ -184,7 +184,7 @@ foreach ($extra in @(
     $notesTestFailures += @{name="empty extra $($extra.heading)";text=$withExtra.Replace($extra.body, '');error='substantive'}
 }
 foreach ($foreign in @(
-    @{heading='Highlights';before='## English'},
+    @{heading='Highlights';before='### 安装说明'},
     @{heading='版本亮点';before='### Installation'}
 )) {
     $notesTestFailures += @{name="wrong language required $($foreign.heading)";text=$notesTestValid.Replace($foreign.before, "### $($foreign.heading)`n`nReviewed change description text.`n`n$($foreign.before)");error='Unexpected'}
