@@ -37,7 +37,7 @@ Do not use **Install Neural Rendering** for this procedure: it installs separate
 #### Manual installation and maintenance
 
 - **Manual installation:** Install ReShade with full Add-on/API 18 support from [the official site](https://reshade.me/), selecting the actual game EXE and its graphics API. Put `renodx-dlss5.addon64` in the actual Add-on directory. Legally obtain a compatible `nvngx_dlssnr.dll` separately and place it beside the Add-on or actual game EXE. The [310.9.16 runtime ZIP](https://github.com/RankFTW/rhi-repo/releases/download/dlssnr-310.9.16/nvngx_dlssnr_310.9.16.zip) listed by RHI is separate from the NR Nexus ZIP. Follow the runtime/model licenses; this project's MIT license does not change their terms.
-- **Built-in update checks and downloads (0.7.0-dev.1 development version, yet to ship in an official package)**
+- **Built-in update checks and downloads (v0.6.4 and later)**
 
   1. Open **Version & about** in NR Nexus. In the classic layout, it is at the bottom of the panel. In the modern layout, it is under **Advanced → Development & maintenance**. Check manually and view the current version, latest stable version, publication time (UTC) and a formatted preview of the release notes. You can also view the original Markdown or open the release page.
   2. Automatic checks are on by default at game startup. Startup checks are skipped for 24 hours after a successful check or 1 hour after a failed check. Turning the option off affects future automatic requests. You can still check manually.
@@ -644,7 +644,7 @@ Full reset retains support policies EnableHooks/DX11Source/ForeignNr, exception 
 #### 手动安装与后续维护
 
 - **手动安装：** 从 [ReShade 官网](https://reshade.me/) 安装支持完整 Add-on／API 18 的版本，选择实际游戏 EXE 及其图形 API；再将 `renodx-dlss5.addon64` 放入实际 Add-on 目录。另行合法取得兼容的 `nvngx_dlssnr.dll`，放在插件旁或实际 EXE 旁；RHI 清单提供的 [310.9.16 Runtime ZIP](https://github.com/RankFTW/rhi-repo/releases/download/dlssnr-310.9.16/nvngx_dlssnr_310.9.16.zip) 与 NR Nexus 插件 ZIP 是不同文件。遵守 Runtime／模型各自许可；项目 MIT 许可不改变这些条件。
-- **内置更新检查和下载（0.7.0-dev.1 开发版，尚未随正式安装包发布）**
+- **内置更新检查和下载（v0.6.4 及以后版本）**
 
   1. 在 NR Nexus 打开**版本与关于**，经典布局在面板底部，现代布局在**高级 → 开发与维护**。在这里手动检查新版，查看当前版本、最新正式版、发布时间（UTC）和基础排版的发布说明。也可查看原始 Markdown 或打开发行页。
   2. 默认在游戏启动时自动检查。检查成功后 24 小时内、失败后 1 小时内，再启动时会跳过自动检查。关闭此选项只影响后续自动请求，仍可手动检查。
