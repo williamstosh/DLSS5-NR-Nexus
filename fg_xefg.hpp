@@ -83,6 +83,7 @@ struct OrdinaryPresentAccess {
   uint64_t declaration = 0;
   uint64_t call = 0;
   bool allowed = false;
+  bool requires_off_turn = false;
   bool operator==(const OrdinaryPresentAccess&) const = default;
 };
 
@@ -93,17 +94,6 @@ struct OrdinaryOffPresent {
   uint32_t width = 0;
   uint32_t height = 0;
   const char* input_rejection = "off_backbuffer_unavailable";
-};
-
-struct OrdinaryPreEffectsWrite {
-  OrdinaryPresentAttempt attempt;
-  OrdinaryPresentAccess access;
-  output_framerate::OutputIdentity physical_output;
-  uint64_t consumer_call = 0;
-  uint64_t disable_epoch = 0;
-  uint64_t disable_declaration = 0;
-  DXGI_COLOR_SPACE_TYPE color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
-  bool operator==(const OrdinaryPreEffectsWrite&) const = default;
 };
 
 // Values only: the ordinary owner retains and retires its own GPU operands.
@@ -132,7 +122,6 @@ struct OrdinaryPresentReceipt {
   bool proofs_healthy = false;
   bool proofs_complete = false;
   bool game_reset_observed = false;
-  bool pre_effects_xefg = false;
   OrdinarySubmissionFact submission;
 };
 
@@ -381,6 +370,7 @@ struct TaggedResource {
   ComPtr<ID3D12Resource> resource;
   std::shared_ptr<Surface> copy;
   ComPtr<ID3D12Device> recording_device;
+  ComPtr<ID3D12Device> native_recording_device;
 };
 struct Frame {
   std::array<TaggedResource, 4> resources;
@@ -461,7 +451,6 @@ struct PresentHandoff {
   bool has_present_id = false;
   bool has_guides = false;
   bool game_reset_edge = false;
-  bool single_backbuffer = false;
   bool color_executed = false;
   bool ordinary_executed = false;
   bool owner_current_at_return = false;
@@ -546,17 +535,14 @@ struct Context {
   uint64_t color_serial = 0;
   uint64_t color_submitted_frame = 0;
   uint64_t color_submitted_epoch = 0;
-  uint64_t guided_delivery_declaration = 0;
   struct PresentColors {
     uintptr_t backbuffer = 0;
     uintptr_t hudless = 0;
     bool xefg_owned = false;
-    bool pre_effects_reserved = false;
     bool ordinary_committed = false;
     OrdinarySubmissionFact ordinary_submission;
   };
   std::map<uint64_t, PresentColors> present_colors;
-  OrdinaryPreEffectsWrite pre_effects_write;
   std::array<uintptr_t, 16> backbuffers{};
   uint32_t handoff_frames_left = 0;
   PresentHandoff last_handoff_write;
@@ -995,11 +981,9 @@ inline void ReleaseFrames(Context* context) {
     }
   }
   context->frames.clear();
-  context->pre_effects_write = {};
   context->fresh_id = false;
   context->last_id_known = false;
   context->game_reset_high = false;
-  context->guided_delivery_declaration = 0;
   context->last_submission_frame = 0;
   context->status = {};
   ++context->epoch;
@@ -1383,12 +1367,53 @@ struct D3D12ProxyPresentObservation {
   bool source_finished = false;
 };
 
+// The pointer is borrowed only while the original Present1 call is on the stack.
+struct PresentUpdate {
+  bool present1 = false;
+  const DXGI_PRESENT_PARAMETERS* parameters = nullptr;
+
+  bool Covers(UINT64 width, UINT height) const {
+    if (!present1) return true;
+    if (parameters == nullptr || parameters->pScrollRect != nullptr || parameters->pScrollOffset != nullptr) return false;
+    if (parameters->DirtyRectsCount == 0) return true;
+    if (parameters->DirtyRectsCount != 1 || parameters->pDirtyRects == nullptr) return false;
+    const auto& rect = *parameters->pDirtyRects;
+    return rect.left == 0 && rect.top == 0 && rect.right > 0 && rect.bottom > 0
+        && static_cast<UINT>(rect.right) == width && static_cast<UINT>(rect.bottom) == height;
+  }
+};
+
+inline bool FullSourceSize(IDXGISwapChain3* swapchain, UINT64 width, UINT height) {
+  UINT source_width = 0;
+  UINT source_height = 0;
+  return swapchain != nullptr && SUCCEEDED(swapchain->GetSourceSize(&source_width, &source_height))
+      && source_width == width && source_height == height;
+}
+
+inline ComPtr<ID3D12Resource> CurrentPresentColor(IDXGISwapChain3* swapchain) {
+  ComPtr<ID3D12Resource> color;
+  if (swapchain != nullptr) swapchain->GetBuffer(swapchain->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&color));
+  return color;
+}
+
+struct PresentFrame;
+inline thread_local PresentFrame* ordinary_off_present = nullptr;
+
+// A nested call can narrow an Off handoff to its own buffer and update.
+struct OrdinaryOffTurnScope {
+  PresentFrame* previous;
+  explicit OrdinaryOffTurnScope(PresentFrame* frame) : previous(std::exchange(ordinary_off_present, frame)) {}
+  OrdinaryOffTurnScope(IDXGISwapChain* swapchain, UINT flags, PresentUpdate update = {});
+  ~OrdinaryOffTurnScope() { ordinary_off_present = previous; }
+};
+
 // A registration owns its device, never the swapchain. The actual Present
 // argument is borrowed only on this thread's call stack, including on unwind.
 struct BridgeSourcePresent : BridgeSourcePresentMapping {
   inline static thread_local BridgeSourcePresent* current = nullptr;
   BridgeSourcePresent* previous = current;
   BridgeSourcePresent* root = this;
+  PresentUpdate update;
   IDXGISwapChain* borrowed_swapchain = nullptr;
   D3D12ProxyPresentObservation* outer_proxy = nullptr;
   uint32_t proxy_calls = 0;
@@ -1680,6 +1705,7 @@ inline std::array<SourcePresentSlot, 4> source_present_slots;
 template <size_t Index>
 struct SourcePresentHooks {
   static HRESULT STDMETHODCALLTYPE Present(IDXGISwapChain* swapchain, UINT interval, UINT flags) {
+    const OrdinaryOffTurnScope scoped_off(swapchain, flags);
     OrdinaryPresentAttempt attempt;
     if ((flags & DXGI_PRESENT_TEST) == 0) {
       if (const auto find = find_ordinary_present_attempt.load(std::memory_order_acquire); find != nullptr) {
@@ -1702,6 +1728,8 @@ struct SourcePresentHooks {
   }
   static HRESULT STDMETHODCALLTYPE Present1(IDXGISwapChain1* swapchain, UINT interval, UINT flags,
                                             const DXGI_PRESENT_PARAMETERS* parameters) {
+    const PresentUpdate update{.present1 = true, .parameters = parameters};
+    const OrdinaryOffTurnScope scoped_off(swapchain, flags, update);
     OrdinaryPresentAttempt attempt;
     if ((flags & DXGI_PRESENT_TEST) == 0) {
       if (const auto find = find_ordinary_present_attempt.load(std::memory_order_acquire); find != nullptr) {
@@ -1715,6 +1743,7 @@ struct SourcePresentHooks {
             .thread_id = GetCurrentThreadId(), .proxy_entry_depth = proxy_entry_depth, .interval = interval, .flags = flags}
 #endif
     );
+    present.update = update;
     const auto status = reinterpret_cast<Present1Fn>(source_present_slots[Index].real[1])(swapchain, interval, flags, parameters);
     present.Finish(status);
     if (status != S_OK && attempt) {
@@ -1785,8 +1814,6 @@ struct PresentFrame {
   OrdinaryPresentReceipt ordinary_receipt;
   OrdinaryPresentAttempt ordinary_attempt;
   OrdinaryOffPresent ordinary_off;
-  OrdinaryPreEffectsWrite pre_effects_write;
-  bool pre_effects_full_consumer_region = false;
   const char* handoff_reason = "fg_off";
   bool trace_handoff = false;
   bool game_reset_edge = false;
@@ -1807,9 +1834,36 @@ struct PresentFrame {
 #endif
 };
 
-inline thread_local PresentFrame* recording_service = nullptr;
-inline thread_local PresentFrame* ordinary_off_present = nullptr;
+inline OrdinaryOffTurnScope::OrdinaryOffTurnScope(IDXGISwapChain* swapchain, UINT flags, PresentUpdate update)
+    : OrdinaryOffTurnScope(nullptr) {
+  if (previous == nullptr || swapchain == nullptr || (flags & DXGI_PRESENT_TEST) != 0) return;
+  const auto& turn = previous->ordinary_off;
+  if (turn.input_rejection != nullptr || !update.Covers(turn.width, turn.height)) return;
+  ComPtr<IDXGISwapChain3> chain;
+  if (FAILED(swapchain->QueryInterface(IID_PPV_ARGS(&chain))) || !FullSourceSize(chain.Get(), turn.width, turn.height)) return;
+  const auto color = CurrentPresentColor(chain.Get());
+  if (color != nullptr && reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(color.Get())) == turn.access.backbuffer) {
+    ordinary_off_present = previous;
+  }
+}
 
+// A source Present1 above the SDK can be narrower than the SDK proxy call.
+// Only a different live backbuffer proves the restriction belongs to another output.
+inline bool EnclosingSourceCovers(uintptr_t backbuffer, UINT64 width, UINT height) {
+  for (auto* source = BridgeSourcePresent::current; source != nullptr; source = source->previous) {
+    if ((!source->test && !source->update.present1)
+        || (source->registration != nullptr && source->registration->device12 == nullptr)) continue;
+    ComPtr<IDXGISwapChain3> chain;
+    if (source->borrowed_swapchain == nullptr || FAILED(source->borrowed_swapchain->QueryInterface(IID_PPV_ARGS(&chain)))) return false;
+    if (!source->test && source->update.Covers(width, height) && FullSourceSize(chain.Get(), width, height)) continue;
+    const auto color = CurrentPresentColor(chain.Get());
+    const auto identity = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(color.Get()));
+    if (identity == 0 || identity == backbuffer) return false;
+  }
+  return true;
+}
+
+inline thread_local PresentFrame* recording_service = nullptr;
 inline bool PresentOwnerCurrentLocked(const PresentFrame& present) {
   const auto it = state.contexts.find(reinterpret_cast<void*>(present.input.context));
   return it != state.contexts.end() && it->second == present.context
@@ -1864,8 +1918,7 @@ inline void ObserveEditPresent(PresentFrame* present, IDXGISwapChain* swapchain,
 }
 #endif
 
-inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags,
-                                 const DXGI_PRESENT_PARAMETERS* parameters = nullptr) {
+inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags, PresentUpdate update = {}) {
   PresentFrame present;
   if (proxy_depth != 0 || stopped.load(std::memory_order_acquire)) return present;
   const auto exception_count = std::uncaught_exceptions();
@@ -1944,14 +1997,8 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags,
           .diagnostic_context = reinterpret_cast<uintptr_t>(context.get())};
       present.input.output = context->output_identity;
       present.input.recording_device = context->proxy_recording_device.Get();
-      if (context->pre_effects_write.consumer_call == present.serial) {
-        present.pre_effects_write = context->pre_effects_write;
-      }
-      context->pre_effects_write = {};
       present.service_eligible = present.service_owned && !repeated;
-      context->present_colors.emplace(present.serial, Context::PresentColors{
-          .backbuffer = present.pre_effects_write.access.backbuffer, .xefg_owned = present.service_owned,
-          .pre_effects_reserved = static_cast<bool>(present.pre_effects_write.attempt)});
+      context->present_colors.emplace(present.serial, Context::PresentColors{.xefg_owned = present.service_owned});
       present.continuing_submission = context->last_submission_frame != 0
           && context->last_submission_frame + 1 == present.input.application_frame;
       if (present.service_eligible && present.input.output) {
@@ -2004,28 +2051,17 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags,
     std::unique_lock lock(state.mutex);
     auto& context = *present.context;
     auto& colors = context.present_colors.at(present.serial);
-    colors.pre_effects_reserved = colors.pre_effects_reserved && colors.backbuffer == backbuffer_identity;
     colors.backbuffer = backbuffer_identity;
     colors.hudless = hudless_identity;
     if (context.epoch == present.input.epoch && backbuffer_index < context.backbuffers.size()) {
       context.backbuffers[backbuffer_index] = backbuffer_identity;
     }
   }
-  const auto full_consumer_region = [&](const D3D12_RESOURCE_DESC& desc) {
-    UINT source_width = 0;
-    UINT source_height = 0;
-    if (FAILED(present.swapchain->GetSourceSize(&source_width, &source_height))
-        || source_width != desc.Width || source_height != desc.Height) return false;
-    if (parameters == nullptr) return true;
-    const auto* dirty = parameters->pDirtyRects;
-    return parameters->pScrollRect == nullptr && parameters->pScrollOffset == nullptr
-        && (parameters->DirtyRectsCount == 0 || (parameters->DirtyRectsCount == 1 && dirty != nullptr
-            && dirty->left == 0 && dirty->top == 0 && dirty->right > 0 && dirty->bottom > 0
-            && static_cast<uint32_t>(dirty->right) == desc.Width && static_cast<uint32_t>(dirty->bottom) == desc.Height));
+  const auto full_consumer_region = [&](const D3D12_RESOURCE_DESC& desc, bool check_source_size) {
+    return update.Covers(desc.Width, desc.Height)
+        && (!check_source_size || FullSourceSize(present.swapchain.Get(), desc.Width, desc.Height))
+        && EnclosingSourceCovers(backbuffer_identity, desc.Width, desc.Height);
   };
-  if (present.pre_effects_write.attempt && present.backbuffer != nullptr && present.service_owned) {
-    present.pre_effects_full_consumer_region = full_consumer_region(present.backbuffer->GetDesc());
-  }
   if (!present.service_owned) {
     if (present.input.fg_enabled) return present;
     auto& turn = present.ordinary_off;
@@ -2039,7 +2075,6 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags,
       return present;
     }
     const auto desc = present.backbuffer->GetDesc();
-    present.pre_effects_full_consumer_region = full_consumer_region(desc);
     turn.width = present.input.color_width = static_cast<uint32_t>(desc.Width);
     turn.height = present.input.color_height = desc.Height;
     const bool full_tag = present.frame == nullptr || (!present.frame->rejected && (!present.frame->has_region
@@ -2052,7 +2087,7 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags,
       turn.input_rejection = "repeated_present_id";
     } else if (!turn.physical_output || turn.queue == nullptr) {
       turn.input_rejection = "off_physical_output_unconfirmed";
-    } else if (!present.pre_effects_full_consumer_region || !full_tag || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+    } else if (!full_consumer_region(desc, true) || !full_tag || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
         || desc.DepthOrArraySize != 1 || desc.MipLevels != 1 || desc.SampleDesc.Count != 1) {
       turn.input_rejection = "off_full_color_region_unconfirmed";
     } else if (present.input.ui_composition || (hudless_identity != 0 && hudless_identity != backbuffer_identity)
@@ -2105,6 +2140,10 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags,
   present.handoff_reason = "backbuffer_unavailable";
   if (present.backbuffer == nullptr) return finish_service();
   const auto description = present.backbuffer->GetDesc();
+  if (!full_consumer_region(description, update.present1)) {
+    present.handoff_reason = "present1_full_color_region_unconfirmed";
+    return finish_service();
+  }
   present.input.color_width = static_cast<uint32_t>(description.Width);
   present.input.color_height = description.Height;
   if (present.frame != nullptr) {
@@ -2149,6 +2188,9 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags,
           present.input.recording_device = tagged.recording_device.Get();
           break;
         }
+        if (tagged.native_recording_device != nullptr) {
+          present.input.native_tag_recording_device = tagged.native_recording_device.Get();
+        }
       }
     }
     present.input.has_constants = frame.has_constants;
@@ -2175,11 +2217,6 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags,
       }
       return finish_service();
     }
-  }
-  if (present.pre_effects_write.attempt && present.pre_effects_write.access.backbuffer == backbuffer_identity) {
-    present.ordinary_claim = OrdinaryPresentClaim::CONFLICT;
-    present.handoff_reason = "pre_fx_submission_unconfirmed";
-    return finish_service();
   }
   const auto callback = service.load(std::memory_order_acquire);
   present.handoff_reason = (copies_ordered ? "service_unavailable" : "tag_copy_unordered");
@@ -2239,11 +2276,6 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
   const bool ordinary_submitted = present->service_result == Result::ORDINARY_SUBMITTED;
   const bool ordinary_off_submitted = present->ordinary_off.access.call != 0 && present->ordinary_claim == OrdinaryPresentClaim::COVERED;
   const bool delivered = present_result == S_OK;
-  const bool single_backbuffer = !present->input.ui_composition && colors.hudless == 0 && present->input.ui == nullptr;
-  if (same_output && delivered && submitted && present->service_submission.signaled && present->serial == context.present_serial
-      && single_backbuffer && present->input.has_present_id && present->input.depth != nullptr && present->input.motion != nullptr) {
-    context.guided_delivery_declaration = present->declaration;
-  }
   const bool failed_delivery = (submitted || ordinary_submitted) && !delivered;
   if (context.status.pending_call == present->serial) {
     context.status.pending_call = 0;
@@ -2302,7 +2334,6 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
       .status_result = status_result, .status_enabled = status.enabled, .sdk_enabled_at_entry = present->input.fg_enabled,
       .has_present_id = present->input.has_present_id, .has_guides = present->input.depth != nullptr && present->input.motion != nullptr,
       .game_reset_edge = present->game_reset_edge,
-      .single_backbuffer = single_backbuffer,
       .color_executed = present->color_executed, .ordinary_executed = colors.ordinary_committed,
       .owner_current_at_return = same_output, .status_queried = status_queried, .status_current = status_current,
       .sdk_result_available = true, .service_submission = present->service_submission,
@@ -2404,7 +2435,7 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
   if (lock.owns_lock()) lock.unlock();
   if (present->trace_handoff || present->game_reset_edge || ordinary_off_submitted
       || present->ordinary_claim == OrdinaryPresentClaim::CONFLICT
-      || (ordinary_submitted && !present->ordinary_receipt.pre_effects_xefg)
+      || ordinary_submitted
       || (!same_output && (present->service_owned || present->color_executed))) {
     LogHandoff("sdk_present_return", handoff);
   }
@@ -2412,11 +2443,9 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
     if (const auto finish = finish_ordinary_present.load(std::memory_order_acquire); finish != nullptr) {
       finish(present->ordinary_receipt, present->input, present->serial, present_result);
     }
-  } else if (present->ordinary_attempt || (present->pre_effects_write.access.backbuffer == colors.backbuffer
-                 && present->pre_effects_write.attempt)) {
+  } else if (present->ordinary_attempt) {
     if (const auto finish = finish_ordinary_present.load(std::memory_order_acquire); finish != nullptr) {
-      finish({.attempt = (present->ordinary_attempt ? present->ordinary_attempt : present->pre_effects_write.attempt)},
-          present->input, present->serial, present_result);
+      finish({.attempt = present->ordinary_attempt}, present->input, present->serial, present_result);
     }
   }
 #if defined(NR_NEXUS_DEV_CONTROL)
@@ -2463,12 +2492,8 @@ struct ProxyEntryScope {
 
 template <typename Present>
 inline HRESULT PresentWithOrdinaryOffTurn(PresentFrame* frame, Present&& present) {
-  struct RestoreTurn {
-    PresentFrame* previous;
-    ~RestoreTurn() { ordinary_off_present = previous; }
-  };
   if (frame->ordinary_off.access.call == 0) return std::forward<Present>(present)();
-  const RestoreTurn scope{std::exchange(ordinary_off_present, frame)};
+  const OrdinaryOffTurnScope scope{frame};
   // Find by address only supplies a candidate. The owner must match its live
   // pre-effects attempt and actual submission to this physical color.
   const auto candidate = std::exchange(frame->ordinary_attempt, {});
@@ -2484,6 +2509,7 @@ template <size_t Index>
 struct ProxyHooks {
   static HRESULT STDMETHODCALLTYPE Present(IDXGISwapChain* swapchain, UINT interval, UINT flags) {
     if (proxy_entry_depth != 0) {
+      const OrdinaryOffTurnScope nested(swapchain, flags);
       if (auto* reverse = D3D12ProxyPresentObservation::current; reverse != nullptr
           && (BridgeSourcePresent::current != nullptr || Identity(swapchain) != reverse->mapping.proxy)) {
         reverse->mapping.failure = "multiple_proxy_presents";
@@ -2516,6 +2542,7 @@ struct ProxyHooks {
   static HRESULT STDMETHODCALLTYPE Present1(IDXGISwapChain1* swapchain, UINT interval, UINT flags,
                                             const DXGI_PRESENT_PARAMETERS* parameters) {
     if (proxy_entry_depth != 0) {
+      const OrdinaryOffTurnScope nested(swapchain, flags, {.present1 = true, .parameters = parameters});
       if (auto* reverse = D3D12ProxyPresentObservation::current; reverse != nullptr
           && (BridgeSourcePresent::current != nullptr || Identity(swapchain) != reverse->mapping.proxy)) {
         reverse->mapping.failure = "multiple_proxy_presents";
@@ -2525,7 +2552,7 @@ struct ProxyHooks {
     const ProxyEntryScope entry;
     BridgeProxyPresent bridge_present(swapchain, flags);
     PresentFrame present;
-    try { present = BeginPresent(swapchain, flags, parameters); } catch (...) { PublishResult(Result::FAILED); }
+    try { present = BeginPresent(swapchain, flags, {.present1 = true, .parameters = parameters}); } catch (...) { PublishResult(Result::FAILED); }
 #if defined(NR_NEXUS_DEV_CONTROL)
     try { ObserveEditPresent(&present, swapchain, 2, interval, flags); }
     catch (...) { edit_fg_observation::Stop("observation_failed"); }
@@ -2913,11 +2940,13 @@ struct SdkHooks {
       }
       if (tagged.resource != nullptr && need_tag_device && list != nullptr) {
         ComPtr<ID3D12Device> face;
-        if (SUCCEEDED(list->GetDevice(IID_PPV_ARGS(&face)))) {
+        if (SUCCEEDED(list->GetDevice(IID_PPV_ARGS(&face)))
+            && renodx::utils::directx::SameNativeObject(face.Get(), context->device.Get())) {
           auto* native_face = face.Get();
-          if (renodx::utils::directx::NativeFromReShadeProxy(&native_face)
-              && renodx::utils::directx::SameNativeObject(face.Get(), context->device.Get())) {
+          if (renodx::utils::directx::NativeFromReShadeProxy(&native_face)) {
             tagged.recording_device = std::move(face);
+          } else {
+            tagged.native_recording_device = std::move(face);
           }
         }
       }
@@ -3071,7 +3100,6 @@ struct SdkHooks {
     uintptr_t proxy = 0;
     bool uses_source_link = false;
     bool overlapping_enable = false;
-    OrdinaryPreEffectsWrite pre_effects_write;
     uint64_t link_generation = 0;
     BridgeSourceIdentity linked_source;
 #if defined(NR_NEXUS_DEV_CONTROL)
@@ -3083,12 +3111,6 @@ struct SdkHooks {
       std::unique_lock lock(state.mutex);
       if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
         attempt = it->second;
-        if (enabled == 0 && attempt->enabled && attempt->pre_effects_write.attempt
-            && attempt->pre_effects_write.access.epoch == attempt->epoch
-            && attempt->pre_effects_write.access.declaration == attempt->bridge_declaration
-            && attempt->pre_effects_write.access.output == attempt->output_identity) {
-          pre_effects_write = attempt->pre_effects_write;
-        }
         attempt->bridge_off_observed = false;
         attempt->ordinary_off_epoch = 0;
         attempt->bridge_before_observation = {};
@@ -3186,12 +3208,6 @@ struct SdkHooks {
         if (ordered && enabled == 0 && attempt->bridge_context_ready && attempt->bridge_proxy_ready && !stopped.load()) {
           // This output's successful SDK Disable is independent of any SR source.
           attempt->ordinary_off_epoch = attempt->epoch;
-          if (pre_effects_write.attempt && attempt->epoch == epoch + 1
-              && pre_effects_write.consumer_call == attempt->present_serial + 1 && attempt->presents_in_flight == 0) {
-            pre_effects_write.disable_epoch = attempt->epoch;
-            pre_effects_write.disable_declaration = declaration;
-            attempt->pre_effects_write = pre_effects_write;
-          }
         }
         RegisterOutput(attempt.get());
         if (ordered && changed && service_requested) {
@@ -3840,7 +3856,7 @@ inline bool BlocksHostWriteLocked(const output_framerate::OutputIdentity& output
 namespace internal {
 
 inline OrdinaryPresentAccess QueryOrdinaryPresentLocked(uintptr_t swapchain, uintptr_t backbuffer,
-    const output_framerate::OutputIdentity& output, bool* ambiguous = nullptr) {
+    const output_framerate::OutputIdentity& output) {
   OrdinaryPresentAccess access{.swapchain = swapchain, .backbuffer = backbuffer, .output = output};
   if (backbuffer == 0 || (output && !output_framerate::IsCurrentOutput(output))) return access;
   const bool service_requested = Requested();
@@ -3851,7 +3867,7 @@ inline OrdinaryPresentAccess QueryOrdinaryPresentLocked(uintptr_t swapchain, uin
   };
   for (const auto& context : state.retired_contexts) {
     for (const auto& [serial, colors] : context->present_colors) {
-      if ((colors.xefg_owned || colors.pre_effects_reserved) && conflicts(*context, colors)) return access;
+      if (colors.xefg_owned && conflicts(*context, colors)) return access;
     }
   }
   bool blocked = false;
@@ -3866,19 +3882,13 @@ inline OrdinaryPresentAccess QueryOrdinaryPresentLocked(uintptr_t swapchain, uin
     for (const auto& [serial, colors] : context->present_colors) {
       if (!conflicts(*context, colors)
           && !(colors.backbuffer == 0 && (same_swapchain || same_output || same_backbuffer))) continue;
-      blocked_call |= colors.xefg_owned || colors.pre_effects_reserved
+      blocked_call |= colors.xefg_owned
           || (service_requested && (colors.ordinary_committed || active_call != 0));
       active_call = serial;
     }
     if (!same_swapchain && !same_output && !same_backbuffer && active_call == 0) continue;
-    if (access.context != 0) {
-      if (ambiguous != nullptr) *ambiguous = true;
-      return access;
-    }
-    const auto& pre_effects = context->pre_effects_write;
-    const bool pre_effects_reserved = pre_effects.attempt && pre_effects.consumer_call == context->present_serial + 1
-        && pre_effects.access.backbuffer == backbuffer;
-    blocked = blocked_call || pre_effects_reserved || (service_requested && (context->enabled || context->bridge_present_fg_on
+    if (access.context != 0) return access;
+    blocked = blocked_call || (service_requested && (context->enabled || context->bridge_present_fg_on
         || context->bridge_enable_inflight != 0 || context->bridge_enable_ambiguous));
     access.context = reinterpret_cast<uintptr_t>(handle);
     access.owner = reinterpret_cast<uintptr_t>(context.get());
@@ -3887,6 +3897,7 @@ inline OrdinaryPresentAccess QueryOrdinaryPresentLocked(uintptr_t swapchain, uin
     // Explicit post-FG compatibility can deliver several actual Presents
     // within one SDK call. The ordinary path tracks those versions itself.
     access.call = (service_requested ? active_call : 0);
+    access.requires_off_turn = service_requested;
   }
   access.allowed = !blocked;
   return access;
@@ -3906,51 +3917,6 @@ inline bool OrdinarySdkInactiveLocked(const OrdinaryPresentAccess& access) {
          && !context.bridge_enable_ambiguous;
 }
 
-inline bool PreEffectsSingleColorWithoutGuides(const Frame* frame, uintptr_t backbuffer, uint32_t width, uint32_t height) {
-  if (frame == nullptr) return true;
-  auto* const hudless = frame->resources[0].resource.Get();
-  return !frame->rejected && frame->captures.empty()
-      && (hudless == nullptr || reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(hudless)) == backbuffer)
-      && frame->resources[1].resource == nullptr && frame->resources[2].resource == nullptr
-      && frame->resources[3].resource == nullptr && (!frame->has_constants || frame->constants.reset == 0)
-      && (!frame->has_region || (frame->region.base.x == 0 && frame->region.base.y == 0
-          && frame->region.size.x == width && frame->region.size.y == height));
-}
-
-inline OrdinaryPreEffectsWrite QueryOrdinaryPreEffectsLocked(const OrdinaryPresentAccess& access,
-    OrdinaryPresentAttempt attempt, uintptr_t queue, uint32_t width, uint32_t height) {
-  if (!attempt || access.allowed || access.call != 0 || access.owner == 0 || !Requested()
-      || !sdk_detours_enabled.load(std::memory_order_acquire)) return {};
-  bool ambiguous = false;
-  if (QueryOrdinaryPresentLocked(access.swapchain, access.backbuffer, access.output, &ambiguous) != access || ambiguous) return {};
-  const auto found = state.contexts.find(reinterpret_cast<void*>(access.context));
-  if (found == state.contexts.end()) return {};
-  const auto& context = *found->second;
-  if (!context.enabled || context.bridge_enable_inflight != 0 || context.bridge_enable_ambiguous
-      || context.ui_composition || !context.omit_optional_hudless || context.presents_in_flight != 0
-      || !context.bridge_context_ready || !context.bridge_proxy_ready || !UniqueProxyLocked(context.proxy_identity)
-      || context.output_identity != access.output || context.pre_effects_write.attempt
-      || queue == 0) return {};
-  if (reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(context.queue.Get())) != queue) return {};
-  const auto& last = context.last_handoff_write;
-  if (context.guided_delivery_declaration == 0 || context.guided_delivery_declaration != context.bridge_declaration
-      || !last.owner_current_at_return || !last.sdk_result_available || last.sdk_result != S_OK
-      || last.call != context.present_serial || last.application_frame != context.application_frame
-      || last.epoch != context.epoch || last.declaration != context.bridge_declaration || last.output != access.output
-      || !last.single_backbuffer || last.has_guides
-      || (last.service_result != Result::SUBMITTED && last.service_result != Result::ORDINARY_SUBMITTED)) return {};
-  if (last.service_result == Result::SUBMITTED && !last.service_submission.signaled) return {};
-  if (context.fresh_id) {
-    if (context.last_id_known && context.last_id == context.present_id) return {};
-    if (const auto tagged = context.frames.find(context.present_id); tagged != context.frames.end()
-        && !PreEffectsSingleColorWithoutGuides(tagged->second.get(), access.backbuffer, width, height)) return {};
-  }
-  const auto output = output_framerate::MatchPresentColorOwner(access.output, access.backbuffer);
-  if (!output || output.swapchain != attempt.owner) return {};
-  return {.attempt = attempt, .access = access, .physical_output = output, .consumer_call = context.present_serial + 1,
-      .color_space = context.color_space};
-}
-
 }  // namespace internal
 
 inline bool OrdinarySdkInactive(const OrdinaryPresentAccess& access) {
@@ -3960,67 +3926,14 @@ inline bool OrdinarySdkInactive(const OrdinaryPresentAccess& access) {
 }
 
 inline OrdinaryPresentAccess QueryOrdinaryPresent(uintptr_t swapchain, uintptr_t backbuffer,
-                                                   const output_framerate::OutputIdentity& output, uint64_t* upcoming_call = nullptr) {
+    const output_framerate::OutputIdentity& output) {
   std::shared_lock lock(internal::state.mutex);
-  const auto access = internal::QueryOrdinaryPresentLocked(swapchain, backbuffer, output);
-  if (upcoming_call != nullptr && access.context != 0 && access.call == 0) {
-    const auto found = internal::state.contexts.find(reinterpret_cast<void*>(access.context));
-    if (found != internal::state.contexts.end()) *upcoming_call = found->second->present_serial + 1;
-  }
-  return access;
+  return internal::QueryOrdinaryPresentLocked(swapchain, backbuffer, output);
 }
 
 inline const OrdinaryOffPresent* CurrentOrdinaryOffPresent() {
   const auto* present = internal::ordinary_off_present;
   return (present != nullptr ? &present->ordinary_off : nullptr);
-}
-
-inline OrdinaryPreEffectsWrite QueryOrdinaryPreEffects(const OrdinaryPresentAccess& access, OrdinaryPresentAttempt attempt,
-    uintptr_t queue, uint32_t width, uint32_t height) {
-  std::shared_lock lock(internal::state.mutex);
-  return internal::QueryOrdinaryPreEffectsLocked(access, attempt, queue, width, height);
-}
-
-inline bool OrdinaryPreEffectsPending(const OrdinaryPresentReceipt& receipt) {
-  if (!receipt.pre_effects_xefg) return false;
-  std::shared_lock lock(internal::state.mutex);
-  const auto found = internal::state.contexts.find(reinterpret_cast<void*>(receipt.context));
-  if (found == internal::state.contexts.end()) return false;
-  const auto& context = *found->second;
-  const auto& write = context.pre_effects_write;
-  return write.attempt == receipt.attempt && write.consumer_call == context.present_serial + 1
-      && write.access.backbuffer == receipt.backbuffer && write.access.epoch == receipt.epoch
-      && write.access.output == receipt.output;
-}
-
-template <typename Record>
-inline bool TryRecordOrdinaryPreEffects(const OrdinaryPreEffectsWrite& write, uintptr_t queue,
-    uint32_t width, uint32_t height, Record&& record) {
-  std::unique_lock lock(internal::state.mutex);
-  if (!write.attempt || internal::QueryOrdinaryPreEffectsLocked(write.access, write.attempt, queue, width, height) != write) return false;
-  if (!std::forward<Record>(record)()) return false;
-  internal::state.contexts.at(reinterpret_cast<void*>(write.access.context))->pre_effects_write = write;
-  return true;
-}
-
-inline bool OrdinaryPreEffectsReceiptCurrent(const OrdinaryPresentReceipt& receipt) {
-  const auto* present = (internal::ordinary_off_present != nullptr ? internal::ordinary_off_present : internal::recording_service);
-  if (present == nullptr || !receipt.pre_effects_xefg || !present->pre_effects_full_consumer_region) return false;
-  const auto& write = present->pre_effects_write;
-  if (!write.attempt || receipt.attempt != write.attempt || receipt.context != write.access.context
-      || receipt.output != write.access.output || receipt.epoch != write.access.epoch || receipt.call != 0
-      || write.access.backbuffer != receipt.backbuffer || write.consumer_call != present->serial
-      || present->input.diagnostic_context != write.access.owner || present->input.ui_composition
-      || present->input.color_space != write.color_space
-      || !internal::PreEffectsSingleColorWithoutGuides(present->frame.get(), receipt.backbuffer, receipt.width, receipt.height)) return false;
-  std::shared_lock lock(internal::state.mutex);
-  if (output_framerate::MatchPresentColorOwner(present->input.output, receipt.backbuffer) != write.physical_output) return false;
-  if (present->input.fg_enabled) {
-    return internal::PresentWriteCurrentLocked(*present) && present->input.epoch == write.access.epoch
-        && present->declaration == write.access.declaration && present->input.output == write.access.output;
-  }
-  return internal::OrdinaryOffCurrentLocked(*present) && present->input.epoch == write.disable_epoch
-      && present->declaration == write.disable_declaration;
 }
 
 inline bool MatchesOrdinaryOffAccess(const OrdinaryOffPresent& turn, const OrdinaryPresentAccess& access) {
@@ -4037,8 +3950,6 @@ inline bool BindOrdinaryOffPresentAttempt(const OrdinaryOffPresent& turn, Ordina
   auto* present = internal::ordinary_off_present;
   if (present == nullptr || &present->ordinary_off != &turn || !attempt
       || attempt.owner != turn.physical_output.swapchain) return false;
-  if (present->pre_effects_write.attempt && present->pre_effects_write.attempt != attempt
-      && present->pre_effects_write.access.backbuffer == turn.access.backbuffer) return false;
   std::shared_lock lock(internal::state.mutex);
   if (!internal::OrdinaryOffCurrentLocked(*present) || (present->ordinary_attempt && present->ordinary_attempt != attempt)) {
     return false;

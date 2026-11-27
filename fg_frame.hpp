@@ -80,6 +80,8 @@ struct FrameInput {
   // Borrowed from this SDK context or its accepted current tag while Service
   // runs. This is the face for recording resources, not for queue submission.
   ID3D12Device* recording_device = nullptr;
+  // Borrowed from this frame's SDK tag command list when it exposes a native device.
+  ID3D12Device* native_tag_recording_device = nullptr;
 };
 
 using Service = Result (*)(const FrameInput&) noexcept;

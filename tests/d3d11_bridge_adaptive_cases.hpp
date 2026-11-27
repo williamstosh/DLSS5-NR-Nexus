@@ -4,7 +4,10 @@
 #include <string_view>
 
 #include "vulkan_test_api_stubs.hpp"
+// Keep the add-on's local alias distinct from the test stubs' nr namespace.
+#define nr nr_bridge_registration_addon
 #include "../addon.cpp"
+#undef nr
 
 namespace bridge_adaptive_cases {
 

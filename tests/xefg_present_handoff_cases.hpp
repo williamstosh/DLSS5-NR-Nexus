@@ -8,6 +8,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -63,6 +64,8 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
 
   Session session(&gpu);
   session.context->ui_composition = false;
+  // Session supplies its actual composition swapchain in place of GetSwapchain.
+  session.context->bridge_proxy_ready = true;
   session.extent_left = session.extent_top = 0;
   session.extent_height = session.extent_width = size;
   ComPtr<ID3D12Resource> back, other_back;
@@ -210,6 +213,16 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
     return native::FindOrdinaryPresentAttempt(reinterpret_cast<uintptr_t>(
         renodx::utils::directx::NativeIdentity(output->swapchain)), reinterpret_cast<uintptr_t>(
         renodx::utils::directx::NativeIdentity(output->back)));
+  };
+  const auto plain_off_present = [&](const auto& pre_effects, HRESULT expected = S_OK) {
+    const auto consume = nr_edit_reuse_xefg_cases::consume_sdk_present;
+    funnel_accounting_tests::Restore restore_consumer;
+    restore_consumer.Value(&nr_edit_reuse_xefg_cases::consume_sdk_present);
+    nr_edit_reuse_xefg_cases::consume_sdk_present = [&](IDXGISwapChain* swapchain) {
+      pre_effects();
+      if (consume) consume(swapchain);
+    };
+    Check(adapter::ProxyHooks<0>::Present(session.proxy.Get(), 0, 0) == expected, "the Off SDK consumer returns its actual status");
   };
   const auto sdk_present = [&](Session* sdk_session, int scene, bool reset, HRESULT expected = S_OK) {
     if (scene >= 0) {
@@ -379,34 +392,33 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
     native::DrainRetiredResources(true);
   };
   if (ordinary_signal_loss_only) {
-    Check(Hooks::Enable(session.handle, 0) == 0 && !session.context->enabled, "Signal fixture starts with ordinary ownership");
-    warm("ordinary-receipt-signal-prefix", &route, false);
+    Check(Hooks::Enable(session.handle, 0) == 0 && !session.context->enabled, "Signal fixture has a confirmed Off consumer");
+    const auto warm_writes = ordinary_submissions(&route);
+    for (uint32_t i = 0; i < native::kContractDebounceFrames + 8 && ordinary_submissions(&route) == warm_writes; ++i) {
+      produce(back.Get(), scene_a, -1, false);
+      plain_off_present([&] { call_ordinary(&route); });
+    }
+    Check(ordinary_submissions(&route) == warm_writes + 1 && consumed == expected_pixels(scene_a, true),
+          "the actual Off scope completes the ordinary model before injecting a color Signal fault");
     produce(back.Get(), menu, -1, false);
     const auto calls = model_calls;
     const auto deliveries = xefg::SubmittedFrames();
     const auto reads = sdk_reads;
     xefg::OrdinaryPresentAttempt attempt;
-    fail_first_tracker_signal([&] { attempt = call_ordinary(&route); });
-    wait_fence(native::present_ring.fence, native::present_ring.submitted);
     xefg::OrdinaryPresentReceipt receipt;
-    {
-      const addon::RuntimeLock lock(native::runtime_mutex);
+    plain_off_present([&] {
+      fail_first_tracker_signal([&] { attempt = call_ordinary(&route); });
+      wait_fence(native::present_ring.fence, native::present_ring.submitted);
       receipt = native::ordinary_present_attempts.at(&route).receipt;
-    }
+    });
     Check(receipt.attempt == attempt && receipt.executed && receipt.output_ready && receipt.group_complete
               && receipt.submission.signaled && receipt.submission.fence_value == native::present_ring.submitted
               && receipt.first_state == submission::SubmissionProofState::kSignalFailed && !receipt.proofs_healthy
               && model_calls == calls + 1, "ordinary color executed once and its own fence completed without a first tracker proof");
-    Check(Hooks::Enable(session.handle, 1) == 0 && find_attempt(&route) == attempt,
-          "the SDK takes the same output and sees the actual unproven ordinary receipt");
-    auto sdk = adapter::BeginPresent(session.proxy.Get(), 0);
-    Check(sdk.ordinary_claim == xefg::OrdinaryPresentClaim::CONFLICT && sdk.ordinary_receipt.attempt == attempt
-              && sdk.ordinary_receipt.first_state == submission::SubmissionProofState::kSignalFailed
-              && !sdk.color_executed && sdk.service_result == fg::Result::NOT_SERVED,
-          "missing first tracker proof forbids claiming the ordinary result or writing it again");
-    const auto status = nr_edit_reuse_xefg_cases::ConsumeSdkPresent(session.proxy.Get(), 0, 0);
-    adapter::EndPresent(&sdk, status);
-    Check(status == S_OK && xefg::CurrentResult() == fg::Result::NOT_SERVED && !find_attempt(&route)
+    const auto& outcome = session.context->last_handoff_write;
+    Check(outcome.ordinary_claim == xefg::OrdinaryPresentClaim::CONFLICT && outcome.ordinary_receipt.attempt == attempt
+              && outcome.ordinary_receipt.first_state == submission::SubmissionProofState::kSignalFailed
+              && !outcome.color_executed && !find_attempt(&route)
               && sdk_reads == reads + 1 && model_calls == calls + 1 && xefg::SubmittedFrames() == deliveries
               && consumed == expected_pixels(menu, true) && !submission::ResourceReleasable(back.Get()),
           "SDK consumes the actual RGBA without a second enhancement or a manufactured lifetime proof");
@@ -504,109 +516,38 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
             << " single_write=" << duplicate_ok << std::endl;
 
   frame("off-last-scene-a", &route, scene_a, 0, true, true, true, 1);
-  {
-    uint64_t first_sdk_execute = 0;
-    const auto color_identity = renodx::utils::directx::NativeIdentity(back.Get());
-    const auto consume_original = nr_edit_reuse_xefg_cases::consume_sdk_present;
-    std::vector<submission::GenerationSubmission> sdk_writes;
-    nlohmann::json sdk_recordings = nlohmann::json::array();
-    funnel_accounting_tests::Restore consumer_restore;
-    consumer_restore.Value(&nr_edit_reuse_xefg_cases::consume_sdk_present);
-    nr_edit_reuse_xefg_cases::consume_sdk_present = [&](IDXGISwapChain* output) {
-      // The consumer's GPU readback retires completed tracker generations.
-      observe_color_submissions(submission::RecordingOwner::kXeFg, color_identity, first_sdk_execute,
-          [&](uint64_t list_id, uint64_t generation, const auto& recorded) {
-            sdk_writes.insert(sdk_writes.end(), recorded.submissions.begin(), recorded.submissions.end());
-            sdk_recordings.push_back({{"list", list_id}, {"generation", generation}, {"execute", recorded.first_execute}});
-          });
-      consume_original(output);
-    };
-    struct ReceiptCase {
-      const char* ordinary_phase;
-      const char* next_phase;
-      HRESULT sdk_status;
-      int ordinary_reset;
-      bool raw_sdk_reset;
-    };
-    constexpr ReceiptCase receipt_cases[]{
-        {"off-first-menu-ordinary", "after-enable-next-produced-menu", S_OK, 1, false},
-        {"off-menu-before-sdk-failure", "after-failed-end-next-produced-menu", E_FAIL, -1, false},
-        {"off-menu-before-sdk-reset", "after-sdk-reset-next-produced-menu", S_OK, -1, true},
-    };
-    const auto& game_resets = native::history_reset_counts[static_cast<size_t>(native::HistoryResetSource::kGameReset)];
-    for (const auto& scenario : receipt_cases) {
-      const bool sdk_success = scenario.sdk_status == S_OK;
-      Check(Hooks::Enable(session.handle, 0) == 0 && !session.context->enabled, "SDK actually relinquishes this output");
-      const auto before_ordinary = model_calls;
-      const auto resets_before_ordinary = game_resets.load();
-      xefg::OrdinaryPresentAttempt ordinary_attempt;
-      Check(frame(scenario.ordinary_phase, &route, menu, -1, false, false, true,
-                  scenario.ordinary_reset, true, &ordinary_attempt)
-                && model_calls == before_ordinary + 1,
-            "ordinary Present writes the complete menu version once before SDK BeginPresent");
-      const auto ordinary_pixels = consumed;
-      const auto menu_production = produced_colors;
-      const auto reads = sdk_reads;
-      const auto submissions = xefg::SubmittedFrames();
-      first_sdk_execute = next_execute();
-      sdk_writes.clear();
-      sdk_recordings.clear();
-      Check(native::present_guides == native::kPresentGuidesOptional && !session.context->ui_composition,
-            "the SDK accepts the untagged menu with Optional guides");
-      Check(Hooks::Enable(session.handle, 1) == 0 && session.context->enabled
-                && find_attempt(&route) == ordinary_attempt, "SDK Enable retains the in-progress ordinary attempt");
-      const auto resets_at_sdk_begin = game_resets.load();
-      nr_edit_reuse_xefg_cases::sdk_present_result = scenario.sdk_status;
-      sdk_present(&session, scenario.raw_sdk_reset ? 0 : -1, scenario.raw_sdk_reset, scenario.sdk_status);
-      nr_edit_reuse_xefg_cases::sdk_present_result = S_OK;
-      const auto resets_after_sdk = game_resets.load();
-      const auto result = xefg::CurrentResult();
-      if (!sdk_success) {
-        check_warn("first-sdk-present-failure-is-yellow", "fg_handoff_failed");
-      }
-      const auto model_evaluates = model_calls - before_ordinary;
-      const auto sdk_deliveries = xefg::SubmittedFrames() - submissions;
-      const bool same_version = produced_colors == menu_production && route.back == back.Get();
-      const bool preserved_rgba = consumed == ordinary_pixels;
-      const bool finished = !find_attempt(&route);
-      const bool single_write = same_version && model_evaluates == 1 && sdk_deliveries == 0 && sdk_writes.empty()
-          && sdk_reads == reads + 1 && preserved_rgba && finished
-          && result == (sdk_success ? fg::Result::ORDINARY_SUBMITTED : fg::Result::FAILED)
-          && (!scenario.raw_sdk_reset || (resets_at_sdk_begin == resets_before_ordinary
-              && resets_after_sdk == resets_at_sdk_begin + 1));
-      accepted &= single_write;
-      std::cout << "XEFG_HANDOFF_SAME_VERSION " << nlohmann::json{{"version", version}, {"same_version", same_version},
-          {"model_evaluates", model_evaluates}, {"ordinary_bb_writes", 1}, {"sdk_bb_writes", sdk_writes.size()},
-          {"sdk_deliveries", sdk_deliveries}, {"sdk_recordings", sdk_recordings}, {"same_rgba", preserved_rgba},
-          {"sdk_success", sdk_success}, {"result", static_cast<unsigned>(result)}, {"finished", finished},
-          {"raw_sdk_reset", scenario.raw_sdk_reset}, {"game_reset_delta", resets_after_sdk - resets_at_sdk_begin},
-          {"passed", single_write}}.dump() << std::endl;
+  for (const HRESULT sdk_status : {S_OK, E_FAIL}) {
+    Check(Hooks::Enable(session.handle, 0) == 0, "the current SDK consumer accepts Disable");
+    produce(back.Get(), menu, -1, false);
+    const auto before_calls = model_calls;
+    const auto before_writes = ordinary_submissions(&route);
+    const auto before_sdk_writes = xefg::SubmittedFrames();
+    const auto before_reads = sdk_reads;
+    xefg::OrdinaryPresentAttempt attempt;
+    nr_edit_reuse_xefg_cases::sdk_present_result = sdk_status;
+    plain_off_present([&] {
+      attempt = call_ordinary(&route);
+      native::RunPresentPath(&route.queue, &route);
+    }, sdk_status);
+    nr_edit_reuse_xefg_cases::sdk_present_result = S_OK;
+    const auto& receipt = session.context->last_handoff_write;
+    Check(model_calls == before_calls + 1 && ordinary_submissions(&route) == before_writes + 1
+              && xefg::SubmittedFrames() == before_sdk_writes && sdk_reads == before_reads + 1
+              && consumed == expected_pixels(menu, true) && receipt.ordinary_receipt.attempt == attempt
+              && receipt.ordinary_claim == xefg::OrdinaryPresentClaim::COVERED && receipt.sdk_result == sdk_status
+              && !find_attempt(&route),
+          "the actual Off call settles one current ordinary write even when its consumer returns an error");
 
-      sdk_writes.clear();
-      sdk_recordings.clear();
-      first_sdk_execute = next_execute();
-      const bool next_delivered = frame(scenario.next_phase, &route, scene_a, -1, false, true, true,
-                                        scenario.raw_sdk_reset ? 1 : -1);
-      const bool next_completed = sdk_writes.size() == 1
-          && submission::ReadSubmission(sdk_writes.front()).state == submission::SubmissionProofState::kComplete;
-      const auto& evaluate = native::stage_telemetry[static_cast<size_t>(addon::stage_plan::Stage::PRESENT)].last_evaluate;
-      const bool game_reset_applied = evaluate.reset_sent && (evaluate.reset_reasons & native::kResetGame) != 0
-          && game_resets.load() == resets_after_sdk;
-      const bool next_passed = next_delivered && next_completed && produced_colors == menu_production + 1
-          && xefg::CurrentResult() == fg::Result::SUBMITTED && (!scenario.raw_sdk_reset || game_reset_applied);
-      accepted &= next_passed;
-      if (!sdk_success) {
-        check_unproven("successful-sdk-return-without-matched-delivery-stays-gray");
-      }
-      std::cout << "XEFG_HANDOFF_NEXT_VERSION " << nlohmann::json{{"version", version},
-          {"new_color_produced", produced_colors == menu_production + 1}, {"sdk_bb_writes", sdk_writes.size()},
-          {"sdk_recordings", sdk_recordings}, {"completed", next_completed}, {"after_sdk_success", sdk_success},
-          {"raw_sdk_reset", scenario.raw_sdk_reset}, {"game_reset_applied", game_reset_applied},
-          {"passed", next_passed}}.dump() << std::endl;
-      if (scenario.raw_sdk_reset && single_write && next_passed) {
-        std::cout << "PASS xefg-ordinary-receipt-game-reset evidence=WARP+MOCK game_reset_delta=1"
-                     " same_version_write=1 sdk_writes=0 next_version_reset=1" << std::endl;
-      }
+    Check(Hooks::Enable(session.handle, 1) == 0, "the next version has a newly enabled SDK owner");
+    const bool reset = sdk_status == E_FAIL;
+    Check(frame("next-on-after-ordinary-off", &route, scene_a, reset ? 1 : -1, reset, true, true, reset ? 1 : -1),
+          "the next produced version takes the actual SDK path after the old call settles");
+    if (reset) {
+      const auto& evaluation = native::stage_telemetry[static_cast<size_t>(addon::stage_plan::Stage::PRESENT)].last_evaluate;
+      Check(evaluation.reset_sent && (evaluation.reset_reasons & native::kResetGame) != 0,
+            "the SDK evaluates the new version with its real game Reset");
+      std::cout << "PASS xefg-ordinary-receipt-game-reset evidence=WARP+MOCK sdk_return_preserved=1"
+                   " same_version_write=1 sdk_writes=0 next_version_reset=1\n";
     }
   }
   {
@@ -615,10 +556,6 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
     funnel_accounting_tests::Restore off_restore;
     off_restore.Value(&nr_edit_reuse_xefg_cases::consume_sdk_present);
     off_restore.Value(&adapter::proxies[0].real[1]);
-    off_restore.Value(&session.context->bridge_proxy_ready);
-    // Session wires its real composition swapchain directly in place of the
-    // SDK's GetSwapchain export. Complete that mock boundary for Off claims.
-    session.context->bridge_proxy_ready = true;
     adapter::proxies[0].real[1] = reinterpret_cast<void*>(+[](IDXGISwapChain1* swapchain, UINT interval, UINT flags,
         const DXGI_PRESENT_PARAMETERS*) -> HRESULT {
       return nr_edit_reuse_xefg_cases::ConsumeSdkPresent(swapchain, interval, flags);
@@ -632,6 +569,12 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
       Check((parameters != nullptr ? adapter::ProxyHooks<0>::Present1(session.proxy.Get(), 0, 0, parameters)
                                   : adapter::ProxyHooks<0>::Present(session.proxy.Get(), 0, 0)) == S_OK,
             "the real outer detour preserves its Off SDK return");
+    };
+    const auto run_ordinary_event = [&] {
+      const auto attempt = native::BeginOrdinaryPresentAttempt(&route.queue, &route);
+      native::present_sdr_white_polled_ns = native::SteadyNowNs();
+      native::RunPresentPath(&route.queue, &route);
+      return attempt;
     };
 
     produce(back.Get(), scene_a, -1, false);
@@ -671,16 +614,15 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
           "no pre-FX callback leaves the original SDK's first read unchanged");
 
     produce(back.Get(), scene_a, -1, false);
-    const auto prior_attempt = call_ordinary(&route);
     const auto prior_calls = model_calls;
-    const auto ordinary_after_prior = ordinary_submissions(&route);
+    const auto prior_writes = ordinary_submissions(&route);
+    const auto prior_read = sdk_reads;
+    const auto prior_attempt = run_ordinary_event();
     off_present(nullptr);
-    const auto& prior_receipt = session.context->last_handoff_write;
-    Check(model_calls == prior_calls && ordinary_submissions(&route) == ordinary_after_prior
-              && consumed == expected_pixels(scene_a, true) && !find_attempt(&route)
-              && prior_receipt.ordinary_claim == Claim::COVERED && prior_receipt.ordinary_receipt.attempt == prior_attempt
-              && prior_receipt.ordinary_receipt.call == 0 && prior_receipt.call != 0 && !session.context->bridge_present_fg_on,
-          "Off accepts an earlier complete ordinary write once without restoring FG ownership");
+    Check(model_calls == prior_calls && ordinary_submissions(&route) == prior_writes && sdk_reads == prior_read + 1
+              && consumed == expected_pixels(scene_a, false) && !session.context->bridge_present_fg_on,
+          "confirmed Off with a standalone ordinary event cannot write before the actual SDK parameters arrive");
+    native::EndOrdinaryPresentAttempt(prior_attempt);
 
     produce(back.Get(), scene_b, -1, false);
     RECT whole{0, 0, size, size};
@@ -718,7 +660,7 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
           "a scroll Present1 does not acquire full BackBuffer write permission");
 
     Check(Hooks::Enable(session.handle, 1) == 0 && session.context->enabled, "return the fixture to XeFG ownership");
-    std::cout << "PASS xefg-off-present-turn evidence=WARP+MOCK late_disable=1 missing_pre_fx=1 prior_write=1 nested_write=1"
+    std::cout << "PASS xefg-off-present-turn evidence=WARP+MOCK late_disable=1 missing_pre_fx=1 standalone_off_rejected=1 nested_write=1"
                  " full_present1=1 partial_present1_rejected=1 scroll_rejected=1" << std::endl;
 
     native::NgxLoaderSymbols signed_mock{.nr_ready = true, .nr_module = native::direct_api.module,
@@ -757,59 +699,83 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
               && !session.context->last_handoff_write.has_guides,
           "the actual earlier SDK consumer used the warm missing-guide contract");
 
-    produce(back.Get(), scene_a, -1, false);
-    const auto before_warm_off = model_calls;
     const auto warm_creates = next_handle;
-    const auto warm_epoch = session.context->epoch;
-    const auto warm_attempt = native::BeginOrdinaryPresentAttempt(&route.queue, &route);
-    Check(static_cast<bool>(warm_attempt), "ordinary Present begins the warm pre-FX attempt");
-    const auto& warm_event = native::ordinary_present_attempts.at(&route);
+    Check(Hooks::Enable(session.handle, 0) == 0, "the real SDK accepts Disable before the full consumers");
     const D3D12_COMMAND_QUEUE_DESC alternate_desc{.Type = D3D12_COMMAND_LIST_TYPE_DIRECT};
     ComPtr<ID3D12CommandQueue> alternate_queue;
     Check(SUCCEEDED(gpu.device->CreateCommandQueue(&alternate_desc, IID_PPV_ARGS(&alternate_queue))),
           "create a second real submission queue on the same WARP device");
-    const auto alternate_identity = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(alternate_queue.Get()));
-    Check(alternate_identity != 0 && alternate_identity != warm_event.queue,
-          "the alternate queue has a distinct native identity");
-    Check(xefg::QueryOrdinaryPreEffects(warm_event.event_access, warm_attempt, warm_event.queue, size, size).attempt == warm_attempt
-              && !xefg::QueryOrdinaryPreEffects(warm_event.event_access, warm_attempt, alternate_identity, size, size).attempt,
-          "only the same physical queue can take this otherwise eligible pre-FX write");
-    native::present_sdr_white_polled_ns = native::SteadyNowNs();
-    native::RunPresentPath(&route.queue, &route);
-    const auto warm_receipt = native::ordinary_present_attempts.at(&route).receipt;
-    Check(warm_receipt.executed && warm_receipt.pre_effects_xefg && warm_receipt.proofs_healthy
-              && warm_receipt.epoch == warm_epoch && warm_receipt.attempt == warm_attempt
-              && model_calls == before_warm_off + 2 && next_handle == warm_creates,
-          "pre-FX executes the complete mature two-Pass neutral model once under live On ownership");
-    auto pre_fx_pixels = Capture(gpu, back.Get(), present_state);
-    // Copy an independent UI pixel after the pre-FX read. A late model would
-    // erase that marker as well as increment the existing two-Pass write.
+    Check(!renodx::utils::directx::SameNativeObject(alternate_queue.Get(), gpu.queue.Get()),
+          "the second native submission queue is distinct");
+    PresentFaceQueue alternate_face;
+    alternate_face.device = &route.device;
+    alternate_face.native = alternate_queue.Get();
+
     const Pixel ui_pixel{91, 120, 151, 201};
     const auto ui = gpu.Texture();
     upload(ui.Get(), ui_pixel, present_state);
     gpu.Transition(ui.Get(), present_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    gpu.Transition(back.Get(), present_state, D3D12_RESOURCE_STATE_COPY_DEST);
-    const D3D12_TEXTURE_COPY_LOCATION to{.pResource = back.Get(), .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-    const D3D12_TEXTURE_COPY_LOCATION from{.pResource = ui.Get(), .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-    constexpr D3D12_BOX top_left{0, 0, 0, 1, 1, 1};
-    gpu.list->CopyTextureRegion(&to, 0, 0, 0, &from, &top_left);
-    gpu.Transition(back.Get(), D3D12_RESOURCE_STATE_COPY_DEST, present_state);
     submit();
-    Check(pre_fx_pixels.Pixels() == expected_pixels(scene_a, true), "the pre-FX consumer reads current edited color");
-    Check(Hooks::Enable(session.handle, 0) == 0, "the real Disable follows the pre-FX write and UI composition");
-    Check(call_ordinary(&route) == warm_attempt && model_calls == before_warm_off + 2,
-          "a second event before this SDK call cannot replace or replay the already-executed attempt after Disable");
-    off_present(nullptr);
-    auto expected_composited = expected_pixels(scene_a, true);
-    std::ranges::copy(ui_pixel, expected_composited.begin());
-    const auto& settled = session.context->last_handoff_write;
-    Check(consumed == expected_composited && model_calls == before_warm_off + 2 && next_handle == warm_creates
-              && settled.ordinary_claim == Claim::COVERED && settled.ordinary_receipt.attempt == warm_attempt
-              && settled.ordinary_receipt.epoch == warm_epoch && settled.epoch == warm_epoch + 1
-              && std::string_view(settled.reason) == "off_pre_fx_owner_receipt" && !find_attempt(&route),
-          "Off consumes the composed version with one Execute, original UI and the exact adjacent Disable claim");
+
+    xefg::OrdinaryPresentAttempt previous_full_attempt;
+    uint64_t previous_full_call = 0;
+    const auto backbuffer_identity = renodx::utils::directx::NativeIdentity(back.Get());
+    const auto public_writes_since = [&](uint64_t first_execute) {
+      size_t writes = 0;
+      for (const auto owner : {submission::RecordingOwner::kOrdinaryPresent, submission::RecordingOwner::kXeFg}) {
+        observe_color_submissions(owner, backbuffer_identity, first_execute,
+            [&](uint64_t, uint64_t, const auto& recorded) { writes += recorded.submissions.size(); });
+      }
+      return writes;
+    };
+    for (const auto* full_parameters : std::array<const DXGI_PRESENT_PARAMETERS*, 2>{nullptr, &full}) {
+      const auto& pixel = (full_parameters == nullptr ? scene_a : scene_b);
+      produce(back.Get(), pixel, -1, false);
+      const auto begin_calls = model_calls;
+      const auto begin_writes = ordinary_submissions(&route);
+      const auto begin_reads = sdk_reads;
+      const auto first_execute = next_execute();
+      xefg::OrdinaryPresentAttempt attempt;
+      nr_edit_reuse_xefg_cases::consume_sdk_present = [&](IDXGISwapChain* swapchain) {
+        Check(!native::BeginOrdinaryPresentAttempt(&alternate_face, &route),
+              "the real pre-FX event rejects a different queue under this legal SDK call");
+        attempt = run_ordinary_event();
+        Check(static_cast<bool>(attempt) && attempt != previous_full_attempt, "this full call acquires its own ordinary attempt");
+        native::EndOrdinaryPresentAttempt(previous_full_attempt);
+        const auto& pre_fx = native::ordinary_present_attempts.at(&route).receipt;
+        Check(pre_fx.attempt == attempt && pre_fx.executed && pre_fx.call != 0 && pre_fx.proofs_healthy,
+              "the full SDK call records an actual ordinary submission and retains its own first Signal");
+        Check(public_writes_since(first_execute) == 1, "the full version has one physical ordinary color write before effects");
+
+        // Compose a UI pixel after the pre-FX read. Replaying NR would erase it.
+        auto pre_fx_pixels = Capture(gpu, back.Get(), present_state);
+        gpu.Transition(back.Get(), present_state, D3D12_RESOURCE_STATE_COPY_DEST);
+        const D3D12_TEXTURE_COPY_LOCATION to{.pResource = back.Get(), .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        const D3D12_TEXTURE_COPY_LOCATION from{.pResource = ui.Get(), .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        constexpr D3D12_BOX top_left{0, 0, 0, 1, 1, 1};
+        gpu.list->CopyTextureRegion(&to, 0, 0, 0, &from, &top_left);
+        gpu.Transition(back.Get(), D3D12_RESOURCE_STATE_COPY_DEST, present_state);
+        submit();
+        Check(pre_fx_pixels.Pixels() == expected_pixels(pixel, true), "effects receive current edited color before UI");
+        native::RunPresentPath(&route.queue, &route);
+        native::OnFinishPresent(&route.queue, &route);
+        consume_original(swapchain);
+      };
+      off_present(full_parameters);
+      auto expected_composited = expected_pixels(pixel, true);
+      std::ranges::copy(ui_pixel, expected_composited.begin());
+      const auto& settled = session.context->last_handoff_write;
+      Check(consumed == expected_composited && model_calls == begin_calls + 2 && next_handle == warm_creates
+                && ordinary_submissions(&route) == begin_writes + 1 && sdk_reads == begin_reads + 1
+                && settled.ordinary_claim == Claim::COVERED && settled.ordinary_receipt.attempt == attempt
+                && settled.ordinary_receipt.call == settled.call && settled.call > previous_full_call && !find_attempt(&route),
+            "one complete two-Pass write serves the exact full SDK call and preserves composed UI at first read");
+      previous_full_attempt = attempt;
+      previous_full_call = settled.call;
+    }
 
     Check(Hooks::Enable(session.handle, 1) == 0, "SDK enable restores its regular consumer");
+    nr_edit_reuse_xefg_cases::consume_sdk_present = consume_original;
     produce(back.Get(), scene_b, -1, false);
     sdk_present(&session, -1, false);
     Check(session.context->last_handoff_write.service_result == fg::Result::SUBMITTED
@@ -817,9 +783,8 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
           "a genuinely untagged startup delivery precedes the first real-guide case");
     produce(back.Get(), scene_a, -1, false);
     const auto before_first_guides = model_calls;
-    const auto startup_attempt = call_ordinary(&route);
-    Check(!native::ordinary_present_attempts.at(&route).receipt.executed && model_calls == before_first_guides,
-          "the reopened declaration must deliver real guides before an untagged frame can authorize pre-FX");
+    const auto startup_attempt = run_ordinary_event();
+    Check(model_calls == before_first_guides, "the standalone callback cannot evaluate the reopened version");
     sdk_present(&session, 1, false);
     Check(consumed == expected_pixels(scene_a, true) && model_calls == before_first_guides + 2
               && model_motion == motions[1].Get() && model_depth == depths[1].Get(),
@@ -833,7 +798,7 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
     {
       const addon::RuntimeLock lock(native::runtime_mutex);
       const auto& game_sr = native::features.at(source);
-      const auto physical = rate::FindPresentOwner(0, warm_receipt.backbuffer);
+      const auto physical = rate::FindPresentOwner(0, reinterpret_cast<uintptr_t>(backbuffer_identity));
       const rate::SourceIdentity sr_source{.handle = reinterpret_cast<uintptr_t>(source), .generation = game_sr.source_generation,
           .device = reinterpret_cast<uintptr_t>(game_sr.source_device12_identity.Get()),
           .resource = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(source_output.Get())),
@@ -844,12 +809,10 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
     }
     produce(back.Get(), scene_b, 1, false);
     const auto late_calls = model_calls;
-    const auto late_attempt = call_ordinary(&route);
-    const auto& late_owner = native::ordinary_present_attempts.at(&route);
-    Check(!late_owner.receipt.executed && model_calls == late_calls
-              && std::string_view(late_owner.pre_effects_rejection) == "off_pre_fx_current_sr_guides"
-              && !session.context->fresh_id,
-          "current SR guide producer keeps late SDK tags eligible before any tag reaches the SDK");
+    const auto late_writes = ordinary_submissions(&route);
+    const auto late_attempt = run_ordinary_event();
+    Check(model_calls == late_calls && !session.context->fresh_id && ordinary_submissions(&route) == late_writes,
+          "the standalone callback does no Evaluate or write before this frame receives its real SDK tags");
     sdk_present(&session, 1, false);
     Check(consumed == expected_pixels(scene_b, true) && model_calls == late_calls + 2 && next_handle == warm_creates
               && model_motion == motions[1].Get() && model_depth == depths[1].Get()
@@ -857,28 +820,442 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
           "the first late-tagged frame uses both real guides, the same models, and one original SDK delivery");
     native::EndOrdinaryPresentAttempt(late_attempt);
 
-    produce(back.Get(), scene_a, -1, false);
-    sdk_present(&session, -1, false);
-    produce(back.Get(), scene_b, -1, false);
-    const auto unconsumed_attempt = call_ordinary(&route);
-    Check(native::ordinary_present_attempts.at(&route).receipt.pre_effects_xefg,
-          "the next missing-guide version can acquire its own pre-FX write");
-    const auto after_unconsumed_write = model_calls;
-    Check(Hooks::Enable(session.handle, 0) == 0 && Hooks::Enable(session.handle, 1) == 0,
-          "an additional Enable breaks the adjacent Disable transfer");
-    sdk_present(&session, -1, false);
-    Check(session.context->last_handoff_write.ordinary_claim == Claim::CONFLICT
-              && session.context->last_handoff_write.ordinary_receipt.attempt == unconsumed_attempt
-              && model_calls == after_unconsumed_write && !find_attempt(&route),
-          "the unconsumed write cannot be adopted or repeated across multiple epoch changes");
-    produce(back.Get(), scene_a, -1, false);
-    sdk_present(&session, 1, false);
-    Check(consumed == expected_pixels(scene_a, true) && model_calls == after_unconsumed_write + 2
-              && session.context->last_handoff_write.service_result == fg::Result::SUBMITTED,
-          "the same backbuffer can deliver a newly produced version through the regular SDK owner");
-    std::cout << "PASS xefg-off-pre-fx-handoff evidence=WARP+MOCK two_pass=1 exact_disable=1 ui_retained=1"
-                 " foreign_queue_rejected=1 late_real_guides=1 stale_epoch_rejected=1 next_version=1\n";
+    std::cout << "PASS xefg-off-pre-fx-handoff evidence=WARP+MOCK two_pass=1 full_present=1 full_present1=1 ui_retained=1"
+                 " foreign_queue_rejected=1 late_real_guides=1 next_version=1\n";
+
+    RECT late_scroll_rect{0, 0, size / 2, size};
+    POINT late_scroll_offset{1, 0};
+    struct LatePresent1Case {
+      const char* phase;
+      DXGI_PRESENT_PARAMETERS parameters;
+      bool full_region = false;
+    };
+    const LatePresent1Case late_present1_cases[]{
+        {"full-control", {}, true},
+        {"scroll-rect-only", {.pScrollRect = &late_scroll_rect}},
+        {"scroll-offset-only", {.pScrollOffset = &late_scroll_offset}},
+        {"partial-dirty", {.DirtyRectsCount = 1, .pDirtyRects = &partial}},
+    };
+    bool late_present1_passed = true;
+    for (const auto& [phase, late_parameters, full_region] : late_present1_cases) {
+      produce(back.Get(), scene_a, -1, false);
+      sdk_present(&session, 1, false);
+      produce(back.Get(), scene_b, -1, false);
+      sdk_present(&session, -1, false);
+      Check(session.context->last_handoff_write.service_result == fg::Result::SUBMITTED
+                && !session.context->last_handoff_write.has_guides,
+            "the late Present1 fixture enters with a mature missing-guide delivery");
+
+      produce(back.Get(), scene_a, -1, false);
+      const auto calls_before = model_calls;
+      const auto sdk_before = xefg::SubmittedFrames();
+      const auto reads_before = sdk_reads;
+      const auto first_execute = next_execute();
+      // The ordinary ReShade event has zero dirty rects. The actual Present1
+      // parameters only become visible at the SDK's outer adapter boundary.
+      const auto late_attempt = run_ordinary_event();
+      const auto early_evaluates = model_calls - calls_before;
+      Check(Hooks::Enable(session.handle, 0) == 0, "late Present1 follows a real Disable");
+
+      size_t public_writes = 0;
+      bool nested_rejected = false;
+      nr_edit_reuse_xefg_cases::consume_sdk_present = [&](IDXGISwapChain* swapchain) {
+        const auto* turn = xefg::CurrentOrdinaryOffPresent();
+        Check(turn != nullptr && (turn->input_rejection == nullptr) == full_region,
+              "the actual adapter Present1 classifies the late region");
+        const auto before_nested = model_calls;
+        xefg::OrdinaryPresentAttempt nested;
+        if (!full_region) {
+          nested = native::BeginOrdinaryPresentAttempt(&route.queue, &route);
+        }
+        // On a full call, only the old event exists. Entering the consumer
+        // cannot upgrade that standalone event into a new pre-FX callback.
+        native::RunPresentPath(&route.queue, &route);
+        nested_rejected = !nested && model_calls == before_nested;
+        public_writes = public_writes_since(first_execute);
+        consume_original(swapchain);
+      };
+      off_present(&late_parameters);
+      native::EndOrdinaryPresentAttempt(late_attempt);
+      const auto expected_original = expected_pixels(scene_a, false);
+      const bool first_read_original = consumed == expected_original;
+      auto final_backbuffer = Capture(gpu, back.Get(), present_state);
+      submit();
+      const bool backbuffer_original = final_backbuffer.Pixels() == expected_original;
+      const auto evaluate_delta = model_calls - calls_before;
+      const auto sdk_write_delta = xefg::SubmittedFrames() - sdk_before;
+      const auto read_delta = sdk_reads - reads_before;
+      const bool blocked = public_writes == 0 && sdk_write_delta == 0 && evaluate_delta == 0 && nested_rejected
+          && read_delta == 1 && first_read_original && backbuffer_original;
+
+      produce(back.Get(), scene_b, -1, false);
+      const auto next_calls = model_calls;
+      const auto next_writes = ordinary_submissions(&route);
+      const auto next_reads = sdk_reads;
+      nr_edit_reuse_xefg_cases::consume_sdk_present = [&](IDXGISwapChain* swapchain) {
+        enter_pre_effects();
+        consume_original(swapchain);
+      };
+      off_present(&full);
+      const bool next_full = model_calls == next_calls + 2 && ordinary_submissions(&route) == next_writes + 1
+          && sdk_reads == next_reads + 1 && consumed == expected_pixels(scene_b, true)
+          && session.context->last_handoff_write.ordinary_claim == Claim::COVERED && !find_attempt(&route);
+      std::cout << "XEFG_LATE_PRESENT1 " << nlohmann::json{{"case", phase}, {"pre_fx_dirty_count", 0},
+          {"evaluates_before_present1", early_evaluates}, {"evaluates", evaluate_delta}, {"public_writes", public_writes},
+          {"sdk_writes", sdk_write_delta}, {"sdk_first_reads", read_delta}, {"first_read_original", first_read_original},
+          {"backbuffer_original", backbuffer_original}, {"nested_rejected", nested_rejected}, {"next_full", next_full},
+          {"passed", blocked && next_full}}.dump() << std::endl;
+      late_present1_passed &= blocked && next_full;
+      nr_edit_reuse_xefg_cases::consume_sdk_present = consume_original;
+      Check(Hooks::Enable(session.handle, 1) == 0, "the next independent interval begins with XeFG On");
+    }
+    Check(late_present1_passed, "standalone attempts leave the original color and the next full frame can write");
+    std::cout << "PASS xefg-late-present1 evidence=WARP+MOCK full_control=1 scroll_rect=1 scroll_offset=1 partial=1 next_full=1\n";
+
+    Check(Hooks::Enable(session.handle, 0) == 0, "the nested Present1 fixture starts with a confirmed Off consumer");
+    bool recursive_present1_passed = true;
+    for (const auto* outer_parameters : std::array<const DXGI_PRESENT_PARAMETERS*, 2>{nullptr, &full}) {
+      produce(back.Get(), scene_a, -1, false);
+      const auto before_calls = model_calls;
+      const auto before_writes = ordinary_submissions(&route);
+      const auto before_reads = sdk_reads;
+      const auto first_execute = next_execute();
+      bool inside_recursive_original = false;
+      bool inner_scope_hidden = false;
+      bool outer_scope_restored = false;
+      bool inner_read_original = false;
+      size_t recursive_writes = 0;
+      nr_edit_reuse_xefg_cases::consume_sdk_present = [&](IDXGISwapChain* swapchain) {
+        if (inside_recursive_original) {
+          inner_scope_hidden = xefg::CurrentOrdinaryOffPresent() == nullptr;
+          run_ordinary_event();
+          native::OnFinishPresent(&route.queue, &route);
+          recursive_writes = public_writes_since(first_execute);
+          consume_original(swapchain);
+          inner_read_original = consumed == expected_pixels(scene_a, false);
+          return;
+        }
+        const auto* outer_turn = xefg::CurrentOrdinaryOffPresent();
+        Check(outer_turn != nullptr && outer_turn->input_rejection == nullptr,
+              "the actual outer SDK call has a legal full-frame turn before recursion");
+        inside_recursive_original = true;
+        Check(adapter::ProxyHooks<0>::Present1(session.proxy.Get(), 0, 0, &scroll) == S_OK,
+              "the same proxy forwards the recursive scrolling Present1 to its original function");
+        inside_recursive_original = false;
+        outer_scope_restored = xefg::CurrentOrdinaryOffPresent() == outer_turn;
+        consume_original(swapchain);
+      };
+      off_present(outer_parameters);
+      const bool isolated = inner_scope_hidden && outer_scope_restored && recursive_writes == 0
+          && model_calls == before_calls && ordinary_submissions(&route) == before_writes
+          && sdk_reads == before_reads + 2 && inner_read_original && consumed == expected_pixels(scene_a, false);
+
+      produce(back.Get(), scene_b, -1, false);
+      const auto next_calls = model_calls;
+      const auto next_writes = ordinary_submissions(&route);
+      const auto next_reads = sdk_reads;
+      nr_edit_reuse_xefg_cases::consume_sdk_present = [&](IDXGISwapChain* swapchain) {
+        enter_pre_effects();
+        consume_original(swapchain);
+      };
+      off_present(outer_parameters);
+      const bool next_full = model_calls == next_calls + 2 && ordinary_submissions(&route) == next_writes + 1
+          && sdk_reads == next_reads + 1 && consumed == expected_pixels(scene_b, true)
+          && session.context->last_handoff_write.ordinary_claim == Claim::COVERED && !find_attempt(&route);
+      std::cout << "XEFG_RECURSIVE_PRESENT1 " << nlohmann::json{
+          {"outer_present1", outer_parameters != nullptr}, {"inner_scope_hidden", inner_scope_hidden},
+          {"outer_scope_restored", outer_scope_restored}, {"public_writes", recursive_writes},
+          {"evaluates", next_calls - before_calls}, {"first_read_original", inner_read_original},
+          {"next_full", next_full}, {"passed", isolated && next_full}}.dump() << std::endl;
+      recursive_present1_passed &= isolated && next_full;
+    }
+    Check(recursive_present1_passed, "recursive scrolling Present1 cannot borrow either outer full-frame turn");
+    std::cout << "PASS xefg-recursive-present1 evidence=WARP+MOCK outer_present=1 outer_present1=1 scope_restored=1 next_full=1\n";
+
+    {
+      struct SourceFace : ReceiptSwapchain {
+        SourceFace(ID3D12Device* device, ID3D12Resource* color) : ReceiptSwapchain(nullptr) {
+          reported_device12 = device;
+          current_back_buffer = color;
+          const auto desc = color->GetDesc();
+          width = static_cast<UINT>(desc.Width);
+          height = desc.Height;
+        }
+
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** output) override {
+          if (iid != __uuidof(IDXGISwapChain1)) return ReceiptSwapchain::QueryInterface(iid, output);
+          if (output == nullptr) return E_POINTER;
+          *output = static_cast<IDXGISwapChain1*>(this);
+          AddRef();
+          return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE GetSourceSize(UINT* out_width, UINT* out_height) override {
+          *out_width = width;
+          *out_height = height;
+          return S_OK;
+        }
+
+        UINT width = 0;
+        UINT height = 0;
+      };
+      ComPtr<SourceFace> source_face;
+      source_face.Attach(new SourceFace(gpu.device.Get(), back.Get()));
+      Check(adapter::Identity(source_face.Get()) != adapter::Identity(session.proxy.Get()),
+            "D3D12 source wrapper has a distinct face for the same physical color");
+
+      static std::function<void(const DXGI_PRESENT_PARAMETERS*)> consume_source_present;
+      constexpr size_t source_slot_index = 0;
+      auto& source_slot = adapter::source_present_slots[source_slot_index];
+      funnel_accounting_tests::Restore source_restore;
+      source_restore.Value(&consume_source_present);
+      source_restore.Value(&nr_edit_reuse_xefg_cases::consume_sdk_present);
+      source_restore.Value(&source_slot);
+      source_slot.records[0].target = reinterpret_cast<uint8_t*>((*reinterpret_cast<void***>(source_face.Get()))[8]);
+      source_slot.records[1].target = reinterpret_cast<uint8_t*>((*reinterpret_cast<void***>(source_face.Get()))[22]);
+      source_slot.installed = source_slot.complete = true;
+      source_slot.real[1] = reinterpret_cast<void*>(+[](IDXGISwapChain1*, UINT, UINT,
+          const DXGI_PRESENT_PARAMETERS* parameters) -> HRESULT {
+        consume_source_present(parameters);
+        return S_OK;
+      });
+      const auto source_owner = reinterpret_cast<uintptr_t>(source_face.Get());
+      Check(xefg::RegisterD3D12SourceSwapchain(source_owner, source_face.Get()),
+            "register the source face through the D3D12 bridge");
+      source_restore.actions.emplace_back([source_owner] { xefg::ForgetBridgeSourceSwapchain(source_owner); });
+      const auto source_present = [&](const DXGI_PRESENT_PARAMETERS* parameters) {
+        Check(adapter::SourcePresentHooks<source_slot_index>::Present1(source_face.Get(), 0, 0, parameters) == S_OK,
+              "D3D12 source Present1 preserves the original result");
+      };
+
+      for (const auto* source_parameters : {&scroll, &full}) {
+        const bool full_source = source_parameters == &full;
+        const auto& pixel = (full_source ? scene_b : scene_a);
+        produce(back.Get(), pixel, -1, false);
+        const auto before_calls = model_calls;
+        const auto before_ordinary_writes = ordinary_submissions(&route);
+        const auto before_sdk_writes = xefg::SubmittedFrames();
+        const auto before_reads = sdk_reads;
+        const auto first_execute = next_execute();
+        size_t writes = 0;
+        bool inside_source = false;
+        bool source_first_read = false;
+        bool outer_scope_restored = false;
+        consume_source_present = [&](const DXGI_PRESENT_PARAMETERS* parameters) {
+          Check(parameters == source_parameters, "original source receives the actual nested Present1 parameters");
+          if (full_source) {
+            inside_source = true;
+            off_present(&full);
+            inside_source = false;
+          } else {
+            run_ordinary_event();
+            writes = public_writes_since(first_execute);
+            native::OnFinishPresent(&route.queue, &route);
+            consume_original(session.proxy.Get());
+          }
+          source_first_read = consumed == expected_pixels(pixel, full_source);
+        };
+        nr_edit_reuse_xefg_cases::consume_sdk_present = [&](IDXGISwapChain* swapchain) {
+          if (inside_source) {
+            call_ordinary(&route);
+            writes = public_writes_since(first_execute);
+            native::OnFinishPresent(&route.queue, &route);
+            consume_original(swapchain);
+            return;
+          }
+          const auto* outer_turn = xefg::CurrentOrdinaryOffPresent();
+          Check(outer_turn != nullptr && outer_turn->input_rejection == nullptr,
+                "the outer SDK Present1 has a proven full-frame Off turn");
+          source_present(source_parameters);
+          outer_scope_restored = xefg::CurrentOrdinaryOffPresent() == outer_turn;
+          consume_original(swapchain);
+        };
+        off_present(&full);
+        const auto evaluates = model_calls - before_calls;
+        const bool passed = source_first_read && outer_scope_restored && sdk_reads == before_reads + 2
+            && xefg::SubmittedFrames() == before_sdk_writes && consumed == expected_pixels(pixel, full_source)
+            && ordinary_submissions(&route) == before_ordinary_writes + (full_source ? 1 : 0)
+            && writes == (full_source ? 1 : 0) && evaluates == (full_source ? 2 : 0) && !find_attempt(&route)
+            && (!full_source || session.context->last_handoff_write.ordinary_claim == Claim::COVERED);
+        std::cout << "XEFG_SOURCE_PRESENT1 " << nlohmann::json{
+            {"case", full_source ? "sdk-off-to-source-full-to-proxy-full" : "sdk-off-to-source-scroll"},
+            {"public_writes", writes}, {"evaluates", evaluates}, {"first_read_expected", source_first_read},
+            {"outer_scope_restored", outer_scope_restored}, {"passed", passed}}.dump() << std::endl;
+        Check(passed, "the nested source update bounds the Off turn across wrappers on the same BB");
+      }
+
+      produce(back.Get(), menu, -1, false);
+      const auto failed_calls = model_calls;
+      const auto failed_writes = ordinary_submissions(&route);
+      const auto failed_sdk_writes = xefg::SubmittedFrames();
+      const auto failed_reads = sdk_reads;
+      const auto first_execute = next_execute();
+      xefg::OrdinaryPresentAttempt first_attempt;
+      size_t full_writes = 0;
+      size_t scroll_writes = 0;
+      uint64_t resets_before_outer_return = 0;
+      bool first_signed = false;
+      bool first_preserved = false;
+      consume_source_present = [&](const DXGI_PRESENT_PARAMETERS* parameters) {
+        if (parameters == &full) {
+          first_attempt = call_ordinary(&route);
+          full_writes = public_writes_since(first_execute);
+          const auto* turn = adapter::ordinary_off_present;
+          first_signed = turn != nullptr && turn->ordinary_claim == Claim::COVERED
+              && turn->ordinary_receipt.attempt == first_attempt && turn->ordinary_receipt.executed;
+          native::OnFinishPresent(&route.queue, &route);
+        } else {
+          Check(parameters == &scroll, "the second source callback is inside the actual scrolling Present1");
+          const auto scroll_execute = next_execute();
+          run_ordinary_event();
+          scroll_writes = public_writes_since(scroll_execute);
+          native::OnFinishPresent(&route.queue, &route);
+        }
+      };
+      nr_edit_reuse_xefg_cases::consume_sdk_present = [&](IDXGISwapChain* swapchain) {
+        source_present(&full);
+        source_present(&scroll);
+        const auto* turn = adapter::ordinary_off_present;
+        const auto& color = native::present_streams.at(&route).ordinary_color;
+        first_preserved = find_attempt(&route) == first_attempt
+            && turn != nullptr && turn->ordinary_attempt == first_attempt && turn->ordinary_claim == Claim::COVERED
+            && turn->ordinary_receipt.attempt == first_attempt && color.attempt == first_attempt && color.group_complete;
+        consume_original(swapchain);
+        resets_before_outer_return = native::present_history_resets.load();
+      };
+      nr_edit_reuse_xefg_cases::sdk_present_result = E_FAIL;
+      const auto failed_status = adapter::ProxyHooks<0>::Present1(session.proxy.Get(), 0, 0, &full);
+      nr_edit_reuse_xefg_cases::sdk_present_result = S_OK;
+      const auto settled = session.context->last_handoff_write;
+      const auto reset_delta = native::present_history_resets.load() - resets_before_outer_return;
+      const bool first_read_edited = consumed == expected_pixels(menu, true);
+      const auto& failed_color = native::present_streams.at(&route).ordinary_color;
+      const bool first_history_invalidated = failed_color.attempt == first_attempt && !failed_color.group_complete;
+      const bool failed_once = first_signed && first_preserved && failed_status == E_FAIL && first_read_edited
+          && full_writes == 1 && scroll_writes == 0 && model_calls == failed_calls + 2
+          && ordinary_submissions(&route) == failed_writes + 1 && xefg::SubmittedFrames() == failed_sdk_writes
+          && sdk_reads == failed_reads + 1 && settled.ordinary_claim == Claim::COVERED
+          && settled.ordinary_receipt.attempt == first_attempt && settled.sdk_result == E_FAIL && !find_attempt(&route);
+
+      produce(back.Get(), scene_b, -1, false);
+      const auto next_creates = next_handle;
+      const auto next_calls = model_calls;
+      const auto next_reads = sdk_reads;
+      const auto next_execute_serial = next_execute();
+      const auto& present_telemetry = native::stage_telemetry[static_cast<size_t>(addon::stage_plan::Stage::PRESENT)];
+      const auto before_reset_evaluates = present_telemetry.reset_accepted;
+      xefg::OrdinaryPresentAttempt next_attempt;
+      size_t next_writes = 0;
+      nr_edit_reuse_xefg_cases::consume_sdk_present = [&](IDXGISwapChain* swapchain) {
+        next_attempt = call_ordinary(&route);
+        next_writes = public_writes_since(next_execute_serial);
+        native::OnFinishPresent(&route.queue, &route);
+        consume_original(swapchain);
+      };
+      off_present(&full);
+      const auto reset_evaluates = present_telemetry.reset_accepted - before_reset_evaluates;
+      const bool next_full = next_creates == next_handle && model_calls == next_calls + 2 && sdk_reads == next_reads + 1
+          && next_writes == 1 && next_attempt && next_attempt != first_attempt && consumed == expected_pixels(scene_b, true)
+          && session.context->last_handoff_write.ordinary_receipt.attempt == next_attempt
+          && session.context->last_handoff_write.ordinary_claim == Claim::COVERED && !find_attempt(&route);
+      const bool next_reset = reset_evaluates == 2 && (present_telemetry.last_evaluate.reset_reasons & native::kResetRecovery) != 0;
+      std::cout << "XEFG_SOURCE_PRESENT1_FAILURE " << nlohmann::json{
+          {"first_signed", first_signed}, {"first_preserved", first_preserved}, {"first_read_edited", first_read_edited},
+          {"full_writes", full_writes}, {"scroll_writes", scroll_writes}, {"outer_failure_preserved", failed_status == E_FAIL},
+          {"first_history_invalidated", first_history_invalidated}, {"history_resets", reset_delta},
+          {"next_reset_evaluates", reset_evaluates}, {"next_full", next_full},
+          {"passed", failed_once && first_history_invalidated && reset_delta == 1 && next_reset && next_full}}.dump() << std::endl;
+      Check(failed_once && first_history_invalidated && reset_delta == 1 && next_reset && next_full,
+            "a later scrolling source preserves the first signed attempt for failed outer delivery and history recovery");
+      std::cout << "PASS xefg-source-present1-failure evidence=WARP+MOCK first_receipt_retained=1 scroll_write=0 outer_failed=1"
+                   " recovery_reset_passes=2 next_full=1\n";
+
+      for (const bool enabled : {false, true}) {
+        if (enabled) {
+          Check(Hooks::Enable(session.handle, 1) == 0, "confirm XeFG On for the source-outer regression");
+          nr_edit_reuse_xefg_cases::consume_sdk_present = consume_original;
+          produce(back.Get(), scene_b, -1, false);
+          sdk_present(&session, 1, false);
+          Check(session.context->last_handoff_write.service_result == fg::Result::SUBMITTED,
+                "the same On consumer writes with real guides when no enclosing source limits the region");
+        }
+        produce(back.Get(), scene_a, -1, false);
+        const auto before_calls = model_calls;
+        const auto before_ordinary_writes = ordinary_submissions(&route);
+        const auto before_sdk_writes = xefg::SubmittedFrames();
+        const auto before_reads = sdk_reads;
+        const auto first_execute = next_execute();
+        size_t writes = 0;
+        consume_source_present = [&](const DXGI_PRESENT_PARAMETERS* parameters) {
+          Check(parameters == &scroll, "enclosing D3D12 source has the actual scroll parameters");
+          sdk_present(&session, (enabled ? 1 : -1), false);
+        };
+        nr_edit_reuse_xefg_cases::consume_sdk_present = [&](IDXGISwapChain* swapchain) {
+          run_ordinary_event();
+          writes = public_writes_since(first_execute);
+          native::OnFinishPresent(&route.queue, &route);
+          consume_original(swapchain);
+        };
+        source_present(&scroll);
+        const auto evaluates = model_calls - before_calls;
+        const bool original = consumed == expected_pixels(scene_a, false);
+        const bool passed = original && sdk_reads == before_reads + 1 && xefg::SubmittedFrames() == before_sdk_writes
+            && ordinary_submissions(&route) == before_ordinary_writes && writes == 0 && evaluates == 0 && !find_attempt(&route);
+        std::cout << "XEFG_SOURCE_PRESENT1 " << nlohmann::json{
+            {"case", enabled ? "source-scroll-to-sdk-on" : "source-scroll-to-sdk-off"},
+            {"public_writes", writes}, {"evaluates", evaluates}, {"first_read_expected", original},
+            {"passed", passed}}.dump() << std::endl;
+        Check(passed, "an enclosing source scroll limits the otherwise full SDK Present on the same BB");
+      }
+      std::cout << "PASS xefg-source-present1 evidence=WARP+MOCK sdk_off_to_source_scroll=1 source_scroll_to_sdk_off=1"
+                   " source_scroll_to_sdk_on=1 nested_full=1\n";
+    }
   }
+
+  {
+    funnel_accounting_tests::Restore post_fg;
+    post_fg.Atomic(&native::present_pre_fg);
+    native::present_pre_fg = native::kPresentPreFgOff;
+    Check(session.context->enabled && !native::fg_service::Requested(),
+          "the explicit post-FG path leaves the SDK On and ordinary NR in charge of its own color");
+    warm("post-fg-only-attempt-warm", &route, false);
+
+    xefg::OrdinaryPresentAttempt attempt;
+    Check(frame("post-fg-only-attempt-write", &route, menu, -1, false, false, true, -1, true, &attempt),
+          "post-FG writes the current BB before the SDK has a handoff receipt");
+    const auto& owner = native::ordinary_present_attempts.at(&route);
+    Check(owner.receipt.executed && owner.receipt.attempt == attempt && owner.receipt.group_complete,
+          "the ordinary owner retains the completed GPU color write");
+    auto sdk = adapter::BeginPresent(session.proxy.Get(), 0);
+    Check(sdk.input.fg_enabled && sdk.ordinary_attempt == attempt && !sdk.ordinary_receipt.attempt
+              && sdk.ordinary_off.access.call == 0 && !sdk.color_executed,
+          "post-FG passes only the matching attempt to SDK completion");
+    const auto before_reads = sdk_reads;
+    nr_edit_reuse_xefg_cases::sdk_present_result = E_FAIL;
+    const auto status = nr_edit_reuse_xefg_cases::ConsumeSdkPresent(session.proxy.Get(), 0, 0);
+    nr_edit_reuse_xefg_cases::sdk_present_result = S_OK;
+    const auto history_resets = native::present_history_resets.load();
+    adapter::EndPresent(&sdk, status);
+    const auto resets = native::present_history_resets.load() - history_resets;
+    const auto& failed_color = native::present_streams.at(&route).ordinary_color;
+    const bool history_invalidated = failed_color.attempt == attempt && !failed_color.group_complete;
+    const bool first_read = status == E_FAIL && sdk_reads == before_reads + 1 && consumed == expected_pixels(menu, true);
+    const bool attempt_retired = !find_attempt(&route);
+
+    const auto creates = next_handle;
+    const auto& telemetry = native::stage_telemetry[static_cast<size_t>(addon::stage_plan::Stage::PRESENT)];
+    const bool next_full = frame("post-fg-only-attempt-recovery", &route, scene_b, -1, false, false, true, -1, false)
+        && next_handle == creates;
+    const bool next_reset = telemetry.last_evaluate.reset_sent && (telemetry.last_evaluate.reset_reasons & native::kResetRecovery) != 0;
+    const bool recovered = first_read && attempt_retired && history_invalidated && resets == 1 && next_reset && next_full;
+    std::cout << "XEFG_POST_FG_ATTEMPT_FAILURE " << nlohmann::json{
+        {"first_read_edited", first_read}, {"attempt_retired", attempt_retired}, {"history_invalidated", history_invalidated},
+        {"history_resets", resets}, {"next_reset", next_reset}, {"next_full", next_full}, {"passed", recovered}}.dump() << std::endl;
+    Check(recovered, "post-FG failure resets the executed attempt even when the SDK only returns its identity");
+    std::cout << "PASS xefg-post-fg-attempt-failure evidence=WARP+MOCK attempt_only=1 owner_executed=1 outer_failed=1"
+                 " history_reset=1 next_full=1\n";
+  }
+
   warm("other-ordinary-prefix", &other_route, false);
   xefg::OrdinaryPresentAttempt other_attempt;
   frame("another-output-ordinary-while-sdk-on", &other_route, scene_b, -1, false, false, true, 0, true, &other_attempt);
@@ -904,31 +1281,35 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
     const auto hudless = gpu.Texture(size, size, DXGI_FORMAT_R8G8B8A8_UNORM, present_state);
     upload(hudless.Get(), scene_b, present_state);
     submit();
-    Check(Hooks::Enable(session.handle, 0) == 0, "SDK relinquishes the BB before the ordinary-only color");
-    xefg::OrdinaryPresentAttempt ordinary_attempt;
-    Check(frame("ordinary-before-new-hudless", &route, menu, -1, false, false, true, -1, true, &ordinary_attempt),
-          "ordinary attempt completes its BB color before the SDK receives a distinct HUDLess");
-    const auto ordinary_pixels = consumed;
-    const auto calls = model_calls;
-    const auto deliveries = xefg::SubmittedFrames();
-    Check(Hooks::Enable(session.handle, 1) == 0, "SDK takes the same output with a necessary HUDLess");
+    Check(Hooks::Enable(session.handle, 0) == 0, "the SDK accepts Disable before the HUDLess case");
     session.context->ui_composition = true;
+    produce(back.Get(), menu, -1, false);
     session.Tag(++present_id, HUDLESS, hudless.Get());
     submit();
-    Check(Hooks::PresentId(session.handle, present_id) == 0, "the SDK receives the actual new HUDLess tag");
-    auto sdk = adapter::BeginPresent(session.proxy.Get(), 0);
-    Check(sdk.input.hudless == hudless.Get() && sdk.input.hudless != sdk.input.backbuffer
-              && sdk.ordinary_claim == xefg::OrdinaryPresentClaim::CONFLICT && sdk.ordinary_receipt.attempt == ordinary_attempt
-              && std::string_view(sdk.handoff_reason) == "ordinary_hudless_uncovered"
-              && !sdk.color_executed && sdk.service_result == fg::Result::NOT_SERVED && model_calls == calls,
-          "a complete BB receipt cannot stand in for the newly required HUDLess or allow a second BB enhancement");
-    check_warn("first-terminal-refusal-visible-inside-sdk", "fg_unserved");
-    first_unserved_status = xefg::ReadStatus(output_of(session));
-    const auto status = nr_edit_reuse_xefg_cases::ConsumeSdkPresent(session.proxy.Get(), 0, 0);
-    Check(status == S_OK && consumed == ordinary_pixels, "the actual SDK consumer reads only the ordinary enhanced BB");
+    Check(Hooks::PresentId(session.handle, present_id) == 0, "the Off SDK call has an actual distinct HUDLess tag");
+    const auto calls = model_calls;
+    const auto deliveries = xefg::SubmittedFrames();
+    plain_off_present([&] {
+      Check(!native::BeginOrdinaryPresentAttempt(&route.queue, &route),
+            "a real Off call with a distinct HUDLess cannot authorize a single-color ordinary attempt");
+      native::RunPresentPath(&route.queue, &route);
+    });
+    Check(model_calls == calls && consumed == expected_pixels(menu, false), "the Off HUDLess refusal preserves the BB at first read");
     const auto hudless_capture = Capture(gpu, hudless.Get(), present_state);
     submit();
     Check(hudless_capture.Pixels() == expected_pixels(scene_b, false), "the rejected group keeps every HUDLess RGBA channel");
+
+    Check(Hooks::Enable(session.handle, 1) == 0, "the next version has an actual enabled SDK consumer");
+    produce(back.Get(), menu, -1, false);
+    const auto ordinary_attempt = call_ordinary(&route);
+    auto sdk = adapter::BeginPresent(session.proxy.Get(), 0);
+    Check(sdk.ordinary_attempt == ordinary_attempt && !sdk.color_executed && sdk.service_result == fg::Result::NOT_SERVED
+              && model_calls == calls,
+          "the enabled consumer with mandatory composition and no current HUDLess reports an actual refusal");
+    check_warn("first-terminal-refusal-visible-inside-sdk", "fg_unserved");
+    first_unserved_status = xefg::ReadStatus(output_of(session));
+    const auto status = nr_edit_reuse_xefg_cases::ConsumeSdkPresent(session.proxy.Get(), 0, 0);
+    Check(status == S_OK && consumed == expected_pixels(menu, false), "the refused SDK call reads this version's original color");
     session.context->ui_composition = false;
 
     produce(back.Get(), scene_a, -1, false);
@@ -936,7 +1317,7 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
     Check(next_attempt.owner == ordinary_attempt.owner && next_attempt.serial > ordinary_attempt.serial,
           "a new ordinary attempt exists before the old SDK End returns");
     adapter::EndPresent(&sdk, status);
-    check_warn("first-unserved-hudless-conflict-is-yellow", "fg_unserved");
+    check_warn("first-unserved-hudless-is-yellow", "fg_unserved");
     Check(find_attempt(&route) == next_attempt && xefg::SubmittedFrames() == deliveries && model_calls == calls,
           "the delayed SDK End settles only its old receipt and leaves the newer attempt active");
     sdk_present(&session, -1, false);
@@ -1380,7 +1761,13 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
   };
 
   Check(Hooks::Enable(session.handle, 0) == 0, "release SDK ownership before the independent guide capture");
-  warm("guide-ordinary-prefix", &route, false);
+  const auto guide_prefix_writes = ordinary_submissions(&route);
+  for (uint32_t i = 0; i < native::kContractDebounceFrames + 8 && ordinary_submissions(&route) == guide_prefix_writes; ++i) {
+    produce(back.Get(), scene_a, -1, false);
+    plain_off_present([&] { call_ordinary(&route); });
+  }
+  Check(ordinary_submissions(&route) == guide_prefix_writes + 1 && consumed == expected_pixels(scene_a, true),
+        "the ordinary guide prefix writes through the actual Off SDK consumer");
   Check(!native::direct_api.private_instance, "guide departure starts on the ordinary provider");
   const auto guide_provider = native::direct_api.module;
   const auto guide_provider_inits = control_mask_gpu_cases::runtime_initializations;
@@ -1619,7 +2006,13 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
   trace_blockers("two-completed-still-replayable", submission::RecordedWork::kReplayable, 2);
   frame("writers-completed-b", &route, scene_b, 1, true, true, false, -1);
   Check(Hooks::Enable(session.handle, 0) == 0, "SDK Off transfers permission but leaves both game writers replayable");
-  frame("ordinary-during-two-completed-writers", &route, menu, -1, false, false, false, -1);
+  produce(back.Get(), menu, -1, false);
+  const auto ordinary_blocked_calls = model_calls;
+  const auto ordinary_blocked_writes = ordinary_submissions(&route);
+  plain_off_present([&] { call_ordinary(&route); });
+  Check(consumed == expected_pixels(menu, false) && model_calls == ordinary_blocked_calls
+            && ordinary_submissions(&route) == ordinary_blocked_writes,
+        "even a legal Off consumer cannot overwrite replayable game writers");
   Check(Hooks::Enable(session.handle, 1) == 0, "SDK resumes while both game writers remain live");
   reset_list(&writer_a);
   execute_and_wait(gpu.queue.Get(), writer_b);

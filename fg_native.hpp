@@ -1669,29 +1669,47 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
       physical_owner = output_framerate::MatchPresentColorOwner(input.output,
           reinterpret_cast<uintptr_t>(backbuffer_identity));
     }
-    if (device == nullptr && physical_owner && fg::xefg::ServiceWriteCurrent(input)) {
-      const auto entry = present_streams.find(reinterpret_cast<const void*>(physical_owner.swapchain));
-      if (entry != present_streams.end()) {
-        auto& proof = entry->second.ordinary_recording_face;
-        const auto ordinary_queue = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(present_ring.queue));
-        if (proof.BindingCurrent(physical_owner, ordinary_queue, present_ring.fence)
-            && renodx::utils::directx::SameNativeObject(proof.device.Get(), submit_device.Get())) {
-          const auto completed = proof.fence->GetCompletedValue();
-          if (completed != UINT64_MAX && completed >= proof.fence_value) {
-            ordinary_face = proof.device;
-            device = ordinary_face.Get();
-            face_source = "same output ordinary recording";
-          } else if (completed == UINT64_MAX) {
-            proof = {};
-          }
-        } else {
+    const bool managed_color = physical_owner && fg::xefg::ServiceWriteCurrent(input);
+    const auto ordinary = present_streams.find(reinterpret_cast<const void*>(physical_owner.swapchain));
+    if (device == nullptr && managed_color && ordinary != present_streams.end()) {
+      auto& proof = ordinary->second.ordinary_recording_face;
+      const auto ordinary_queue = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(present_ring.queue));
+      if (proof.BindingCurrent(physical_owner, ordinary_queue, present_ring.fence)
+          && renodx::utils::directx::SameNativeObject(proof.device.Get(), submit_device.Get())) {
+        const auto completed = proof.fence->GetCompletedValue();
+        if (completed != UINT64_MAX && completed >= proof.fence_value) {
+          ordinary_face = proof.device;
+          device = ordinary_face.Get();
+          face_source = "same output ordinary recording";
+        } else if (completed == UINT64_MAX) {
           proof = {};
         }
+      } else {
+        proof = {};
       }
     }
     if (device == nullptr && queue_recording_device != nullptr) {
       device = queue_recording_device.Get();
       face_source = "SDK queue GetDevice";
+    }
+    if (device == nullptr && input.native_tag_recording_device == submit_device.Get()
+        && (direct_device == nullptr || direct_device == submit_device.Get())) {
+      device = submit_device.Get();
+      face_source = "current SDK native tag list";
+    }
+    if (device == nullptr && managed_color && WarmPresentColorConfigured()) {
+      const bool single_native_face = ordinary != present_streams.end()
+          && ordinary->second.ordinary_observed_face_owner == physical_owner
+          && ordinary->second.ordinary_observed_face.Get() == submit_device.Get()
+          && (direct_device == nullptr || direct_device == submit_device.Get());
+      if (!single_native_face) {
+        // GetDevice on the native queue only proves submission ownership.
+        // A later current tag can supply the actual recording interface.
+        observe("original_runtime_recording_face_pending");
+        return fg::Result::PREPARED;
+      }
+      device = submit_device.Get();
+      face_source = "same output native recording interface";
     }
     if (device == nullptr) {
       device = submit_device.Get();
@@ -1973,12 +1991,13 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
           shared.owner = &present_streams[owner_key];
         } else if (!real_guides && guide_mode == kPresentGuidesOptional) {
           const auto entry = present_streams.find(owner_key);
-          if (entry != present_streams.end() && WarmPresentColorCurrent(entry->second.warm_color, physical_owner,
-                  target, input.color_width, input.color_height)) {
+          const bool has_layout = entry != present_streams.end() && entry->second.warm_color.has_real_layout
+              && WarmPresentColorCurrent(entry->second.warm_color, physical_owner, target, input.color_width, input.color_height);
+          if (has_layout) {
             shared.neutral = WarmNeutralGuideContract(entry->second.warm_color, input.color_width, input.color_height);
-            if (shared.neutral) {
-              shared.owner = &entry->second;
-            }
+          }
+          if (!has_layout || shared.neutral) {
+            shared.owner = &present_streams[owner_key];
           }
         }
         if (shared.owner != nullptr) {
