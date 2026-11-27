@@ -1,5 +1,11 @@
 [CmdletBinding()]
-param([string]$OutputDirectory = (Join-Path (Split-Path $PSScriptRoot -Parent) 'tmp/ci-tests/core'))
+param(
+    [string]$OutputDirectory = (Join-Path (Split-Path $PSScriptRoot -Parent) 'tmp/ci-tests/core'),
+    [string]$BuildProject = (Join-Path (Split-Path $PSScriptRoot -Parent) 'build/dlss5.vcxproj'),
+    [string]$ShaderIncludeDirectory = (Join-Path (Split-Path $PSScriptRoot -Parent) 'build/dlss5.include'),
+    [hashtable]$ReusableSuites = @{},
+    [hashtable]$ReusableIndependentCases = @{}
+)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -69,19 +75,63 @@ try {
     $devCases = @($pairedFgCases + 'native-present-decision' | Select-Object -Unique)
     # -SoftwareOnly controls runner selection; the compile guard also rejects
     # any accidental native adapter path inside the existing FG fixtures.
-    $env:CL = ($previousCl + ' /DNR_NEXUS_TEST_WARP_ONLY').Trim()
+    if ("$previousCl" -notmatch '(?i)(?:^|\s)[/-]D\s*NR_NEXUS_TEST_WARP_ONLY(?:\s|$)') {
+        $env:CL = ($previousCl + ' /DNR_NEXUS_TEST_WARP_ONLY').Trim()
+    }
+    $compileInputs = @{BuildProject=$BuildProject; ShaderIncludeDirectory=$ShaderIncludeDirectory}
     $suiteOutput = Join-Path $OutputDirectory 'suites'
-    & (Join-Path $PSScriptRoot 'run-tests.ps1') -Suite $suites -DevControlMode Off `
-        -SoftwareOnly -UiPreview None -OutputDirectory $suiteOutput -RetentionMode Standard
+    $ordinary = @{}
+    $reusedSuites = [ordered]@{}
+    $needed = @(foreach ($suite in $suites) {
+        $ordinary[$suite] = Join-Path $suiteOutput $suite
+        if ($ReusableSuites.ContainsKey($suite)) {
+            $directory = [IO.Path]::GetFullPath($ReusableSuites[$suite])
+            Assert-TestArtifactPath $directory
+            $resultPath = Join-Path $directory 'result.json'
+            $inputsPath = Join-Path $directory 'inputs.json'
+            # Legacy config, constants and lifecycle runners do not all emit
+            # the current result and input manifests.
+            if (!(Test-Path -LiteralPath $resultPath -PathType Leaf) -or !(Test-Path -LiteralPath $inputsPath -PathType Leaf)) {
+                $suite
+                continue
+            }
+            $state = Get-Content -LiteralPath (Join-Path $directory 'artifact-lifecycle.json') -Raw | ConvertFrom-Json -AsHashtable
+            $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json -AsHashtable
+            $identity = $result['buildIdentity']
+            $explicitOff = $suite -notin @('fg-native','adaptive-resolution') -or
+                ($identity -and $identity.mode -ceq 'Off' -and $identity.softwareOnly -eq $true)
+            if ($state.status -ceq 'Passed' -and $state.sourceCommit -ceq $summary.sourceCommit -and
+                $result.suite -ceq $suite -and $result.build -ceq 'passed' -and $result.run -ceq 'passed' -and $explicitOff) {
+                $manifest = Get-Content -LiteralPath $inputsPath -Raw | ConvertFrom-Json -AsHashtable -NoEnumerate
+                $inputChanged = @($manifest | Where-Object {
+                    (Get-FileHash -LiteralPath $_.path).Hash -cne $_.sha256
+                })
+                if (@($manifest).Count -and !$inputChanged.Count) {
+                    $ordinary[$suite] = $directory
+                    $reusedSuites[$suite] = $directory
+                    continue
+                }
+            }
+        }
+        $suite
+    })
+    if ($needed.Count) {
+        $baseRun = @{Suite=$needed; SoftwareOnly=$true; UiPreview='None'; OutputDirectory=$suiteOutput; RetentionMode='Standard'}
+        if (@($needed | Where-Object { $_ -in @('fg-native','adaptive-resolution') }).Count) { $baseRun.DevControlMode = 'Off' }
+        & (Join-Path $PSScriptRoot 'run-tests.ps1') @baseRun @compileInputs
+    }
+    $summary['reusedSuites'] = $reusedSuites
     foreach ($policySuite in $policySuites) {
-        $policy = Get-Content -LiteralPath (Join-Path $suiteOutput "$policySuite/result.json") -Raw | ConvertFrom-Json
+        $policy = Get-Content -LiteralPath (Join-Path $ordinary[$policySuite] 'result.json') -Raw | ConvertFrom-Json
         if ($policy.suite -cne $policySuite -or $policy.build -cne 'passed' -or $policy.run -cne 'passed' -or
             $policy.dependency_policy -cne 'passed') {
             throw "$policySuite requires a passing CPU run and STATIC dependency check."
         }
     }
-    $fg = Join-Path $suiteOutput 'fg-native'
+    $fg = $ordinary['fg-native']
     $executable = Join-Path $fg 'fg_native_tests.exe'
+    $executableHash = (Get-FileHash -LiteralPath $executable).Hash
+    $caseDirectories = @{}
     $inputs = @(Get-Content -LiteralPath (Join-Path $fg 'inputs.json') -Raw | ConvertFrom-Json)
     $summary['adaptiveInlineReceipt'] = Get-CoreCaseReceipt 'adaptive-inline' (Join-Path $fg 'adaptive-inline.stdout.log') `
         '^PASS case=adaptive-inline evidence=WARP\+MOCK dev=0$'
@@ -91,31 +141,43 @@ try {
         foreach ($input in $inputs) {
             if ((Get-FileHash -LiteralPath $input.path).Hash -cne $input.sha256) { throw "Core input changed: $($input.path)" }
         }
-        $directory = Initialize-TestOutput (Join-Path $OutputDirectory $case)
-        Invoke-TestProcess $executable $directory 'test' @("--$case") -TimeoutMilliseconds 180000
+        $reuse = $ReusableIndependentCases[$case]
+        $reused = ($reuse -and $reuse.executableSha256 -ceq $executableHash)
+        if ($reused) {
+            $directory = [IO.Path]::GetFullPath($reuse.logs)
+            Assert-TestArtifactPath $directory
+            $state = Get-Content -LiteralPath (Join-Path $directory 'artifact-lifecycle.json') -Raw | ConvertFrom-Json -AsHashtable
+            if ($state.status -cne 'Passed' -or $state.sourceCommit -cne $summary.sourceCommit) {
+                throw "Reused core case lacks a successful current-source run: $case"
+            }
+        } else {
+            $directory = Initialize-TestOutput (Join-Path $OutputDirectory $case)
+            Invoke-TestProcess $executable $directory 'test' @("--$case") -TimeoutMilliseconds 180000
+        }
+        $caseDirectories[$case] = $directory
         $stdout = Join-Path $directory 'test.stdout.log'
         $receipt = Get-CoreCaseReceipt $case $stdout $independentCases[$case]
-        $caseResult = @{name=$case;status='Passed';receipt=$receipt
+        $caseResult = @{name=$case;status='Passed';receipt=$receipt;logs=$directory;reused=[bool]$reused
             evidence=$(if ($case -in @('adaptive-status','output-framerate-sdk')) { 'MOCK' } else { 'WARP+MOCK' })
-            executableSha256=(Get-FileHash -LiteralPath $executable).Hash}
+            executableSha256=$executableHash}
         if ($adaptiveContractReceipts.ContainsKey($case)) {
             $caseResult.adaptiveContractReceipts = @(foreach ($pattern in $adaptiveContractReceipts[$case]) {
                 Get-CoreCaseReceipt "$case adaptive contract $pattern" $stdout $pattern
             })
         }
-        Complete-TestOutput $directory
+        if (!$reused) { Complete-TestOutput $directory }
         $summary.independent += $caseResult
     }
     $summary['presentFrameTrace'] = & (Join-Path $PSScriptRoot 'check-present-frame-traces.ps1') `
-        -OrdinaryLog (Join-Path $OutputDirectory 'nr-edit-reuse-present-contracts/test.stdout.log') `
-        -XefgLog (Join-Path $OutputDirectory 'nr-edit-reuse-xefg-contracts/test.stdout.log')
+        -OrdinaryLog (Join-Path $caseDirectories['nr-edit-reuse-present-contracts'] 'test.stdout.log') `
+        -XefgLog (Join-Path $caseDirectories['nr-edit-reuse-xefg-contracts'] 'test.stdout.log')
     foreach ($input in $inputs) {
         if ((Get-FileHash -LiteralPath $input.path).Hash -cne $input.sha256) { throw "Core input changed: $($input.path)" }
     }
 
     $bridgeOutput = Join-Path $OutputDirectory 'bridge-suites'
     & (Join-Path $PSScriptRoot 'run-tests.ps1') -Suite bridge-motion -BridgeCase $pairedBridgeCases -DevControlMode Off `
-        -SoftwareOnly -UiPreview None -OutputDirectory $bridgeOutput -RetentionMode Standard
+        -SoftwareOnly -UiPreview None -OutputDirectory $bridgeOutput -RetentionMode Standard @compileInputs
     $bridge = Join-Path $bridgeOutput 'bridge-motion'
     $bridgeResult = Get-Content -LiteralPath (Join-Path $bridge 'result.json') -Raw | ConvertFrom-Json
     if ($bridgeResult.suite -cne 'bridge-motion' -or $bridgeResult.build -cne 'passed' -or $bridgeResult.run -cne 'passed') {
@@ -127,17 +189,17 @@ try {
     $summary.independent += @{name='bridge-edit-reuse-production';status='Passed';evidence='WARP+MOCK';receipt=$bridgeReceipt
         executableSha256=(Get-FileHash -LiteralPath (Join-Path $bridge 'd3d11_bridge_motion_tests.exe')).Hash}
     $summary['inlineFrameTrace'] = & (Join-Path $PSScriptRoot 'check-inline-frame-traces.ps1') `
-        -PublicLog (Join-Path $OutputDirectory 'nr-edit-reuse-contracts-public/test.stdout.log') -BridgeLog $bridgeStdout
+        -PublicLog (Join-Path $caseDirectories['nr-edit-reuse-contracts-public'] 'test.stdout.log') -BridgeLog $bridgeStdout
 
     $devOutput = Join-Path $OutputDirectory 'dev-suites'
     & (Join-Path $PSScriptRoot 'run-tests.ps1') -Suite fg-native,bridge-motion,adaptive-resolution `
         -NativeCase $devCases -BridgeCase $pairedBridgeCases -DevControlMode On `
-        -SoftwareOnly -UiPreview None -OutputDirectory $devOutput -RetentionMode Standard
+        -SoftwareOnly -UiPreview None -OutputDirectory $devOutput -RetentionMode Standard @compileInputs
     $after = Get-ReleaseParityBuildContext $repo $hostRoot
     if (($after | ConvertTo-Json -Depth 5 -Compress) -cne ($buildContext | ConvertTo-Json -Depth 5 -Compress)) {
         throw 'Core source or locked dependencies changed between the two modes.'
     }
-    $ordinaryBuilds = @{ 'fg-native'=$fg; 'bridge-motion'=$bridge; 'adaptive-resolution'=(Join-Path $suiteOutput 'adaptive-resolution') }
+    $ordinaryBuilds = @{ 'fg-native'=$fg; 'bridge-motion'=$bridge; 'adaptive-resolution'=$ordinary['adaptive-resolution'] }
     foreach ($suite in $ordinaryBuilds.Keys) {
         $summary.releaseParity.builds[$suite] = Assert-ReleaseParityBuildPair $suite $ordinaryBuilds[$suite] `
             (Join-Path $devOutput $suite) $buildContext
@@ -156,7 +218,7 @@ try {
             $offDirectory = $ordinaryBuilds[$case.suite]
             $offLogName = "$($case.log).stdout.log"
             if ($case.suite -ceq 'fg-native' -and $independentCases.Contains($case.name)) {
-                $offDirectory = Join-Path $OutputDirectory $case.name
+                $offDirectory = $caseDirectories[$case.name]
                 $offLogName = 'test.stdout.log'
             } elseif ($pair.Off.cases -cnotcontains $case.name) {
                 throw "Missing ordinary invocation: $($case.suite)/$($case.name)"

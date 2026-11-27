@@ -1,11 +1,13 @@
 <#
 .SYNOPSIS
 Local release checks. Software is the default; native modes require a separately
-coordinated device window and never start a game. GitHub CI keeps its own scope.
+coordinated device window and never start a game.
 .DESCRIPTION
-Software retains Suite all, then reuses its executables for existing independent
-stage, resolution, source-lifecycle and pre-FG cases. ReuseAllOutputDirectory may
-reuse a completed all run only when its source and recorded inputs still match.
+Software runs Suite all, existing independent stage/resolution/FG cases,
+the core ordinary/DEV parity, and the CI evidence and Publishing tool tests.
+Core reuses exact ordinary suite receipts and independent runs when available.
+ReuseAllOutputDirectory may reuse a completed all run only when its source and
+recorded inputs still match.
 NativeGpu runs real D3D12 with model stand-ins. NativeNgx requires the FG case's
 native inline handoff report and the paired full/on-demand adaptive preparation
 cost reports. NativeNgx requires an explicit SR runtime.
@@ -17,6 +19,8 @@ param(
     [ValidateSet('Software','NativeGpu','NativeNgx','CandidateAcceptance')][string]$Mode = 'Software',
     [string]$OutputDirectory = (Join-Path (Split-Path $PSScriptRoot -Parent) ('tmp/release-preflight/' + [guid]::NewGuid().ToString('N'))),
     [string]$ReuseAllOutputDirectory,
+    [string]$BuildProject = (Join-Path (Split-Path $PSScriptRoot -Parent) 'build/dlss5.vcxproj'),
+    [string]$ShaderIncludeDirectory = (Join-Path (Split-Path $PSScriptRoot -Parent) 'build/dlss5.include'),
     [switch]$RefreshFg,
     [string]$PythonExecutable,
     [string]$VulkanIncludeDirectory,
@@ -115,14 +119,18 @@ try {
             throw "Candidate acceptance $($candidate.status): $($candidate.reason)"
         }
     } elseif ($Mode -eq 'Software') {
-        $env:CL = ($previousCl + ' /DNR_NEXUS_TEST_WARP_ONLY').Trim()
+        if ("$previousCl" -notmatch '(?i)(?:^|\s)[/-]D\s*NR_NEXUS_TEST_WARP_ONLY(?:\s|$)') {
+            $env:CL = ($previousCl + ' /DNR_NEXUS_TEST_WARP_ONLY').Trim()
+        }
+        $compileInputs = @{BuildProject=$BuildProject; ShaderIncludeDirectory=$ShaderIncludeDirectory}
         $all = if ($ReuseAllOutputDirectory) { [IO.Path]::GetFullPath($ReuseAllOutputDirectory) } else { Join-Path $OutputDirectory 'all' }
         Assert-TestArtifactPath $all
         if (-not $ReuseAllOutputDirectory) {
-            $arguments = @{Suite=@('all');SoftwareOnly=$true;UiPreview='None';OutputDirectory=$all;RetentionMode='Standard'}
+            $arguments = @{Suite=@('all');SoftwareOnly=$true;UiPreview='None';OutputDirectory=$all
+                RetentionMode='Standard';DevControlMode='Off'}
             if ($PythonExecutable) { $arguments.PythonExecutable = $PythonExecutable }
             if ($VulkanIncludeDirectory) { $arguments.VulkanIncludeDirectory = $VulkanIncludeDirectory }
-            & (Join-Path $PSScriptRoot 'run-tests.ps1') @arguments
+            & (Join-Path $PSScriptRoot 'run-tests.ps1') @arguments @compileInputs
         }
         $allState = Get-Content (Join-Path $all 'artifact-lifecycle.json') -Raw | ConvertFrom-Json -AsHashtable
         if ($allState.status -ne 'Passed') { throw 'Suite all has no successful terminal record.' }
@@ -134,7 +142,7 @@ try {
         if ($RefreshFg) {
             $fgRoot = Join-Path $OutputDirectory 'refreshed-fg'
             # No NativeCase: preserve the default groups before additions.
-            & (Join-Path $PSScriptRoot 'run-tests.ps1') -Suite fg-native -SoftwareOnly -UiPreview None -OutputDirectory $fgRoot
+            & (Join-Path $PSScriptRoot 'run-tests.ps1') -Suite fg-native -DevControlMode Off -SoftwareOnly -UiPreview None -OutputDirectory $fgRoot @compileInputs
             $fgDirectory = Join-Path $fgRoot 'fg-native'
         }
         $verified = @{}
@@ -192,12 +200,15 @@ try {
         $summary['allEvidence'] = @{directory=$all;sourceCommit=$allState.sourceCommit;reused=[bool]$ReuseAllOutputDirectory;verifiedInputs=$verified.Count;checkoutLineEndingsOnly=@($checkoutEquivalent.Keys);fgDirectory=$fgDirectory;refreshedFg=[bool]$RefreshFg}
         $required = @('report','ui','presets','unicode-input','branding','native','sdr-policy','lastgasp',
             'hdr-policy','scope','config','constants','control-mask','control-mask-execution','vulkan-control-mask',
-            'fg-xefg','fg-native','lifecycle','bridge-motion','stage-plan','adaptive-resolution','copy-slots')
+            'fg-xefg','fg-native','lifecycle','bridge-motion','stage-plan','edit-reuse-policy',
+            'present-frame-policy','capability-policy','adaptive-resolution','copy-slots')
+        $reusableSuites = @{}
         foreach ($suite in $required) {
             $directory = if ($suite -eq 'fg-native') { $fgDirectory } else { Join-Path $all $suite }
             $state = Get-Content (Join-Path $directory 'artifact-lifecycle.json') -Raw | ConvertFrom-Json -AsHashtable
             if ($state.status -ne 'Passed') { throw "Suite did not complete: $suite" }
             $checks.Add(@{name="all/$suite";status='Passed';sourceCommit=$state.sourceCommit;evidence=$directory})
+            if ($state.sourceCommit -ceq $source) { $reusableSuites[$suite] = $directory }
         }
         $vulkan = $checks | Where-Object name -EQ 'all/vulkan-control-mask'
         $vulkan.status = 'NotRun'
@@ -213,6 +224,7 @@ try {
         $plan = @($nativeCases | ForEach-Object { @{name="fg/$_";log="fg-$_";exe=(Join-Path $fgDirectory 'fg_native_tests.exe');arguments=@("--$_");evidence=$(if ($_ -eq 'source-lifecycle') {'CPU'} else {'WARP+MOCK'})} })
         $plan += @($bridgeCases | ForEach-Object { @{name="bridge/$_";log="bridge-$_";exe=(Join-Path $all 'bridge-motion/d3d11_bridge_motion_tests.exe');arguments=@('--warp',"--$_");evidence='WARP+MOCK'} })
         foreach ($case in $plan) { $checks.Add(@{name=$case.name;status='NotRun';reason='not reached';evidence=$case.evidence}) }
+        $reusableCases = @{}
         foreach ($case in $plan) {
             $record = $checks | Where-Object name -EQ $case.name
             $caseOutput = Initialize-TestOutput (Join-Path $extra $case.log)
@@ -222,6 +234,7 @@ try {
                 Invoke-TestProcess $case.exe $caseOutput 'test' $case.arguments -TimeoutMilliseconds 180000
                 Complete-TestOutput $caseOutput
                 $record.status = 'Passed'; [void]$record.Remove('reason')
+                if ($case.name.StartsWith('fg/')) { $reusableCases[$case.name.Substring(3)] = $record }
             } catch {
                 $record.status = 'Failed'; $record.reason = $_.Exception.Message
                 Complete-TestOutput $caseOutput -Outcome Failed
@@ -236,6 +249,28 @@ try {
             $checks.Add(@{name=$name;status='NotRun';reason='Outside the selected release preflight scope; no result inferred from other cases.'})
         }
         if ($extraOutcome -eq 'Failed') { throw 'Independent preflight cases failed; see individual results.' }
+
+        foreach ($test in @('evidence','publishing')) {
+            $directory = Join-Path $OutputDirectory "ci-$test"
+            & (Join-Path $repo "tests/run-ci-$test-tests.ps1") -OutputDirectory $directory
+            $resultPath = Join-Path $directory 'result.json'
+            $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json -AsHashtable
+            if ($result.status -cne 'Passed') { throw "Local CI $test tests did not pass." }
+            $checks.Add(@{name="ci/$test";status='Passed';sourceCommit=$source;evidence=$resultPath
+                evidenceSha256=(Get-FileHash -LiteralPath $resultPath).Hash})
+        }
+        $core = Join-Path $OutputDirectory 'ci-core'
+        & (Join-Path $PSScriptRoot 'ci-core.ps1') -OutputDirectory $core -ReusableSuites $reusableSuites `
+            -ReusableIndependentCases $reusableCases @compileInputs
+        $corePath = Join-Path $core 'result.json'
+        $coreResult = Get-Content -LiteralPath $corePath -Raw | ConvertFrom-Json -AsHashtable
+        $tree = (& git --no-optional-locks -C $repo rev-parse 'HEAD^{tree}').Trim()
+        if ($coreResult.status -cne 'Passed' -or $coreResult.releaseParity.status -cne 'Passed' -or
+            $coreResult.sourceCommit -cne $source -or $coreResult.sourceTree -cne $tree) {
+            throw 'Local CI core lacks exact-source Passed parity evidence.'
+        }
+        $checks.Add(@{name='ci/core';status='Passed';sourceCommit=$source;sourceTree=$tree;evidence=$corePath
+            evidenceSha256=(Get-FileHash -LiteralPath $corePath).Hash})
     } else {
         if ($ReuseAllOutputDirectory) { throw 'Native mode does not rerun or consume Suite all.' }
         if ($previousCl -match 'NR_NEXUS_TEST_WARP_ONLY') { throw 'Native mode conflicts with the inherited WARP-only build guard.' }
