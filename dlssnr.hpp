@@ -11565,12 +11565,17 @@ inline bool SubrectFits(
     uint32_t base_y,
     uint32_t width,
     uint32_t height,
-    const D3D12_RESOURCE_DESC& resource) {
+    uint64_t resource_width,
+    uint32_t resource_height) {
   return width != 0 && height != 0
-      && static_cast<uint64_t>(base_x) + width <= resource.Width
-      && static_cast<uint64_t>(base_y) + height <= resource.Height;
+      && static_cast<uint64_t>(base_x) + width <= resource_width
+      && static_cast<uint64_t>(base_y) + height <= resource_height;
 }
 
+inline bool SubrectFits(
+    uint32_t base_x, uint32_t base_y, uint32_t width, uint32_t height, const D3D12_RESOURCE_DESC& resource) {
+  return SubrectFits(base_x, base_y, width, height, resource.Width, resource.Height);
+}
 // The grid the game's motion vectors are rendered at (DLSS Programming Guide
 // 3.6.2): the render subrect with MVLowRes, otherwise the DLSS output
 // (display) resolution - "if display resolution motion vectors are sent,
@@ -11605,11 +11610,12 @@ inline MotionWindow ResolveMotionWindow(
     uint32_t render_height,
     uint32_t display_width,
     uint32_t display_height,
-    const D3D12_RESOURCE_DESC& motion_desc) {
+    uint64_t motion_width,
+    uint32_t motion_height) {
   MotionWindow window;
   if ((create_flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) != 0) {
     window = {render_width, render_height, false, false};
-  } else if (!SubrectFits(base_x, base_y, display_width, display_height, motion_desc)) {
+  } else if (!SubrectFits(base_x, base_y, display_width, display_height, motion_width, motion_height)) {
     guide_mv_contradiction_frames.fetch_add(1, std::memory_order_relaxed);
     window = {render_width, render_height, false, true};
   } else {
@@ -11617,7 +11623,7 @@ inline MotionWindow ResolveMotionWindow(
     window = {display_width, display_height, true, false};
   }
   window.outside =
-      !SubrectFits(base_x, base_y, window.width, window.height, motion_desc);
+      !SubrectFits(base_x, base_y, window.width, window.height, motion_width, motion_height);
   if (window.outside) {
     guide_mv_window_outside_frames.fetch_add(1, std::memory_order_relaxed);
   }
@@ -16613,7 +16619,7 @@ inline bool RecordInline(
   // The display grid of the after path is the DLSS output rect.
   const MotionWindow motion_window = ResolveMotionWindow(
       frame.create_flags, frame.motion_x, frame.motion_y, frame.input_width,
-      frame.input_height, width, height, motion_desc);
+      frame.input_height, width, height, motion_desc.Width, motion_desc.Height);
   frame.motion_width = motion_window.width;
   frame.motion_height = motion_window.height;
 #if defined(NR_NEXUS_DEV_CONTROL)
@@ -18870,7 +18876,7 @@ inline bool RecordInlinePreSR(
       width, height,
       (current.declared_output_width != 0 ? current.declared_output_width : feature.declared_output_width),
       (current.declared_output_height != 0 ? current.declared_output_height : feature.declared_output_height),
-      motion_desc);
+      motion_desc.Width, motion_desc.Height);
   if (control_mask_requested && !control_mask_route_eligible
       && !control_mask_refusal_logged.exchange(true, std::memory_order_relaxed)) {
     Log(reshade::log::level::warning,

@@ -2670,13 +2670,10 @@ inline NrDeclineReason ProcessNr(VkCommandBuffer command_buffer,
       && control_mask_surface_ready;
   const uint32_t motion_x = GetUInt(parameters, NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X);
   const uint32_t motion_y = GetUInt(parameters, NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y);
-  // The shared contract helper uses only Width/Height from this description.
-  D3D12_RESOURCE_DESC motion_desc = {};
-  motion_desc.Width = motion->Resource.ImageViewInfo.Width;
-  motion_desc.Height = motion->Resource.ImageViewInfo.Height;
+  const NVSDK_NGX_ImageViewInfo_VK& motion_info = motion->Resource.ImageViewInfo;
   const MotionWindow motion_window = ResolveMotionWindow(
       feature.create_flags, motion_x, motion_y, render_width, render_height,
-      width, height, motion_desc);
+      width, height, motion_info.Width, motion_info.Height);
   const uint32_t motion_width = motion_window.width;
   const uint32_t motion_height = motion_window.height;
   FeatureState motion_contract;
@@ -2691,7 +2688,6 @@ inline NrDeclineReason ProcessNr(VkCommandBuffer command_buffer,
   // Every pass of this frame resets against the same epoch (ProcessInline).
   const uint64_t chain_reset_epoch = history_reset_epoch.load(std::memory_order_relaxed);
   const resource_view output_view = {reinterpret_cast<uint64_t>(out.ImageView)};
-  const NVSDK_NGX_ImageViewInfo_VK& motion_info = motion->Resource.ImageViewInfo;
   const bool control_mask_motion_format = motion_info.Format == VK_FORMAT_R16G16_SFLOAT
       || motion_info.Format == VK_FORMAT_R32G32_SFLOAT
       || motion_info.Format == VK_FORMAT_R16G16_SNORM

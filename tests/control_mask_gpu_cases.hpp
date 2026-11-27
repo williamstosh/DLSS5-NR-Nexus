@@ -2514,7 +2514,7 @@ int RunSafety(bool hardware, bool safety = true) {
         frame.depth = (test.missing_depth ? nullptr : depth_input.Get());
         frame.create_flags = (test.display_grid ? 0u : static_cast<uint32_t>(NVSDK_NGX_DLSS_Feature_Flags_MVLowRes));
         const auto window = addon::ResolveMotionWindow(frame.create_flags, frame.motion_x, frame.motion_y,
-            5, 1, 10, 2, vector_desc);
+            5, 1, 10, 2, vector_desc.Width, vector_desc.Height);
         frame.motion_width = window.width;
         frame.motion_height = window.height;
         frame.motion_scale_x = test.scale_x;
