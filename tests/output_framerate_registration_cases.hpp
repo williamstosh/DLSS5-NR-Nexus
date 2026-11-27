@@ -10,6 +10,7 @@ namespace output_framerate_registration_cases {
 namespace addon = renodx::addons::dlss5;
 namespace rate = renodx::addons::dlss5::output_framerate;
 inline std::map<reshade::addon_event, std::vector<void*>> callbacks;
+inline void* registered_module = nullptr;
 
 template <reshade::addon_event Event, typename... Args>
 void Dispatch(Args... args) {
@@ -28,11 +29,18 @@ extern "C" __declspec(dllexport) void ReShadeUnregisterEvent(reshade::addon_even
   std::erase(output_framerate_registration_cases::callbacks[event], callback);
 }
 
-extern "C" __declspec(dllexport) bool ReShadeRegisterAddon(void*, uint32_t version) {
-  return version == RESHADE_API_VERSION;
+extern "C" __declspec(dllexport) bool ReShadeRegisterAddon(void* module, uint32_t version) {
+  if (module == nullptr || output_framerate_registration_cases::registered_module != nullptr || version != RESHADE_API_VERSION) return false;
+  output_framerate_registration_cases::registered_module = module;
+  return true;
 }
 
-extern "C" __declspec(dllexport) bool ReShadeUnregisterAddon(void*) { return true; }
+extern "C" __declspec(dllexport) void ReShadeUnregisterAddon(void* module) {
+  if (module == nullptr || module != output_framerate_registration_cases::registered_module) return;
+  // This fixture hosts one add-on; ReShade removes its owned callbacks on module unregister.
+  output_framerate_registration_cases::callbacks.clear();
+  output_framerate_registration_cases::registered_module = nullptr;
+}
 
 #if defined(IMGUI_VERSION_NUM)
 extern "C" __declspec(dllexport) const imgui_function_table* ReShadeGetImGuiFunctionTable(uint32_t version) {
@@ -225,7 +233,14 @@ int RunOutputFramerateRegistrationCases() {
             "the Off SDK's registered forwarding creates a new ordinary Present window");
     }
     Dispatch<reshade::addon_event::destroy_swapchain>(&main, false);
+    const auto registered_callbacks = callbacks;
+    int foreign_module = 0;
+    ReShadeUnregisterAddon(nullptr);
+    ReShadeUnregisterAddon(&foreign_module);
+    Check(callbacks == registered_callbacks && registered_module == module,
+          "unknown modules cannot unregister the live add-on's callbacks");
     attached.reset();
+    Check(callbacks.empty() && registered_module == nullptr, "module unregister releases every owned event");
     Check(callbacks[reshade::addon_event::present].empty(), "ordinary sampling unregisters every test callback");
     model_gpu = nullptr;
     std::cout << "PASS production registered sampling to ordinary adaptive NR evidence=WARP+MOCK\n";
