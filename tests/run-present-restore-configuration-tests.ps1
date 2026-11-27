@@ -53,6 +53,7 @@ try {
         (Join-Path $addonDirectory 'reshade_config.hpp'),
         (Join-Path $addonDirectory 'ui/update.hpp'),
         (Join-Path $PSScriptRoot 'update_configuration_cases.hpp'),
+        (Join-Path $PSScriptRoot 'adaptive_ui_cases.hpp'),
         (Join-Path $addonDirectory 'capability.hpp'),
         (Join-Path $addonDirectory 'stage_plan.hpp'),
         (Join-Path $addonDirectory 'gpu_timers.hpp'),

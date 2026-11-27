@@ -7,6 +7,10 @@
 if (test_case == "online-update") {
   namespace updater = renodx::addons::dlss5::update;
   using Json = renodx::addons::dlss5::presets::Json;
+  OutputRuntimeFixture primary_runtime(false);
+  OutputRuntimeFixture secondary_runtime(false);
+  auto* primary = &primary_runtime;
+  auto* secondary = &secondary_runtime;
   const auto read_update = [](const char* key) {
     char value[32768]{};
     GetPrivateProfileStringA(runtime::kUpdateConfigSection, key, "<absent>", value, sizeof(value), ini_path.c_str());
@@ -33,7 +37,7 @@ if (test_case == "online-update") {
 
   runtime::enabled = false;
   runtime::OnUpdateInit(nullptr);
-  runtime::OnUpdateInit(reinterpret_cast<reshade::api::effect_runtime*>(uintptr_t{1}));
+  runtime::OnUpdateInit(primary);
   Check(!updater::GetSnapshot().busy && !updater::GetSnapshot().release, "automatic Off never launches a startup request across runtimes");
 
   const auto saved_update = read_update("DownloadDirectory");
@@ -49,8 +53,6 @@ if (test_case == "online-update") {
             && read_update("NextAutoCheckUtc") == next_text, "image resets and persistence preserve update preferences");
 
   updater::SetAutoCheck(true);
-  auto* primary = reinterpret_cast<reshade::api::effect_runtime*>(uintptr_t{1});
-  auto* secondary = reinterpret_cast<reshade::api::effect_runtime*>(uintptr_t{2});
   runtime::live_effect_runtimes = {primary, secondary};
   const auto before_secondary = writes.size();
   runtime::OnUpdatePresent(secondary);

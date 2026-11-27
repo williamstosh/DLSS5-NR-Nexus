@@ -30,6 +30,10 @@
 
 #include <dlssnr.hpp>
 
+#define NR_NEXUS_TEST_OUTPUT_RUNTIME_ONLY
+#include "adaptive_ui_cases.hpp"
+#undef NR_NEXUS_TEST_OUTPUT_RUNTIME_ONLY
+
 // Only the ReShade host boundary is substituted. Production LoadConfiguration,
 // raw section discovery, registry, typed getters and save decisions remain real.
 // Expected integration API: bool internal::SavePresentRestoreScope(scope::Scope).
