@@ -588,12 +588,31 @@ inline bool BeginServiceRecording(Stream* stream, Slot* slot) {
   return true;
 }
 
+struct SharedPresentColor {
+  PresentStream* owner = nullptr;
+  output_framerate::OutputIdentity identity;
+  std::shared_ptr<const void> context;
+  std::optional<FeatureState> neutral;
+  std::optional<WarmPresentColor> recorded;
+  bool waits_for_outgoing_queue = false;
+  bool model_changed = false;
+};
+
+inline bool FullServiceBackbuffer(const fg::FrameInput& input) {
+  if (input.hudless != nullptr || input.ui != nullptr || input.ui_composition || input.color_x != 0 || input.color_y != 0) {
+    return false;
+  }
+  const auto desc = input.backbuffer->GetDesc();
+  return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.DepthOrArraySize == 1
+      && desc.SampleDesc.Count == 1 && desc.Width == input.color_width && desc.Height == input.color_height;
+}
+
 inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* list,
                          const fg::FrameInput& input, const PresentTarget& base,
                          bool* output_ready, std::array<NrRecording, 2>* recordings,
                          const NVSDK_NGX_Parameter* native_parameters = nullptr,
                          bool ui_recomposition = true, const fg::FrameInput* service_scope = nullptr,
-                         PresentStream** warm_owner = nullptr) {
+                         SharedPresentColor* shared = nullptr) {
   *output_ready = false;
   *recordings = {};
   slot->adaptive_delivery = {};
@@ -658,71 +677,11 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
   // Missing XeFG guide extents do not imply low-resolution or jittered motion.
   contract.create_flags = (real_guides ? input.init_flags
       : (service_scope != nullptr ? (input.init_flags & kDepthInverted) : kDepthInverted));
-  PresentStream* shared_color = nullptr;
-  bool prepare_shared_color = false;
-  bool warm_neutral = false;
-  const auto xefg_context = (service_scope != nullptr ? fg::xefg::ServiceOutputOwner(*service_scope) : nullptr);
-  if (warm_owner != nullptr && xefg_context != nullptr && !stream->native && !has_hudless
-      && input.hudless == nullptr && input.ui == nullptr && !input.ui_composition
-      && input.color_x == 0 && input.color_y == 0 && WarmPresentColorEligible(base)) {
-    const auto canonical = renodx::utils::directx::NativeIdentity(input.backbuffer);
-    const auto owner_identity = output_framerate::MatchPresentColorOwner(input.output, reinterpret_cast<uintptr_t>(canonical));
-    if (owner_identity) {
-      auto& owner = present_streams[reinterpret_cast<const void*>(owner_identity.swapchain)];
-      const auto back = input.backbuffer->GetDesc();
-      const auto& warm = owner.warm_color;
-      const bool same_output = warm.xefg_context.lock() == xefg_context
-          && WarmPresentColorCurrent(warm, owner_identity, base, input.color_width, input.color_height);
-      if (back.Width == input.color_width && back.Height == input.color_height) {
-        if (real_guides) {
-          const bool same_guides = warm.guide_width == contract.input_width && warm.guide_height == contract.input_height
-              && warm.motion_x == contract.motion_x && warm.motion_y == contract.motion_y
-              && warm.depth_x == contract.depth_x && warm.depth_y == contract.depth_y
-              && warm.flags == contract.create_flags;
-          const auto existing = features.find(owner.Handle());
-          const bool continuing_preparation = !warm.complete && warm.xefg && warm.delivery_context == input.context;
-          if (SubrectFits(contract.motion_x, contract.motion_y, contract.input_width, contract.input_height, input.motion->GetDesc())
-              && SubrectFits(contract.depth_x, contract.depth_y, contract.input_width, contract.input_height, input.depth->GetDesc())
-              && (existing == features.end() || (same_guides && same_output
-                  && (continuing_preparation || (warm.complete
-                      && WarmPresentSlotsMatch(owner, list, contract, base, input.color_width, input.color_height)))))) {
-            // Delivery changed, not the model owner. Before continuing its
-            // incomplete group, mature the old Create exactly as ordinary
-            // Present does; don't Evaluate it or create a private duplicate.
-            if (existing != features.end() && continuing_preparation && warm.delivery_epoch != input.epoch) {
-              for (auto& pass : std::span{existing->second.slots}.first(2)) {
-                if (pass.handle == nullptr) {
-                  prepare_shared_color = true;
-                  continue;
-                }
-                if (!WarmPresentModelOnBinding(pass)) return fg::Result::NOT_SERVED;
-                if (pass.creation_completed) continue;
-                if (pass.preparation_recording == nullptr) {
-                  pass.preparation_recording = pass.creation_recording;
-                }
-                if (pass.preparation_recording == nullptr || !NrModelPreparationReady(&pass, list)) {
-                  CountNrDecline(NrDeclineReason::kSlotWarmupMaturation);
-                  return fg::Result::NOT_SERVED;
-                }
-              }
-            }
-            shared_color = &owner;
-          }
-        } else if (guide_mode == kPresentGuidesOptional && same_output) {
-          const auto neutral = WarmNeutralGuideContract(warm, input.color_width, input.color_height);
-          if (neutral && WarmPresentSlotsMatch(owner, list, *neutral, base, input.color_width, input.color_height)
-              && EnsureWarmPresentNeutralGuides(&owner, stream->device, *neutral)) {
-            contract = *neutral;
-            shared_color = &owner;
-            warm_neutral = true;
-          }
-        }
-      }
-      if (shared_color != nullptr) {
-        *warm_owner = shared_color;
-        stream->warm_color_owner = owner_identity;
-      }
-    }
+  auto* const shared_color = (shared != nullptr ? shared->owner : nullptr);
+  const bool warm_neutral = shared_color != nullptr && shared->neutral.has_value();
+  if (warm_neutral) {
+    contract = *shared->neutral;
+    if (!EnsureWarmPresentNeutralGuides(shared_color, stream->device, contract)) return fg::Result::FAILED;
   }
   const bool game_reset = input.reset || (service_scope != nullptr && stream->pending_xefg_game_reset);
   contract.frame_reset = (game_reset ? 1 : 0);
@@ -1119,19 +1078,53 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
                             : present_restore_scope::Domain::PRE_FG_HUDLESS);
     target.original_identity = reinterpret_cast<uintptr_t>(i == 0 ? input.backbuffer : input.hudless);
     auto& recording = (*recordings)[i];
-    if (prepare_shared_color && i == 0) {
-      // Finish the old owner's Create on this preparation list. The next
-      // real color list must see both passes ready; don't publish pass one.
+    const bool recorded_owner_contract = shared_color != nullptr && shared_color->warm_color.owner
+        && WarmPresentColorCurrent(shared_color->warm_color, shared->identity, target, input.color_width, input.color_height);
+    if (shared_color != nullptr && i == 0 && (!recorded_owner_contract
+        || !WarmPresentSlotsMatch(*shared_color, list, contract, target, input.color_width, input.color_height))) {
+      const auto existing = features.find(model);
+      bool incompatible = false;
+      bool pending = false;
+      if (existing != features.end()) {
+        for (uint32_t pass = 0; pass < 2; ++pass) {
+          auto& model_slot = existing->second.slots[pass];
+          if (model_slot.handle == nullptr) continue;
+          const auto& creation = model_slot.creation_recording;
+          const bool discarded = creation != nullptr && creation->closed.load() && !creation->submitted.load();
+          pending |= !discarded && !WarmPresentCreationReady(&model_slot, list);
+          incompatible |= discarded || (shared_color->warm_color.owner && !recorded_owner_contract)
+              || !WarmPresentSlotContractMatches(model_slot, pass, contract, target,
+                                                                         input.color_width, input.color_height);
+        }
+      }
+      if (pending || (incompatible && shared->waits_for_outgoing_queue)) {
+        slot->model_preparation_pending = true;
+        CountNrDecline(NrDeclineReason::kSlotWarmupMaturation);
+        fg::xefg::ObserveServiceHandoff(*service_scope, {.reason = "shared_model_preparation_pending"});
+        restore_guides();
+        return fg::Result::PREPARED;
+      }
+      if (incompatible) {
+        // The handles and parameter blocks must retire with their own family.
+        // A different runtime flag alone leaves EnsureNrFeature's live slot intact.
+        InvalidateWarmPresentColor(shared_color);
+        shared->model_changed = true;
+      }
       NrModelPreparationResult preparation;
       const bool accepted = PrepareNrModels(list, model, &role.parameters, target, &preparation);
       if (!accepted || preparation.state != NrModelPreparationState::READY) {
         const bool created = accepted && preparation.state == NrModelPreparationState::RECORDED;
+        shared->model_changed |= preparation.created_mask != 0;
+        recording.prepared = created;
         if (created) {
-          RememberWarmPresentColor(shared_color, stream->warm_color_owner, target, contract,
-                                   input.color_width, input.color_height, true, real_guides, false, &input, xefg_context);
+          shared->recorded = DescribeWarmPresentColor(*shared_color, shared->identity, target, contract,
+              input.color_width, input.color_height, true, real_guides, false, &input, shared->context);
+        } else if (preparation.state == NrModelPreparationState::PENDING) {
+          slot->model_preparation_pending = true;
+          fg::xefg::ObserveServiceHandoff(*service_scope, {.reason = "shared_model_preparation_pending"});
         }
         restore_guides();
-        if (created) return fg::Result::PREPARED;
+        if (created || slot->model_preparation_pending) return fg::Result::PREPARED;
         return preparation.state == NrModelPreparationState::FAILED ? fg::Result::FAILED : fg::Result::NOT_SERVED;
       }
     }
@@ -1322,15 +1315,18 @@ inline fg::Result Record(Stream* stream, Slot* slot, ID3D12GraphicsCommandList* 
       Log(reshade::log::level::info, line.str());
     }
     prepared |= recording.prepared;
-    if (shared_color != nullptr && i == 0
-        && (recording.prepared || recording.model_invoked || recording.output_ready)) {
-      RememberWarmPresentColor(shared_color, stream->warm_color_owner, target, contract,
-                               input.color_width, input.color_height, true, real_guides,
-                               recording.output_ready && recording.group_complete && recording.model_pass_mask == 3u, &input, xefg_context);
+    if (shared_color != nullptr && i == 0) {
+      shared->model_changed |= recording.prepared || recording.model_invoked;
+      if (accepted && recording.output_ready && recording.group_complete
+          && recording.model_pass_mask == 3u && recording.model_evaluate_mask == 3u) {
+        shared->recorded = DescribeWarmPresentColor(*shared_color, shared->identity, target, contract,
+            input.color_width, input.color_height, true, real_guides, true, &input, shared->context);
+      }
     }
-    const bool complete_pair = !base.native_prefg_resolution_pair
-        || (NativePreFgResolutionPairAllowed(target)
-            && recording.group_complete && recording.model_pass_mask == 3u);
+    const bool complete_pair = (shared_color != nullptr && i == 0)
+        ? shared->recorded.has_value()
+        : (!base.native_prefg_resolution_pair || (NativePreFgResolutionPairAllowed(target)
+            && recording.group_complete && recording.model_pass_mask == 3u));
     if (!accepted || !recording.output_ready || !complete_pair) {
       // Admission and History-order guards can defer a frame before any model
       // call. Actual Evaluate failures latch their own adaptive session.
@@ -1667,6 +1663,32 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
       device = input.recording_device;
       face_source = "current SDK host object";
     }
+    Microsoft::WRL::ComPtr<ID3D12Device> ordinary_face;
+    output_framerate::OutputIdentity physical_owner;
+    if (FullServiceBackbuffer(input)) {
+      physical_owner = output_framerate::MatchPresentColorOwner(input.output,
+          reinterpret_cast<uintptr_t>(backbuffer_identity));
+    }
+    if (device == nullptr && physical_owner && fg::xefg::ServiceWriteCurrent(input)) {
+      const auto entry = present_streams.find(reinterpret_cast<const void*>(physical_owner.swapchain));
+      if (entry != present_streams.end()) {
+        auto& proof = entry->second.ordinary_recording_face;
+        const auto ordinary_queue = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(present_ring.queue));
+        if (proof.BindingCurrent(physical_owner, ordinary_queue, present_ring.fence)
+            && renodx::utils::directx::SameNativeObject(proof.device.Get(), submit_device.Get())) {
+          const auto completed = proof.fence->GetCompletedValue();
+          if (completed != UINT64_MAX && completed >= proof.fence_value) {
+            ordinary_face = proof.device;
+            device = ordinary_face.Get();
+            face_source = "same output ordinary recording";
+          } else if (completed == UINT64_MAX) {
+            proof = {};
+          }
+        } else {
+          proof = {};
+        }
+      }
+    }
     if (device == nullptr && queue_recording_device != nullptr) {
       device = queue_recording_device.Get();
       face_source = "SDK queue GetDevice";
@@ -1690,23 +1712,6 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
         {.resource = backbuffer_identity, .subresource = 0, .version = input.application_frame},
         {.resource = hudless_identity, .subresource = 0, .version = input.application_frame}}};
     const auto targets = std::span{colors}.first(distinct_hudless ? 2 : 1);
-    PresentStream* order_candidate = nullptr;
-    if (input.hudless == nullptr && input.ui == nullptr && !input.ui_composition
-        && input.color_x == 0 && input.color_y == 0) {
-      const auto owner = output_framerate::MatchPresentColorOwner(input.output, reinterpret_cast<uintptr_t>(backbuffer_identity));
-      const auto entry = present_streams.find(reinterpret_cast<const void*>(owner.swapchain));
-      if (owner && entry != present_streams.end()) {
-        const auto& warm = entry->second.warm_color;
-        const auto xefg_context = fg::xefg::ServiceOutputOwner(input);
-        if (xefg_context != nullptr && warm.complete && warm.owner == owner && warm.face == device
-            && warm.xefg_context.lock() == xefg_context && WarmPresentBindingLive(device)
-            && warm.context_generation == original_nr_init_generation
-            && warm.configuration == configuration_generation.load()
-            && warm.width == input.color_width && warm.height == input.color_height) {
-          order_candidate = &entry->second;
-        }
-      }
-    }
     WarmPresentQueueWaits handoff_waits;
     const auto color_ordered = [&](const std::pair<uint64_t, uint64_t>& recording, const PresentStream* shared) {
       FenceRef queue_fence;
@@ -1733,9 +1738,6 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
       }
       return false;
     };
-    // Known conflicts should leave the current history intact. Recheck at
-    // publication for changes while the private candidate was recorded.
-    if (!color_ordered({}, order_candidate)) return fg::Result::NOT_SERVED;
     observe("previous_sdk_present_pending");
     if (const auto it = streams.find({false, input.context}); it != streams.end()) {
       auto& previous = it->second;
@@ -1757,7 +1759,8 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
       std::ostringstream message;
       message << "XeFG NR recording device: source=" << face_source << ", face=" << device
               << ", native submit device=" << submit_device.Get() << ", queue=" << queue
-              << ", context=" << input.context << ", epoch=" << input.epoch;
+              << ", context=" << input.context << ", epoch=" << input.epoch
+              << ", call=" << fg::xefg::ServiceCall(input);
       Log(reshade::log::level::info, message.str());
       stream.device = device;
       device->AddRef();
@@ -1855,7 +1858,7 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
       return stream.result;
     }
     slot->model_preparation_pending = false;
-    PresentStream* warm_owner = nullptr;
+    SharedPresentColor shared;
     bool submitted = false;
     bool close_attempted = false;
     const auto close_recording = [&] {
@@ -1880,10 +1883,8 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
           close_recording();
         }
         submission::DiscardOwnedRecording(slot->list, submission::RecordingOwner::kXeFg);
-        if (warm_owner != nullptr && warm_owner->warm_color.delivery_context == input.context
-            && warm_owner->warm_color.delivery_epoch == input.epoch
-            && warm_owner->warm_color.delivery_frame == input.application_frame) {
-          InvalidateWarmPresentColor(warm_owner);
+        if (shared.model_changed) {
+          InvalidateWarmPresentColor(shared.owner);
         }
         if (slot->model_preparation_pending) {
           // The separate creation slot still owns its submitted model work.
@@ -1924,6 +1925,7 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     PresentTarget target;
     target.original_signed_runtime = true;
     SnapshotPresentRestoreConfiguration(&target);
+    target.adaptive_output = input.output;
     target.swapchain_identity = reinterpret_cast<uintptr_t>(input.swapchain);
     target.swapchain_format = input.backbuffer->GetDesc().Format;
     if (input.color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
@@ -1957,6 +1959,37 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     target.divisor = (target.hdr_mode != 0 && mode != 1u && mode != 3u
         ? codec::PresentDivisor(target.units, white, paper_white_scale.load(), pq_calibration.load()) : 0.f);
     target.ui_correction = present_ui_correction.load();
+    if (physical_owner && WarmPresentBindingLive(recording_device) && WarmPresentColorEligible(target)
+        && fg::xefg::ServiceWriteCurrent(input)) {
+      shared.context = fg::xefg::ServiceOutputOwner(input);
+      if (shared.context != nullptr) {
+        const auto guide_mode = diagnostics::GuideMode(target.diagnostic.guides, present_guides.load(std::memory_order_relaxed));
+        const bool real_guides = guide_mode != kPresentGuidesNever && input.motion != nullptr && input.depth != nullptr
+            && input.guide_width != 0 && input.guide_height != 0;
+        const auto owner_key = reinterpret_cast<const void*>(physical_owner.swapchain);
+        if (real_guides
+            && SubrectFits(input.motion_x, input.motion_y, input.guide_width, input.guide_height, input.motion->GetDesc())
+            && SubrectFits(input.depth_x, input.depth_y, input.guide_width, input.guide_height, input.depth->GetDesc())) {
+          shared.owner = &present_streams[owner_key];
+        } else if (!real_guides && guide_mode == kPresentGuidesOptional) {
+          const auto entry = present_streams.find(owner_key);
+          if (entry != present_streams.end() && WarmPresentColorCurrent(entry->second.warm_color, physical_owner,
+                  target, input.color_width, input.color_height)) {
+            shared.neutral = WarmNeutralGuideContract(entry->second.warm_color, input.color_width, input.color_height);
+            if (shared.neutral) {
+              shared.owner = &entry->second;
+            }
+          }
+        }
+        if (shared.owner != nullptr) {
+          shared.identity = physical_owner;
+        }
+      }
+    }
+    // Inspect this same physical group before touching its slots or history.
+    // Publication repeats the proof using the actual recording.
+    if (!color_ordered({}, shared.owner)) return fg::Result::NOT_SERVED;
+    shared.waits_for_outgoing_queue = !handoff_waits.empty();
     const EvaluateChainScope chain;
     // XeFG init flags are a different ABI from NGX feature flags. Motion
     // scale is already supplied in pixels by XeFG's public constants.
@@ -2012,11 +2045,26 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     };
     stream.warm_color_owner = {};
     const auto recorded = Record(&stream, slot, slot->list, nr_input, target,
-                                 &output_ready, &recordings, exact_ui ? &composition : nullptr, true, &input, &warm_owner);
+                                 &output_ready, &recordings, exact_ui ? &composition : nullptr, true, &input, &shared);
     const auto submit_neutral_guides = [&](bool signaled) {
       // The next recording uses the same queue; a cancelled or unproven fill cannot prime it.
       if (slot->recorded_neutral_depth_inverted.has_value()) {
         stream.submitted_neutral_depth_inverted = (signaled ? slot->recorded_neutral_depth_inverted : std::nullopt);
+      }
+      if (signaled && shared.neutral && shared.owner->warm_neutral_guides.upload != nullptr) {
+        WarmPresentNeutralGuidesSubmitted(&shared.owner->warm_neutral_guides);
+      }
+    };
+    const auto shared_owner_current = [&] {
+      return shared.owner == nullptr || (WarmPresentBindingLive(recording_device)
+          && output_framerate::MatchPresentColorOwner(input.output, reinterpret_cast<uintptr_t>(backbuffer_identity))
+              == shared.identity);
+    };
+    const auto remember_shared = [&] {
+      if (shared.recorded) {
+        shared.owner->warm_color = std::move(*shared.recorded);
+        owner_resident_nr_handles.insert(shared.owner->Handle());
+        stream.warm_color_owner = shared.identity;
       }
     };
     uint32_t process_calls = 0;
@@ -2067,7 +2115,13 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
         renodx::utils::directx::NativeFromReShadeProxy(&list);
         submission::TrackUse(slot->list, slot->allocator);
         submission::TrackUse(slot->list, slot->list);
-        if (!fg::xefg::WithServiceWritePermission(input, false, [&] { queue->ExecuteCommandLists(1, &list); })) {
+        const auto recording_id = submission::RecordingIdentity(slot->list);
+        if (shared.owner != nullptr && !color_ordered(recording_id, shared.owner)) return fg::Result::NOT_SERVED;
+        if (!fg::xefg::WithServiceWritePermission(input, false, [&] {
+              if (!shared_owner_current() || !EnqueueWarmPresentQueueWaits(queue, handoff_waits)) return false;
+              queue->ExecuteCommandLists(1, &list);
+              return true;
+            })) {
           observe("write_permission_revoked");
           return fg::Result::NOT_SERVED;
         }
@@ -2075,9 +2129,19 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
         slot->fence_value = ++stream.submitted;
         const bool signaled = SUCCEEDED(queue->Signal(stream.fence, slot->fence_value));
         submit_neutral_guides(signaled);
-        if (!signaled) {
+        if (signaled) {
+          remember_shared();
+        } else {
+          if (shared.model_changed) {
+            InvalidateWarmPresentColor(shared.owner);
+          }
           slot->quarantined = true;
         }
+        fg::xefg::ObserveServiceHandoff(input,
+            {.reason = (signaled ? "model_preparation_submitted" : "model_preparation_signal_failed"),
+             .recording = recording_id, .queue = reinterpret_cast<uintptr_t>(queue),
+             .fence = reinterpret_cast<uintptr_t>(stream.fence), .fence_value = slot->fence_value,
+             .completed_value = stream.fence->GetCompletedValue(), .signaled = signaled});
         submission::DiscardOwnedRecording(slot->list, submission::RecordingOwner::kXeFg);
       }
       stream.result = (slot->quarantined ? fg::Result::FAILED : recorded);
@@ -2133,10 +2197,10 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     submission::TrackUse(slot->list, slot->list);
     ID3D12CommandList* list = slot->list;
     renodx::utils::directx::NativeFromReShadeProxy(&list);
-    if (warm_owner == nullptr) handoff_waits.clear();
-    if (!color_ordered(recording_id, warm_owner)) return fg::Result::NOT_SERVED;
+    if (!color_ordered(recording_id, shared.owner)) return fg::Result::NOT_SERVED;
     bool handoff_wait_failed = false;
     if (!fg::xefg::WithServiceWritePermission(input, true, [&] {
+          if (!shared_owner_current()) return false;
           if (!EnqueueWarmPresentQueueWaits(queue, handoff_waits)) {
             handoff_wait_failed = true;
             return false;
@@ -2164,7 +2228,9 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
     stream.awaiting_xefg_delivery = true;
     fg::xefg::RegisterDeliveryCallback(OnXeFGPresentDelivery);
     if (!signaled) {
-      if (warm_owner != nullptr) InvalidateWarmPresentColor(warm_owner);
+      if (shared.model_changed) {
+        InvalidateWarmPresentColor(shared.owner);
+      }
       ResolveAdaptiveDelivery(slot->adaptive_delivery, false);
       slot->quarantined = true;
       if (slot->adaptive_delivery.frame.enabled) {
@@ -2179,10 +2245,7 @@ inline fg::Result Service(const fg::FrameInput& input) noexcept {
       return stream.result;
     }
     stream.result = fg::Result::SUBMITTED;
-    if (warm_owner != nullptr && recordings[0].output_ready && !warm_owner->warm_color.real_guides
-        && warm_owner->warm_neutral_guides.upload != nullptr) {
-      WarmPresentNeutralGuidesSubmitted(&warm_owner->warm_neutral_guides);
-    }
+    remember_shared();
     stream.pending_xefg_delivery = std::exchange(slot->adaptive_delivery, {});
     present_frame_policy::Publish(&stream.base_frame_clock, slot->base_frame, true, slot->base_frame_group.complete);
     stream.pending_monitor_delivery = {.output = input.output, .configuration = configuration_generation.load(),

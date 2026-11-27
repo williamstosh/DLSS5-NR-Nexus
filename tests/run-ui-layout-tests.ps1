@@ -8,9 +8,14 @@ param(
     [string]$VcVars64,
     [ValidateSet('Quick','Full')][string]$SnapshotMode,
     [switch]$DevControlOnly,
+    [ValidateSet('Off','On')][string]$MonitorSessionMode,
     [ValidateSet('Standard','Full','Acceptance')][string]$RetentionMode = $(if ($env:NR_NEXUS_TEST_RETENTION) { $env:NR_NEXUS_TEST_RETENTION } else { 'Standard' })
 )
 $ErrorActionPreference = 'Stop'
+if ($MonitorSessionMode -and ($SnapshotMode -or $DevControlOnly -or
+    $env:CL -match 'NR_NEXUS_DEV_CONTROL\b' -or $env:_CL_ -match 'NR_NEXUS_DEV_CONTROL\b')) {
+    throw 'Monitor session parity requires an explicit mode without snapshot, DEV-only or compiler environment overrides.'
+}
 . (Join-Path $PSScriptRoot 'test-support.ps1')
 $RetentionMode = @('Standard','Full','Acceptance') | Where-Object { $_ -ieq $RetentionMode } | Select-Object -First 1
 $OutputDirectory = Initialize-TestOutput $OutputDirectory -RetentionMode $RetentionMode
@@ -20,7 +25,7 @@ $imguiRoot = Join-Path $HostRoot 'external/reshade/deps/imgui'
 $executable = Join-Path $OutputDirectory 'ui-layout-tests.exe'
 $sources = @((Join-Path $SourceRoot 'tests/ui_layout_tests.cpp'))
 $sources += @('imgui.cpp','imgui_draw.cpp','imgui_tables.cpp','imgui_widgets.cpp') | ForEach-Object { Join-Path $imguiRoot $_ }
-if (-not $SnapshotMode -and -not $DevControlOnly) {
+if (-not $SnapshotMode -and -not $DevControlOnly -and -not $MonitorSessionMode) {
 $arguments = @('/nologo','/std:c++20','/EHsc','/O2','/MT','/utf-8','/DNOMINMAX',"/I$SourceRoot","/I$imguiRoot")
 $arguments += $sources
 $arguments += @("/Fo$OutputDirectory/", "/Fe$executable")
@@ -37,7 +42,8 @@ New-Item -ItemType Directory -Path $menuDirectory | Out-Null
 $sources[0] = Join-Path $SourceRoot 'tests/ui_menu_tests.cpp'
 $arguments = @('/nologo','/std:c++20','/EHsc','/W3','/O2','/MT','/utf-8','/DNOMINMAX','/DRESHADE_ADDON=2',
     '/DIMGUI_ENABLE_TEST_ENGINE','/bigobj','/Gy','/Gw')
-if ($DevControlOnly) { $arguments += '/DNR_NEXUS_DEV_CONTROL' }
+if ($DevControlOnly -or $MonitorSessionMode -eq 'On') { $arguments += '/DNR_NEXUS_DEV_CONTROL' }
+if ($MonitorSessionMode -eq 'Off') { $arguments += '/UNR_NEXUS_DEV_CONTROL' }
 $arguments += @($projectInputs.Includes | ForEach-Object { "/I$_" })
 $arguments += $sources
 $arguments += @("/Fo$menuDirectory/", "/Fe$menuExecutable", '/link', '/OPT:REF', '/OPT:ICF') + $projectInputs.Libraries
@@ -58,14 +64,23 @@ if ($LASTEXITCODE -ne 0) { throw "Production menu test build failed: $OutputDire
 $previousSnapshotMode = $env:NR_NEXUS_UI_SNAPSHOTS
 $previousAdaptiveOnly = $env:NR_NEXUS_ADAPTIVE_UI_ONLY
 $previousDevControlOnly = $env:NR_NEXUS_DEV_CONTROL_ONLY
+$previousMonitorSessionOnly = $env:NR_NEXUS_MONITOR_SESSION_ONLY
 try {
     if ($DevControlOnly) { $env:NR_NEXUS_DEV_CONTROL_ONLY = '1' }
     if ($SnapshotMode) { $env:NR_NEXUS_UI_SNAPSHOTS = $SnapshotMode }
-    # The complete production matrix renders over 13,000 frames across themes,
-    # languages and DPI sizes. Keep its bound separate from focused 45s cases
-    # so slower hosted runners can finish the same assertions without retries.
-    Invoke-TestProcess $menuExecutable $menuDirectory 'menu' -TimeoutMilliseconds 180000
-    if (-not $SnapshotMode -and -not $previousAdaptiveOnly -and -not $DevControlOnly) {
+    if ($MonitorSessionMode) {
+        $env:NR_NEXUS_UI_SNAPSHOTS = $null
+        $env:NR_NEXUS_ADAPTIVE_UI_ONLY = $null
+        $env:NR_NEXUS_DEV_CONTROL_ONLY = $null
+        $env:NR_NEXUS_MONITOR_SESSION_ONLY = '1'
+        Invoke-TestProcess $menuExecutable $OutputDirectory 'monitor-session'
+    } else {
+        # The complete production matrix renders over 13,000 frames across themes,
+        # languages and DPI sizes. Keep its bound separate from focused 45s cases
+        # so slower hosted runners can finish the same assertions without retries.
+        Invoke-TestProcess $menuExecutable $menuDirectory 'menu' -TimeoutMilliseconds 180000
+    }
+    if (-not $SnapshotMode -and -not $previousAdaptiveOnly -and -not $DevControlOnly -and -not $MonitorSessionMode) {
         # Reuse the binary in a fresh process so adaptive fixtures cannot
         # inherit the complete menu matrix's configuration or ImGui state.
         $adaptiveDirectory = Join-Path $OutputDirectory 'adaptive'
@@ -77,9 +92,14 @@ try {
     $env:NR_NEXUS_UI_SNAPSHOTS = $previousSnapshotMode
     $env:NR_NEXUS_ADAPTIVE_UI_ONLY = $previousAdaptiveOnly
     $env:NR_NEXUS_DEV_CONTROL_ONLY = $previousDevControlOnly
+    $env:NR_NEXUS_MONITOR_SESSION_ONLY = $previousMonitorSessionOnly
 }
 $timer.Stop()
-@{build='passed';run='passed';retention=$RetentionMode;seconds=$timer.Elapsed.TotalSeconds
-    snapshotMode=$SnapshotMode; scope='real ImGui layout, synthetic live status; no game or GPU inference'} |
-    ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputDirectory 'result.json') -Encoding utf8
+$result = @{build='passed';run='passed';retention=$RetentionMode;seconds=$timer.Elapsed.TotalSeconds
+    snapshotMode=$SnapshotMode; scope='real ImGui layout, synthetic live status; no game or GPU inference'}
+if ($MonitorSessionMode) {
+    $result['buildIdentity'] = @{mode=$MonitorSessionMode;cases=@('monitor-session')
+        executableSha256=(Get-FileHash -LiteralPath $menuExecutable).Hash}
+}
+$result | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputDirectory 'result.json') -Encoding utf8
 Complete-TestOutput $OutputDirectory

@@ -73,6 +73,39 @@ struct OrdinaryPresentAttempt {
 
 enum class OrdinaryPresentClaim : uint8_t { NO_MATCH, COVERED, CONFLICT };
 
+struct OrdinaryPresentAccess {
+  uintptr_t swapchain = 0;
+  uintptr_t backbuffer = 0;
+  output_framerate::OutputIdentity output;
+  uintptr_t context = 0;
+  uintptr_t owner = 0;
+  uint64_t epoch = 0;
+  uint64_t declaration = 0;
+  uint64_t call = 0;
+  bool allowed = false;
+  bool operator==(const OrdinaryPresentAccess&) const = default;
+};
+
+struct OrdinaryOffPresent {
+  OrdinaryPresentAccess access;
+  output_framerate::OutputIdentity physical_output;
+  ID3D12CommandQueue* queue = nullptr;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  const char* input_rejection = "off_backbuffer_unavailable";
+};
+
+struct OrdinaryPreEffectsWrite {
+  OrdinaryPresentAttempt attempt;
+  OrdinaryPresentAccess access;
+  output_framerate::OutputIdentity physical_output;
+  uint64_t consumer_call = 0;
+  uint64_t disable_epoch = 0;
+  uint64_t disable_declaration = 0;
+  DXGI_COLOR_SPACE_TYPE color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+  bool operator==(const OrdinaryPreEffectsWrite&) const = default;
+};
+
 // Values only: the ordinary owner retains and retires its own GPU operands.
 // SDK epochs describe the original recording, never a new color version.
 struct OrdinaryPresentReceipt {
@@ -99,10 +132,12 @@ struct OrdinaryPresentReceipt {
   bool proofs_healthy = false;
   bool proofs_complete = false;
   bool game_reset_observed = false;
+  bool pre_effects_xefg = false;
   OrdinarySubmissionFact submission;
 };
 
 using ClaimOrdinaryPresent = OrdinaryPresentClaim (*)(const FrameInput&) noexcept;
+using ClaimOrdinaryOffPresent = void (*)(const OrdinaryOffPresent&, OrdinaryPresentAttempt) noexcept;
 using FinishOrdinaryPresent = void (*)(const OrdinaryPresentReceipt&, const FrameInput&, uint64_t, HRESULT) noexcept;
 using InvalidateOrdinaryPresent = void (*)(uintptr_t) noexcept;
 using FindOrdinaryPresentAttempt = OrdinaryPresentAttempt (*)(uintptr_t, uintptr_t) noexcept;
@@ -307,6 +342,7 @@ using Microsoft::WRL::ComPtr;
 inline constexpr int32_t kUiModeAuto = 0;
 inline std::atomic<Service> service{nullptr};
 inline std::atomic<ClaimOrdinaryPresent> claim_ordinary_present{nullptr};
+inline std::atomic<ClaimOrdinaryOffPresent> claim_ordinary_off_present{nullptr};
 inline std::atomic<FinishOrdinaryPresent> finish_ordinary_present{nullptr};
 inline std::atomic<InvalidateOrdinaryPresent> invalidate_ordinary_present{nullptr};
 inline std::atomic<FindOrdinaryPresentAttempt> find_ordinary_present_attempt{nullptr};
@@ -424,6 +460,8 @@ struct PresentHandoff {
   bool sdk_enabled_at_entry = false;
   bool has_present_id = false;
   bool has_guides = false;
+  bool game_reset_edge = false;
+  bool single_backbuffer = false;
   bool color_executed = false;
   bool ordinary_executed = false;
   bool owner_current_at_return = false;
@@ -486,6 +524,7 @@ struct Context {
   uint64_t bridge_declaration = 0;
   uint64_t bridge_off_epoch = 0;
   uint64_t ordinary_off_epoch = 0;
+  bool game_reset_high = false;
   uint64_t bridge_write_epoch = 0;
   output_framerate::OutputIdentity bridge_off_output;
   BridgeSourceIdentity bridge_off_source;
@@ -507,14 +546,17 @@ struct Context {
   uint64_t color_serial = 0;
   uint64_t color_submitted_frame = 0;
   uint64_t color_submitted_epoch = 0;
+  uint64_t guided_delivery_declaration = 0;
   struct PresentColors {
     uintptr_t backbuffer = 0;
     uintptr_t hudless = 0;
     bool xefg_owned = false;
+    bool pre_effects_reserved = false;
     bool ordinary_committed = false;
     OrdinarySubmissionFact ordinary_submission;
   };
   std::map<uint64_t, PresentColors> present_colors;
+  OrdinaryPreEffectsWrite pre_effects_write;
   std::array<uintptr_t, 16> backbuffers{};
   uint32_t handoff_frames_left = 0;
   PresentHandoff last_handoff_write;
@@ -689,7 +731,7 @@ inline void LogHandoff(const char* event, const PresentHandoff& fact) noexcept {
   std::snprintf(message, sizeof(message),
       "DLSS5 XeFG present_handoff event=%s context=%llx context_identity=%llx output=%llx output_view=%llx output_generation=%llu "
       "epoch=%llu call=%llu declaration=%llu application_frame=%llu bb=%llx hudless=%llx subresource=0 "
-      "sdk_enabled_at_entry=%u present_id=%u fresh_id=%u guides=%u reason=%s service_result=%u "
+      "sdk_enabled_at_entry=%u present_id=%u fresh_id=%u guides=%u game_reset_edge=%u reason=%s service_result=%u "
       "xefg_execute=%u ordinary_execute=%u fence_value=%llu sdk_return_ns=%lld sdk_hresult=0x%08x "
       "sdk_result_available=%u owner_current_at_return=%u status_queried=%u status_current=%u status_result=%d status_enabled=%u "
       "xefg[list=%llu generation=%llu queue=%llx fence=%llx completed=%llu signaled=%u] "
@@ -704,7 +746,8 @@ inline void LogHandoff(const char* event, const PresentHandoff& fact) noexcept {
       static_cast<unsigned long long>(fact.declaration), static_cast<unsigned long long>(fact.application_frame),
       static_cast<unsigned long long>(fact.backbuffer), static_cast<unsigned long long>(fact.hudless),
       static_cast<unsigned>(fact.sdk_enabled_at_entry), fact.present_id, static_cast<unsigned>(fact.has_present_id),
-      static_cast<unsigned>(fact.has_guides), fact.reason, static_cast<unsigned>(fact.service_result),
+      static_cast<unsigned>(fact.has_guides), static_cast<unsigned>(fact.game_reset_edge), fact.reason,
+      static_cast<unsigned>(fact.service_result),
       static_cast<unsigned>(fact.color_executed), static_cast<unsigned>(fact.ordinary_executed),
       static_cast<unsigned long long>(fact.service_submission.fence_value), static_cast<long long>(fact.sdk_return_ns),
       static_cast<unsigned>(fact.sdk_result), static_cast<unsigned>(fact.sdk_result_available),
@@ -952,8 +995,11 @@ inline void ReleaseFrames(Context* context) {
     }
   }
   context->frames.clear();
+  context->pre_effects_write = {};
   context->fresh_id = false;
   context->last_id_known = false;
+  context->game_reset_high = false;
+  context->guided_delivery_declaration = 0;
   context->last_submission_frame = 0;
   context->status = {};
   ++context->epoch;
@@ -1738,8 +1784,12 @@ struct PresentFrame {
   OrdinaryPresentClaim ordinary_claim = OrdinaryPresentClaim::NO_MATCH;
   OrdinaryPresentReceipt ordinary_receipt;
   OrdinaryPresentAttempt ordinary_attempt;
+  OrdinaryOffPresent ordinary_off;
+  OrdinaryPreEffectsWrite pre_effects_write;
+  bool pre_effects_full_consumer_region = false;
   const char* handoff_reason = "fg_off";
   bool trace_handoff = false;
+  bool game_reset_edge = false;
   BridgeLinkVersion bridge_link;
   bool test_present = false;
   bool completed = false;
@@ -1758,6 +1808,7 @@ struct PresentFrame {
 };
 
 inline thread_local PresentFrame* recording_service = nullptr;
+inline thread_local PresentFrame* ordinary_off_present = nullptr;
 
 inline bool PresentOwnerCurrentLocked(const PresentFrame& present) {
   const auto it = state.contexts.find(reinterpret_cast<void*>(present.input.context));
@@ -1773,6 +1824,19 @@ inline bool PresentWriteCurrentLocked(const PresentFrame& present) {
       && context.enabled && context.bridge_enable_inflight == 0 && !context.bridge_enable_ambiguous
       && context.bridge_declaration == present.declaration && context.color_serial == present.serial
       && context.application_frame == present.input.application_frame
+      && !stopped.load(std::memory_order_acquire) && sdk_detours_enabled.load(std::memory_order_acquire);
+}
+
+inline bool OrdinaryOffCurrentLocked(const PresentFrame& present) {
+  const auto& turn = present.ordinary_off;
+  const auto& context = *present.context;
+  return turn.input_rejection == nullptr && turn.access.call != 0 && Requested() && PresentOwnerCurrentLocked(present)
+      && context.ordinary_off_epoch == context.epoch && context.bridge_context_ready && context.bridge_proxy_ready
+      && !context.enabled && !context.bridge_present_fg_on && context.bridge_enable_inflight == 0
+      && !context.bridge_enable_ambiguous && context.bridge_declaration == present.declaration
+      && context.presents_in_flight == 1 && present.serial > context.status_ambiguous_through
+      && context.color_serial == present.serial && context.application_frame == present.input.application_frame
+      && output_framerate::MatchPresentColorOwner(turn.access.output, turn.access.backbuffer) == turn.physical_output
       && !stopped.load(std::memory_order_acquire) && sdk_detours_enabled.load(std::memory_order_acquire);
 }
 
@@ -1800,7 +1864,8 @@ inline void ObserveEditPresent(PresentFrame* present, IDXGISwapChain* swapchain,
 }
 #endif
 
-inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
+inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags,
+                                 const DXGI_PRESENT_PARAMETERS* parameters = nullptr) {
   PresentFrame present;
   if (proxy_depth != 0 || stopped.load(std::memory_order_acquire)) return present;
   const auto exception_count = std::uncaught_exceptions();
@@ -1879,8 +1944,14 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
           .diagnostic_context = reinterpret_cast<uintptr_t>(context.get())};
       present.input.output = context->output_identity;
       present.input.recording_device = context->proxy_recording_device.Get();
+      if (context->pre_effects_write.consumer_call == present.serial) {
+        present.pre_effects_write = context->pre_effects_write;
+      }
+      context->pre_effects_write = {};
       present.service_eligible = present.service_owned && !repeated;
-      context->present_colors.emplace(present.serial, Context::PresentColors{.xefg_owned = present.service_owned});
+      context->present_colors.emplace(present.serial, Context::PresentColors{
+          .backbuffer = present.pre_effects_write.access.backbuffer, .xefg_owned = present.service_owned,
+          .pre_effects_reserved = static_cast<bool>(present.pre_effects_write.attempt)});
       present.continuing_submission = context->last_submission_frame != 0
           && context->last_submission_frame + 1 == present.input.application_frame;
       if (present.service_eligible && present.input.output) {
@@ -1892,6 +1963,11 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
           it->second->presenting = true;
           present.pending_frame = it->second;
           present.frame = std::make_shared<Frame>(*it->second);
+          if (service_requested && !repeated && present.frame->has_constants) {
+            const bool reset = present.frame->constants.reset != 0;
+            present.game_reset_edge = reset && !context->game_reset_high;
+            context->game_reset_high = reset;
+          }
         }
       }
       context->fresh_id = false;
@@ -1928,13 +2004,68 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
     std::unique_lock lock(state.mutex);
     auto& context = *present.context;
     auto& colors = context.present_colors.at(present.serial);
+    colors.pre_effects_reserved = colors.pre_effects_reserved && colors.backbuffer == backbuffer_identity;
     colors.backbuffer = backbuffer_identity;
     colors.hudless = hudless_identity;
     if (context.epoch == present.input.epoch && backbuffer_index < context.backbuffers.size()) {
       context.backbuffers[backbuffer_index] = backbuffer_identity;
     }
   }
-  if (!present.service_owned) return present;
+  const auto full_consumer_region = [&](const D3D12_RESOURCE_DESC& desc) {
+    UINT source_width = 0;
+    UINT source_height = 0;
+    if (FAILED(present.swapchain->GetSourceSize(&source_width, &source_height))
+        || source_width != desc.Width || source_height != desc.Height) return false;
+    if (parameters == nullptr) return true;
+    const auto* dirty = parameters->pDirtyRects;
+    return parameters->pScrollRect == nullptr && parameters->pScrollOffset == nullptr
+        && (parameters->DirtyRectsCount == 0 || (parameters->DirtyRectsCount == 1 && dirty != nullptr
+            && dirty->left == 0 && dirty->top == 0 && dirty->right > 0 && dirty->bottom > 0
+            && static_cast<uint32_t>(dirty->right) == desc.Width && static_cast<uint32_t>(dirty->bottom) == desc.Height));
+  };
+  if (present.pre_effects_write.attempt && present.backbuffer != nullptr && present.service_owned) {
+    present.pre_effects_full_consumer_region = full_consumer_region(present.backbuffer->GetDesc());
+  }
+  if (!present.service_owned) {
+    if (present.input.fg_enabled) return present;
+    auto& turn = present.ordinary_off;
+    turn.access = {.swapchain = identity, .backbuffer = backbuffer_identity, .output = present.input.output,
+        .context = present.input.context, .owner = present.input.diagnostic_context, .epoch = present.input.epoch,
+        .declaration = present.declaration, .call = present.serial};
+    turn.physical_output = output_framerate::MatchPresentColorOwner(present.input.output, backbuffer_identity);
+    turn.queue = present.input.queue;
+    if (present.backbuffer == nullptr) {
+      present.handoff_reason = turn.input_rejection;
+      return present;
+    }
+    const auto desc = present.backbuffer->GetDesc();
+    present.pre_effects_full_consumer_region = full_consumer_region(desc);
+    turn.width = present.input.color_width = static_cast<uint32_t>(desc.Width);
+    turn.height = present.input.color_height = desc.Height;
+    const bool full_tag = present.frame == nullptr || (!present.frame->rejected && (!present.frame->has_region
+        || (present.frame->region.base.x == 0 && present.frame->region.base.y == 0
+            && present.frame->region.size.x == turn.width && present.frame->region.size.y == turn.height)));
+    turn.input_rejection = nullptr;
+    if (!service_requested) {
+      turn.input_rejection = "off_nr_not_requested";
+    } else if (repeated) {
+      turn.input_rejection = "repeated_present_id";
+    } else if (!turn.physical_output || turn.queue == nullptr) {
+      turn.input_rejection = "off_physical_output_unconfirmed";
+    } else if (!present.pre_effects_full_consumer_region || !full_tag || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || desc.DepthOrArraySize != 1 || desc.MipLevels != 1 || desc.SampleDesc.Count != 1) {
+      turn.input_rejection = "off_full_color_region_unconfirmed";
+    } else if (present.input.ui_composition || (hudless_identity != 0 && hudless_identity != backbuffer_identity)
+        || !copies_ordered) {
+      turn.input_rejection = "off_single_backbuffer_unconfirmed";
+    }
+    std::shared_lock lock(state.mutex);
+    if (turn.input_rejection == nullptr && !OrdinaryOffCurrentLocked(present)) {
+      turn.input_rejection = "off_disable_or_write_permission_unconfirmed";
+    }
+    present.handoff_reason = (turn.input_rejection != nullptr ? turn.input_rejection : "off_pre_fx_input_unavailable");
+    return present;
+  }
   // A repeated tagged ID is not a new application frame. Untagged outer
   // Presents still use the current backbuffer with empty guide fields; the
   // Present service can apply its Optional-guide fallback without borrowing
@@ -2045,6 +2176,11 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
       return finish_service();
     }
   }
+  if (present.pre_effects_write.attempt && present.pre_effects_write.access.backbuffer == backbuffer_identity) {
+    present.ordinary_claim = OrdinaryPresentClaim::CONFLICT;
+    present.handoff_reason = "pre_fx_submission_unconfirmed";
+    return finish_service();
+  }
   const auto callback = service.load(std::memory_order_acquire);
   present.handoff_reason = (copies_ordered ? "service_unavailable" : "tag_copy_unordered");
   if (callback != nullptr && copies_ordered) {
@@ -2101,7 +2237,13 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
   const bool same_output = PresentOwnerCurrentLocked(*present) && context.bridge_declaration == present->declaration;
   const bool submitted = present->service_result == Result::SUBMITTED;
   const bool ordinary_submitted = present->service_result == Result::ORDINARY_SUBMITTED;
+  const bool ordinary_off_submitted = present->ordinary_off.access.call != 0 && present->ordinary_claim == OrdinaryPresentClaim::COVERED;
   const bool delivered = present_result == S_OK;
+  const bool single_backbuffer = !present->input.ui_composition && colors.hudless == 0 && present->input.ui == nullptr;
+  if (same_output && delivered && submitted && present->service_submission.signaled && present->serial == context.present_serial
+      && single_backbuffer && present->input.has_present_id && present->input.depth != nullptr && present->input.motion != nullptr) {
+    context.guided_delivery_declaration = present->declaration;
+  }
   const bool failed_delivery = (submitted || ordinary_submitted) && !delivered;
   if (context.status.pending_call == present->serial) {
     context.status.pending_call = 0;
@@ -2155,9 +2297,12 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
       .application_frame = present->input.application_frame, .call = present->serial,
       .declaration = present->declaration, .backbuffer = colors.backbuffer, .hudless = colors.hudless,
       .sdk_return_ns = presented_ns, .present_id = present->input.present_id,
-      .reason = present->handoff_reason, .service_result = present->service_result, .sdk_result = present_result,
+      .reason = present->handoff_reason,
+      .service_result = (ordinary_off_submitted ? Result::ORDINARY_SUBMITTED : present->service_result), .sdk_result = present_result,
       .status_result = status_result, .status_enabled = status.enabled, .sdk_enabled_at_entry = present->input.fg_enabled,
       .has_present_id = present->input.has_present_id, .has_guides = present->input.depth != nullptr && present->input.motion != nullptr,
+      .game_reset_edge = present->game_reset_edge,
+      .single_backbuffer = single_backbuffer,
       .color_executed = present->color_executed, .ordinary_executed = colors.ordinary_committed,
       .owner_current_at_return = same_output, .status_queried = status_queried, .status_current = status_current,
       .sdk_result_available = true, .service_submission = present->service_submission,
@@ -2188,7 +2333,10 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
     // interval total. Declined or failed frames never inherit an earlier route.
     const char* last_nr_route = "not_processed";
     const char* last_nr_route_reason = "not_served";
-    if (!present->service_owned) {
+    if (ordinary_off_submitted) {
+      last_nr_route = (delivered ? "single_backbuffer" : "not_processed");
+      last_nr_route_reason = (delivered ? "off_ordinary_owner_receipt" : "sdk_present_failed");
+    } else if (!present->service_owned) {
       last_nr_route_reason = (present->input.fg_enabled ? "nr_off" : "fg_off");
     } else if (failed_delivery) {
       last_nr_route_reason = "sdk_present_failed";
@@ -2254,7 +2402,9 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
     reshade::log::message(reshade::log::level::info, message);
   }
   if (lock.owns_lock()) lock.unlock();
-  if (present->trace_handoff || present->ordinary_claim != OrdinaryPresentClaim::NO_MATCH
+  if (present->trace_handoff || present->game_reset_edge || ordinary_off_submitted
+      || present->ordinary_claim == OrdinaryPresentClaim::CONFLICT
+      || (ordinary_submitted && !present->ordinary_receipt.pre_effects_xefg)
       || (!same_output && (present->service_owned || present->color_executed))) {
     LogHandoff("sdk_present_return", handoff);
   }
@@ -2262,9 +2412,11 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
     if (const auto finish = finish_ordinary_present.load(std::memory_order_acquire); finish != nullptr) {
       finish(present->ordinary_receipt, present->input, present->serial, present_result);
     }
-  } else if (present->ordinary_attempt) {
+  } else if (present->ordinary_attempt || (present->pre_effects_write.access.backbuffer == colors.backbuffer
+                 && present->pre_effects_write.attempt)) {
     if (const auto finish = finish_ordinary_present.load(std::memory_order_acquire); finish != nullptr) {
-      finish({.attempt = present->ordinary_attempt}, present->input, present->serial, present_result);
+      finish({.attempt = (present->ordinary_attempt ? present->ordinary_attempt : present->pre_effects_write.attempt)},
+          present->input, present->serial, present_result);
     }
   }
 #if defined(NR_NEXUS_DEV_CONTROL)
@@ -2309,6 +2461,25 @@ struct ProxyEntryScope {
   ~ProxyEntryScope() { --proxy_entry_depth; }
 };
 
+template <typename Present>
+inline HRESULT PresentWithOrdinaryOffTurn(PresentFrame* frame, Present&& present) {
+  struct RestoreTurn {
+    PresentFrame* previous;
+    ~RestoreTurn() { ordinary_off_present = previous; }
+  };
+  if (frame->ordinary_off.access.call == 0) return std::forward<Present>(present)();
+  const RestoreTurn scope{std::exchange(ordinary_off_present, frame)};
+  // Find by address only supplies a candidate. The owner must match its live
+  // pre-effects attempt and actual submission to this physical color.
+  const auto candidate = std::exchange(frame->ordinary_attempt, {});
+  if (candidate) {
+    if (const auto claim = claim_ordinary_off_present.load(std::memory_order_acquire); claim != nullptr) {
+      claim(frame->ordinary_off, candidate);
+    }
+  }
+  return std::forward<Present>(present)();
+}
+
 template <size_t Index>
 struct ProxyHooks {
   static HRESULT STDMETHODCALLTYPE Present(IDXGISwapChain* swapchain, UINT interval, UINT flags) {
@@ -2328,7 +2499,9 @@ struct ProxyHooks {
     catch (...) { edit_fg_observation::Stop("observation_failed"); }
 #endif
     if (present.service_owned) ++proxy_depth;
-    const HRESULT status = reinterpret_cast<PresentFn>(proxies[Index].real[0])(swapchain, interval, flags);
+    const HRESULT status = PresentWithOrdinaryOffTurn(&present, [&] {
+      return reinterpret_cast<PresentFn>(proxies[Index].real[0])(swapchain, interval, flags);
+    });
     const int64_t presented_ns = output_framerate::NowNs();
 #if defined(NR_NEXUS_DEV_CONTROL)
     if (present.edit_fg_ticket.call_id != 0) {
@@ -2352,13 +2525,15 @@ struct ProxyHooks {
     const ProxyEntryScope entry;
     BridgeProxyPresent bridge_present(swapchain, flags);
     PresentFrame present;
-    try { present = BeginPresent(swapchain, flags); } catch (...) { PublishResult(Result::FAILED); }
+    try { present = BeginPresent(swapchain, flags, parameters); } catch (...) { PublishResult(Result::FAILED); }
 #if defined(NR_NEXUS_DEV_CONTROL)
     try { ObserveEditPresent(&present, swapchain, 2, interval, flags); }
     catch (...) { edit_fg_observation::Stop("observation_failed"); }
 #endif
     if (present.service_owned) ++proxy_depth;
-    const HRESULT status = reinterpret_cast<Present1Fn>(proxies[Index].real[1])(swapchain, interval, flags, parameters);
+    const HRESULT status = PresentWithOrdinaryOffTurn(&present, [&] {
+      return reinterpret_cast<Present1Fn>(proxies[Index].real[1])(swapchain, interval, flags, parameters);
+    });
     const int64_t presented_ns = output_framerate::NowNs();
 #if defined(NR_NEXUS_DEV_CONTROL)
     if (present.edit_fg_ticket.call_id != 0) {
@@ -2896,6 +3071,7 @@ struct SdkHooks {
     uintptr_t proxy = 0;
     bool uses_source_link = false;
     bool overlapping_enable = false;
+    OrdinaryPreEffectsWrite pre_effects_write;
     uint64_t link_generation = 0;
     BridgeSourceIdentity linked_source;
 #if defined(NR_NEXUS_DEV_CONTROL)
@@ -2907,6 +3083,12 @@ struct SdkHooks {
       std::unique_lock lock(state.mutex);
       if (const auto it = state.contexts.find(handle); it != state.contexts.end()) {
         attempt = it->second;
+        if (enabled == 0 && attempt->enabled && attempt->pre_effects_write.attempt
+            && attempt->pre_effects_write.access.epoch == attempt->epoch
+            && attempt->pre_effects_write.access.declaration == attempt->bridge_declaration
+            && attempt->pre_effects_write.access.output == attempt->output_identity) {
+          pre_effects_write = attempt->pre_effects_write;
+        }
         attempt->bridge_off_observed = false;
         attempt->ordinary_off_epoch = 0;
         attempt->bridge_before_observation = {};
@@ -3004,6 +3186,12 @@ struct SdkHooks {
         if (ordered && enabled == 0 && attempt->bridge_context_ready && attempt->bridge_proxy_ready && !stopped.load()) {
           // This output's successful SDK Disable is independent of any SR source.
           attempt->ordinary_off_epoch = attempt->epoch;
+          if (pre_effects_write.attempt && attempt->epoch == epoch + 1
+              && pre_effects_write.consumer_call == attempt->present_serial + 1 && attempt->presents_in_flight == 0) {
+            pre_effects_write.disable_epoch = attempt->epoch;
+            pre_effects_write.disable_declaration = declaration;
+            attempt->pre_effects_write = pre_effects_write;
+          }
         }
         RegisterOutput(attempt.get());
         if (ordered && changed && service_requested) {
@@ -3450,7 +3638,9 @@ inline void ConfigureBridgeSource(BridgeSourceObserver observer) noexcept {
 }
 
 inline void ConfigureOrdinaryPresentOwner(ClaimOrdinaryPresent claim, FinishOrdinaryPresent finish,
-    InvalidateOrdinaryPresent invalidate, FindOrdinaryPresentAttempt find, EndOrdinaryPresent end) noexcept {
+    InvalidateOrdinaryPresent invalidate, FindOrdinaryPresentAttempt find, EndOrdinaryPresent end,
+    ClaimOrdinaryOffPresent claim_off = nullptr) noexcept {
+  internal::claim_ordinary_off_present.store(claim_off, std::memory_order_release);
   internal::claim_ordinary_present.store(claim, std::memory_order_release);
   internal::finish_ordinary_present.store(finish, std::memory_order_release);
   internal::invalidate_ordinary_present.store(invalidate, std::memory_order_release);
@@ -3647,23 +3837,10 @@ inline bool BlocksHostWriteLocked(const output_framerate::OutputIdentity& output
 
 // The output may name the ordinary view or its associated XeFG context.
 // Swapchain/backbuffer are the borrowed native identities of this callback.
-struct OrdinaryPresentAccess {
-  uintptr_t swapchain = 0;
-  uintptr_t backbuffer = 0;
-  output_framerate::OutputIdentity output;
-  uintptr_t context = 0;
-  uintptr_t owner = 0;
-  uint64_t epoch = 0;
-  uint64_t declaration = 0;
-  uint64_t call = 0;
-  bool allowed = false;
-  bool operator==(const OrdinaryPresentAccess&) const = default;
-};
-
 namespace internal {
 
 inline OrdinaryPresentAccess QueryOrdinaryPresentLocked(uintptr_t swapchain, uintptr_t backbuffer,
-                                                         const output_framerate::OutputIdentity& output) {
+    const output_framerate::OutputIdentity& output, bool* ambiguous = nullptr) {
   OrdinaryPresentAccess access{.swapchain = swapchain, .backbuffer = backbuffer, .output = output};
   if (backbuffer == 0 || (output && !output_framerate::IsCurrentOutput(output))) return access;
   const bool service_requested = Requested();
@@ -3674,7 +3851,7 @@ inline OrdinaryPresentAccess QueryOrdinaryPresentLocked(uintptr_t swapchain, uin
   };
   for (const auto& context : state.retired_contexts) {
     for (const auto& [serial, colors] : context->present_colors) {
-      if (colors.xefg_owned && conflicts(*context, colors)) return access;
+      if ((colors.xefg_owned || colors.pre_effects_reserved) && conflicts(*context, colors)) return access;
     }
   }
   bool blocked = false;
@@ -3689,12 +3866,19 @@ inline OrdinaryPresentAccess QueryOrdinaryPresentLocked(uintptr_t swapchain, uin
     for (const auto& [serial, colors] : context->present_colors) {
       if (!conflicts(*context, colors)
           && !(colors.backbuffer == 0 && (same_swapchain || same_output || same_backbuffer))) continue;
-      blocked_call |= colors.xefg_owned || (service_requested && (colors.ordinary_committed || active_call != 0));
+      blocked_call |= colors.xefg_owned || colors.pre_effects_reserved
+          || (service_requested && (colors.ordinary_committed || active_call != 0));
       active_call = serial;
     }
     if (!same_swapchain && !same_output && !same_backbuffer && active_call == 0) continue;
-    if (access.context != 0) return access;
-    blocked = blocked_call || (service_requested && (context->enabled || context->bridge_present_fg_on
+    if (access.context != 0) {
+      if (ambiguous != nullptr) *ambiguous = true;
+      return access;
+    }
+    const auto& pre_effects = context->pre_effects_write;
+    const bool pre_effects_reserved = pre_effects.attempt && pre_effects.consumer_call == context->present_serial + 1
+        && pre_effects.access.backbuffer == backbuffer;
+    blocked = blocked_call || pre_effects_reserved || (service_requested && (context->enabled || context->bridge_present_fg_on
         || context->bridge_enable_inflight != 0 || context->bridge_enable_ambiguous));
     access.context = reinterpret_cast<uintptr_t>(handle);
     access.owner = reinterpret_cast<uintptr_t>(context.get());
@@ -3722,6 +3906,51 @@ inline bool OrdinarySdkInactiveLocked(const OrdinaryPresentAccess& access) {
          && !context.bridge_enable_ambiguous;
 }
 
+inline bool PreEffectsSingleColorWithoutGuides(const Frame* frame, uintptr_t backbuffer, uint32_t width, uint32_t height) {
+  if (frame == nullptr) return true;
+  auto* const hudless = frame->resources[0].resource.Get();
+  return !frame->rejected && frame->captures.empty()
+      && (hudless == nullptr || reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(hudless)) == backbuffer)
+      && frame->resources[1].resource == nullptr && frame->resources[2].resource == nullptr
+      && frame->resources[3].resource == nullptr && (!frame->has_constants || frame->constants.reset == 0)
+      && (!frame->has_region || (frame->region.base.x == 0 && frame->region.base.y == 0
+          && frame->region.size.x == width && frame->region.size.y == height));
+}
+
+inline OrdinaryPreEffectsWrite QueryOrdinaryPreEffectsLocked(const OrdinaryPresentAccess& access,
+    OrdinaryPresentAttempt attempt, uintptr_t queue, uint32_t width, uint32_t height) {
+  if (!attempt || access.allowed || access.call != 0 || access.owner == 0 || !Requested()
+      || !sdk_detours_enabled.load(std::memory_order_acquire)) return {};
+  bool ambiguous = false;
+  if (QueryOrdinaryPresentLocked(access.swapchain, access.backbuffer, access.output, &ambiguous) != access || ambiguous) return {};
+  const auto found = state.contexts.find(reinterpret_cast<void*>(access.context));
+  if (found == state.contexts.end()) return {};
+  const auto& context = *found->second;
+  if (!context.enabled || context.bridge_enable_inflight != 0 || context.bridge_enable_ambiguous
+      || context.ui_composition || !context.omit_optional_hudless || context.presents_in_flight != 0
+      || !context.bridge_context_ready || !context.bridge_proxy_ready || !UniqueProxyLocked(context.proxy_identity)
+      || context.output_identity != access.output || context.pre_effects_write.attempt
+      || queue == 0) return {};
+  if (reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(context.queue.Get())) != queue) return {};
+  const auto& last = context.last_handoff_write;
+  if (context.guided_delivery_declaration == 0 || context.guided_delivery_declaration != context.bridge_declaration
+      || !last.owner_current_at_return || !last.sdk_result_available || last.sdk_result != S_OK
+      || last.call != context.present_serial || last.application_frame != context.application_frame
+      || last.epoch != context.epoch || last.declaration != context.bridge_declaration || last.output != access.output
+      || !last.single_backbuffer || last.has_guides
+      || (last.service_result != Result::SUBMITTED && last.service_result != Result::ORDINARY_SUBMITTED)) return {};
+  if (last.service_result == Result::SUBMITTED && !last.service_submission.signaled) return {};
+  if (context.fresh_id) {
+    if (context.last_id_known && context.last_id == context.present_id) return {};
+    if (const auto tagged = context.frames.find(context.present_id); tagged != context.frames.end()
+        && !PreEffectsSingleColorWithoutGuides(tagged->second.get(), access.backbuffer, width, height)) return {};
+  }
+  const auto output = output_framerate::MatchPresentColorOwner(access.output, access.backbuffer);
+  if (!output || output.swapchain != attempt.owner) return {};
+  return {.attempt = attempt, .access = access, .physical_output = output, .consumer_call = context.present_serial + 1,
+      .color_space = context.color_space};
+}
+
 }  // namespace internal
 
 inline bool OrdinarySdkInactive(const OrdinaryPresentAccess& access) {
@@ -3731,9 +3960,110 @@ inline bool OrdinarySdkInactive(const OrdinaryPresentAccess& access) {
 }
 
 inline OrdinaryPresentAccess QueryOrdinaryPresent(uintptr_t swapchain, uintptr_t backbuffer,
-                                                   const output_framerate::OutputIdentity& output) {
+                                                   const output_framerate::OutputIdentity& output, uint64_t* upcoming_call = nullptr) {
   std::shared_lock lock(internal::state.mutex);
-  return internal::QueryOrdinaryPresentLocked(swapchain, backbuffer, output);
+  const auto access = internal::QueryOrdinaryPresentLocked(swapchain, backbuffer, output);
+  if (upcoming_call != nullptr && access.context != 0 && access.call == 0) {
+    const auto found = internal::state.contexts.find(reinterpret_cast<void*>(access.context));
+    if (found != internal::state.contexts.end()) *upcoming_call = found->second->present_serial + 1;
+  }
+  return access;
+}
+
+inline const OrdinaryOffPresent* CurrentOrdinaryOffPresent() {
+  const auto* present = internal::ordinary_off_present;
+  return (present != nullptr ? &present->ordinary_off : nullptr);
+}
+
+inline OrdinaryPreEffectsWrite QueryOrdinaryPreEffects(const OrdinaryPresentAccess& access, OrdinaryPresentAttempt attempt,
+    uintptr_t queue, uint32_t width, uint32_t height) {
+  std::shared_lock lock(internal::state.mutex);
+  return internal::QueryOrdinaryPreEffectsLocked(access, attempt, queue, width, height);
+}
+
+inline bool OrdinaryPreEffectsPending(const OrdinaryPresentReceipt& receipt) {
+  if (!receipt.pre_effects_xefg) return false;
+  std::shared_lock lock(internal::state.mutex);
+  const auto found = internal::state.contexts.find(reinterpret_cast<void*>(receipt.context));
+  if (found == internal::state.contexts.end()) return false;
+  const auto& context = *found->second;
+  const auto& write = context.pre_effects_write;
+  return write.attempt == receipt.attempt && write.consumer_call == context.present_serial + 1
+      && write.access.backbuffer == receipt.backbuffer && write.access.epoch == receipt.epoch
+      && write.access.output == receipt.output;
+}
+
+template <typename Record>
+inline bool TryRecordOrdinaryPreEffects(const OrdinaryPreEffectsWrite& write, uintptr_t queue,
+    uint32_t width, uint32_t height, Record&& record) {
+  std::unique_lock lock(internal::state.mutex);
+  if (!write.attempt || internal::QueryOrdinaryPreEffectsLocked(write.access, write.attempt, queue, width, height) != write) return false;
+  if (!std::forward<Record>(record)()) return false;
+  internal::state.contexts.at(reinterpret_cast<void*>(write.access.context))->pre_effects_write = write;
+  return true;
+}
+
+inline bool OrdinaryPreEffectsReceiptCurrent(const OrdinaryPresentReceipt& receipt) {
+  const auto* present = (internal::ordinary_off_present != nullptr ? internal::ordinary_off_present : internal::recording_service);
+  if (present == nullptr || !receipt.pre_effects_xefg || !present->pre_effects_full_consumer_region) return false;
+  const auto& write = present->pre_effects_write;
+  if (!write.attempt || receipt.attempt != write.attempt || receipt.context != write.access.context
+      || receipt.output != write.access.output || receipt.epoch != write.access.epoch || receipt.call != 0
+      || write.access.backbuffer != receipt.backbuffer || write.consumer_call != present->serial
+      || present->input.diagnostic_context != write.access.owner || present->input.ui_composition
+      || present->input.color_space != write.color_space
+      || !internal::PreEffectsSingleColorWithoutGuides(present->frame.get(), receipt.backbuffer, receipt.width, receipt.height)) return false;
+  std::shared_lock lock(internal::state.mutex);
+  if (output_framerate::MatchPresentColorOwner(present->input.output, receipt.backbuffer) != write.physical_output) return false;
+  if (present->input.fg_enabled) {
+    return internal::PresentWriteCurrentLocked(*present) && present->input.epoch == write.access.epoch
+        && present->declaration == write.access.declaration && present->input.output == write.access.output;
+  }
+  return internal::OrdinaryOffCurrentLocked(*present) && present->input.epoch == write.disable_epoch
+      && present->declaration == write.disable_declaration;
+}
+
+inline bool MatchesOrdinaryOffAccess(const OrdinaryOffPresent& turn, const OrdinaryPresentAccess& access) {
+  const auto& expected = turn.access;
+  return access.context == expected.context && access.owner == expected.owner && access.epoch == expected.epoch
+      && access.declaration == expected.declaration && access.call == expected.call && access.call != 0
+      && access.backbuffer == expected.backbuffer && access.output == expected.output;
+}
+
+// The owner binds the attempt while the real pre-effects callback is active,
+// or when reconciling a callback that already ran for this same output.
+inline bool BindOrdinaryOffPresentAttempt(const OrdinaryOffPresent& turn, OrdinaryPresentAttempt attempt,
+    const char* reason) {
+  auto* present = internal::ordinary_off_present;
+  if (present == nullptr || &present->ordinary_off != &turn || !attempt
+      || attempt.owner != turn.physical_output.swapchain) return false;
+  if (present->pre_effects_write.attempt && present->pre_effects_write.attempt != attempt
+      && present->pre_effects_write.access.backbuffer == turn.access.backbuffer) return false;
+  std::shared_lock lock(internal::state.mutex);
+  if (!internal::OrdinaryOffCurrentLocked(*present) || (present->ordinary_attempt && present->ordinary_attempt != attempt)) {
+    return false;
+  }
+  present->ordinary_attempt = attempt;
+  present->handoff_reason = reason;
+  return true;
+}
+
+inline void AcceptOrdinaryOffPresentReceipt(const OrdinaryOffPresent& turn, const OrdinaryPresentReceipt& receipt,
+                                            OrdinaryPresentClaim claim, const char* reason) {
+  auto* present = internal::ordinary_off_present;
+  if (present == nullptr || &present->ordinary_off != &turn || present->ordinary_attempt != receipt.attempt
+      || !receipt.executed || claim == OrdinaryPresentClaim::NO_MATCH) return;
+  std::unique_lock lock(internal::state.mutex);
+  auto& colors = present->context->present_colors.at(present->serial);
+  if (present->ordinary_claim != OrdinaryPresentClaim::NO_MATCH) return;
+  // Preserve evidence of an actual Execute even when coverage or permission
+  // was lost. This also prevents a second write through a nested callback.
+  colors.ordinary_committed = true;
+  colors.ordinary_submission = receipt.submission;
+  present->ordinary_receipt = receipt;
+  const bool current = internal::OrdinaryOffCurrentLocked(*present);
+  present->ordinary_claim = (current ? claim : OrdinaryPresentClaim::CONFLICT);
+  present->handoff_reason = (current ? reason : "off_write_permission_revoked");
 }
 
 enum class OrdinaryPresentRecordResult { kOwnerRejected, kRecordFailed, kRecorded };
@@ -3742,11 +4072,18 @@ enum class OrdinaryPresentRecordResult { kOwnerRejected, kRecordFailed, kRecorde
 // native commands for this handoff, without reentering the adapter or SDK.
 template <typename Record>
 inline OrdinaryPresentRecordResult TryRecordOrdinaryPresentDelivery(const OrdinaryPresentAccess& access, Record&& record,
-                                                                    bool require_sdk_inactive = false) {
+                                                                    bool require_sdk_inactive = false,
+                                                                    OrdinaryPresentAttempt off_attempt = {}) {
   if (!access.allowed) return OrdinaryPresentRecordResult::kOwnerRejected;
   std::unique_lock lock(internal::state.mutex);
   if (internal::QueryOrdinaryPresentLocked(access.swapchain, access.backbuffer, access.output) != access
       || (require_sdk_inactive && !internal::OrdinarySdkInactiveLocked(access))) {
+    return OrdinaryPresentRecordResult::kOwnerRejected;
+  }
+  if (off_attempt && (!require_sdk_inactive || internal::ordinary_off_present == nullptr
+      || internal::ordinary_off_present->ordinary_attempt != off_attempt
+      || !MatchesOrdinaryOffAccess(internal::ordinary_off_present->ordinary_off, access)
+      || !internal::OrdinaryOffCurrentLocked(*internal::ordinary_off_present))) {
     return OrdinaryPresentRecordResult::kOwnerRejected;
   }
 
@@ -3769,8 +4106,9 @@ inline OrdinaryPresentRecordResult TryRecordOrdinaryPresentDelivery(const Ordina
 }
 
 template <typename Publish>
-inline bool WithOrdinaryPresentCommit(const OrdinaryPresentAccess& access, Publish&& publish, bool require_sdk_inactive = false) {
-  return TryRecordOrdinaryPresentDelivery(access, std::forward<Publish>(publish), require_sdk_inactive)
+inline bool WithOrdinaryPresentCommit(const OrdinaryPresentAccess& access, Publish&& publish,
+    bool require_sdk_inactive = false, OrdinaryPresentAttempt off_attempt = {}) {
+  return TryRecordOrdinaryPresentDelivery(access, std::forward<Publish>(publish), require_sdk_inactive, off_attempt)
          == OrdinaryPresentRecordResult::kRecorded;
 }
 

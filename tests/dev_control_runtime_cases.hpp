@@ -8,7 +8,8 @@
 #define NR_NEXUS_TEST_OUTPUT_RUNTIME_ONLY
 #include "adaptive_ui_cases.hpp"
 #undef NR_NEXUS_TEST_OUTPUT_RUNTIME_ONLY
-{
+// Keep the DEV-only fixtures out of the stack frame shared by the menu tests.
+[&]() __declspec(noinline) {
   OutputRuntimeFixture output_runtime;
   check(static_cast<bool>(output_runtime.output), "DEV diagnostics resolve their registered runtime backbuffer");
   namespace control = runtime::dev_control;
@@ -1173,4 +1174,4 @@
   configuration_fixture::use_cache = false;
   configuration_fixture::cache.clear();
   std::printf("PASS development control production configuration cases; checks=%u\n", checks);
-}
+}();

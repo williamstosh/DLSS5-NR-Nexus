@@ -818,7 +818,6 @@ void PublishOriginalFgRuntimeMock() {
 }
 
 #include "nr_edit_reuse_xefg_cases.hpp"
-#include "present_original_handoff_cases.hpp"
 #include "control_mask_capture_cases.hpp"
 #include "adaptive_fg_service_cases.hpp"
 #include "adaptive_inline_cases.hpp"
@@ -836,6 +835,10 @@ void PublishOriginalFgRuntimeMock() {
 #include "late_bridge_present_cases.hpp"
 
 namespace core_parameter_family_cases { int Run(); }
+#if defined(NR_NEXUS_TEST_NATIVE_NGX)
+// The original handoff case reuses the ReShade Present facade below main.
+namespace present_original_handoff_cases { inline int Run(const char* project_id_path, const char* variant); }
+#endif
 
 int main(int argc, char** argv) {
   if (argc == 2 && std::strcmp(argv[1], "--core-parameter-family") == 0) return core_parameter_family_cases::Run();
@@ -975,8 +978,8 @@ int main(int argc, char** argv) {
   if (argc == 2 && std::strcmp(argv[1], "--bridge-xefg-original-fg-first") == 0) {
     return RunPresentGuideModelsTest(true, nullptr, false, false, false, true, false, true);
   }
-  if (argc == 3 && std::strcmp(argv[1], "--present-original-handoff") == 0) {
-    return present_original_handoff_cases::Run();
+  if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--present-original-handoff") == 0) {
+    return present_original_handoff_cases::Run(argv[2], argc == 4 ? argv[3] : nullptr);
   }
 #else
   if (argc >= 2 && (std::strncmp(argv[1], "--control-mask-native-ngx", 25) == 0
@@ -4831,8 +4834,27 @@ void ResizeNativeTestOutput(Gpu& gpu, IDXGISwapChain3* output, ID3D12Resource* o
 }
 
 #include "nr_edit_reuse_present_cases.hpp"
+#include "present_original_handoff_cases.hpp"
 #include "adaptive_resource_strategy_cases.hpp"
+// addon.cpp's local alias would collide with the Vulkan stubs' nr namespace in this translation unit.
+#define nr nr_output_registration_addon
 #include "output_framerate_registration_cases.hpp"
+#undef nr
+
+namespace {
+// The adaptive fixture owns just the output callbacks, without attaching the add-on.
+void RegisterOutputSampling() {
+  reshade::register_event<reshade::addon_event::init_swapchain>(ObserveOutputInit);
+  reshade::register_event<reshade::addon_event::present>(ObserveOutputPresent);
+  reshade::register_event<reshade::addon_event::destroy_swapchain>(ObserveOutputDestroy);
+}
+
+void UnregisterOutputSampling() {
+  reshade::unregister_event<reshade::addon_event::destroy_swapchain>(ObserveOutputDestroy);
+  reshade::unregister_event<reshade::addon_event::present>(ObserveOutputPresent);
+  reshade::unregister_event<reshade::addon_event::init_swapchain>(ObserveOutputInit);
+}
+}  // namespace
 
 #include "xefg_inline_handoff_cases.hpp"
 #include "xefg_present_handoff_cases.hpp"

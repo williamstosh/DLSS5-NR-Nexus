@@ -30,6 +30,7 @@ inline thread_local MonitorSnapshot monitor_snapshot;
 inline constexpr int64_t kMonitorRefreshNs = 100'000'000;
 inline uint64_t ui_monitor_seen_epoch = UINT64_MAX;
 inline int ui_monitor_drawn_frame = -1;
+inline uint64_t ui_monitor_hidden_requests = 0;
 inline bool ui_monitor_was_interactive = false;
 inline bool ui_monitor_saved_detailed = false;
 inline uint64_t ui_monitor_save_batches = 0;
@@ -1048,14 +1049,28 @@ inline void DrawIndependentMonitor(reshade::api::effect_runtime* runtime, bool m
     monitor_snapshot.attempted_ns = 0;
   }
   if (ui_monitor_drawn_frame == ImGui::GetFrameCount()) return;
-  ui_monitor_drawn_frame = ImGui::GetFrameCount();
   RefreshUiLanguage();
-  ui::SetTheme(ui_theme_choice.load());
-  ui_runtime_monitor_state.open = true;
   const bool record_history = ui_runtime_monitor_state.trends;
   PrepareMonitorHistory(record_history);
   UpdateMonitorCadence(runtime);
   const auto& snapshot = RefreshMonitorSnapshot(true);
+  const bool interactive = menu || hud_overlay_open.load();
+  if (!interactive && runtime != nullptr) {
+    const auto window = static_cast<HWND>(runtime->get_hwnd());
+    // A hidden swapchain's last image can be stretched when its window first appears.
+    if (IsWindow(window) && !IsWindowVisible(window)) {
+      if (++ui_monitor_hidden_requests == 1) {
+        const auto extent = ImGui::GetIO().DisplaySize;
+        std::ostringstream message;
+        message << "passive monitor deferred on hidden window, viewport=" << extent.x << 'x' << extent.y;
+        Log(reshade::log::level::debug, message.str());
+      }
+      return;
+    }
+  }
+  ui_monitor_drawn_frame = ImGui::GetFrameCount();
+  ui::SetTheme(ui_theme_choice.load());
+  ui_runtime_monitor_state.open = true;
   monitor_snapshot.monitor.history = (record_history ? &monitor_history.values : nullptr);
   monitor_snapshot.monitor.now_ns = SteadyNowNs();
   const auto binding = monitor_hotkey.load();
@@ -1064,10 +1079,18 @@ inline void DrawIndependentMonitor(reshade::api::effect_runtime* runtime, bool m
   const auto mode_binding = monitor_mode_key.load();
   monitor_snapshot.monitor.mode_hotkey = (mode_binding != 0 && !MonitorModeKeyConflict(mode_binding)
       ? VirtualKeyName(mode_binding) : "");
-  const bool interactive = menu || hud_overlay_open.load();
   if (interactive && !ui_monitor_was_interactive) ImGui::SetNextWindowFocus();
   ui_monitor_was_interactive = interactive;
   const auto actions = ui::DrawRuntimeMonitor(snapshot.monitor, &ui_runtime_monitor_state, nullptr, interactive, true);
+  if (ui_monitor_hidden_requests != 0) {
+    const auto extent = ImGui::GetIO().DisplaySize;
+    const auto size = ui_runtime_monitor_state.geometry.size;
+    std::ostringstream message;
+    message << "monitor drawn after hidden requests=" << std::exchange(ui_monitor_hidden_requests, 0)
+            << ", viewport=" << extent.x << 'x' << extent.y << ", card=" << size.x << 'x' << size.y
+            << ", interactive=" << interactive;
+    Log(reshade::log::level::debug, message.str());
+  }
   if (actions.open_diagnostics) ui_open_diagnostics = true;
   if (!ui_runtime_monitor_state.open) {
     std::unique_lock visibility_lock(monitor_visibility_mutex);

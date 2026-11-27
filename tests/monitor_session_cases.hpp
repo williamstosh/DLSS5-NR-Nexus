@@ -15,6 +15,7 @@
 #include <functional>
 #include <future>
 #include <iterator>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -277,6 +278,7 @@ void RunMonitorSessionCases(const Check& check, const Frame& frame) {
   preserve(ImGui::GetIO().Framerate);
   preserve(r::ui_monitor_seen_epoch);
   preserve(r::ui_monitor_drawn_frame);
+  preserve(r::ui_monitor_hidden_requests);
   preserve(r::ui_monitor_was_interactive);
   preserve(r::ui_monitor_save_batches);
   preserve(r::ui_runtime_monitor_state);
@@ -1088,6 +1090,39 @@ void RunMonitorSessionCases(const Check& check, const Frame& frame) {
             && expired_proof.monitor.passes[0].gpu_cost.empty(),
         "expired proof loses its execution confirmation without inventing a cost");
   frame(expired_proof.monitor);
+  {
+    // The fixture owns a full monitor snapshot, as do the two heap fixtures above.
+    const auto output = std::make_unique<OutputRuntimeFixture>();
+    output->window = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"STATIC", L"", WS_POPUP,
+        -10000, -10000, 320, 180, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    check(output->window != nullptr, "created a hidden low-resolution monitor fixture window");
+    restore_values.emplace_back([window = output->window] { DestroyWindow(window); });
+    preserve(r::present_restore_configuration.global_writable);
+    r::present_restore_configuration.global_writable = false;
+    r::monitor_requested = true;
+    r::hud_overlay_open = false;
+    r::ui_runtime_monitor_state.trends = true;
+    const auto before = r::ui_runtime_monitor_state.geometry;
+    const auto saves = r::ui_monitor_save_batches;
+    ImGui::NewFrame();
+    r::DrawIndependentMonitor(output.get(), false);
+    const auto& geometry = r::ui_runtime_monitor_state.geometry;
+    check(r::ui_monitor_drawn_frame != ImGui::GetFrameCount() && r::monitor_history.active
+              && r::monitor_cadence.frame == ImGui::GetFrameCount() && r::monitor_snapshot.attempted_ns != 0
+              && r::ui_monitor_save_batches == saves && geometry.position.x == before.position.x
+              && geometry.position.y == before.position.y && geometry.size.x == before.size.x && geometry.size.y == before.size.y,
+          "a hidden passive window still samples and keeps its saved geometry and frame available");
+    r::DrawIndependentMonitor(output.get(), true);
+    check(r::ui_monitor_drawn_frame == ImGui::GetFrameCount() && r::ui_monitor_was_interactive,
+          "an interactive request can draw in the same frame as a hidden passive request");
+    ImGui::Render();
+    ShowWindow(output->window, SW_SHOWNOACTIVATE);
+    ImGui::NewFrame();
+    r::DrawIndependentMonitor(output.get(), false);
+    check(r::ui_monitor_drawn_frame == ImGui::GetFrameCount() && !r::ui_monitor_was_interactive,
+          "a visible low-resolution window draws its passive monitor immediately");
+    ImGui::Render();
+  }
   check(read_ini() == original_ini, "session callbacks and monitor frames leave the isolated fixture INI unchanged");
   check(r::flush_profile_storage == nullptr, "profile storage remains disconnected for the entire session test");
 }

@@ -489,6 +489,7 @@ struct WarmPresentColor {
   uint32_t depth_x = 0, depth_y = 0;
   uint32_t flags = 0;
   uint32_t depth_setting = 0;
+  bool signed_group = false;
   bool xefg = false;
   bool real_guides = false;
   bool has_real_layout = false;
@@ -509,6 +510,30 @@ struct WarmPresentNeutralGuides {
   bool initialized = false;
 };
 
+struct OrdinaryRecordingFace {
+  output_framerate::OutputIdentity owner;
+  Microsoft::WRL::ComPtr<ID3D12Device> device;
+  uintptr_t queue = 0;
+  HMODULE image = nullptr;
+  HMODULE core = nullptr;
+  uint32_t core_pass_mask = 0;
+  uint64_t image_generation = 0;
+  uint64_t init_generation = 0;
+  FenceRef fence;
+  uint64_t fence_value = 0;
+
+  bool BindingCurrent(const output_framerate::OutputIdentity& output,
+                      uintptr_t recording_queue, ID3D12Fence* ring_fence) const {
+    return owner == output && queue != 0 && queue == recording_queue
+        && fence.fence != nullptr && fence.fence == ring_fence && fence_value != 0
+        && device != nullptr && device.Get() == direct_device && parameter_runtime_ready
+        && !direct_runtime_failed && direct_load_state == DirectLoadState::Ready && CurrentOriginalNrApi()
+        && image == direct_api.module && image_generation == direct_api.original_image_generation
+        && (core == nullptr || core == ngx_core_module)
+        && init_generation != 0 && init_generation == original_nr_init_generation;
+  }
+};
+
 // One NR stream per swapchain: its temporal history is the NR feature
 // registered under Handle(), an address no NGX handle can have (the
 // Streamline path keys its synthetic streams the same way; never
@@ -517,6 +542,10 @@ struct PresentStream {
   output_framerate::OutputIdentity output;
   WarmPresentColor warm_color;
   WarmPresentNeutralGuides warm_neutral_guides;
+  uint64_t guided_sr_version = 0;
+  uint64_t guided_sr_observed_version = 0;
+  uint64_t guided_sr_consumer_call = 0;
+  uintptr_t guided_sr_consumer_owner = 0;
   present_frame_policy::Clock base_frame_clock;
   bool base_history_unbound = false;
   PresentEditReuseMonitor edit_reuse_monitor;
@@ -596,6 +625,7 @@ struct PresentStream {
   uint64_t native_options_revision = 0;
   std::optional<bool> native_options_enabled;
   fg::xefg::OrdinaryPresentReceipt ordinary_color;
+  OrdinaryRecordingFace ordinary_recording_face;
   uint64_t ordinary_color_guide_serial = 0;
   submission::QueueOrderProof ordinary_color_order;
   struct NativeColour {
@@ -649,19 +679,29 @@ struct OrdinaryPresentOwnerState {
   output_framerate::OutputIdentity output;
   uintptr_t swapchain = 0;
   uintptr_t backbuffer = 0;
+  uintptr_t queue = 0;
+  fg::xefg::OrdinaryPresentAccess event_access;
   uintptr_t sdk_owner = 0;
   uint64_t sdk_call = 0;
+  uint64_t event_guided_sr_version = 0;
+  const char* pre_effects_rejection = "off_prior_present_without_color";
+  bool pre_effects_full_color = false;
+  bool event_has_guided_sr = false;
+  bool off_recording = false;
   bool producer_conflict = false;
 };
 
 inline std::unordered_map<const void*, OrdinaryPresentOwnerState> ordinary_present_attempts;
 inline uint64_t ordinary_present_attempt_serial = 0;
 inline thread_local std::vector<fg::xefg::OrdinaryPresentAttempt> ordinary_present_event_attempts;
+
+inline std::unordered_map<reshade::api::effect_runtime*, uintptr_t> ordinary_present_effects_started;
 inline void ConfigureOrdinaryPresentOwner();
 inline void ResetPresentStreamHistory(PresentStream* stream, uint32_t reason);
 
 // Caller holds runtime_mutex. Ending a color receipt has no GPU lifetime effect.
 inline void InvalidateOrdinaryPresentAttemptsLocked(uintptr_t swapchain = 0) {
+  if (swapchain == 0) ordinary_present_effects_started.clear();
   std::erase_if(ordinary_present_attempts, [&](const auto& entry) {
     const auto& [owner, state] = entry;
     return swapchain == 0 || reinterpret_cast<uintptr_t>(owner) == swapchain
@@ -674,7 +714,9 @@ inline void InvalidateOrdinaryPresentAttemptsLocked(uintptr_t swapchain = 0) {
 }
 
 inline fg::xefg::OrdinaryPresentAttempt BeginOrdinaryPresentAttempt(
-    reshade::api::command_queue* queue, reshade::api::swapchain* swapchain) {
+    reshade::api::command_queue* queue, reshade::api::swapchain* swapchain,
+    const reshade::api::rect* source = nullptr, const reshade::api::rect* destination = nullptr,
+    uint32_t dirty_rect_count = 0, const reshade::api::rect* dirty_rects = nullptr) {
   ConfigureOrdinaryPresentOwner();
   if (queue == nullptr || swapchain == nullptr || queue->get_device() != swapchain->get_device()
       || swapchain->get_device() == nullptr || swapchain->get_device()->get_api() != reshade::api::device_api::d3d12
@@ -685,10 +727,49 @@ inline fg::xefg::OrdinaryPresentAttempt BeginOrdinaryPresentAttempt(
   const auto native_swapchain = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(
       reinterpret_cast<IUnknown*>(swapchain->get_native())));
   const auto output = output_framerate::MatchPresentOutput(reinterpret_cast<uintptr_t>(swapchain), backbuffer.handle);
+  if (native_backbuffer == 0) return {};
+  const auto desc = reinterpret_cast<ID3D12Resource*>(backbuffer.handle)->GetDesc();
+  const auto full_rect = [&](const reshade::api::rect* rect) {
+    return rect != nullptr && rect->left == 0 && rect->top == 0 && rect->right > 0 && rect->bottom > 0
+        && static_cast<uint64_t>(rect->right) == desc.Width && static_cast<uint32_t>(rect->bottom) == desc.Height;
+  };
+  const auto native_queue = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(
+      reinterpret_cast<IUnknown*>(queue->get_native())));
+  uint64_t upcoming_call = 0;
+  const auto access = fg::xefg::QueryOrdinaryPresent(native_swapchain, native_backbuffer, output, &upcoming_call);
   RuntimeLock lock(runtime_mutex);
+  if (const auto pending = ordinary_present_attempts.find(swapchain);
+      pending != ordinary_present_attempts.end() && pending->second.backbuffer == native_backbuffer
+      && fg::xefg::OrdinaryPreEffectsPending(pending->second.receipt)) return pending->second.attempt;
   const fg::xefg::OrdinaryPresentAttempt attempt{reinterpret_cast<uintptr_t>(swapchain), ++ordinary_present_attempt_serial};
+  const bool full_region = (source == nullptr || full_rect(source)) && (destination == nullptr || full_rect(destination))
+      && (dirty_rect_count == 0 || (dirty_rect_count == 1 && full_rect(dirty_rects)));
+  const bool full_pre_effects = full_region && std::ranges::none_of(ordinary_present_effects_started,
+      [&](const auto& effect) { return effect.second == native_backbuffer; });
+  const auto* turn = fg::xefg::CurrentOrdinaryOffPresent();
+  const bool scoped_off = turn != nullptr && (native_backbuffer == turn->access.backbuffer
+      || (turn->access.context == access.context && turn->access.owner == access.owner));
+  if (scoped_off && (!fg::xefg::MatchesOrdinaryOffAccess(*turn, access)
+      || native_queue != reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(turn->queue))
+      || !fg::xefg::BindOrdinaryOffPresentAttempt(*turn, attempt,
+          full_pre_effects ? "off_ordinary_attempt_without_color" : "off_pre_fx_full_color_unavailable"))) return {};
+  uint64_t guided_sr_version = 0;
+  bool guided_sr_pending = false;
+  if (const auto stream = present_streams.find(swapchain); upcoming_call != 0 && stream != present_streams.end()) {
+    auto& producer = stream->second;
+    guided_sr_version = producer.guided_sr_version;
+    if (guided_sr_version != producer.guided_sr_observed_version) {
+      producer.guided_sr_observed_version = guided_sr_version;
+      producer.guided_sr_consumer_call = upcoming_call;
+      producer.guided_sr_consumer_owner = access.owner;
+    }
+    guided_sr_pending = producer.guided_sr_consumer_call == upcoming_call && producer.guided_sr_consumer_owner == access.owner;
+  }
   ordinary_present_attempts[swapchain] = {.attempt = attempt, .output = output,
-      .swapchain = native_swapchain, .backbuffer = native_backbuffer};
+      .swapchain = native_swapchain, .backbuffer = native_backbuffer, .queue = native_queue, .event_access = access,
+      .sdk_owner = (scoped_off ? turn->access.owner : 0), .sdk_call = (scoped_off ? turn->access.call : 0),
+      .event_guided_sr_version = guided_sr_version, .pre_effects_full_color = full_pre_effects,
+      .event_has_guided_sr = guided_sr_pending, .off_recording = scoped_off && full_pre_effects};
   std::erase_if(ordinary_present_event_attempts, [&](const auto& previous) {
     const auto found = ordinary_present_attempts.find(reinterpret_cast<const void*>(previous.owner));
     return found == ordinary_present_attempts.end() || found->second.attempt != previous;
@@ -697,11 +778,26 @@ inline fg::xefg::OrdinaryPresentAttempt BeginOrdinaryPresentAttempt(
   return attempt;
 }
 
+inline void ObserveOrdinaryPresentEffects(reshade::api::effect_runtime* runtime, bool started) {
+  if (runtime == nullptr || runtime->get_device() == nullptr
+      || runtime->get_device()->get_api() != reshade::api::device_api::d3d12) return;
+  RuntimeLock lock(runtime_mutex);
+  if (!started) {
+    ordinary_present_effects_started.erase(runtime);
+    return;
+  }
+  if (runtime->get_back_buffer_count() == 0) return;
+  const auto backbuffer = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(
+      reinterpret_cast<IUnknown*>(runtime->get_current_back_buffer().handle)));
+  if (backbuffer != 0) ordinary_present_effects_started[runtime] = backbuffer;
+}
+
 inline void EndOrdinaryPresentAttempt(fg::xefg::OrdinaryPresentAttempt attempt, HRESULT status = S_OK) noexcept {
   if (!attempt) return;
   RuntimeLock lock(runtime_mutex);
   const auto found = ordinary_present_attempts.find(reinterpret_cast<const void*>(attempt.owner));
   if (found != ordinary_present_attempts.end() && found->second.attempt == attempt) {
+    if (found->second.sdk_call != 0 && fg::xefg::CurrentOrdinaryOffPresent() != nullptr) return;
     if (status != S_OK && found->second.receipt.executed) {
       if (const auto stream = present_streams.find(reinterpret_cast<const void*>(attempt.owner)); stream != present_streams.end()) {
         ResetPresentStreamHistory(&stream->second, kResetRecovery);
@@ -1086,18 +1182,19 @@ inline bool WarmPresentColorCurrent(const WarmPresentColor& warm, const output_f
       && warm.width == width && warm.height == height && warm.depth_setting == depth_mode.load();
 }
 
-inline bool SharesWarmPresentRuntime(const PresentTarget& target, ID3D12Resource* backbuffer) {
-  if (backbuffer == nullptr || target.adaptive_output.view == 0 || !WarmPresentColorEligible(target)) return false;
-  const auto back_identity = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(backbuffer));
-  const auto owner = output_framerate::MatchPresentColorOwner(target.adaptive_output, back_identity);
+inline bool SharesWarmPresentRuntime(const PresentTarget& target, uintptr_t backbuffer, uint32_t width, uint32_t height) {
+  if (backbuffer == 0 || !WarmPresentColorEligible(target)) return false;
+  const auto owner = output_framerate::MatchPresentColorOwner(target.adaptive_output, backbuffer);
   if (!owner || owner.swapchain != target.swapchain_identity) return false;
   const auto entry = present_streams.find(reinterpret_cast<const void*>(owner.swapchain));
   if (entry == present_streams.end()) return false;
   const auto& warm = entry->second.warm_color;
-  const auto live_context = warm.xefg_context.lock();
-  if (live_context == nullptr || reinterpret_cast<uintptr_t>(live_context.get()) != target.adaptive_output.view) return false;
-  const auto extent = backbuffer->GetDesc();
-  return WarmPresentColorCurrent(warm, owner, target, static_cast<uint32_t>(extent.Width), extent.Height);
+  if (!warm.signed_group) return false;
+  if (target.adaptive_output.view != 0) {
+    const auto live_context = warm.xefg_context.lock();
+    if (reinterpret_cast<uintptr_t>(live_context.get()) != target.adaptive_output.view) return false;
+  }
+  return WarmPresentColorCurrent(warm, owner, target, width, height);
 }
 
 inline bool EnsureOrdinaryPresentRing(ID3D12Resource* backbuffer, IUnknown* game_device) {
@@ -1115,43 +1212,50 @@ inline bool EnsureOrdinaryPresentRing(ID3D12Resource* backbuffer, IUnknown* game
   return ready;
 }
 
+inline bool WarmPresentSlotContractMatches(const NrFeatureSlot& slot, uint32_t pass,
+    const FeatureState& guide, const PresentTarget& target, uint32_t width, uint32_t height) {
+  const auto group = RequestedStagePlan().At(stage_plan::Stage::PRESENT);
+  const auto flags = NrCreateFlags(guide.create_flags, target.hdr_mode != 0);
+  const uint32_t logical_pass = group.begin + pass;
+  const auto override_preset = (logical_pass == 0 ? 0u : pass_preset[logical_pass - 1].load());
+  const auto chosen = nr_model::ResolvePreset(override_preset == 0 ? preset.load() : override_preset, 0,
+                                              direct_runtime_requirements.dual_models);
+  uint32_t work_width = 0, work_height = 0;
+  ComputeNrWorkingResolution(width, height, guide.input_width, guide.input_height, work_width, work_height,
+      PresentResolutionPairAllowed(target) ? logical_pass : group.begin);
+  return slot.handle != nullptr && slot.parameters != nullptr && !slot.failed && WarmPresentModelOnBinding(slot)
+      && slot.configuration_generation == configuration_generation.load() && slot.nr_hdr_mode == target.hdr_mode
+      && slot.nr_preset == chosen && slot.nr_create_flags == flags
+      && slot.create_input_width == work_width && slot.create_input_height == work_height
+      && slot.create_output_width == work_width && slot.create_output_height == work_height;
+}
+
+inline bool WarmPresentCreationReady(NrFeatureSlot* slot, ID3D12GraphicsCommandList* list) {
+  if (slot->creation_completed) return true;
+  const auto& creation = slot->creation_recording;
+  if (creation != nullptr && (slot->preparation_recording == nullptr || slot->preparation_recording == creation)
+      && submission::ExactOwnedRecordingCompleted(*creation, std::array<const void*, 2>{slot->handle, slot->parameters})) {
+    slot->preparation_recording.reset();
+    slot->creation_completed = true;
+    return true;
+  }
+  if (slot->preparation_recording == nullptr) {
+    slot->preparation_recording = creation;
+  }
+  return slot->preparation_recording != nullptr && NrModelPreparationReady(slot, list);
+}
+
 inline bool WarmPresentSlotsMatch(const PresentStream& owner, ID3D12GraphicsCommandList* list,
                                   const FeatureState& guide, const PresentTarget& target,
                                   uint32_t width, uint32_t height) {
   const auto feature = features.find(owner.Handle());
   if (feature == features.end()) return false;
-  const auto group = RequestedStagePlan().At(stage_plan::Stage::PRESENT);
-  const auto flags = NrCreateFlags(guide.create_flags, target.hdr_mode != 0);
-  const bool independent = PresentResolutionPairAllowed(target);
-  for (uint32_t pass = 0; pass < group.count; ++pass) {
+  for (uint32_t pass = 0; pass < 2; ++pass) {
     auto& slot = feature->second.slots[pass];
-    const uint32_t logical_pass = group.begin + pass;
-    const auto override_preset = logical_pass == 0 ? 0u : pass_preset[logical_pass - 1].load();
-    const auto chosen = nr_model::ResolvePreset(override_preset == 0 ? preset.load() : override_preset, 0,
-                                                direct_runtime_requirements.dual_models);
-    uint32_t work_width = 0, work_height = 0;
-    ComputeNrWorkingResolution(width, height, guide.input_width, guide.input_height,
-        work_width, work_height, independent ? logical_pass : group.begin);
-    if (slot.handle == nullptr || slot.parameters == nullptr || slot.failed || !WarmPresentModelOnBinding(slot)
-        || slot.configuration_generation != configuration_generation.load() || slot.nr_hdr_mode != target.hdr_mode
-        || slot.nr_preset != chosen || slot.nr_create_flags != flags
-        || slot.create_input_width != work_width || slot.create_input_height != work_height
-        || slot.create_output_width != work_width || slot.create_output_height != work_height) return false;
-    if (slot.creation_completed) continue;
-
-    // XeFG's first mature group can predate ordinary Prepare. Latch completion
-    // of that exact Create, not of every later Evaluate using the same model.
-    // The shared writer still orders live work through ProveWarmPresentQueueOrder.
-    const auto& creation = slot.creation_recording;
-    if (creation != nullptr && (slot.preparation_recording == nullptr || slot.preparation_recording == creation)
-        && submission::ExactOwnedRecordingCompleted(*creation, std::array<const void*, 2>{slot.handle, slot.parameters})) {
-      slot.preparation_recording.reset();
-      slot.creation_completed = true;
-    } else if (!NrModelPreparationReady(&slot, list)) {
-      return false;
-    }
+    if (!WarmPresentSlotContractMatches(slot, pass, guide, target, width, height)
+        || !WarmPresentCreationReady(&slot, list)) return false;
   }
-  return group.count == 2;
+  return true;
 }
 
 using WarmPresentQueueWaits = std::vector<std::pair<FenceRef, uint64_t>>;
@@ -1209,24 +1313,32 @@ inline bool EnqueueWarmPresentQueueWaits(ID3D12CommandQueue* queue, const WarmPr
   });
 }
 
-inline void RememberWarmPresentColor(PresentStream* stream, const output_framerate::OutputIdentity& owner,
+inline WarmPresentColor DescribeWarmPresentColor(const PresentStream& stream, const output_framerate::OutputIdentity& owner,
     const PresentTarget& target, const FeatureState& guide, uint32_t width, uint32_t height,
     bool xefg, bool real_guides, bool complete, const fg::FrameInput* delivery = nullptr,
     const std::shared_ptr<const void>& context = {}) {
-  const bool has_layout = real_guides || (target.warm_neutral_guides && stream->warm_color.has_real_layout);
-  auto xefg_context = stream->warm_color.xefg_context;
+  const auto& previous = stream.warm_color;
+  const bool current = WarmPresentColorCurrent(previous, owner, target, width, height);
+  const bool new_layout = real_guides && complete;
+  const bool keep_layout = current && previous.has_real_layout && !new_layout;
+  auto xefg_context = (current ? previous.xefg_context : std::weak_ptr<const void>{});
   if (delivery != nullptr) {
     xefg_context = context;
   }
-  stream->warm_color = {
+  return {
       .owner = owner, .image = direct_api.module, .face = direct_device,
       .context_generation = original_nr_init_generation, .xefg_context = std::move(xefg_context),
       .configuration = configuration_generation.load(),
       .format = target.swapchain_format, .units = target.units, .hdr_mode = target.hdr_mode,
-      .width = width, .height = height, .guide_width = guide.input_width, .guide_height = guide.input_height,
-      .motion_x = guide.motion_x, .motion_y = guide.motion_y, .depth_x = guide.depth_x, .depth_y = guide.depth_y,
-      .flags = guide.create_flags, .depth_setting = depth_mode.load(), .xefg = xefg, .real_guides = real_guides,
-      .has_real_layout = has_layout, .complete = complete, .delivery_frame = delivery != nullptr ? delivery->application_frame : 0,
+      .width = width, .height = height,
+      .guide_width = (keep_layout ? previous.guide_width : guide.input_width),
+      .guide_height = (keep_layout ? previous.guide_height : guide.input_height),
+      .motion_x = (keep_layout ? previous.motion_x : guide.motion_x), .motion_y = (keep_layout ? previous.motion_y : guide.motion_y),
+      .depth_x = (keep_layout ? previous.depth_x : guide.depth_x), .depth_y = (keep_layout ? previous.depth_y : guide.depth_y),
+      .flags = (keep_layout ? previous.flags : guide.create_flags), .depth_setting = depth_mode.load(),
+      .signed_group = xefg || (current && previous.signed_group && target.original_signed_runtime),
+      .xefg = xefg, .real_guides = real_guides, .has_real_layout = new_layout || keep_layout,
+      .complete = complete, .delivery_frame = delivery != nullptr ? delivery->application_frame : 0,
       .delivery_epoch = delivery != nullptr ? delivery->epoch : 0,
       .delivery_context = delivery != nullptr ? delivery->context : 0};
 }
@@ -1234,7 +1346,7 @@ inline void RememberWarmPresentColor(PresentStream* stream, const output_framera
 inline std::optional<FeatureState> WarmNeutralGuideContract(const WarmPresentColor& warm, uint32_t width, uint32_t height) {
   constexpr uint32_t preserved_flags = NVSDK_NGX_DLSS_Feature_Flags_DepthInverted
       | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
-  if (!warm.complete || !warm.has_real_layout || warm.guide_width == 0 || warm.guide_height == 0
+  if (!warm.has_real_layout || warm.guide_width == 0 || warm.guide_height == 0
       || (warm.flags & ~preserved_flags) != 0 || warm.guide_width > width || warm.guide_height > height
       || warm.guide_width > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION
       || warm.guide_height > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION
@@ -1314,12 +1426,10 @@ inline bool EnsureWarmPresentNeutralGuides(PresentStream* stream, ID3D12Device* 
 
 inline std::optional<FeatureState> SelectWarmPresentNeutralGuides(PresentStream* stream,
     const PresentTarget& target, uintptr_t backbuffer, uintptr_t swapchain, uint32_t width, uint32_t height) {
-  if (target.guide_mode != kPresentGuidesOptional || !WarmPresentColorEligible(target)) return {};
-  const auto owner = output_framerate::MatchPresentColorOwner(target.adaptive_output, backbuffer);
-  if (owner.swapchain != swapchain || !WarmPresentColorCurrent(stream->warm_color, owner, target, width, height)) return {};
+  if (target.guide_mode != kPresentGuidesOptional || target.swapchain_identity != swapchain
+      || !SharesWarmPresentRuntime(target, backbuffer, width, height)) return {};
   const auto neutral = WarmNeutralGuideContract(stream->warm_color, width, height);
-  if (!neutral || !WarmPresentSlotsMatch(*stream, nullptr, *neutral, target, width, height)
-      || !EnsureWarmPresentNeutralGuides(stream, direct_device, *neutral)) return {};
+  if (!neutral || !EnsureWarmPresentNeutralGuides(stream, direct_device, *neutral)) return {};
   return neutral;
 }
 
@@ -1352,7 +1462,10 @@ inline void InvalidateWarmPresentColor(PresentStream* stream) {
     ReleaseAllNrSlots(feature->second, true);
   }
   RetireWorkset({stream->Handle(), reinterpret_cast<const ID3D12Resource*>(&stream->warm_color.service_workset_key)});
-  stream->warm_color = {};
+  stream->warm_color.complete = false;
+  stream->warm_color.delivery_frame = 0;
+  stream->warm_color.delivery_epoch = 0;
+  stream->warm_color.delivery_context = 0;
 }
 
 inline void PublishPresentBaseRejection(PresentStream* stream, const void* backbuffer,
@@ -1400,6 +1513,7 @@ inline void RetirePresentStream(const void* swapchain, bool keep_source_observat
   }
   RetireWorkset({stream.Handle(), reinterpret_cast<const ID3D12Resource*>(&stream.warm_color.service_workset_key)});
   stream.warm_color = {};
+  stream.ordinary_recording_face = {};
   RetirePresentResource(&stream.warm_neutral_guides.motion);
   RetirePresentResource(&stream.warm_neutral_guides.depth);
   RetirePresentResource(&stream.warm_neutral_guides.upload);
@@ -1858,6 +1972,7 @@ inline void CapturePresentGuides(
     D3D12_RESOURCE_STATES motion_state,
     D3D12_RESOURCE_STATES depth_state, bool mixed_predecessor, bool successful_dlss_sr) {
   ID3D12Resource* const output = GetD3D12Resource(parameters, NVSDK_NGX_Parameter_Output);
+  const auto capture_output = ResolvePresentSourceOutput(handle, output);
   if (successful_dlss_sr && output != nullptr) {
     const auto resource = renodx::utils::directx::NativeIdentity(output);
     if (!SuppressCommandStateObservation()) {
@@ -1869,6 +1984,19 @@ inline void CapturePresentGuides(
       submission::TrackUse(command_list, output, submission::UseKind::kOutputColor,
           {.resource = resource, .subresource = 0,
            .version = source != features.end() ? source->second.sr_sequence : 0});
+    }
+    // XeFG may receive this SR frame's public tags downstream of ReShade.
+    // Keep the producer fact even when XeFG ownership skips ordinary copies.
+    if (!mixed_predecessor && capture_output.view != 0 && present_guides.load(std::memory_order_relaxed) == kPresentGuidesOptional
+        && (GetD3D12Resource(parameters, NVSDK_NGX_Parameter_MotionVectors) != nullptr
+            || GetD3D12Resource(parameters, NVSDK_NGX_Parameter_Depth) != nullptr)) {
+      for (auto& [_, stream] : present_streams) {
+        const auto& owner = stream.warm_color.owner;
+        if (owner && output_framerate::ResolveRegisteredPresentOutput(owner) == capture_output) {
+          ++stream.guided_sr_version;
+          break;
+        }
+      }
     }
   }
   // One capture per evaluate chain, admitted like an after-path pass: a real
@@ -1892,7 +2020,6 @@ inline void CapturePresentGuides(
     }
   }
   if (!mixed_predecessor) CountNrDecline(NrDeclineReason::kPresentHook);
-  const auto capture_output = ResolvePresentSourceOutput(handle, output);
   // SDK tags supply this output's guides while it is owned by XeFG. Copies
   // for an independent output have their own lifetime and remain useful.
   if (!mixed_predecessor && capture_output && !fg::xefg::QueryOrdinaryPresent(0,
@@ -3221,12 +3348,53 @@ inline uint64_t PresentColourVersion(PresentStream& stream, const void* backbuff
 #include "native_fg_tag_source.hpp"
 #include "fg_native.hpp"
 
+// Recording order cannot establish the consumer's color. Inspect actual
+// submissions, including later completed writes that no longer block a queue.
+inline const char* OrdinaryPresentReceiptRejection(OrdinaryPresentOwnerState* state, ID3D12CommandQueue* consumer_queue,
+    const output_framerate::OutputIdentity& output, uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
+  const auto& receipt = state->receipt;
+  const auto queue = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(consumer_queue));
+  renodx::utils::directx::NativeFromReShadeProxy(&consumer_queue);
+  FenceRef ordered_fence;
+  {
+    std::shared_lock completion_lock(queue_completion_mutex);
+    if (const auto completion = queue_completions.find(consumer_queue); completion != queue_completions.end()) {
+      ordered_fence = FenceRef(completion->second.fence);
+    }
+  }
+  const submission::OutputUse color{.resource = reinterpret_cast<const void*>(state->backbuffer), .subresource = receipt.subresource};
+  const bool output_ordered = submission::OutputWriteOrdered(color, receipt.submission.recording, ordered_fence.fence);
+  submission::InspectRecordedWork([&](uint64_t list, uint64_t generation, const submission::Generation& recorded) {
+    if (std::pair{list, generation} == receipt.submission.recording || recorded.first_execute <= receipt.first_execute) return false;
+    if (std::ranges::any_of(recorded.classified_uses, [&](const auto& use) {
+          return use.kind == submission::UseKind::kOutputColor && use.output.resource == color.resource
+              && (use.output.subresource == color.subresource
+                  || use.output.subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+        })) state->producer_conflict = true;
+    return false;
+  }, nullptr);
+  // SDK views and enable epochs can change while this physical color stays.
+  const bool same_output = output && receipt.output && output.device == receipt.output.device
+      && output_framerate::MatchPresentOutput(receipt.attempt.owner, state->backbuffer) == output;
+  const bool same_region = receipt.subresource == 0 && receipt.x == x && receipt.y == y
+      && receipt.width == width && receipt.height == height;
+  const bool ordered = receipt.proofs_complete || (queue != 0 && queue == receipt.submission.queue);
+  if (!output_ordered) return "ordinary_output_conflict";
+  if (state->producer_conflict) return "ordinary_new_producer_uncovered";
+  if (!same_output) return "ordinary_output_unconfirmed";
+  if (!same_region) return "ordinary_region_uncovered";
+  if (!receipt.proofs_healthy) return "ordinary_first_submission_unproven";
+  if (!receipt.submission.signaled) return "ordinary_signal_failed";
+  if (!ordered) return "ordinary_queue_unordered";
+  if (!receipt.output_ready || !receipt.group_complete) return "ordinary_group_incomplete";
+  return nullptr;
+}
+
 inline fg::xefg::OrdinaryPresentClaim ClaimOrdinaryPresentColour(const fg::FrameInput& input) noexcept {
   using Claim = fg::xefg::OrdinaryPresentClaim;
   try {
     const auto backbuffer = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(input.backbuffer));
     const auto hudless = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(input.hudless));
-    const auto queue = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(input.queue));
     if (backbuffer == 0) return Claim::NO_MATCH;
     RuntimeLock lock(runtime_mutex);
     RefreshOrdinaryPresentCompletionLocked();
@@ -3238,49 +3406,18 @@ inline fg::xefg::OrdinaryPresentClaim ClaimOrdinaryPresentColour(const fg::Frame
     }
     if (match == nullptr) return Claim::NO_MATCH;
     const auto& receipt = match->receipt;
-    ID3D12CommandQueue* native_queue = input.queue;
-    renodx::utils::directx::NativeFromReShadeProxy(&native_queue);
-    FenceRef ordered_fence;
-    {
-      std::shared_lock completion_lock(queue_completion_mutex);
-      if (const auto completion = queue_completions.find(native_queue); completion != queue_completions.end()) {
-        ordered_fence = FenceRef(completion->second.fence);
-      }
-    }
-    const submission::OutputUse color{.resource = reinterpret_cast<const void*>(backbuffer), .subresource = receipt.subresource};
-    const bool output_ordered = submission::OutputWriteOrdered(color, receipt.submission.recording, ordered_fence.fence);
-    // Completed generations may no longer block a queue. Their later Execute
-    // still replaces the color covered by this receipt, while it remains live.
-    submission::InspectRecordedWork([&](uint64_t list, uint64_t generation, const submission::Generation& recorded) {
-      if (std::pair{list, generation} == receipt.submission.recording || recorded.first_execute <= receipt.first_execute) return false;
-      if (std::ranges::any_of(recorded.classified_uses, [&](const auto& use) {
-            return use.kind == submission::UseKind::kOutputColor && use.output.resource == color.resource
-                && (use.output.subresource == color.subresource
-                    || use.output.subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
-          })) match->producer_conflict = true;
-      return false;
-    }, nullptr);
-    // SDK views and enable epochs can change while this physical color stays.
-    const bool same_output = input.output && receipt.output && input.output.device == receipt.output.device
-        && output_framerate::MatchPresentOutput(receipt.attempt.owner, backbuffer) == input.output;
-    const bool same_region = receipt.subresource == 0 && receipt.x == input.color_x && receipt.y == input.color_y
-        && receipt.width == input.color_width && receipt.height == input.color_height;
     const bool hudless_complete = (hudless == 0 || hudless == backbuffer)
         && !(input.ui_composition && (input.ui_mode == 0 || input.ui_mode >= 3) && hudless == 0);
-    const bool ordered = receipt.proofs_complete || (queue != 0 && queue == receipt.submission.queue);
-    const Claim claim = (same_output && same_region && hudless_complete && !match->producer_conflict
-        && receipt.output_ready && receipt.group_complete && receipt.submission.signaled
-        && receipt.proofs_healthy && ordered && output_ordered && match->sdk_call == 0 ? Claim::COVERED : Claim::CONFLICT);
-    const char* reason = claim == Claim::COVERED ? "ordinary_owner_receipt"
-        : !output_ordered ? "ordinary_output_conflict"
-        : match->producer_conflict ? "ordinary_new_producer_uncovered"
-        : !same_output ? "ordinary_output_unconfirmed"
-        : !same_region ? "ordinary_region_uncovered"
-        : !hudless_complete ? "ordinary_hudless_uncovered"
-        : !receipt.proofs_healthy ? "ordinary_first_submission_unproven"
-        : !receipt.submission.signaled ? "ordinary_signal_failed"
-        : !ordered ? "ordinary_queue_unordered" : "ordinary_group_incomplete";
-    if (!fg::xefg::AcceptOrdinaryPresentReceipt(input, receipt, claim, reason)) return Claim::CONFLICT;
+    const char* rejection = OrdinaryPresentReceiptRejection(match, input.queue, input.output,
+        input.color_x, input.color_y, input.color_width, input.color_height);
+    if (rejection == nullptr && receipt.pre_effects_xefg && !fg::xefg::OrdinaryPreEffectsReceiptCurrent(receipt)) {
+      rejection = "pre_fx_consumer_version_unconfirmed";
+    }
+    if (rejection == nullptr && !hudless_complete) rejection = "ordinary_hudless_uncovered";
+    if (rejection == nullptr && match->sdk_call != 0) rejection = "ordinary_attempt_already_claimed";
+    const Claim claim = (rejection == nullptr ? Claim::COVERED : Claim::CONFLICT);
+    if (!fg::xefg::AcceptOrdinaryPresentReceipt(input, receipt, claim,
+            rejection != nullptr ? rejection : "ordinary_owner_receipt")) return Claim::CONFLICT;
     if (match->sdk_call == 0) {
       match->sdk_owner = input.diagnostic_context;
       match->sdk_call = fg::xefg::ServiceCall(input);
@@ -3289,6 +3426,52 @@ inline fg::xefg::OrdinaryPresentClaim ClaimOrdinaryPresentColour(const fg::Frame
     return claim;
   } catch (...) {
     return Claim::CONFLICT;
+  }
+}
+
+inline void ClaimOrdinaryOffPresentColour(const fg::xefg::OrdinaryOffPresent& turn,
+    fg::xefg::OrdinaryPresentAttempt attempt) noexcept {
+  using Claim = fg::xefg::OrdinaryPresentClaim;
+  try {
+    RuntimeLock lock(runtime_mutex);
+    auto* const owner = reinterpret_cast<const void*>(attempt.owner);
+    const auto found = ordinary_present_attempts.find(owner);
+    if (found == ordinary_present_attempts.end() || found->second.attempt != attempt
+        || CurrentOrdinaryPresentAttempt(owner) != attempt || attempt.owner != turn.physical_output.swapchain
+        || found->second.backbuffer != turn.access.backbuffer) return;
+    auto& state = found->second;
+    const bool nested = state.sdk_call == turn.access.call && state.sdk_owner == turn.access.owner;
+    if (turn.input_rejection != nullptr) return;
+    if (!nested) {
+      if (state.sdk_call != 0 || !fg::xefg::BindOrdinaryOffPresentAttempt(turn, attempt,
+              state.pre_effects_rejection)) return;
+      state.sdk_owner = turn.access.owner;
+      state.sdk_call = turn.access.call;
+    }
+    state.off_recording = false;
+    if (!state.receipt.executed) return;
+    RefreshOrdinaryPresentCompletionLocked();
+    const auto& receipt = state.receipt;
+    const auto& entry = state.event_access;
+    const char* rejection = nullptr;
+    if (!state.pre_effects_full_color) {
+      rejection = "off_pre_fx_full_color_unavailable";
+    } else if (receipt.pre_effects_xefg) {
+      if (!fg::xefg::OrdinaryPreEffectsReceiptCurrent(receipt)) rejection = "off_pre_fx_disable_version_unconfirmed";
+    } else if (entry.context != turn.access.context || entry.owner != turn.access.owner || entry.epoch != turn.access.epoch
+        || entry.declaration != turn.access.declaration || entry.output != turn.access.output
+        || receipt.context != entry.context || receipt.epoch != entry.epoch || receipt.call != entry.call) {
+      rejection = "off_ordinary_attempt_version_unconfirmed";
+    }
+    if (rejection == nullptr) {
+      rejection = (state.queue == 0 || receipt.submission.queue != state.queue ? "off_ordinary_producer_queue_unconfirmed"
+          : OrdinaryPresentReceiptRejection(&state, turn.queue, turn.access.output, 0, 0, turn.width, turn.height));
+    }
+    fg::xefg::AcceptOrdinaryOffPresentReceipt(turn, receipt,
+        rejection == nullptr ? Claim::COVERED : Claim::CONFLICT,
+        rejection != nullptr ? rejection : (receipt.pre_effects_xefg ? "off_pre_fx_owner_receipt" : "off_ordinary_owner_receipt"));
+  } catch (...) {
+    // The bound attempt still prevents replay if a proof cannot be collected.
   }
 }
 
@@ -3316,7 +3499,7 @@ inline void InvalidateOrdinaryPresentAttempts(uintptr_t swapchain) noexcept {
 
 inline void ConfigureOrdinaryPresentOwner() {
   fg::xefg::ConfigureOrdinaryPresentOwner(ClaimOrdinaryPresentColour, FinishOrdinaryPresentColour,
-      InvalidateOrdinaryPresentAttempts, FindOrdinaryPresentAttempt, EndOrdinaryPresentAttempt);
+      InvalidateOrdinaryPresentAttempts, FindOrdinaryPresentAttempt, EndOrdinaryPresentAttempt, ClaimOrdinaryOffPresentColour);
 }
 
 // Caller holds runtime_mutex. The independent preparation Execute never
@@ -3325,7 +3508,8 @@ inline void PublishOrdinaryPresentColour(const fg::xefg::OrdinaryPresentAccess& 
     PresentStream* stream, bool frame_ordered,
     ID3D12Resource* backbuffer, const PresentTarget& target, const NrRecording& recording,
     const fg::xefg::OrdinarySubmissionFact& submission_fact, bool reset_observed,
-    const submission::QueueOrderProof& queue_order) {
+    const submission::QueueOrderProof& queue_order, ID3D12GraphicsCommandList* list,
+    const NVSDK_NGX_Handle* handle, bool pre_effects_xefg) {
   const auto found = ordinary_present_attempts.find(reinterpret_cast<const void*>(target.ordinary_attempt.owner));
   if (found == ordinary_present_attempts.end()) return;
   auto* owner = &found->second;
@@ -3336,19 +3520,55 @@ inline void PublishOrdinaryPresentColour(const fg::xefg::OrdinaryPresentAccess& 
       .backbuffer = access.backbuffer, .width = static_cast<uint32_t>(desc.Width), .height = desc.Height,
       .context = access.context, .epoch = access.epoch, .call = access.call,
       .executed = true, .output_ready = recording.output_ready, .group_complete = recording.group_complete,
-      .game_reset_observed = reset_observed, .submission = submission_fact};
+      .game_reset_observed = reset_observed, .pre_effects_xefg = pre_effects_xefg, .submission = submission_fact};
   SnapshotOrdinaryPresentProof(&owner->receipt);
   stream->ordinary_color = owner->receipt;
   stream->ordinary_color_guide_serial = (frame_ordered ? target.guide_serial : 0);
   stream->ordinary_color_order = queue_order;
+
+  if (target.domain != present_restore_scope::Domain::FINAL_PRESENT || target.d3d11_bridge
+      || target.stage_execution_plan != nullptr || target.native_fg_inputs || target.native_prefg_resolution_pair
+      || !recording.output_ready || !recording.group_complete || !owner->receipt.proofs_healthy
+      || !submission_fact.signaled || submission_fact.queue == 0 || submission_fact.fence_value == 0
+      || recording.model_pass_mask == 0
+      || recording.model_pass_mask != recording.model_evaluate_mask
+      || !CurrentOriginalNrApi() || original_nr_init_generation == 0) return;
+  const auto output = output_framerate::MatchPresentColorOwner(owner->output, access.backbuffer);
+  const auto feature = features.find(handle);
+  if (output.swapchain != owner->attempt.owner || feature == features.end()) return;
+  uint32_t core_pass_mask = 0;
+  for (uint32_t pass = 0; pass < kMaxNrPasses; ++pass) {
+    if ((recording.model_pass_mask & (1u << pass)) == 0) continue;
+    const auto& model = feature->second.slots[pass];
+    const bool core_family = model.via_core && ngx_core_module != nullptr
+        && model.evaluate_feature == core_evaluate_feature && model.release_feature == core_release_feature
+        && model.destroy_parameters == core_destroy_parameters;
+    if (model.handle == nullptr || model.parameters == nullptr
+        || (!core_family && !WarmPresentModelOnBinding(model))) return;
+    if (core_family) {
+      core_pass_mask |= 1u << pass;
+    }
+  }
+  Microsoft::WRL::ComPtr<ID3D12Device> face;
+  if (FAILED(list->GetDevice(IID_PPV_ARGS(&face))) || face.Get() != direct_device
+      || face.Get() != present_ring.device || present_ring.fence == nullptr) return;
+  // One completed recording proves this face for the same binding. Preserve
+  // its earliest exact signal even when a newer recording is already queued.
+  auto& proof = stream->ordinary_recording_face;
+  if (proof.BindingCurrent(output, submission_fact.queue, present_ring.fence)
+      && proof.core_pass_mask == core_pass_mask) return;
+  proof = {.owner = output, .device = std::move(face), .queue = submission_fact.queue, .image = direct_api.module,
+      .core = (core_pass_mask != 0 ? ngx_core_module : nullptr), .core_pass_mask = core_pass_mask,
+      .image_generation = direct_api.original_image_generation, .init_generation = original_nr_init_generation,
+      .fence = FenceRef(present_ring.fence), .fence_value = submission_fact.fence_value};
 }
 
 inline bool ResumeOrdinaryPresentLocked(ID3D12GraphicsCommandList* command_list = nullptr,
-    PresentTarget* target = nullptr, ID3D12Resource* backbuffer = nullptr) {
+    PresentTarget* target = nullptr, ID3D12Resource* backbuffer = nullptr, bool pre_effects_xefg = false) {
   if (target != nullptr) {
     target->original_signed_runtime = false;
   }
-  if (target != nullptr && backbuffer != nullptr && !fg::xefg::QueryOrdinaryPresent(0,
+  if (!pre_effects_xefg && target != nullptr && backbuffer != nullptr && !fg::xefg::QueryOrdinaryPresent(0,
           reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(backbuffer)), target->adaptive_output).allowed) {
     return false;
   }
@@ -3359,7 +3579,10 @@ inline bool ResumeOrdinaryPresentLocked(ID3D12GraphicsCommandList* command_list 
       return false;
     }
   }
-  if (target != nullptr && SharesWarmPresentRuntime(*target, backbuffer)) {
+  if (target == nullptr || backbuffer == nullptr) return true;
+  const auto extent = backbuffer->GetDesc();
+  const auto identity = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(backbuffer));
+  if (SharesWarmPresentRuntime(*target, identity, static_cast<uint32_t>(extent.Width), extent.Height)) {
     ID3D12Device* face = nullptr;
     const HRESULT got_face = (command_list != nullptr ? command_list->GetDevice(IID_PPV_ARGS(&face)) : E_INVALIDARG);
     const bool same_face = SUCCEEDED(got_face) && face == direct_device;
@@ -3369,7 +3592,7 @@ inline bool ResumeOrdinaryPresentLocked(ID3D12GraphicsCommandList* command_list 
     // on the ordinary path; unrelated Present and Core admission are unchanged.
     target->original_signed_runtime = true;
   }
-  return true;
+  return !pre_effects_xefg || target->original_signed_runtime;
 }
 
 // The ordinary route and B1 share the same private Present recording and ring.
@@ -3379,12 +3602,15 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     reshade::api::command_queue* queue, PresentSlot* slot, PresentStream& stream,
     bridge::OwnedParameters& block, PresentGuideSet* guides, PresentTarget& target,
     bool neutral_model, const std::vector<std::pair<FenceRef, uint64_t>>& waits,
-    PresentQueueOrder* base_order = nullptr) {
+    PresentQueueOrder* base_order = nullptr, const fg::xefg::OrdinaryPreEffectsWrite* pre_effects_write = nullptr) {
   bool terminal_named = false;
   auto* const backbuffer = GetD3D12Resource(&block, NVSDK_NGX_Parameter_Output);
-  const auto write_access = fg::xefg::QueryOrdinaryPresent(target.swapchain_identity,
-      reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(backbuffer)), target.adaptive_output);
-  if (!write_access.allowed) {
+  const bool pre_effects_xefg = pre_effects_write != nullptr;
+  const auto backbuffer_identity = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(backbuffer));
+  const auto write_access = (pre_effects_xefg ? pre_effects_write->access : fg::xefg::QueryOrdinaryPresent(target.swapchain_identity,
+      backbuffer_identity, target.adaptive_output));
+  if (pre_effects_xefg && (backbuffer_identity != write_access.backbuffer || target.adaptive_output != write_access.output)) return false;
+  if (!pre_effects_xefg && !write_access.allowed) {
     fg::xefg::ObserveOrdinaryPresentSubmission(write_access, {.reason = "output_write_permission_unavailable"});
     return false;
   }
@@ -3395,7 +3621,7 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
   const auto warm_entry = present_streams.find(reinterpret_cast<const void*>(warm_owner.swapchain));
   const bool track_warm_color = warm_owner && warm_entry != present_streams.end() && &stream == &warm_entry->second;
   const auto extent = backbuffer != nullptr ? backbuffer->GetDesc() : D3D12_RESOURCE_DESC{};
-  const bool order_shared_group = track_warm_color && WarmPresentColorEligible(target) && stream.warm_color.complete
+  const bool order_shared_group = track_warm_color && WarmPresentColorEligible(target)
       && WarmPresentColorCurrent(stream.warm_color, warm_owner, target, static_cast<uint32_t>(extent.Width), extent.Height);
   WarmPresentQueueWaits handoff_waits;
   const auto output_write_ordered = [&](const std::pair<uint64_t, uint64_t>& recording) {
@@ -3421,7 +3647,7 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     return false;
   };
   if (!output_write_ordered(submission::RecordingIdentity(slot->list))) return false;
-  if (!ResumeOrdinaryPresentLocked(slot->list, &target, backbuffer)) {
+  if (!ResumeOrdinaryPresentLocked(slot->list, &target, backbuffer, pre_effects_xefg)) {
     fg::xefg::ObserveOrdinaryPresentSubmission(write_access, {.reason = "runtime_unavailable"});
     return false;
   }
@@ -3439,14 +3665,14 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
       && stream.fg_multiplier == 1;
   const bool independent_pair = PresentResolutionPairAllowed(target);
   const auto* const handle = stream.Handle(neutral_model);
+  if (pre_effects_xefg && (!target.warm_neutral_guides || !stream.warm_color.complete || !order_shared_group
+      || !WarmPresentSlotsMatch(stream, slot->list, DeriveFeatureState(&block), target,
+          static_cast<uint32_t>(extent.Width), extent.Height))) return false;
   if (order_shared_group && stream.warm_color.xefg) {
     ResetPresentStreamHistory(&stream, kResetSourceChange);
   }
   if (target.warm_neutral_guides) {
-    const auto desc = backbuffer->GetDesc();
-    const auto contract = DeriveFeatureState(&block);
-    if (!track_warm_color || !WarmPresentSlotsMatch(stream, slot->list, contract, target,
-            static_cast<uint32_t>(desc.Width), desc.Height)) return false;
+    if (!track_warm_color || !target.original_signed_runtime) return false;
   }
   bool recording_started = false;
   bool recording_closed = false;
@@ -3711,15 +3937,17 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
   if (!output_write_ordered(submission::RecordingIdentity(slot->list))) return false;
   // One normal color publication per actual owner attempt, also before an
   // SDK proxy has supplied its own call ID.
+  fg::xefg::OrdinaryPresentAttempt off_attempt;
   if (target.ordinary_attempt) {
     const auto owner = ordinary_present_attempts.find(reinterpret_cast<const void*>(target.ordinary_attempt.owner));
     if (owner == ordinary_present_attempts.end() || owner->second.attempt != target.ordinary_attempt
         || owner->second.backbuffer != write_access.backbuffer
         || owner->second.receipt.executed) return false;
+    if (owner->second.off_recording) off_attempt = target.ordinary_attempt;
   }
   submission::QueueOrderProof color_order;
   bool handoff_wait_failed = false;
-  const bool write_permitted = fg::xefg::WithOrdinaryPresentCommit(write_access, [&] {
+  const auto execute_color = [&] {
     if (!EnqueueWarmPresentQueueWaits(native_queue, handoff_waits)) {
       handoff_wait_failed = true;
       return false;
@@ -3731,7 +3959,12 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
     }
     execute_owned(list);
     return true;
-  });
+  };
+  const bool write_permitted = (pre_effects_xefg
+      ? fg::xefg::TryRecordOrdinaryPreEffects(*pre_effects_write,
+          reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(native_queue)),
+          static_cast<uint32_t>(extent.Width), extent.Height, execute_color)
+      : fg::xefg::WithOrdinaryPresentCommit(write_access, execute_color, static_cast<bool>(off_attempt), off_attempt));
   if (!write_permitted) {
     fg::xefg::ObserveOrdinaryPresentSubmission(write_access,
         {.reason = (handoff_wait_failed ? "handoff_queue_wait_failed" : "write_permission_revoked"),
@@ -3751,15 +3984,15 @@ inline bool SubmitPresentGroup(ID3D12CommandQueue* native_queue,
   const bool reset_observed = DeriveFeatureState(&block).frame_reset != 0 && (target.game_frame_observed
       || history_reset_counts[static_cast<size_t>(HistoryResetSource::kGameReset)].load() != game_resets_before);
   PublishOrdinaryPresentColour(write_access, &stream, frame_ordered, backbuffer, target, recording,
-                               submission_fact, reset_observed, color_order);
+                                submission_fact, reset_observed, color_order, slot->list, handle, pre_effects_xefg);
   if (track_warm_color && WarmPresentColorEligible(target) && signaled && recording.output_ready
-      && recording.model_pass_mask == 3u && recording.model_evaluate_mask == 3u) {
+      && recording.group_complete && recording.model_pass_mask == 3u && recording.model_evaluate_mask == 3u) {
     const auto footprint = backbuffer->GetDesc();
     const auto guide = DeriveFeatureState(&block);
     if (target.warm_neutral_guides) {
       WarmPresentNeutralGuidesSubmitted(&stream.warm_neutral_guides);
     }
-    RememberWarmPresentColor(&stream, warm_owner, target, guide, static_cast<uint32_t>(footprint.Width),
+    stream.warm_color = DescribeWarmPresentColor(stream, warm_owner, target, guide, static_cast<uint32_t>(footprint.Width),
         footprint.Height, false, guides != nullptr, true);
   }
   submission::DiscardOwnedRecording(slot->list, submission::RecordingOwner::kOrdinaryPresent);
@@ -4698,8 +4931,54 @@ inline void RunPresentPath(
   const auto output = (swapchain != nullptr
       ? output_framerate::MatchPresentOutput(reinterpret_cast<uintptr_t>(swapchain), backbuffer.handle)
       : output_framerate::OutputIdentity{});
-  const auto ordinary_access = fg::xefg::QueryOrdinaryPresent(
-      (swapchain != nullptr ? static_cast<uintptr_t>(swapchain->get_native()) : 0), backbuffer.handle, output);
+  const auto* off_turn = fg::xefg::CurrentOrdinaryOffPresent();
+  auto swapchain_identity = (swapchain != nullptr ? static_cast<uintptr_t>(swapchain->get_native()) : 0);
+  auto backbuffer_identity = static_cast<uintptr_t>(backbuffer.handle);
+  if (off_turn != nullptr && owner_attempt) {
+    swapchain_identity = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(
+        reinterpret_cast<IUnknown*>(swapchain_identity)));
+    backbuffer_identity = reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(
+        reinterpret_cast<IUnknown*>(backbuffer_identity)));
+  }
+  const auto ordinary_access = fg::xefg::QueryOrdinaryPresent(swapchain_identity, backbuffer_identity, output);
+  const bool scoped_off = off_turn != nullptr && swapchain != nullptr && (ordinary_access.owner == off_turn->access.owner
+      || (off_turn->access.backbuffer != 0 && off_turn->access.backbuffer == backbuffer_identity));
+  struct SettleOffAttempt {
+    const fg::xefg::OrdinaryOffPresent* turn = nullptr;
+    fg::xefg::OrdinaryPresentAttempt attempt;
+    ~SettleOffAttempt() {
+      if (turn != nullptr) ClaimOrdinaryOffPresentColour(*turn, attempt);
+    }
+  };
+  if (scoped_off || (owner_attempt && ordinary_access.context != 0 && fg::xefg::OrdinarySdkInactive(ordinary_access))) {
+    RuntimeLock lock(runtime_mutex);
+    const auto event = ordinary_present_attempts.find(swapchain);
+    if (event == ordinary_present_attempts.end() || event->second.attempt != owner_attempt
+        || !event->second.pre_effects_full_color || (scoped_off && (!event->second.off_recording
+            || !fg::xefg::MatchesOrdinaryOffAccess(*off_turn, ordinary_access)))) return;
+  }
+  const SettleOffAttempt settle_off{.turn = (scoped_off ? off_turn : nullptr), .attempt = owner_attempt};
+  fg::xefg::OrdinaryPreEffectsWrite pre_effects_write;
+  if (!ordinary_access.allowed && ordinary_access.owner != 0 && owner_attempt && backbuffer.handle != 0 && !scoped_off
+      && !auto_fallback && !deferred && !late_bridge && present_guides.load() == kPresentGuidesOptional
+      && !screenshot::WantsFinalPresent()) {
+    RuntimeLock lock(runtime_mutex);
+    const auto event = ordinary_present_attempts.find(swapchain);
+    if (event != ordinary_present_attempts.end() && event->second.attempt == owner_attempt
+        && !event->second.receipt.executed
+        && event->second.backbuffer == reinterpret_cast<uintptr_t>(renodx::utils::directx::NativeIdentity(
+            reinterpret_cast<IUnknown*>(backbuffer.handle)))) {
+      auto& state = event->second;
+      state.pre_effects_rejection = "off_pre_fx_event_region_unavailable";
+      const auto desc = reinterpret_cast<ID3D12Resource*>(backbuffer.handle)->GetDesc();
+      if (state.pre_effects_full_color && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.MipLevels == 1
+          && desc.DepthOrArraySize == 1 && desc.SampleDesc.Count == 1) {
+        state.pre_effects_rejection = "off_pre_fx_sdk_contract_unavailable";
+        pre_effects_write = fg::xefg::QueryOrdinaryPreEffects(state.event_access, owner_attempt, state.queue,
+            static_cast<uint32_t>(desc.Width), desc.Height);
+      }
+    }
+  }
   // An armed request can reach Present without another source Evaluate.
   if (screenshot::WantsFinalPresent()) {
     RejectMixedFinalPresent(RequestedStagePlan());
@@ -4758,7 +5037,7 @@ inline void RunPresentPath(
       }
     }
   }
-  if (!ordinary_access.allowed) {
+  if (!ordinary_access.allowed && !pre_effects_write.attempt) {
     fg::xefg::ObserveOrdinaryPresentSubmission(ordinary_access, {.reason = "xefg_color_owned_or_pending"});
     RuntimeLock lock(runtime_mutex);
     const auto stream = present_streams.find(swapchain);
@@ -5152,6 +5431,57 @@ inline void RunPresentPath(
   // Optional because Direct3D 11 hands the frame to the bridge, which takes
   // runtime_mutex itself and may bring the bridge up outside it.
   std::optional<RuntimeLock> lock(std::in_place, runtime_mutex);
+  if (pre_effects_write.attempt) {
+    // ReShade owns this pre-effects event and its presenting queue. The SDK
+    // owns the color permission while On and settles this Execute at its real
+    // next call, including a successful adjacent Disable during composition.
+    const auto entry = present_streams.find(swapchain);
+    const auto event = ordinary_present_attempts.find(swapchain);
+    if (event == ordinary_present_attempts.end() || event->second.attempt != owner_attempt
+        || event->second.receipt.executed) return;
+    auto& rejection = event->second.pre_effects_rejection;
+    rejection = "off_pre_fx_mature_models_unavailable";
+    if (mixed || d3d11 || !ngx_turn->owns() || entry == present_streams.end()
+        || !entry->second.warm_color.complete
+        || !SharesWarmPresentRuntime(target, pre_effects_write.access.backbuffer, back_width, back_height)) return;
+    if (event->second.event_has_guided_sr || entry->second.guided_sr_version != event->second.event_guided_sr_version) {
+      rejection = "off_pre_fx_current_sr_guides";
+      return;
+    }
+    rejection = "off_pre_fx_event_region_unavailable";
+    if (std::ranges::any_of(ordinary_present_effects_started, [&](const auto& effect) {
+             return effect.second == pre_effects_write.access.backbuffer;
+           })) return;
+    Microsoft::WRL::ComPtr<IDXGISwapChain2> source_swapchain;
+    auto* const native_swapchain = reinterpret_cast<IUnknown*>(swapchain->get_native());
+    UINT source_width = 0;
+    UINT source_height = 0;
+    if (native_swapchain == nullptr || FAILED(native_swapchain->QueryInterface(IID_PPV_ARGS(&source_swapchain)))
+        || FAILED(source_swapchain->GetSourceSize(&source_width, &source_height))
+        || source_width != back_width || source_height != back_height) return;
+    auto& stream = entry->second;
+    rejection = "off_pre_fx_mature_neutral_contract_unavailable";
+    target.guide_mode = diagnostics::GuideMode(target.diagnostic.guides, present_guides.load());
+    const auto contract = SelectWarmPresentNeutralGuides(&stream, target, pre_effects_write.access.backbuffer,
+        reinterpret_cast<uintptr_t>(swapchain), back_width, back_height);
+    if (!contract || !EnsureOrdinaryPresentRing(back, reinterpret_cast<IUnknown*>(api_device->get_native()))) return;
+    rejection = "off_pre_fx_recording_unavailable";
+    auto& slot = present_ring.slots[(present_ring.submitted + 1) % kPresentRing];
+    const auto completed = present_ring.fence->GetCompletedValue();
+    if (completed == UINT64_MAX || completed < slot.value) return;
+    auto* native_queue = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
+    renodx::utils::directx::NativeFromReShadeProxy(&native_queue);
+    if (stream.real_guides) {
+      stream.real_guides = false;
+      ResetPresentStreamHistory(&stream, kResetSourceChange);
+    }
+    target.warm_neutral_guides = true;
+    target.workset_key = reinterpret_cast<const ID3D12Resource*>(&stream);
+    auto& block = FillPresentBlock(&stream, back, stream.warm_neutral_guides.motion, stream.warm_neutral_guides.depth,
+        *contract, back_width, back_height, 1.f, 0, false, nullptr);
+    SubmitPresentGroup(native_queue, queue, &slot, stream, block, nullptr, target, false, {}, nullptr, &pre_effects_write);
+    return;
+  }
   // A DLSS evaluate can resume while this present waits for its NGX turn.
   // The selected inline path owns that frame again; do not enhance it twice.
   const auto auto_owner_current = [&] {

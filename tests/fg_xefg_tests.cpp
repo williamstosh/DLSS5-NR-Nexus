@@ -360,9 +360,13 @@ struct Session {
   uint32_t extent_height = 3;
   bool sdk_closed = false;
   explicit Session(Gpu* value, int32_t ui_mode = 0, uint32_t init_flags = 17,
-                   DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM) : gpu(value), proxy(value->Swapchain(format)) {
-    xefg::abi::Init init{.application_swapchain = proxy.Get(), .flags = init_flags, .max_interpolated = 1, .ui_mode = ui_mode};
-    Check(Hooks::Init(handle, gpu->queue.Get(), &init) == 0, "SDK init");
+                   DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM,
+                   ID3D12CommandQueue* sdk_queue_without_application = nullptr) : gpu(value), proxy(value->Swapchain(format)) {
+    const bool has_application = sdk_queue_without_application == nullptr;
+    xefg::abi::Init init{.application_swapchain = (has_application ? proxy.Get() : nullptr),
+        .flags = init_flags, .max_interpolated = 1, .ui_mode = ui_mode};
+    auto* sdk_queue = (has_application ? gpu->queue.Get() : sdk_queue_without_application);
+    Check(Hooks::Init(handle, sdk_queue, &init) == 0, "SDK init");
     context = adapter::state.contexts.at(handle);
     context->proxy_identity = adapter::Identity(proxy.Get());
     context->enabled = true;

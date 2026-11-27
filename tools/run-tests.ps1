@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('all','update','update-lifecycle','report','branding','ui','dev-control','presets','unicode-input','native','lastgasp','sdr-policy','hdr-policy','scope','config','constants','control-mask','control-mask-execution','vulkan-control-mask','fg-xefg','fg-native','lifecycle','bridge-motion','stage-plan','edit-reuse-policy','present-frame-policy','capability-policy','adaptive-resolution','copy-slots')]
+    [ValidateSet('all','update','update-lifecycle','report','branding','ui','dev-control','presets','unicode-input','native','lastgasp','sdr-policy','hdr-policy','scope','config','constants','control-mask','control-mask-execution','vulkan-control-mask','fg-xefg','fg-native','look-motion-ring','lifecycle','bridge-motion','stage-plan','edit-reuse-policy','present-frame-policy','capability-policy','adaptive-resolution','copy-slots')]
     [string[]]$Suite = @('all'),
     [string]$SourceRoot = (Split-Path $PSScriptRoot -Parent),
     [string]$HostRoot = (Join-Path (Split-Path $PSScriptRoot -Parent) '.local/renodx'),
@@ -57,6 +57,7 @@ $sources = [ordered]@{
     'control-mask-execution'='control_mask_execution_tests'
     'vulkan-control-mask'='vulkan_control_mask_tests'
     'fg-xefg'='fg_xefg_tests'; 'fg-native'='fg_native_tests'
+    'look-motion-ring'='look_motion_ring_tests'
     lifecycle='fg_lifecycle_tests'; 'bridge-motion'='d3d11_bridge_motion_tests'
     'stage-plan'='stage_plan_tests'
     'edit-reuse-policy'='edit_reuse_policy_tests'
@@ -67,11 +68,11 @@ $sources = [ordered]@{
 }
 $executionPolicySuites = @('edit-reuse-policy','present-frame-policy','capability-policy')
 $dependencyCheckedSuites = $executionPolicySuites + @('adaptive-resolution')
-$macroSuites = @('fg-native','bridge-motion','adaptive-resolution','vulkan-control-mask','update','update-lifecycle')
+$macroSuites = @('fg-native','look-motion-ring','bridge-motion','adaptive-resolution','vulkan-control-mask','update','update-lifecycle')
 if ($Suite -contains 'all') { $Suite = @($sources.Keys) }
 if ($DevControlMode -ne 'Auto') {
     if (-not @($Suite | Where-Object { $_ -in $macroSuites }).Count) {
-        throw '-DevControlMode Off/On requires fg-native, bridge-motion, adaptive-resolution, vulkan-control-mask, update or update-lifecycle.'
+        throw '-DevControlMode Off/On requires fg-native, look-motion-ring, bridge-motion, adaptive-resolution, vulkan-control-mask, update or update-lifecycle.'
     }
     if ($env:CL -match 'NR_NEXUS_DEV_CONTROL\b' -or $env:_CL_ -match 'NR_NEXUS_DEV_CONTROL\b') {
         throw 'Explicit DEV control mode cannot be combined with NR_NEXUS_DEV_CONTROL in CL or _CL_.'
@@ -221,7 +222,7 @@ foreach ($item in $Suite) {
     }
     $link = $libraries
     if ($item -in $dependencyCheckedSuites -or $item -in @('branding','sdr-policy','hdr-policy','scope','stage-plan','control-mask')) { $link = @() }
-    if ($item -in @('fg-native','bridge-motion','vulkan-control-mask')) {
+    if ($item -in @('fg-native','look-motion-ring','bridge-motion','vulkan-control-mask')) {
         if (-not (Test-Path -LiteralPath "$ShaderIncludeDirectory/embed/shaders.h")) { throw 'Build new shaders first.' }
         $arguments += @('/bigobj','/Gy','/Gw','/DNDEBUG','/DRESHADE_ADDON=1',
             "/I$ShaderIncludeDirectory", "/I$HostRoot/external/DLSS/include",
@@ -374,7 +375,56 @@ foreach ($item in $Suite) {
                             @{ path=$_; sha256=(Get-FileHash -LiteralPath $_).Hash }
                         } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $directory 'native-ngx-runtime-inputs.json') -Encoding utf8
                         $nativeArgument = "--$case"
-                        if ($case -eq 'nr-edit-reuse-jitter') {
+                        if ($case -eq 'present-original-handoff') {
+                            $variantFailures = [Collections.Generic.List[string]]::new()
+                            foreach ($variant in @('hot','cold','core-live','core-idle')) {
+                                $name = if ($variant -eq 'hot') { $case } else { "$case-$variant" }
+                                $variantDirectory = Join-Path $directory "$case-variants/$variant"
+                                $variantExe = Join-Path $variantDirectory ([IO.Path]::GetFileName($exe))
+                                $linkedInputs = @($exe, $runtimeLink, $srRuntimeLink) | Where-Object { $_ }
+                                $createdLinks = [Collections.Generic.List[string]]::new()
+                                $variantOutputs = @()
+                                try {
+                                    [void][IO.Directory]::CreateDirectory($variantDirectory)
+                                    foreach ($inputPath in $linkedInputs) {
+                                        $childLink = Join-Path $variantDirectory ([IO.Path]::GetFileName($inputPath))
+                                        New-Item -ItemType HardLink -Path $childLink -Target $inputPath -ErrorAction Stop | Out-Null
+                                        $createdLinks.Add($childLink)
+                                    }
+                                    $plannedOutputs = @("$name.stdout.log", "$name.stderr.log", "$name.json") | ForEach-Object {
+                                        Join-Path $variantDirectory $_
+                                    }
+                                    foreach ($variantOutput in $plannedOutputs) {
+                                        if (Test-Path -LiteralPath $variantOutput) { throw "Variant output already exists: $variantOutput" }
+                                    }
+                                    $variantOutputs = $plannedOutputs
+                                    Invoke-TestProcess $variantExe $variantDirectory $name @(
+                                        $nativeArgument, ('"' + $NativeNgxProjectIdPath + '"'), $variant
+                                    ) -TimeoutMilliseconds 90000 -DeferFailureCleanup
+                                } catch {
+                                    $variantFailures.Add($_.Exception.Message)
+                                } finally {
+                                    foreach ($childLink in $createdLinks) {
+                                        try {
+                                            if (Test-Path -LiteralPath $childLink) { Remove-Item -LiteralPath $childLink -ErrorAction Stop }
+                                        } catch {
+                                            $variantFailures.Add("Failed to remove variant link ${childLink}: $($_.Exception.Message)")
+                                        }
+                                    }
+                                    foreach ($variantOutput in $variantOutputs) {
+                                        try {
+                                            if (Test-Path -LiteralPath $variantOutput) {
+                                                $destination = Join-Path $directory ([IO.Path]::GetFileName($variantOutput))
+                                                Move-Item -LiteralPath $variantOutput -Destination $destination -ErrorAction Stop
+                                            }
+                                        } catch {
+                                            $variantFailures.Add("Failed to collect variant output ${variantOutput}: $($_.Exception.Message)")
+                                        }
+                                    }
+                                }
+                            }
+                            if ($variantFailures.Count) { throw ($variantFailures -join [Environment]::NewLine) }
+                        } elseif ($case -eq 'nr-edit-reuse-jitter') {
                             try {
                                 Invoke-TestProcess $exe $directory $case @($nativeArgument, $NativeNgxProjectIdPath) -TimeoutMilliseconds 90000 -DeferFailureCleanup
                             } finally {

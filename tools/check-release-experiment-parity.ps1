@@ -38,7 +38,7 @@ function Get-ReleaseParityBuildContext([string]$SourceRoot, [string]$HostRoot) {
         $dependencies[$dependency.path] = $commit
     }
     $patterns = @('*.hpp','*.h','*.cpp','shaders/*.hlsl','shaders/*.hlsli','shaders/*.slang',
-        'tools/*.ps1','tools/release-experiment-parity.json','host/*.json','host/*.patch')
+        'tools/*.ps1','tools/release-experiment-parity.json','tests/run-ui-layout-tests.ps1','host/*.json','host/*.patch')
     $changedFiles = @(& git --no-optional-locks -C $SourceRoot -c core.quotePath=false diff --name-only HEAD -- @patterns)
     if ($LASTEXITCODE -ne 0) { throw 'Cannot enumerate changed test inputs.' }
     $changedFiles += @(& git --no-optional-locks -C $SourceRoot -c core.quotePath=false ls-files --others --exclude-standard -- @patterns)
@@ -305,7 +305,7 @@ function Get-ReleaseParityRegistration([string]$SourceRoot, [switch]$AllowPendin
         }
         $caseNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         foreach ($case in $row.cases) {
-            if ($case.suite -cnotin @('fg-native','bridge-motion','adaptive-resolution','update','update-lifecycle') -or
+            if ($case.suite -cnotin @('fg-native','bridge-motion','adaptive-resolution','update','update-lifecycle','ui','look-motion-ring') -or
                 -not $caseNames.Add("$($case.suite)/$($case.name)") -or $case.log -cnotmatch '^[a-z0-9-]+$' -or
                 -not $case.receipt.StartsWith('^') -or @($case.scenarios).Count -eq 0 -or
                 @($case.scenarios | Sort-Object -Unique).Count -ne $case.scenarios.Count -or

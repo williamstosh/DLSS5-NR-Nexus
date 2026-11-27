@@ -1,6 +1,56 @@
 {
   "rows": [
     {
+      "id": "d3d12-look-motion-ring",
+      "state": "ready",
+      "intent": [],
+      "commands": [],
+      "producer": "D3D12 Look tracks the actual motion texture and its descriptor slot on every successful bind.",
+      "consumer": "The descriptor ring checks the slot's recorded readers before reuse, and the existing retirement path preserves displaced textures for their remaining users.",
+      "success": "A completed Look recording releases its slot even when a game command list can still replay a reference to the old texture. The texture is released when its final recording ends.",
+      "refusal": "Slots with in-flight or replayable descriptor readers stay occupied, and real binding failures still contribute to the missing-motion count.",
+      "fallback": "When no slot can be reused, detail stabilization continues with its existing no-motion fallback.",
+      "sources": [
+        ["dlssnr.hpp", "inline void ReleaseLookMotionView("],
+        ["dlssnr.hpp", "submission::TrackUse(command_list, &(*res.look_motion_slots)[ring]);"]
+      ],
+      "cases": [
+        {
+          "suite": "look-motion-ring", "name": "test", "log": "test", "existingTrace": true,
+          "receipt": "^Look motion ring WARP contract passed$",
+          "scenarios": ["descriptor-and-texture-lifetime"],
+          "expect": {
+            "descriptor-and-texture-lifetime": "^Look motion ring WARP contract passed$"
+          }
+        }
+      ]
+    },
+    {
+      "id": "runtime-monitor-startup",
+      "state": "ready",
+      "intent": [],
+      "commands": [],
+      "producer": "The selected effect runtime supplies its Win32 window and the current overlay supplies interaction intent.",
+      "consumer": "DrawIndependentMonitor refreshes diagnostics and checks window visibility before consuming the frame's drawing opportunity.",
+      "success": "A passive monitor remains suppressed while its valid window is hidden, preserves sampling and saved geometry, and draws when the window becomes visible.",
+      "refusal": "The hidden passive frame does not commit drawing or geometry even if the swapchain already produces frames.",
+      "fallback": "Same-frame interactive drawing and drawing without a valid Win32 window follow the existing monitor path.",
+      "sources": [
+        ["monitor_runtime.hpp", "inline void DrawIndependentMonitor("],
+        ["monitor_runtime.hpp", "IsWindow(window) && !IsWindowVisible(window)"]
+      ],
+      "cases": [
+        {
+          "suite": "ui", "name": "monitor-session", "log": "monitor-session", "existingTrace": true,
+          "receipt": "^PASS production monitor session evidence cases; checks=[1-9][0-9]*$",
+          "scenarios": ["startup-visibility"],
+          "expect": {
+            "startup-visibility": "^(?<trace>PASS production monitor session evidence cases); checks=[1-9][0-9]*$"
+          }
+        }
+      ]
+    },
+    {
       "id": "online-update",
       "state": "ready",
       "intent": [],
@@ -384,13 +434,13 @@
       "state": "ready",
       "intent": [],
       "commands": [],
-      "producer": "Committed NR configuration, successful SDK declarations and each actual swapchain/BB identify the output owner. ReconcileNrService runs after configuration/SDK locks are released.",
-      "consumer": "Ordinary Present and XeFG revalidate the same color at their final owned submission. Each pool closes its own replay and retains pending SDK/GPU operands. Status uses the selected output and epoch; only its verified delivery shows green.",
-      "success": "The first legal scene/menu version is delivered once. Compatible single-backbuffer dual Pass retains one exact live signed context and the two mature models; Optional missing guides reuse only the proven layout.",
-      "refusal": "Replayable writes, unusable first Execute proof, and genuine output/provider conflicts retain their protection. Optional no-ID frames stay with the enabled SDK until an explicit Off permits ordinary delivery.",
-      "fallback": "A late result settles only its own attempt. Changed true inputs use existing cold preparation; there is no new dependency for unordered or replayable work.",
+      "producer": "Committed NR configuration, accepted SDK declarations and actual swapchain/BB identify the physical output. An ordinary NR submission can prove its recording interface for this output, image and initialization generation.",
+      "consumer": "The ordinary pre-effects submission and XeFG Service revalidate the physical output, underlying queue and current write ownership. Early Service may use the completed ordinary recording proof when its preferred interfaces are unavailable. A verified delivery updates the selected output's active status.",
+      "success": "The first legal scene/menu version is delivered once. Compatible single-backbuffer dual Pass maintains the physical output's established direct group across SDK transitions and retains the proven Optional guide layout.",
+      "refusal": "Replayable writes, unusable first Execute proof, and genuine output/provider conflicts retain their protection. An ordinary recording interface does not establish direct model ownership or prove delivery.",
+      "fallback": "A late result settles only its attempt. An incompatible or immature group uses proven preparation, and frames without a lawful writer remain unserved.",
       "nativeQualification": ["--present-original-handoff"],
-      "nativeEvidenceBoundary": "One original signed runtime and its exact ReShade recording face, with a mock SDK first GPU read. Displayed output and Intel internal first read are separate.",
+      "nativeEvidenceBoundary": "The identified NR runtime, its direct entry points and the exact ReShade recording interface qualify Core-first startup, model ownership and mature dual-Pass handoffs with a mock SDK first GPU read. The actual runtime hash and version are recorded for each run.",
       "sources": [
         ["preset_runtime.hpp", "fg::xefg::ReconcileNrService();"],
         ["dlssnr.hpp", "fg::xefg::ReconcileNrService();"],
@@ -404,6 +454,12 @@
         ["fg_native.hpp", "if (stream.awaiting_xefg_delivery || keep_resources)"],
         ["present_path.hpp", "fg::xefg::QueryOrdinaryPresent("],
         ["present_path.hpp", "fg::xefg::WithOrdinaryPresentCommit("],
+        ["fg_xefg.hpp", "inline HRESULT PresentWithOrdinaryOffTurn("],
+        ["fg_xefg.hpp", "internal::QueryOrdinaryPreEffectsLocked(write.access, write.attempt, queue, width, height)"],
+        ["fg_xefg.hpp", "inline void AcceptOrdinaryOffPresentReceipt("],
+        ["present_path.hpp", "proof = {.owner = output, .device = std::move(face), .queue = submission_fact.queue"],
+        ["fg_native.hpp", "auto& proof = entry->second.ordinary_recording_face;"],
+        ["fg_native.hpp", "SharedPresentColor shared;"],
         ["present_path.hpp", "submission::OutputWriteOrdered("],
         ["fg_xefg.hpp", "inline OrdinaryPresentAccess QueryOrdinaryPresent("],
         ["fg_xefg.hpp", "inline OrdinaryPresentRecordResult TryRecordOrdinaryPresentDelivery("],
@@ -451,11 +507,14 @@
         { "suite": "fg-native", "name": "xefg-present-handoff", "log": "xefg-present-handoff",
           "receipt": "^PASS xefg-present-handoff evidence=WARP\\+MOCK passes=1 same_backbuffer=1 full_rgba=1$",
           "existingTrace": true,
-          "scenarios": ["present-handoff", "ordinary-present-receipt", "ordinary-receipt-game-reset", "load-neutral-continuity"],
+          "scenarios": ["present-handoff", "ordinary-present-receipt", "ordinary-receipt-game-reset", "off-present-turn", "off-pre-fx-handoff", "first-handoff-status", "load-neutral-continuity"],
           "expect": {
             "present-handoff": "^PASS xefg-present-handoff evidence=WARP\\+MOCK passes=1 same_backbuffer=1 full_rgba=1$",
             "ordinary-present-receipt": "^PASS xefg-ordinary-present-receipt evidence=WARP\\+MOCK same_version=1 next_version=1 sdk_failure=1 late_end=1 distinct_output=1 hudless_conflict=1 no_sdk_finish=1$",
             "ordinary-receipt-game-reset": "^PASS xefg-ordinary-receipt-game-reset evidence=WARP\\+MOCK game_reset_delta=1 same_version_write=1 sdk_writes=0 next_version_reset=1$",
+            "off-present-turn": "^PASS xefg-off-present-turn evidence=WARP\\+MOCK late_disable=1 missing_pre_fx=1 prior_write=1 nested_write=1 full_present1=1 partial_present1_rejected=1 scroll_rejected=1$",
+            "off-pre-fx-handoff": "^PASS xefg-off-pre-fx-handoff evidence=WARP\\+MOCK two_pass=1 exact_disable=1 ui_retained=1 foreign_queue_rejected=1 late_real_guides=1 stale_epoch_rejected=1 next_version=1$",
+            "first-handoff-status": "^PASS xefg-first-handoff-status evidence=WARP\\+MOCK fresh=1 prepared=1 unserved=1 sdk_failure=1 selected_output=1 old_epoch=1 failed_disable=1$",
             "load-neutral-continuity": "^PASS xefg-load-neutral-guides evidence=WARP\\+MOCK continuity=1 two_pass=1 actual_pixels=1 depth_modes=1 game_reset=1 true_rebuild=1$"
           } },
         { "suite": "fg-native", "name": "xefg-ordinary-receipt-first-signal", "log": "xefg-ordinary-receipt-first-signal",

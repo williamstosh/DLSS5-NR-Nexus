@@ -17,7 +17,8 @@ $previousCl = $env:CL
 $outcome = 'Failed'
 $policySuites = @('edit-reuse-policy','present-frame-policy','capability-policy','adaptive-resolution')
 $suites = @('native','sdr-policy','hdr-policy','scope','config','constants','stage-plan') +
-    $policySuites + @('copy-slots','lifecycle','fg-native','update','update-lifecycle')
+    $policySuites + @('copy-slots','lifecycle','fg-native','look-motion-ring','update','update-lifecycle')
+$explicitOffSuites = @('fg-native','look-motion-ring','adaptive-resolution','update','update-lifecycle')
 $independentCases = [ordered]@{
     'native-prefg-resolution'='^PASS native-prefg-resolution hardware=0 steady_pairs_observed='
     'present-chain'='^PASS B1 WARP format=DXGI_FORMAT_R8G8B8A8_UNORM source_input='
@@ -98,7 +99,7 @@ try {
             $state = Get-Content -LiteralPath (Join-Path $directory 'artifact-lifecycle.json') -Raw | ConvertFrom-Json -AsHashtable
             $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json -AsHashtable
             $identity = $result['buildIdentity']
-            $explicitOff = $suite -notin @('fg-native','adaptive-resolution','update','update-lifecycle') -or
+            $explicitOff = $suite -notin $explicitOffSuites -or
                 ($identity -and $identity.mode -ceq 'Off' -and $identity.softwareOnly -eq $true)
             if ($state.status -ceq 'Passed' -and $state.sourceCommit -ceq $summary.sourceCommit -and
                 $result.suite -ceq $suite -and $result.build -ceq 'passed' -and $result.run -ceq 'passed' -and $explicitOff) {
@@ -117,7 +118,7 @@ try {
     })
     if ($needed.Count) {
         $baseRun = @{Suite=$needed; SoftwareOnly=$true; UiPreview='None'; OutputDirectory=$suiteOutput; RetentionMode='Standard'}
-        if (@($needed | Where-Object { $_ -in @('fg-native','adaptive-resolution','update','update-lifecycle') }).Count) { $baseRun.DevControlMode = 'Off' }
+        if (@($needed | Where-Object { $_ -in $explicitOffSuites }).Count) { $baseRun.DevControlMode = 'Off' }
         & (Join-Path $PSScriptRoot 'run-tests.ps1') @baseRun @compileInputs
     }
     $summary['reusedSuites'] = $reusedSuites
@@ -192,18 +193,37 @@ try {
         -PublicLog (Join-Path $caseDirectories['nr-edit-reuse-contracts-public'] 'test.stdout.log') -BridgeLog $bridgeStdout
 
     $devOutput = Join-Path $OutputDirectory 'dev-suites'
-    & (Join-Path $PSScriptRoot 'run-tests.ps1') -Suite fg-native,bridge-motion,adaptive-resolution,update,update-lifecycle `
+    $devSuites = $explicitOffSuites + 'bridge-motion'
+    & (Join-Path $PSScriptRoot 'run-tests.ps1') -Suite $devSuites `
         -NativeCase $devCases -BridgeCase $pairedBridgeCases -DevControlMode On `
         -SoftwareOnly -UiPreview None -OutputDirectory $devOutput -RetentionMode Standard @compileInputs
+    $monitorPair = [ordered]@{}
+    foreach ($mode in 'Off','On') {
+        $suiteRoot = if ($mode -eq 'Off') { $suiteOutput } else { $devOutput }
+        $directory = Join-Path $suiteRoot 'ui'
+        & (Join-Path $repo 'tests/run-ui-layout-tests.ps1') -MonitorSessionMode $mode `
+            -OutputDirectory $directory -RetentionMode Standard @compileInputs
+        $result = Get-Content -LiteralPath (Join-Path $directory 'result.json') -Raw | ConvertFrom-Json -AsHashtable
+        if ($result.build -cne 'passed' -or $result.run -cne 'passed' -or $result.buildIdentity.mode -cne $mode) {
+            throw "UI monitor session requires a completed $mode run."
+        }
+        $monitorPair[$mode] = $result.buildIdentity
+    }
+    if ($monitorPair.Off.executableSha256 -ceq $monitorPair.On.executableSha256) {
+        throw 'UI monitor session requires distinct ordinary and DEV executables.'
+    }
+    $summary.releaseParity.builds['ui'] = $monitorPair
     $after = Get-ReleaseParityBuildContext $repo $hostRoot
     if (($after | ConvertTo-Json -Depth 5 -Compress) -cne ($buildContext | ConvertTo-Json -Depth 5 -Compress)) {
         throw 'Core source or locked dependencies changed between the two modes.'
     }
-    $ordinaryBuilds = @{ 'fg-native'=$fg; 'bridge-motion'=$bridge; 'adaptive-resolution'=$ordinary['adaptive-resolution']; update=$ordinary['update']; 'update-lifecycle'=$ordinary['update-lifecycle'] }
+    $ordinaryBuilds = @{ 'bridge-motion'=$bridge }
+    foreach ($suite in $explicitOffSuites) { $ordinaryBuilds[$suite] = $ordinary[$suite] }
     foreach ($suite in $ordinaryBuilds.Keys) {
         $summary.releaseParity.builds[$suite] = Assert-ReleaseParityBuildPair $suite $ordinaryBuilds[$suite] `
             (Join-Path $devOutput $suite) $buildContext
     }
+    $ordinaryBuilds['ui'] = Join-Path $suiteOutput 'ui'
     $devController = Get-Content -LiteralPath (Join-Path $devOutput 'adaptive-resolution/result.json') -Raw | ConvertFrom-Json
     if ($devController.dependency_policy -cne 'passed') { throw 'DEV controller requires STATIC dependency isolation.' }
     $devFg = Join-Path $devOutput 'fg-native'

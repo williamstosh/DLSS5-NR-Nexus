@@ -63,6 +63,7 @@ struct OutputRuntimeFixture final : reshade::api::effect_runtime {
     bool get_pipeline_shader_group_handles(reshade::api::pipeline pipeline, uint32_t first, uint32_t count, void *out_handles) override { throw std::logic_error("unsupported output fixture operation"); }
   } device;
   std::array<reshade::api::resource, 2> buffers{{{0xADA100}, {0xADA200}}};
+  HWND window = nullptr;
   uint32_t current_buffer = 0;
   fixture_rate::OutputIdentity output;
   reshade::api::effect_runtime* saved_owner = fixture_runtime::monitor_runtime.load();
@@ -108,7 +109,7 @@ struct OutputRuntimeFixture final : reshade::api::effect_runtime {
   void get_private_data(const uint8_t guid[16], uint64_t *data) const override { throw std::logic_error("unsupported output fixture operation"); }
   void set_private_data(const uint8_t guid[16], const uint64_t data) override { throw std::logic_error("unsupported output fixture operation"); }
   reshade::api::device *get_device() override { return &device; }
-  void *get_hwnd() const override { return nullptr; }
+  void *get_hwnd() const override { return window; }
   reshade::api::resource get_back_buffer(uint32_t index) override { return buffers.at(index); }
   uint32_t get_back_buffer_count() const override {
     return (has_output ? static_cast<uint32_t>(buffers.size()) : 0);

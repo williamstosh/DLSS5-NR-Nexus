@@ -1047,6 +1047,8 @@ struct FinalResources {
   // The motion ring's resources, each holding a reference so the write-once
   // view can never outlive (or be aliased by a successor of) what it views.
   ID3D12Resource* motion_views[kMotionRingSize] = {};
+  // Each descriptor has its own tracker key, stable across workset moves.
+  std::unique_ptr<std::array<uint8_t, kMotionRingSize>> look_motion_slots;
   // The exposure ring's resources, held for the same reason.
   ID3D12Resource* exposure_views[kExposureRingSize] = {};
   // Depth guides rotate independently of the workset; each view is write-once
@@ -1365,10 +1367,10 @@ inline std::atomic_uint32_t max_worksets = kDefaultMaxWorksets;
 // frees caused them; Keep permits a retained-resource comparison without
 // claiming to control driver cleanup after process death. 0 = Retire
 // (the default, unchanged since
-// v6.5.3): idle worksets retire and release once proven.  1 = Keep: the v4.x
-// posture - idle retirement never runs and nothing releases at runtime; pool
-// pressure is resolved by recycling in place on exact proof only, an evaluate
-// that cannot reuse or allocate declines, and everything frees at teardown.
+// v6.5.3): idle worksets retire and release once proven.  1 = Keep: idle
+// worksets and features stay resident until teardown; pool pressure is
+// resolved by recycling in place on exact proof only, and an evaluate that
+// cannot reuse or allocate declines. Replaced ring entries can still release.
 // Ini-only like NRMaxWorksets: a stability escape hatch, not a look control.
 constexpr uint32_t kDefaultWorksetFreePolicy = 0;
 inline std::atomic_uint32_t workset_free_policy = kDefaultWorksetFreePolicy;
@@ -1388,6 +1390,9 @@ constexpr uint32_t kDefaultDisableRelease = 0;
 inline std::atomic_uint32_t disable_release_mode = kDefaultDisableRelease;
 inline std::atomic_bool disabled_resources_released{false};
 inline std::vector<RetiredFinalResources> retired_final_resources;
+// Owns one reference per displaced Look texture still used by a recording.
+// Guarded by runtime_mutex along with the worksets.
+inline std::unordered_set<ID3D12Resource*> retired_look_motion_views;
 
 struct HdrCaptureConstants {
   uint32_t roi[4]{};
@@ -5733,6 +5738,16 @@ inline bool LoadDirectApi(std::optional<bool> private_runtime = std::nullopt) {
   return true;
 }
 
+inline void ReleaseLookMotionView(ID3D12Resource** view) {
+  if (*view == nullptr) return;
+  // A game recording can still use the texture after the descriptor is idle.
+  if (!submission::ResourceReleasable(*view) && retired_look_motion_views.insert(*view).second) {
+    *view = nullptr;
+  } else {
+    ReleaseCom(*view);
+  }
+}
+
 inline void ReleaseFinalResources(FinalResources& resources) {
   if (resources.resolution_tail != nullptr) {
     ReleaseFinalResources(*resources.resolution_tail);
@@ -5761,7 +5776,7 @@ inline void ReleaseFinalResources(FinalResources& resources) {
   ReleaseCom(resources.look_up_neural);
   ReleaseCom(resources.look_trace_histogram);
   ReleaseCom(resources.look_trace_blocks);
-  for (ID3D12Resource*& motion : resources.motion_views) ReleaseCom(motion);
+  for (auto*& motion : resources.motion_views) ReleaseLookMotionView(&motion);
   for (ID3D12Resource*& exposure : resources.exposure_views) ReleaseCom(exposure);
   for (ID3D12Resource*& depth : resources.control_mask_depth_views) ReleaseCom(depth);
   for (ID3D12Resource*& motion : resources.control_mask_motion_views) ReleaseCom(motion);
@@ -5775,13 +5790,10 @@ inline void ReleaseFinalResources(FinalResources& resources) {
 // the look surfaces, and the shader-visible descriptor heap.  There are
 // deliberately no readback resources in v6; norm_commit is the only
 // cross-frame normalization state and it is GPU-resident.
-// The view rings' entries (feed v2's exposure textures, the look's motion
-// vectors) are deliberately absent: each bind tracks the one resource it
-// views (RingSlot), which is what lets a full ring prove an entry idle and
-// recycle it (listing them here tracked every entry on every evaluate, so
-// none ever was: the motion ring stayed full on 80 % of Silent Hill 2's
-// frames through rc10).  Retirement still covers them: every list that binds
-// a ring view binds this workset's heap, listed below.  norm_commit is
+// Ring binds track only the entries they use so unused slots can recycle.
+// Look tracks the texture and the slot separately. Every list that binds a
+// slot also tracks the heap below, so its proof covers the slot keys' lifetime.
+// norm_commit is
 // absent for the same reason (rc11): every workset of a stream binds the
 // stream's texel, so tracked here it would be in use on every evaluate and
 // no workset of a running stream could ever prove idle - no recycle, no
@@ -6334,6 +6346,15 @@ inline void PruneCompletedSubmissionUses() {
     gpu_timers::PreserveSubmissionProof(marker, receipts);
   });
   control_mask_execution::Prune();
+  // Ring replacements can retire even when the worksets themselves are kept
+  // or NR is bypassed. The shutdown quiesce latch still holds runtime frees.
+  if (!shutdown_quiesce_latched.load(std::memory_order_relaxed)) {
+    std::erase_if(retired_look_motion_views, [](ID3D12Resource* motion) {
+      if (!submission::ResourceReleasable(motion)) return false;
+      motion->Release();
+      return true;
+    });
+  }
 }
 
 // Requires runtime_mutex. Releases only entries with a positive completion
@@ -6514,6 +6535,8 @@ inline void FlushRetiredResources() {
     ++worksets_released;
   }
   retired_final_resources.clear();
+  for (auto* motion : retired_look_motion_views) motion->Release();
+  retired_look_motion_views.clear();
   FlushRetiredNrFeatures();
 }
 
@@ -10519,30 +10542,34 @@ inline void BindCodecV6(
 
 // A write-once view ring (feed v2's exposure sets, the look's motion views):
 // the slot whose view holds `resource`, else an empty slot, else - with exact
-// proofs only (the queue hooks live) - a slot whose resource the submission
-// tracker proves no recorded list can still execute or replay.  That entry's
-// reference is dropped here (counted in `recycled`) and the slot comes back
-// empty for the caller to rewrite.  N when every entry may still be read:
-// counted in `full`, and the first such frame logs `consequence`.
-// A view is never rewritten while a list that bound it may run: every bind
-// tracks the resource it views (the callers TrackUse it), and a list that
-// bound the slot for an older resource was proven complete when that one
-// was recycled.  Without exact proofs nothing is rewritten: a descriptor is
-// read when the list executes, so a rewrite under a pending list would feed
-// it another frame's resource.
+// proofs only (the queue hooks live) - a slot whose recorded readers have
+// completed and cannot replay. A bind tracks its texture and, for Look,
+// its own slot key. The displaced Look texture can outlive the slot.
+// Returns N when no slot is safe to rewrite; the first such frame logs
+// `consequence` and each occurrence counts toward `full`.
 template <size_t N>
 inline uint32_t RingSlot(
     ID3D12Resource* (&views)[N], const ID3D12Resource* resource,
     std::atomic_uint64_t* recycled = nullptr, std::atomic_uint64_t* full = nullptr,
-    const char* consequence = nullptr) {
+    const char* consequence = nullptr, const std::array<uint8_t, N>* slot_keys = nullptr) {
   uint32_t ring = 0;
   while (ring < N && views[ring] != nullptr && views[ring] != resource) ++ring;
   const bool proofs = queue_tracking_active.load();
   if (ring == N && proofs) {
     ring = 0;
-    while (ring < N && !submission::ResourceReleasable(views[ring])) ++ring;
+    for (; ring < N; ++ring) {
+      const void* key = views[ring];
+      if (slot_keys != nullptr) {
+        key = &(*slot_keys)[ring];
+      }
+      if (submission::ResourceReleasable(key)) break;
+    }
     if (ring < N) {
-      ReleaseCom(views[ring]);
+      if (slot_keys != nullptr) {
+        ReleaseLookMotionView(&views[ring]);
+      } else {
+        ReleaseCom(views[ring]);
+      }
       if (recycled != nullptr) {
         recycled->fetch_add(1, std::memory_order_relaxed);
       }
@@ -11496,21 +11523,19 @@ inline LookRoute RunLookStage(
     submission::TrackUse(command_list, history.buffers[0]);
     submission::TrackUse(command_list, history.buffers[1]);
     if (settings.stabilize == 2u && frame.motion != nullptr) {
-      // A write-once view per distinct motion-vector resource (RingSlot).
-      // UE5 cycles more than four: until rc11 the ring never recycled (its
-      // entries were tracked on every evaluate), so Silent Hill 2 ran the
-      // Motion stabilizer without motion on 80 % of frames (ring_full=2040
-      // of shaped=2533).  A frame with no provably idle entry runs static
-      // (counted).
+      if (res.look_motion_slots == nullptr) {
+        res.look_motion_slots = std::make_unique<std::array<uint8_t, kMotionRingSize>>();
+      }
       const uint32_t ring = RingSlot(
           res.motion_views, frame.motion, &look_motion_ring_recycled,
-          &look_motion_ring_full, "the look's Stabilize runs without motion");
+          &look_motion_ring_full, "the look's Stabilize runs without motion", res.look_motion_slots.get());
       if (ring < kMotionRingSize) {
         if (res.motion_views[ring] == nullptr) {
           frame.motion->AddRef();
           res.motion_views[ring] = frame.motion;
           SetSourceView(device, res, frame.motion, kDescriptorMotionRing + ring);
         }
+        submission::TrackUse(command_list, &(*res.look_motion_slots)[ring]);
         submission::TrackUse(command_list, frame.motion);
         // DLSS motion vectors (Programming Guide 3.6): MV * MVecScale is the
         // displacement to the previous position in pixels of the grid the
@@ -29286,8 +29311,8 @@ inline void RunLifecycleTick(int64_t present_ns, bool from_present) {
     SettleRetiredQueueFences();
     UpdateShutdownQuiesce(from_present, present_ns);
     // Keep policy (NRWorksetFreePolicy=1) and the quiesce latch both hold:
-    // no idle retirement, no retired-resource releases at runtime - see the
-    // comments at their definitions.  SettleRetiredQueueFences still runs
+    // no idle retirement or release of retired worksets and features.
+    // SettleRetiredQueueFences still runs
     // above: it settles destroyed queues' fences, frees nothing, and a
     // pending lease left unsettled would block the recycle fast path.
     if (workset_free_policy.load(std::memory_order_relaxed) == 0u
@@ -29444,6 +29469,7 @@ inline void OnInitEffectRuntime(reshade::api::effect_runtime* runtime) {
 }
 
 inline void OnDestroyEffectRuntime(reshade::api::effect_runtime* runtime) {
+  ObserveOrdinaryPresentEffects(runtime, false);
   std::scoped_lock lock(overlay_listener_mutex);
   std::erase(live_effect_runtimes, runtime);
   effect_runtime_generations.erase(runtime);
@@ -29507,7 +29533,7 @@ inline void ServiceDisabledNr() {
   // Nothing to release in a never-engaged or Vulkan-only session. Vulkan
   // features have no equivalent recording proof and keep their normal
   // game-feature-release/device-teardown lifetime.
-  if (worksets.empty() && retired_final_resources.empty()
+  if (worksets.empty() && retired_final_resources.empty() && retired_look_motion_views.empty()
       && active_features.load(std::memory_order_relaxed) == 0u
       && retired_nr_features.empty() && present_ring.device == nullptr
       && present_streams.empty() && !fg_service::HasResources() && present_retired.empty()
@@ -29554,14 +29580,14 @@ inline void OnFinishPresent(reshade::api::command_queue*, reshade::api::swapchai
 inline void OnPresent(
     reshade::api::command_queue* queue,
     reshade::api::swapchain* swapchain,
-    const reshade::api::rect*,
-    const reshade::api::rect*,
-    uint32_t,
-    const reshade::api::rect*) {
+    const reshade::api::rect* source,
+    const reshade::api::rect* destination,
+    uint32_t dirty_rect_count,
+    const reshade::api::rect* dirty_rects) {
   if (shutting_down.load(std::memory_order_acquire)) return;
   CancelLateBridgePresent(swapchain);
   GuardHook([&] {
-    BeginOrdinaryPresentAttempt(queue, swapchain);
+    BeginOrdinaryPresentAttempt(queue, swapchain, source, destination, dirty_rect_count, dirty_rects);
   });
   StartAsyncAutoscalePreparation();
   // Bind to the selected runtime's device and first backbuffer, rather than
@@ -35671,6 +35697,7 @@ inline void OnUpdateInit(reshade::api::effect_runtime*) {
 }
 
 inline void OnUpdatePresent(reshade::api::effect_runtime* runtime) {
+  ObserveOrdinaryPresentEffects(runtime, false);
   {
     const std::unique_lock lock(overlay_listener_mutex);
     if (!live_effect_runtimes.empty() && runtime != live_effect_runtimes.front()) return;
@@ -37744,6 +37771,10 @@ inline void RegisterReShadeCallbacks() {
   reshade::register_event<reshade::addon_event::destroy_swapchain>(internal::OnDestroySwapchain);
   reshade::register_event<reshade::addon_event::present>(internal::OnPresent);
   reshade::register_event<reshade::addon_event::finish_present>(internal::OnFinishPresent);
+  reshade::register_event<reshade::addon_event::reshade_begin_effects>(
+      +[](reshade::api::effect_runtime* runtime, reshade::api::command_list*, reshade::api::resource_view, reshade::api::resource_view) {
+        internal::GuardHook([&] { internal::ObserveOrdinaryPresentEffects(runtime, true); });
+      });
   reshade::register_event<reshade::addon_event::init_effect_runtime>(internal::OnInitEffectRuntime);
   reshade::register_event<reshade::addon_event::init_effect_runtime>(internal::OnUpdateInit);
   reshade::register_event<reshade::addon_event::reshade_present>(internal::OnUpdatePresent);
