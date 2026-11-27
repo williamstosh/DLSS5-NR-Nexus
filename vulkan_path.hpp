@@ -55,6 +55,7 @@ typedef VkFlags VkBufferUsageFlags;
 typedef VkFlags VkAccessFlags;
 typedef VkFlags VkPipelineStageFlags;
 typedef VkFlags VkDependencyFlags;
+typedef int32_t VkResult;
 typedef int32_t VkStructureType;
 typedef int32_t VkImageLayout;
 typedef struct VkMemoryBarrier {
@@ -144,6 +145,10 @@ typedef struct VkDependencyInfo {
   uint32_t imageMemoryBarrierCount;
   const VkImageMemoryBarrier2* pImageMemoryBarriers;
 } VkDependencyInfo;
+struct VkCommandBufferBeginInfo;
+typedef VkResult(VKAPI_PTR* PFN_vkBeginCommandBuffer)(
+    VkCommandBuffer, const VkCommandBufferBeginInfo*);
+typedef VkResult(VKAPI_PTR* PFN_vkResetCommandBuffer)(VkCommandBuffer, VkFlags);
 typedef void(VKAPI_PTR* PFN_vkCmdPipelineBarrier)(
     VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
     uint32_t, const VkMemoryBarrier*, uint32_t, const VkBufferMemoryBarrier*,
@@ -394,6 +399,8 @@ struct Feature {
   bool commit_cleared = false;
 };
 inline std::unordered_map<const NVSDK_NGX_Handle*, Feature> features;
+inline std::vector<Feature> released_features;  // runtime_mutex
+inline std::atomic_bool released_features_pending{false};
 inline uint64_t source_generation = 0;  // runtime_mutex
 
 // A Vulkan command buffer may be begun again or freed only when it is not
@@ -827,13 +834,10 @@ using ReleaseFn = decltype(&NVSDK_NGX_VULKAN_ReleaseFeature);
 // codec's sampled descriptors are SHADER_READ_ONLY_OPTIMAL (ReShade's
 // push_descriptors), so the scratch images rest there between frames.
 //
-// Lifetime.  A workset and an NR feature belong to the game DLSS feature
-// whose evaluates they ride: same command buffer, so same submission.  NGX's
-// ReleaseFeature "releases the feature ... and frees its memory" (DLSS guide,
-// NVSDK_NGX_ReleaseFeature), so a game that releases its DLSS handle has
-// completed every submission that used it, ours included, and they are
-// freed there (HookedRelease).  The device's teardown frees the rest:
-// vkDestroyDevice requires all of the device's work to be complete.
+// Closing the game's source stops new NR recording for that source. It does
+// not close executable command buffers that still reference add-on resources.
+// Retain those resources until successful native reset, begin, free or device
+// destruction ends the corresponding recording lifetime.
 // Runtime.  Feature 18 on Vulkan runs on the signed runtime directly, as on
 // D3D12: its Vulkan Init_Ext on the game's instance, physical device and
 // device, then CreateFeature1 / EvaluateFeature / ReleaseFeature.
@@ -1432,6 +1436,236 @@ inline void RestoreComputeState(reshade::api::command_list* cmd_list) {
   }
 }
 
+inline void DestroyWorkset(reshade::api::device* device,
+                           const Workset& workset) {
+  for (const auto view : workset.views) {
+    if (view.handle != 0)
+      device->destroy_resource_view(view);
+  }
+  for (const auto image : workset.images) {
+    if (image.handle != 0)
+      device->destroy_resource(image);
+  }
+}
+
+inline void DestroyLookHistoryImage(reshade::api::device* device,
+                                    const LookHistoryImage& image) {
+  if (image.view.handle != 0)
+    device->destroy_resource_view(image.view);
+  if (image.image.handle != 0)
+    device->destroy_resource(image.image);
+}
+
+// Keep the retired handle and its parameter block together until its last
+// recording can no longer use it. A new Create starts with a clean block.
+inline void RetireNrHandle(Feature* feature, uint32_t pass) {
+  NrFeatureSlot& slot = feature->slots[pass];
+  if (slot.handle != nullptr) {
+    feature->retired_nr.push_back(
+        {slot.handle, slot.parameters, feature->nr_use[pass]});
+    slot.handle = nullptr;
+    slot.parameters = nullptr;
+    live_nr_features.fetch_sub(1, std::memory_order_relaxed);
+  }
+  feature->nr_use[pass] = 0;
+}
+
+// Caller holds runtime_mutex. A reset/freed command buffer cannot replay its
+// old recording, regardless of whether it executed. Until then even a
+// completed submission is still a live use.
+inline void DrainRetiredFeature(Feature* feature) {
+  // Keep is the same retained-resource comparison on Vulkan as on D3D12:
+  // completed recordings permit reuse, but frees wait for feature teardown.
+  if (workset_free_policy.load(std::memory_order_relaxed) != 0)
+    return;
+  reshade::api::device* const device = feature->device;
+  for (auto it = feature->retired_worksets.begin();
+       it != feature->retired_worksets.end();) {
+    if (!RecordedUseComplete(it->use_id)) {
+      ++it;
+      continue;
+    }
+    DestroyWorkset(device, *it);
+    it = feature->retired_worksets.erase(it);
+  }
+  for (auto it = feature->retired_history.begin();
+       it != feature->retired_history.end();) {
+    if (!RecordedUseComplete(it->use_id)) {
+      ++it;
+      continue;
+    }
+    for (const LookHistoryImage& half : it->buffers) {
+      DestroyLookHistoryImage(device, half);
+    }
+    it = feature->retired_history.erase(it);
+  }
+  for (auto it = feature->retired_nr.begin();
+       it != feature->retired_nr.end();) {
+    if (!RecordedUseComplete(it->use_id)) {
+      ++it;
+      continue;
+    }
+    {
+      DirectCallScope direct;
+      runtime.release(it->handle);
+    }
+    bridge::DestroyOwnedParameters(it->parameters);
+    it = feature->retired_nr.erase(it);
+  }
+}
+
+// Caller holds runtime_mutex. Source admission has ended and every recording
+// has retired, or device teardown has made replay impossible. `release_nr`
+// false drops the NR handles unreleased: inside destroy_device the runtime's
+// own Vulkan calls go through a ReShade layer that has already let go of the
+// device (vk_basic, 2026-09-25: an access violation in ReShade64.dll on the
+// runtime's Shutdown1 there), so they are released at the game's NGX
+// Shutdown instead (HookedShutdown) and only a game that skips it leaves
+// them to die with the device.
+inline void FreeFeatureNr(Feature* feature, bool release_nr = true) {
+  reshade::api::device* const device = feature->device;
+  for (const Workset& workset : feature->worksets) {
+    DestroyWorkset(device, workset);
+  }
+  feature->worksets.clear();
+  for (const Workset& workset : feature->retired_worksets) {
+    DestroyWorkset(device, workset);
+  }
+  feature->retired_worksets.clear();
+  for (LookHistoryVk& history : feature->look_history) {
+    for (const LookHistoryImage& half : history.buffers) {
+      DestroyLookHistoryImage(device, half);
+    }
+    history = {};
+  }
+  for (const RetiredLookHistory& retired : feature->retired_history) {
+    for (const LookHistoryImage& half : retired.buffers) {
+      DestroyLookHistoryImage(device, half);
+    }
+  }
+  feature->retired_history.clear();
+  for (uint64_t& id : feature->look_history_use)
+    id = 0;
+  if (feature->commit_view.handle != 0)
+    device->destroy_resource_view(feature->commit_view);
+  if (feature->commit.handle != 0)
+    device->destroy_resource(feature->commit);
+  feature->commit = {};
+  feature->commit_view = {};
+  feature->commit_cleared = false;
+  for (uint32_t pass = 0; pass < kMaxNrPasses; ++pass) {
+    RetireNrHandle(feature, pass);
+  }
+  for (const RetiredNrHandle& retired : feature->retired_nr) {
+    if (release_nr) {
+      DirectCallScope direct;
+      runtime.release(retired.handle);
+    }
+    bridge::DestroyOwnedParameters(retired.parameters);
+  }
+  feature->retired_nr.clear();
+  for (NrFeatureSlot& slot : feature->slots) {
+    if (slot.parameters != nullptr) {
+      bridge::DestroyOwnedParameters(slot.parameters);
+      slot.parameters = nullptr;
+    }
+  }
+}
+
+inline void DrainReleasedFeatures() {
+  const auto has_live_use = [](const Feature& feature) {
+    const auto live = [](const auto& retired) {
+      return !RecordedUseComplete(retired.use_id);
+    };
+    const auto live_id = [](uint64_t use_id) {
+      return !RecordedUseComplete(use_id);
+    };
+    return std::any_of(feature.worksets.begin(), feature.worksets.end(),
+                       live)
+           || std::any_of(feature.retired_worksets.begin(),
+                          feature.retired_worksets.end(), live)
+           || std::any_of(feature.retired_history.begin(),
+                          feature.retired_history.end(), live)
+           || std::any_of(feature.retired_nr.begin(), feature.retired_nr.end(),
+                          live)
+           || std::any_of(std::begin(feature.look_history_use),
+                          std::end(feature.look_history_use), live_id)
+           || std::any_of(std::begin(feature.nr_use), std::end(feature.nr_use),
+                          live_id);
+  };
+  for (auto it = released_features.begin(); it != released_features.end();) {
+    if (has_live_use(*it)) {
+      ++it;
+      continue;
+    }
+    FreeFeatureNr(&*it);
+    it = released_features.erase(it);
+  }
+  released_features_pending.store(!released_features.empty(),
+                                  std::memory_order_release);
+}
+
+inline void ServiceReleasedFeatures() {
+  if (!released_features_pending.load(std::memory_order_acquire) || HoldingRuntimeLock() || InsideDirectCall() || ngx_serial::inside.load(std::memory_order_relaxed) != 0) {
+    return;
+  }
+  const ngx_serial::PresentTurn turn(true);
+  if (!turn.owns())
+    return;
+  RuntimeTryLock lock(runtime_mutex);
+  if (lock.owns_lock()) {
+    GuardHook([] { DrainReleasedFeatures(); });
+  }
+}
+
+inline void ConfirmRecordingReset(VkCommandBuffer buffer) {
+  {
+    std::shared_lock lock(command_lists_mutex);
+    if (const auto found = command_lists.find(buffer);
+        found != command_lists.end()) {
+      RetireScaleSamples(found->second.list);
+      ForgetRecordedUses(found->second.list);
+    }
+  }
+  ServiceReleasedFeatures();
+}
+
+inline PFN_vkBeginCommandBuffer real_begin_command_buffer = nullptr;
+inline PFN_vkResetCommandBuffer real_reset_command_buffer = nullptr;
+inline detour_guard::Record recording_hook_records[2];
+inline bool recording_hooks_attempted = false;  // barrier_install_mutex
+
+inline VkResult VKAPI_CALL HookedBeginCommandBuffer(
+    VkCommandBuffer buffer, const VkCommandBufferBeginInfo* info) {
+  CallbackScope callback_scope;
+  const auto result = real_begin_command_buffer(buffer, info);
+  if (callback_scope && result == static_cast<VkResult>(0)) {
+    ConfirmRecordingReset(buffer);
+  }
+  return result;
+}
+
+inline VkResult VKAPI_CALL HookedResetCommandBuffer(VkCommandBuffer buffer,
+                                                    VkFlags flags) {
+  CallbackScope callback_scope;
+  const auto result = real_reset_command_buffer(buffer, flags);
+  if (callback_scope && result == static_cast<VkResult>(0)) {
+    ConfirmRecordingReset(buffer);
+  }
+  return result;
+}
+
+inline const detour_guard::Hook kRecordingHooks[] = {
+    {"vkBeginCommandBuffer",
+     reinterpret_cast<void**>(&real_begin_command_buffer),
+     reinterpret_cast<void*>(&HookedBeginCommandBuffer),
+     &recording_hook_records[0]},
+    {"vkResetCommandBuffer",
+     reinterpret_cast<void**>(&real_reset_command_buffer),
+     reinterpret_cast<void*>(&HookedResetCommandBuffer),
+     &recording_hook_records[1]},
+};
+
 // ReShade calls init_device from inside its vkCreateDevice. At that point
 // the loader has installed a zeroed dispatch table on VkDevice, but fills
 // its entries only after the layer chain returns. Resolving observers there
@@ -1466,6 +1700,15 @@ inline void EnsureBarrierObservers(reshade::api::device* device) {
     return;
   }
   const auto native_device = reinterpret_cast<VkDevice>(device->get_native());
+  if (!recording_hooks_attempted) {
+    real_begin_command_buffer = reinterpret_cast<PFN_vkBeginCommandBuffer>(
+        device_proc(native_device, "vkBeginCommandBuffer"));
+    real_reset_command_buffer = reinterpret_cast<PFN_vkResetCommandBuffer>(
+        device_proc(native_device, "vkResetCommandBuffer"));
+    size_t failures = 0;
+    const size_t attached = detour_guard::AttachAll(kRecordingHooks, &failures);
+    recording_hooks_attempted = attached != 0 || failures != 0;
+  }
   real_barrier2 = reinterpret_cast<PFN_vkCmdPipelineBarrier2>(device_proc(native_device, "vkCmdPipelineBarrier2"));
   real_barrier2_khr = reinterpret_cast<PFN_vkCmdPipelineBarrier2>(device_proc(native_device, "vkCmdPipelineBarrier2KHR"));
   if (real_barrier2_khr == real_barrier2) real_barrier2_khr = nullptr;
@@ -1511,9 +1754,8 @@ inline void OnResetCommandList(reshade::api::command_list* cmd_list) {
     return;
   }
   EnsureBarrierObservers(cmd_list->get_device());
-  // vkBeginCommandBuffer: a new recording starts with no state bound.
-  RetireScaleSamples(cmd_list);
-  ForgetRecordedUses(cmd_list);
+  // ReShade notifies before vkBeginCommandBuffer. Clear binding state here,
+  // but end the old use lifetime only after the native operation succeeds.
   if (ComputeShadow* const shadow = cmd_list->get_private_data<ComputeShadow>()) {
     shadow->pipeline = {};
     for (auto& set : shadow->sets) {
@@ -1536,8 +1778,11 @@ inline void ForgetCommandList(reshade::api::command_list* cmd_list) {
   if (cmd_list->get_private_data<ComputeShadow>() != nullptr) {
     cmd_list->destroy_private_data<ComputeShadow>();
   }
-  std::unique_lock lock(command_lists_mutex);
-  command_lists.erase(reinterpret_cast<VkCommandBuffer>(native));
+  {
+    std::unique_lock lock(command_lists_mutex);
+    command_lists.erase(reinterpret_cast<VkCommandBuffer>(native));
+  }
+  ServiceReleasedFeatures();
 }
 
 // Caller holds runtime_mutex.  Returns kCount when NR's runtime is live on
@@ -1730,129 +1975,6 @@ inline void SetControlMaskParameters(NVSDK_NGX_Parameter* parameters,
   NVSDK_NGX_Parameter_SetUI(parameters, "DLSSNR.ControlMaskSubrectWidth", width);
   NVSDK_NGX_Parameter_SetUI(parameters, "DLSSNR.ControlMaskSubrectHeight", height);
   NVSDK_NGX_Parameter_SetUI(parameters, "DLSSNR.MaskBlendMode", blend);
-}
-
-inline void DestroyWorkset(reshade::api::device* device, const Workset& workset) {
-  for (const auto view : workset.views) {
-    if (view.handle != 0) device->destroy_resource_view(view);
-  }
-  for (const auto image : workset.images) {
-    if (image.handle != 0) device->destroy_resource(image);
-  }
-}
-
-inline void DestroyLookHistoryImage(reshade::api::device* device,
-                                   const LookHistoryImage& image) {
-  if (image.view.handle != 0) device->destroy_resource_view(image.view);
-  if (image.image.handle != 0) device->destroy_resource(image.image);
-}
-
-// Keep the retired handle and its parameter block together until its last
-// recording can no longer use it. A new Create starts with a clean block.
-inline void RetireNrHandle(Feature* feature, uint32_t pass) {
-  NrFeatureSlot& slot = feature->slots[pass];
-  if (slot.handle != nullptr) {
-    feature->retired_nr.push_back({slot.handle, slot.parameters, feature->nr_use[pass]});
-    slot.handle = nullptr;
-    slot.parameters = nullptr;
-    live_nr_features.fetch_sub(1, std::memory_order_relaxed);
-  }
-  feature->nr_use[pass] = 0;
-}
-
-// Caller holds runtime_mutex. A reset/freed command buffer cannot replay its
-// old recording, regardless of whether it executed. Until then even a
-// completed submission is still a live use.
-inline void DrainRetiredFeature(Feature* feature) {
-  // Keep is the same retained-resource comparison on Vulkan as on D3D12:
-  // completed recordings permit reuse, but frees wait for feature teardown.
-  if (workset_free_policy.load(std::memory_order_relaxed) != 0) return;
-  reshade::api::device* const device = feature->device;
-  for (auto it = feature->retired_worksets.begin(); it != feature->retired_worksets.end();) {
-    if (!RecordedUseComplete(it->use_id)) {
-      ++it;
-      continue;
-    }
-    DestroyWorkset(device, *it);
-    it = feature->retired_worksets.erase(it);
-  }
-  for (auto it = feature->retired_history.begin(); it != feature->retired_history.end();) {
-    if (!RecordedUseComplete(it->use_id)) {
-      ++it;
-      continue;
-    }
-    for (const LookHistoryImage& half : it->buffers) {
-      DestroyLookHistoryImage(device, half);
-    }
-    it = feature->retired_history.erase(it);
-  }
-  for (auto it = feature->retired_nr.begin(); it != feature->retired_nr.end();) {
-    if (!RecordedUseComplete(it->use_id)) {
-      ++it;
-      continue;
-    }
-    {
-      DirectCallScope direct;
-      runtime.release(it->handle);
-    }
-    bridge::DestroyOwnedParameters(it->parameters);
-    it = feature->retired_nr.erase(it);
-  }
-}
-
-// Caller holds runtime_mutex.  The frees a DLSS handle's release (or the
-// device's teardown) has proven safe; see "Lifetime" above.  `release_nr`
-// false drops the NR handles unreleased: inside destroy_device the runtime's
-// own Vulkan calls go through a ReShade layer that has already let go of the
-// device (vk_basic, 2026-09-25: an access violation in ReShade64.dll on the
-// runtime's Shutdown1 there), so they are released at the game's NGX
-// Shutdown instead (HookedShutdown) and only a game that skips it leaves
-// them to die with the device.
-inline void FreeFeatureNr(Feature* feature, bool release_nr = true) {
-  reshade::api::device* const device = feature->device;
-  for (const Workset& workset : feature->worksets) {
-    DestroyWorkset(device, workset);
-  }
-  feature->worksets.clear();
-  for (const Workset& workset : feature->retired_worksets) {
-    DestroyWorkset(device, workset);
-  }
-  feature->retired_worksets.clear();
-  for (LookHistoryVk& history : feature->look_history) {
-    for (const LookHistoryImage& half : history.buffers) {
-      DestroyLookHistoryImage(device, half);
-    }
-    history = {};
-  }
-  for (const RetiredLookHistory& retired : feature->retired_history) {
-    for (const LookHistoryImage& half : retired.buffers) {
-      DestroyLookHistoryImage(device, half);
-    }
-  }
-  feature->retired_history.clear();
-  for (uint64_t& id : feature->look_history_use) id = 0;
-  if (feature->commit_view.handle != 0) device->destroy_resource_view(feature->commit_view);
-  if (feature->commit.handle != 0) device->destroy_resource(feature->commit);
-  feature->commit = {};
-  feature->commit_view = {};
-  feature->commit_cleared = false;
-  for (uint32_t pass = 0; pass < kMaxNrPasses; ++pass) {
-    RetireNrHandle(feature, pass);
-  }
-  for (const RetiredNrHandle& retired : feature->retired_nr) {
-    if (release_nr) {
-      DirectCallScope direct;
-      runtime.release(retired.handle);
-    }
-    bridge::DestroyOwnedParameters(retired.parameters);
-  }
-  feature->retired_nr.clear();
-  for (NrFeatureSlot& slot : feature->slots) {
-    if (slot.parameters != nullptr) {
-      bridge::DestroyOwnedParameters(slot.parameters);
-      slot.parameters = nullptr;
-    }
-  }
 }
 
 inline NVSDK_NGX_Resource_VK ImageResource(reshade::api::resource_view view,
@@ -3130,6 +3252,16 @@ inline void ShutdownNr(VkDevice device) {
       FreeFeatureNr(&feature);
     }
   }
+  for (auto it = released_features.begin(); it != released_features.end();) {
+    if (it->device != game_api_device.load(std::memory_order_relaxed)) {
+      ++it;
+      continue;
+    }
+    FreeFeatureNr(&*it);
+    it = released_features.erase(it);
+  }
+  released_features_pending.store(!released_features.empty(),
+                                  std::memory_order_release);
   {
     DirectCallScope direct;
     runtime.shutdown(runtime.device);
@@ -3155,6 +3287,16 @@ inline void OnDestroyGameDevice() {
     FreeFeatureNr(&it->second, false);
     it = features.erase(it);
   }
+  for (auto it = released_features.begin(); it != released_features.end();) {
+    if (it->device != device) {
+      ++it;
+      continue;
+    }
+    FreeFeatureNr(&*it, false);
+    it = released_features.erase(it);
+  }
+  released_features_pending.store(!released_features.empty(),
+                                  std::memory_order_release);
   for (auto& program : codec_programs) {
     if (program.handle != 0) device->destroy_pipeline(program);
     program = {};
@@ -3208,6 +3350,16 @@ inline void OnDestroyDeviceContext(reshade::api::device* device) {
       ++it;
     }
   }
+  for (auto it = released_features.begin(); it != released_features.end();) {
+    if (it->device != device) {
+      ++it;
+      continue;
+    }
+    FreeFeatureNr(&*it, false);
+    it = released_features.erase(it);
+  }
+  released_features_pending.store(!released_features.empty(),
+                                  std::memory_order_release);
   {
     std::lock_guard lock(context_mutex);
     device_contexts.erase(destroyed);
@@ -3438,20 +3590,23 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedRelease(NVSDK_NGX_Handle* handle) {
   CallbackScope callback_scope;
   const NgxNesting nesting(&call_depth);
   const ngx_serial::Call ngx_turn;
-  if (callback_scope && nesting.outermost && !InsideDirectCall()) {
-    // The game's release proves the submissions that used this handle, and
-    // with them NR's work on it, complete ("Lifetime" above).
+  const auto result = real(handle);
+  if (callback_scope && nesting.outermost && !InsideDirectCall() && NVSDK_NGX_SUCCEED(result)) {
     RuntimeLock lock(runtime_mutex);
-    const auto feature = features.find(handle);
-    if (feature != features.end()) {
-      if (configuration_facts.source == handle) {
-        ClearConfigurationFactsLocked();
+    GuardHook([&] {
+      if (const auto feature = features.find(handle);
+          feature != features.end()) {
+        released_features.push_back(std::move(feature->second));
+        released_features_pending.store(true, std::memory_order_release);
+        features.erase(feature);
+        if (configuration_facts.source == handle) {
+          ClearConfigurationFactsLocked();
+        }
       }
-      GuardHook([&] { FreeFeatureNr(&feature->second); });
-      features.erase(feature);
-    }
+      DrainReleasedFeatures();
+    });
   }
-  return real(handle);
+  return result;
 }
 
 inline CreateFn const kCreateWrappers[kMaxNgxSlots] = {
@@ -3585,6 +3740,12 @@ inline void Unhook() {
     for (const detour_guard::Hook& hook : kBarrierHooks) {
       if (hook.record->target != nullptr) NoteDetourRemoval(detour_guard::Detach(hook));
     }
+    for (const detour_guard::Hook& hook : kRecordingHooks) {
+      if (hook.record->target != nullptr) {
+        NoteDetourRemoval(detour_guard::Detach(hook));
+      }
+    }
+    recording_hooks_attempted = false;
     native_barrier.store(nullptr, std::memory_order_release);
     barrier_observers_resolved.store(0, std::memory_order_relaxed);
     barrier_observers_attached.store(0, std::memory_order_relaxed);

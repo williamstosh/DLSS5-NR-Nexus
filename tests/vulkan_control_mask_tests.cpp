@@ -70,11 +70,21 @@ void DestroyBuffer(vk_test::VulkanContext& context, Buffer* buffer) {
 }
 
 void Begin(vk_test::VulkanContext& context) {
-  vk_test::Require(context.DeviceProc<PFN_vkResetCommandBuffer>("vkResetCommandBuffer")(
-                       context.command_buffer, 0), "vkResetCommandBuffer");
+  if (addon::vk::real_reset_command_buffer == nullptr) {
+    addon::vk::real_reset_command_buffer =
+        context.DeviceProc<PFN_vkResetCommandBuffer>("vkResetCommandBuffer");
+  }
+  if (addon::vk::real_begin_command_buffer == nullptr) {
+    addon::vk::real_begin_command_buffer =
+        context.DeviceProc<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer");
+  }
+  vk_test::Require(
+      addon::vk::HookedResetCommandBuffer(context.command_buffer, 0),
+      "vkResetCommandBuffer");
   VkCommandBufferBeginInfo info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-  vk_test::Require(context.DeviceProc<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(
-                       context.command_buffer, &info), "vkBeginCommandBuffer");
+  vk_test::Require(
+      addon::vk::HookedBeginCommandBuffer(context.command_buffer, &info),
+      "vkBeginCommandBuffer");
 }
 
 void SubmitRecordedAndWait(vk_test::VulkanContext& context);
@@ -547,9 +557,9 @@ void RunProductionMaskDispatchMock() {
   reshade::api::resource_view motion_view{};
   reshade::api::resource_view mask_view{};
   const auto usages = reshade::api::resource_usage::shader_resource
-      | reshade::api::resource_usage::unordered_access
-      | reshade::api::resource_usage::copy_dest
-      | reshade::api::resource_usage::copy_source;
+                      | reshade::api::resource_usage::unordered_access
+                      | reshade::api::resource_usage::copy_dest
+                      | reshade::api::resource_usage::copy_source;
   Check(device.create_resource({16, 16, 1, 1, reshade::api::format::r32_float, 1,
                                 reshade::api::memory_heap::gpu_only, usages},
                                nullptr, reshade::api::resource_usage::undefined, &depth),
@@ -563,14 +573,17 @@ void RunProductionMaskDispatchMock() {
                                nullptr, reshade::api::resource_usage::undefined, &motion),
         "create motion image");
   Check(device.create_resource_view(depth, reshade::api::resource_usage::undefined,
-                                   reshade::api::resource_view_desc(reshade::api::format::r32_float),
-                                   &depth_view), "create depth image view");
+                                    reshade::api::resource_view_desc(reshade::api::format::r32_float),
+                                    &depth_view),
+        "create depth image view");
   Check(device.create_resource_view(motion, reshade::api::resource_usage::undefined,
-                                   reshade::api::resource_view_desc(reshade::api::format::r32g32_float),
-                                   &motion_view), "create motion image view");
+                                    reshade::api::resource_view_desc(reshade::api::format::r32g32_float),
+                                    &motion_view),
+        "create motion image view");
   Check(device.create_resource_view(mask, reshade::api::resource_usage::undefined,
-                                   reshade::api::resource_view_desc(reshade::api::format::r8g8b8a8_unorm),
-                                   &mask_view), "create mask image view");
+                                    reshade::api::resource_view_desc(reshade::api::format::r8g8b8a8_unorm),
+                                    &mask_view),
+        "create mask image view");
   Check(addon::vk::EnsureControlMaskPipeline(&device), "create production ControlMask pipeline");
 
   std::array<float, 16 * 16> depths{};
@@ -584,17 +597,23 @@ void RunProductionMaskDispatchMock() {
   Buffer readback = CreateHostBuffer(context, width * height * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
   void* mapped = nullptr;
   vk_test::Require(context.DeviceProc<PFN_vkMapMemory>("vkMapMemory")(
-                       context.device, upload.memory, 0, upload.size, 0, &mapped), "map depth upload");
+                       context.device, upload.memory, 0, upload.size, 0, &mapped),
+                   "map depth upload");
   std::memcpy(mapped, depths.data(), sizeof(depths));
   context.DeviceProc<PFN_vkUnmapMemory>("vkUnmapMemory")(context.device, upload.memory);
 
   Begin(context);
+  addon::vk::OnResetCommandList(&command_list);
+  Check(addon::vk::command_lists.at(context.command_buffer).list == &command_list,
+        "the host's first recording event maps the actual native command buffer");
+  Check(renodx::addons::dlss5::detour_guard::Classify(addon::vk::recording_hook_records[0]) == renodx::addons::dlss5::detour_guard::Head::kOurs
+            && renodx::addons::dlss5::detour_guard::Classify(addon::vk::recording_hook_records[1]) == renodx::addons::dlss5::detour_guard::Head::kOurs,
+        "native Begin and Reset entries actually forward through the production observers");
   const reshade::api::resource depth_resource[] = {depth};
   const reshade::api::resource_usage depth_before[] = {reshade::api::resource_usage::undefined};
   const reshade::api::resource_usage depth_copy[] = {reshade::api::resource_usage::copy_dest};
   command_list.barrier(1, depth_resource, depth_before, depth_copy);
-  const VkBufferImageCopy upload_region{0, 0, 0,
-      {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, 0, 0, 0, {16, 16, 1}};
+  const VkBufferImageCopy upload_region{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, 0, 0, 0, {16, 16, 1}};
   context.DeviceProc<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(
       context.command_buffer, upload.buffer, vk_test::NativeHandle<VkImage>(depth.handle),
       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &upload_region);
@@ -609,7 +628,8 @@ void RunProductionMaskDispatchMock() {
   }
   auto motion_upload = CreateHostBuffer(context, sizeof(vectors), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
   vk_test::Require(context.DeviceProc<PFN_vkMapMemory>("vkMapMemory")(
-      context.device, motion_upload.memory, 0, motion_upload.size, 0, &mapped), "map motion upload");
+                       context.device, motion_upload.memory, 0, motion_upload.size, 0, &mapped),
+                   "map motion upload");
   std::memcpy(mapped, vectors.data(), sizeof(vectors));
   context.DeviceProc<PFN_vkUnmapMemory>("vkUnmapMemory")(context.device, motion_upload.memory);
   const reshade::api::resource motion_resource[] = {motion};
@@ -624,20 +644,19 @@ void RunProductionMaskDispatchMock() {
   command_list.barrier(1, mask_resource, mask_before, mask_write);
 
   const auto depth_vk = MakeImageResource(vk_test::NativeHandle<VkImage>(depth.handle),
-      vk_test::NativeHandle<VkImageView>(depth_view.handle), 16, 16, VK_FORMAT_R32_SFLOAT, false);
+                                          vk_test::NativeHandle<VkImageView>(depth_view.handle), 16, 16, VK_FORMAT_R32_SFLOAT, false);
   const addon::vk::ControlMaskConstants constants{
       width, height, addon::kControlMaskDepthFar, width / 2, height / 2,
       0.75f, 0.25f, 0.5f, depth_base_x, depth_base_y, depth_width, depth_height,
       0, 0.7f, 0.9f, 0};
   const auto motion_vk = MakeImageResource(vk_test::NativeHandle<VkImage>(motion.handle),
-      vk_test::NativeHandle<VkImageView>(motion_view.handle), 16, 16, VK_FORMAT_R32G32_SFLOAT, false);
+                                           vk_test::NativeHandle<VkImageView>(motion_view.handle), 16, 16, VK_FORMAT_R32G32_SFLOAT, false);
   addon::vk::RecordControlMaskDispatch(&command_list, &depth_vk, &motion_vk, depth_view, motion_view, mask_view, constants);
   const reshade::api::resource_usage mask_read[] = {reshade::api::resource_usage::shader_resource};
   command_list.barrier(1, mask_resource, mask_write, mask_read);
   const reshade::api::resource_usage mask_copy[] = {reshade::api::resource_usage::copy_source};
   command_list.barrier(1, mask_resource, mask_read, mask_copy);
-  const VkBufferImageCopy read_region{0, 0, 0,
-      {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, 0, 0, 0, {width, height, 1}};
+  const VkBufferImageCopy read_region{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, 0, 0, 0, {width, height, 1}};
   context.DeviceProc<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(
       context.command_buffer, vk_test::NativeHandle<VkImage>(mask.handle),
       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.buffer, 1, &read_region);
@@ -663,7 +682,8 @@ void RunProductionMaskDispatchMock() {
         "completed Vulkan submission remains replayable until command-buffer reset");
 
   vk_test::Require(context.DeviceProc<PFN_vkMapMemory>("vkMapMemory")(
-                       context.device, readback.memory, 0, readback.size, 0, &mapped), "map mask readback");
+                       context.device, readback.memory, 0, readback.size, 0, &mapped),
+                   "map mask readback");
   const auto* pixels = static_cast<const uint8_t*>(mapped);
   const auto channel = [&](uint32_t x, uint32_t y, uint32_t c) {
     return pixels[(y * width + x) * 4 + c];
@@ -676,8 +696,8 @@ void RunProductionMaskDispatchMock() {
   if (channel(6, 0, 1) != 64 || channel(6, 0, 2) < 127 || channel(6, 0, 2) > 128
       || channel(6, 0, 3) != 255) {
     throw std::runtime_error("production Vulkan mask G/B/A readback was "
-        + std::to_string(channel(6, 0, 1)) + "/" + std::to_string(channel(6, 0, 2))
-        + "/" + std::to_string(channel(6, 0, 3)));
+                             + std::to_string(channel(6, 0, 1)) + "/" + std::to_string(channel(6, 0, 2))
+                             + "/" + std::to_string(channel(6, 0, 3)));
   }
   context.DeviceProc<PFN_vkUnmapMemory>("vkUnmapMemory")(context.device, readback.memory);
 
@@ -703,14 +723,15 @@ void RunProductionMaskDispatchMock() {
     motion_constants.motion_start = 2.f;
     motion_constants.motion_end = 16.f;
     addon::vk::RecordControlMaskDispatch(&command_list, &depth_vk, &motion_vk,
-        depth_view, motion_view, mask_view, motion_constants);
+                                         depth_view, motion_view, mask_view, motion_constants);
     command_list.barrier(1, mask_resource, mask_write, mask_copy);
     context.DeviceProc<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(
         context.command_buffer, vk_test::NativeHandle<VkImage>(mask.handle),
         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.buffer, 1, &read_region);
     SubmitAndWait(context);
     vk_test::Require(context.DeviceProc<PFN_vkMapMemory>("vkMapMemory")(
-        context.device, readback.memory, 0, readback.size, 0, &mapped), "map motion mask readback");
+                         context.device, readback.memory, 0, readback.size, 0, &mapped),
+                     "map motion mask readback");
     const auto* motion_pixels = static_cast<const uint8_t*>(mapped);
     Check(motion_pixels[0] == 0 && std::abs(static_cast<int>(motion_pixels[2 * 4]) - 191) <= 1
               && std::abs(static_cast<int>(motion_pixels[4 * 4]) - 96) <= 1
@@ -732,6 +753,64 @@ void RunProductionMaskDispatchMock() {
   Begin(context);
   addon::vk::OnResetCommandList(&command_list);
   Check(addon::vk::RecordedUseComplete(discarded_use), "discarded recording retires mask use on reset");
+
+  const auto* source =
+      reinterpret_cast<NVSDK_NGX_Handle*>(uintptr_t{0xC0A71003});
+  constexpr uint64_t retired_source_use = 0xC0A71004;
+  {
+    auto& feature = addon::vk::features[source];
+    feature.device = &device;
+    feature.id = addon::kFeatureDlss;
+    feature.worksets.push_back({});
+    feature.worksets.back().images[addon::vk::kControlMask] = mask;
+    feature.worksets.back().views[addon::vk::kControlMask] = mask_view;
+    feature.worksets.back().use_id = retired_source_use;
+  }
+  const reshade::api::resource_usage previous_mask[] = {
+      reshade::api::resource_usage::copy_source};
+  command_list.barrier(1, mask_resource, previous_mask, mask_write);
+  addon::vk::TrackRecordedUse(&command_list, retired_source_use);
+  addon::vk::RecordControlMaskDispatch(&command_list, &depth_vk, &motion_vk,
+                                       depth_view, motion_view, mask_view,
+                                       constants);
+  command_list.barrier(1, mask_resource, mask_write, mask_copy);
+  context.DeviceProc<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(
+      context.command_buffer, vk_test::NativeHandle<VkImage>(mask.handle),
+      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.buffer, 1, &read_region);
+  addon::vk::slot_real[0].release = reinterpret_cast<void*>(
+      +[](NVSDK_NGX_Handle*) { return NVSDK_NGX_Result_Success; });
+  Check(addon::vk::HookedRelease<0>(const_cast<NVSDK_NGX_Handle*>(source)) == NVSDK_NGX_Result_Success && !addon::vk::features.contains(source) && addon::vk::released_features.size() == 1 && device.NativeImage(mask) != VK_NULL_HANDLE,
+        "source Release keeps the actual replayable Vulkan mask image alive");
+  SubmitAndWait(context);
+  SubmitRecordedAndWait(context);
+  vk_test::Require(
+      context.DeviceProc<PFN_vkMapMemory>("vkMapMemory")(
+          context.device, readback.memory, 0, readback.size, 0, &mapped),
+      "map retired source replay");
+  const auto* retired_pixels = static_cast<const uint8_t*>(mapped);
+  Check(retired_pixels[0] == 191 && retired_pixels[1] == 64 && std::abs(static_cast<int>(retired_pixels[2]) - 128) <= 1 && retired_pixels[3] == 255,
+        "the released source's old executable recording still produces its "
+        "actual shader pixels");
+  context.DeviceProc<PFN_vkUnmapMemory>("vkUnmapMemory")(context.device,
+                                                         readback.memory);
+  Check(addon::vk::released_features.size() == 1 && !addon::vk::RecordedUseComplete(retired_source_use),
+        "completed replay is still executable and cannot free the retired "
+        "source");
+  vk_test::Require(context.DeviceProc<PFN_vkResetCommandBuffer>("vkResetCommandBuffer")(
+                       context.command_buffer, 0),
+                   "native entry vkResetCommandBuffer");
+  VkCommandBufferBeginInfo next_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  vk_test::Require(context.DeviceProc<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(
+                       context.command_buffer, &next_info),
+                   "native entry vkBeginCommandBuffer");
+  Check(addon::vk::released_features.empty() && addon::vk::RecordedUseComplete(retired_source_use) && device.NativeImage(mask) == VK_NULL_HANDLE,
+        "a successful real native reset retires the released source without "
+        "another Evaluate or Present");
+  mask = {};
+  mask_view = {};
+  std::cout << "VULKAN_SOURCE_REPLAY evidence=NATIVE_GPU+MOCK source_closed=1 "
+               "completed_replay=retained"
+               " rgba=actual native_entry=detoured native_reset=success retired=drained\n";
 
   DestroyBuffer(context, &upload);
   DestroyBuffer(context, &motion_upload);

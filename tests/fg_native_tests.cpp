@@ -991,6 +991,129 @@ int main(int argc, char** argv) {
       native::vk::ForgetRecordedUses(recording_b);
       Check(native::vk::RecordedUseComplete(use_id),
           "shared Vulkan use retires after every recording is reset or freed");
+      struct LifetimeDevice final : nr::test::vk::DeviceApiStubs {
+        uint64_t get_native() const override { return 0xC000; }
+        reshade::api::device_api get_api() const override {
+          return reshade::api::device_api::vulkan;
+        }
+        void destroy_resource(reshade::api::resource) override {
+          ++destroyed_images;
+        }
+        void destroy_resource_view(reshade::api::resource_view) override {
+          ++destroyed_views;
+        }
+        uint32_t destroyed_images = 0;
+        uint32_t destroyed_views = 0;
+      } device;
+      struct LifetimeList final : nr::test::vk::CommandListApiStubs {
+        reshade::api::device* device = nullptr;
+        uint64_t identity = 0;
+        uint64_t get_native() const override { return identity; }
+        reshade::api::device* get_device() override { return device; }
+        void get_private_data(const uint8_t[16],
+                              uint64_t* data) const override {
+          *data = 0;
+        }
+      };
+      LifetimeList first_list;
+      first_list.device = &device;
+      first_list.identity = 0xC101;
+      LifetimeList second_list;
+      second_list.device = &device;
+      second_list.identity = 0xC102;
+      static VkResult reset_result = static_cast<VkResult>(0);
+      static NVSDK_NGX_Result source_result = NVSDK_NGX_Result_Success;
+      static uint32_t model_releases = 0;
+      native::hooks_enabled = false;
+      native::workset_free_policy = 0;
+      native::vk::real_begin_command_buffer =
+          +[](VkCommandBuffer, const VkCommandBufferBeginInfo*) -> VkResult {
+        return reset_result;
+      };
+      native::vk::real_reset_command_buffer =
+          +[](VkCommandBuffer, VkFlags) -> VkResult { return reset_result; };
+      native::vk::slot_real[0].release = reinterpret_cast<void*>(
+          +[](NVSDK_NGX_Handle*) { return source_result; });
+      native::vk::runtime.release = +[](NVSDK_NGX_Handle*) {
+        ++model_releases;
+        return NVSDK_NGX_Result_Success;
+      };
+      const auto* source =
+          reinterpret_cast<NVSDK_NGX_Handle*>(uintptr_t{0xC201});
+      const auto* model =
+          reinterpret_cast<NVSDK_NGX_Handle*>(uintptr_t{0xC301});
+      auto& feature = native::vk::features[source];
+      feature.device = &device;
+      feature.id = native::kFeatureDlss;
+      feature.slots[0].handle = const_cast<NVSDK_NGX_Handle*>(model);
+      Check(NVSDK_NGX_SUCCEED(
+                renodx::addons::dlss5::bridge::AllocateOwnedParameters(
+                    &feature.slots[0].parameters)),
+            "source lifetime uses a real owned parameter block");
+      auto* const parameters = feature.slots[0].parameters;
+      feature.nr_use[0] = use_id;
+      native::vk::live_nr_features.fetch_add(1, std::memory_order_relaxed);
+      feature.worksets.push_back({});
+      feature.worksets.back().images[0] = {11};
+      feature.worksets.back().views[0] = {21};
+      feature.worksets.back().use_id = use_id;
+      feature.look_history_use[0] = second_use_id;
+      native::vk::OnResetCommandList(&first_list);
+      native::vk::OnResetCommandList(&second_list);
+      native::vk::TrackRecordedUse(&first_list, use_id);
+      native::vk::TrackRecordedUse(&second_list, second_use_id);
+      source_result = NVSDK_NGX_Result_FAIL_InvalidParameter;
+      Check(native::vk::HookedRelease<0>(
+                const_cast<NVSDK_NGX_Handle*>(source))
+                    == source_result
+                && native::vk::features.contains(source) && native::vk::released_features.empty() && feature.slots[0].handle == model && feature.slots[0].parameters == parameters,
+            "a failed game source Release leaves its active model and "
+            "parameters untouched");
+      source_result = NVSDK_NGX_Result_Success;
+      Check(native::vk::HookedRelease<0>(
+                const_cast<NVSDK_NGX_Handle*>(source))
+                    == source_result
+                && !native::vk::features.contains(source) && native::vk::released_features.size() == 1 && native::vk::released_features.front().slots[0].handle == model && native::vk::released_features.front().slots[0].parameters == parameters && model_releases == 0 && device.destroyed_images == 0,
+            "successful source Release stops admission without releasing "
+            "replayable NR objects");
+      native::vk::features[source].id = native::kFeatureDlssd;
+      native::vk::features[source].device = &device;
+      native::vk::OnResetCommandList(&first_list);
+      Check(!native::vk::RecordedUseComplete(use_id),
+            "a ReShade pre-Begin notification is not successful native reset");
+      reset_result = static_cast<VkResult>(-1);
+      Check(native::vk::HookedBeginCommandBuffer(
+                reinterpret_cast<VkCommandBuffer>(first_list.identity),
+                nullptr)
+                    == reset_result
+                && native::vk::HookedResetCommandBuffer(
+                       reinterpret_cast<VkCommandBuffer>(first_list.identity),
+                       0)
+                       == reset_result
+                && !native::vk::RecordedUseComplete(use_id) && native::vk::released_features.size() == 1 && model_releases == 0,
+            "failed native Begin and Reset do not close the old recording or "
+            "free the source");
+      reset_result = static_cast<VkResult>(0);
+      Check(native::vk::HookedBeginCommandBuffer(
+                reinterpret_cast<VkCommandBuffer>(first_list.identity),
+                nullptr)
+                    == reset_result
+                && native::vk::RecordedUseComplete(use_id) && !native::vk::RecordedUseComplete(second_use_id) && native::vk::released_features.size() == 1 && model_releases == 0,
+            "successful native Begin closes only its own old lifetime");
+      Check(native::vk::HookedResetCommandBuffer(
+                reinterpret_cast<VkCommandBuffer>(second_list.identity), 0)
+                    == reset_result
+                && native::vk::RecordedUseComplete(second_use_id) && native::vk::released_features.empty() && !native::vk::released_features_pending.load() && model_releases == 1 && device.destroyed_images == 1 && device.destroyed_views == 1 && native::vk::features.at(source).id == native::kFeatureDlssd,
+            "the final successful native reset retires the old source without "
+            "another source callback or touching its replacement");
+      native::vk::ForgetCommandList(&first_list);
+      native::vk::ForgetCommandList(&second_list);
+      native::vk::features.erase(source);
+      std::cout << "VULKAN_SOURCE_RETIREMENT evidence=MOCK "
+                   "failed_release=preserved pre_begin=unproven"
+                   " failed_native_reset=retained "
+                   "successful_native_reset=exact replacement=independent"
+                   " no_followup_source_callback=drained\n";
       std::cout << "PASS Vulkan recorded-use ledger: duplicate references deduplicate; retirement waits for every recording" << std::endl;
       return 0;
     } catch (const std::exception& error) {

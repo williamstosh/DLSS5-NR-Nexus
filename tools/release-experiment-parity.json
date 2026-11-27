@@ -1,6 +1,50 @@
 {
   "rows": [
     {
+      "id": "vulkan-recording-lifetime",
+      "state": "ready",
+      "intent": [],
+      "commands": [],
+      "producer": "The original Vulkan source Release and the actual native command-buffer Begin/Reset return close their own admission and recording lifetimes.",
+      "consumer": "The existing recorded-use ledger retains released source resources and model/parameter pairs until every executable recording ends.",
+      "success": "Successful native Begin/Reset or command-buffer destruction can retire the old source without a later source callback; a reused source handle starts independently.",
+      "refusal": "Failed original Release, a pre-Begin notification and failed native Begin/Reset do not retire replayable work.",
+      "fallback": "Retain unresolved old resources until their recording or device lifetime actually ends; do not add submit/history qualification.",
+      "sources": [
+        [
+          "vulkan_path.hpp",
+          "inline VkResult VKAPI_CALL HookedBeginCommandBuffer("
+        ],
+        [
+          "vulkan_path.hpp",
+          "inline VkResult VKAPI_CALL HookedResetCommandBuffer("
+        ],
+        [
+          "vulkan_path.hpp",
+          "inline void DrainReleasedFeatures("
+        ],
+        [
+          "vulkan_path.hpp",
+          "released_features.push_back("
+        ]
+      ],
+      "cases": [
+        {
+          "suite": "fg-native",
+          "name": "vulkan-recorded-use-contract",
+          "existingTrace": true,
+          "log": "vulkan-recorded-use-contract",
+          "receipt": "^PASS Vulkan recorded-use ledger: duplicate references deduplicate; retirement waits for every recording$",
+          "scenarios": [
+            "source-retirement"
+          ],
+          "expect": {
+            "source-retirement": "^VULKAN_SOURCE_RETIREMENT evidence=MOCK failed_release=preserved pre_begin=unproven failed_native_reset=retained successful_native_reset=exact replacement=independent no_followup_source_callback=drained$"
+          }
+        }
+      ]
+    },
+    {
       "id": "d3d11-late-neutral-present",
       "state": "ready",
       "intent": [],
