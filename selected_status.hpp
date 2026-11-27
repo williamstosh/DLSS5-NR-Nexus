@@ -40,7 +40,8 @@ inline bool CurrentMonitorDelivery(const MonitorDelivery& receipt,
 
 inline ui::CardInputs ProjectSelectedCardInputs(ui::CardInputs in, bool has_present,
     const gpu_timers::Stats* execution, const MonitorDelivery& receipt = {},
-    const output_framerate::Snapshot& rate = {}) {
+    const output_framerate::Snapshot& rate = {},
+    const std::optional<fg::xefg::StatusSnapshot>& xefg = {}) {
   in.active_features = 0;
   in.fg_submitted_frames.reset();
   in.fg_continuing_submission = false;
@@ -52,7 +53,8 @@ inline ui::CardInputs ProjectSelectedCardInputs(ui::CardInputs in, bool has_pres
   in.input_width = in.input_height = in.output_width = in.output_height = 0;
   in.nr_gpu_ms = in.nr_present_ms = 0.f;
   if (in.verdict.state == NrState::kOff || in.verdict.state == NrState::kUnavailable) return in;
-  in.verdict = {.api = in.verdict.api, .path = (has_present ? "present" : in.verdict.path)};
+  const auto observed = in.verdict;
+  in.verdict = {.api = observed.api, .path = (has_present ? "present" : observed.path)};
   in.starting = true;
   in.dlss_hint = 0;
   in.issues = 0;
@@ -62,6 +64,18 @@ inline ui::CardInputs ProjectSelectedCardInputs(ui::CardInputs in, bool has_pres
     in.input_height = execution->passes[0].height;
     in.output_width = execution->width;
     in.output_height = execution->height;
+  }
+  if (has_present && xefg) {
+    const auto outcome = xefg->DisplayOutcome();
+    const bool selected_delivery = xefg->owned && receipt.consumer == MonitorConsumer::XE_FG
+        && receipt.output == xefg->output && receipt.frame.generation == xefg->epoch;
+    const bool rejected = outcome == fg::Result::NOT_SERVED || outcome == fg::Result::FAILED;
+    const bool preparing = outcome == fg::Result::PREPARED;
+    if (rejected || (preparing && (!selected_delivery || !xefg->continuing_submission))) {
+      in.verdict = observed;
+      return in;
+    }
+    if (!selected_delivery) return in;
   }
   if ((has_present && receipt.consumer != MonitorConsumer::NONE) || (!has_present && execution != nullptr)) {
     in.verdict.state = NrState::kEngaged;

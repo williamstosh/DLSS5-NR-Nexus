@@ -13,6 +13,7 @@ struct MonitorSnapshot {
   ui::StatusSummaryFields summary;
   ui::frame_metrics::Sample frame;
   output_framerate::OutputIdentity output;
+  std::optional<fg::xefg::StatusSnapshot> xefg_status;
   std::array<uint64_t, 3> adaptive_sources{};
   std::string execution;
   unsigned warnings = 0;
@@ -331,10 +332,10 @@ inline bool CurrentSelectedMonitorSample(const gpu_timers::Stats& sample, const 
       && CurrentCompletedGroup(sample, group, now, &settings);
 }
 
-inline void InvalidateMonitorDisplay() {
+inline void InvalidateMonitorDisplay(const std::optional<fg::xefg::StatusSnapshot>& xefg) {
   auto& cached = monitor_snapshot;
   auto pending = ProjectSelectedCardInputs(
-      {.verdict = ComputeNrVerdict(CollectFunnelInputs())}, false, nullptr);
+      {.verdict = ComputeNrVerdict(CollectFunnelInputs(xefg))}, xefg.has_value(), nullptr, {}, {}, xefg);
   cached.verdict = pending.verdict;
   cached.inputs = pending;
   pending.runtime_fault = static_cast<ui::RuntimeFault>(nr_runtime_fault.load());
@@ -381,7 +382,8 @@ inline void NotifyCompletedModelAdjustments(int64_t now) {
 inline void (*monitor_snapshot_before_lock)() = nullptr;
 #endif
 
-inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
+inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor,
+    const std::optional<fg::xefg::StatusSnapshot>* observed_xefg = nullptr) {
   auto& cached = monitor_snapshot;
   auto now = SteadyNowNs();
   const auto& cadence = monitor_cadence;
@@ -419,7 +421,15 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
   cached.summary.fps_tip = cached.monitor.summary.fps_tip = monitor_cadence.fps_tip;
   cached.card.frame_ms = cached.monitor.card.frame_ms = (frame_current ? frame.interval_ms : 0.f);
   const auto key = MonitorSnapshotKey(output);
-  const bool changed = key != cached.key || cached.output != output || cached.adaptive_sources != adaptive_sources;
+  const auto xefg = (observed_xefg != nullptr ? *observed_xefg : ReadSelectedXefgStatus());
+  // Entering a proven next frame does not invalidate the already checked
+  // delivery. A new epoch, an actual refusal, or losing continuity still does.
+  auto card_status = xefg;
+  if (card_status && card_status->continuing_submission) {
+    card_status->recording = false;
+  }
+  const bool changed = key != cached.key || cached.output != output || cached.adaptive_sources != adaptive_sources
+      || cached.xefg_status != card_status;
   const bool edit_reuse_changed = need_monitor && cached.edit_reuse_revision
       != present_edit_reuse_monitor_revision.load(std::memory_order_acquire);
   if (!changed && !edit_reuse_changed && (!need_monitor || cached.complete)
@@ -427,7 +437,7 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
       && now - cached.attempted_ns < kMonitorRefreshNs) return cached;
   if (changed || now > cached.valid_until_ns
       || (cached.sampled_ns != 0 && now - cached.sampled_ns > ui::RecentHealthWindow::kStaleNs)) {
-    InvalidateMonitorDisplay();
+    InvalidateMonitorDisplay(xefg);
     if (cached.output != output) {
       monitor_history.latest = {};
       monitor_history.contracts = {};
@@ -442,6 +452,7 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
   }
   cached.key = key;
   cached.output = output;
+  cached.xefg_status = card_status;
   cached.adaptive_sources = adaptive_sources;
   cached.attempted_ns = now;
 #if defined(IMGUI_ENABLE_TEST_ENGINE)
@@ -468,7 +479,7 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
     monitor_history.consumed = gpu_timers::monitor_events.published;
     monitor_history.reset_cursor = false;
   }
-  const auto session_inputs = CollectCardInputs();
+  const auto session_inputs = CollectCardInputs(ComputeNrVerdict(CollectFunnelInputs(xefg)), now, xefg);
   const auto health_mask = health_active_mask.load();
   const auto plan = RequestedStagePlan();
   const auto queried = need_monitor ? QueryConfigurationCapability() : capability::Result{};
@@ -621,10 +632,10 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
     all_groups_executed &= (found != nullptr);
   }
   const auto inputs = ProjectSelectedCardInputs(session_inputs, present_group.count != 0,
-      (all_groups_executed || present_group.count != 0 ? first_execution : nullptr), delivery, output_rate);
+      (all_groups_executed || present_group.count != 0 ? first_execution : nullptr), delivery, output_rate, xefg);
   const auto& verdict = inputs.verdict;
   auto card = ui::ComputeStatusCard(inputs);
-  if (present_group.count != 0 && current_execution(static_cast<size_t>(stage_plan::Stage::PRESENT)) != nullptr
+  if (!xefg && present_group.count != 0 && current_execution(static_cast<size_t>(stage_plan::Stage::PRESENT)) != nullptr
       && delivery.consumer == MonitorConsumer::NONE && inputs.verdict.state == NrState::kNotEngaged) {
     ui::card_internal::Set(card, ui::CardId::kStarting, ui::CardTone::kIdle, ui::CardGlyph::kWaiting,
         "GPU complete: single submission", "Pending confirmation");
@@ -941,14 +952,15 @@ inline const MonitorSnapshot& RefreshMonitorSnapshot(bool need_monitor) {
   return cached;
 }
 
-inline ui::StatusCard CurrentOutputCard(reshade::api::effect_runtime* runtime) {
+inline ui::StatusCard CurrentOutputCard(reshade::api::effect_runtime* runtime,
+    const std::optional<fg::xefg::StatusSnapshot>& xefg) {
   // Never borrow another effect runtime's HUD, even on the same device.
   if (runtime == nullptr || runtime != monitor_runtime.load()) {
     return ui::ComputeStatusCard(ProjectSelectedCardInputs(
-        {.verdict = ComputeNrVerdict(CollectFunnelInputs())}, false, nullptr));
+        {.verdict = ComputeNrVerdict(CollectFunnelInputs(std::nullopt))}, false, nullptr));
   }
   UpdateMonitorCadence(runtime);
-  return RefreshMonitorSnapshot(monitor_requested.load()).card;
+  return RefreshMonitorSnapshot(monitor_requested.load(), &xefg).card;
 }
 
 inline void SaveMonitorVisibility() {

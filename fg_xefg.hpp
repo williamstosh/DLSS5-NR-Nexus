@@ -27,6 +27,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <type_traits>
@@ -459,6 +460,12 @@ struct Context {
 #endif
   uint64_t application_frame = 0;
   uint64_t last_submission_frame = 0;
+  // State for this output and epoch, protected by the existing context lock.
+  struct Status {
+    std::optional<Result> outcome;
+    uint64_t pending_call = 0;
+    bool continuing_submission = false;
+  } status;
   uint64_t next_fence = 0;
   uint32_t present_id = 0;
   uint32_t last_id = 0;
@@ -948,6 +955,7 @@ inline void ReleaseFrames(Context* context) {
   context->fresh_id = false;
   context->last_id_known = false;
   context->last_submission_frame = 0;
+  context->status = {};
   ++context->epoch;
   ++context->bridge_write_epoch;
 #if defined(NR_NEXUS_DEV_CONTROL)
@@ -968,9 +976,13 @@ inline void ReleaseFrames(Context* context) {
 
 inline void RegisterOutput(Context* context) {
   if (output_framerate::IsCurrentOutput(context->output_identity)) return;
-  context->output_identity = output_framerate::RegisterXeFGOutput(context->proxy_identity,
+  const auto output = output_framerate::RegisterXeFGOutput(context->proxy_identity,
       reinterpret_cast<uintptr_t>(context->device_identity.Get()), reinterpret_cast<uintptr_t>(context),
       context->application_swapchain_identity);
+  if (context->output_identity != output) {
+    context->status = {};
+    context->output_identity = output;
+  }
   output_framerate::ObserveXeFGMetadata(context->output_identity, context->init.max_interpolated + 1,
       context->requested_interpolated_known ? context->requested_interpolated + 1 : 0);
   if (BridgeSourceLinkCurrentLocked(*context)) {
@@ -1797,6 +1809,14 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
     std::unique_lock lock(state.mutex);
     --present.context->presents_in_flight;
     present.context->present_colors.erase(present.serial);
+    auto& status = present.context->status;
+    if (status.pending_call == present.serial) {
+      status.pending_call = 0;
+      if (PresentOwnerCurrentLocked(present) && present.context->enabled
+          && present.context->bridge_declaration == present.declaration) {
+        status.outcome = Result::FAILED;
+      }
+    }
     if (present.pending_frame != nullptr) {
       present.pending_frame->presenting = false;
     }
@@ -1863,6 +1883,10 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
       context->present_colors.emplace(present.serial, Context::PresentColors{.xefg_owned = present.service_owned});
       present.continuing_submission = context->last_submission_frame != 0
           && context->last_submission_frame + 1 == present.input.application_frame;
+      if (present.service_eligible && present.input.output) {
+        context->status.pending_call = present.serial;
+        context->status.continuing_submission = present.continuing_submission;
+      }
       if (const auto it = context->frames.find(context->present_id); has_present_id && it != context->frames.end()) {
         if (!it->second->presenting) {
           it->second->presenting = true;
@@ -1933,9 +1957,16 @@ inline PresentFrame BeginPresent(IDXGISwapChain* swapchain, UINT flags) {
   }
   const auto finish_service = [&] {
     {
-      std::shared_lock lock(state.mutex);
+      std::unique_lock lock(state.mutex);
       if (PresentWriteCurrentLocked(present)) {
         PublishResult(present.service_result == Result::ORDINARY_SUBMITTED ? Result::PREPARED : present.service_result);
+        // A clean refusal is final before ReShade's in-SDK overlay executes.
+        // A recorded color still needs this SDK Present's actual result.
+        auto& status = present.context->status;
+        if (status.pending_call == present.serial && !Submitted(present.service_result)) {
+          status.pending_call = 0;
+          status.outcome = present.service_result;
+        }
       }
     }
     return std::move(present);
@@ -2072,6 +2103,12 @@ inline void EndPresent(PresentFrame* present, HRESULT present_result = E_FAIL,
   const bool ordinary_submitted = present->service_result == Result::ORDINARY_SUBMITTED;
   const bool delivered = present_result == S_OK;
   const bool failed_delivery = (submitted || ordinary_submitted) && !delivered;
+  if (context.status.pending_call == present->serial) {
+    context.status.pending_call = 0;
+    if (same_output && context.enabled) {
+      context.status.outcome = (failed_delivery ? Result::FAILED : present->service_result);
+    }
+  }
   const bool status_current = has_status && same_output && present->input.output
       && present->serial == context.present_serial && present->serial > context.status_ambiguous_through;
   if (same_output && present->serial == context.present_serial) {
@@ -3836,6 +3873,48 @@ inline bool OwnsStream(const output_framerate::OutputIdentity& output) {
 
 inline Result CurrentResult() noexcept {
   return OwnsStream() ? internal::result.load(std::memory_order_acquire) : Result::NOT_SERVED;
+}
+
+struct StatusSnapshot {
+  output_framerate::OutputIdentity output;
+  uint64_t epoch = 0;
+  std::optional<Result> outcome;
+  bool owned = false;
+  bool recording = false;
+  bool continuing_submission = false;
+  bool operator==(const StatusSnapshot&) const = default;
+
+  Result DisplayOutcome() const {
+    return (recording ? Result::PREPARED : outcome.value_or(Result::PREPARED));
+  }
+};
+
+// No value means this observation has no XeFG owner. A snapshot without an
+// outcome is not a refused frame, and never borrows another owner's result.
+inline std::optional<StatusSnapshot> ReadStatus(const output_framerate::OutputIdentity& output, bool ambiguous = false) {
+  if (!internal::Requested()) return std::nullopt;
+  if (ambiguous) return StatusSnapshot{};
+  if (!output || output.view == 0) return std::nullopt;
+  std::shared_lock lock(internal::state.mutex);
+  for (const auto& [handle, context] : internal::state.contexts) {
+    if (context->output_identity != output || !context->enabled
+        || context->queue == nullptr || context->proxy_identity == 0) continue;
+    if (!internal::UniqueProxyLocked(context->proxy_identity) || !output_framerate::IsCurrentOutput(output)) {
+      return StatusSnapshot{};
+    }
+    const auto& status = context->status;
+    const bool recording = status.pending_call != 0;
+    return StatusSnapshot{
+        .output = output,
+        .epoch = context->epoch,
+        .outcome = status.outcome,
+        .owned = true,
+        .recording = recording,
+        .continuing_submission = (recording ? status.continuing_submission
+                                           : status.outcome.has_value() && Submitted(*status.outcome)),
+    };
+  }
+  return std::nullopt;
 }
 
 // UI service state only: CurrentResult remains the exact current handoff.

@@ -415,7 +415,76 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
                  " claim=conflict single_write=1" << std::endl;
     return;
   }
+  namespace ui = addon::ui;
+  // This fixture registers real D3D12 swapchains directly, without ReShade's
+  // callback that otherwise records D3D12 for the production funnel.
+  funnel_accounting_tests::Restore api_restore;
+  api_restore.Atomic(&native::d3d12_swapchain_seen);
+  native::d3d12_swapchain_seen = true;
+  const auto output_of = [](const Session& target) {
+    const std::shared_lock lock(adapter::state.mutex);
+    return target.context->output_identity;
+  };
+  const auto card_inputs = [](const rate::OutputIdentity& output) {
+    Check(static_cast<bool>(output), "snapshot uses a registered output identity");
+#if defined(NR_NEXUS_TEST_LEGACY_XEFG_STATUS)
+    return native::CollectCardInputs(addon::ComputeNrVerdict(native::CollectFunnelInputs()), native::SteadyNowNs());
+#else
+    return native::CollectCardInputs(output);
+#endif
+  };
+  const auto check_status = [&](const char* phase, const rate::OutputIdentity& output,
+                                ui::CardTone tone, ui::CardId id, const char* reason, uint64_t injected) {
+    const auto in = card_inputs(output);
+    const auto card = ui::ComputeStatusCard(in);
+    const auto verdict = addon::ComputeNrVerdict(native::CollectFunnelInputs(xefg::ReadStatus(output)));
+    const std::string_view verdict_reason = (in.verdict.reason == nullptr ? "" : in.verdict.reason);
+    const bool matching = card.id == id && card.tone == tone && verdict.injected == injected
+        && verdict_reason == reason
+        && (tone == ui::CardTone::kGood ? in.fg_submitted_frames.value_or(0) > 0
+                                         : !in.fg_submitted_frames.has_value())
+        && (id != ui::CardId::kFgPreparing
+            || (in.verdict.IsFgPreparing() && !in.fg_continuing_submission));
+    std::cout << "XEFG_HANDOFF_PRESENT_STATUS " << nlohmann::json{
+        {"phase", phase}, {"generation", output.generation}, {"injected", verdict.injected},
+        {"reason", verdict_reason}, {"card", ui::CardSlug(card.id)}, {"tone", ui::CardToneName(card.tone)},
+        {"continuing", in.fg_continuing_submission}, {"passed", matching}}.dump() << std::endl;
+    Check(matching, phase);
+  };
+  const auto check_gray = [&](const char* phase, const Session& target) {
+    check_status(phase, output_of(target), ui::CardTone::kIdle, ui::CardId::kFgPreparing, "fg_preparing", 0);
+  };
+  const auto check_green = [&](const char* phase, const Session& target) {
+    check_status(phase, output_of(target), ui::CardTone::kGood, ui::CardId::kActive, "", 1);
+  };
+  const auto check_unproven = [&](const char* phase) {
+    check_status(phase, output_of(session), ui::CardTone::kIdle, ui::CardId::kStarting, "", 1);
+  };
+  const auto check_warn = [&](const char* phase, const char* reason) {
+    check_status(phase, output_of(session), ui::CardTone::kWarn, ui::CardId::kNotRunning, reason, 0);
+  };
+  std::optional<xefg::StatusSnapshot> first_unserved_status;
+  const auto calls_before_first = model_calls;
+  const auto submissions_before_first = xefg::SubmittedFrames();
+  const auto frames_before_first = session.context->application_frame;
+  Check(Hooks::Enable(session.handle, 0) == 0 && Hooks::Enable(session.handle, 1) == 0
+            && session.context->enabled && rate::MatchPresentOutput(reinterpret_cast<uintptr_t>(&route),
+                reinterpret_cast<uintptr_t>(back.Get())) == output_of(session),
+        "actual SDK enable is tied to the current Present output");
+  check_gray("first-enable-before-real-present", session);
+  {
+    funnel_accounting_tests::Restore test_present_restore;
+    test_present_restore.Value(&nr_edit_reuse_xefg_cases::consume_sdk_present);
+    nr_edit_reuse_xefg_cases::consume_sdk_present = {};
+    Check(adapter::ProxyHooks<0>::Present(session.proxy.Get(), 0, DXGI_PRESENT_TEST) == S_OK,
+          "SDK test flag is forwarded without classifying an application frame");
+  }
+  check_gray("test-present-does-not-classify-first-frame", session);
+  Check(model_calls == calls_before_first && xefg::SubmittedFrames() == submissions_before_first
+            && session.context->application_frame == frames_before_first,
+        "no real Present, model evaluation, or NR submission occurred before the first color");
   warm("initial-sdk", &route, true);
+  check_green("first-delivered-color-is-green", session);
   frame("on-last-scene-a", &route, scene_a, 0, false, true, true, 0);
   frame("on-menu-no-id", &route, menu, -1, false, true, true, 1);
   frame("on-menu-continued-no-id", &route, menu, -1, false, true, true, 0);
@@ -492,6 +561,9 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
       nr_edit_reuse_xefg_cases::sdk_present_result = S_OK;
       const auto resets_after_sdk = game_resets.load();
       const auto result = xefg::CurrentResult();
+      if (!sdk_success) {
+        check_warn("first-sdk-present-failure-is-yellow", "fg_handoff_failed");
+      }
       const auto model_evaluates = model_calls - before_ordinary;
       const auto sdk_deliveries = xefg::SubmittedFrames() - submissions;
       const bool same_version = produced_colors == menu_production && route.back == back.Get();
@@ -523,6 +595,9 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
       const bool next_passed = next_delivered && next_completed && produced_colors == menu_production + 1
           && xefg::CurrentResult() == fg::Result::SUBMITTED && (!scenario.raw_sdk_reset || game_reset_applied);
       accepted &= next_passed;
+      if (!sdk_success) {
+        check_unproven("successful-sdk-return-without-matched-delivery-stays-gray");
+      }
       std::cout << "XEFG_HANDOFF_NEXT_VERSION " << nlohmann::json{{"version", version},
           {"new_color_produced", produced_colors == menu_production + 1}, {"sdk_bb_writes", sdk_writes.size()},
           {"sdk_recordings", sdk_recordings}, {"completed", next_completed}, {"after_sdk_success", sdk_success},
@@ -577,6 +652,8 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
               && std::string_view(sdk.handoff_reason) == "ordinary_hudless_uncovered"
               && !sdk.color_executed && sdk.service_result == fg::Result::NOT_SERVED && model_calls == calls,
           "a complete BB receipt cannot stand in for the newly required HUDLess or allow a second BB enhancement");
+    check_warn("first-terminal-refusal-visible-inside-sdk", "fg_unserved");
+    first_unserved_status = xefg::ReadStatus(output_of(session));
     const auto status = nr_edit_reuse_xefg_cases::ConsumeSdkPresent(session.proxy.Get(), 0, 0);
     Check(status == S_OK && consumed == ordinary_pixels, "the actual SDK consumer reads only the ordinary enhanced BB");
     const auto hudless_capture = Capture(gpu, hudless.Get(), present_state);
@@ -589,6 +666,7 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
     Check(next_attempt.owner == ordinary_attempt.owner && next_attempt.serial > ordinary_attempt.serial,
           "a new ordinary attempt exists before the old SDK End returns");
     adapter::EndPresent(&sdk, status);
+    check_warn("first-unserved-hudless-conflict-is-yellow", "fg_unserved");
     Check(find_attempt(&route) == next_attempt && xefg::SubmittedFrames() == deliveries && model_calls == calls,
           "the delayed SDK End settles only its old receipt and leaves the newer attempt active");
     sdk_present(&session, -1, false);
@@ -596,6 +674,137 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
               && xefg::SubmittedFrames() == deliveries + 1 && model_calls == calls + 1
               && consumed == expected_pixels(scene_a, true),
           "the next actual BB version delivers after the late SDK End");
+    check_unproven("untagged-success-does-not-borrow-a-delivery-proof");
+    frame("status-recovery-with-current-guides", &route, scene_a, 1, false, true, true, -1);
+    check_green("success-with-selected-delivery-after-first-unserved-is-green", session);
+  }
+
+  {
+    funnel_accounting_tests::Restore enable_restore;
+    enable_restore.Value(&adapter::modules[0].real[6]);
+    enable_restore.Value(&receipt_sdk_status);
+    adapter::modules[0].real[6] = reinterpret_cast<void*>(&FakeReceiptEnable);
+    receipt_sdk_status = -19;
+    const auto failed_disable_output = output_of(session);
+    const auto failed_disable_epoch = session.context->epoch;
+    Check(Hooks::Enable(session.handle, 0) == -19 && session.context->enabled
+              && output_of(session) == failed_disable_output && session.context->epoch == failed_disable_epoch,
+          "a failed SDK Disable preserves the actual selected owner and epoch");
+    check_green("failed-disable-keeps-prior-success", session);
+  }
+
+  {
+    Session other_sdk(&gpu);
+    other_sdk.context->ui_composition = false;
+    Check(Hooks::Enable(other_sdk.handle, 0) == 0 && Hooks::Enable(other_sdk.handle, 1) == 0
+              && output_of(other_sdk) != output_of(session),
+          "the second SDK owner has a separately registered output");
+    check_green("first-output-retains-its-own-green", session);
+    check_gray("second-output-cannot-borrow-first-output-green", other_sdk);
+    {
+      // Keep the actual published ordinary owner on A while B performs a
+      // different, genuine SDK attempt and records its own refusal.
+      funnel_accounting_tests::Restore selected_restore;
+      selected_restore.Value(&native::monitor_status_output);
+      selected_restore.Value(&nr_edit_reuse_xefg_cases::consume_sdk_present);
+      native::monitor_status_output = {.owner = rate::FindPresentOwner(0, reinterpret_cast<uintptr_t>(back.Get()))};
+      nr_edit_reuse_xefg_cases::consume_sdk_present = {};
+      other_sdk.context->ui_composition = true;
+      sdk_present(&other_sdk, -1, false);
+      const auto second = xefg::ReadStatus(output_of(other_sdk));
+      Check(second && second->DisplayOutcome() == fg::Result::NOT_SERVED,
+            "a real second-output refusal is independently visible");
+      const auto observation = native::ReadSelectedXefgStatus();
+      const auto selected = addon::ComputeNrVerdict(native::CollectFunnelInputs());
+      const auto selected_card = ui::ComputeStatusCard(native::CollectCardInputs());
+      Check(observation && observation->output == output_of(session)
+                && selected.state == addon::NrState::kEngaged && selected_card.tone == ui::CardTone::kGood,
+            "a second output cannot replace the selected verdict or card");
+      other_sdk.context->ui_composition = false;
+      Check(Hooks::Enable(other_sdk.handle, 0) == 0 && Hooks::Enable(other_sdk.handle, 1) == 0,
+            "successful restart returns the second output to fresh status");
+      std::cout << "PASS xefg-selected-status other_outcome_not_selected=1 selected_verdict=1 selected_card=1" << std::endl;
+    }
+    {
+      const auto recovering = xefg::ReadStatus(output_of(session));
+      const auto other = xefg::ReadStatus(output_of(other_sdk));
+      Check(first_unserved_status && recovering && other && first_unserved_status->output == recovering->output,
+            "HUD test follows an actual yellow and recovery on the same output");
+      funnel_accounting_tests::Restore hud_restore;
+      hud_restore.Atomic(&native::hud_enabled);
+      hud_restore.Atomic(&native::hud_pill);
+      hud_restore.Atomic(&native::hud_toast_until_ns);
+      hud_restore.Value(&native::hud_recovery_pending);
+      hud_restore.Value(&native::hud_xefg_scope);
+      native::hud_enabled = true;
+      native::hud_toast_until_ns = 0;
+      const auto now = native::SteadyNowNs();
+      native::MaybeEmitStatusCard(addon::ComputeNrVerdict(native::CollectFunnelInputs(first_unserved_status)),
+          now, first_unserved_status);
+      Check(native::hud_pill && native::hud_recovery_pending && native::hud_toast_until_ns == 0,
+            "selected first real rejection claims its own HUD warning");
+      native::MaybeEmitStatusCard(addon::ComputeNrVerdict(native::CollectFunnelInputs(xefg::StatusSnapshot{})),
+          now + 1, xefg::StatusSnapshot{});
+      Check(native::hud_pill && native::hud_recovery_pending && native::hud_toast_until_ns == 0,
+            "an unresolved selection cannot clear the selected warning or consume its recovery");
+      native::MaybeEmitStatusCard(addon::ComputeNrVerdict(native::CollectFunnelInputs(recovering)),
+          now + 2, recovering);
+      Check(!native::hud_pill && !native::hud_recovery_pending && native::hud_toast_until_ns == now + 2 + native::kHudToastNs,
+            "only delivery on the selected generation consumes its warning and toasts");
+      std::cout << "PASS xefg-selected-hud first_refusal=1 unrelated_present=1 same_generation_recovery=1" << std::endl;
+    }
+
+    produce(back.Get(), scene_a, -1, false);
+    const auto attempt = call_ordinary(&route);
+    const auto calls = model_calls;
+    const auto deliveries = xefg::SubmittedFrames();
+    auto late = adapter::BeginPresent(session.proxy.Get(), 0);
+    Check(late.input.output == output_of(session) && late.color_executed
+              && late.service_result == fg::Result::SUBMITTED && model_calls == calls + 1,
+          "the old owner records real color before its successful SDK return is delayed");
+    {
+      const auto recording = xefg::ReadStatus(late.input.output);
+      Check(recording && recording->recording && recording->continuing_submission,
+            "next real recording has continuity from same-generation delivered color");
+      funnel_accounting_tests::Restore monitor_restore;
+      monitor_restore.Value(&native::monitor_snapshot);
+      native::InvalidateMonitorDisplay(recording);
+      Check(native::monitor_snapshot.verdict.IsFgPreparing()
+                && native::monitor_snapshot.card.id == ui::CardId::kFgPreparing
+                && native::monitor_snapshot.card.tone == ui::CardTone::kIdle,
+            "a busy monitor must not manufacture selected delivery from an SDK status");
+      const auto fresh = xefg::ReadStatus(output_of(other_sdk));
+      native::InvalidateMonitorDisplay(fresh);
+      Check(native::monitor_snapshot.card.id == ui::CardId::kFgPreparing
+                && native::monitor_snapshot.card.tone == ui::CardTone::kIdle,
+            "a new output with no result cannot use other generation's green");
+      std::cout << "PASS xefg-monitor-busy no_unproven_green=1 new_scope_unknown=1" << std::endl;
+    }
+    const auto sdk_result = nr_edit_reuse_xefg_cases::ConsumeSdkPresent(session.proxy.Get(), 0, 0);
+    Check(sdk_result == S_OK && consumed == expected_pixels(scene_a, true),
+          "the delayed old SDK call genuinely consumed the enhanced pixels");
+
+    const auto ordinary_key = rate::FindPresentOwner(0, reinterpret_cast<uintptr_t>(back.Get()));
+    Check(ordinary_key && rate::ResolveRegisteredPresentOutput(ordinary_key) == late.input.output,
+          "published ordinary identity initially selects the original XeFG generation");
+    Check(Hooks::Enable(session.handle, 0) == 0 && !session.context->enabled,
+          "successful Disable relinquishes the old selected owner");
+    const auto off = card_inputs(output_of(session));
+    Check(!off.fg_submitted_frames.has_value() && !off.fg_continuing_submission,
+          "successful Disable exits the XeFG presentation status");
+    Check(Hooks::Enable(session.handle, 1) == 0 && session.context->enabled
+              && session.context->epoch != late.input.epoch && output_of(session) != late.input.output,
+          "real re-enable creates a new selected generation on the primary output");
+    check_gray("primary-new-epoch-is-unjudged", session);
+    Check(ordinary_key && rate::ResolveRegisteredPresentOutput(ordinary_key) == output_of(session),
+          "published ordinary identity resolves the newly accepted XeFG generation");
+    adapter::EndPresent(&late, sdk_result);
+    native::EndOrdinaryPresentAttempt(attempt, S_OK);
+    Check(xefg::SubmittedFrames() == deliveries + 1,
+          "reporting isolation does not change accounting for the genuinely submitted old color");
+    check_gray("late-old-epoch-success-cannot-color-primary", session);
+    check_gray("late-old-epoch-success-cannot-color-second-output", other_sdk);
+    other_sdk.CloseSdk();
   }
 
   const auto create_list = [&] {
@@ -905,6 +1114,7 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
   {
     Check(Hooks::Enable(session.handle, 0) == 0 && Hooks::Enable(session.handle, 1) == 0,
           "public SDK cycle starts a cold model on the existing output");
+    check_gray("before-first-cold-model-present", session);
     produce(back.Get(), scene_b, 1, false);
     ComPtr<ID3D12Fence> gate;
     Check(SUCCEEDED(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate))), "creation GPU gate");
@@ -920,6 +1130,7 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
     Check(SUCCEEDED(gpu.queue->Wait(gate.Get(), 1)), "queue holds the actual private Create in flight");
     sdk_present(&session, 1, true);
     const auto creation = pending_model(&session, creates, evaluates, deliveries);
+    check_gray("actual-first-preparation-remains-gray", session);
     const auto& [model, recording, fence, value] = creation;
     Check(value != 0 && fence->GetCompletedValue() < value, "the owner Prepare Fence is genuinely in flight");
     std::this_thread::sleep_until(started + std::chrono::milliseconds(120));
@@ -935,6 +1146,7 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
         {"creates", 1}, {"claims", 0}, {"gpu_completed_after_release", true}}.dump() << std::endl;
   }
   frame("first-legal-b-after-creation-gate", &route, scene_b, 1, false, true, true, 1);
+  check_green("actual-delivery-after-first-preparation-is-green", session);
   const auto& last_evaluate = native::stage_telemetry[static_cast<size_t>(addon::stage_plan::Stage::PRESENT)].last_evaluate;
   Check(last_evaluate.reset_sent && (last_evaluate.reset_reasons & native::kResetGame) != 0,
         "the first legal application frame applies the actual Game Reset retained across both pending Presents");
@@ -1008,6 +1220,8 @@ inline void Run(Gpu& gpu, const auto& submit, const auto& wait_fence, bool ordin
   Check(accepted, "same-backbuffer Present handoff must deliver the first legal version exactly once");
   std::cout << "PASS xefg-ordinary-present-receipt evidence=WARP+MOCK same_version=1 next_version=1"
                " sdk_failure=1 late_end=1 distinct_output=1 hudless_conflict=1 no_sdk_finish=1" << std::endl;
+  std::cout << "PASS xefg-first-handoff-status evidence=WARP+MOCK fresh=1 prepared=1"
+               " unserved=1 sdk_failure=1 selected_output=1 old_epoch=1 failed_disable=1" << std::endl;
   std::cout << "PASS xefg-present-handoff evidence=WARP+MOCK passes=1 same_backbuffer=1 full_rgba=1" << std::endl;
 }
 }  // namespace xefg_present_handoff_cases

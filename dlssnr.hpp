@@ -2385,7 +2385,8 @@ inline std::mutex monitor_key_mutex;
 inline ui::ProfileKeyEdge monitor_key_edge;
 inline ui::ProfileKeyEdge monitor_mode_key_edge;
 inline void DrawIndependentMonitor(reshade::api::effect_runtime* runtime, bool menu = false);
-inline ui::StatusCard CurrentOutputCard(reshade::api::effect_runtime* runtime);
+inline ui::StatusCard CurrentOutputCard(reshade::api::effect_runtime* runtime,
+    const std::optional<fg::xefg::StatusSnapshot>& xefg);
 
 inline bool MonitorKeyConflict(uint32_t key) {
   if (key == 0) return false;
@@ -2470,6 +2471,11 @@ inline std::vector<reshade::api::effect_runtime*> live_effect_runtimes;
 inline std::unordered_map<reshade::api::effect_runtime*, uint64_t> effect_runtime_generations;
 inline uint64_t effect_runtime_generation_serial = 0;
 inline bool late_bridge_overlay_listening = false;
+struct MonitorStatusOutput {
+  output_framerate::OutputIdentity owner;
+  bool ambiguous = false;
+};
+inline MonitorStatusOutput monitor_status_output;
 inline std::atomic_bool logged_overlay_frozen{false};
 // The ImGui frame in which OnOverlay found this addon's window floating at a
 // size no one would pick, or -1 (OnDockOverlayWindow docks it; see there).
@@ -3151,15 +3157,49 @@ inline void PublishAdaptiveStatus(const adaptive_resolution::Status& status) {
   }
 }
 
-inline output_framerate::OutputIdentity MatchRuntimeOutput(reshade::api::effect_runtime* runtime) {
+inline std::pair<uintptr_t, uintptr_t> RuntimePresentBuffer(reshade::api::effect_runtime* runtime) {
   if (runtime == nullptr || runtime->get_back_buffer_count() == 0) return {};
   const auto* device = runtime->get_device();
   if (device == nullptr || (device->get_api() != reshade::api::device_api::d3d11
       && device->get_api() != reshade::api::device_api::d3d12)) return {};
   const auto identity = renodx::utils::directx::NativeIdentity(reinterpret_cast<IUnknown*>(device->get_native()));
   if (identity == nullptr) return {};
-  return output_framerate::FindPresentOutput(reinterpret_cast<uintptr_t>(identity),
-      static_cast<uintptr_t>(runtime->get_current_back_buffer().handle));
+  return {reinterpret_cast<uintptr_t>(identity), runtime->get_current_back_buffer().handle};
+}
+
+inline output_framerate::OutputIdentity MatchRuntimeOutput(reshade::api::effect_runtime* runtime) {
+  const auto [device, back_buffer] = RuntimePresentBuffer(runtime);
+  return (device != 0 ? output_framerate::FindPresentOutput(device, back_buffer) : output_framerate::OutputIdentity{});
+}
+
+inline MonitorStatusOutput MatchRuntimePresentOwner(reshade::api::effect_runtime* runtime) {
+  const auto [device, back_buffer] = RuntimePresentBuffer(runtime);
+  if (device == 0) return {};
+  MonitorStatusOutput selected;
+  selected.owner = output_framerate::FindPresentOwner(device, back_buffer, &selected.ambiguous);
+  return selected;
+}
+
+inline std::optional<fg::xefg::StatusSnapshot> ReadSelectedXefgStatus(
+    reshade::api::effect_runtime* borrowed_runtime = nullptr) {
+  MonitorStatusOutput selected;
+  if (borrowed_runtime != nullptr) {
+    selected = MatchRuntimePresentOwner(borrowed_runtime);
+  } else {
+    // Only a host callback resolves a live runtime/backbuffer. Other threads
+    // use the ordinary output's published value and recheck its generation.
+    std::unique_lock lock(overlay_listener_mutex, std::try_to_lock);
+    if (lock.owns_lock()) {
+      selected = monitor_status_output;
+      if (selected.owner.swapchain == 0 && monitor_runtime.load() != nullptr) {
+        selected.ambiguous = true;
+      }
+    } else {
+      selected.ambiguous = true;
+    }
+  }
+  const auto output = output_framerate::ResolveRegisteredPresentOutput(selected.owner, &selected.ambiguous);
+  return fg::xefg::ReadStatus(output, selected.ambiguous);
 }
 
 inline adaptive_resolution::Status CopyAdaptiveStatus(const output_framerate::OutputIdentity& output,
@@ -25141,6 +25181,10 @@ inline bool ProcessModuleSetChanged() {
 // Path B: the D3D11 NGX detours and the Direct3D 11 bridge.
 #include "d3d11_bridge.hpp"
 #include "selected_status.hpp"
+
+// The monitor is composed after the UI adapters, but lifecycle status shares its receipt proof.
+inline MonitorDelivery ReadSelectedMonitorDelivery(const output_framerate::OutputIdentity& output,
+    const stage_plan::Group& group, int64_t now);
 #include "present_path.hpp"
 // The NGX Vulkan detours (second inclusion: the body, v8.1).
 #include "vulkan_path.hpp"
@@ -26852,26 +26896,27 @@ inline FunnelInputs CollectSessionFunnelInputs() {
   return in;
 }
 
-inline FunnelInputs CollectFunnelInputs() {
+inline bool NativeFgStatusActive() {
+  return native_fg_owns.load(std::memory_order_acquire) && hook_point.load(std::memory_order_relaxed) == kHookPresent;
+}
+
+inline FunnelInputs CollectFunnelInputs(const std::optional<fg::xefg::StatusSnapshot>& xefg = ReadSelectedXefgStatus()) {
   auto in = CollectSessionFunnelInputs();
-  // FG mode reports this application's current handoff. A model evaluation
-  // from an earlier frame, or a create-only recording, is not engagement.
-  const bool xefg_active = fg::xefg::OwnsStream();
-  const bool native_active = native_fg_owns.load(std::memory_order_acquire)
-      && hook_point.load(std::memory_order_relaxed) == kHookPresent;
-  if (xefg_active || native_active) {
-    const auto current = (xefg_active ? fg::xefg::CurrentResult() : native_fg_result.load(std::memory_order_acquire));
+  // Ownership alone is not a reported frame. A result belongs to the selected
+  // output's current epoch; the status card receives the same observation.
+  if (xefg || NativeFgStatusActive()) {
+    const auto current = (xefg ? xefg->DisplayOutcome() : native_fg_result.load(std::memory_order_acquire));
     in.present_hook = true;
     in.dx11_source_off = false;
-    in.seen = 1;
-    in.eligible = 1;
+    in.seen = (xefg && !xefg->outcome.has_value() ? 0 : 1);
+    in.eligible = in.seen;
     in.injected = fg::Submitted(current) ? 1 : 0;
     in.submitted_ok = in.injected;
     in.unaccounted = 0;
     in.top_decline_tag = (current == fg::Result::PREPARED ? "fg_preparing"
         : current == fg::Result::FAILED ? "fg_handoff_failed"
         : fg::Submitted(current) ? nullptr : "fg_unserved");
-    in.top_decline_count = in.injected == 0 ? 1 : 0;
+    in.top_decline_count = (in.eligible != 0 && in.injected == 0 ? 1 : 0);
   }
   return in;
 }
@@ -26894,8 +26939,7 @@ inline std::atomic_bool emitted_any_verdict = false;
 // inside Shutdown(), which a crashing or Alt-F4'd game never reaches - so
 // the sessions that most needed explaining were the ones that explained
 // nothing.
-inline void EmitNrVerdict(const char* trigger) {
-  const NrVerdict verdict = ComputeNrVerdict(CollectFunnelInputs());
+inline void EmitNrVerdict(const char* trigger, const NrVerdict& verdict, bool observed_fg) {
   char line[512];
   FormatNrVerdictLine(
       line, sizeof(line), verdict,
@@ -26919,13 +26963,14 @@ inline void EmitNrVerdict(const char* trigger) {
   last_emitted_state.store(verdict.state, std::memory_order_relaxed);
   last_emitted_stage.store(verdict.stage, std::memory_order_relaxed);
   last_emitted_reason.store(verdict.reason, std::memory_order_relaxed);
-  last_emitted_fg_progress.store(
-      (fg::xefg::OwnsStream()
-          || (native_fg_owns.load(std::memory_order_acquire)
-              && hook_point.load(std::memory_order_relaxed) == kHookPresent))
-          && verdict.IsFgHandoffProgress(),
-      std::memory_order_relaxed);
+  last_emitted_fg_progress.store(observed_fg && verdict.IsFgHandoffProgress(), std::memory_order_relaxed);
   emitted_any_verdict.store(true, std::memory_order_relaxed);
+}
+
+inline void EmitNrVerdict(const char* trigger,
+                          const std::optional<fg::xefg::StatusSnapshot>& xefg = ReadSelectedXefgStatus()) {
+  EmitNrVerdict(trigger, ComputeNrVerdict(CollectFunnelInputs(xefg)),
+                (xefg ? xefg->owned : NativeFgStatusActive()));
 }
 
 // Called from the lifecycle tick: emits on a state change, and otherwise on
@@ -26941,14 +26986,13 @@ inline bool emitted_settled_verdict = false;
 inline constexpr int64_t kVerdictSettleNs = 30LL * 1'000'000'000LL;
 
 // Returns the verdict it computed, so the status card reads the same one.
-inline NrVerdict MaybeEmitNrVerdict() {
-  const NrVerdict verdict = ComputeNrVerdict(CollectFunnelInputs());
+inline NrVerdict MaybeEmitNrVerdict(const std::optional<fg::xefg::StatusSnapshot>& xefg = ReadSelectedXefgStatus()) {
+  const NrVerdict verdict = ComputeNrVerdict(CollectFunnelInputs(xefg));
+  const bool observed_fg = (xefg ? xefg->owned : NativeFgStatusActive());
   // Recording and queue submission are phases of one healthy handoff. Only
   // coalesce their change lines; UI and periodic/settled snapshots keep the
   // current truth, including a recording that never reaches submission.
-  const bool normal_fg_cycle = (fg::xefg::OwnsStream()
-      || (native_fg_owns.load(std::memory_order_acquire)
-          && hook_point.load(std::memory_order_relaxed) == kHookPresent))
+  const bool normal_fg_cycle = observed_fg && (!xefg || xefg->continuing_submission)
       && verdict.IsFgPreparing()
       && last_emitted_fg_progress.load(std::memory_order_relaxed)
       && last_emitted_state.load(std::memory_order_relaxed) == NrState::kEngaged;
@@ -26959,7 +27003,7 @@ inline NrVerdict MaybeEmitNrVerdict() {
           && (verdict.state != last_emitted_state.load(std::memory_order_relaxed)
               || verdict.stage != last_emitted_stage.load(std::memory_order_relaxed)
               || verdict.reason != last_emitted_reason.load(std::memory_order_relaxed)))) {
-    EmitNrVerdict("change");
+    EmitNrVerdict("change", verdict, observed_fg);
     return verdict;
   }
   // One guaranteed line per enable, 30 s in.  Without it a session that
@@ -26979,7 +27023,7 @@ inline NrVerdict MaybeEmitNrVerdict() {
   if (!emitted_settled_verdict
       && now_ns - nr_enabled_since_ns >= kVerdictSettleNs) {
     emitted_settled_verdict = true;
-    EmitNrVerdict("settled");
+    EmitNrVerdict("settled", verdict, observed_fg);
   }
   return verdict;
 }
@@ -27514,8 +27558,8 @@ inline void TickNrCost(int64_t now_ns, double /*interval_ms*/) {
   nr_cost_frame_ms.store(frame_current ? frame.interval_ms : 0.f, std::memory_order_relaxed);
 }
 
-inline ui::CardInputs CollectCardInputs(const NrVerdict& verdict,
-                                        int64_t now_ns) {
+inline ui::CardInputs CollectCardInputs(const NrVerdict& verdict, int64_t now_ns,
+                                        const std::optional<fg::xefg::StatusSnapshot>& xefg = {}) {
   // Explicit snapshots come from a locked lifecycle tick or deterministic CPU
   // fixtures. Keep their complete read/Observe transaction under the same lock.
   std::optional<RuntimeLock> runtime_lock;
@@ -27525,11 +27569,7 @@ inline ui::CardInputs CollectCardInputs(const NrVerdict& verdict,
   ui::CardInputs in;
   in.verdict = verdict;
   // The funnel's 0/1 values describe the current handoff, not session totals.
-  if (fg::xefg::OwnsStream()) {
-    in.fg_submitted_frames = fg::xefg::SubmittedFrames();
-    in.fg_continuing_submission = fg::Submitted(fg::xefg::DisplayResult());
-  } else if (native_fg_owns.load(std::memory_order_acquire)
-             && hook_point.load(std::memory_order_relaxed) == kHookPresent) {
+  if (!xefg && NativeFgStatusActive()) {
     in.fg_submitted_frames = native_fg_submitted_frames.load(std::memory_order_relaxed);
     const auto submitted_ns = native_fg_last_submission_ns.load(std::memory_order_acquire);
     in.fg_continuing_submission = native_fg_continuing_submission.load(std::memory_order_acquire)
@@ -27699,15 +27739,36 @@ inline ui::CardInputs CollectCardInputs(const NrVerdict& verdict,
   return in;
 }
 
-inline ui::CardInputs CollectCardInputs() {
+// Called under runtime_mutex, by reports and the lifecycle HUD as well as
+// the selected monitor projection. SDK status alone cannot show delivered NR.
+inline ui::CardInputs ProjectXefgCardInputs(ui::CardInputs inputs,
+    const std::optional<fg::xefg::StatusSnapshot>& xefg, int64_t now_ns) {
+  if (!xefg) return inputs;
+  const auto plan = RequestedStagePlan();
+  const auto& group = plan.At(stage_plan::Stage::PRESENT);
+  const auto delivery = (plan.valid && xefg->owned
+      ? ReadSelectedMonitorDelivery(xefg->output, group, now_ns) : MonitorDelivery{});
+  return ProjectSelectedCardInputs(std::move(inputs), true, nullptr, delivery, {}, xefg);
+}
+
+inline ui::CardInputs CollectCardInputs(const std::optional<fg::xefg::StatusSnapshot>& xefg) {
   // Time, counters, configuration and GPU evidence must describe the same
   // serialized observation, including callers that were delayed by NR work.
   std::optional<RuntimeLock> runtime_lock;
   if (!runtime_lock::State::HeldByThisThread()) {
     runtime_lock.emplace(runtime_mutex);
   }
-  const auto verdict = ComputeNrVerdict(CollectFunnelInputs());
-  return CollectCardInputs(verdict, SteadyNowNs());
+  const auto verdict = ComputeNrVerdict(CollectFunnelInputs(xefg));
+  const auto now_ns = SteadyNowNs();
+  return ProjectXefgCardInputs(CollectCardInputs(verdict, now_ns, xefg), xefg, now_ns);
+}
+
+inline ui::CardInputs CollectCardInputs() {
+  return CollectCardInputs(ReadSelectedXefgStatus());
+}
+
+inline ui::CardInputs CollectCardInputs(const output_framerate::OutputIdentity& output) {
+  return CollectCardInputs(fg::xefg::ReadStatus(output));
 }
 
 inline std::atomic_uint8_t last_emitted_card{0xff};
@@ -27738,6 +27799,7 @@ inline std::atomic_bool hud_pill{false};
 // Lifecycle tick only (runtime_mutex). A neutral preparation clears the
 // visible pill but cannot consume recovery before a proven submission.
 inline bool hud_recovery_pending = false;
+inline std::pair<output_framerate::OutputIdentity, uint64_t> hud_xefg_scope;
 inline std::atomic_int64_t hud_toast_until_ns{0};
 // Preset adapters keep these percentage fields as the legacy custom position.
 inline std::atomic<float> hud_position_x{50.f};
@@ -27779,37 +27841,52 @@ inline void PersistHudPosition() {
   reshade::set_config_value(nullptr, kConfigSection, "UiHudY", position.legacy_percent.y);
 }
 
-inline void MaybeEmitStatusCard(const NrVerdict& verdict, int64_t now_ns) {
-  const ui::CardInputs inputs = CollectCardInputs(verdict, now_ns);
+inline void MaybeEmitStatusCard(const NrVerdict& verdict, int64_t now_ns,
+                                const std::optional<fg::xefg::StatusSnapshot>& xefg = {}) {
+  std::optional<RuntimeLock> status_lock;
+  if (xefg && !runtime_lock::State::HeldByThisThread()) {
+    status_lock.emplace(runtime_mutex);
+  }
+  const auto inputs = ProjectXefgCardInputs(CollectCardInputs(verdict, now_ns, xefg), xefg, now_ns);
   const ui::StatusCard card =
       ui::ComputeStatusCard(inputs);
   card_partial_latched.store(card.id == ui::CardId::kPartlyActive, std::memory_order_relaxed);
   // Every tick, ahead of the line's dedupe and its token bucket.  A gray
   // flap (waiting_for_dlss across a resolution change) and amber (the pill
   // already said it) raise no toast.
-  if (!hud_enabled.load(std::memory_order_relaxed)) {
-    hud_pill.store(false, std::memory_order_relaxed);
-    hud_toast_until_ns.store(0, std::memory_order_relaxed);
-    hud_recovery_pending = false;
-  } else if (card.tone != ui::CardTone::kGood) {
-    hud_pill.store(ui::ShowsOnHud(card), std::memory_order_relaxed);
-    if (ui::ShowsOnHud(card)) {
-      hud_recovery_pending = true;
-    }
-    if (verdict.state == NrState::kOff || verdict.state == NrState::kUnavailable) {
-      hud_recovery_pending = false;
+  // An unresolved selection must not consume a previous output's recovery.
+  // A known non-XeFG output preserves the ordinary/native HUD path.
+  if (!xefg || xefg->owned) {
+    const auto scope = (xefg ? std::pair{xefg->output, xefg->epoch} : decltype(hud_xefg_scope){});
+    if (hud_xefg_scope != scope) {
+      hud_xefg_scope = scope;
       hud_toast_until_ns.store(0, std::memory_order_relaxed);
-    }
-  } else {
-    hud_pill.store(false, std::memory_order_relaxed);
-    // A Present tick can always land inside the next FG recording. The
-    // card's bounded, current-epoch submission proof also permits its toast;
-    // preparation without that proof remains silent.
-    if (!verdict.IsFgPreparing() || inputs.fg_continuing_submission) {
-      if (hud_recovery_pending) {
-        hud_toast_until_ns.store(now_ns + kHudToastNs, std::memory_order_relaxed);
-      }
       hud_recovery_pending = false;
+    }
+    if (!hud_enabled.load(std::memory_order_relaxed)) {
+      hud_pill.store(false, std::memory_order_relaxed);
+      hud_toast_until_ns.store(0, std::memory_order_relaxed);
+      hud_recovery_pending = false;
+    } else if (card.tone != ui::CardTone::kGood) {
+      hud_pill.store(ui::ShowsOnHud(card), std::memory_order_relaxed);
+      if (ui::ShowsOnHud(card)) {
+        hud_recovery_pending = true;
+      }
+      if (verdict.state == NrState::kOff || verdict.state == NrState::kUnavailable) {
+        hud_recovery_pending = false;
+        hud_toast_until_ns.store(0, std::memory_order_relaxed);
+      }
+    } else {
+      hud_pill.store(false, std::memory_order_relaxed);
+      // A Present tick can always land inside the next FG recording. The
+      // card's bounded, current-epoch submission proof also permits its toast;
+      // preparation without that proof remains silent.
+      if (!verdict.IsFgPreparing() || inputs.fg_continuing_submission) {
+        if (hud_recovery_pending) {
+          hud_toast_until_ns.store(now_ns + kHudToastNs, std::memory_order_relaxed);
+        }
+        hud_recovery_pending = false;
+      }
     }
   }
   if (card_line_refill_ns != 0) {
@@ -28061,12 +28138,20 @@ inline void OnHudOverlay(reshade::api::effect_runtime* runtime) {
     return;
   }
   if (hud_overlay_open.load(std::memory_order_relaxed)) return;
-  if (!hud_pill.load() && now_ns >= hud_toast_until_ns.load()
+  const bool selected_runtime = (runtime != nullptr && monitor_runtime.load() == runtime);
+  const auto xefg = (selected_runtime ? ReadSelectedXefgStatus(runtime) : std::nullopt);
+  int64_t toast_ns = 0;
+  if (selected_runtime && (!xefg || xefg->owned)) {
+    RuntimeTryLock lock(runtime_mutex);
+    const auto scope = (xefg ? std::pair{xefg->output, xefg->epoch} : decltype(hud_xefg_scope){});
+    if (lock.owns_lock() && hud_xefg_scope == scope) {
+      toast_ns = hud_toast_until_ns.load(std::memory_order_relaxed) - now_ns;
+    }
+  }
+  if (!xefg && !hud_pill.load() && toast_ns <= 0
       && now_ns >= health_notice_until_ns.load() && now_ns >= profile_feedback_until_ns.load()) return;
-  const ui::StatusCard card = CurrentOutputCard(runtime);
+  const ui::StatusCard card = CurrentOutputCard(runtime, xefg);
   const bool pill = ui::ShowsOnHud(card);
-  const int64_t toast_ns =
-      hud_toast_until_ns.load(std::memory_order_relaxed) - now_ns;
   const bool profile_notice = profile_feedback_until_ns.load() > now_ns;
   // The issue notice (rc11): a warn row of the health ledger entered, or is
   // still active five minutes on.  Below the pill (NR not working says more)
@@ -28178,7 +28263,8 @@ inline void OnHudOverlay(reshade::api::effect_runtime* runtime) {
 inline std::mutex last_telemetry_mutex;
 inline std::string last_telemetry_line;
 
-inline void EmitTelemetry(int64_t now_ns, bool force = false) {
+inline void EmitTelemetry(int64_t now_ns, bool force = false,
+                          const std::optional<fg::xefg::StatusSnapshot>& xefg = ReadSelectedXefgStatus()) {
   const uint32_t interval_s = telemetry_seconds.load(std::memory_order_relaxed);
   if (interval_s == 0) return;
   const uint64_t evals = successful_evaluations.load(std::memory_order_relaxed)
@@ -29009,7 +29095,7 @@ inline void EmitTelemetry(int64_t now_ns, bool force = false) {
   // One verdict beside every telemetry line, so a log opened at any point in
   // a session answers "is NR running" without the reader deriving it from
   // fifteen counters.
-  EmitNrVerdict("interval");
+  EmitNrVerdict("interval", xefg);
   EmitHealthSummary();
 
   telemetry_pacing = {};
@@ -29226,13 +29312,16 @@ inline void RunLifecycleTick(int64_t present_ns, bool from_present) {
     }
     TickNrCost(present_ns != 0 ? present_ns : SteadyNowNs(), 0.0);
     ++telemetry_window_ticks;
-    EmitTelemetry(present_ns != 0 ? present_ns : SteadyNowNs());
+    // A tick can be driven by a different swapchain. Its cadence doesn't
+    // select the status shown in the verdict, card, HUD, or report.
+    const auto xefg = ReadSelectedXefgStatus();
+    EmitTelemetry((present_ns != 0 ? present_ns : SteadyNowNs()), false, xefg);
     // The verdict is emitted the moment engagement changes, not only on the
     // telemetry interval: the session that needs explaining is usually the
     // one that stopped working part way through, and waiting out an interval
     // (or Shutdown, which a crash never reaches) is how that went unrecorded
     // for six releases.  A present-rate check of ~20 relaxed loads.
-    const NrVerdict verdict = MaybeEmitNrVerdict();
+    const NrVerdict verdict = MaybeEmitNrVerdict(xefg);
     const int64_t tick_ns = SteadyNowNs();
     if (!enabled.load(std::memory_order_relaxed)) {
       nr_on_since_ns.store(0, std::memory_order_relaxed);
@@ -29241,7 +29330,7 @@ inline void RunLifecycleTick(int64_t present_ns, bool from_present) {
     }
     // Before the card, which counts the issues it publishes.
     TickHealth(tick_ns, present_ns != 0);
-    MaybeEmitStatusCard(verdict, tick_ns);
+    MaybeEmitStatusCard(verdict, tick_ns, xefg);
   }
   retirement_turn.reset();
   retirement_device_lock.reset();
@@ -29313,6 +29402,7 @@ inline void OnInitEffectRuntime(reshade::api::effect_runtime* runtime) {
   }
   if (monitor_runtime.load() == nullptr) {
     monitor_runtime = runtime;
+    monitor_status_output = MatchRuntimePresentOwner(runtime);
     monitor_history_epoch.fetch_add(1);
   }
   monitor_observation_epoch.fetch_add(1);
@@ -29328,6 +29418,7 @@ inline void OnDestroyEffectRuntime(reshade::api::effect_runtime* runtime) {
 #endif
   if (monitor_runtime.load() == runtime) {
     monitor_runtime = live_effect_runtimes.empty() ? nullptr : live_effect_runtimes.front();
+    monitor_status_output = {};
     gpu_timers::monitor_events.enabled = false;
     monitor_history_epoch.fetch_add(1);
     monitor_observation_epoch.fetch_add(1);
@@ -30780,7 +30871,7 @@ inline capability::Result QueryConfigurationCapability(const presets::Json& valu
     vulkan_configuration = vk::ReadConfigurationFactsLocked();
     input.runtime = vulkan_configuration.runtime;
   } else {
-    const auto funnel = CollectFunnelInputs();
+    const auto funnel = CollectSessionFunnelInputs();
     input.runtime = (funnel.runtime_available ? capability::Runtime::AVAILABLE
         : nr_runtime_fault.load() != 0 ? capability::Runtime::UNAVAILABLE : capability::Runtime::UNKNOWN);
   }
@@ -34430,6 +34521,9 @@ inline void OnProfilePresent(reshade::api::effect_runtime* runtime) {
   {
     std::unique_lock lock(overlay_listener_mutex);
     if (!live_effect_runtimes.empty() && runtime != live_effect_runtimes.front()) return;
+    if (runtime == monitor_runtime.load()) {
+      monitor_status_output = MatchRuntimePresentOwner(runtime);
+    }
   }
   SaveMonitorVisibility();
   if (monitor_mode_cycle_request.exchange(0) != 0) CycleMonitorMode();
@@ -36742,11 +36836,12 @@ inline void OnDestroyDevice(reshade::api::device* device) {
       // skipped at random.  Before the verdict, because EmitTelemetry ends
       // by stating its own `interval` verdict and the log's last verdict
       // has to be the final one.
+      const auto xefg = ReadSelectedXefgStatus();
       {
         RuntimeLock lock(runtime_mutex);
-        EmitTelemetry(SteadyNowNs(), /*force=*/true);
+        EmitTelemetry(SteadyNowNs(), /*force=*/true, xefg);
       }
-      EmitNrVerdict("teardown");
+      EmitNrVerdict("teardown", xefg);
     }
     return;
   }
@@ -37152,9 +37247,10 @@ inline bool Shutdown(bool proof_gated) {
   // BEFORE the shutdown verdict, not after: EmitTelemetry ends by stating
   // its own `trigger=interval` verdict, and the last verdict in the log has
   // to be the final one.
+  const auto xefg_status = ReadSelectedXefgStatus();
   {
     RuntimeLock lock(runtime_mutex);
-    EmitTelemetry(SteadyNowNs(), /*force=*/true);
+    EmitTelemetry(SteadyNowNs(), /*force=*/true, xefg_status);
   }
   // The session's LAST word, before anything is torn down.  The periodic
   // verdict covers the sessions that never reach here (a crash, an Alt-F4),
@@ -37164,15 +37260,11 @@ inline bool Shutdown(bool proof_gated) {
   // `late_ngx` lane: the host ran 240 evaluates and the last line in the
   // log said seen=197, because the run ended mid-interval - 43 frames that
   // no reader, and no test, could account for.
-  EmitNrVerdict("shutdown");
+  const auto status_inputs = CollectCardInputs(xefg_status);
+  EmitNrVerdict("shutdown", xefg_status);
   EmitHealthSummary();
-  // And the card that verdict shows, outside the rate limit: the lanes read
-  // it as the session's last card.
-  {
-    EmitStatusCard(
-        ui::ComputeStatusCard(CollectCardInputs()),
-        "shutdown");
-  }
+  // The final card uses exactly the verdict written alongside it.
+  EmitStatusCard(ui::ComputeStatusCard(status_inputs), "shutdown");
   const uint64_t session_bypassed =
       bypassed_evaluations.load(std::memory_order_relaxed);
   if (session_bypassed != 0) {

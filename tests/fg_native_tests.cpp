@@ -1896,19 +1896,23 @@ int main(int argc, char** argv) {
       Check(off_card.id == ui::CardId::kOffByUser, "historical submissions cannot hide Off");
       Check(native::BuildSupportReport().find("fg_submitted=") != std::string::npos,
             "support report distinguishes real FG submissions from model evaluations");
-      // Select the real XeFG observation path, without fabricating a service
-      // submission: observing phases must never manufacture session counts.
+      // The real XeFG Present fixture verifies per-output outcomes and counts.
+      // A global phase without a registered owner must not affect this card.
+      funnel_accounting_tests::Restore restore;
+      restore.Atomic(&native::native_fg_owns);
+      native::native_fg_owns.store(false);
+      const auto ordinary = native::CollectCardInputs();
       xefg::Configure(nullptr, nullptr, nullptr, &Requested);
       xefg::internal::owns_stream.store(true);
       const auto submitted_count = xefg::SubmittedFrames();
       for (auto phase : {fg::Result::PREPARED, fg::Result::SUBMITTED, fg::Result::FAILED, fg::Result::NOT_SERVED}) {
         xefg::internal::result.store(phase);
-        const auto observed = native::CollectFunnelInputs();
-        const auto verdict = renodx::addons::dlss5::ComputeNrVerdict(observed);
-        const auto inputs = native::CollectCardInputs(verdict, hud_now);
-        Check(observed.injected == (phase == fg::Result::SUBMITTED ? 1u : 0u)
-                  && inputs.fg_submitted_frames == submitted_count,
-              "real XeFG UI source keeps current result separate from submitted session count");
+        const auto inputs = native::CollectCardInputs();
+        Check(inputs.verdict.injected == ordinary.verdict.injected
+                  && inputs.verdict.reason == ordinary.verdict.reason
+                  && !inputs.fg_submitted_frames.has_value()
+                  && xefg::SubmittedFrames() == submitted_count,
+              "XeFG global phase without a selected owner cannot affect the ordinary status or counts");
       }
       xefg::internal::owns_stream.store(false);
       xefg::Configure(nullptr, nullptr, nullptr, nullptr);

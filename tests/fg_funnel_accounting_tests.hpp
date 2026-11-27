@@ -389,7 +389,9 @@ void Run(Gpu* gpu) {
         expected_nr += 99 - gaps_per_hundred;
         expected_gaps += gaps_per_hundred;
         const auto session = nr::CollectSessionFunnelInputs();
-        const auto presentation = nr::CollectFunnelInputs();
+        const auto selected_xefg = (route == 1
+            ? std::optional{xefg::StatusSnapshot{.outcome = phase, .owned = true}} : std::nullopt);
+        const auto presentation = nr::CollectFunnelInputs(selected_xefg);
         auto sample = nr::CollectHealthSample();
         const bool cumulative_matches = session.seen == expected_eligible && session.eligible == expected_eligible
             && session.injected == expected_nr && session.unaccounted == expected_gaps

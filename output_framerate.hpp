@@ -348,13 +348,18 @@ inline bool OwnsBackBuffer(const Output& output, uintptr_t back_buffer) {
   return back_buffer != 0 && std::ranges::find(output.back_buffers, back_buffer) != output.back_buffers.end();
 }
 
-inline OutputIdentity ResolvePresentOutput(const Output& output) {
+inline OutputIdentity ResolvePresentOutput(const Output& output, bool* ambiguous = nullptr) {
   if (output.native_swapchain == 0) return output.identity;
   OutputIdentity proxy;
   for (const auto& [context, candidate] : state.xefg) {
     if (candidate.linked_present != output.identity && candidate.identity.swapchain != output.native_swapchain
         && candidate.native_swapchain != output.native_swapchain) continue;
-    if (proxy) return {};
+    if (proxy) {
+      if (ambiguous != nullptr) {
+        *ambiguous = true;
+      }
+      return {};
+    }
     proxy = candidate.identity;
   }
   return (proxy ? proxy : output.identity);
@@ -460,12 +465,17 @@ inline bool HasRegisteredPresentOutputs() {
 }
 
 namespace internal {
-inline const Output* FindPresentOwner(uintptr_t device, uintptr_t back_buffer) {
+inline const Output* FindPresentOwner(uintptr_t device, uintptr_t back_buffer, bool* ambiguous = nullptr) {
   const Output* match = nullptr;
   for (const auto& [swapchain, candidate] : state.present) {
     if ((device != 0 && candidate.identity.device != device)
         || !OwnsBackBuffer(candidate, back_buffer)) continue;
-    if (match != nullptr) return nullptr;
+    if (match != nullptr) {
+      if (ambiguous != nullptr) {
+        *ambiguous = true;
+      }
+      return nullptr;
+    }
     match = &candidate;
   }
   return match;
@@ -510,9 +520,9 @@ inline OutputIdentity FindPresentOutput(uintptr_t device, uintptr_t back_buffer)
   return internal::FindPresentOutput(device, back_buffer);
 }
 
-inline OutputIdentity FindPresentOwner(uintptr_t device, uintptr_t back_buffer) {
+inline OutputIdentity FindPresentOwner(uintptr_t device, uintptr_t back_buffer, bool* ambiguous = nullptr) {
   std::shared_lock lock(internal::state.mutex);
-  const auto* owner = internal::FindPresentOwner(device, back_buffer);
+  const auto* owner = internal::FindPresentOwner(device, back_buffer, ambiguous);
   return (owner != nullptr ? owner->identity : OutputIdentity{});
 }
 
@@ -524,6 +534,18 @@ inline OutputIdentity MatchPresentColorOwner(const OutputIdentity& route, uintpt
   const auto* owner = internal::FindPresentOwner(route.device, back_buffer);
   if (owner == nullptr || internal::ResolvePresentOutput(*owner) != route) return {};
   return owner->identity;
+}
+
+inline OutputIdentity ResolveRegisteredPresentOutput(const OutputIdentity& owner, bool* ambiguous = nullptr) {
+  if (!owner || owner.view != 0) return {};
+  std::shared_lock lock(internal::state.mutex);
+  if (const auto* current = internal::FindOutput(owner); current != nullptr) {
+    return internal::ResolvePresentOutput(*current, ambiguous);
+  }
+  if (ambiguous != nullptr) {
+    *ambiguous = true;
+  }
+  return {};
 }
 
 inline void BindSourceOutput(const SourceIdentity& source, const OutputIdentity& identity) {
